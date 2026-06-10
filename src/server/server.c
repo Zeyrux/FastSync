@@ -11,7 +11,6 @@
 
 FileReceive *receive_file_receive(int file_descriptor) {
   char *path = (char *)receive_str(file_descriptor);
-  printf("%s\n", path);
   DataFragment *file_data_fragment = receive_data(file_descriptor);
   FileReceive *file = file_receive_create(path, file_data_fragment);
   return file;

@@ -7,6 +7,7 @@
 #include "config.h"
 #include "log.h"
 #include "multiprocessing.h"
+#include "pipeline.h"
 #include "queue.h"
 #include "scanner.h"
 #include "socket.h"
@@ -24,9 +25,6 @@ int send_chunk(Client *client, Chunk *chunk, bool use_compression) {
       send_str(client->file_descriptor, file->path);
       send_data(client->file_descriptor, file->data, file->stats.st_size);
     }
-    send_status(client->file_descriptor, FINISHED);
-    if (receive_status(client->file_descriptor) != OK)
-      return -1;
   }
   return 0;
 }
@@ -105,12 +103,14 @@ int send_files(Config *config) {
   DirectoryScanner *scanner = directory_scanner_create(config->send_directory);
   Chunk *current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
-    chunk_print(current_chunk);
     for (int i = 0; i < current_chunk->element_count; i++)
       file_load_data(current_chunk->items[i]);
     send_chunk(client, current_chunk, config->use_compression);
     chunk_destroy(current_chunk);
   }
+  send_status(client->file_descriptor, FINISHED);
+  if (receive_status(client->file_descriptor) != OK)
+    return -1;
   printf("FINISHED");
   directory_scanner_destroy(scanner);
   client_disconnect(client);
@@ -149,42 +149,40 @@ int send_files_multithreaded(Config *config) {
   return 0;
 }
 
-int send_files_multiprocessed(Config *config) {
-  int cores = sysconf(_SC_NPROCESSORS_ONLN);
-  int pid = fork();
-  if (pid == -1) {
-    perror("Error Forking!");
-    return 1;
-  } else if (pid == 0) {
-  }
-  for (int i = 0; i < cores; i++) {
-    int pid = fork();
-    if (pid == -1) {
-      perror("Error forking!");
-      return 1;
-    } else if (pid == 0) {
-    }
-  }
-  return 0;
-}
+// int send_files_multiprocessed(Config *config) {
+//   int cores = sysconf(_SC_NPROCESSORS_ONLN);
+//   int pid = fork();
+//   if (pid == -1) {
+//     perror("Error Forking!");
+//     return 1;
+//   } else if (pid == 0) {
+//   }
+//   for (int i = 0; i < cores; i++) {
+//     int pid = fork();
+//     if (pid == -1) {
+//       perror("Error forking!");
+//       return 1;
+//     } else if (pid == 0) {
+//     }
+//   }
+//   return 0;
+// }
 
 int main(int argc, char *argv[]) {
   Config *config = config_create(
       str_dup("1.0.0"), str_dup("/home/taptap/Nextcloud/Uni/moodle/MINT-Raum"),
-      str_dup("./data_copied"), false, false, false, false, false, 1);
+      str_dup("./data_copied"), false, false, false, false, 1);
   for (int i = 1; i < argc; i++) {
     handle_arg(argv[i], "-m", &config->use_multithreading,
                "Enabled Multithreading");
     handle_arg(argv[i], "-s", &config->use_chunk_serialization,
                "Enabled Chunk Serialization");
     handle_arg(argv[i], "-c", &config->use_compression, "Enabled Compression");
-    handle_arg(argv[i], "-p", &config->use_multiprocessing,
-               "Enabled Multiprocessing");
   }
 
   if (config->use_multithreading)
     return send_files_multithreaded(config);
-  else if (config->use_multiprocessing)
-    return send_files_multiprocessed(config);
+  // else if (config->use_multiprocessing)
+  //   return send_files_multiprocessed(config);
   return send_files(config);
 }

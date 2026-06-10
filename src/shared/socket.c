@@ -198,14 +198,29 @@ int receive_int(int file_descriptor) {
   return data;
 }
 
+const char *status_to_string(Status status) {
+  switch (status) {
+  case OK:
+    return "OK";
+  case ERROR:
+    return "ERROR";
+  case FINISHED:
+    return "FINISHED";
+  case NEXT:
+    return "NEXT";
+  default:
+    return "UNKNOWN";
+  }
+}
+
 void send_status(int file_descriptor, Status status) {
   send_n_data(file_descriptor, &status, sizeof(Status));
-  log_message(LOG_LEVEL_DEBUG, "Send Status: %d", status);
+  log_message(LOG_LEVEL_DEBUG, "Send Status: %s", status_to_string(status));
 }
 
 Status receive_status(int file_descriptor) {
   Status data;
   receive_n_data(file_descriptor, &data, sizeof(Status));
-  log_message(LOG_LEVEL_DEBUG, "Received Status: %d", data);
+  log_message(LOG_LEVEL_DEBUG, "Received Status: %s", status_to_string(data));
   return data;
 }

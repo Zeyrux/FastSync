@@ -44,7 +44,6 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
       perror("Could not open directory!");
       exit(EXIT_FAILURE);
     }
-    printf("%s", path);
     while ((entry = readdir(dir)) != NULL) {
       if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
         continue;
