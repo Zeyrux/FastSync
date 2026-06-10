@@ -1,0 +1,1611 @@
+--- src/client/scanner.h ---
+
+#ifndef SCANNER_H
+#define SCANNER_H
+
+#include "chunk.h"
+#include "queue.h"
+typedef struct {
+  Queue *directories;
+} DirectoryScanner;
+
+DirectoryScanner *directory_scanner_create(char *root_directory);
+Chunk *directory_scanner_next(DirectoryScanner *scanner);
+void directory_scanner_destroy(DirectoryScanner *scanner);
+
+#endif
+--- src/shared/queue.h ---
+
+#ifndef QUEUE_H
+#define QUEUE_H
+
+#include <stdbool.h>
+#include <threads.h>
+
+typedef struct Queue {
+  void **items;
+  int front;
+  int rear;
+  int size;
+  int capacity;
+  void (*item_destroyer)(void *item);
+} Queue;
+
+Queue *queue_create(int capacity, void (*destroyer)(void *item));
+void queue_destroy(Queue *queue);
+bool queue_is_empty(Queue *queue);
+bool queue_is_full(Queue *queue);
+void queue_double_capacity(Queue *queue);
+void queue_enqueue(Queue *queue, void *item);
+void queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
+                                 cnd_t *condition_not_empty,
+                                 cnd_t *condition_not_full);
+void *queue_dequeue(Queue *queue);
+void *queue_dequeue_multithreaded(Queue *queue, mtx_t *mutex,
+                                  cnd_t *condition_not_empty,
+                                  cnd_t *condition_not_full,
+                                  bool *other_thread_done);
+
+#endif
+--- src/shared/config.h ---
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <stdbool.h>
+
+typedef struct Config {
+  char *version;
+  char *send_directory;
+  char *receive_root_directory;
+  bool save_to_disk;
+  bool use_multithreading;
+  bool use_chunk_serialization;
+  bool use_compression;
+  bool use_multiprocessing;
+  int num_connections;
+} Config;
+
+Config *config_create(char *version, char *send_directory,
+                      char *receive_directory, bool save_to_disk,
+                      bool use_multithreading, bool use_chunk_serialization,
+                      bool use_compression, bool use_multiprocessing,
+                      int num_connections);
+void config_delete(Config *config);
+void config_send(int file_descriptor, Config *config);
+Config *config_receive(int file_descriptor);
+
+#endif
+--- src/shared/array_list.h ---
+
+#ifndef ARRAY_LIST_H
+#define ARRAY_LIST_H
+
+#define INITIAL_ARRAY_SIZE 100
+
+typedef struct ArrayList {
+  void **items;
+  int size;
+  int capacity;
+  void (*item_destroyer)(void *item);
+} ArrayList;
+
+ArrayList *array_list_create(void (*item_destroyer)(void *item));
+void array_list_delete(ArrayList *array_list);
+void array_list_clear(ArrayList *array_list);
+void array_list_extend(ArrayList *array_list);
+void array_list_add(ArrayList *array_list, void *item);
+void **array_list_to_array(ArrayList *array_list);
+
+#endif
+--- src/shared/log.h ---
+
+#ifndef LOG_H
+#define LOG_H
+
+typedef enum {
+  LOG_LEVEL_DEBUG,
+  LOG_LEVEL_INFO,
+  LOG_LEVEL_WARNING,
+  LOG_LEVEL_ERROR
+} LogLevel;
+
+void log_message(LogLevel log_level, char *message, ...);
+
+#endif
+--- src/shared/chunk.h ---
+
+#ifndef CHUNK_H
+#define CHUNK_H
+
+#include "socket.h"
+#include <sys/stat.h>
+
+#define DESIRED_CHUNK_SIZE 10 * 1024 * 1024
+#define FILE_PATH_SEPERATOR "#&&SEPP&&#"
+#define FILE_PATH_DATA_SEPERATOR "#&&SEPD&&#"
+
+typedef struct {
+  char *path;
+  struct stat stats;
+  char *data;
+} File;
+
+typedef struct {
+  char *path;
+  DataFragment *data_fragment;
+} FileReceive;
+
+typedef struct {
+  File **items;
+  int element_count;
+} Chunk;
+
+typedef struct {
+  void *data;
+  unsigned long long data_size;
+} Data;
+
+File *file_create(const char *path, struct stat *stats);
+void file_destroy(void *item);
+void file_load_data(File *file);
+void file_print(void *item);
+void file_content_to_buffer(File *file, char *buffer);
+
+FileReceive *file_receive_create(char *path, DataFragment *data_fragment);
+void file_receive_destroy(void *file_receive);
+
+Chunk *chunk_create(File **items, int element_count);
+void chunk_destroy(void *chunk);
+void chunk_print(void *chunk);
+Data *chunk_format(Chunk *chunk);
+Data *chunk_compress(Chunk *chunk);
+
+Data *chunk_data_create(void *data, unsigned long long data_size);
+void chunk_data_delete(void *chunk);
+void chunk_data_to_disk(Data *chunk, char *root_directory);
+#endif
+--- src/shared/utils.h ---
+
+#ifndef UTILS_H
+#define UTILS_H
+
+void mkdir_r(char *path);
+char *str_dup(char *string);
+void to_disk(char *path, void *data, unsigned long long data_size);
+char *path_cat(char *path1, char *path2);
+
+#endif
+--- src/shared/multiprocessing.h ---
+
+#ifndef MULTIPROCESSING_H
+#define MULTIPROCESSING_H
+
+#include <threads.h>
+
+#include "config.h"
+#include "queue.h"
+
+typedef struct {
+  Config *config;
+  Queue *queue_scanner;
+  mtx_t mutex_scanner;
+  cnd_t condition_not_full_scanner;
+  cnd_t condition_not_empty_scanner;
+  bool scanner_done;
+  Queue *queue_loader;
+  mtx_t mutex_loader;
+  cnd_t condition_not_full_loader;
+  cnd_t condition_not_empty_loader;
+  bool loader_done;
+} PipelineContextSender;
+
+typedef struct PipelineContextReceiver {
+  Queue *queue;
+  Config *config;
+  int file_descriptor;
+  mtx_t mutex;
+  cnd_t condition_not_full;
+  cnd_t condition_not_empty;
+  bool receiver_done;
+} PipelineContextReceiver;
+
+PipelineContextSender *pipeline_context_sender_create(Config *config,
+                                                      Queue *queue_scanner,
+                                                      Queue *queue_loader);
+void pipeline_context_sender_destroy(PipelineContextSender *context);
+PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
+                                                          Queue *queue_receiver,
+                                                          int file_descriptor);
+void pipeline_context_receiver_destroy(PipelineContextReceiver *context);
+#endif
+--- src/shared/socket.h ---
+
+#ifndef SOCKET_H
+#define SOCKET_H
+
+#include "array_list.h"
+#include <netinet/in.h>
+
+typedef unsigned long long NET_SIZE;
+typedef int Status;
+enum NET_STATUS { OK, ERROR, FINISHED, NEXT };
+
+typedef struct Server {
+  struct sockaddr_in address;
+  unsigned int address_length;
+  int file_descriptor;
+} Server;
+
+Server *server_create(int port);
+void server_listen(Server *server, void (*handler)(int file_descriptor));
+void server_delete(Server *server);
+
+typedef struct Client {
+  struct sockaddr_in address;
+  unsigned int address_length;
+  int file_descriptor;
+} Client;
+
+typedef struct DataFragment {
+  void *data;
+  unsigned long long size;
+} DataFragment;
+
+Client *client_create();
+void client_disconnect(Client *client);
+void client_delete(Client *client);
+void client_connect(Client *client, char *host, int port);
+
+DataFragment *data_fragment_create(void *data, unsigned long long size);
+void data_fragment_delete(void *data_fragment);
+
+void send_n_data(int file_descriptor, void *data, NET_SIZE data_size);
+void receive_n_data(int file_descriptor, void *data, NET_SIZE data_size);
+void send_str(int file_descriptor, char *data);
+char *receive_str(int file_descriptor);
+void send_data(int file_descriptor, void *data, unsigned long long data_size);
+DataFragment *receive_data(int file_descriptor);
+void send_int(int file_descriptor, int data);
+int receive_int(int file_descriptor);
+void send_status(int file_descriptor, Status status);
+Status receive_status(int file_descriptor);
+
+#endif
+--- src/client/client.c ---
+
+#include <stdio.h>
+#include <string.h>
+#include <threads.h>
+#include <unistd.h>
+
+#include "chunk.h"
+#include "config.h"
+#include "log.h"
+#include "multiprocessing.h"
+#include "queue.h"
+#include "scanner.h"
+#include "socket.h"
+#include "utils.h"
+#include <dirent.h>
+
+int send_chunk(Client *client, Chunk *chunk, bool use_compression) {
+  if (use_compression) {
+    Data *data = chunk_compress(chunk);
+    send_data(client->file_descriptor, data->data, data->data_size);
+  } else {
+    for (int i = 0; i < chunk->element_count; i++) {
+      send_status(client->file_descriptor, NEXT);
+      File *file = chunk->items[i];
+      send_str(client->file_descriptor, file->path);
+      send_data(client->file_descriptor, file->data, file->stats.st_size);
+    }
+    send_status(client->file_descriptor, FINISHED);
+    if (receive_status(client->file_descriptor) != OK)
+      return -1;
+  }
+  return 0;
+}
+
+int scan_directory_multithreaded(void *pipeline_context) {
+  PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
+  mtx_lock(&context->mutex_scanner);
+  DirectoryScanner *scanner =
+      directory_scanner_create(context->config->send_directory);
+  mtx_unlock(&context->mutex_scanner);
+
+  Chunk *current_chunk;
+  while ((current_chunk = directory_scanner_next(scanner)) != NULL)
+    queue_enqueue_multithreaded(context->queue_scanner, current_chunk,
+                                &context->mutex_scanner,
+                                &context->condition_not_empty_scanner,
+                                &context->condition_not_full_scanner);
+  mtx_lock(&context->mutex_scanner);
+  context->scanner_done = true;
+  cnd_signal(&context->condition_not_empty_scanner);
+  mtx_unlock(&context->mutex_scanner);
+
+  directory_scanner_destroy(scanner);
+  return thrd_success;
+}
+
+int load_files_multithreaded(void *pipeline_context) {
+  PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
+  while (true) {
+    Chunk *chunk = queue_dequeue_multithreaded(
+        context->queue_scanner, &context->mutex_scanner,
+        &context->condition_not_empty_scanner,
+        &context->condition_not_full_scanner, &context->scanner_done);
+    if (chunk == NULL) {
+      mtx_lock(&context->mutex_loader);
+      context->loader_done = true;
+      cnd_signal(&context->condition_not_empty_loader);
+      mtx_unlock(&context->mutex_loader);
+      return thrd_success;
+    }
+    for (int i = 0; i < chunk->element_count; i++)
+      file_load_data(chunk->items[i]);
+    queue_enqueue_multithreaded(context->queue_loader, chunk,
+                                &context->mutex_loader,
+                                &context->condition_not_empty_loader,
+                                &context->condition_not_full_loader);
+  }
+}
+
+int send_chunks_multithreaded(void *pipeline_context) {
+  PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
+  bool use_compression = context->config->use_compression;
+  Client *client = client_create();
+  client_connect(client, "127.0.0.1", 8080);
+  config_send(client->file_descriptor, context->config);
+
+  while (true) {
+    Chunk *current_chunk = queue_dequeue_multithreaded(
+        context->queue_loader, &context->mutex_loader,
+        &context->condition_not_empty_loader,
+        &context->condition_not_full_loader, &context->loader_done);
+    if (current_chunk == NULL) {
+      client_disconnect(client);
+      client_delete(client);
+      return thrd_success;
+    }
+    send_chunk(client, current_chunk, use_compression);
+    chunk_destroy(current_chunk);
+  }
+}
+
+int send_files(Config *config) {
+  Client *client = client_create();
+  client_connect(client, "127.0.0.1", 8080);
+  config_send(client->file_descriptor, config);
+  DirectoryScanner *scanner = directory_scanner_create(config->send_directory);
+  Chunk *current_chunk;
+  while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
+    chunk_print(current_chunk);
+    for (int i = 0; i < current_chunk->element_count; i++)
+      file_load_data(current_chunk->items[i]);
+    send_chunk(client, current_chunk, config->use_compression);
+    chunk_destroy(current_chunk);
+  }
+  printf("FINISHED");
+  directory_scanner_destroy(scanner);
+  client_disconnect(client);
+  client_delete(client);
+  return 0;
+}
+
+void handle_arg(char *argument_given, char *argument_to_set, bool *result,
+                char *message) {
+  if (strcmp(argument_given, argument_to_set) == 0) {
+    *result = true;
+    log_message(LOG_LEVEL_INFO, message);
+  }
+}
+
+int send_files_multithreaded(Config *config) {
+  PipelineContextSender *context =
+      pipeline_context_sender_create(config, queue_create(100, chunk_destroy),
+                                     queue_create(100, chunk_destroy));
+
+  thrd_t scanner, loader, sender;
+  if (thrd_create(&scanner, scan_directory_multithreaded, context) !=
+          thrd_success ||
+      thrd_create(&loader, load_files_multithreaded, context) != thrd_success ||
+      thrd_create(&sender, send_chunks_multithreaded, context) !=
+          thrd_success) {
+    perror("Error creating threads.\n");
+    return 1;
+  }
+
+  thrd_join(scanner, NULL);
+  thrd_join(loader, NULL);
+  thrd_join(sender, NULL);
+
+  pipeline_context_sender_destroy(context);
+  return 0;
+}
+
+int send_files_multiprocessed(Config *config) {
+  int cores = sysconf(_SC_NPROCESSORS_ONLN);
+  int pid = fork();
+  if (pid == -1) {
+    perror("Error Forking!");
+    return 1;
+  } else if (pid == 0) {
+  }
+  for (int i = 0; i < cores; i++) {
+    int pid = fork();
+    if (pid == -1) {
+      perror("Error forking!");
+      return 1;
+    } else if (pid == 0) {
+    }
+  }
+  return 0;
+}
+
+int main(int argc, char *argv[]) {
+  Config *config = config_create(
+      str_dup("1.0.0"), str_dup("/home/taptap/Nextcloud/Uni/moodle/MINT-Raum"),
+      str_dup("./data_copied"), false, false, false, false, false, 1);
+  for (int i = 1; i < argc; i++) {
+    handle_arg(argv[i], "-m", &config->use_multithreading,
+               "Enabled Multithreading");
+    handle_arg(argv[i], "-s", &config->use_chunk_serialization,
+               "Enabled Chunk Serialization");
+    handle_arg(argv[i], "-c", &config->use_compression, "Enabled Compression");
+    handle_arg(argv[i], "-p", &config->use_multiprocessing,
+               "Enabled Multiprocessing");
+  }
+
+  if (config->use_multithreading)
+    return send_files_multithreaded(config);
+  else if (config->use_multiprocessing)
+    return send_files_multiprocessed(config);
+  return send_files(config);
+}
+--- src/client/scanner.c ---
+
+#include "scanner.h"
+#include "array_list.h"
+#include "chunk.h"
+#include "queue.h"
+#include "utils.h"
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+DirectoryScanner *directory_scanner_create(char *root_directory) {
+  DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
+  scanner->directories = queue_create(100, free);
+  queue_enqueue(scanner->directories, str_dup(root_directory));
+  return scanner;
+}
+
+void directory_scanner_destroy(DirectoryScanner *scanner) {
+  if (scanner == NULL)
+    return;
+  queue_destroy(scanner->directories);
+  free(scanner);
+}
+
+Chunk *chunk_data_to_chunk(ArrayList *chunk_data) {
+  void **chunk_items = array_list_to_array(chunk_data);
+  Chunk *chunk = chunk_create((File **)chunk_items, chunk_data->size);
+  free(chunk_items);
+  chunk_data->item_destroyer = NULL;
+  array_list_delete(chunk_data);
+  return chunk;
+}
+
+Chunk *directory_scanner_next(DirectoryScanner *scanner) {
+  ArrayList *chunk_data = array_list_create(file_destroy);
+  unsigned long long chunk_data_size = 0;
+
+  while (!queue_is_empty(scanner->directories)) {
+    char *path = (char *)queue_dequeue(scanner->directories);
+    DIR *dir;
+    struct dirent *entry;
+    dir = opendir(path);
+    if (dir == NULL) {
+      perror("Could not open directory!");
+      exit(EXIT_FAILURE);
+    }
+    printf("%s", path);
+    while ((entry = readdir(dir)) != NULL) {
+      if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+        continue;
+      }
+      char *cur_path = path_cat(path, entry->d_name);
+      struct stat stats;
+      stat(cur_path, &stats);
+      if (!S_ISREG(stats.st_mode))
+        queue_enqueue(scanner->directories, (void *)cur_path);
+      else {
+        File *file = file_create(cur_path, &stats);
+        array_list_add(chunk_data, file);
+        chunk_data_size += file->stats.st_size;
+        if (chunk_data_size > DESIRED_CHUNK_SIZE)
+          return chunk_data_to_chunk(chunk_data);
+        free(cur_path);
+      }
+    }
+    closedir(dir);
+    free(path);
+  }
+  if (chunk_data->size > 0)
+    return chunk_data_to_chunk(chunk_data);
+  return NULL;
+}
+--- src/shared/multiprocessing.c ---
+
+#include "multiprocessing.h"
+#include "config.h"
+#include "queue.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <threads.h>
+
+PipelineContextSender *pipeline_context_sender_create(Config *config,
+                                                      Queue *queue_scanner,
+                                                      Queue *queue_loader) {
+  PipelineContextSender *context = malloc(sizeof(PipelineContextSender));
+  context->config = config;
+  context->queue_scanner = queue_scanner;
+  context->queue_loader = queue_loader;
+  context->scanner_done = false;
+  context->loader_done = false;
+  if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success ||
+      cnd_init(&context->condition_not_full_scanner) != thrd_success ||
+      cnd_init(&context->condition_not_empty_scanner) != thrd_success ||
+      mtx_init(&context->mutex_loader, mtx_plain) != thrd_success ||
+      cnd_init(&context->condition_not_full_loader) != thrd_success ||
+      cnd_init(&context->condition_not_empty_loader) != thrd_success) {
+    perror("Error initializing synchronization objects!");
+    exit(EXIT_FAILURE);
+  }
+  return context;
+}
+
+void pipeline_context_sender_destroy(PipelineContextSender *context) {
+  config_delete(context->config);
+  queue_destroy(context->queue_scanner);
+  queue_destroy(context->queue_loader);
+  mtx_destroy(&context->mutex_scanner);
+  cnd_destroy(&context->condition_not_full_scanner);
+  cnd_destroy(&context->condition_not_empty_scanner);
+  mtx_destroy(&context->mutex_loader);
+  cnd_destroy(&context->condition_not_full_loader);
+  cnd_destroy(&context->condition_not_empty_loader);
+  free(context);
+}
+
+PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
+                                                          Queue *queue,
+                                                          int file_descriptor) {
+  PipelineContextReceiver *context = malloc(sizeof(PipelineContextReceiver));
+  context->config = config;
+  context->queue = queue;
+  context->file_descriptor = file_descriptor;
+  context->receiver_done = false;
+  if (mtx_init(&context->mutex, mtx_plain) != thrd_success ||
+      cnd_init(&context->condition_not_full) != thrd_success ||
+      cnd_init(&context->condition_not_empty) != thrd_success) {
+    perror("Error initializing synchronization objects!");
+    exit(EXIT_FAILURE);
+  }
+  return context;
+}
+
+void pipeline_context_receiver_destroy(PipelineContextReceiver *context) {
+  config_delete(context->config);
+  queue_destroy(context->queue);
+  mtx_destroy(&context->mutex);
+  cnd_destroy(&context->condition_not_full);
+  cnd_destroy(&context->condition_not_empty);
+  free(context);
+}
+--- src/shared/array_list.c ---
+
+#include "array_list.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+ArrayList *array_list_create(void (*item_destroyer)(void *item)) {
+  ArrayList *list = (ArrayList *)malloc(sizeof(ArrayList));
+  if (list == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for array list struct");
+    exit(EXIT_FAILURE);
+  }
+
+  list->items = malloc(INITIAL_ARRAY_SIZE * sizeof(void *));
+  if (list->items == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for list items");
+    free(list);
+    exit(EXIT_FAILURE);
+  }
+  list->size = 0;
+  list->capacity = INITIAL_ARRAY_SIZE;
+  list->item_destroyer = item_destroyer;
+  return list;
+}
+
+void array_list_delete(ArrayList *array_list) {
+  if (array_list == NULL)
+    return;
+  if (array_list->item_destroyer != NULL) {
+    for (int i = 0; i < array_list->size; i++) {
+      array_list->item_destroyer(array_list->items[i]);
+      array_list->items[i] = NULL;
+    }
+  }
+  free(array_list->items);
+  free(array_list);
+}
+
+void array_list_clear(ArrayList *array_list) {
+  if (array_list == NULL)
+    return;
+  for (int i = 0; i < array_list->size; i++)
+    array_list->items[i] = NULL;
+  array_list->size = 0;
+}
+
+void array_list_extend(ArrayList *array_list) {
+  if (array_list == NULL)
+    return;
+  int new_capacity = array_list->capacity * 2;
+  if (new_capacity == 0)
+    new_capacity = INITIAL_ARRAY_SIZE;
+  array_list->items = realloc(array_list->items, new_capacity * sizeof(void *));
+  if (array_list->items == NULL) {
+    perror("FATAL ERROR: Could not reallocate memory for array list struct");
+    exit(EXIT_FAILURE);
+  }
+  array_list->capacity = new_capacity;
+}
+
+void array_list_add(ArrayList *array_list, void *item) {
+  if (array_list == NULL) {
+    return;
+  }
+  if (array_list->capacity == array_list->size) {
+    array_list_extend(array_list);
+  }
+  array_list->items[array_list->size] = item;
+  array_list->size += 1;
+}
+
+void **array_list_to_array(ArrayList *array_list) {
+  if (array_list == NULL) {
+    return NULL;
+  }
+  void **array = malloc(array_list->size * sizeof(void *));
+  if (array == NULL) {
+    perror("Could not malloc space for array from array list!");
+    return NULL;
+  }
+  memcpy(array, array_list->items, array_list->size * sizeof(void *));
+  return array;
+}
+--- src/shared/utils.c ---
+
+#include "utils.h"
+#include "libgen.h"
+#include "sys/stat.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void mkdir_r(char *path) {
+  char *path_duplicate = malloc(strlen(path) + 1);
+  strcpy(path_duplicate, path);
+  char *path_current = (char *)malloc((strlen(path) + 2) * sizeof(char));
+  char *path_current_position = path_current;
+  const char *delimiter = "/";
+  char *part = strtok(path_duplicate, delimiter);
+  // struct stat st;
+  while (part != NULL) {
+    strcpy(path_current_position, part);
+    path_current_position += strlen(part) * sizeof(char);
+    strcpy(path_current_position, "/");
+    path_current_position += sizeof(char);
+    struct stat st;
+    if (stat(path_current, &st) != 0) {
+      if (mkdir(path_current, 0755) != 0) {
+        perror("Could not create directory");
+        exit(EXIT_FAILURE);
+      }
+    }
+    part = strtok(NULL, delimiter);
+  }
+  free(path_duplicate);
+  free(path_current);
+}
+
+char *str_dup(char *string) {
+  if (string == NULL)
+    return NULL;
+  char *new_string = (char *)malloc(strlen(string) + 1);
+  strcpy(new_string, string);
+  return new_string;
+}
+
+void to_disk(char *path, void *data, unsigned long long data_size) {
+  char *directory = str_dup(path);
+  directory = dirname(directory);
+  mkdir_r(directory);
+  FILE *file_pointer = fopen(path, "wb");
+  if (file_pointer == NULL) {
+    perror("Could not open File");
+    exit(EXIT_FAILURE);
+  }
+  fwrite(data, 1, data_size, file_pointer);
+  fclose(file_pointer);
+  free(directory);
+}
+
+char *path_cat(char *path1, char *path2) {
+  if (path1 == NULL || *path1 == '\0')
+    return str_dup(path2);
+  if (path2 == NULL || *path2 == '\0')
+    return str_dup(path1);
+  int path1_len = strlen(path1);
+  int path2_len = strlen(path2);
+  char *path2_pointer = path2;
+  if (path1[path1_len - 1] == '/')
+    path1_len -= 1;
+  if (path2[0] == '/') {
+    path2_pointer += 1;
+    path2_len -= 1;
+  }
+  char *new_path = malloc(path1_len + path2_len + 2);
+  memcpy(new_path, path1, path1_len);
+  new_path[path1_len] = '/';
+  memcpy(new_path + path1_len + 1, path2_pointer, path2_len);
+  new_path[path1_len + path2_len + 1] = '\0';
+  return new_path;
+}
+--- src/shared/queue.c ---
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <threads.h>
+
+#include "queue.h"
+
+Queue *queue_create(int capacity, void (*destroyer)(void *item)) {
+  Queue *queue = (Queue *)malloc(sizeof(Queue));
+  if (queue == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for queue structure");
+    exit(EXIT_FAILURE);
+  }
+
+  queue->items = malloc(capacity * sizeof(void *));
+  if (queue->items == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for queue items");
+    free(queue);
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < capacity; ++i) {
+    queue->items[i] = NULL;
+  }
+
+  queue->capacity = capacity;
+  queue->front = 0;
+  queue->rear = 0;
+  queue->size = 0;
+  queue->item_destroyer = destroyer;
+
+  return queue;
+}
+
+void queue_destroy(Queue *queue) {
+  if (queue == NULL)
+    return;
+
+  for (int i = 0; i < queue->size; ++i) {
+    int index = (queue->front + i) % queue->capacity;
+    queue->item_destroyer(queue->items[index]);
+  }
+  free(queue->items);
+  free(queue);
+}
+
+bool queue_is_empty(Queue *queue) {
+  if (queue == NULL)
+    return true;
+  return queue->size == 0;
+}
+
+bool queue_is_full(Queue *queue) {
+  if (queue == NULL)
+    return false;
+  return queue->size == queue->capacity;
+}
+
+void queue_double_capacity(Queue *queue) {
+  if (queue == NULL)
+    return;
+  unsigned int new_capacity = queue->capacity * 2;
+  if (new_capacity <= 1)
+    new_capacity = 100;
+  void **new_items = malloc(new_capacity * sizeof(void *));
+  if (new_items == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for doubling capacity of "
+           "queue.");
+    exit(EXIT_FAILURE);
+  }
+  for (int i = 0; i < queue->size; i++)
+    new_items[i] = queue->items[(i + queue->front) % queue->capacity];
+  free(queue->items);
+  queue->items = new_items;
+  queue->front = 0;
+  queue->rear = queue->size;
+  queue->capacity = new_capacity;
+}
+
+void queue_enqueue(Queue *queue, void *item) {
+  if (queue == NULL || item == NULL) {
+    perror("ERROR: Cannot enqueue with a null queue or item.\n");
+    exit(EXIT_FAILURE);
+  }
+  if (queue_is_full(queue))
+    queue_double_capacity(queue);
+  queue->items[queue->rear] = item;
+  queue->rear = (queue->rear + 1) % queue->capacity;
+  queue->size++;
+}
+
+void queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
+                                 cnd_t *condition_not_empty,
+                                 cnd_t *condition_not_full) {
+  mtx_lock(mutex);
+  while (queue_is_full(queue))
+    cnd_wait(condition_not_full, mutex);
+  queue_enqueue(queue, item);
+  cnd_signal(condition_not_empty);
+  mtx_unlock(mutex);
+}
+
+void *queue_dequeue(Queue *queue) {
+  if (queue == NULL || queue_is_empty(queue)) {
+    perror("ERROR: Could not dequeue from null or empty queue.");
+    return NULL;
+  }
+
+  void *item = queue->items[queue->front];
+  queue->items[queue->front] = NULL;
+  queue->front = (queue->front + 1) % queue->capacity;
+  queue->size--;
+  return item;
+}
+
+void *queue_dequeue_multithreaded(Queue *queue, mtx_t *mutex,
+                                  cnd_t *condition_not_empty,
+                                  cnd_t *condition_not_full,
+                                  bool *other_thread_done) {
+  mtx_lock(mutex);
+  while (queue_is_empty(queue) && !*other_thread_done)
+    cnd_wait(condition_not_empty, mutex);
+  if (queue_is_empty(queue) && *other_thread_done) {
+    mtx_unlock(mutex);
+    return NULL;
+  }
+  void *item = queue_dequeue(queue);
+  cnd_signal(condition_not_full);
+  mtx_unlock(mutex);
+  return item;
+}
+--- src/shared/chunk.c ---
+
+#include <dirent.h>
+#include <libgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zstd.h>
+
+#include "chunk.h"
+#include "log.h"
+#include "socket.h"
+
+File *file_create(const char *path, struct stat *stats) {
+  File *file = (File *)malloc(sizeof(File));
+  if (file == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for file struct");
+    exit(EXIT_FAILURE);
+  }
+
+  file->stats = *stats;
+
+  int path_len = strlen(path);
+  file->path = (char *)malloc(path_len + 1);
+  if (file->path == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for path file string");
+    free(file);
+    exit(EXIT_FAILURE);
+  }
+
+  strcpy(file->path, path);
+  file->data = NULL;
+  return file;
+}
+
+void file_destroy(void *item) {
+  if (item == NULL)
+    return;
+  File *file = (File *)item;
+  free(file->data);
+  file->data = NULL;
+  free(file->path);
+  file->path = NULL;
+  free(file);
+}
+
+void file_load_data(File *file) {
+  if (file == NULL)
+    return;
+  file->data = malloc(file->stats.st_size);
+  if (file->data == NULL) {
+    perror("Could not allocate memeor y for file data!");
+    exit(EXIT_FAILURE);
+  }
+  file_content_to_buffer(file, file->data);
+}
+
+void file_print(void *item) {
+  if (item == NULL)
+    return;
+  printf("%s\n", ((File *)item)->path);
+}
+
+void file_content_to_buffer(File *file, char *buffer) {
+  if (buffer == NULL) {
+    perror("Buffer is to write file content to is NULL!");
+    exit(EXIT_FAILURE);
+  }
+  FILE *file_pointer = fopen(file->path, "rb");
+  if (file_pointer == NULL) {
+    perror("Could not open the file!");
+    exit(EXIT_FAILURE);
+  }
+  size_t bytes_read = fread(buffer, 1, file->stats.st_size, file_pointer);
+  if (bytes_read != (size_t)file->stats.st_size) {
+    perror("Read to many or to less bytes from File!");
+    exit(EXIT_FAILURE);
+  }
+  fclose(file_pointer);
+}
+
+FileReceive *file_receive_create(char *path, DataFragment *data_fragment) {
+  FileReceive *file = malloc(sizeof(FileReceive));
+  file->path = path;
+  file->data_fragment = data_fragment;
+  return file;
+}
+
+void file_receive_destroy(void *file_receive) {
+  if (file_receive == NULL)
+    return;
+  FileReceive *file = (FileReceive *)file_receive;
+  data_fragment_delete(file->data_fragment);
+  free(file->path);
+  free(file);
+}
+
+Chunk *chunk_create(File **items, int element_count) {
+  Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
+  if (chunk == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for chunk structure");
+    exit(EXIT_FAILURE);
+  }
+
+  chunk->items = (File **)malloc(element_count * sizeof(File *));
+  if (chunk->items == NULL) {
+    perror("FATAL ERROR: Could not allocate memory for items of chunk "
+           "structure");
+    free(chunk);
+    exit(EXIT_FAILURE);
+  }
+
+  for (int i = 0; i < element_count; i++) {
+    chunk->items[i] = items[i];
+  }
+  chunk->element_count = element_count;
+  return chunk;
+}
+
+void chunk_destroy(void *item) {
+  if (item == NULL) {
+    return;
+  }
+  Chunk *chunk = (Chunk *)item;
+  for (int i = 0; i < chunk->element_count; ++i) {
+    if (chunk->items[i] != NULL) {
+      file_destroy(chunk->items[i]);
+    }
+  }
+  free(chunk->items);
+  free(chunk);
+}
+
+void chunk_print(void *item) {
+  if (item == NULL)
+    return;
+  Chunk *chunk = (Chunk *)item;
+  for (int i = 0; i < chunk->element_count; ++i)
+    if (chunk->items[i] != NULL)
+      file_print(chunk->items[i]);
+}
+
+Data *chunk_format(Chunk *chunk) {
+  unsigned long long buffer_size = 0;
+  for (int i = 0; i < chunk->element_count; ++i) {
+    buffer_size += sizeof(int);
+    buffer_size += strlen(chunk->items[i]->path);
+    buffer_size += sizeof(unsigned long long);
+    buffer_size += chunk->items[i]->stats.st_size;
+  }
+
+  char *data = malloc(buffer_size);
+  if (data == NULL) {
+    perror("Could not allocate data for ChunkFormated!");
+    exit(EXIT_FAILURE);
+  }
+  char *current_data_pointer = data;
+  for (int i = 0; i < chunk->element_count; ++i) {
+    File *file = chunk->items[i];
+    // add path len
+    int path_length = (int)strlen(file->path);
+    memcpy(current_data_pointer, &path_length, sizeof(int));
+    current_data_pointer += sizeof(int);
+    // add path
+    memcpy(current_data_pointer, file->path, path_length);
+    current_data_pointer += path_length;
+    // add file data len
+    unsigned long long file_length = file->stats.st_size;
+    memcpy(current_data_pointer, &file_length, sizeof(unsigned long long));
+    current_data_pointer += sizeof(unsigned long long);
+    // add file data
+    file_content_to_buffer(file, current_data_pointer);
+    current_data_pointer += file_length;
+  }
+  if (current_data_pointer - data != (long)(long)buffer_size) {
+    perror("Buffer of Chunk wasn't filled enough!");
+    exit(EXIT_FAILURE);
+  }
+  return chunk_data_create(data, buffer_size);
+}
+
+Data *chunk_compress(Chunk *chunk) {
+  unsigned long long data_size = 0;
+  for (int i = 0; i < chunk->element_count; i++) {
+    data_size += sizeof(unsigned long long);
+    data_size += strlen(chunk->items[i]->path);
+    data_size += sizeof(unsigned long long);
+    data_size += chunk->items[i]->stats.st_size;
+  }
+  char *data = malloc(data_size);
+  char *data_pointer = data;
+  for (int i = 0; i < chunk->element_count; i++) {
+    // path length
+    unsigned long long path_len = strlen(chunk->items[i]->path);
+    memcpy(data_pointer, &path_len, sizeof(unsigned long long));
+    data_pointer += sizeof(unsigned long long);
+    memcpy(data_pointer, chunk->items[i]->path, path_len);
+    data_pointer += path_len;
+    // file data
+    unsigned long long data_size = chunk->items[i]->stats.st_size;
+    memcpy(data_pointer, &data_size, sizeof(unsigned long long));
+    data_pointer += data_size;
+    memcpy(data_pointer, chunk->items[i]->data, data_size);
+    data_pointer += data_size;
+  }
+  size_t compressed_data_size = ZSTD_compressBound(data_size);
+  void *compressed_data = malloc(compressed_data_size);
+  if (compressed_data == NULL) {
+    log_message(ERROR, "Could not allocate memory for compressed Chunk");
+    exit(EXIT_FAILURE);
+  }
+  // TODO
+}
+
+Data *chunk_data_create(void *data, unsigned long long data_size) {
+  Data *chunk_formated = malloc(sizeof(Data));
+  if (chunk_formated == NULL) {
+    perror("Could not allocate memory for ChunkFormated");
+    exit(EXIT_FAILURE);
+  }
+  chunk_formated->data = data;
+  chunk_formated->data_size = data_size;
+  return chunk_formated;
+}
+
+void chunk_data_delete(void *chunk) {
+  Data *chunk_data = (Data *)chunk;
+  free(chunk_data->data);
+  free(chunk_data);
+}
+
+// void chunk_data_to_disk(ChunkData *chunk_formated, char *root_directory) {
+//   char *current_data_pointer = chunk_formated->data;
+//   while (current_data_pointer - (char *)chunk_formated->data <
+//          chunk_formated->data_size) {
+//     // get path length
+//     int path_length = 0;
+//     memcpy(&path_length, (int *)current_data_pointer, sizeof(int));
+//     current_data_pointer += sizeof(int);
+//     // get path
+//     int path_dir_size =
+//         (strlen(root_directory) + path_length + 1) * sizeof(char);
+//     char *path = (char *)malloc(path_dir_size);
+//     if (path == NULL) {
+//       perror("Could not allocate memory for path!");
+//       exit(EXIT_FAILURE);
+//     }
+//     snprintf(path, path_dir_size, "%s%.*s", root_directory, path_length,
+//              current_data_pointer);
+//     current_data_pointer += sizeof(char) * path_length;
+//     // get data length
+//     unsigned long long data_size = 0;
+//     memcpy(&data_size, (unsigned long long *)current_data_pointer,
+//            sizeof(unsigned long long));
+//     current_data_pointer += sizeof(unsigned long long);
+//     // create File Receive
+//     FileReceive *file =
+//         file_receive_create(path, data_size, current_data_pointer);
+//     file_receive_print(file);
+//     file_receive_to_disk(file);
+//     current_data_pointer += sizeof(char) * data_size;
+//   }
+// }
+--- src/shared/socket.c ---
+
+#include "socket.h"
+#include "log.h"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+Server *server_create(int port) {
+  Server *server = (Server *)malloc(sizeof(Server));
+  if (server == NULL) {
+    perror("Could not allocate space for Server");
+    exit(EXIT_FAILURE);
+  }
+
+  int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
+  if (file_descriptor < 0) {
+    perror("Could not create Socket!");
+    exit(EXIT_FAILURE);
+  }
+  server->file_descriptor = file_descriptor;
+  int opt = 1;
+  if (setsockopt(server->file_descriptor, SOL_SOCKET, SO_REUSEADDR, &opt,
+                 sizeof(opt))) {
+    perror("Error setting a socket option!");
+    close(server->file_descriptor);
+    free(server);
+    exit(EXIT_FAILURE);
+  }
+
+  server->address.sin_family = AF_INET;
+  server->address.sin_addr.s_addr = INADDR_ANY;
+  server->address.sin_port = htons(port);
+  server->address_length = sizeof(server->address);
+
+  if (bind(server->file_descriptor, (struct sockaddr *)&server->address,
+           server->address_length) < 0) {
+    perror("Could not bind server");
+    close(server->file_descriptor);
+    free(server);
+    exit(EXIT_FAILURE);
+  }
+
+  return server;
+}
+
+void server_delete(Server *server) {
+  free(server);
+  server = NULL;
+};
+
+void server_listen(Server *server, void (*handler)(int file_descriptor)) {
+  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",
+              server->address.sin_port);
+  if (listen(server->file_descriptor, 3) < 0) {
+    perror("Could not listen on port!");
+    exit(EXIT_FAILURE);
+  }
+
+  int file_descriptor =
+      accept(server->file_descriptor, (struct sockaddr *)&server->address,
+             &server->address_length);
+  if (server->file_descriptor < 0) {
+    perror("Could not accept the connection");
+    exit(EXIT_FAILURE);
+  }
+  log_message(LOG_LEVEL_INFO, "Received Connection");
+  handler(file_descriptor);
+  close(server->file_descriptor);
+  close(file_descriptor);
+}
+
+Client *client_create() {
+  int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
+  if (file_descriptor < 0) {
+    perror("Could not create Socket!");
+    exit(EXIT_FAILURE);
+  };
+
+  Client *client = (Client *)malloc(sizeof(Client));
+  client->file_descriptor = file_descriptor;
+  client->address.sin_family = AF_INET;
+  client->address_length = sizeof(client->address);
+  return client;
+}
+
+void client_connect(Client *client, char *host, int port) {
+  client->address.sin_port = htons(port);
+
+  if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
+    perror("Could not convert host address!");
+    exit(EXIT_FAILURE);
+  }
+
+  if (connect(client->file_descriptor, (struct sockaddr *)&client->address,
+              client->address_length) < 0) {
+    perror("Could not connect to Server!");
+    exit(EXIT_FAILURE);
+  }
+}
+
+void client_disconnect(Client *client) { close(client->file_descriptor); }
+
+void client_delete(Client *client) {
+  if (client == NULL)
+    return;
+  free(client);
+}
+
+DataFragment *data_fragment_create(void *data, unsigned long long size) {
+  DataFragment *data_fragment = malloc(sizeof(DataFragment));
+  data_fragment->data = data;
+  data_fragment->size = size;
+  return data_fragment;
+}
+
+void data_fragment_delete(void *data_fragment) {
+  if (data_fragment == NULL)
+    return;
+  DataFragment *fragment = (DataFragment *)data_fragment;
+  free(fragment->data);
+  free(fragment);
+}
+
+void send_n_data(int file_descriptor, void *data, NET_SIZE data_size) {
+  log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %d", data_size);
+  NET_SIZE total_bytes_send = 0;
+  while (total_bytes_send < data_size) {
+    long long bytes_send =
+        send(file_descriptor, (char *)data + total_bytes_send,
+             data_size - total_bytes_send, 0);
+    if (bytes_send == 0) {
+      perror("Could not send data!");
+      exit(EXIT_FAILURE);
+    }
+    total_bytes_send += bytes_send;
+  }
+  log_message(LOG_LEVEL_DEBUG, "    Send n Data: %d", total_bytes_send);
+}
+
+void receive_n_data(int file_descriptor, void *data, NET_SIZE data_size) {
+  log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %d", data_size);
+  NET_SIZE total_bytes_received = 0;
+  while (total_bytes_received < data_size) {
+    long long bytes_received =
+        recv(file_descriptor, data + total_bytes_received,
+             data_size - total_bytes_received, 0);
+    if (bytes_received == -1 || bytes_received == 0) {
+      perror("Could not receive bytes!");
+      exit(EXIT_FAILURE);
+    }
+    total_bytes_received += bytes_received;
+  }
+  log_message(LOG_LEVEL_DEBUG, "    Received n Data: %d", total_bytes_received);
+}
+
+void send_str(int file_descriptor, char *data) {
+  NET_SIZE size = strlen(data);
+  send_n_data(file_descriptor, &size, sizeof(NET_SIZE));
+  send_n_data(file_descriptor, data, size);
+  log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
+}
+
+char *receive_str(int file_descriptor) {
+  NET_SIZE size;
+  receive_n_data(file_descriptor, &size, sizeof(NET_SIZE));
+  char *data = (char *)malloc(size + 1);
+  receive_n_data(file_descriptor, data, size);
+  data[size] = '\0';
+  log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
+  return data;
+}
+
+void send_data(int file_descriptor, void *data, unsigned long long data_size) {
+  send_n_data(file_descriptor, &data_size, sizeof(unsigned long long));
+  send_n_data(file_descriptor, data, data_size);
+  log_message(LOG_LEVEL_DEBUG, "Send %lld data", data_size);
+}
+
+DataFragment *receive_data(int file_descriptor) {
+  unsigned long long size = 0;
+  receive_n_data(file_descriptor, &size, sizeof(unsigned long long));
+  void *data = malloc(size);
+  receive_n_data(file_descriptor, data, size);
+  log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
+  return data_fragment_create(data, size);
+}
+
+void send_int(int file_descriptor, int data) {
+  send_n_data(file_descriptor, &data, sizeof(int));
+  log_message(LOG_LEVEL_DEBUG, "Send Int: %d", data);
+}
+
+int receive_int(int file_descriptor) {
+  int data;
+  receive_n_data(file_descriptor, &data, sizeof(int));
+  log_message(LOG_LEVEL_DEBUG, "Received Int: %d", data);
+  return data;
+}
+
+void send_status(int file_descriptor, Status status) {
+  send_n_data(file_descriptor, &status, sizeof(Status));
+  log_message(LOG_LEVEL_DEBUG, "Send Status: %d", status);
+}
+
+Status receive_status(int file_descriptor) {
+  Status data;
+  receive_n_data(file_descriptor, &data, sizeof(Status));
+  log_message(LOG_LEVEL_DEBUG, "Received Status: %d", data);
+  return data;
+}
+--- src/shared/log.c ---
+
+#include "log.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <time.h>
+
+static const char *log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
+static LogLevel current_log_level = LOG_LEVEL_DEBUG;
+
+void log_message(LogLevel log_level, char *format, ...) {
+  if (log_level < current_log_level)
+    return;
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+
+  // Print timestamp and log level to the file
+  printf("%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900,
+         t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec,
+         log_level_strings[log_level]);
+
+  va_list args;
+  va_start(args, format);
+  vprintf(format, args);
+  va_end(args);
+  printf("\n");
+}
+--- src/shared/config.c ---
+
+#include "config.h"
+#include "socket.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+Config *config_create(char *version, char *send_directory,
+                      char *receive_directory, bool save_to_disk,
+                      bool use_multithreading, bool use_chunk_serialization,
+                      bool use_compression, bool use_multiprocessing,
+                      int num_connections) {
+
+  Config *config = malloc(sizeof(Config));
+  config->version = version;
+  config->send_directory = send_directory;
+  config->receive_root_directory = receive_directory;
+  config->save_to_disk = save_to_disk;
+  config->use_multithreading = use_multithreading;
+  config->use_chunk_serialization = use_chunk_serialization;
+  config->use_compression = use_compression;
+  config->use_multiprocessing = use_multiprocessing;
+  config->num_connections = num_connections;
+  return config;
+}
+
+void config_delete(Config *config) {
+  free(config->version);
+  free(config->send_directory);
+  free(config->receive_root_directory);
+  free(config);
+}
+
+void config_send(int file_descriptor, Config *config) {
+  send_str(file_descriptor, config->version);
+  send_str(file_descriptor, config->send_directory);
+  send_str(file_descriptor, config->receive_root_directory);
+  send_int(file_descriptor, config->save_to_disk);
+  send_int(file_descriptor, config->use_multithreading);
+  send_int(file_descriptor, config->use_chunk_serialization);
+  send_int(file_descriptor, config->use_compression);
+  send_int(file_descriptor, config->use_multiprocessing);
+  send_int(file_descriptor, config->num_connections);
+  if (receive_status(file_descriptor) != OK) {
+    perror("Error transmitting config!");
+    exit(EXIT_FAILURE);
+  }
+}
+
+Config *config_receive(int file_descriptor) {
+  Config *config = (Config *)malloc(sizeof(Config));
+  config->version = receive_str(file_descriptor);
+  config->send_directory = receive_str(file_descriptor);
+  config->receive_root_directory = receive_str(file_descriptor);
+  config->save_to_disk = receive_int(file_descriptor);
+  config->use_multithreading = receive_int(file_descriptor);
+  config->use_chunk_serialization = receive_int(file_descriptor);
+  config->use_compression = receive_int(file_descriptor);
+  config->use_multiprocessing = receive_int(file_descriptor);
+  config->num_connections = receive_int(file_descriptor);
+  send_status(file_descriptor, OK);
+  return config;
+}
+--- src/server/server.c ---
+
+#include "chunk.h"
+#include "config.h"
+#include "multiprocessing.h"
+#include "queue.h"
+#include "socket.h"
+#include "unistd.h"
+#include "utils.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <threads.h>
+
+FileReceive *receive_file_receive(int file_descriptor) {
+  char *path = (char *)receive_str(file_descriptor);
+  printf("%s\n", path);
+  DataFragment *file_data_fragment = receive_data(file_descriptor);
+  FileReceive *file = file_receive_create(path, file_data_fragment);
+  return file;
+}
+
+int receive_thread(void *pipeline_context) {
+  PipelineContextReceiver *context =
+      (PipelineContextReceiver *)pipeline_context;
+  mtx_lock(&context->mutex);
+  int file_descriptor = context->file_descriptor;
+  mtx_unlock(&context->mutex);
+
+  while (receive_status(file_descriptor) == NEXT) {
+    FileReceive *file = receive_file_receive(file_descriptor);
+    queue_enqueue_multithreaded(context->queue, file, &context->mutex,
+                                &context->condition_not_empty,
+                                &context->condition_not_full);
+  }
+  mtx_lock(&context->mutex);
+  context->receiver_done = true;
+  cnd_signal(&context->condition_not_empty);
+  mtx_unlock(&context->mutex);
+  return thrd_success;
+}
+
+int write_thread(void *pipeline_context) {
+  PipelineContextReceiver *context =
+      (PipelineContextReceiver *)pipeline_context;
+  mtx_lock(&context->mutex);
+  bool save_to_disk = context->config->save_to_disk;
+  char *root_directory = str_dup(context->config->receive_root_directory);
+  mtx_unlock(&context->mutex);
+
+  while (true) {
+    FileReceive *file = queue_dequeue_multithreaded(
+        context->queue, &context->mutex, &context->condition_not_empty,
+        &context->condition_not_full, &context->receiver_done);
+    if (file == NULL) {
+      free(root_directory);
+      return thrd_success;
+    }
+    if (save_to_disk)
+      to_disk(path_cat(root_directory, file->path), file->data_fragment->data,
+              file->data_fragment->size);
+  }
+}
+
+int receive_files(Config *config, int file_descriptor) {
+  Status status = receive_status(file_descriptor);
+  while (status == NEXT) {
+    FileReceive *file = receive_file_receive(file_descriptor);
+    if (config->save_to_disk)
+      to_disk(path_cat(config->receive_root_directory, file->path),
+              file->data_fragment->data, file->data_fragment->size);
+    file_receive_destroy(file);
+    status = receive_status(file_descriptor);
+  }
+  if (status != FINISHED) {
+    send_status(file_descriptor, ERROR);
+    return -1;
+  }
+  send_status(file_descriptor, OK);
+  return 0;
+}
+
+void handler(int file_descriptor) {
+  Config *config = config_receive(file_descriptor);
+  if (config->use_multithreading) {
+    PipelineContextReceiver *context = pipeline_context_receiver_create(
+        config, queue_create(100, file_receive_destroy), file_descriptor);
+    thrd_t receiver, writer;
+    if (thrd_create(&receiver, receive_thread, context) != thrd_success ||
+        thrd_create(&writer, write_thread, context) != thrd_success) {
+      perror("Error creating Threads!");
+      exit(EXIT_FAILURE);
+    }
+    thrd_join(receiver, NULL);
+    thrd_join(writer, NULL);
+    pipeline_context_receiver_destroy(context);
+  } else
+    receive_files(config, file_descriptor);
+  close(file_descriptor);
+}
+
+int main() {
+  Server *server = server_create(8080);
+  server_listen(server, handler);
+  server_delete(server);
+  return 0;
+}
+--- Makefile ---
+
+CC = gcc
+CFLAGS = -Wall -g -pthread -std=c11 -Isrc/shared -Isrc/server -Isrc/client
+LIBS = -lzstd
+
+OBJ_DIR = obj
+SRC_DIR = src
+SHARED_SRCS = $(wildcard src/shared/*.c)
+SHARED_OBJS = $(patsubst $(SRC_DIR)/shared/%.c, $(OBJ_DIR)/shared/%.o, $(SHARED_SRCS))
+
+SERVER = server
+SERVER_SRCS = $(wildcard src/server/*.c)
+SERVER_OBJS = $(patsubst $(SRC_DIR)/server/%.c, $(OBJ_DIR)/server/%.o, $(SERVER_SRCS))
+
+CLIENT = client
+CLIENT_SRCS = $(wildcard src/client/*.c)
+CLIENT_OBJS = $(patsubst $(SRC_DIR)/client/%.c, $(OBJ_DIR)/client/%.o, $(CLIENT_SRCS))
+
+all: $(SERVER) $(CLIENT)
+
+$(SERVER): $(SHARED_OBJS) $(SERVER_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+$(CLIENT): $(SHARED_OBJS) $(CLIENT_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+.PHONY: all clean
+
+clean:
+	rm -r $(OBJ_DIR) $(SERVER) $(CLIENT)
