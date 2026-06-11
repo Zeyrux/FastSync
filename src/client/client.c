@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <unistd.h>
@@ -7,7 +8,6 @@
 #include "config.h"
 #include "log.h"
 #include "multiprocessing.h"
-#include "pipeline.h"
 #include "queue.h"
 #include "scanner.h"
 #include "socket.h"
@@ -87,11 +87,15 @@ int send_chunks_multithreaded(void *pipeline_context) {
         &context->condition_not_empty_loader,
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
+      send_status(client->file_descriptor, FINISHED);
       client_disconnect(client);
       client_delete(client);
       return thrd_success;
     }
-    send_chunk(client, current_chunk, use_compression);
+    if (send_chunk(client, current_chunk, use_compression) != 0) {
+      perror("Something unexpected happend while sending the chunk");
+      exit(EXIT_FAILURE);
+    }
     chunk_destroy(current_chunk);
   }
 }
