@@ -11,8 +11,8 @@
 
 FileReceive *receive_file_receive(int file_descriptor) {
   char *path = (char *)receive_str(file_descriptor);
-  DataFragment *file_data_fragment = receive_data(file_descriptor);
-  FileReceive *file = file_receive_create(path, file_data_fragment);
+  Data *file_data = receive_data(file_descriptor);
+  FileReceive *file = file_receive_create(path, file_data);
   return file;
 }
 
@@ -53,8 +53,8 @@ int write_thread(void *pipeline_context) {
       return thrd_success;
     }
     if (save_to_disk)
-      to_disk(path_cat(root_directory, file->path), file->data_fragment->data,
-              file->data_fragment->size);
+      to_disk(path_cat(root_directory, file->path), file->data->data,
+              file->data->size);
   }
 }
 
@@ -64,7 +64,7 @@ int receive_files(Config *config, int file_descriptor) {
     FileReceive *file = receive_file_receive(file_descriptor);
     if (config->save_to_disk)
       to_disk(path_cat(config->receive_root_directory, file->path),
-              file->data_fragment->data, file->data_fragment->size);
+              file->data->data, file->data->size);
     file_receive_destroy(file);
     status = receive_status(file_descriptor);
   }

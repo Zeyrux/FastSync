@@ -14,16 +14,15 @@
 #include "utils.h"
 #include <dirent.h>
 
-int send_chunk(Client *client, Chunk *chunk, bool use_compression) {
-  if (use_compression) {
-    Data *data = chunk_compress(chunk);
-    send_data(client->file_descriptor, data->data, data->data_size);
+int send_chunk(Client *client, Chunk *chunk, Config *config) {
+  if (config->use_compression) {
+    Data *data = chunk_compress(chunk, config->compression_level);
+    send_data(client->file_descriptor, data->data, data->size);
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
       send_status(client->file_descriptor, NEXT);
       File *file = chunk->items[i];
-      send_str(client->file_descriptor, file->path);
-      send_data(client->file_descriptor, file->data, file->stats.st_size);
+      file_send_single_calls(file, client->file_descriptor);
     }
   }
   return 0;
@@ -76,7 +75,6 @@ int load_files_multithreaded(void *pipeline_context) {
 
 int send_chunks_multithreaded(void *pipeline_context) {
   PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
-  bool use_compression = context->config->use_compression;
   Client *client = client_create();
   client_connect(client, "127.0.0.1", 8080);
   config_send(client->file_descriptor, context->config);
@@ -92,7 +90,7 @@ int send_chunks_multithreaded(void *pipeline_context) {
       client_delete(client);
       return thrd_success;
     }
-    if (send_chunk(client, current_chunk, use_compression) != 0) {
+    if (send_chunk(client, current_chunk, context->config) != 0) {
       perror("Something unexpected happend while sending the chunk");
       exit(EXIT_FAILURE);
     }
@@ -109,7 +107,7 @@ int send_files(Config *config) {
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < current_chunk->element_count; i++)
       file_load_data(current_chunk->items[i]);
-    send_chunk(client, current_chunk, config->use_compression);
+    send_chunk(client, current_chunk, config);
     chunk_destroy(current_chunk);
   }
   send_status(client->file_descriptor, FINISHED);
@@ -175,7 +173,7 @@ int send_files_multithreaded(Config *config) {
 int main(int argc, char *argv[]) {
   Config *config = config_create(
       str_dup("1.0.0"), str_dup("/home/taptap/Nextcloud/Uni/moodle/MINT-Raum"),
-      str_dup("./data_copied"), false, false, false, false, 1);
+      str_dup("./data_copied"), false, false, false, false, 5, 1);
   for (int i = 1; i < argc; i++) {
     handle_arg(argv[i], "-m", &config->use_multithreading,
                "Enabled Multithreading");

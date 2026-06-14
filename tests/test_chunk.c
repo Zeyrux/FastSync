@@ -1,8 +1,7 @@
 #include "test_chunk.h"
 #include "chunk.h"
-#include "utils.h"
 #include "test_utils.h"
-#include <stdlib.h>
+#include "utils.h"
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -37,7 +36,7 @@ static void test_file_receive_operations() {
   char *data = str_dup("receive data content");
   unsigned long long size = strlen(data);
 
-  DataFragment *df = data_fragment_create(data, size);
+  Data *df = data_create(data, size);
   EXPECT_NOT_NULL(df);
   EXPECT_EQ_INT((int)df->size, (int)size);
   EXPECT_EQ_STR(df->data, "receive data content");
@@ -80,10 +79,10 @@ static void test_chunk_operations() {
   Data *formatted = chunk_format(chunk);
   EXPECT_NOT_NULL(formatted);
 
-  unsigned long long expected_size = 
-    (sizeof(int) + strlen(path1) + sizeof(unsigned long long) + len1) +
-    (sizeof(int) + strlen(path2) + sizeof(unsigned long long) + len2);
-  EXPECT_EQ_INT((int)formatted->data_size, (int)expected_size);
+  unsigned long long expected_size =
+      (sizeof(int) + strlen(path1) + sizeof(unsigned long long) + len1) +
+      (sizeof(int) + strlen(path2) + sizeof(unsigned long long) + len2);
+  EXPECT_EQ_INT((int)formatted->size, (int)expected_size);
 
   char *ptr = (char *)formatted->data;
 

@@ -1,11 +1,13 @@
 #include <dirent.h>
 #include <libgen.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zstd.h>
 
 #include "chunk.h"
+#include "data.h"
 #include "log.h"
 #include "socket.h"
 
@@ -59,6 +61,11 @@ void file_print(void *item) {
   printf("%s\n", ((File *)item)->path);
 }
 
+void file_send_single_calls(File *file, int file_descriptor) {
+  send_str(file_descriptor, file->path);
+  send_data(file_descriptor, file->data, file->stats.st_size);
+}
+
 void file_content_to_buffer(File *file, char *buffer) {
   if (buffer == NULL) {
     perror("Buffer is to write file content to is NULL!");
@@ -77,10 +84,10 @@ void file_content_to_buffer(File *file, char *buffer) {
   fclose(file_pointer);
 }
 
-FileReceive *file_receive_create(char *path, DataFragment *data_fragment) {
+FileReceive *file_receive_create(char *path, Data *data) {
   FileReceive *file = malloc(sizeof(FileReceive));
   file->path = path;
-  file->data_fragment = data_fragment;
+  file->data_fragment = data;
   return file;
 }
 
@@ -88,7 +95,7 @@ void file_receive_destroy(void *file_receive) {
   if (file_receive == NULL)
     return;
   FileReceive *file = (FileReceive *)file_receive;
-  data_fragment_delete(file->data_fragment);
+  data_destroy(file->data_fragment);
   free(file->path);
   free(file);
 }
@@ -177,7 +184,8 @@ Data *chunk_format(Chunk *chunk) {
   return chunk_data_create(data, buffer_size);
 }
 
-Data *chunk_compress(Chunk *chunk) {
+Data *chunk_compress(Chunk *chunk, int compression_level) {
+  log_message(LOG_LEVEL_DEBUG, "Starting to gather data for chunk compression");
   unsigned long long data_size = 0;
   for (int i = 0; i < chunk->element_count; i++) {
     data_size += sizeof(unsigned long long);
@@ -185,8 +193,13 @@ Data *chunk_compress(Chunk *chunk) {
     data_size += sizeof(unsigned long long);
     data_size += chunk->items[i]->stats.st_size;
   }
-  char *data = malloc(data_size);
-  char *data_pointer = data;
+  Data *data = data_create_empty(data_size);
+  if (data == NULL) {
+    log_message(LOG_LEVEL_ERROR,
+                "Could not allocate memory for chunk compression");
+    exit(EXIT_FAILURE);
+  }
+  char *data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
     // path length
     unsigned long long path_len = strlen(chunk->items[i]->path);
@@ -197,19 +210,19 @@ Data *chunk_compress(Chunk *chunk) {
     // file data
     unsigned long long data_size = chunk->items[i]->stats.st_size;
     memcpy(data_pointer, &data_size, sizeof(unsigned long long));
-    data_pointer += data_size;
+    data_pointer += sizeof(unsigned long long);
     memcpy(data_pointer, chunk->items[i]->data, data_size);
     data_pointer += data_size;
   }
-  size_t compressed_data_size = ZSTD_compressBound(data_size);
-  void *compressed_data = malloc(compressed_data_size);
-  if (compressed_data == NULL) {
-    log_message(ERROR, "Could not allocate memory for compressed Chunk");
-    exit(EXIT_FAILURE);
-  }
-  // TODO
-  Data *tmp = malloc(sizeof(Data));
-  return tmp;
+
+  log_message(LOG_LEVEL_DEBUG, "Chunk succesfully compressed");
+  return compress_data(data, compression_level);
+}
+
+Chunk *chunk_decompress(Data *data, int compression_level) {
+  // ArrayList *files = array_list_create(file_destroy);
+  // size_t data_size = ZSTD_getFrameContentSize(const void *src, size_t
+  // srcSize);
 }
 
 Data *chunk_data_create(void *data, unsigned long long data_size) {
@@ -219,7 +232,7 @@ Data *chunk_data_create(void *data, unsigned long long data_size) {
     exit(EXIT_FAILURE);
   }
   chunk_formated->data = data;
-  chunk_formated->data_size = data_size;
+  chunk_formated->size = data_size;
   return chunk_formated;
 }
 

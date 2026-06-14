@@ -1,6 +1,7 @@
 #include "socket.h"
 #include "log.h"
 #include <arpa/inet.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,24 +108,9 @@ void client_delete(Client *client) {
   free(client);
 }
 
-DataFragment *data_fragment_create(void *data, unsigned long long size) {
-  DataFragment *data_fragment = malloc(sizeof(DataFragment));
-  data_fragment->data = data;
-  data_fragment->size = size;
-  return data_fragment;
-}
-
-void data_fragment_delete(void *data_fragment) {
-  if (data_fragment == NULL)
-    return;
-  DataFragment *fragment = (DataFragment *)data_fragment;
-  free(fragment->data);
-  free(fragment);
-}
-
-void send_n_data(int file_descriptor, void *data, NET_SIZE data_size) {
+void send_n_data(int file_descriptor, void *data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %d", data_size);
-  NET_SIZE total_bytes_send = 0;
+  size_t total_bytes_send = 0;
   while (total_bytes_send < data_size) {
     long long bytes_send =
         send(file_descriptor, (char *)data + total_bytes_send,
@@ -138,9 +124,9 @@ void send_n_data(int file_descriptor, void *data, NET_SIZE data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Send n Data: %d", total_bytes_send);
 }
 
-void receive_n_data(int file_descriptor, void *data, NET_SIZE data_size) {
+void receive_n_data(int file_descriptor, void *data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %d", data_size);
-  NET_SIZE total_bytes_received = 0;
+  size_t total_bytes_received = 0;
   while (total_bytes_received < data_size) {
     long long bytes_received =
         recv(file_descriptor, data + total_bytes_received,
@@ -155,15 +141,15 @@ void receive_n_data(int file_descriptor, void *data, NET_SIZE data_size) {
 }
 
 void send_str(int file_descriptor, char *data) {
-  NET_SIZE size = strlen(data);
-  send_n_data(file_descriptor, &size, sizeof(NET_SIZE));
+  size_t size = strlen(data);
+  send_n_data(file_descriptor, &size, sizeof(size_t));
   send_n_data(file_descriptor, data, size);
   log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
 }
 
 char *receive_str(int file_descriptor) {
-  NET_SIZE size;
-  receive_n_data(file_descriptor, &size, sizeof(NET_SIZE));
+  size_t size;
+  receive_n_data(file_descriptor, &size, sizeof(size_t));
   char *data = (char *)malloc(size + 1);
   receive_n_data(file_descriptor, data, size);
   data[size] = '\0';
@@ -177,13 +163,13 @@ void send_data(int file_descriptor, void *data, unsigned long long data_size) {
   log_message(LOG_LEVEL_DEBUG, "Send %lld data", data_size);
 }
 
-DataFragment *receive_data(int file_descriptor) {
-  unsigned long long size = 0;
+Data *receive_data(int file_descriptor) {
+  size_t size = 0;
   receive_n_data(file_descriptor, &size, sizeof(unsigned long long));
   void *data = malloc(size);
   receive_n_data(file_descriptor, data, size);
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
-  return data_fragment_create(data, size);
+  return data_create(data, size);
 }
 
 void send_int(int file_descriptor, int data) {

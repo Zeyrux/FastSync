@@ -1,4 +1,6 @@
-{ pkgs ? import <nixpkgs> { } }:
+{
+  pkgs ? import <nixpkgs> { },
+}:
 
 pkgs.mkShell {
   nativeBuildInputs = with pkgs; [
@@ -13,6 +15,6 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    echo "fastSync development environment loaded"
+    ./tmux.sh
   '';
 }
