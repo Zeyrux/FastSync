@@ -32,7 +32,7 @@ add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
 target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY})
 
-add_executable(tests ${TEST_SRCS} ${SHARED_SRCS})
+add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
 target_include_directories(tests PRIVATE tests src/shared src/server src/client)
 target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY})
 

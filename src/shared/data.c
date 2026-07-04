@@ -25,6 +25,7 @@ Data *data_create(void *data, size_t data_size) {
 }
 
 void data_destroy(Data *data) {
+  if (data == NULL) return;
   free(data->data);
   free(data);
 }
