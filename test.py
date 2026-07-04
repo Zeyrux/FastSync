@@ -36,7 +36,7 @@ CLIENT_CMD_PREFIX = [
 TEST_CASES = [
     {"name": "Standard (Single-threaded)", "flags": []},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
-    {"name": "Compression (-c -5)", "flags": ["-c 20"]},
+    {"name": "Compression (-c -5)", "flags": ["-c -5"]},
     {"name": "Compression (-c 0)", "flags": ["-c 0"]},
     {"name": "Compression (-c 10)", "flags": ["-c 10"]},
     {"name": "Compression (-c 20)", "flags": ["-c 20"]},
