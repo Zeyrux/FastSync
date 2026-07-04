@@ -6,8 +6,8 @@
 #include <string.h>
 #include <zstd.h>
 
-#include "array_list.h"
 #include "chunk.h"
+#include "array_list.h"
 #include "data.h"
 #include "file.h"
 #include "log.h"
@@ -72,23 +72,26 @@ Data *chunk_format(Chunk *chunk) {
     exit(EXIT_FAILURE);
   }
   char *current_data_pointer = data;
-  // for (int i = 0; i < chunk->element_count; ++i) {
-  //   File *file = chunk->items[i];
-  //   // add path len
-  //   int path_length = (int)strlen(file->path);
-  //   memcpy(current_data_pointer, &path_length, sizeof(int));
-  //   current_data_pointer += sizeof(int);
-  //   // add path
-  //   memcpy(current_data_pointer, file->path, path_length);
-  //   current_data_pointer += path_length;
-  //   // add file data len
-  //   unsigned long long file_length = file->stats.st_size;
-  //   memcpy(current_data_pointer, &file_length, sizeof(unsigned long long));
-  //   current_data_pointer += sizeof(unsigned long long);
-  //   // add file data
-  //   file_content_to_buffer(file, current_data_pointer);
-  //   current_data_pointer += file_length;
-  // }
+  for (int i = 0; i < chunk->element_count; ++i) {
+    File *file = chunk->items[i];
+    // add path len
+    int path_length = (int)strlen(file->path);
+    memcpy(current_data_pointer, &path_length, sizeof(int));
+    current_data_pointer += sizeof(int);
+    // add path
+    memcpy(current_data_pointer, file->path, path_length);
+    current_data_pointer += path_length;
+    // add file data len
+    unsigned long long file_length = file->stats.st_size;
+    memcpy(current_data_pointer, &file_length, sizeof(unsigned long long));
+    current_data_pointer += sizeof(unsigned long long);
+    // add file data
+    if (file->data == NULL) {
+      file_load_data(file);
+    }
+    memcpy(current_data_pointer, file->data->data, file_length);
+    current_data_pointer += file_length;
+  }
   if (current_data_pointer - data != (long)(long)buffer_size) {
     perror("Buffer of Chunk wasn't filled enough!");
     exit(EXIT_FAILURE);
@@ -123,7 +126,7 @@ Data *chunk_compress(Chunk *chunk, int compression_level) {
     unsigned long long data_size = chunk->items[i]->stats.st_size;
     memcpy(data_pointer, &data_size, sizeof(size_t));
     data_pointer += sizeof(size_t);
-    memcpy(data_pointer, chunk->items[i]->data, data_size);
+    memcpy(data_pointer, chunk->items[i]->data->data, data_size);
     data_pointer += data_size;
   }
 
@@ -139,15 +142,15 @@ Chunk *chunk_decompress(Data *compressed_data) {
     return NULL;
   }
   
-  ArrayList *files = array_list_create(file_destroy);
+  ArrayList *files = array_list_create((void (*)(void *))data_destroy);
   char *data_pointer = uncompressed_data->data;
   size_t remaining_size = uncompressed_data->size;
   
   while (remaining_size > 0) {
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path length");
-      array_list_destroy(files);
-      data_delete(uncompressed_data);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
       return NULL;
     }
     
@@ -157,16 +160,16 @@ Chunk *chunk_decompress(Data *compressed_data) {
     
     if (remaining_size < path_len) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path");
-      array_list_destroy(files);
-      data_delete(uncompressed_data);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
       return NULL;
     }
     
     char *path = malloc(path_len + 1);
     if (path == NULL) {
       perror("Could not allocate memory for file path");
-      array_list_destroy(files);
-      data_delete(uncompressed_data);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
       return NULL;
     }
     memcpy(path, data_pointer, path_len);
@@ -177,8 +180,8 @@ Chunk *chunk_decompress(Data *compressed_data) {
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for data size");
       free(path);
-      array_list_destroy(files);
-      data_delete(uncompressed_data);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
       return NULL;
     }
     
@@ -189,20 +192,22 @@ Chunk *chunk_decompress(Data *compressed_data) {
     if (remaining_size < data_size) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for file content");
       free(path);
-      array_list_destroy(files);
-      data_delete(uncompressed_data);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
       return NULL;
     }
     
-    File *file = file_create(path, data_size);
+    struct stat st = {0};
+    st.st_size = data_size;
+    File *file = file_create(path, &st);
     if (file == NULL) {
       free(path);
-      array_list_destroy(files);
-      data_delete(uncompressed_data);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
       return NULL;
     }
     
-    memcpy(file->data, data_pointer, data_size);
+    file->data = data_create(data_pointer, data_size);
     data_pointer += data_size;
     remaining_size -= data_size;
     
@@ -212,12 +217,12 @@ Chunk *chunk_decompress(Data *compressed_data) {
   
   // Create the chunk from the files
   File **file_array = (File **)array_list_to_array(files);
-  Chunk *chunk = chunk_create(file_array, array_list_size(files));
+  Chunk *chunk = chunk_create(file_array, files->size);
   
   // Clean up
   free(file_array);
-  array_list_destroy(files);
-  data_delete(uncompressed_data);
+  array_list_delete(files);
+  data_destroy(uncompressed_data);
   
   log_message(LOG_LEVEL_DEBUG, "Chunk successfully decompressed");
   return chunk;

@@ -25,7 +25,7 @@ static void test_file_operations() {
 
   file_load_data(f);
   EXPECT_NOT_NULL(f->data);
-  EXPECT_EQ_INT(memcmp(f->data, test_content, test_len), 0);
+  EXPECT_EQ_INT(memcmp(f->data->data, test_content, test_len), 0);
 
   file_destroy(f);
   unlink(test_path);

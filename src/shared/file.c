@@ -37,7 +37,7 @@ void file_destroy(void *item) {
   if (item == NULL)
     return;
   File *file = (File *)item;
-  free(file->data);
+  data_destroy(file->data);
   file->data = NULL;
   free(file->path);
   file->path = NULL;
