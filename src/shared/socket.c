@@ -61,7 +61,7 @@ void server_listen(Server *server, void (*handler)(int file_descriptor)) {
   int file_descriptor =
       accept(server->file_descriptor, (struct sockaddr *)&server->address,
              &server->address_length);
-  if (file_descriptor < 0) {
+  if (server->file_descriptor < 0) {
     perror("Could not accept the connection");
     exit(EXIT_FAILURE);
   }

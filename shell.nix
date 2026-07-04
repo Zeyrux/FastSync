@@ -8,6 +8,7 @@ pkgs.mkShell {
     cmake
     gnumake
     pkg-config
+    tea
   ];
 
   buildInputs = with pkgs; [
