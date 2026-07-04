@@ -36,18 +36,15 @@ CLIENT_CMD_PREFIX = [
 TEST_CASES = [
     {"name": "Standard (Single-threaded)", "flags": []},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
-    # {"name": "Compression (-c -5)", "flags": ["-c -5"]},
     {"name": "Compression (-c 0)", "flags": ["-c 0"]},
-    # {"name": "Compression (-c 10)", "flags": ["-c 10"]},
-    # {"name": "Compression (-c 20)", "flags": ["-c 20"]},
-    # {"name": "Chunk Serialization (-s)", "flags": ["-s"]},
+    {"name": "Chunk Serialization (-s)", "flags": ["-s"]},
+    {"name": "Compression + Chunk Serialization (-c -s)", "flags": ["-c", "-s"]},
     {"name": "Multithreading + Compression (-m -c)", "flags": ["-m", "-c"]},
-    # {"name": "Multithreading + Chunk Serialization (-m -s)", "flags": ["-m", "-s"]},
-    # {"name": "Compression + Chunk Serialization (-c -s)", "flags": ["-c", "-s"]},
-    # {
-    #     "name": "Multithreading + Compression + Chunk Serialization (-m -c -s)",
-    #     "flags": ["-m", "-c", "-s"],
-    # },
+    {"name": "Multithreading + Chunk Serialization (-m -s)", "flags": ["-m", "-s"]},
+    {
+        "name": "Multithreading + Compression + Chunk Serialization (-m -c -s)",
+        "flags": ["-m", "-c", "-s"],
+    },
 ]
 
 
