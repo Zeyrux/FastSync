@@ -39,7 +39,7 @@ CLIENT_CMD_PREFIX = [
 TEST_CASES = [
     {"name": "Standard (Single-threaded)", "flags": []},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
-    {"name": "Compression (-c 0)", "flags": ["-c 0"]},
+    {"name": "Compression (-c 0)", "flags": ["-c", "0"]},
     {"name": "Chunk Serialization (-s)", "flags": ["-s"]},
     {"name": "Compression + Chunk Serialization (-c -s)", "flags": ["-c", "-s"]},
     {"name": "Multithreading + Compression (-m -c)", "flags": ["-m", "-c"]},
@@ -149,11 +149,13 @@ def run_suite(env_name, apply_limits, source_dir, dest_dir):
                 time.sleep(0.5)
 
                 env = os.environ.copy()
-                env["FASTSYNC_SOURCE_DIR"] = source_dir
-                env["FASTSYNC_DEST_DIR"] = dest_dir
-                env["FASTSYNC_SAVE_TO_DISK"] = "true"
 
-                client_cmd = client_prefix + base_client_cmd + flags
+                client_cmd = (
+                    client_prefix
+                    + base_client_cmd
+                    + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk"]
+                    + flags
+                )
                 print(f"    Running: {' '.join(client_cmd)}")
 
                 start_time = time.monotonic()
@@ -208,11 +210,11 @@ def run_suite(env_name, apply_limits, source_dir, dest_dir):
 
             except subprocess.TimeoutExpired:
                 results.append(
-                    {"name": name, "status": "Timeout", "time": "N/A", "error": "Exceeded 15s"}
+                    {"name": name, "suite": env_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 15s"}
                 )
             except Exception as e:
                 results.append(
-                    {"name": name, "status": "Error", "time": "N/A", "error": str(e)}
+                    {"name": name, "suite": env_name, "status": "Error", "time": "N/A", "error": str(e)}
                 )
             finally:
                 if server_process:
