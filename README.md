@@ -49,15 +49,18 @@ The client-server communication uses the following status codes:
 | `-m` | Enable multithreading mode |
 | `-c [level]` | Enable compression with optional level (1-22, default: 5) |
 | `-s` | Enable chunk serialization (batch-transfer all files per chunk) |
+| `--source-dir <path>` | Source directory to sync (overrides `FASTSYNC_SOURCE_DIR`) |
+| `--dest-dir <path>` | Server-side destination directory (overrides `FASTSYNC_DEST_DIR`) |
+| `--save-to-disk` | Persist received files to disk |
 
 ### Environment Variables
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `FASTSYNC_SOURCE_DIR` | Source directory for files | Current user's documents directory |
-| `FASTSYNC_DEST_DIR` | Destination directory | `./data_copied` |
+| `FASTSYNC_SOURCE_DIR` | Source directory for files (fallback, overridden by `--source-dir`) | Current user's documents directory |
+| `FASTSYNC_DEST_DIR` | Destination directory (fallback, overridden by `--dest-dir`) | `./data_copied` |
 | `FASTSYNC_SERVER_IP` | Server IP address | `127.0.0.1` |
 | `FASTSYNC_SERVER_PORT` | Server port | `8080` |
-| `FASTSYNC_SAVE_TO_DISK` | Save to disk (true/false) | `false` |
+| `FASTSYNC_SAVE_TO_DISK` | Save to disk (fallback, overridden by `--save-to-disk`) | `false` |
 
 ## Implementation Details
 
@@ -101,8 +104,11 @@ make
 
 ### Client
 ```bash
-# Basic usage
+# Basic usage with default settings (sends from ~/Documents/...)
 ./build/client -m -c 10
+
+# Specify source and destination directories
+./build/client --source-dir /path/to/send --dest-dir /path/to/receive --save-to-disk
 
 # Chunk serialization mode (batch per chunk)
 ./build/client -s
@@ -120,6 +126,14 @@ The project includes comprehensive unit tests for core functionality:
 
 ```bash
 ./build/tests
+```
+
+An integration test / benchmark script runs all configurations against ~50 MB of generated test data with byte-for-byte verification:
+
+```bash
+python3 test.py
+# Skip the throttled suite (disk I/O limits + 100ms network delay) if sudo is unavailable:
+python3 test.py --no-throttled
 ```
 
 ## Code Organization
