@@ -7,10 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 DirectoryScanner *directory_scanner_create(char *root_directory) {
   DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
   scanner->directories = queue_create(100, free);
+  scanner->current_dir = NULL;
+  scanner->current_path = NULL;
   queue_enqueue(scanner->directories, str_dup(root_directory));
   return scanner;
 }
@@ -18,11 +22,16 @@ DirectoryScanner *directory_scanner_create(char *root_directory) {
 void directory_scanner_destroy(DirectoryScanner *scanner) {
   if (scanner == NULL)
     return;
+  if (scanner->current_dir) {
+    closedir(scanner->current_dir);
+    scanner->current_dir = NULL;
+  }
+  free(scanner->current_path);
   queue_destroy(scanner->directories);
   free(scanner);
 }
 
-Chunk *chunk_data_to_chunk(ArrayList *chunk_data) {
+static Chunk *chunk_data_to_chunk(ArrayList *chunk_data) {
   void **chunk_items = array_list_to_array(chunk_data);
   Chunk *chunk = chunk_create((File **)chunk_items, chunk_data->size);
   free(chunk_items);
@@ -31,40 +40,66 @@ Chunk *chunk_data_to_chunk(ArrayList *chunk_data) {
   return chunk;
 }
 
+static int open_next_directory(DirectoryScanner *scanner) {
+  if (scanner->current_dir) {
+    closedir(scanner->current_dir);
+    scanner->current_dir = NULL;
+  }
+  free(scanner->current_path);
+
+  if (queue_is_empty(scanner->directories))
+    return 0;
+
+  scanner->current_path = (char *)queue_dequeue(scanner->directories);
+  scanner->current_dir = opendir(scanner->current_path);
+  if (scanner->current_dir == NULL) {
+    perror("Could not open directory!");
+    exit(EXIT_FAILURE);
+  }
+  return 1;
+}
+
 Chunk *directory_scanner_next(DirectoryScanner *scanner) {
   ArrayList *chunk_data = array_list_create(file_destroy);
   unsigned long long chunk_data_size = 0;
 
-  while (!queue_is_empty(scanner->directories)) {
-    char *path = (char *)queue_dequeue(scanner->directories);
-    DIR *dir;
-    struct dirent *entry;
-    dir = opendir(path);
-    if (dir == NULL) {
-      perror("Could not open directory!");
-      exit(EXIT_FAILURE);
+  while (1) {
+    if (scanner->current_dir == NULL) {
+      if (!open_next_directory(scanner))
+        break;
     }
-    while ((entry = readdir(dir)) != NULL) {
-      if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-        continue;
-      }
-      char *cur_path = path_cat(path, entry->d_name);
-      struct stat stats;
-      stat(cur_path, &stats);
-      if (!S_ISREG(stats.st_mode))
-        queue_enqueue(scanner->directories, (void *)cur_path);
-      else {
-        File *file = file_create(cur_path, &stats);
-        array_list_add(chunk_data, file);
-        chunk_data_size += file->stats.st_size;
-        if (chunk_data_size > DESIRED_CHUNK_SIZE)
-          return chunk_data_to_chunk(chunk_data);
-        free(cur_path);
-      }
+
+    struct dirent *entry = readdir(scanner->current_dir);
+    if (entry == NULL) {
+      closedir(scanner->current_dir);
+      scanner->current_dir = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
+      continue;
     }
-    closedir(dir);
-    free(path);
+
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+
+    char *cur_path = path_cat(scanner->current_path, entry->d_name);
+    struct stat stats;
+    if (stat(cur_path, &stats) != 0) {
+      free(cur_path);
+      continue;
+    }
+
+    if (!S_ISREG(stats.st_mode)) {
+      queue_enqueue(scanner->directories, (void *)cur_path);
+    } else {
+      File *file = file_create(cur_path, &stats);
+      array_list_add(chunk_data, file);
+      chunk_data_size += file->stats.st_size;
+      if (chunk_data_size > DESIRED_CHUNK_SIZE)
+        return chunk_data_to_chunk(chunk_data);
+      free(cur_path);
+    }
   }
+
   if (chunk_data->size > 0)
     return chunk_data_to_chunk(chunk_data);
   return NULL;

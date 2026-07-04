@@ -56,10 +56,13 @@ def generate_test_files(source_dir):
         shutil.rmtree(source_dir)
     os.makedirs(source_dir)
 
+    target_total = 50 * 1024 * 1024
+    written = 0
+
     files = {
         "small.txt": b"hello world\n",
-        "medium.txt": b"line\n" * 1000,
-        "binary.bin": bytes(range(256)),
+        "medium.txt": b"the quick brown fox jumps over the lazy dog\n" * 5000,
+        "binary.bin": bytes(range(256)) * 1000,
         "nested/subdir/deep.txt": b"deeply nested file\n",
         "nested/another.txt": b"another nested file\n" * 50,
     }
@@ -68,6 +71,21 @@ def generate_test_files(source_dir):
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "wb") as f:
             f.write(content)
+        written += len(content)
+
+    i = 0
+    while written < target_total:
+        chunk_size = min(5 * 1024 * 1024, target_total - written)
+        rel_path = f"bulk/file_{i}.dat"
+        full_path = os.path.join(source_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as f:
+            f.write(b"0" * chunk_size)
+        written += chunk_size
+        i += 1
+
+    total_mb = written / (1024 * 1024)
+    print(f"  Generated {total_mb:.1f} MB of test data in {source_dir}")
 
 
 def verify_transfer(source_dir, dest_dir):
