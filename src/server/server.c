@@ -1,3 +1,4 @@
+#include "chunk.h"
 #include "config.h"
 #include "data.h"
 #include "file.h"
@@ -16,11 +17,34 @@ FileReceive *receive_file_receive(Config *config, int file_descriptor) {
   Data *file_data = receive_data(file_descriptor);
   if (config->use_compression) {
     Data *file_data_uncompressed = data_decompress(file_data);
-    free(file_data);
+    data_destroy(file_data);
     file_data = file_data_uncompressed;
   }
   FileReceive *file = file_receive_create(path, file_data);
   return file;
+}
+
+static void receive_chunk_enqueue(int file_descriptor, Config *config,
+                                  PipelineContextReceiver *context) {
+  Data *chunk_data = receive_data(file_descriptor);
+  Data *data_to_process = chunk_data;
+  if (config->use_compression) {
+    data_to_process = data_decompress(chunk_data);
+    data_destroy(chunk_data);
+  }
+  Chunk *chunk = chunk_deserialize(data_to_process);
+  data_destroy(data_to_process);
+
+  for (int i = 0; i < chunk->element_count; i++) {
+    FileReceive *file = file_receive_create(chunk->items[i]->path,
+                                            chunk->items[i]->data);
+    chunk->items[i]->path = NULL;
+    chunk->items[i]->data = NULL;
+    queue_enqueue_multithreaded(context->queue, file, &context->mutex,
+                                &context->condition_not_empty,
+                                &context->condition_not_full);
+  }
+  chunk_destroy(chunk);
 }
 
 int receive_thread(void *pipeline_context) {
@@ -31,11 +55,17 @@ int receive_thread(void *pipeline_context) {
   Config *config = context->config;
   mtx_unlock(&context->mutex);
 
-  while (receive_status(file_descriptor) == STATUS_NEXT) {
-    FileReceive *file = receive_file_receive(config, file_descriptor);
-    queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                &context->condition_not_empty,
-                                &context->condition_not_full);
+  Status status = receive_status(file_descriptor);
+  while (status == STATUS_NEXT || status == STATUS_CHUNK) {
+    if (status == STATUS_CHUNK) {
+      receive_chunk_enqueue(file_descriptor, config, context);
+    } else {
+      FileReceive *file = receive_file_receive(config, file_descriptor);
+      queue_enqueue_multithreaded(context->queue, file, &context->mutex,
+                                  &context->condition_not_empty,
+                                  &context->condition_not_full);
+    }
+    status = receive_status(file_descriptor);
   }
   mtx_lock(&context->mutex);
   context->receiver_done = true;
@@ -68,17 +98,34 @@ int write_thread(void *pipeline_context) {
 
 int receive_files(Config *config, int file_descriptor) {
   Status status = receive_status(file_descriptor);
-  while (status == STATUS_NEXT) {
-    FileReceive *file = receive_file_receive(config, file_descriptor);
-    if (config->save_to_disk)
-      to_disk(path_cat(config->receive_root_directory, file->path),
-              file->data->data, file->data->size);
-    file_receive_destroy(file);
-    // send_status(file_descriptor, STATUS_OK);
+  while (status == STATUS_NEXT || status == STATUS_CHUNK) {
+    if (status == STATUS_CHUNK) {
+      Data *chunk_data = receive_data(file_descriptor);
+      Data *data_to_process = chunk_data;
+      if (config->use_compression) {
+        data_to_process = data_decompress(chunk_data);
+        data_destroy(chunk_data);
+      }
+      Chunk *chunk = chunk_deserialize(data_to_process);
+      data_destroy(data_to_process);
+
+      for (int i = 0; i < chunk->element_count; i++) {
+        if (config->save_to_disk)
+          to_disk(path_cat(config->receive_root_directory, chunk->items[i]->path),
+                  chunk->items[i]->data->data, chunk->items[i]->data->size);
+      }
+      chunk_destroy(chunk);
+    } else {
+      FileReceive *file = receive_file_receive(config, file_descriptor);
+      if (config->save_to_disk)
+        to_disk(path_cat(config->receive_root_directory, file->path),
+                file->data->data, file->data->size);
+      file_receive_destroy(file);
+    }
     status = receive_status(file_descriptor);
   }
   if (status != STATUS_FINISHED) {
-    log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED or NEXT Status");
+    log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
     send_status(file_descriptor, STATUS_ERROR);
     return -1;
   }

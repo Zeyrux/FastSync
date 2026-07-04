@@ -21,11 +21,8 @@ void file_load_data(File *file);
 void file_print(void *item);
 void file_send_single_calls(File *file, int file_descriptor);
 size_t file_content_to_buffer(File *file);
-Data *file_compress(File *file);
 
 FileReceive *file_receive_create(char *path, Data *data);
 void file_receive_destroy(void *file_receive);
-FileReceive *file_receive_from_buffer(void *buffer);
-FileReceive *file_receive_decompress(void *FileReceive);
 
 #endif
