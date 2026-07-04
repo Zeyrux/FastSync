@@ -38,7 +38,7 @@ void config_send(int file_descriptor, Config *config) {
   send_int(file_descriptor, config->use_multithreading);
   send_int(file_descriptor, config->use_chunk_serialization);
   send_int(file_descriptor, config->use_compression);
-  send_int(file_descriptor, config->use_compression);
+  send_int(file_descriptor, config->compression_level);
   send_int(file_descriptor, config->num_connections);
   if (receive_status(file_descriptor) != STATUS_OK) {
     perror("Error transmitting config!");
