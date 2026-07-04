@@ -21,6 +21,7 @@ The system consists of two main components:
 - Scans source directories recursively
 - Creates file chunks with configurable size (10MB default)
 - Compresses data using zstd algorithm
+- Serializes chunks into a compact binary format for batch transfer
 - Sends files to server using custom protocol
 - Supports both single-threaded and multi-threaded operation
 
@@ -37,7 +38,8 @@ The client-server communication uses the following status codes:
 - `STATUS_OK`: Operation successful
 - `STATUS_ERROR`: Error occurred
 - `STATUS_FINISHED`: Transfer complete
-- `STATUS_NEXT`: Ready for next chunk
+- `STATUS_NEXT`: Ready for next file (per-file mode)
+- `STATUS_CHUNK`: Following data is a serialized chunk (chunk mode)
 
 ## Configuration Options
 
@@ -46,7 +48,7 @@ The client-server communication uses the following status codes:
 |----------|-------------|
 | `-m` | Enable multithreading mode |
 | `-c [level]` | Enable compression with optional level (1-22, default: 5) |
-| `-s` | Enable chunk serialization |
+| `-s` | Enable chunk serialization (batch-transfer all files per chunk) |
 
 ### Environment Variables
 | Variable | Description | Default |
@@ -101,6 +103,15 @@ make
 ```bash
 # Basic usage
 ./build/client -m -c 10
+
+# Chunk serialization mode (batch per chunk)
+./build/client -s
+
+# Compressed chunk serialization
+./build/client -s -c 3
+
+# Multithreaded with compressed chunk serialization
+./build/client -m -s -c 3
 ```
 
 ## Testing
