@@ -100,4 +100,4 @@ void file_receive_destroy(void *file_receive) {
   free(file);
 }
 
-FileReceive *file_receive_from_buffer(void *buffer) {}
+

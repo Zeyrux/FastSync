@@ -195,6 +195,8 @@ const char *status_to_string(Status status) {
     return "FINISHED";
   case STATUS_NEXT:
     return "NEXT";
+  case STATUS_CHUNK:
+    return "CHUNK";
   default:
     return "UNKNOWN";
   }

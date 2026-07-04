@@ -5,7 +5,7 @@
 #include <netinet/in.h>
 
 typedef int Status;
-enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT };
+enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK };
 
 typedef struct Server {
   struct sockaddr_in address;
