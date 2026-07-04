@@ -131,7 +131,9 @@ Data *chunk_compress(Chunk *chunk, int compression_level) {
   }
 
   log_message(LOG_LEVEL_DEBUG, "Chunk succesfully compressed");
-  return data_compress(data, compression_level);
+  Data *compressed = data_compress(data, compression_level);
+  data_destroy(data);
+  return compressed;
 }
 
 Chunk *chunk_decompress(Data *compressed_data) {
@@ -142,7 +144,7 @@ Chunk *chunk_decompress(Data *compressed_data) {
     return NULL;
   }
   
-  ArrayList *files = array_list_create((void (*)(void *))data_destroy);
+  ArrayList *files = array_list_create(file_destroy);
   char *data_pointer = uncompressed_data->data;
   size_t remaining_size = uncompressed_data->size;
   
@@ -207,7 +209,16 @@ Chunk *chunk_decompress(Data *compressed_data) {
       return NULL;
     }
     
-    file->data = data_create(data_pointer, data_size);
+    void *file_data = malloc(data_size);
+    if (file_data == NULL) {
+      perror("Could not allocate memory for file data");
+      free(path);
+      array_list_delete(files);
+      data_destroy(uncompressed_data);
+      return NULL;
+    }
+    memcpy(file_data, data_pointer, data_size);
+    file->data = data_create(file_data, data_size);
     data_pointer += data_size;
     remaining_size -= data_size;
     
@@ -219,8 +230,9 @@ Chunk *chunk_decompress(Data *compressed_data) {
   File **file_array = (File **)array_list_to_array(files);
   Chunk *chunk = chunk_create(file_array, files->size);
   
-  // Clean up
+  // Clean up - files are now owned by the chunk
   free(file_array);
+  files->item_destroyer = NULL;
   array_list_delete(files);
   data_destroy(uncompressed_data);
   
