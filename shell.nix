@@ -14,7 +14,10 @@ pkgs.mkShell {
     zstd
   ];
 
+  NIX_ENFORCE_PURITY = 0;
+
   shellHook = ''
-    ./tmux.sh
+    export NIX_ENFORCE_PURITY=0
+    cmake -B build
   '';
 }

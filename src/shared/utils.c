@@ -10,9 +10,14 @@ void mkdir_r(char *path) {
   strcpy(path_duplicate, path);
   char *path_current = (char *)malloc((strlen(path) + 2) * sizeof(char));
   char *path_current_position = path_current;
+  if (path[0] == '/') {
+    strcpy(path_current, "/");
+    path_current_position += 1;
+  } else {
+    path_current[0] = '\0';
+  }
   const char *delimiter = "/";
   char *part = strtok(path_duplicate, delimiter);
-  // struct stat st;
   while (part != NULL) {
     strcpy(path_current_position, part);
     path_current_position += strlen(part) * sizeof(char);

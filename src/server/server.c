@@ -1,5 +1,7 @@
-#include "chunk.h"
 #include "config.h"
+#include "data.h"
+#include "file.h"
+#include "log.h"
 #include "multiprocessing.h"
 #include "queue.h"
 #include "socket.h"
@@ -9,9 +11,14 @@
 #include <stdlib.h>
 #include <threads.h>
 
-FileReceive *receive_file_receive(int file_descriptor) {
+FileReceive *receive_file_receive(Config *config, int file_descriptor) {
   char *path = (char *)receive_str(file_descriptor);
   Data *file_data = receive_data(file_descriptor);
+  if (config->use_compression) {
+    Data *file_data_uncompressed = data_decompress(file_data);
+    free(file_data);
+    file_data = file_data_uncompressed;
+  }
   FileReceive *file = file_receive_create(path, file_data);
   return file;
 }
@@ -21,10 +28,11 @@ int receive_thread(void *pipeline_context) {
       (PipelineContextReceiver *)pipeline_context;
   mtx_lock(&context->mutex);
   int file_descriptor = context->file_descriptor;
+  Config *config = context->config;
   mtx_unlock(&context->mutex);
 
-  while (receive_status(file_descriptor) == NEXT) {
-    FileReceive *file = receive_file_receive(file_descriptor);
+  while (receive_status(file_descriptor) == STATUS_NEXT) {
+    FileReceive *file = receive_file_receive(config, file_descriptor);
     queue_enqueue_multithreaded(context->queue, file, &context->mutex,
                                 &context->condition_not_empty,
                                 &context->condition_not_full);
@@ -60,19 +68,21 @@ int write_thread(void *pipeline_context) {
 
 int receive_files(Config *config, int file_descriptor) {
   Status status = receive_status(file_descriptor);
-  while (status == NEXT) {
-    FileReceive *file = receive_file_receive(file_descriptor);
+  while (status == STATUS_NEXT) {
+    FileReceive *file = receive_file_receive(config, file_descriptor);
     if (config->save_to_disk)
       to_disk(path_cat(config->receive_root_directory, file->path),
               file->data->data, file->data->size);
     file_receive_destroy(file);
+    // send_status(file_descriptor, STATUS_OK);
     status = receive_status(file_descriptor);
   }
-  if (status != FINISHED) {
-    send_status(file_descriptor, ERROR);
+  if (status != STATUS_FINISHED) {
+    log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED or NEXT Status");
+    send_status(file_descriptor, STATUS_ERROR);
     return -1;
   }
-  send_status(file_descriptor, OK);
+  send_status(file_descriptor, STATUS_OK);
   return 0;
 }
 

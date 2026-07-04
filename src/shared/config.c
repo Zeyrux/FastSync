@@ -40,7 +40,7 @@ void config_send(int file_descriptor, Config *config) {
   send_int(file_descriptor, config->use_compression);
   send_int(file_descriptor, config->use_compression);
   send_int(file_descriptor, config->num_connections);
-  if (receive_status(file_descriptor) != OK) {
+  if (receive_status(file_descriptor) != STATUS_OK) {
     perror("Error transmitting config!");
     exit(EXIT_FAILURE);
   }
@@ -57,6 +57,6 @@ Config *config_receive(int file_descriptor) {
   config->use_compression = receive_int(file_descriptor);
   config->compression_level = receive_int(file_descriptor);
   config->num_connections = receive_int(file_descriptor);
-  send_status(file_descriptor, OK);
+  send_status(file_descriptor, STATUS_OK);
   return config;
 }

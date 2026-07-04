@@ -21,7 +21,7 @@ Data *data_create(void *data, size_t data_size) {
   }
   new_data->data = data;
   new_data->size = data_size;
-  return data;
+  return new_data;
 }
 
 void data_destroy(Data *data) {
@@ -29,7 +29,7 @@ void data_destroy(Data *data) {
   free(data);
 }
 
-Data *compress_data(Data *data_to_compress, int compression_level) {
+Data *data_compress(Data *data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   Data *compressed_data =
       data_create_empty(ZSTD_compressBound(data_to_compress->size));
@@ -43,11 +43,12 @@ Data *compress_data(Data *data_to_compress, int compression_level) {
     exit(EXIT_FAILURE);
   }
 
-  log_message(LOG_LEVEL_DEBUG, "Data succesfully compressed");
+  log_message(LOG_LEVEL_DEBUG, "Data succesfully compressed from %zu to %zu",
+              data_to_compress->size, compressed_data->size);
   return compressed_data;
 }
 
-Data *decompress_data(Data *compressed_data) {
+Data *data_decompress(Data *compressed_data) {
   log_message(LOG_LEVEL_DEBUG, "Start to decompress data");
   Data *uncompressed_data = data_create_empty(
       ZSTD_getFrameContentSize(compressed_data->data, compressed_data->size));

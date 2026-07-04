@@ -8,7 +8,7 @@ for file in path.glob("**/*.h"):
 for file in path.glob("**/*.c"):
     text += "--- " + str(file) + " ---\n\n"
     text += file.read_text()
-for file in [Path("Makefile")]:
+for file in [Path("CMakeLists.txt")]:
     text += "--- " + str(file) + " ---\n\n"
     text += file.read_text()
 Path("all.txt").write_text(text)

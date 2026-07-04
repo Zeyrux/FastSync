@@ -1,4 +1,4 @@
-#include "test_chunk.h"
+
 #include "chunk.h"
 #include "test_utils.h"
 #include "utils.h"
@@ -44,8 +44,8 @@ static void test_file_receive_operations() {
   FileReceive *fr = file_receive_create(path, df);
   EXPECT_NOT_NULL(fr);
   EXPECT_EQ_STR(fr->path, "temp_receive.txt");
-  EXPECT_NOT_NULL(fr->data_fragment);
-  EXPECT_EQ_STR(fr->data_fragment->data, "receive data content");
+  EXPECT_NOT_NULL(fr->data);
+  EXPECT_EQ_STR(fr->data->data, "receive data content");
 
   file_receive_destroy(fr);
 }

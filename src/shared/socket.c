@@ -110,18 +110,19 @@ void client_delete(Client *client) {
 
 void send_n_data(int file_descriptor, void *data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %d", data_size);
-  size_t total_bytes_send = 0;
+  ssize_t total_bytes_send = 0;
   while (total_bytes_send < data_size) {
-    long long bytes_send =
-        send(file_descriptor, (char *)data + total_bytes_send,
-             data_size - total_bytes_send, 0);
-    if (bytes_send == 0) {
+    printf("Trying: %zu\n", data_size - total_bytes_send);
+    ssize_t bytes_send = send(file_descriptor, (char *)data + total_bytes_send,
+                              data_size - total_bytes_send, 0);
+    printf("Bytes send: %zd\n", bytes_send);
+    if (bytes_send <= 0) {
       perror("Could not send data!");
       exit(EXIT_FAILURE);
     }
     total_bytes_send += bytes_send;
   }
-  log_message(LOG_LEVEL_DEBUG, "    Send n Data: %d", total_bytes_send);
+  log_message(LOG_LEVEL_DEBUG, "    Send n Data: %zu", total_bytes_send);
 }
 
 void receive_n_data(int file_descriptor, void *data, size_t data_size) {
@@ -186,13 +187,13 @@ int receive_int(int file_descriptor) {
 
 const char *status_to_string(Status status) {
   switch (status) {
-  case OK:
+  case STATUS_OK:
     return "OK";
-  case ERROR:
+  case STATUS_ERROR:
     return "ERROR";
-  case FINISHED:
+  case STATUS_FINISHED:
     return "FINISHED";
-  case NEXT:
+  case STATUS_NEXT:
     return "NEXT";
   default:
     return "UNKNOWN";

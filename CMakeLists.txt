@@ -7,6 +7,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_compile_options(-Wall -g -O3)
+# add_compile_options(-Wall -g -O1 -fsanitize=address)
+
+# add_link_options(-fsanitize=address)
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)

@@ -6,99 +6,11 @@
 #include <string.h>
 #include <zstd.h>
 
+#include "array_list.h"
 #include "chunk.h"
 #include "data.h"
+#include "file.h"
 #include "log.h"
-#include "socket.h"
-
-File *file_create(const char *path, struct stat *stats) {
-  File *file = (File *)malloc(sizeof(File));
-  if (file == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for file struct");
-    exit(EXIT_FAILURE);
-  }
-
-  file->stats = *stats;
-
-  int path_len = strlen(path);
-  file->path = (char *)malloc(path_len + 1);
-  if (file->path == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for path file string");
-    free(file);
-    exit(EXIT_FAILURE);
-  }
-
-  strcpy(file->path, path);
-  file->data = NULL;
-  return file;
-}
-
-void file_destroy(void *item) {
-  if (item == NULL)
-    return;
-  File *file = (File *)item;
-  free(file->data);
-  file->data = NULL;
-  free(file->path);
-  file->path = NULL;
-  free(file);
-}
-
-void file_load_data(File *file) {
-  if (file == NULL)
-    return;
-  file->data = malloc(file->stats.st_size);
-  if (file->data == NULL) {
-    perror("Could not allocate memeor y for file data!");
-    exit(EXIT_FAILURE);
-  }
-  file_content_to_buffer(file, file->data);
-}
-
-void file_print(void *item) {
-  if (item == NULL)
-    return;
-  printf("%s\n", ((File *)item)->path);
-}
-
-void file_send_single_calls(File *file, int file_descriptor) {
-  send_str(file_descriptor, file->path);
-  send_data(file_descriptor, file->data, file->stats.st_size);
-}
-
-void file_content_to_buffer(File *file, char *buffer) {
-  if (buffer == NULL) {
-    perror("Buffer is to write file content to is NULL!");
-    exit(EXIT_FAILURE);
-  }
-  FILE *file_pointer = fopen(file->path, "rb");
-  if (file_pointer == NULL) {
-    perror("Could not open the file!");
-    exit(EXIT_FAILURE);
-  }
-  size_t bytes_read = fread(buffer, 1, file->stats.st_size, file_pointer);
-  if (bytes_read != (size_t)file->stats.st_size) {
-    perror("Read to many or to less bytes from File!");
-    exit(EXIT_FAILURE);
-  }
-  fclose(file_pointer);
-}
-
-FileReceive *file_receive_create(char *path, Data *data) {
-  FileReceive *file = malloc(sizeof(FileReceive));
-  file->path = path;
-  file->data_fragment = data;
-  return file;
-}
-
-void file_receive_destroy(void *file_receive) {
-  if (file_receive == NULL)
-    return;
-  FileReceive *file = (FileReceive *)file_receive;
-  data_destroy(file->data_fragment);
-  free(file->path);
-  free(file);
-}
 
 Chunk *chunk_create(File **items, int element_count) {
   Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
@@ -160,23 +72,23 @@ Data *chunk_format(Chunk *chunk) {
     exit(EXIT_FAILURE);
   }
   char *current_data_pointer = data;
-  for (int i = 0; i < chunk->element_count; ++i) {
-    File *file = chunk->items[i];
-    // add path len
-    int path_length = (int)strlen(file->path);
-    memcpy(current_data_pointer, &path_length, sizeof(int));
-    current_data_pointer += sizeof(int);
-    // add path
-    memcpy(current_data_pointer, file->path, path_length);
-    current_data_pointer += path_length;
-    // add file data len
-    unsigned long long file_length = file->stats.st_size;
-    memcpy(current_data_pointer, &file_length, sizeof(unsigned long long));
-    current_data_pointer += sizeof(unsigned long long);
-    // add file data
-    file_content_to_buffer(file, current_data_pointer);
-    current_data_pointer += file_length;
-  }
+  // for (int i = 0; i < chunk->element_count; ++i) {
+  //   File *file = chunk->items[i];
+  //   // add path len
+  //   int path_length = (int)strlen(file->path);
+  //   memcpy(current_data_pointer, &path_length, sizeof(int));
+  //   current_data_pointer += sizeof(int);
+  //   // add path
+  //   memcpy(current_data_pointer, file->path, path_length);
+  //   current_data_pointer += path_length;
+  //   // add file data len
+  //   unsigned long long file_length = file->stats.st_size;
+  //   memcpy(current_data_pointer, &file_length, sizeof(unsigned long long));
+  //   current_data_pointer += sizeof(unsigned long long);
+  //   // add file data
+  //   file_content_to_buffer(file, current_data_pointer);
+  //   current_data_pointer += file_length;
+  // }
   if (current_data_pointer - data != (long)(long)buffer_size) {
     perror("Buffer of Chunk wasn't filled enough!");
     exit(EXIT_FAILURE);
@@ -202,27 +114,38 @@ Data *chunk_compress(Chunk *chunk, int compression_level) {
   char *data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
     // path length
-    unsigned long long path_len = strlen(chunk->items[i]->path);
-    memcpy(data_pointer, &path_len, sizeof(unsigned long long));
-    data_pointer += sizeof(unsigned long long);
+    size_t path_len = strlen(chunk->items[i]->path);
+    memcpy(data_pointer, &path_len, sizeof(size_t));
+    data_pointer += sizeof(size_t);
     memcpy(data_pointer, chunk->items[i]->path, path_len);
     data_pointer += path_len;
     // file data
     unsigned long long data_size = chunk->items[i]->stats.st_size;
-    memcpy(data_pointer, &data_size, sizeof(unsigned long long));
-    data_pointer += sizeof(unsigned long long);
+    memcpy(data_pointer, &data_size, sizeof(size_t));
+    data_pointer += sizeof(size_t);
     memcpy(data_pointer, chunk->items[i]->data, data_size);
     data_pointer += data_size;
   }
 
   log_message(LOG_LEVEL_DEBUG, "Chunk succesfully compressed");
-  return compress_data(data, compression_level);
+  return data_compress(data, compression_level);
 }
 
-Chunk *chunk_decompress(Data *data, int compression_level) {
-  // ArrayList *files = array_list_create(file_destroy);
-  // size_t data_size = ZSTD_getFrameContentSize(const void *src, size_t
-  // srcSize);
+Chunk *chunk_decompress(Data *compressed_data) {
+  log_message(LOG_LEVEL_DEBUG, "Starting to decompress chunk");
+  Data *uncompressed_data = data_decompress(compressed_data);
+  ArrayList *files = array_list_create(file_destroy);
+  size_t *data_pointer = uncompressed_data->data;
+  while (data_pointer <
+         (size_t *)uncompressed_data->data + uncompressed_data->size) {
+    size_t path_len = data_pointer[0];
+
+    printf("%zu, testing", path_len);
+    break;
+  }
+
+  log_message(LOG_LEVEL_DEBUG, "Chunk succesfully decompressed");
+  return NULL;
 }
 
 Data *chunk_data_create(void *data, unsigned long long data_size) {
