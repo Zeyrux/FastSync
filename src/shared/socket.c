@@ -109,7 +109,7 @@ void client_delete(Client *client) {
 }
 
 void send_n_data(int file_descriptor, void *data, size_t data_size) {
-  log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %d", data_size);
+  log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   ssize_t total_bytes_send = 0;
   while (total_bytes_send < data_size) {
     printf("Trying: %zu\n", data_size - total_bytes_send);
@@ -126,7 +126,7 @@ void send_n_data(int file_descriptor, void *data, size_t data_size) {
 }
 
 void receive_n_data(int file_descriptor, void *data, size_t data_size) {
-  log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %d", data_size);
+  log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %zu", data_size);
   size_t total_bytes_received = 0;
   while (total_bytes_received < data_size) {
     long long bytes_received =
@@ -138,7 +138,7 @@ void receive_n_data(int file_descriptor, void *data, size_t data_size) {
     }
     total_bytes_received += bytes_received;
   }
-  log_message(LOG_LEVEL_DEBUG, "    Received n Data: %d", total_bytes_received);
+  log_message(LOG_LEVEL_DEBUG, "    Received n Data: %zu", total_bytes_received);
 }
 
 void send_str(int file_descriptor, char *data) {
