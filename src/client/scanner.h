@@ -3,8 +3,12 @@
 
 #include "chunk.h"
 #include "queue.h"
+#include <dirent.h>
+
 typedef struct {
   Queue *directories;
+  DIR *current_dir;
+  char *current_path;
 } DirectoryScanner;
 
 DirectoryScanner *directory_scanner_create(char *root_directory);

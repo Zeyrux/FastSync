@@ -207,6 +207,14 @@ int main(int argc, char *argv[]) {
                       config->compression_level);
         }
       }
+    } else if (strcmp(argv[i], "--source-dir") == 0 && i + 1 < argc) {
+      free(config->send_directory);
+      config->send_directory = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--dest-dir") == 0 && i + 1 < argc) {
+      free(config->receive_root_directory);
+      config->receive_root_directory = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--save-to-disk") == 0) {
+      config->save_to_disk = true;
     } else {
       handle_arg(argv[i], "-m", &config->use_multithreading,
                  "Enabled Multithreading");
