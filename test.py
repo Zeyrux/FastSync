@@ -153,7 +153,7 @@ def run_suite(env_name, apply_limits, source_dir, dest_dir):
                 client_cmd = (
                     client_prefix
                     + base_client_cmd
-                    + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk"]
+                    + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk", "-M"]
                     + flags
                 )
                 print(f"    Running: {' '.join(client_cmd)}")
