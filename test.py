@@ -322,7 +322,7 @@ path = {source_dir}
 
                     start_time = time.monotonic()
                     rsync_result = subprocess.run(
-                        rsync_cmd, capture_output=True, timeout=120
+                        rsync_cmd, capture_output=True, text=True, timeout=120
                     )
                     end_time = time.monotonic()
                     duration = end_time - start_time
