@@ -11,6 +11,8 @@
 #include "file.h"
 #include "log.h"
 
+#define FILE_METADATA_WIRE_SIZE (sizeof(mode_t) + sizeof(uid_t) + sizeof(gid_t) + sizeof(time_t) + sizeof(long))
+
 Chunk *chunk_create(File **items, int element_count) {
   Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
   if (chunk == NULL) {
@@ -56,13 +58,44 @@ void chunk_print(void *item) {
       file_print(chunk->items[i]);
 }
 
+static void metadata_to_buf(char **buf, FileMetadata *m) {
+  int present = (m != NULL) ? 1 : 0;
+  memcpy(*buf, &present, sizeof(int));
+  *buf += sizeof(int);
+  if (m == NULL)
+    return;
+  memcpy(*buf, &m->mode, sizeof(mode_t));        *buf += sizeof(mode_t);
+  memcpy(*buf, &m->uid, sizeof(uid_t));          *buf += sizeof(uid_t);
+  memcpy(*buf, &m->gid, sizeof(gid_t));          *buf += sizeof(gid_t);
+  memcpy(*buf, &m->mtime_sec, sizeof(time_t));   *buf += sizeof(time_t);
+  memcpy(*buf, &m->mtime_nsec, sizeof(long));    *buf += sizeof(long);
+}
+
+static FileMetadata *metadata_from_buf(char **buf) {
+  int present;
+  memcpy(&present, *buf, sizeof(int));
+  *buf += sizeof(int);
+  if (!present)
+    return NULL;
+  FileMetadata *m = malloc(sizeof(FileMetadata));
+  memcpy(&m->mode, *buf, sizeof(mode_t));        *buf += sizeof(mode_t);
+  memcpy(&m->uid, *buf, sizeof(uid_t));          *buf += sizeof(uid_t);
+  memcpy(&m->gid, *buf, sizeof(gid_t));          *buf += sizeof(gid_t);
+  memcpy(&m->mtime_sec, *buf, sizeof(time_t));   *buf += sizeof(time_t);
+  memcpy(&m->mtime_nsec, *buf, sizeof(long));    *buf += sizeof(long);
+  return m;
+}
+
+static unsigned long long per_file_chunk_format_size(File *file) {
+  return sizeof(int) + strlen(file->path) + sizeof(int) +
+         (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) +
+         sizeof(unsigned long long) + file->data->size;
+}
+
 Data *chunk_format(Chunk *chunk) {
   unsigned long long buffer_size = 0;
   for (int i = 0; i < chunk->element_count; ++i) {
-    buffer_size += sizeof(int);
-    buffer_size += strlen(chunk->items[i]->path);
-    buffer_size += sizeof(unsigned long long);
-    buffer_size += chunk->items[i]->stats.st_size;
+    buffer_size += per_file_chunk_format_size(chunk->items[i]);
   }
 
   char *data = malloc(buffer_size);
@@ -80,12 +113,14 @@ Data *chunk_format(Chunk *chunk) {
     // add path
     memcpy(current_data_pointer, file->path, path_length);
     current_data_pointer += path_length;
+    // add metadata
+    metadata_to_buf(&current_data_pointer, file->metadata);
     // add file data len
-    unsigned long long file_length = file->stats.st_size;
+    unsigned long long file_length = file->data->size;
     memcpy(current_data_pointer, &file_length, sizeof(unsigned long long));
     current_data_pointer += sizeof(unsigned long long);
     // add file data
-    if (file->data == NULL) {
+    if (file->data->data == NULL) {
       file_load_data(file);
     }
     memcpy(current_data_pointer, file->data->data, file_length);
@@ -98,13 +133,16 @@ Data *chunk_format(Chunk *chunk) {
   return chunk_data_create(data, buffer_size);
 }
 
-Data *chunk_serialize(Chunk *chunk) {
+static unsigned long long per_file_serialize_size(File *file, bool use_metadata) {
+  return sizeof(size_t) + strlen(file->path) +
+         (use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0) +
+         sizeof(size_t) + file->data->size;
+}
+
+Data *chunk_serialize(Chunk *chunk, bool use_metadata) {
   unsigned long long data_size = 0;
   for (int i = 0; i < chunk->element_count; i++) {
-    data_size += sizeof(size_t);
-    data_size += strlen(chunk->items[i]->path);
-    data_size += sizeof(size_t);
-    data_size += chunk->items[i]->stats.st_size;
+    data_size += per_file_serialize_size(chunk->items[i], use_metadata);
   }
   Data *data = data_create_empty(data_size);
   if (data == NULL) {
@@ -114,22 +152,26 @@ Data *chunk_serialize(Chunk *chunk) {
   }
   char *data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
-    size_t path_len = strlen(chunk->items[i]->path);
+    File *file = chunk->items[i];
+    size_t path_len = strlen(file->path);
     memcpy(data_pointer, &path_len, sizeof(size_t));
     data_pointer += sizeof(size_t);
-    memcpy(data_pointer, chunk->items[i]->path, path_len);
+    memcpy(data_pointer, file->path, path_len);
     data_pointer += path_len;
 
-    size_t file_data_size = chunk->items[i]->stats.st_size;
+    if (use_metadata)
+      metadata_to_buf(&data_pointer, file->metadata);
+
+    size_t file_data_size = file->data->size;
     memcpy(data_pointer, &file_data_size, sizeof(size_t));
     data_pointer += sizeof(size_t);
-    memcpy(data_pointer, chunk->items[i]->data->data, file_data_size);
+    memcpy(data_pointer, file->data->data, file_data_size);
     data_pointer += file_data_size;
   }
   return data;
 }
 
-Chunk *chunk_deserialize(Data *data) {
+Chunk *chunk_deserialize(Data *data, bool use_metadata) {
   ArrayList *files = array_list_create(file_destroy);
   char *data_pointer = data->data;
   size_t remaining_size = data->size;
@@ -162,9 +204,18 @@ Chunk *chunk_deserialize(Data *data) {
     data_pointer += path_len;
     remaining_size -= path_len;
 
+    File *file = file_create(path);
+    free(path);
+
+    if (use_metadata) {
+      file->metadata = metadata_from_buf(&data_pointer);
+      remaining_size -= sizeof(int);
+      if (file->metadata)
+        remaining_size -= FILE_METADATA_WIRE_SIZE;
+    }
+
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for data size");
-      free(path);
       array_list_delete(files);
       return NULL;
     }
@@ -175,16 +226,6 @@ Chunk *chunk_deserialize(Data *data) {
 
     if (remaining_size < file_data_size) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for file content");
-      free(path);
-      array_list_delete(files);
-      return NULL;
-    }
-
-    struct stat st = {0};
-    st.st_size = file_data_size;
-    File *file = file_create(path, &st);
-    if (file == NULL) {
-      free(path);
       array_list_delete(files);
       return NULL;
     }
@@ -192,17 +233,16 @@ Chunk *chunk_deserialize(Data *data) {
     void *file_data = malloc(file_data_size);
     if (file_data == NULL) {
       perror("Could not allocate memory for file data");
-      free(path);
       array_list_delete(files);
       return NULL;
     }
     memcpy(file_data, data_pointer, file_data_size);
+    data_destroy(file->data);
     file->data = data_create(file_data, file_data_size);
     data_pointer += file_data_size;
     remaining_size -= file_data_size;
 
     array_list_add(files, file);
-    free(path);
   }
 
   File **file_array = (File **)array_list_to_array(files);
@@ -215,16 +255,16 @@ Chunk *chunk_deserialize(Data *data) {
   return chunk;
 }
 
-Data *chunk_compress(Chunk *chunk, int compression_level) {
+Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress chunk");
-  Data *serialized = chunk_serialize(chunk);
+  Data *serialized = chunk_serialize(chunk, use_metadata);
   Data *compressed = data_compress(serialized, compression_level);
   data_destroy(serialized);
   log_message(LOG_LEVEL_DEBUG, "Chunk successfully compressed");
   return compressed;
 }
 
-Chunk *chunk_decompress(Data *compressed_data) {
+Chunk *chunk_decompress(Data *compressed_data, bool use_metadata) {
   log_message(LOG_LEVEL_DEBUG, "Starting to decompress chunk");
   Data *uncompressed_data = data_decompress(compressed_data);
   if (uncompressed_data == NULL) {
@@ -232,7 +272,7 @@ Chunk *chunk_decompress(Data *compressed_data) {
     return NULL;
   }
 
-  Chunk *chunk = chunk_deserialize(uncompressed_data);
+  Chunk *chunk = chunk_deserialize(uncompressed_data, use_metadata);
   if (chunk == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk data");
     data_destroy(uncompressed_data);
@@ -260,36 +300,3 @@ void chunk_data_delete(void *chunk) {
   free(chunk_data->data);
   free(chunk_data);
 }
-
-// void chunk_data_to_disk(ChunkData *chunk_formated, char *root_directory) {
-//   char *current_data_pointer = chunk_formated->data;
-//   while (current_data_pointer - (char *)chunk_formated->data <
-//          chunk_formated->data_size) {
-//     // get path length
-//     int path_length = 0;
-//     memcpy(&path_length, (int *)current_data_pointer, sizeof(int));
-//     current_data_pointer += sizeof(int);
-//     // get path
-//     int path_dir_size =
-//         (strlen(root_directory) + path_length + 1) * sizeof(char);
-//     char *path = (char *)malloc(path_dir_size);
-//     if (path == NULL) {
-//       perror("Could not allocate memory for path!");
-//       exit(EXIT_FAILURE);
-//     }
-//     snprintf(path, path_dir_size, "%s%.*s", root_directory, path_length,
-//              current_data_pointer);
-//     current_data_pointer += sizeof(char) * path_length;
-//     // get data length
-//     unsigned long long data_size = 0;
-//     memcpy(&data_size, (unsigned long long *)current_data_pointer,
-//            sizeof(unsigned long long));
-//     current_data_pointer += sizeof(unsigned long long);
-//     // create File Receive
-//     FileReceive *file =
-//         file_receive_create(path, data_size, current_data_pointer);
-//     file_receive_print(file);
-//     file_receive_to_disk(file);
-//     current_data_pointer += sizeof(char) * data_size;
-//   }
-// }

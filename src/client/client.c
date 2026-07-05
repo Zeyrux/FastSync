@@ -21,18 +21,18 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     send_status(client->file_descriptor, STATUS_CHUNK);
     Data *data;
     if (config->use_compression) {
-      data = chunk_compress(chunk, config->compression_level);
+      data = chunk_compress(chunk, config->compression_level, config->use_metadata);
     } else {
       for (int i = 0; i < chunk->element_count; i++)
         file_load_data(chunk->items[i]);
-      data = chunk_serialize(chunk);
+      data = chunk_serialize(chunk, config->use_metadata);
     }
     send_data(client->file_descriptor, data->data, data->size);
     data_destroy(data);
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
       send_status(client->file_descriptor, STATUS_NEXT);
-      file_send_sendfile(chunk->items[i], client->file_descriptor);
+      file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata);
     }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
@@ -44,7 +44,7 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
         data_destroy(file->data);
         file->data = compressed_data;
       }
-      file_send_single_calls(file, client->file_descriptor);
+      file_send_single_calls(file, client->file_descriptor, config->use_metadata);
     }
   }
   return 0;
@@ -54,7 +54,7 @@ int scan_directory_multithreaded(void *pipeline_context) {
   PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
   mtx_lock(&context->mutex_scanner);
   DirectoryScanner *scanner =
-      directory_scanner_create(context->config->send_directory);
+      directory_scanner_create(context->config->send_directory, context->config->use_metadata);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk *current_chunk;
@@ -134,7 +134,7 @@ int send_files(Config *config) {
   int port = env_port ? atoi(env_port) : 8080;
   client_connect(client, (char *)ip, port);
   config_send(client->file_descriptor, config);
-  DirectoryScanner *scanner = directory_scanner_create(config->send_directory);
+  DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata);
   Chunk *current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     if (!config->use_sendfile) {
@@ -201,7 +201,7 @@ int main(int argc, char *argv[]) {
   }
 
   Config *config = config_create(str_dup("1.0.0"), source_dir, dest_dir,
-                                 save_to_disk, false, false, false, 5, 20, false);
+                                 save_to_disk, false, false, false, false, 5, 20, false);
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0) {
       config->use_compression = true;
@@ -224,6 +224,9 @@ int main(int argc, char *argv[]) {
       config->receive_root_directory = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--save-to-disk") == 0) {
       config->save_to_disk = true;
+    } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--preserve") == 0) {
+      config->use_metadata = true;
+      log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
     } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--sendfile") == 0) {
       config->use_sendfile = true;
       log_message(LOG_LEVEL_INFO, "Enabled sendfile");

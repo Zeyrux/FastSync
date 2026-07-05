@@ -200,7 +200,7 @@ def run_profile(profile_name, source_dir, dest_dir):
                 client_cmd = (
                     client_prefix
                     + base_client_cmd
-                    + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk"]
+                    + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk", "-M"]
                     + flags
                 )
                 print(f"    Running: {' '.join(client_cmd)}")
@@ -271,6 +271,88 @@ def run_profile(profile_name, source_dir, dest_dir):
                     except subprocess.TimeoutExpired:
                         server_process.kill()
                         server_process.wait()
+
+        # Run one case without metadata transfer to verify -M disabled works
+        print(f"\n  --- Standard (no metadata) ---")
+        if os.path.exists(dest_dir):
+            shutil.rmtree(dest_dir)
+        server_process2 = None
+        try:
+            server_process2 = subprocess.Popen(
+                SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None
+            )
+            time.sleep(0.5)
+
+            env = os.environ.copy()
+            client_cmd = (
+                client_prefix
+                + base_client_cmd
+                + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk"]
+            )
+            print(f"    Running: {' '.join(client_cmd)}")
+
+            start_time = time.monotonic()
+            client_result = subprocess.run(
+                client_cmd, env=env, text=True, capture_output=True
+            )
+            end_time = time.monotonic()
+            duration = end_time - start_time
+
+            if server_process2:
+                try:
+                    server_process2.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server_process2.kill()
+                    server_process2.wait()
+                server_process2 = None
+
+            mismatches, missing = [], []
+            if client_result.returncode == 0:
+                received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
+                mismatches, missing = verify_transfer(source_dir, received)
+
+            entry = {
+                "name": "Standard (no metadata)",
+                "suite": profile_name,
+                "time": f"{duration:.4f}s" if client_result.returncode == 0 else "N/A",
+            }
+
+            if client_result.returncode == 0 and not mismatches and not missing:
+                entry["status"] = "Success"
+                entry["error"] = ""
+            else:
+                entry["status"] = "Failed"
+                errors = []
+                if client_result.returncode != 0:
+                    err = (
+                        client_result.stderr.strip().split("\n")[0]
+                        if client_result.stderr
+                        else (
+                            client_result.stdout.strip().split("\n")[0]
+                            if client_result.stdout
+                            else "No output"
+                        )
+                    )
+                    errors.append(f"Exit code {client_result.returncode}: {err[:80]}")
+                if missing:
+                    errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
+                if mismatches:
+                    errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
+                entry["error"] = " | ".join(errors)
+
+            results.append(entry)
+
+        except Exception as e:
+            results.append(
+                {"name": "Standard (no metadata)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
+            )
+        finally:
+            if server_process2:
+                try:
+                    server_process2.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server_process2.kill()
+                    server_process2.wait()
 
         # Rsync tests (over network via daemon, so tc netem applies)
         rsync_port = find_free_port()

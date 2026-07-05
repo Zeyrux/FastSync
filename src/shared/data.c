@@ -13,6 +13,17 @@ Data *data_create_empty(size_t data_size) {
   return data_create(data, data_size);
 }
 
+Data *data_create_reserve(size_t size) {
+  Data *d = malloc(sizeof(Data));
+  if (d == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Could not allocate memory for data");
+    exit(EXIT_FAILURE);
+  }
+  d->data = NULL;
+  d->size = size;
+  return d;
+}
+
 Data *data_create(void *data, size_t data_size) {
   Data *new_data = malloc(sizeof(Data));
   if (new_data == NULL) {

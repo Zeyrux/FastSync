@@ -68,8 +68,10 @@ static void test_chunk_compress_decompress_roundtrip() {
   EXPECT_EQ_INT(stat(path1, &st1), 0);
   EXPECT_EQ_INT(stat(path2, &st2), 0);
 
-  File *f1 = file_create(path1, &st1);
-  File *f2 = file_create(path2, &st2);
+  File *f1 = file_create(path1);
+  f1->data->size = st1.st_size;
+  File *f2 = file_create(path2);
+  f2->data->size = st2.st_size;
   EXPECT_NOT_NULL(f1);
   EXPECT_NOT_NULL(f2);
 
@@ -80,10 +82,10 @@ static void test_chunk_compress_decompress_roundtrip() {
   Chunk *chunk = chunk_create(files, 2);
   EXPECT_NOT_NULL(chunk);
 
-  Data *compressed = chunk_compress(chunk, 3);
+  Data *compressed = chunk_compress(chunk, 3, false);
   EXPECT_NOT_NULL(compressed);
 
-  Chunk *decompressed_chunk = chunk_decompress(compressed);
+  Chunk *decompressed_chunk = chunk_decompress(compressed, false);
   EXPECT_NOT_NULL(decompressed_chunk);
   EXPECT_EQ_INT(decompressed_chunk->element_count, 2);
 
