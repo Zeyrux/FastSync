@@ -359,12 +359,17 @@ def main():
     os.makedirs(args.dest_dir, exist_ok=True)
 
     profiles_to_run = []
-    if not args.no_unlimited:
-        profiles_to_run.append("Unlimited")
-    if not args.no_lan:
-        profiles_to_run.append("LAN")
     if args.wan:
-        profiles_to_run.append("WAN")
+        if not args.no_unlimited:
+            profiles_to_run.append("WAN")
+        else:
+            print("--wan and --no-unlimited are mutually exclusive")
+            sys.exit(1)
+    else:
+        if not args.no_unlimited:
+            profiles_to_run.append("Unlimited")
+        if not args.no_lan:
+            profiles_to_run.append("LAN")
 
     try:
         all_results = []
