@@ -361,14 +361,18 @@ read only = yes
                             errors.append(f"Exit code {rsync_result.returncode}: {err[:200]}")
                             # Retry without systemd-run to reveal the actual error
                             if client_prefix:
-                                plain = subprocess.run(
-                                    ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", "/tmp/"],
-                                    capture_output=True, text=True, timeout=30
-                                )
-                                if plain.returncode != 0:
-                                    plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
-                                    if plain_errs:
-                                        errors.append(f"raw: {plain_errs[-1][:150]}")
+                                tmp_dest = tempfile.mkdtemp()
+                                try:
+                                    plain = subprocess.run(
+                                        ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", f"{tmp_dest}/"],
+                                        capture_output=True, text=True, timeout=30
+                                    )
+                                    if plain.returncode != 0:
+                                        plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
+                                        if plain_errs:
+                                            errors.append(f"raw: {plain_errs[-1][:150]}")
+                                finally:
+                                    shutil.rmtree(tmp_dest, ignore_errors=True)
                         if missing:
                             errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
                         if mismatches:
