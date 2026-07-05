@@ -68,8 +68,10 @@ static void test_chunk_compress_decompress_roundtrip() {
   EXPECT_EQ_INT(stat(path1, &st1), 0);
   EXPECT_EQ_INT(stat(path2, &st2), 0);
 
-  File *f1 = file_create(path1, &st1);
-  File *f2 = file_create(path2, &st2);
+  File *f1 = file_create(path1);
+  f1->data->size = st1.st_size;
+  File *f2 = file_create(path2);
+  f2->data->size = st2.st_size;
   EXPECT_NOT_NULL(f1);
   EXPECT_NOT_NULL(f2);
 

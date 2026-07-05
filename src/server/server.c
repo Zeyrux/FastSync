@@ -12,20 +12,25 @@
 #include <stdlib.h>
 #include <threads.h>
 
-FileReceive *receive_file_receive(Config *config, int file_descriptor) {
+File *receive_file_receive(Config *config, int file_descriptor) {
   char *path = (char *)receive_str(file_descriptor);
+  File *file = file_create(path);
+  free(path);
+  file->metadata = file_receive_metadata(file_descriptor);
   Data *file_data = receive_data(file_descriptor);
   if (config->use_compression) {
     Data *file_data_uncompressed = data_decompress(file_data);
     data_destroy(file_data);
     file_data = file_data_uncompressed;
   }
-  FileReceive *file = file_receive_create(path, file_data);
+  data_destroy(file->data);
+  file->data = file_data;
   return file;
 }
 
 static void receive_chunk_enqueue(int file_descriptor, Config *config,
                                   PipelineContextReceiver *context) {
+  (void)config;
   Data *chunk_data = receive_data(file_descriptor);
   Data *data_to_process = chunk_data;
   if (config->use_compression) {
@@ -36,10 +41,8 @@ static void receive_chunk_enqueue(int file_descriptor, Config *config,
   data_destroy(data_to_process);
 
   for (int i = 0; i < chunk->element_count; i++) {
-    FileReceive *file = file_receive_create(chunk->items[i]->path,
-                                            chunk->items[i]->data);
-    chunk->items[i]->path = NULL;
-    chunk->items[i]->data = NULL;
+    File *file = chunk->items[i];
+    chunk->items[i] = NULL;
     queue_enqueue_multithreaded(context->queue, file, &context->mutex,
                                 &context->condition_not_empty,
                                 &context->condition_not_full);
@@ -60,7 +63,7 @@ int receive_thread(void *pipeline_context) {
     if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, config, context);
     } else {
-      FileReceive *file = receive_file_receive(config, file_descriptor);
+      File *file = receive_file_receive(config, file_descriptor);
       queue_enqueue_multithreaded(context->queue, file, &context->mutex,
                                   &context->condition_not_empty,
                                   &context->condition_not_full);
@@ -83,16 +86,20 @@ int write_thread(void *pipeline_context) {
   mtx_unlock(&context->mutex);
 
   while (true) {
-    FileReceive *file = queue_dequeue_multithreaded(
+    File *file = queue_dequeue_multithreaded(
         context->queue, &context->mutex, &context->condition_not_empty,
         &context->condition_not_full, &context->receiver_done);
     if (file == NULL) {
       free(root_directory);
       return thrd_success;
     }
-    if (save_to_disk)
-      to_disk(path_cat(root_directory, file->path), file->data->data,
-              file->data->size);
+    if (save_to_disk) {
+      char *disk_path = path_cat(root_directory, file->path);
+      to_disk(disk_path, file->data->data, file->data->size);
+      file_restore_metadata(disk_path, file->metadata);
+      free(disk_path);
+    }
+    file_destroy(file);
   }
 }
 
@@ -110,17 +117,23 @@ int receive_files(Config *config, int file_descriptor) {
       data_destroy(data_to_process);
 
       for (int i = 0; i < chunk->element_count; i++) {
-        if (config->save_to_disk)
-          to_disk(path_cat(config->receive_root_directory, chunk->items[i]->path),
-                  chunk->items[i]->data->data, chunk->items[i]->data->size);
+        if (config->save_to_disk) {
+          char *disk_path = path_cat(config->receive_root_directory, chunk->items[i]->path);
+          to_disk(disk_path, chunk->items[i]->data->data, chunk->items[i]->data->size);
+          file_restore_metadata(disk_path, chunk->items[i]->metadata);
+          free(disk_path);
+        }
       }
       chunk_destroy(chunk);
     } else {
-      FileReceive *file = receive_file_receive(config, file_descriptor);
-      if (config->save_to_disk)
-        to_disk(path_cat(config->receive_root_directory, file->path),
-                file->data->data, file->data->size);
-      file_receive_destroy(file);
+      File *file = receive_file_receive(config, file_descriptor);
+      if (config->save_to_disk) {
+        char *disk_path = path_cat(config->receive_root_directory, file->path);
+        to_disk(disk_path, file->data->data, file->data->size);
+        file_restore_metadata(disk_path, file->metadata);
+        free(disk_path);
+      }
+      file_destroy(file);
     }
     status = receive_status(file_descriptor);
   }
@@ -137,7 +150,7 @@ void handler(int file_descriptor) {
   Config *config = config_receive(file_descriptor);
   if (config->use_multithreading) {
     PipelineContextReceiver *context = pipeline_context_receiver_create(
-        config, queue_create(100, file_receive_destroy), file_descriptor);
+        config, queue_create(100, file_destroy), file_descriptor);
     thrd_t receiver, writer;
     if (thrd_create(&receiver, receive_thread, context) != thrd_success ||
         thrd_create(&writer, write_thread, context) != thrd_success) {

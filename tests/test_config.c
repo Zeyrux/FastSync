@@ -8,7 +8,7 @@
 
 static void test_config_lifecycle() {
   Config *cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("/dst"),
-                              true, true, false, false, 1, 4);
+                              true, true, false, false, false, 1, 4);
   EXPECT_NOT_NULL(cfg);
   EXPECT_EQ_STR(cfg->version, "1.0");
   EXPECT_EQ_STR(cfg->send_directory, "/src");
@@ -23,7 +23,7 @@ static void test_config_lifecycle() {
 
 static void test_pipeline_sender_lifecycle() {
   Config *cfg = config_create(str_dup("2.0"), str_dup("/src2"),
-                              str_dup("/dst2"), false, false, true, true, 1, 8);
+                              str_dup("/dst2"), false, false, true, true, false, 1, 8);
   Queue *q1 = queue_create(5, NULL);
   Queue *q2 = queue_create(15, NULL);
 
@@ -40,7 +40,7 @@ static void test_pipeline_sender_lifecycle() {
 
 static void test_pipeline_receiver_lifecycle() {
   Config *cfg = config_create(str_dup("3.0"), str_dup("/src3"),
-                              str_dup("/dst3"), true, true, true, true, 1, 2);
+                              str_dup("/dst3"), true, true, true, true, false, 1, 2);
   Queue *q = queue_create(20, NULL);
 
   PipelineContextReceiver *pcr = pipeline_context_receiver_create(cfg, q, 42);

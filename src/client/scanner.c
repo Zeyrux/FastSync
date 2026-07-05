@@ -1,6 +1,7 @@
 #include "scanner.h"
 #include "array_list.h"
 #include "chunk.h"
+#include "file.h"
 #include "queue.h"
 #include "utils.h"
 #include <dirent.h>
@@ -10,11 +11,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-DirectoryScanner *directory_scanner_create(char *root_directory) {
+DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata) {
   DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
   scanner->directories = queue_create(100, free);
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
+  scanner->use_metadata = use_metadata;
   queue_enqueue(scanner->directories, str_dup(root_directory));
   return scanner;
 }
@@ -91,9 +93,12 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
     if (!S_ISREG(stats.st_mode)) {
       queue_enqueue(scanner->directories, (void *)cur_path);
     } else {
-      File *file = file_create(cur_path, &stats);
+      File *file = file_create(cur_path);
+      file->data->size = stats.st_size;
+      if (scanner->use_metadata)
+        file->metadata = file_metadata_create(&stats);
       array_list_add(chunk_data, file);
-      chunk_data_size += file->stats.st_size;
+      chunk_data_size += file->data->size;
       if (chunk_data_size > DESIRED_CHUNK_SIZE)
         return chunk_data_to_chunk(chunk_data);
       free(cur_path);

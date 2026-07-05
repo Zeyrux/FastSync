@@ -1,9 +1,12 @@
 #include "utils.h"
 #include "libgen.h"
 #include "sys/stat.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 void mkdir_r(char *path) {
   char *path_duplicate = malloc(strlen(path) + 1);
@@ -57,6 +60,19 @@ void to_disk(char *path, void *data, unsigned long long data_size) {
   fwrite(data, 1, data_size, file_pointer);
   fclose(file_pointer);
   free(dir_to_free);
+}
+
+void file_restore_metadata(const char *path, FileMetadata *metadata) {
+  if (metadata == NULL)
+    return;
+  chmod(path, metadata->mode & 07777);
+  chown(path, metadata->uid, metadata->gid);
+  struct timespec times[2];
+  times[0].tv_sec = 0;
+  times[0].tv_nsec = UTIME_OMIT;
+  times[1].tv_sec = metadata->mtime_sec;
+  times[1].tv_nsec = metadata->mtime_nsec;
+  utimensat(AT_FDCWD, path, times, 0);
 }
 
 char *path_cat(char *path1, char *path2) {

@@ -13,41 +13,25 @@ static void test_file_operations() {
 
   to_disk(test_path, test_content, test_len);
 
-  struct stat st;
-  int stat_res = stat(test_path, &st);
-  EXPECT_EQ_INT(stat_res, 0);
-  EXPECT_EQ_INT((int)st.st_size, (int)test_len);
-
-  File *f = file_create(test_path, &st);
+  File *f = file_create(test_path);
   EXPECT_NOT_NULL(f);
   EXPECT_EQ_STR(f->path, test_path);
-  EXPECT_NULL(f->data);
+  EXPECT_NOT_NULL(f->data);
+  EXPECT_NULL(f->data->data);
+  EXPECT_EQ_INT((int)f->data->size, 0);
+
+  struct stat st;
+  stat(test_path, &st);
+  f->data->size = st.st_size;
 
   file_load_data(f);
   EXPECT_NOT_NULL(f->data);
+  EXPECT_NOT_NULL(f->data->data);
+  EXPECT_EQ_INT((int)f->data->size, (int)test_len);
   EXPECT_EQ_INT(memcmp(f->data->data, test_content, test_len), 0);
 
   file_destroy(f);
   unlink(test_path);
-}
-
-static void test_file_receive_operations() {
-  char *path = str_dup("temp_receive.txt");
-  char *data = str_dup("receive data content");
-  unsigned long long size = strlen(data);
-
-  Data *df = data_create(data, size);
-  EXPECT_NOT_NULL(df);
-  EXPECT_EQ_INT((int)df->size, (int)size);
-  EXPECT_EQ_STR(df->data, "receive data content");
-
-  FileReceive *fr = file_receive_create(path, df);
-  EXPECT_NOT_NULL(fr);
-  EXPECT_EQ_STR(fr->path, "temp_receive.txt");
-  EXPECT_NOT_NULL(fr->data);
-  EXPECT_EQ_STR(fr->data->data, "receive data content");
-
-  file_receive_destroy(fr);
 }
 
 static void test_chunk_operations() {
@@ -66,8 +50,10 @@ static void test_chunk_operations() {
   stat(path1, &st1);
   stat(path2, &st2);
 
-  File *f1 = file_create(path1, &st1);
-  File *f2 = file_create(path2, &st2);
+  File *f1 = file_create(path1);
+  f1->data->size = st1.st_size;
+  File *f2 = file_create(path2);
+  f2->data->size = st2.st_size;
 
   File *files[2] = {f1, f2};
   Chunk *chunk = chunk_create(files, 2);
@@ -76,12 +62,34 @@ static void test_chunk_operations() {
   EXPECT_NOT_NULL(chunk->items[0]);
   EXPECT_NOT_NULL(chunk->items[1]);
 
+  // load data before serializing
+  file_load_data(f1);
+  file_load_data(f2);
+
+  // Test chunk_serialize / chunk_deserialize round-trip
+  Data *serialized = chunk_serialize(chunk);
+  EXPECT_NOT_NULL(serialized);
+
+  Chunk *deserialized = chunk_deserialize(serialized);
+  EXPECT_NOT_NULL(deserialized);
+  EXPECT_EQ_INT(deserialized->element_count, 2);
+  EXPECT_EQ_STR(deserialized->items[0]->path, path1);
+  EXPECT_EQ_STR(deserialized->items[1]->path, path2);
+  EXPECT_EQ_INT((int)deserialized->items[0]->data->size, (int)len1);
+  EXPECT_EQ_INT((int)deserialized->items[1]->data->size, (int)len2);
+  EXPECT_EQ_INT(memcmp(deserialized->items[0]->data->data, content1, len1), 0);
+  EXPECT_EQ_INT(memcmp(deserialized->items[1]->data->data, content2, len2), 0);
+
+  chunk_data_delete(serialized);
+  chunk_destroy(deserialized);
+
+  // Test chunk_format layout (old format)
   Data *formatted = chunk_format(chunk);
   EXPECT_NOT_NULL(formatted);
 
   unsigned long long expected_size =
-      (sizeof(int) + strlen(path1) + sizeof(unsigned long long) + len1) +
-      (sizeof(int) + strlen(path2) + sizeof(unsigned long long) + len2);
+      (sizeof(int) + strlen(path1) + sizeof(int) + sizeof(unsigned long long) + len1) +
+      (sizeof(int) + strlen(path2) + sizeof(int) + sizeof(unsigned long long) + len2);
   EXPECT_EQ_INT((int)formatted->size, (int)expected_size);
 
   char *ptr = (char *)formatted->data;
@@ -97,6 +105,11 @@ static void test_chunk_operations() {
   read_path1[p_len1] = '\0';
   ptr += p_len1;
   EXPECT_EQ_STR(read_path1, path1);
+
+  int meta_present1;
+  memcpy(&meta_present1, ptr, sizeof(int));
+  ptr += sizeof(int);
+  EXPECT_EQ_INT(meta_present1, 0);
 
   unsigned long long d_len1;
   memcpy(&d_len1, ptr, sizeof(unsigned long long));
@@ -121,6 +134,11 @@ static void test_chunk_operations() {
   ptr += p_len2;
   EXPECT_EQ_STR(read_path2, path2);
 
+  int meta_present2;
+  memcpy(&meta_present2, ptr, sizeof(int));
+  ptr += sizeof(int);
+  EXPECT_EQ_INT(meta_present2, 0);
+
   unsigned long long d_len2;
   memcpy(&d_len2, ptr, sizeof(unsigned long long));
   ptr += sizeof(unsigned long long);
@@ -141,6 +159,5 @@ static void test_chunk_operations() {
 
 void test_chunk() {
   test_file_operations();
-  test_file_receive_operations();
   test_chunk_operations();
 }

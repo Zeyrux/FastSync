@@ -49,7 +49,7 @@ int scan_directory_multithreaded(void *pipeline_context) {
   PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
   mtx_lock(&context->mutex_scanner);
   DirectoryScanner *scanner =
-      directory_scanner_create(context->config->send_directory);
+      directory_scanner_create(context->config->send_directory, context->config->use_metadata);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk *current_chunk;
@@ -127,7 +127,7 @@ int send_files(Config *config) {
   int port = env_port ? atoi(env_port) : 8080;
   client_connect(client, (char *)ip, port);
   config_send(client->file_descriptor, config);
-  DirectoryScanner *scanner = directory_scanner_create(config->send_directory);
+  DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata);
   Chunk *current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < current_chunk->element_count; i++)
@@ -192,7 +192,7 @@ int main(int argc, char *argv[]) {
   }
 
   Config *config = config_create(str_dup("1.0.0"), source_dir, dest_dir,
-                                 save_to_disk, false, false, false, 5, 20);
+                                 save_to_disk, false, false, false, false, 5, 20);
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0) {
       config->use_compression = true;
@@ -215,6 +215,9 @@ int main(int argc, char *argv[]) {
       config->receive_root_directory = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--save-to-disk") == 0) {
       config->save_to_disk = true;
+    } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--preserve") == 0) {
+      config->use_metadata = true;
+      log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
     } else {
       handle_arg(argv[i], "-m", &config->use_multithreading,
                  "Enabled Multithreading");
