@@ -67,10 +67,10 @@ static void test_chunk_operations() {
   file_load_data(f2);
 
   // Test chunk_serialize / chunk_deserialize round-trip
-  Data *serialized = chunk_serialize(chunk);
+  Data *serialized = chunk_serialize(chunk, false);
   EXPECT_NOT_NULL(serialized);
 
-  Chunk *deserialized = chunk_deserialize(serialized);
+  Chunk *deserialized = chunk_deserialize(serialized, false);
   EXPECT_NOT_NULL(deserialized);
   EXPECT_EQ_INT(deserialized->element_count, 2);
   EXPECT_EQ_STR(deserialized->items[0]->path, path1);

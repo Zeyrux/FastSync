@@ -12,11 +12,12 @@
 #include <stdlib.h>
 #include <threads.h>
 
-File *receive_file_receive(Config *config, int file_descriptor) {
+File *file_receive(Config *config, int file_descriptor) {
   char *path = (char *)receive_str(file_descriptor);
   File *file = file_create(path);
   free(path);
-  file->metadata = file_receive_metadata(file_descriptor);
+  if (config->use_metadata)
+    file->metadata = file_receive_metadata(file_descriptor);
   Data *file_data = receive_data(file_descriptor);
   if (config->use_compression) {
     Data *file_data_uncompressed = data_decompress(file_data);
@@ -37,7 +38,7 @@ static void receive_chunk_enqueue(int file_descriptor, Config *config,
     data_to_process = data_decompress(chunk_data);
     data_destroy(chunk_data);
   }
-  Chunk *chunk = chunk_deserialize(data_to_process);
+  Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
   data_destroy(data_to_process);
 
   for (int i = 0; i < chunk->element_count; i++) {
@@ -63,7 +64,7 @@ int receive_thread(void *pipeline_context) {
     if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, config, context);
     } else {
-      File *file = receive_file_receive(config, file_descriptor);
+      File *file = file_receive(config, file_descriptor);
       queue_enqueue_multithreaded(context->queue, file, &context->mutex,
                                   &context->condition_not_empty,
                                   &context->condition_not_full);
@@ -113,7 +114,7 @@ int receive_files(Config *config, int file_descriptor) {
         data_to_process = data_decompress(chunk_data);
         data_destroy(chunk_data);
       }
-      Chunk *chunk = chunk_deserialize(data_to_process);
+      Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
       data_destroy(data_to_process);
 
       for (int i = 0; i < chunk->element_count; i++) {
@@ -126,7 +127,7 @@ int receive_files(Config *config, int file_descriptor) {
       }
       chunk_destroy(chunk);
     } else {
-      File *file = receive_file_receive(config, file_descriptor);
+      File *file = file_receive(config, file_descriptor);
       if (config->save_to_disk) {
         char *disk_path = path_cat(config->receive_root_directory, file->path);
         to_disk(disk_path, file->data->data, file->data->size);

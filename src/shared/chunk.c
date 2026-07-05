@@ -133,16 +133,16 @@ Data *chunk_format(Chunk *chunk) {
   return chunk_data_create(data, buffer_size);
 }
 
-static unsigned long long per_file_serialize_size(File *file) {
-  return sizeof(size_t) + strlen(file->path) + sizeof(int) +
-         (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) +
+static unsigned long long per_file_serialize_size(File *file, bool use_metadata) {
+  return sizeof(size_t) + strlen(file->path) +
+         (use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0) +
          sizeof(size_t) + file->data->size;
 }
 
-Data *chunk_serialize(Chunk *chunk) {
+Data *chunk_serialize(Chunk *chunk, bool use_metadata) {
   unsigned long long data_size = 0;
   for (int i = 0; i < chunk->element_count; i++) {
-    data_size += per_file_serialize_size(chunk->items[i]);
+    data_size += per_file_serialize_size(chunk->items[i], use_metadata);
   }
   Data *data = data_create_empty(data_size);
   if (data == NULL) {
@@ -159,7 +159,8 @@ Data *chunk_serialize(Chunk *chunk) {
     memcpy(data_pointer, file->path, path_len);
     data_pointer += path_len;
 
-    metadata_to_buf(&data_pointer, file->metadata);
+    if (use_metadata)
+      metadata_to_buf(&data_pointer, file->metadata);
 
     size_t file_data_size = file->data->size;
     memcpy(data_pointer, &file_data_size, sizeof(size_t));
@@ -170,7 +171,7 @@ Data *chunk_serialize(Chunk *chunk) {
   return data;
 }
 
-Chunk *chunk_deserialize(Data *data) {
+Chunk *chunk_deserialize(Data *data, bool use_metadata) {
   ArrayList *files = array_list_create(file_destroy);
   char *data_pointer = data->data;
   size_t remaining_size = data->size;
@@ -206,10 +207,12 @@ Chunk *chunk_deserialize(Data *data) {
     File *file = file_create(path);
     free(path);
 
-    file->metadata = metadata_from_buf(&data_pointer);
-    remaining_size -= sizeof(int);
-    if (file->metadata)
-      remaining_size -= FILE_METADATA_WIRE_SIZE;
+    if (use_metadata) {
+      file->metadata = metadata_from_buf(&data_pointer);
+      remaining_size -= sizeof(int);
+      if (file->metadata)
+        remaining_size -= FILE_METADATA_WIRE_SIZE;
+    }
 
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for data size");
@@ -252,16 +255,16 @@ Chunk *chunk_deserialize(Data *data) {
   return chunk;
 }
 
-Data *chunk_compress(Chunk *chunk, int compression_level) {
+Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress chunk");
-  Data *serialized = chunk_serialize(chunk);
+  Data *serialized = chunk_serialize(chunk, use_metadata);
   Data *compressed = data_compress(serialized, compression_level);
   data_destroy(serialized);
   log_message(LOG_LEVEL_DEBUG, "Chunk successfully compressed");
   return compressed;
 }
 
-Chunk *chunk_decompress(Data *compressed_data) {
+Chunk *chunk_decompress(Data *compressed_data, bool use_metadata) {
   log_message(LOG_LEVEL_DEBUG, "Starting to decompress chunk");
   Data *uncompressed_data = data_decompress(compressed_data);
   if (uncompressed_data == NULL) {
@@ -269,7 +272,7 @@ Chunk *chunk_decompress(Data *compressed_data) {
     return NULL;
   }
 
-  Chunk *chunk = chunk_deserialize(uncompressed_data);
+  Chunk *chunk = chunk_deserialize(uncompressed_data, use_metadata);
   if (chunk == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk data");
     data_destroy(uncompressed_data);

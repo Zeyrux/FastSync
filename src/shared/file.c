@@ -73,8 +73,13 @@ void file_metadata_destroy(void *metadata) {
 void file_load_data(File *file) {
   if (file == NULL)
     return;
-  if (file->data->data == NULL)
+  if (file->data->data == NULL) {
     file->data->data = malloc(file->data->size);
+    if (file->data->data == NULL) {
+      perror("Could not allocate memory for file data");
+      exit(EXIT_FAILURE);
+    }
+  }
   printf("%ld is file big", file->data->size);
   size_t bytes_read = file_content_to_buffer(file);
   if (bytes_read != file->data->size) {

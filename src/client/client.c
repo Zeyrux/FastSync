@@ -21,11 +21,11 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     send_status(client->file_descriptor, STATUS_CHUNK);
     Data *data;
     if (config->use_compression) {
-      data = chunk_compress(chunk, config->compression_level);
+      data = chunk_compress(chunk, config->compression_level, config->use_metadata);
     } else {
       for (int i = 0; i < chunk->element_count; i++)
         file_load_data(chunk->items[i]);
-      data = chunk_serialize(chunk);
+      data = chunk_serialize(chunk, config->use_metadata);
     }
     send_data(client->file_descriptor, data->data, data->size);
     data_destroy(data);
