@@ -8,7 +8,7 @@ Config *config_create(char *version, char *send_directory,
                       char *receive_directory, bool save_to_disk,
                       bool use_multithreading, bool use_chunk_serialization,
                       bool use_compression, int compression_level,
-                      int num_connections) {
+                      int num_connections, bool use_sendfile) {
 
   Config *config = malloc(sizeof(Config));
   config->version = version;
@@ -20,6 +20,7 @@ Config *config_create(char *version, char *send_directory,
   config->use_compression = use_compression;
   config->compression_level = compression_level;
   config->num_connections = num_connections;
+  config->use_sendfile = use_sendfile;
   return config;
 }
 
