@@ -4,9 +4,7 @@
 		"bash": {
 			"*": "allow",
 			"git push origin main": "deny",
-			"git push origin master": "deny",
-			"git push *": "ask",
-			"git commit *": "ask"
+			"git push main": "ask"
 		}
 	}
 }
