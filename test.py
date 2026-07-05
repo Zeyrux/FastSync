@@ -341,12 +341,10 @@ def main():
                         help="Destination directory for received files (default: %(default)s)")
     parser.add_argument("--keep-data", action="store_true",
                         help="Keep test_data directory after run")
-    parser.add_argument("--no-unlimited", action="store_true",
-                        help="Skip the Unlimited (no limits) profile")
-    parser.add_argument("--no-lan", action="store_true",
-                        help="Skip the LAN profile")
+    parser.add_argument("--unlimited", action="store_true",
+                        help="Run Unlimited profile instead of LAN (no network limits)")
     parser.add_argument("--wan", action="store_true",
-                        help="Include the WAN profile (requires sudo)")
+                        help="Run WAN profile instead of LAN (100mbit, 50ms, 1% loss)")
     args = parser.parse_args()
 
     os.system("cmake -B build -S . > /dev/null 2>&1")
@@ -359,17 +357,12 @@ def main():
     os.makedirs(args.dest_dir, exist_ok=True)
 
     profiles_to_run = []
-    if args.wan:
-        if not args.no_unlimited:
-            profiles_to_run.append("WAN")
-        else:
-            print("--wan and --no-unlimited are mutually exclusive")
-            sys.exit(1)
+    if args.unlimited:
+        profiles_to_run.append("Unlimited")
+    elif args.wan:
+        profiles_to_run.append("WAN")
     else:
-        if not args.no_unlimited:
-            profiles_to_run.append("Unlimited")
-        if not args.no_lan:
-            profiles_to_run.append("LAN")
+        profiles_to_run.append("LAN")
 
     try:
         all_results = []
