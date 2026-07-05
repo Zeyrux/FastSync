@@ -17,14 +17,23 @@ base_client_cmd = ["./build/client"]
 DISK_DEVICE = "/dev/nvme0n1p5"
 READ_BPS_MAX = "15M"
 WRITE_BPS_MAX = "10M"
-
-NET_LIMIT = "100mbit"
-NET_DELAY = "100ms"
 NETWORK_INTERFACE = "lo"
-NET_LIMIT_CMD = (
-    f"sudo tc qdisc add dev {NETWORK_INTERFACE} root netem rate {NET_LIMIT} delay {NET_DELAY}".split()
-)
-NET_RESET_CMD = f"sudo tc qdisc del dev {NETWORK_INTERFACE} root".split()
+
+NETWORK_PROFILES = {
+    "Unlimited": {},
+    "LAN": {
+        "rate": "1000mbit",
+        "delay": "1ms",
+        "jitter": "0.1ms",
+        "loss": "0%",
+    },
+    "WAN": {
+        "rate": "100mbit",
+        "delay": "50ms",
+        "jitter": "10ms",
+        "loss": "1%",
+    },
+}
 
 CLIENT_CMD_PREFIX = [
     "sudo",
@@ -37,7 +46,7 @@ CLIENT_CMD_PREFIX = [
 ]
 
 TEST_CASES = [
-    {"name": "Standard (Single-threaded)", "flags": []},
+    {"name": "Standard", "flags": []},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
     {"name": "Compression (-c)", "flags": ["-c"]},
     {"name": "Chunk Serialization (-s)", "flags": ["-s"]},
@@ -51,6 +60,30 @@ TEST_CASES = [
     {"name": "Sendfile (-f)", "flags": ["-f"]},
     {"name": "Sendfile + Multithreading (-f -m)", "flags": ["-f", "-m"]},
 ]
+
+RSYNC_CASES = [
+    {"name": "rsync (archive)", "args": ["-aH"]},
+    {"name": "rsync (archive + compress)", "args": ["-aHz"]},
+]
+
+
+def netem_apply(profile):
+    params = NETWORK_PROFILES[profile]
+    if not params:
+        netem_reset()
+        return
+    cmd = ["sudo", "tc", "qdisc", "add", "dev", NETWORK_INTERFACE, "root", "netem"]
+    cmd += ["rate", params["rate"]]
+    cmd += ["delay", params["delay"], params["jitter"]]
+    cmd += ["loss", params["loss"]]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def netem_reset():
+    subprocess.run(
+        f"sudo tc qdisc del dev {NETWORK_INTERFACE} root".split(),
+        capture_output=True,
+    )
 
 
 def generate_test_files(source_dir):
@@ -90,12 +123,11 @@ def generate_test_files(source_dir):
     print(f"  Generated {total_mb:.1f} MB of test data in {source_dir}")
 
 
-def verify_transfer(source_dir, dest_dir):
+def verify_transfer(source_dir, received_dir):
     source_dir = os.path.abspath(source_dir)
-    dest_dir = os.path.abspath(dest_dir)
+    received_dir = os.path.abspath(received_dir)
 
-    received_prefix = os.path.join(dest_dir, source_dir.lstrip(os.sep))
-    if not os.path.exists(received_prefix):
+    if not os.path.exists(received_dir):
         return [], ["no received files found"]
 
     mismatches = []
@@ -105,7 +137,7 @@ def verify_transfer(source_dir, dest_dir):
         for f in files:
             src_path = os.path.join(root, f)
             rel = os.path.relpath(src_path, source_dir)
-            dst_path = os.path.join(received_prefix, rel)
+            dst_path = os.path.join(received_dir, rel)
 
             if not os.path.exists(dst_path):
                 missing.append(rel)
@@ -115,25 +147,28 @@ def verify_transfer(source_dir, dest_dir):
     return mismatches, missing
 
 
-def run_suite(env_name, apply_limits, source_dir, dest_dir):
+def run_profile(profile_name, source_dir, dest_dir):
     results = []
+    is_limited = profile_name != "Unlimited"
+    params = NETWORK_PROFILES[profile_name]
     print(f"\n{'=' * 60}")
-    print(f"Suite: {env_name}")
+    print(f"Profile: {profile_name}")
     print(f"{'=' * 60}")
 
-    if apply_limits:
+    if is_limited:
+        p = params
+        print(f"  Network: rate={p['rate']}, delay={p['delay']} ±{p['jitter']}, loss={p['loss']}")
         print(f"  Disk I/O: Reads <= {READ_BPS_MAX}, Writes <= {WRITE_BPS_MAX}")
-        print(f"  Network: {NET_LIMIT}, {NET_DELAY} delay")
         client_prefix = CLIENT_CMD_PREFIX
     else:
-        print("  Baseline (no limits)")
+        print("  No limits applied")
         client_prefix = []
 
     try:
-        if apply_limits:
-            subprocess.run(NET_LIMIT_CMD, check=True)
+        if is_limited:
+            netem_apply(profile_name)
         else:
-            subprocess.run(NET_RESET_CMD, capture_output=True)
+            netem_reset()
 
         for case in TEST_CASES:
             name = case["name"]
@@ -177,11 +212,12 @@ def run_suite(env_name, apply_limits, source_dir, dest_dir):
 
                 mismatches, missing = [], []
                 if client_result.returncode == 0:
-                    mismatches, missing = verify_transfer(source_dir, dest_dir)
+                    received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
+                    mismatches, missing = verify_transfer(source_dir, received)
 
                 entry = {
                     "name": name,
-                    "suite": env_name,
+                    "suite": profile_name,
                     "time": f"{duration:.4f}s" if client_result.returncode == 0 else "N/A",
                 }
 
@@ -212,11 +248,11 @@ def run_suite(env_name, apply_limits, source_dir, dest_dir):
 
             except subprocess.TimeoutExpired:
                 results.append(
-                    {"name": name, "suite": env_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 15s"}
+                    {"name": name, "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 15s"}
                 )
             except Exception as e:
                 results.append(
-                    {"name": name, "suite": env_name, "status": "Error", "time": "N/A", "error": str(e)}
+                    {"name": name, "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
                 )
             finally:
                 if server_process:
@@ -226,12 +262,71 @@ def run_suite(env_name, apply_limits, source_dir, dest_dir):
                         server_process.kill()
                         server_process.wait()
 
-    except subprocess.CalledProcessError as e:
-        print(f"  Error running limit command: {' '.join(e.cmd)}")
-    finally:
-        if apply_limits:
+        for case in RSYNC_CASES:
+            name = case["name"]
+            rsync_args = case["args"]
+            print(f"\n  --- {name} ---")
+
+            if os.path.exists(dest_dir):
+                shutil.rmtree(dest_dir)
+
             try:
-                subprocess.run(NET_RESET_CMD, check=True, capture_output=True)
+                rsync_cmd = (
+                    ["rsync"]
+                    + rsync_args
+                    + [f"{source_dir}/", f"{dest_dir}/"]
+                )
+                print(f"    Running: {' '.join(rsync_cmd)}")
+
+                start_time = time.monotonic()
+                rsync_result = subprocess.run(
+                    rsync_cmd, capture_output=True, timeout=120
+                )
+                end_time = time.monotonic()
+                duration = end_time - start_time
+
+                mismatches, missing = [], []
+                if rsync_result.returncode == 0:
+                    mismatches, missing = verify_transfer(source_dir, dest_dir)
+
+                entry = {
+                    "name": name,
+                    "suite": profile_name,
+                    "time": f"{duration:.4f}s" if rsync_result.returncode == 0 else "N/A",
+                }
+
+                if rsync_result.returncode == 0 and not mismatches and not missing:
+                    entry["status"] = "Success"
+                    entry["error"] = ""
+                else:
+                    entry["status"] = "Failed"
+                    errors = []
+                    if rsync_result.returncode != 0:
+                        err = rsync_result.stderr.strip().split("\n")[0] if rsync_result.stderr else "No output"
+                        errors.append(f"Exit code {rsync_result.returncode}: {err[:80]}")
+                    if missing:
+                        errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
+                    if mismatches:
+                        errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
+                    entry["error"] = " | ".join(errors)
+
+                results.append(entry)
+
+            except subprocess.TimeoutExpired:
+                results.append(
+                    {"name": name, "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 120s"}
+                )
+            except Exception as e:
+                results.append(
+                    {"name": name, "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
+                )
+
+    except subprocess.CalledProcessError as e:
+        print(f"  Error running netem command: {' '.join(e.cmd)}")
+    finally:
+        if is_limited:
+            try:
+                netem_reset()
             except Exception:
                 pass
 
@@ -246,10 +341,12 @@ def main():
                         help="Destination directory for received files (default: %(default)s)")
     parser.add_argument("--keep-data", action="store_true",
                         help="Keep test_data directory after run")
-    parser.add_argument("--no-throttled", action="store_true",
-                        help="Skip throttled suite (requires sudo)")
     parser.add_argument("--no-unlimited", action="store_true",
-                        help="Skip unlimited suite")
+                        help="Skip the Unlimited (no limits) profile")
+    parser.add_argument("--no-lan", action="store_true",
+                        help="Skip the LAN profile")
+    parser.add_argument("--wan", action="store_true",
+                        help="Include the WAN profile (requires sudo)")
     args = parser.parse_args()
 
     os.system("cmake -B build -S . > /dev/null 2>&1")
@@ -261,24 +358,26 @@ def main():
     generate_test_files(args.source_dir)
     os.makedirs(args.dest_dir, exist_ok=True)
 
+    profiles_to_run = []
+    if not args.no_unlimited:
+        profiles_to_run.append("Unlimited")
+    if not args.no_lan:
+        profiles_to_run.append("LAN")
+    if args.wan:
+        profiles_to_run.append("WAN")
+
     try:
         all_results = []
-
-        if not args.no_unlimited:
+        for profile in profiles_to_run:
             all_results.extend(
-                run_suite("Unlimited", False, args.source_dir, args.dest_dir)
+                run_profile(profile, args.source_dir, args.dest_dir)
             )
 
-        if not args.no_throttled:
-            all_results.extend(
-                run_suite("Throttled", True, args.source_dir, args.dest_dir)
-            )
-
-        print("\n" + "=" * 110)
-        print(f"{'RESULTS':^110}")
-        print("=" * 110)
-        print(f"{'Configuration':<45} | {'Suite':<12} | {'Status':<8} | {'Time':<10} | {'Details'}")
-        print("-" * 110)
+        print("\n" + "=" * 130)
+        print(f"{'RESULTS':^130}")
+        print("=" * 130)
+        print(f"{'Configuration':<45} | {'Profile':<12} | {'Status':<8} | {'Time':<10} | {'Details'}")
+        print("-" * 130)
 
         for res in all_results:
             print(
