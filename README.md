@@ -12,6 +12,7 @@ FastFileTransfer is a C implementation of a file synchronization system that:
 4. Utilizes multithreading for parallel file processing
 5. Implements producer-consumer patterns with thread-safe queues
 6. Provides both in-memory and disk-based storage options
+7. Supports `sendfile()` for zero-copy file transfer
 
 ## System Architecture
 
@@ -23,6 +24,7 @@ The system consists of two main components:
 - Compresses data using zstd algorithm
 - Serializes chunks into a compact binary format for batch transfer
 - Sends files to server using custom protocol
+- Supports sendfile for zero-copy file transfer (`-f`)
 - Supports both single-threaded and multi-threaded operation
 
 ### Server
@@ -122,6 +124,9 @@ make
 
 # Sendfile (zero-copy, bypasses userspace for large files)
 ./build/client -f
+
+# Sendfile with multithreading
+./build/client -f -m
 ```
 
 ## Testing
@@ -154,8 +159,9 @@ tests/      # Unit tests
 
 1. Chunk size (10MB default) affects memory usage and transfer efficiency
 2. Compression level (1-22) trades CPU usage for space savings
-3. Multithreading improves performance on multi-core systems
-4. Thread-safe queues minimize contention between producer/consumer threads
+3. `sendfile()` (`-f`) bypasses userspace memory, ~2x faster on localhost for large files
+4. Multithreading improves performance on multi-core systems
+5. Thread-safe queues minimize contention between producer/consumer threads
 
 ## Extensibility
 
