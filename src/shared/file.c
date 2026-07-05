@@ -131,8 +131,10 @@ void file_send_single_calls(File *file, int file_descriptor, bool use_metadata) 
   send_data(file_descriptor, file->data->data, file->data->size);
 }
 
-void file_send_sendfile(File *file, int file_descriptor) {
+void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
   send_str(file_descriptor, file->path);
+  if (use_metadata)
+    metadata_send(file_descriptor, file->metadata);
 
   int fd = open(file->path, O_RDONLY);
   if (fd == -1) {

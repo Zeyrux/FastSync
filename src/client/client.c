@@ -32,7 +32,7 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
       send_status(client->file_descriptor, STATUS_NEXT);
-      file_send_sendfile(chunk->items[i], client->file_descriptor);
+      file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata);
     }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
