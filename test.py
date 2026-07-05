@@ -73,6 +73,7 @@ def netem_apply(profile):
     if not params:
         netem_reset()
         return
+    netem_reset()
     cmd = ["sudo", "tc", "qdisc", "add", "dev", NETWORK_INTERFACE, "root", "netem"]
     cmd += ["rate", params["rate"]]
     cmd += ["delay", params["delay"], params["jitter"]]
@@ -288,7 +289,19 @@ path = {source_dir}
                 ["rsync", "--daemon", "--no-detach", f"--config={rsyncd_conf}"],
                 stdout=subprocess.DEVNULL, stderr=None
             )
-            time.sleep(0.5)
+            for _ in range(25):
+                time.sleep(0.1)
+                if rsync_daemon.poll() is not None:
+                    print(f"  rsync daemon exited prematurely (rc={rsync_daemon.returncode})")
+                    raise RuntimeError("rsync daemon failed to start")
+                try:
+                    with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.5):
+                        break
+                except (ConnectionRefusedError, OSError):
+                    continue
+            else:
+                print(f"  timed out waiting for rsync daemon on port {rsync_port}")
+                raise RuntimeError("rsync daemon did not start")
 
             for case in RSYNC_CASES:
                 name = case["name"]
