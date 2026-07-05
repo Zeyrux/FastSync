@@ -86,8 +86,10 @@ int load_files_multithreaded(void *pipeline_context) {
       mtx_unlock(&context->mutex_loader);
       return thrd_success;
     }
-    for (int i = 0; i < chunk->element_count; i++)
-      file_load_data(chunk->items[i]);
+    if (!context->config->use_sendfile) {
+      for (int i = 0; i < chunk->element_count; i++)
+        file_load_data(chunk->items[i]);
+    }
     queue_enqueue_multithreaded(context->queue_loader, chunk,
                                 &context->mutex_loader,
                                 &context->condition_not_empty_loader,
@@ -152,11 +154,6 @@ int send_files(Config *config) {
 }
 
 int send_files_multithreaded(Config *config) {
-  if (config->use_sendfile) {
-    log_message(LOG_LEVEL_INFO, "Sendfile enabled, falling back to single-threaded");
-    return send_files(config);
-  }
-
   PipelineContextSender *context =
       pipeline_context_sender_create(config, queue_create(100, chunk_destroy),
                                      queue_create(100, chunk_destroy));
@@ -236,6 +233,11 @@ int main(int argc, char *argv[]) {
       handle_arg(argv[i], "-s", &config->use_chunk_serialization,
                  "Enabled Chunk Serialization");
     }
+  }
+
+  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
+    fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk serialization)\n");
+    return 1;
   }
 
   if (config->use_multithreading)

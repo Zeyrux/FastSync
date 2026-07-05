@@ -49,7 +49,7 @@ The client-server communication uses the following status codes:
 | `-m` | Enable multithreading mode |
 | `-c [level]` | Enable compression with optional level (1-22, default: 5) |
 | `-s` | Enable chunk serialization (batch-transfer all files per chunk) |
-| `-f` | Enable sendfile (zero-copy file transfer, bypasses userspace memory) |
+| `-f` | Enable sendfile (zero-copy file transfer, bypasses userspace memory). Can be combined with `-m`. Incompatible with `-c` and `-s`. |
 | `--source-dir <path>` | Source directory to sync (overrides `FASTSYNC_SOURCE_DIR`) |
 | `--dest-dir <path>` | Server-side destination directory (overrides `FASTSYNC_DEST_DIR`) |
 | `--save-to-disk` | Persist received files to disk |
