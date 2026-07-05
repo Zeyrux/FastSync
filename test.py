@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import socket
 
 TEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data")
 DEFAULT_SOURCE_DIR = os.path.join(TEST_DIR, "source")
@@ -72,6 +73,7 @@ def netem_apply(profile):
     if not params:
         netem_reset()
         return
+    netem_reset()
     cmd = ["sudo", "tc", "qdisc", "add", "dev", NETWORK_INTERFACE, "root", "netem"]
     cmd += ["rate", params["rate"]]
     cmd += ["delay", params["delay"], params["jitter"]]
@@ -84,6 +86,12 @@ def netem_reset():
         f"sudo tc qdisc del dev {NETWORK_INTERFACE} root".split(),
         capture_output=True,
     )
+
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
 
 def generate_test_files(source_dir):
@@ -262,64 +270,137 @@ def run_profile(profile_name, source_dir, dest_dir):
                         server_process.kill()
                         server_process.wait()
 
-        for case in RSYNC_CASES:
-            name = case["name"]
-            rsync_args = case["args"]
-            print(f"\n  --- {name} ---")
+        # Rsync tests (over network via daemon, so tc netem applies)
+        rsync_port = find_free_port()
+        rsyncd_conf = os.path.join(tempfile.gettempdir(), f"rsyncd-{rsync_port}.conf")
+        with open(rsyncd_conf, "w") as f:
+            f.write(f"""port = {rsync_port}
+read only = yes
 
-            if os.path.exists(dest_dir):
-                shutil.rmtree(dest_dir)
+[source]
+    path = {source_dir}
+""")
 
+        rsync_daemon = None
+        try:
+            rsync_daemon = subprocess.Popen(
+                ["rsync", "--daemon", "--no-detach", f"--config={rsyncd_conf}"],
+                stdout=subprocess.DEVNULL, stderr=None
+            )
+            for _ in range(50):
+                time.sleep(0.1)
+                if rsync_daemon.poll() is not None:
+                    print(f"  rsync daemon exited (rc={rsync_daemon.returncode})")
+                    raise RuntimeError("rsync daemon failed to start")
+                try:
+                    with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.3):
+                        break
+                except (ConnectionRefusedError, OSError):
+                    continue
+            else:
+                print(f"  timed out waiting for rsync daemon on port {rsync_port}")
+                raise RuntimeError("rsync daemon did not start")
+
+            for case in RSYNC_CASES:
+                name = case["name"]
+                rsync_args = case["args"]
+                print(f"\n  --- {name} ---")
+
+                if os.path.exists(dest_dir):
+                    shutil.rmtree(dest_dir)
+
+                try:
+                    rsync_cmd = (
+                        client_prefix
+                        + ["rsync"]
+                        + rsync_args
+                        + [f"rsync://localhost:{rsync_port}/source/", f"{dest_dir}/"]
+                    )
+                    print(f"    Running: {' '.join(rsync_cmd)}")
+
+                    start_time = time.monotonic()
+                    rsync_result = subprocess.run(
+                        rsync_cmd, capture_output=True, text=True, timeout=120
+                    )
+                    end_time = time.monotonic()
+                    duration = end_time - start_time
+
+                    mismatches, missing = [], []
+                    if rsync_result.returncode == 0:
+                        mismatches, missing = verify_transfer(source_dir, dest_dir)
+
+                    entry = {
+                        "name": name,
+                        "suite": profile_name,
+                        "time": f"{duration:.4f}s" if rsync_result.returncode == 0 else "N/A",
+                    }
+
+                    if rsync_result.returncode == 0 and not mismatches and not missing:
+                        entry["status"] = "Success"
+                        entry["error"] = ""
+                    else:
+                        entry["status"] = "Failed"
+                        errors = []
+                        if rsync_result.returncode != 0:
+                            errs = []
+                            for line in (rsync_result.stderr or "").split("\n"):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                if line.startswith("Running as unit:"):
+                                    continue
+                                errs.append(line)
+                            for line in (rsync_result.stdout or "").split("\n"):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                errs.append(line)
+                            if not errs:
+                                errs.append("No output")
+                            err = " | ".join(errs[-3:])
+                            errors.append(f"Exit code {rsync_result.returncode}: {err[:200]}")
+                            # Retry without systemd-run to reveal the actual error
+                            if client_prefix:
+                                tmp_dest = tempfile.mkdtemp()
+                                try:
+                                    plain = subprocess.run(
+                                        ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", f"{tmp_dest}/"],
+                                        capture_output=True, text=True, timeout=30
+                                    )
+                                    if plain.returncode != 0:
+                                        plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
+                                        if plain_errs:
+                                            errors.append(f"raw: {plain_errs[-1][:150]}")
+                                finally:
+                                    shutil.rmtree(tmp_dest, ignore_errors=True)
+                        if missing:
+                            errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
+                        if mismatches:
+                            errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
+                        entry["error"] = " | ".join(errors)
+
+                    results.append(entry)
+
+                except subprocess.TimeoutExpired:
+                    results.append(
+                        {"name": name, "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 120s"}
+                    )
+                except Exception as e:
+                    results.append(
+                        {"name": name, "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
+                    )
+
+        finally:
+            if rsync_daemon:
+                try:
+                    rsync_daemon.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    rsync_daemon.kill()
+                    rsync_daemon.wait()
             try:
-                rsync_cmd = (
-                    ["rsync"]
-                    + rsync_args
-                    + [f"{source_dir}/", f"{dest_dir}/"]
-                )
-                print(f"    Running: {' '.join(rsync_cmd)}")
-
-                start_time = time.monotonic()
-                rsync_result = subprocess.run(
-                    rsync_cmd, capture_output=True, timeout=120
-                )
-                end_time = time.monotonic()
-                duration = end_time - start_time
-
-                mismatches, missing = [], []
-                if rsync_result.returncode == 0:
-                    mismatches, missing = verify_transfer(source_dir, dest_dir)
-
-                entry = {
-                    "name": name,
-                    "suite": profile_name,
-                    "time": f"{duration:.4f}s" if rsync_result.returncode == 0 else "N/A",
-                }
-
-                if rsync_result.returncode == 0 and not mismatches and not missing:
-                    entry["status"] = "Success"
-                    entry["error"] = ""
-                else:
-                    entry["status"] = "Failed"
-                    errors = []
-                    if rsync_result.returncode != 0:
-                        err = rsync_result.stderr.strip().split("\n")[0] if rsync_result.stderr else "No output"
-                        errors.append(f"Exit code {rsync_result.returncode}: {err[:80]}")
-                    if missing:
-                        errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
-                    if mismatches:
-                        errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
-                    entry["error"] = " | ".join(errors)
-
-                results.append(entry)
-
-            except subprocess.TimeoutExpired:
-                results.append(
-                    {"name": name, "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 120s"}
-                )
-            except Exception as e:
-                results.append(
-                    {"name": name, "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
-                )
+                os.unlink(rsyncd_conf)
+            except Exception:
+                pass
 
     except subprocess.CalledProcessError as e:
         print(f"  Error running netem command: {' '.join(e.cmd)}")
@@ -354,6 +435,8 @@ def main():
         sys.exit(1)
 
     generate_test_files(args.source_dir)
+    if os.path.exists(args.dest_dir):
+        shutil.rmtree(args.dest_dir)
     os.makedirs(args.dest_dir, exist_ok=True)
 
     profiles_to_run = []
