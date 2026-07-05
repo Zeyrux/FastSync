@@ -92,6 +92,14 @@ def netem_reset():
     )
 
 
+def wait_proc(proc, timeout=5):
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
@@ -120,13 +128,11 @@ def generate_test_files(source_dir):
             f.write(content)
         written += len(content)
 
+    os.makedirs(os.path.join(source_dir, "bulk"), exist_ok=True)
     i = 0
     while written < target_total:
         chunk_size = min(5 * 1024 * 1024, target_total - written)
-        rel_path = f"bulk/file_{i}.dat"
-        full_path = os.path.join(source_dir, rel_path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "wb") as f:
+        with open(os.path.join(source_dir, f"bulk/file_{i}.dat"), "wb") as f:
             f.write(b"0" * chunk_size)
         written += chunk_size
         i += 1
@@ -139,58 +145,67 @@ def generate_test_files(source_dir):
 def verify_transfer(source_dir, received_dir):
     source_dir = os.path.abspath(source_dir)
     received_dir = os.path.abspath(received_dir)
-
     if not os.path.exists(received_dir):
         return [], ["no received files found"]
-
-    mismatches = []
-    missing = []
-
+    mismatches, missing = [], []
     for root, dirs, files in os.walk(source_dir):
         for f in files:
             src_path = os.path.join(root, f)
             rel = os.path.relpath(src_path, source_dir)
             dst_path = os.path.join(received_dir, rel)
-
             if not os.path.exists(dst_path):
                 missing.append(rel)
             elif not filecmp.cmp(src_path, dst_path, shallow=False):
                 mismatches.append(rel)
-
     return mismatches, missing
+
+
+def start_rsync_daemon(source_dir):
+    port = find_free_port()
+    conf = os.path.join(tempfile.gettempdir(), f"rsyncd-{port}.conf")
+    with open(conf, "w") as f:
+        f.write(f"port = {port}\nread only = yes\n\n[source]\n    path = {source_dir}\n")
+    daemon = subprocess.Popen(
+        ["rsync", "--daemon", "--no-detach", f"--config={conf}"],
+        stdout=subprocess.DEVNULL, stderr=None,
+    )
+    for _ in range(50):
+        time.sleep(0.1)
+        if daemon.poll() is not None:
+            raise RuntimeError(f"rsync daemon exited (rc={daemon.returncode})")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                break
+        except (ConnectionRefusedError, OSError):
+            continue
+    else:
+        raise RuntimeError("rsync daemon did not start")
+    return port, conf, daemon
 
 
 def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None):
     if os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
-
     server = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
     time.sleep(0.5)
-
     try:
         start = time.monotonic()
         result = subprocess.run(cmd, text=True, capture_output=True)
         duration = time.monotonic() - start
     finally:
-        try:
-            server.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait()
+        wait_proc(server)
 
     mismatches, missing = [], []
     if result.returncode == 0:
-        if source_prefix is not None:
-            received = os.path.join(dest_dir, source_prefix)
-        else:
-            received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
+        received = os.path.join(dest_dir, source_prefix if source_prefix is not None
+                                else os.path.abspath(source_dir).lstrip(os.sep))
         mismatches, missing = verify_transfer(source_dir, received)
 
+    first_line = lambda s: (s or "").strip().split("\n")[0]
     entry = {
         "name": name,
         "time": f"{duration:.4f}s" if result.returncode == 0 else "N/A",
     }
-
     if result.returncode == 0 and not mismatches and not missing:
         entry["status"] = "Success"
         entry["error"] = ""
@@ -198,175 +213,29 @@ def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None):
         entry["status"] = "Failed"
         errors = []
         if result.returncode != 0:
-            err = (
-                result.stderr.strip().split("\n")[0]
-                if result.stderr
-                else (
-                    result.stdout.strip().split("\n")[0]
-                    if result.stdout
-                    else "No output"
-                )
-            )
-            errors.append(f"Exit code {result.returncode}: {err[:80]}")
+            errors.append(f"Exit code {result.returncode}: {first_line(result.stderr) or first_line(result.stdout) or 'No output'[:80]}")
         if missing:
             errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
         if mismatches:
             errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
         entry["error"] = " | ".join(errors)
-
     return entry
 
 
-def run_client_tests(profile_name, source_dir, dest_dir, client_prefix):
-    results = []
-    for case in TEST_CASES:
-        name = case["name"]
-        flags = list(BASE_CLIENT_FLAGS)
-        if case.get("use_metadata", True):
-            flags.append("-M")
-        flags += case["flags"]
-
-        cmd = (
-            client_prefix
-            + BASE_CLIENT_CMD
-            + ["--source-dir", source_dir, "--dest-dir", dest_dir]
-            + flags
-        )
-
-        print(f"\n  --- {name} ---")
-        print(f"    Running: {' '.join(cmd)}")
-
-        try:
-            result = run_single_test(cmd, name, source_dir, dest_dir)
-            result["suite"] = profile_name
-            results.append(result)
-        except Exception as e:
-            results.append({
-                "name": name,
-                "suite": profile_name,
-                "status": "Error",
-                "time": "N/A",
-                "error": str(e),
-            })
-
-    return results
-
-
-def run_rsync_tests(profile_name, source_dir, dest_dir, client_prefix):
-    results = []
-    rsync_port = find_free_port()
-    rsyncd_conf = os.path.join(tempfile.gettempdir(), f"rsyncd-{rsync_port}.conf")
-    with open(rsyncd_conf, "w") as f:
-        f.write(f"""port = {rsync_port}
-read only = yes
-
-[source]
-    path = {source_dir}
-""")
-
-    rsync_daemon = None
-    try:
-        rsync_daemon = subprocess.Popen(
-            ["rsync", "--daemon", "--no-detach", f"--config={rsyncd_conf}"],
-            stdout=subprocess.DEVNULL, stderr=None
-        )
-        for _ in range(50):
-            time.sleep(0.1)
-            if rsync_daemon.poll() is not None:
-                print(f"  rsync daemon exited (rc={rsync_daemon.returncode})")
-                raise RuntimeError("rsync daemon failed to start")
-            try:
-                with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.3):
-                    break
-            except (ConnectionRefusedError, OSError):
-                continue
-        else:
-            print(f"  timed out waiting for rsync daemon on port {rsync_port}")
-            raise RuntimeError("rsync daemon did not start")
-
-        for case in RSYNC_CASES:
-            name = case["name"]
-            rsync_args = case["args"]
-            print(f"\n  --- {name} ---")
-
-            cmd = (
-                client_prefix
-                + ["rsync"]
-                + rsync_args
-                + [f"rsync://localhost:{rsync_port}/source/", f"{dest_dir}/"]
-            )
-            print(f"    Running: {' '.join(cmd)}")
-
-            try:
-                result = run_single_test(
-                    cmd, name, source_dir, dest_dir,
-                    source_prefix=""
-                )
-                result["suite"] = profile_name
-            except subprocess.TimeoutExpired:
-                result = {
-                    "name": name,
-                    "suite": profile_name,
-                    "status": "Timeout",
-                    "time": "N/A",
-                    "error": "Exceeded 120s",
-                }
-            except Exception as e:
-                result = {
-                    "name": name,
-                    "suite": profile_name,
-                    "status": "Error",
-                    "time": "N/A",
-                    "error": str(e),
-                }
-            else:
-                # If failed under systemd-run, retry without it to reveal raw error
-                if result["status"] != "Success" and client_prefix:
-                    tmp_dest = tempfile.mkdtemp()
-                    try:
-                        plain = subprocess.run(
-                            ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", f"{tmp_dest}/"],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if plain.returncode != 0:
-                            plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
-                            if plain_errs:
-                                result["error"] += f" | raw: {plain_errs[-1][:150]}"
-                    finally:
-                        shutil.rmtree(tmp_dest, ignore_errors=True)
-
-            results.append(result)
-
-    finally:
-        if rsync_daemon:
-            try:
-                rsync_daemon.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                rsync_daemon.kill()
-                rsync_daemon.wait()
-        try:
-            os.unlink(rsyncd_conf)
-        except Exception:
-            pass
-
-    return results
+def print_profile_header(profile_name):
+    params = NETWORK_PROFILES[profile_name]
+    print(f"\n{'=' * 60}\nProfile: {profile_name}\n{'=' * 60}")
+    if params:
+        print(f"  Network: rate={params['rate']}, delay={params['delay']} ±{params['jitter']}, loss={params['loss']}")
+        print(f"  Disk I/O: Reads <= {READ_BPS_MAX}, Writes <= {WRITE_BPS_MAX}")
+    else:
+        print("  No limits applied")
 
 
 def run_profile(profile_name, source_dir, dest_dir):
+    print_profile_header(profile_name)
     is_limited = profile_name != "Unlimited"
-    params = NETWORK_PROFILES[profile_name]
-    print(f"\n{'=' * 60}")
-    print(f"Profile: {profile_name}")
-    print(f"{'=' * 60}")
-
-    if is_limited:
-        p = params
-        print(f"  Network: rate={p['rate']}, delay={p['delay']} ±{p['jitter']}, loss={p['loss']}")
-        print(f"  Disk I/O: Reads <= {READ_BPS_MAX}, Writes <= {WRITE_BPS_MAX}")
-        client_prefix = CLIENT_CMD_PREFIX
-    else:
-        print("  No limits applied")
-        client_prefix = []
+    client_prefix = CLIENT_CMD_PREFIX if is_limited else []
 
     try:
         if is_limited:
@@ -375,11 +244,50 @@ def run_profile(profile_name, source_dir, dest_dir):
             netem_reset()
 
         results = []
-        results.extend(run_client_tests(profile_name, source_dir, dest_dir, client_prefix))
-        results.extend(run_rsync_tests(profile_name, source_dir, dest_dir, client_prefix))
+        for case in TEST_CASES:
+            flags = BASE_CLIENT_FLAGS + (["-M"] if case.get("use_metadata", True) else []) + case["flags"]
+            cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
+            print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
+            try:
+                r = run_single_test(cmd, case["name"], source_dir, dest_dir)
+                r["suite"] = profile_name
+                results.append(r)
+            except Exception as e:
+                results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
 
-    except subprocess.CalledProcessError as e:
-        print(f"  Error running netem command: {' '.join(e.cmd)}")
+        port, conf, daemon = start_rsync_daemon(source_dir)
+        try:
+            for case in RSYNC_CASES:
+                cmd = client_prefix + ["rsync"] + case["args"] + [f"rsync://localhost:{port}/source/", f"{dest_dir}/"]
+                print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
+                try:
+                    r = run_single_test(cmd, case["name"], source_dir, dest_dir, source_prefix="")
+                    r["suite"] = profile_name
+                except subprocess.TimeoutExpired:
+                    r = {"name": case["name"], "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 120s"}
+                except Exception as e:
+                    r = {"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
+                else:
+                    if r["status"] != "Success" and client_prefix:
+                        tmp = tempfile.mkdtemp()
+                        try:
+                            plain = subprocess.run(["rsync", "-aH", f"rsync://localhost:{port}/source/", f"{tmp}/"], capture_output=True, text=True, timeout=30)
+                            if plain.returncode != 0:
+                                errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
+                                if errs:
+                                    r["error"] += f" | raw: {errs[-1][:150]}"
+                        finally:
+                            shutil.rmtree(tmp, ignore_errors=True)
+                results.append(r)
+        finally:
+            wait_proc(daemon)
+            try:
+                os.unlink(conf)
+            except Exception:
+                pass
+
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        print(f"  Error: {e}")
         results = []
     finally:
         if is_limited:
@@ -391,119 +299,62 @@ def run_profile(profile_name, source_dir, dest_dir):
     return results
 
 
-def parse_rate_to_bytes_per_sec(rate_str):
-    m = re.match(r'(\d+)\s*(mbit|gbit|kbit|bit)', rate_str)
-    if not m:
-        return None
-    val = int(m.group(1))
-    unit = m.group(2)
-    bits_per_sec = {
-        'bit': val,
-        'kbit': val * 1000,
-        'mbit': val * 1_000_000,
-        'gbit': val * 1_000_000_000,
-    }.get(unit)
-    return bits_per_sec / 8 if bits_per_sec is not None else None
+def print_metrics(profile_name, results, total_bytes):
+    params = NETWORK_PROFILES.get(profile_name)
+    if not params or "rate" not in params:
+        return
+
+    client_times, rsync_times = [], {}
+    for r in results:
+        if r["status"] != "Success" or r["time"] == "N/A":
+            continue
+        t = float(r["time"].rstrip("s"))
+        if r["name"].startswith("rsync"):
+            rsync_times[r["name"]] = t
+        else:
+            client_times.append((t, r["name"]))
+    if not client_times or len(rsync_times) < 2:
+        return
+
+    m = re.match(r'(\d+)\s*(mbit|gbit|kbit|bit)', params["rate"])
+    rate_val = int(m.group(1)) * {'mbit': 1_000_000, 'gbit': 1_000_000_000, 'kbit': 1000, 'bit': 1}[m.group(2)] / 8 if m else None
+
+    best_time, best_name = min(client_times, key=lambda x: x[0])
+    theoretical_max = total_bytes / rate_val if rate_val else None
+
+    print(f"\n  {'─' * 90}\n  Profile: {profile_name}\n  {'─' * 90}")
+    print(f"  Total data size:               {total_bytes / (1024*1024):.1f} MB")
+    if rate_val:
+        print(f"  Network rate:                  {params['rate']} ({format_throughput(rate_val)})")
+    print(f"  Best client configuration:     {best_name}")
+    print(f"  Best client time:              {best_time:.4f}s")
+    if theoretical_max:
+        print(f"  Theoretical max (uncompressed): {theoretical_max:.4f}s")
+        print(f"  Speedup vs theoretical max:    {theoretical_max / best_time:.2f}x")
+    if (a := rsync_times.get("rsync (archive)")):
+        print(f"  Speedup vs rsync (archive):    {a / best_time:.2f}x")
+    if (c := rsync_times.get("rsync (archive + compress)")):
+        print(f"  Speedup vs rsync (compress):   {c / best_time:.2f}x")
 
 
 def format_throughput(bps):
-    if bps >= 1_000_000_000:
-        return f"{bps/1_000_000_000:.1f} GB/s"
-    if bps >= 1_000_000:
-        return f"{bps/1_000_000:.1f} MB/s"
-    if bps >= 1_000:
-        return f"{bps/1_000:.1f} KB/s"
+    for unit, threshold in [("GB/s", 1_000_000_000), ("MB/s", 1_000_000), ("KB/s", 1000)]:
+        if bps >= threshold:
+            return f"{bps/threshold:.1f} {unit}"
     return f"{bps:.0f} B/s"
-
-
-def print_results(all_results, total_bytes):
-    print("\n" + "=" * 130)
-    print(f"{'RESULTS':^130}")
-    print("=" * 130)
-    print(f"{'Configuration':<45} | {'Profile':<12} | {'Status':<8} | {'Time':<10} | {'Details'}")
-    print("-" * 130)
-
-    for res in all_results:
-        print(
-            f"{res['name']:<45} | {res['suite']:<12} | {res['status']:<8} | {res['time']:<10} | {res['error']}"
-        )
-
-    # --- Additional metrics per profile ---
-    profiles_results = {}
-    for res in all_results:
-        profiles_results.setdefault(res["suite"], []).append(res)
-
-    for profile_name, results in profiles_results.items():
-        params = NETWORK_PROFILES.get(profile_name)
-        if not params or "rate" not in params:
-            continue
-
-        client_times = []
-        rsync_times = {}
-        for r in results:
-            if r["status"] != "Success" or r["time"] == "N/A":
-                continue
-            t = float(r["time"].rstrip("s"))
-            if r["name"].startswith("rsync"):
-                rsync_times[r["name"]] = t
-            else:
-                client_times.append((t, r["name"]))
-
-        if not client_times or len(rsync_times) < 2:
-            continue
-
-        best_time, best_name = min(client_times, key=lambda x: x[0])
-
-        rate_Bps = parse_rate_to_bytes_per_sec(params["rate"])
-        theoretical_max_time = None
-        speedup_vs_theoretical = None
-        if rate_Bps is not None:
-            theoretical_max_time = total_bytes / rate_Bps
-            speedup_vs_theoretical = theoretical_max_time / best_time
-
-        print(f"\n  {'─' * 90}")
-        print(f"  Profile: {profile_name}")
-        print(f"  {'─' * 90}")
-        print(f"  Total data size:               {total_bytes / (1024*1024):.1f} MB")
-        print(f"  Network rate:                  {params['rate']} ({format_throughput(rate_Bps)})" if rate_Bps else "")
-        print(f"  Best client configuration:     {best_name}")
-        print(f"  Best client time:              {best_time:.4f}s")
-        if theoretical_max_time is not None:
-            print(f"  Theoretical max (uncompressed): {theoretical_max_time:.4f}s")
-            print(f"  Speedup vs theoretical max:    {speedup_vs_theoretical:.2f}x")
-
-        rsync_archive = rsync_times.get("rsync (archive)")
-        rsync_compress = rsync_times.get("rsync (archive + compress)")
-        if rsync_archive:
-            print(f"  Speedup vs rsync (archive):    {rsync_archive / best_time:.2f}x")
-        if rsync_compress:
-            print(f"  Speedup vs rsync (compress):   {rsync_compress / best_time:.2f}x")
-
-    failed = [r for r in all_results if r["status"] != "Success"]
-    if failed:
-        print(f"\n  {len(failed)} test(s) FAILED")
-        sys.exit(1)
-    else:
-        print(f"\n  ALL {len(all_results)} TESTS PASSED")
 
 
 def main():
     parser = argparse.ArgumentParser(description="FastSync integration test / benchmark")
-    parser.add_argument("--source-dir", default=DEFAULT_SOURCE_DIR,
-                        help="Source directory for test files (default: %(default)s)")
-    parser.add_argument("--dest-dir", default=DEFAULT_DEST_DIR,
-                        help="Destination directory for received files (default: %(default)s)")
-    parser.add_argument("--keep-data", action="store_true",
-                        help="Keep test_data directory after run")
-    parser.add_argument("--unlimited", action="store_true",
-                        help="Run Unlimited profile instead of LAN (no network limits)")
-    parser.add_argument("--wan", action="store_true",
-                        help="Run WAN profile instead of LAN (100mbit, 50ms, 1% loss)")
+    parser.add_argument("--source-dir", default=DEFAULT_SOURCE_DIR)
+    parser.add_argument("--dest-dir", default=DEFAULT_DEST_DIR)
+    parser.add_argument("--keep-data", action="store_true")
+    parser.add_argument("--unlimited", action="store_true")
+    parser.add_argument("--wan", action="store_true")
     args = parser.parse_args()
 
     os.system("cmake -B build -S . > /dev/null 2>&1")
-    ret = os.system("cd build && make -j$(nproc) 2>&1 | tail -3")
-    if ret != 0:
+    if os.system("cd build && make -j$(nproc) 2>&1 | tail -3") != 0:
         print("Build failed")
         sys.exit(1)
 
@@ -512,23 +363,35 @@ def main():
         shutil.rmtree(args.dest_dir)
     os.makedirs(args.dest_dir, exist_ok=True)
 
-    profiles_to_run = []
+    profiles = []
     if args.unlimited:
-        profiles_to_run.append("Unlimited")
+        profiles.append("Unlimited")
     elif args.wan:
-        profiles_to_run.append("WAN")
+        profiles.append("WAN")
     else:
-        profiles_to_run.append("LAN")
+        profiles.append("LAN")
 
     try:
         all_results = []
-        for profile in profiles_to_run:
-            all_results.extend(
-                run_profile(profile, args.source_dir, args.dest_dir)
-            )
+        for p in profiles:
+            all_results.extend(run_profile(p, args.source_dir, args.dest_dir))
 
-        print_results(all_results, total_bytes)
+        print("\n" + "=" * 130)
+        print(f"{'RESULTS':^130}")
+        print("=" * 130)
+        print(f"{'Configuration':<45} | {'Profile':<12} | {'Status':<8} | {'Time':<10} | {'Details'}")
+        print("-" * 130)
+        for r in all_results:
+            print(f"{r['name']:<45} | {r['suite']:<12} | {r['status']:<8} | {r['time']:<10} | {r['error']}")
 
+        for p in profiles:
+            print_metrics(p, [r for r in all_results if r["suite"] == p], total_bytes)
+
+        failed = [r for r in all_results if r["status"] != "Success"]
+        if failed:
+            print(f"\n  {len(failed)} test(s) FAILED")
+            sys.exit(1)
+        print(f"\n  ALL {len(all_results)} TESTS PASSED")
     finally:
         if not args.keep_data:
             shutil.rmtree(TEST_DIR, ignore_errors=True)
