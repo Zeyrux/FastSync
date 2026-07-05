@@ -344,8 +344,15 @@ path = {source_dir}
                         entry["status"] = "Failed"
                         errors = []
                         if rsync_result.returncode != 0:
-                            err = rsync_result.stderr.strip().split("\n")[0] if rsync_result.stderr else "No output"
-                            errors.append(f"Exit code {rsync_result.returncode}: {err[:80]}")
+                        errs = []
+                        if rsync_result.stderr:
+                            errs.append(rsync_result.stderr.strip().split("\n")[0])
+                        if rsync_result.stdout:
+                            errs.append(rsync_result.stdout.strip().split("\n")[0])
+                        if not errs:
+                            errs.append("No output")
+                        err = " | ".join(errs)
+                        errors.append(f"Exit code {rsync_result.returncode}: {err[:150]}")
                         if missing:
                             errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
                         if mismatches:
