@@ -29,6 +29,11 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     }
     send_data(client->file_descriptor, data->data, data->size);
     data_destroy(data);
+  } else if (config->use_sendfile && !config->use_compression) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      send_status(client->file_descriptor, STATUS_NEXT);
+      file_send_sendfile(chunk->items[i], client->file_descriptor);
+    }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
       send_status(client->file_descriptor, STATUS_NEXT);
@@ -81,8 +86,10 @@ int load_files_multithreaded(void *pipeline_context) {
       mtx_unlock(&context->mutex_loader);
       return thrd_success;
     }
-    for (int i = 0; i < chunk->element_count; i++)
-      file_load_data(chunk->items[i]);
+    if (!context->config->use_sendfile) {
+      for (int i = 0; i < chunk->element_count; i++)
+        file_load_data(chunk->items[i]);
+    }
     queue_enqueue_multithreaded(context->queue_loader, chunk,
                                 &context->mutex_loader,
                                 &context->condition_not_empty_loader,
@@ -130,8 +137,10 @@ int send_files(Config *config) {
   DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata);
   Chunk *current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
-    for (int i = 0; i < current_chunk->element_count; i++)
-      file_load_data(current_chunk->items[i]);
+    if (!config->use_sendfile) {
+      for (int i = 0; i < current_chunk->element_count; i++)
+        file_load_data(current_chunk->items[i]);
+    }
     send_chunk(client, current_chunk, config);
     chunk_destroy(current_chunk);
   }
@@ -192,7 +201,7 @@ int main(int argc, char *argv[]) {
   }
 
   Config *config = config_create(str_dup("1.0.0"), source_dir, dest_dir,
-                                 save_to_disk, false, false, false, false, 5, 20);
+                                 save_to_disk, false, false, false, false, 5, 20, false);
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0) {
       config->use_compression = true;
@@ -218,12 +227,20 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--preserve") == 0) {
       config->use_metadata = true;
       log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
+    } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--sendfile") == 0) {
+      config->use_sendfile = true;
+      log_message(LOG_LEVEL_INFO, "Enabled sendfile");
     } else {
       handle_arg(argv[i], "-m", &config->use_multithreading,
                  "Enabled Multithreading");
       handle_arg(argv[i], "-s", &config->use_chunk_serialization,
                  "Enabled Chunk Serialization");
     }
+  }
+
+  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
+    fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk serialization)\n");
+    return 1;
   }
 
   if (config->use_multithreading)
