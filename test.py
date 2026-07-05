@@ -14,7 +14,7 @@ DEFAULT_SOURCE_DIR = os.path.join(TEST_DIR, "source")
 DEFAULT_DEST_DIR = os.path.join(TEST_DIR, "dest")
 
 SERVER_CMD = ["./build/server"]
-base_client_cmd = ["./build/client"]
+BASE_CLIENT_CMD = ["./build/client"]
 
 DISK_DEVICE = "/dev/nvme0n1p5"
 READ_BPS_MAX = "15M"
@@ -47,8 +47,11 @@ CLIENT_CMD_PREFIX = [
     f"IOWriteBandwidthMax={DISK_DEVICE} {WRITE_BPS_MAX}",
 ]
 
+BASE_CLIENT_FLAGS = ["--save-to-disk"]
+
 TEST_CASES = [
     {"name": "Standard", "flags": []},
+    {"name": "Standard (no metadata)", "flags": [], "use_metadata": False},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
     {"name": "Compression (-c)", "flags": ["-c"]},
     {"name": "Chunk Serialization (-s)", "flags": ["-s"]},
@@ -157,8 +160,199 @@ def verify_transfer(source_dir, received_dir):
     return mismatches, missing
 
 
-def run_profile(profile_name, source_dir, dest_dir):
+def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None):
+    if os.path.exists(dest_dir):
+        shutil.rmtree(dest_dir)
+
+    server = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+    time.sleep(0.5)
+
+    try:
+        start = time.monotonic()
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        duration = time.monotonic() - start
+    finally:
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+
+    mismatches, missing = [], []
+    if result.returncode == 0:
+        if source_prefix is not None:
+            received = os.path.join(dest_dir, source_prefix)
+        else:
+            received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
+        mismatches, missing = verify_transfer(source_dir, received)
+
+    entry = {
+        "name": name,
+        "time": f"{duration:.4f}s" if result.returncode == 0 else "N/A",
+    }
+
+    if result.returncode == 0 and not mismatches and not missing:
+        entry["status"] = "Success"
+        entry["error"] = ""
+    else:
+        entry["status"] = "Failed"
+        errors = []
+        if result.returncode != 0:
+            err = (
+                result.stderr.strip().split("\n")[0]
+                if result.stderr
+                else (
+                    result.stdout.strip().split("\n")[0]
+                    if result.stdout
+                    else "No output"
+                )
+            )
+            errors.append(f"Exit code {result.returncode}: {err[:80]}")
+        if missing:
+            errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
+        if mismatches:
+            errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
+        entry["error"] = " | ".join(errors)
+
+    return entry
+
+
+def run_client_tests(profile_name, source_dir, dest_dir, client_prefix):
     results = []
+    for case in TEST_CASES:
+        name = case["name"]
+        flags = list(BASE_CLIENT_FLAGS)
+        if case.get("use_metadata", True):
+            flags.append("-M")
+        flags += case["flags"]
+
+        cmd = (
+            client_prefix
+            + BASE_CLIENT_CMD
+            + ["--source-dir", source_dir, "--dest-dir", dest_dir]
+            + flags
+        )
+
+        print(f"\n  --- {name} ---")
+        print(f"    Running: {' '.join(cmd)}")
+
+        try:
+            result = run_single_test(cmd, name, source_dir, dest_dir)
+            result["suite"] = profile_name
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "name": name,
+                "suite": profile_name,
+                "status": "Error",
+                "time": "N/A",
+                "error": str(e),
+            })
+
+    return results
+
+
+def run_rsync_tests(profile_name, source_dir, dest_dir, client_prefix):
+    results = []
+    rsync_port = find_free_port()
+    rsyncd_conf = os.path.join(tempfile.gettempdir(), f"rsyncd-{rsync_port}.conf")
+    with open(rsyncd_conf, "w") as f:
+        f.write(f"""port = {rsync_port}
+read only = yes
+
+[source]
+    path = {source_dir}
+""")
+
+    rsync_daemon = None
+    try:
+        rsync_daemon = subprocess.Popen(
+            ["rsync", "--daemon", "--no-detach", f"--config={rsyncd_conf}"],
+            stdout=subprocess.DEVNULL, stderr=None
+        )
+        for _ in range(50):
+            time.sleep(0.1)
+            if rsync_daemon.poll() is not None:
+                print(f"  rsync daemon exited (rc={rsync_daemon.returncode})")
+                raise RuntimeError("rsync daemon failed to start")
+            try:
+                with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.3):
+                    break
+            except (ConnectionRefusedError, OSError):
+                continue
+        else:
+            print(f"  timed out waiting for rsync daemon on port {rsync_port}")
+            raise RuntimeError("rsync daemon did not start")
+
+        for case in RSYNC_CASES:
+            name = case["name"]
+            rsync_args = case["args"]
+            print(f"\n  --- {name} ---")
+
+            cmd = (
+                client_prefix
+                + ["rsync"]
+                + rsync_args
+                + [f"rsync://localhost:{rsync_port}/source/", f"{dest_dir}/"]
+            )
+            print(f"    Running: {' '.join(cmd)}")
+
+            try:
+                result = run_single_test(
+                    cmd, name, source_dir, dest_dir,
+                    source_prefix=""
+                )
+                result["suite"] = profile_name
+            except subprocess.TimeoutExpired:
+                result = {
+                    "name": name,
+                    "suite": profile_name,
+                    "status": "Timeout",
+                    "time": "N/A",
+                    "error": "Exceeded 120s",
+                }
+            except Exception as e:
+                result = {
+                    "name": name,
+                    "suite": profile_name,
+                    "status": "Error",
+                    "time": "N/A",
+                    "error": str(e),
+                }
+            else:
+                # If failed under systemd-run, retry without it to reveal raw error
+                if result["status"] != "Success" and client_prefix:
+                    tmp_dest = tempfile.mkdtemp()
+                    try:
+                        plain = subprocess.run(
+                            ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", f"{tmp_dest}/"],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        if plain.returncode != 0:
+                            plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
+                            if plain_errs:
+                                result["error"] += f" | raw: {plain_errs[-1][:150]}"
+                    finally:
+                        shutil.rmtree(tmp_dest, ignore_errors=True)
+
+            results.append(result)
+
+    finally:
+        if rsync_daemon:
+            try:
+                rsync_daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rsync_daemon.kill()
+                rsync_daemon.wait()
+        try:
+            os.unlink(rsyncd_conf)
+        except Exception:
+            pass
+
+    return results
+
+
+def run_profile(profile_name, source_dir, dest_dir):
     is_limited = profile_name != "Unlimited"
     params = NETWORK_PROFILES[profile_name]
     print(f"\n{'=' * 60}")
@@ -180,314 +374,13 @@ def run_profile(profile_name, source_dir, dest_dir):
         else:
             netem_reset()
 
-        for case in TEST_CASES:
-            name = case["name"]
-            flags = case["flags"]
-            print(f"\n  --- {name} ---")
-
-            if os.path.exists(dest_dir):
-                shutil.rmtree(dest_dir)
-
-            server_process = None
-            try:
-                server_process = subprocess.Popen(
-                    SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None
-                )
-                time.sleep(0.5)
-
-                env = os.environ.copy()
-
-                client_cmd = (
-                    client_prefix
-                    + base_client_cmd
-                    + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk", "-M"]
-                    + flags
-                )
-                print(f"    Running: {' '.join(client_cmd)}")
-
-                start_time = time.monotonic()
-                client_result = subprocess.run(
-                    client_cmd, env=env, text=True, capture_output=True
-                )
-                end_time = time.monotonic()
-                duration = end_time - start_time
-
-                if server_process:
-                    try:
-                        server_process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        server_process.kill()
-                        server_process.wait()
-                    server_process = None
-
-                mismatches, missing = [], []
-                if client_result.returncode == 0:
-                    received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
-                    mismatches, missing = verify_transfer(source_dir, received)
-
-                entry = {
-                    "name": name,
-                    "suite": profile_name,
-                    "time": f"{duration:.4f}s" if client_result.returncode == 0 else "N/A",
-                }
-
-                if client_result.returncode == 0 and not mismatches and not missing:
-                    entry["status"] = "Success"
-                    entry["error"] = ""
-                else:
-                    entry["status"] = "Failed"
-                    errors = []
-                    if client_result.returncode != 0:
-                        err = (
-                            client_result.stderr.strip().split("\n")[0]
-                            if client_result.stderr
-                            else (
-                                client_result.stdout.strip().split("\n")[0]
-                                if client_result.stdout
-                                else "No output"
-                            )
-                        )
-                        errors.append(f"Exit code {client_result.returncode}: {err[:80]}")
-                    if missing:
-                        errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
-                    if mismatches:
-                        errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
-                    entry["error"] = " | ".join(errors)
-
-                results.append(entry)
-
-            except subprocess.TimeoutExpired:
-                results.append(
-                    {"name": name, "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 15s"}
-                )
-            except Exception as e:
-                results.append(
-                    {"name": name, "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
-                )
-            finally:
-                if server_process:
-                    try:
-                        server_process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        server_process.kill()
-                        server_process.wait()
-
-        # Run one case without metadata transfer to verify -M disabled works
-        print(f"\n  --- Standard (no metadata) ---")
-        if os.path.exists(dest_dir):
-            shutil.rmtree(dest_dir)
-        server_process2 = None
-        try:
-            server_process2 = subprocess.Popen(
-                SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None
-            )
-            time.sleep(0.5)
-
-            env = os.environ.copy()
-            client_cmd = (
-                client_prefix
-                + base_client_cmd
-                + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk"]
-            )
-            print(f"    Running: {' '.join(client_cmd)}")
-
-            start_time = time.monotonic()
-            client_result = subprocess.run(
-                client_cmd, env=env, text=True, capture_output=True
-            )
-            end_time = time.monotonic()
-            duration = end_time - start_time
-
-            if server_process2:
-                try:
-                    server_process2.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    server_process2.kill()
-                    server_process2.wait()
-                server_process2 = None
-
-            mismatches, missing = [], []
-            if client_result.returncode == 0:
-                received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
-                mismatches, missing = verify_transfer(source_dir, received)
-
-            entry = {
-                "name": "Standard (no metadata)",
-                "suite": profile_name,
-                "time": f"{duration:.4f}s" if client_result.returncode == 0 else "N/A",
-            }
-
-            if client_result.returncode == 0 and not mismatches and not missing:
-                entry["status"] = "Success"
-                entry["error"] = ""
-            else:
-                entry["status"] = "Failed"
-                errors = []
-                if client_result.returncode != 0:
-                    err = (
-                        client_result.stderr.strip().split("\n")[0]
-                        if client_result.stderr
-                        else (
-                            client_result.stdout.strip().split("\n")[0]
-                            if client_result.stdout
-                            else "No output"
-                        )
-                    )
-                    errors.append(f"Exit code {client_result.returncode}: {err[:80]}")
-                if missing:
-                    errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
-                if mismatches:
-                    errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
-                entry["error"] = " | ".join(errors)
-
-            results.append(entry)
-
-        except Exception as e:
-            results.append(
-                {"name": "Standard (no metadata)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
-            )
-        finally:
-            if server_process2:
-                try:
-                    server_process2.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    server_process2.kill()
-                    server_process2.wait()
-
-        # Rsync tests (over network via daemon, so tc netem applies)
-        rsync_port = find_free_port()
-        rsyncd_conf = os.path.join(tempfile.gettempdir(), f"rsyncd-{rsync_port}.conf")
-        with open(rsyncd_conf, "w") as f:
-            f.write(f"""port = {rsync_port}
-read only = yes
-
-[source]
-    path = {source_dir}
-""")
-
-        rsync_daemon = None
-        try:
-            rsync_daemon = subprocess.Popen(
-                ["rsync", "--daemon", "--no-detach", f"--config={rsyncd_conf}"],
-                stdout=subprocess.DEVNULL, stderr=None
-            )
-            for _ in range(50):
-                time.sleep(0.1)
-                if rsync_daemon.poll() is not None:
-                    print(f"  rsync daemon exited (rc={rsync_daemon.returncode})")
-                    raise RuntimeError("rsync daemon failed to start")
-                try:
-                    with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.3):
-                        break
-                except (ConnectionRefusedError, OSError):
-                    continue
-            else:
-                print(f"  timed out waiting for rsync daemon on port {rsync_port}")
-                raise RuntimeError("rsync daemon did not start")
-
-            for case in RSYNC_CASES:
-                name = case["name"]
-                rsync_args = case["args"]
-                print(f"\n  --- {name} ---")
-
-                if os.path.exists(dest_dir):
-                    shutil.rmtree(dest_dir)
-
-                try:
-                    rsync_cmd = (
-                        client_prefix
-                        + ["rsync"]
-                        + rsync_args
-                        + [f"rsync://localhost:{rsync_port}/source/", f"{dest_dir}/"]
-                    )
-                    print(f"    Running: {' '.join(rsync_cmd)}")
-
-                    start_time = time.monotonic()
-                    rsync_result = subprocess.run(
-                        rsync_cmd, capture_output=True, text=True, timeout=120
-                    )
-                    end_time = time.monotonic()
-                    duration = end_time - start_time
-
-                    mismatches, missing = [], []
-                    if rsync_result.returncode == 0:
-                        mismatches, missing = verify_transfer(source_dir, dest_dir)
-
-                    entry = {
-                        "name": name,
-                        "suite": profile_name,
-                        "time": f"{duration:.4f}s" if rsync_result.returncode == 0 else "N/A",
-                    }
-
-                    if rsync_result.returncode == 0 and not mismatches and not missing:
-                        entry["status"] = "Success"
-                        entry["error"] = ""
-                    else:
-                        entry["status"] = "Failed"
-                        errors = []
-                        if rsync_result.returncode != 0:
-                            errs = []
-                            for line in (rsync_result.stderr or "").split("\n"):
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                if line.startswith("Running as unit:"):
-                                    continue
-                                errs.append(line)
-                            for line in (rsync_result.stdout or "").split("\n"):
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                errs.append(line)
-                            if not errs:
-                                errs.append("No output")
-                            err = " | ".join(errs[-3:])
-                            errors.append(f"Exit code {rsync_result.returncode}: {err[:200]}")
-                            # Retry without systemd-run to reveal the actual error
-                            if client_prefix:
-                                tmp_dest = tempfile.mkdtemp()
-                                try:
-                                    plain = subprocess.run(
-                                        ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", f"{tmp_dest}/"],
-                                        capture_output=True, text=True, timeout=30
-                                    )
-                                    if plain.returncode != 0:
-                                        plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
-                                        if plain_errs:
-                                            errors.append(f"raw: {plain_errs[-1][:150]}")
-                                finally:
-                                    shutil.rmtree(tmp_dest, ignore_errors=True)
-                        if missing:
-                            errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
-                        if mismatches:
-                            errors.append(f"Mismatch ({len(mismatches)}): {', '.join(mismatches[:3])}")
-                        entry["error"] = " | ".join(errors)
-
-                    results.append(entry)
-
-                except subprocess.TimeoutExpired:
-                    results.append(
-                        {"name": name, "suite": profile_name, "status": "Timeout", "time": "N/A", "error": "Exceeded 120s"}
-                    )
-                except Exception as e:
-                    results.append(
-                        {"name": name, "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)}
-                    )
-
-        finally:
-            if rsync_daemon:
-                try:
-                    rsync_daemon.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    rsync_daemon.kill()
-                    rsync_daemon.wait()
-            try:
-                os.unlink(rsyncd_conf)
-            except Exception:
-                pass
+        results = []
+        results.extend(run_client_tests(profile_name, source_dir, dest_dir, client_prefix))
+        results.extend(run_rsync_tests(profile_name, source_dir, dest_dir, client_prefix))
 
     except subprocess.CalledProcessError as e:
         print(f"  Error running netem command: {' '.join(e.cmd)}")
+        results = []
     finally:
         if is_limited:
             try:
@@ -521,6 +414,77 @@ def format_throughput(bps):
     if bps >= 1_000:
         return f"{bps/1_000:.1f} KB/s"
     return f"{bps:.0f} B/s"
+
+
+def print_results(all_results, total_bytes):
+    print("\n" + "=" * 130)
+    print(f"{'RESULTS':^130}")
+    print("=" * 130)
+    print(f"{'Configuration':<45} | {'Profile':<12} | {'Status':<8} | {'Time':<10} | {'Details'}")
+    print("-" * 130)
+
+    for res in all_results:
+        print(
+            f"{res['name']:<45} | {res['suite']:<12} | {res['status']:<8} | {res['time']:<10} | {res['error']}"
+        )
+
+    # --- Additional metrics per profile ---
+    profiles_results = {}
+    for res in all_results:
+        profiles_results.setdefault(res["suite"], []).append(res)
+
+    for profile_name, results in profiles_results.items():
+        params = NETWORK_PROFILES.get(profile_name)
+        if not params or "rate" not in params:
+            continue
+
+        client_times = []
+        rsync_times = {}
+        for r in results:
+            if r["status"] != "Success" or r["time"] == "N/A":
+                continue
+            t = float(r["time"].rstrip("s"))
+            if r["name"].startswith("rsync"):
+                rsync_times[r["name"]] = t
+            else:
+                client_times.append((t, r["name"]))
+
+        if not client_times or len(rsync_times) < 2:
+            continue
+
+        best_time, best_name = min(client_times, key=lambda x: x[0])
+
+        rate_Bps = parse_rate_to_bytes_per_sec(params["rate"])
+        theoretical_max_time = None
+        speedup_vs_theoretical = None
+        if rate_Bps is not None:
+            theoretical_max_time = total_bytes / rate_Bps
+            speedup_vs_theoretical = theoretical_max_time / best_time
+
+        print(f"\n  {'─' * 90}")
+        print(f"  Profile: {profile_name}")
+        print(f"  {'─' * 90}")
+        print(f"  Total data size:               {total_bytes / (1024*1024):.1f} MB")
+        print(f"  Network rate:                  {params['rate']} ({format_throughput(rate_Bps)})" if rate_Bps else "")
+        print(f"  Best client configuration:     {best_name}")
+        print(f"  Best client time:              {best_time:.4f}s")
+        if theoretical_max_time is not None:
+            print(f"  Theoretical max (uncompressed): {theoretical_max_time:.4f}s")
+            print(f"  Speedup vs theoretical max:    {speedup_vs_theoretical:.2f}x")
+
+        rsync_archive = rsync_times.get("rsync (archive)")
+        rsync_compress = rsync_times.get("rsync (archive + compress)")
+        if rsync_archive:
+            print(f"  Speedup vs rsync (archive):    {rsync_archive / best_time:.2f}x")
+        if rsync_compress:
+            print(f"  Speedup vs rsync (compress):   {rsync_compress / best_time:.2f}x")
+
+    failed = [r for r in all_results if r["status"] != "Success"]
+    if failed:
+        print(f"\n  {len(failed)} test(s) FAILED")
+        sys.exit(1)
+    else:
+        print(f"\n  ALL {len(all_results)} TESTS PASSED")
 
 
 def main():
@@ -563,74 +527,7 @@ def main():
                 run_profile(profile, args.source_dir, args.dest_dir)
             )
 
-        print("\n" + "=" * 130)
-        print(f"{'RESULTS':^130}")
-        print("=" * 130)
-        print(f"{'Configuration':<45} | {'Profile':<12} | {'Status':<8} | {'Time':<10} | {'Details'}")
-        print("-" * 130)
-
-        for res in all_results:
-            print(
-                f"{res['name']:<45} | {res['suite']:<12} | {res['status']:<8} | {res['time']:<10} | {res['error']}"
-            )
-
-        # --- Additional metrics per profile ---
-        profiles_results = {}
-        for res in all_results:
-            profiles_results.setdefault(res["suite"], []).append(res)
-
-        for profile_name, results in profiles_results.items():
-            params = NETWORK_PROFILES.get(profile_name)
-            if not params or "rate" not in params:
-                continue
-
-            client_times = []
-            rsync_times = {}
-            for r in results:
-                if r["status"] != "Success" or r["time"] == "N/A":
-                    continue
-                t = float(r["time"].rstrip("s"))
-                if r["name"].startswith("rsync"):
-                    rsync_times[r["name"]] = t
-                else:
-                    client_times.append((t, r["name"]))
-
-            if not client_times or len(rsync_times) < 2:
-                continue
-
-            best_time, best_name = min(client_times, key=lambda x: x[0])
-
-            rate_Bps = parse_rate_to_bytes_per_sec(params["rate"])
-            theoretical_max_time = None
-            speedup_vs_theoretical = None
-            if rate_Bps is not None:
-                theoretical_max_time = total_bytes / rate_Bps
-                speedup_vs_theoretical = theoretical_max_time / best_time
-
-            print(f"\n  {'─' * 90}")
-            print(f"  Profile: {profile_name}")
-            print(f"  {'─' * 90}")
-            print(f"  Total data size:               {total_bytes / (1024*1024):.1f} MB")
-            print(f"  Network rate:                  {params['rate']} ({format_throughput(rate_Bps)})" if rate_Bps else "")
-            print(f"  Best client configuration:     {best_name}")
-            print(f"  Best client time:              {best_time:.4f}s")
-            if theoretical_max_time is not None:
-                print(f"  Theoretical max (uncompressed): {theoretical_max_time:.4f}s")
-                print(f"  Speedup vs theoretical max:    {speedup_vs_theoretical:.2f}x")
-
-            rsync_archive = rsync_times.get("rsync (archive)")
-            rsync_compress = rsync_times.get("rsync (archive + compress)")
-            if rsync_archive:
-                print(f"  Speedup vs rsync (archive):    {rsync_archive / best_time:.2f}x")
-            if rsync_compress:
-                print(f"  Speedup vs rsync (compress):   {rsync_compress / best_time:.2f}x")
-
-        failed = [r for r in all_results if r["status"] != "Success"]
-        if failed:
-            print(f"\n  {len(failed)} test(s) FAILED")
-            sys.exit(1)
-        else:
-            print(f"\n  ALL {len(all_results)} TESTS PASSED")
+        print_results(all_results, total_bytes)
 
     finally:
         if not args.keep_data:
