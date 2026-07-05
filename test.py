@@ -1,6 +1,7 @@
 import argparse
 import filecmp
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -129,6 +130,7 @@ def generate_test_files(source_dir):
 
     total_mb = written / (1024 * 1024)
     print(f"  Generated {total_mb:.1f} MB of test data in {source_dir}")
+    return written
 
 
 def verify_transfer(source_dir, received_dir):
@@ -414,6 +416,31 @@ read only = yes
     return results
 
 
+def parse_rate_to_bytes_per_sec(rate_str):
+    m = re.match(r'(\d+)\s*(mbit|gbit|kbit|bit)', rate_str)
+    if not m:
+        return None
+    val = int(m.group(1))
+    unit = m.group(2)
+    bits_per_sec = {
+        'bit': val,
+        'kbit': val * 1000,
+        'mbit': val * 1_000_000,
+        'gbit': val * 1_000_000_000,
+    }.get(unit)
+    return bits_per_sec / 8 if bits_per_sec is not None else None
+
+
+def format_throughput(bps):
+    if bps >= 1_000_000_000:
+        return f"{bps/1_000_000_000:.1f} GB/s"
+    if bps >= 1_000_000:
+        return f"{bps/1_000_000:.1f} MB/s"
+    if bps >= 1_000:
+        return f"{bps/1_000:.1f} KB/s"
+    return f"{bps:.0f} B/s"
+
+
 def main():
     parser = argparse.ArgumentParser(description="FastSync integration test / benchmark")
     parser.add_argument("--source-dir", default=DEFAULT_SOURCE_DIR,
@@ -434,7 +461,7 @@ def main():
         print("Build failed")
         sys.exit(1)
 
-    generate_test_files(args.source_dir)
+    total_bytes = generate_test_files(args.source_dir)
     if os.path.exists(args.dest_dir):
         shutil.rmtree(args.dest_dir)
     os.makedirs(args.dest_dir, exist_ok=True)
@@ -464,6 +491,57 @@ def main():
             print(
                 f"{res['name']:<45} | {res['suite']:<12} | {res['status']:<8} | {res['time']:<10} | {res['error']}"
             )
+
+        # --- Additional metrics per profile ---
+        profiles_results = {}
+        for res in all_results:
+            profiles_results.setdefault(res["suite"], []).append(res)
+
+        for profile_name, results in profiles_results.items():
+            params = NETWORK_PROFILES.get(profile_name)
+            if not params or "rate" not in params:
+                continue
+
+            client_times = []
+            rsync_times = {}
+            for r in results:
+                if r["status"] != "Success" or r["time"] == "N/A":
+                    continue
+                t = float(r["time"].rstrip("s"))
+                if r["name"].startswith("rsync"):
+                    rsync_times[r["name"]] = t
+                else:
+                    client_times.append((t, r["name"]))
+
+            if not client_times or len(rsync_times) < 2:
+                continue
+
+            best_time, best_name = min(client_times, key=lambda x: x[0])
+
+            rate_Bps = parse_rate_to_bytes_per_sec(params["rate"])
+            theoretical_max_time = None
+            speedup_vs_theoretical = None
+            if rate_Bps is not None:
+                theoretical_max_time = total_bytes / rate_Bps
+                speedup_vs_theoretical = theoretical_max_time / best_time
+
+            print(f"\n  {'─' * 90}")
+            print(f"  Profile: {profile_name}")
+            print(f"  {'─' * 90}")
+            print(f"  Total data size:               {total_bytes / (1024*1024):.1f} MB")
+            print(f"  Network rate:                  {params['rate']} ({format_throughput(rate_Bps)})" if rate_Bps else "")
+            print(f"  Best client configuration:     {best_name}")
+            print(f"  Best client time:              {best_time:.4f}s")
+            if theoretical_max_time is not None:
+                print(f"  Theoretical max (uncompressed): {theoretical_max_time:.4f}s")
+                print(f"  Speedup vs theoretical max:    {speedup_vs_theoretical:.2f}x")
+
+            rsync_archive = rsync_times.get("rsync (archive)")
+            rsync_compress = rsync_times.get("rsync (archive + compress)")
+            if rsync_archive:
+                print(f"  Speedup vs rsync (archive):    {rsync_archive / best_time:.2f}x")
+            if rsync_compress:
+                print(f"  Speedup vs rsync (compress):   {rsync_compress / best_time:.2f}x")
 
         failed = [r for r in all_results if r["status"] != "Success"]
         if failed:
