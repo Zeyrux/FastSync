@@ -44,7 +44,7 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
         data_destroy(file->data);
         file->data = compressed_data;
       }
-      file_send_single_calls(file, client->file_descriptor);
+      file_send_single_calls(file, client->file_descriptor, config->use_metadata);
     }
   }
   return 0;

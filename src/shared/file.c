@@ -123,9 +123,10 @@ FileMetadata *file_receive_metadata(int file_descriptor) {
   return m;
 }
 
-void file_send_single_calls(File *file, int file_descriptor) {
+void file_send_single_calls(File *file, int file_descriptor, bool use_metadata) {
   send_str(file_descriptor, file->path);
-  metadata_send(file_descriptor, file->metadata);
+  if (use_metadata)
+    metadata_send(file_descriptor, file->metadata);
   printf("Sending File: %ld", file->data->size);
   send_data(file_descriptor, file->data->data, file->data->size);
 }
