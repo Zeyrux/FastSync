@@ -23,9 +23,9 @@ NETWORK_PROFILES = {
     "Unlimited": {},
     "LAN": {
         "rate": "1000mbit",
-        "delay": "1ms",
-        "jitter": "0.1ms",
-        "loss": "0%",
+        "delay": "20ms",
+        "jitter": "1ms",
+        "loss": "0.1%",
     },
     "WAN": {
         "rate": "100mbit",
