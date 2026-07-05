@@ -345,14 +345,32 @@ path = {source_dir}
                         errors = []
                         if rsync_result.returncode != 0:
                             errs = []
-                            if rsync_result.stderr:
-                                errs.append(rsync_result.stderr.strip().split("\n")[0])
-                            if rsync_result.stdout:
-                                errs.append(rsync_result.stdout.strip().split("\n")[0])
+                            for line in (rsync_result.stderr or "").split("\n"):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                if line.startswith("Running as unit:"):
+                                    continue
+                                errs.append(line)
+                            for line in (rsync_result.stdout or "").split("\n"):
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                errs.append(line)
                             if not errs:
                                 errs.append("No output")
-                            err = " | ".join(errs)
-                            errors.append(f"Exit code {rsync_result.returncode}: {err[:150]}")
+                            err = " | ".join(errs[-3:])
+                            errors.append(f"Exit code {rsync_result.returncode}: {err[:200]}")
+                            # Retry without systemd-run to reveal the actual error
+                            if client_prefix:
+                                plain = subprocess.run(
+                                    ["rsync", "-aH", f"rsync://localhost:{rsync_port}/source/", "/tmp/"],
+                                    capture_output=True, text=True, timeout=30
+                                )
+                                if plain.returncode != 0:
+                                    plain_errs = [l for l in (plain.stderr or "").split("\n") if l.strip()]
+                                    if plain_errs:
+                                        errors.append(f"raw: {plain_errs[-1][:150]}")
                         if missing:
                             errors.append(f"Missing ({len(missing)}): {', '.join(missing[:5])}")
                         if mismatches:
