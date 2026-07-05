@@ -20,6 +20,7 @@ Config *config_create(char *version, char *send_directory,
   config->use_compression = use_compression;
   config->compression_level = compression_level;
   config->num_connections = num_connections;
+  config->use_sendfile = false;
   return config;
 }
 

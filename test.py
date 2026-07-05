@@ -48,6 +48,7 @@ TEST_CASES = [
         "name": "Multithreading + Compression + Chunk Serialization (-m -c -s)",
         "flags": ["-m", "-c", "-s"],
     },
+    {"name": "Sendfile (-f)", "flags": ["-f"]},
 ]
 
 

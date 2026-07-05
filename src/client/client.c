@@ -29,6 +29,11 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     }
     send_data(client->file_descriptor, data->data, data->size);
     data_destroy(data);
+  } else if (config->use_sendfile && !config->use_compression) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      send_status(client->file_descriptor, STATUS_NEXT);
+      file_send_sendfile(chunk->items[i], client->file_descriptor);
+    }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
       send_status(client->file_descriptor, STATUS_NEXT);
@@ -130,8 +135,10 @@ int send_files(Config *config) {
   DirectoryScanner *scanner = directory_scanner_create(config->send_directory);
   Chunk *current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
-    for (int i = 0; i < current_chunk->element_count; i++)
-      file_load_data(current_chunk->items[i]);
+    if (!config->use_sendfile) {
+      for (int i = 0; i < current_chunk->element_count; i++)
+        file_load_data(current_chunk->items[i]);
+    }
     send_chunk(client, current_chunk, config);
     chunk_destroy(current_chunk);
   }
@@ -145,6 +152,11 @@ int send_files(Config *config) {
 }
 
 int send_files_multithreaded(Config *config) {
+  if (config->use_sendfile) {
+    log_message(LOG_LEVEL_INFO, "Sendfile enabled, falling back to single-threaded");
+    return send_files(config);
+  }
+
   PipelineContextSender *context =
       pipeline_context_sender_create(config, queue_create(100, chunk_destroy),
                                      queue_create(100, chunk_destroy));
@@ -215,6 +227,9 @@ int main(int argc, char *argv[]) {
       config->receive_root_directory = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--save-to-disk") == 0) {
       config->save_to_disk = true;
+    } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--sendfile") == 0) {
+      config->use_sendfile = true;
+      log_message(LOG_LEVEL_INFO, "Enabled sendfile");
     } else {
       handle_arg(argv[i], "-m", &config->use_multithreading,
                  "Enabled Multithreading");

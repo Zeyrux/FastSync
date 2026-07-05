@@ -11,6 +11,7 @@ typedef struct Config {
   bool use_multithreading;
   bool use_chunk_serialization;
   bool use_compression;
+  bool use_sendfile;
   bool use_single_send_per_file;
   int compression_level;
   int num_connections;

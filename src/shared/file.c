@@ -1,9 +1,12 @@
 #include <dirent.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
+#include <unistd.h>
 #include <zstd.h>
 
 #include "data.h"
@@ -66,6 +69,31 @@ void file_send_single_calls(File *file, int file_descriptor) {
   send_str(file_descriptor, file->path);
   printf("Sending File: %ld", file->data->size);
   send_data(file_descriptor, file->data->data, file->data->size);
+}
+
+void file_send_sendfile(File *file, int file_descriptor) {
+  send_str(file_descriptor, file->path);
+
+  int fd = open(file->path, O_RDONLY);
+  if (fd == -1) {
+    perror("Could not open file for sendfile");
+    exit(EXIT_FAILURE);
+  }
+
+  unsigned long long file_size = file->stats.st_size;
+  send_n_data(file_descriptor, &file_size, sizeof(unsigned long long));
+
+  off_t offset = 0;
+  while (offset < file_size) {
+    ssize_t sent = sendfile(file_descriptor, fd, &offset, file_size - offset);
+    if (sent == -1) {
+      perror("sendfile failed");
+      close(fd);
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  close(fd);
 }
 
 size_t file_content_to_buffer(File *file) {
