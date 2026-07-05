@@ -395,6 +395,8 @@ def main():
         sys.exit(1)
 
     generate_test_files(args.source_dir)
+    if os.path.exists(args.dest_dir):
+        shutil.rmtree(args.dest_dir)
     os.makedirs(args.dest_dir, exist_ok=True)
 
     profiles_to_run = []
