@@ -274,13 +274,11 @@ def run_profile(profile_name, source_dir, dest_dir):
         rsync_port = find_free_port()
         rsyncd_conf = os.path.join(tempfile.gettempdir(), f"rsyncd-{rsync_port}.conf")
         with open(rsyncd_conf, "w") as f:
-            f.write(f"""use chroot = no
-max connections = 5
+            f.write(f"""port = {rsync_port}
 read only = yes
-port = {rsync_port}
 
 [source]
-path = {source_dir}
+    path = {source_dir}
 """)
 
         rsync_daemon = None
@@ -289,13 +287,13 @@ path = {source_dir}
                 ["rsync", "--daemon", "--no-detach", f"--config={rsyncd_conf}"],
                 stdout=subprocess.DEVNULL, stderr=None
             )
-            for _ in range(25):
+            for _ in range(50):
                 time.sleep(0.1)
                 if rsync_daemon.poll() is not None:
-                    print(f"  rsync daemon exited prematurely (rc={rsync_daemon.returncode})")
+                    print(f"  rsync daemon exited (rc={rsync_daemon.returncode})")
                     raise RuntimeError("rsync daemon failed to start")
                 try:
-                    with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.5):
+                    with socket.create_connection(("127.0.0.1", rsync_port), timeout=0.3):
                         break
                 except (ConnectionRefusedError, OSError):
                     continue
