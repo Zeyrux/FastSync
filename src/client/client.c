@@ -201,7 +201,7 @@ int main(int argc, char *argv[]) {
   }
 
   Config *config = config_create(str_dup("1.0.0"), source_dir, dest_dir,
-                                 save_to_disk, false, false, false, 5, 20);
+                                 save_to_disk, false, false, false, 5, 20, false);
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0) {
       config->use_compression = true;
