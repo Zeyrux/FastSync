@@ -381,27 +381,31 @@ def check_ssh_localhost():
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                         "localhost", "which", "fastsync-server"],
                        capture_output=True, timeout=10)
-    if r.returncode != 0:
-        SSH_AVAILABLE = False
-        # Try common directories that are typically in PATH
-        for d in ["~/.local/bin", "~/bin", "~/.local/state/nix/profile/bin"]:
-            install = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "localhost",
-                 f"mkdir -p {d} && ln -sf {server_path} {d}/fastsync-server && test -f {d}/fastsync-server"],
-                capture_output=True, timeout=10)
-            if install.returncode == 0:
-                SSH_AVAILABLE = True
-                break
-        if not SSH_AVAILABLE:
-            # Last resort: find a writable dir in PATH
-            r2 = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "localhost",
-                 'd=$(echo $PATH | tr ":" "\\n" | while read p; do [ -w "$p" ] && echo "$p" && break; done) && '
-                 f'ln -sf {server_path} "$d"/fastsync-server && test -f "$d"/fastsync-server'],
-                capture_output=True, timeout=10)
-            SSH_AVAILABLE = r2.returncode == 0
-    else:
+    if r.returncode == 0:
         SSH_AVAILABLE = True
+        return
+
+    SSH_AVAILABLE = False
+    # Try each PATH dir: create symlink, then verify with which
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "localhost",
+         'echo "$PATH"'],
+        capture_output=True, timeout=10, text=True)
+    if r.returncode != 0:
+        return
+    for d in r.stdout.strip().split(":"):
+        d = d.strip()
+        if not d:
+            continue
+        if "wrappers" in d:
+            continue
+        test = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "localhost",
+             f'test -w "{d}" && ln -sf {server_path} "{d}/fastsync-server" && which fastsync-server'],
+            capture_output=True, timeout=10)
+        if test.returncode == 0:
+            SSH_AVAILABLE = True
+            return
 
 
 def preflight_checks():
