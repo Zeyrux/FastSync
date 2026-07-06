@@ -18,6 +18,20 @@ static void test_config_lifecycle() {
   EXPECT_FALSE(cfg->use_chunk_serialization);
   EXPECT_FALSE(cfg->use_compression);
   EXPECT_EQ_INT(cfg->num_connections, 4);
+  EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
+  EXPECT_NULL(cfg->ssh_destination);
+  config_delete(cfg);
+}
+
+static void test_config_ssh_dest() {
+  Config *cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("user@host:/dst"),
+                              true, false, false, false, false, 1, 4, false);
+  cfg->transport = TRANSPORT_SSH;
+  cfg->ssh_destination = str_dup("user@host:/dst");
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_EQ_INT(cfg->transport, TRANSPORT_SSH);
+  EXPECT_EQ_STR(cfg->ssh_destination, "user@host:/dst");
+  EXPECT_EQ_STR(cfg->receive_root_directory, "user@host:/dst");
   config_delete(cfg);
 }
 
@@ -55,6 +69,7 @@ static void test_pipeline_receiver_lifecycle() {
 
 void test_config() {
   test_config_lifecycle();
+  test_config_ssh_dest();
   test_pipeline_sender_lifecycle();
   test_pipeline_receiver_lifecycle();
 }

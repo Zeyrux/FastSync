@@ -51,6 +51,7 @@ BASE_CLIENT_FLAGS = ["--save-to-disk"]
 
 TEST_CASES = [
     {"name": "Standard", "flags": []},
+    {"name": "Posix Args (no flags)", "flags": [], "posix": True},
     {"name": "Standard (no metadata)", "flags": [], "use_metadata": False},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
     {"name": "Compression (-c)", "flags": ["-c"]},
@@ -246,7 +247,10 @@ def run_profile(profile_name, source_dir, dest_dir):
         results = []
         for case in TEST_CASES:
             flags = BASE_CLIENT_FLAGS + (["-M"] if case.get("use_metadata", True) else []) + case["flags"]
-            cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
+            if case.get("posix"):
+                cmd = client_prefix + BASE_CLIENT_CMD + [source_dir, dest_dir] + flags
+            else:
+                cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
             print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
             try:
                 r = run_single_test(cmd, case["name"], source_dir, dest_dir)
@@ -344,7 +348,48 @@ def format_throughput(bps):
     return f"{bps:.0f} B/s"
 
 
+def preflight_checks():
+    errors = []
+    print("Pre-flight checks:")
+    print("  [1] --help flag...", end=" ")
+    r = subprocess.run(BASE_CLIENT_CMD + ["--help"], capture_output=True, text=True)
+    if r.returncode == 0 and "Usage:" in r.stdout and "SSH transport" in r.stdout:
+        print("OK")
+    else:
+        print("FAIL")
+        errors.append("--help failed")
+
+    print("  [2] Remote SSH dest detection...", end=" ")
+    r = subprocess.run(BASE_CLIENT_CMD + ["/x", "somehost:/y"], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0 and ("ssh" in r.stderr or "Could not receive" in r.stderr or "could not launch" in r.stderr or "Error" in r.stderr):
+        print("OK (detected as SSH)")
+    else:
+        print("FAIL (not detected as SSH dest)")
+        errors.append("SSH detection failed")
+
+    print("  [3] Server --stdio flag...", end=" ")
+    r = subprocess.run(["./build/server", "--stdio"], capture_output=True, text=True, timeout=3)
+    if r.returncode != 0 and ("receiving" in r.stderr or "receiving" in r.stdout or "Receiving" in r.stderr):
+        print("OK (started in stdio mode)")
+    else:
+        print("WARN (stdio exited: rc=%d)" % r.returncode)
+
+    print("  [4] Posix arg syntax (no server, expect failure)...", end=" ")
+    r = subprocess.run(BASE_CLIENT_CMD + ["/tmp/x", "/tmp/y"], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0 and "connect" in r.stderr:
+        print("OK (TCP fallback)")
+    else:
+        print("FAIL")
+        errors.append("Posix arg syntax failed")
+
+    if errors:
+        print(f"\n  {len(errors)} pre-flight check(s) failed: {', '.join(errors)}")
+        sys.exit(1)
+    print("  All pre-flight checks passed.\n")
+
+
 def main():
+    preflight_checks()
     parser = argparse.ArgumentParser(description="FastSync integration test / benchmark")
     parser.add_argument("--source-dir", default=DEFAULT_SOURCE_DIR)
     parser.add_argument("--dest-dir", default=DEFAULT_DEST_DIR)

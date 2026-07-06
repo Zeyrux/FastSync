@@ -10,6 +10,7 @@
 #include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 
 File *file_receive(Config *config, int file_descriptor) {
@@ -161,12 +162,18 @@ void handler(int file_descriptor) {
     thrd_join(receiver, NULL);
     thrd_join(writer, NULL);
     pipeline_context_receiver_destroy(context);
+    send_status(file_descriptor, STATUS_OK);
   } else
     receive_files(config, file_descriptor);
   close(file_descriptor);
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+  if (argc > 1 && strcmp(argv[1], "--stdio") == 0) {
+    io_set_fds(STDIN_FILENO, STDOUT_FILENO);
+    handler(STDIN_FILENO);
+    return 0;
+  }
   Server *server = server_create(8080);
   server_listen(server, handler);
   server_delete(server);
