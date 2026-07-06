@@ -382,20 +382,26 @@ def check_ssh_localhost():
                         "localhost", "which", "fastsync-server"],
                        capture_output=True, timeout=10)
     if r.returncode != 0:
-        path_r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "localhost",
-             "echo $PATH | tr ':' '\\n' | while read d; do [ -w \"$d\" ] && echo \"$d\" && break; done"],
-            capture_output=True, timeout=10, text=True)
-        remote_bin_dir = path_r.stdout.strip()
-        if remote_bin_dir:
+        SSH_AVAILABLE = False
+        # Try common directories that are typically in PATH
+        for d in ["~/.local/bin", "~/bin", "~/.local/state/nix/profile/bin"]:
             install = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "localhost",
-                 f"ln -sf {server_path} {remote_bin_dir}/fastsync-server"],
+                 f"mkdir -p {d} && ln -sf {server_path} {d}/fastsync-server && test -f {d}/fastsync-server"],
                 capture_output=True, timeout=10)
             if install.returncode == 0:
-                r = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost",
-                                    "which", "fastsync-server"], capture_output=True, timeout=10)
-    SSH_AVAILABLE = r.returncode == 0
+                SSH_AVAILABLE = True
+                break
+        if not SSH_AVAILABLE:
+            # Last resort: find a writable dir in PATH
+            r2 = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "localhost",
+                 'd=$(echo $PATH | tr ":" "\\n" | while read p; do [ -w "$p" ] && echo "$p" && break; done) && '
+                 f'ln -sf {server_path} "$d"/fastsync-server && test -f "$d"/fastsync-server'],
+                capture_output=True, timeout=10)
+            SSH_AVAILABLE = r2.returncode == 0
+    else:
+        SSH_AVAILABLE = True
 
 
 def preflight_checks():
