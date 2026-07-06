@@ -16,6 +16,9 @@
 #include "utils.h"
 #include <dirent.h>
 
+static char *server_host = "127.0.0.1";
+static int server_port = 8080;
+
 int send_chunk(Client *client, Chunk *chunk, Config *config) {
   if (config->use_chunk_serialization) {
     send_status(client->file_descriptor, STATUS_CHUNK);
@@ -108,11 +111,7 @@ int send_chunks_multithreaded(void *pipeline_context) {
     client = client_connect_ssh(context->config->ssh_destination);
   } else {
     client = client_create();
-    const char *env_ip = getenv("FASTSYNC_SERVER_IP");
-    const char *ip = env_ip ? env_ip : "127.0.0.1";
-    const char *env_port = getenv("FASTSYNC_SERVER_PORT");
-    int port = env_port ? atoi(env_port) : 8080;
-    client_connect(client, (char *)ip, port);
+    client_connect(client, server_host, server_port);
   }
   config_send(client->file_descriptor, context->config);
 
@@ -123,14 +122,10 @@ int send_chunks_multithreaded(void *pipeline_context) {
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
       send_status(client->file_descriptor, STATUS_FINISHED);
-      if (receive_status(client->file_descriptor) != STATUS_OK) {
-        client_disconnect(client);
-        client_delete(client);
-        return 1;
-      }
+      int ok = receive_status(client->file_descriptor) == STATUS_OK;
       client_disconnect(client);
       client_delete(client);
-      return thrd_success;
+      return ok ? thrd_success : 1;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
       perror("Something unexpected happend while sending the chunk");
@@ -150,11 +145,7 @@ int send_files(Config *config) {
     client = client_connect_ssh(config->ssh_destination);
   } else {
     client = client_create();
-    const char *env_ip = getenv("FASTSYNC_SERVER_IP");
-    const char *ip = env_ip ? env_ip : "127.0.0.1";
-    const char *env_port = getenv("FASTSYNC_SERVER_PORT");
-    int port = env_port ? atoi(env_port) : 8080;
-    client_connect(client, (char *)ip, port);
+    client_connect(client, server_host, server_port);
   }
   config_send(client->file_descriptor, config);
   DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata);
@@ -168,12 +159,11 @@ int send_files(Config *config) {
     chunk_destroy(current_chunk);
   }
   send_status(client->file_descriptor, STATUS_FINISHED);
-  if (receive_status(client->file_descriptor) != STATUS_OK)
-    return -1;
+  int ok = receive_status(client->file_descriptor) == STATUS_OK;
   directory_scanner_destroy(scanner);
   client_disconnect(client);
   client_delete(client);
-  return 0;
+  return ok ? 0 : -1;
 }
 
 int send_files_multithreaded(Config *config) {
@@ -228,6 +218,8 @@ static void print_usage(void) {
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");
   printf("  --save-to-disk      Write received files to disk\n");
+  printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
+  printf("  --server-port <n>   Server port (default: 8080)\n");
   printf("  --help              Show this help\n");
 }
 
@@ -285,6 +277,11 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "-s") == 0) {
       config->use_chunk_serialization = true;
       log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
+    } else if (strcmp(argv[i], "--server-host") == 0 && i + 1 < argc) {
+      free(server_host);
+      server_host = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
+      server_port = atoi(argv[++i]);
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
@@ -302,8 +299,8 @@ int main(int argc, char *argv[]) {
 
   if (positional_count == 2) {
     free(config->send_directory);
-    config->send_directory = str_dup(argv[positional_args[0]]);
     free(config->receive_root_directory);
+    config->send_directory = str_dup(argv[positional_args[0]]);
     config->receive_root_directory = str_dup(argv[positional_args[1]]);
     config->save_to_disk = true;
 
@@ -316,18 +313,17 @@ int main(int argc, char *argv[]) {
     print_usage();
     return 1;
   } else {
-    if (!config->send_directory) {
-      config->send_directory =
-          env_source ? str_dup((char *)env_source)
-                     : str_dup("/home/taptap/Nextcloud/Uni/moodle/B. Schnor： "
-                               "Konzepte Paralleler Programmierung, SoSe 2026");
-    }
-    if (!config->receive_root_directory) {
-      config->receive_root_directory =
-          env_dest ? str_dup((char *)env_dest) : str_dup("./data_copied");
-    }
+    if (!config->send_directory && env_source)
+      config->send_directory = str_dup((char *)env_source);
+    if (!config->receive_root_directory && env_dest)
+      config->receive_root_directory = str_dup((char *)env_dest);
   }
 
+  if (!config->send_directory || !config->receive_root_directory) {
+    fprintf(stderr, "Error: source and destination directories are required\n");
+    print_usage();
+    return 1;
+  }
   if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
     fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk serialization)\n");
     return 1;
