@@ -273,7 +273,7 @@ def run_profile(profile_name, source_dir, dest_dir):
             for case in SSH_CASES:
                 flags = BASE_CLIENT_FLAGS + (["-M"] if case.get("use_metadata", True) else []) + case["flags"]
                 ssh_dest = f"localhost:{dest_dir}_ssh"
-                cmd = client_prefix + BASE_CLIENT_CMD + [source_dir, ssh_dest] + flags
+                cmd = BASE_CLIENT_CMD + [source_dir, ssh_dest] + flags
                 print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
                 try:
                     r = run_single_test(cmd, case["name"], source_dir, f"{dest_dir}_ssh", no_server=True)
@@ -281,7 +281,7 @@ def run_profile(profile_name, source_dir, dest_dir):
                     results.append(r)
                 except Exception as e:
                     results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
-
+    
         port, conf, daemon = start_rsync_daemon(source_dir)
         try:
             for case in RSYNC_CASES:

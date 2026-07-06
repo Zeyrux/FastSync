@@ -307,6 +307,10 @@ int main(int argc, char *argv[]) {
     if (is_remote_dest(config->receive_root_directory)) {
       config->transport = TRANSPORT_SSH;
       config->ssh_destination = str_dup(config->receive_root_directory);
+      char *colon = strchr(config->receive_root_directory, ':');
+      char *path = str_dup(colon + 1);
+      free(config->receive_root_directory);
+      config->receive_root_directory = path;
     }
   } else if (positional_count == 1) {
     fprintf(stderr, "Error: missing destination argument\n");
