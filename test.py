@@ -67,6 +67,12 @@ TEST_CASES = [
     {"name": "Sendfile + Multithreading (-f -m)", "flags": ["-f", "-m"]},
 ]
 
+SSH_CASES = [
+    {"name": "SSH (localhost)", "flags": []},
+    {"name": "SSH Multithreading (-m)", "flags": ["-m"]},
+    {"name": "SSH Compression (-c)", "flags": ["-c"]},
+]
+
 RSYNC_CASES = [
     {"name": "rsync (archive)", "args": ["-aH"]},
     {"name": "rsync (archive + compress)", "args": ["-aHz"]},
@@ -184,17 +190,21 @@ def start_rsync_daemon(source_dir):
     return port, conf, daemon
 
 
-def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None):
+def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None, no_server=False):
     if os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
-    server = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
-    time.sleep(0.5)
+    if no_server:
+        server = None
+    else:
+        server = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+        time.sleep(0.5)
     try:
         start = time.monotonic()
         result = subprocess.run(cmd, text=True, capture_output=True)
         duration = time.monotonic() - start
     finally:
-        wait_proc(server)
+        if server:
+            wait_proc(server)
 
     mismatches, missing = [], []
     if result.returncode == 0:
@@ -258,6 +268,19 @@ def run_profile(profile_name, source_dir, dest_dir):
                 results.append(r)
             except Exception as e:
                 results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        if SSH_AVAILABLE:
+            for case in SSH_CASES:
+                flags = BASE_CLIENT_FLAGS + (["-M"] if case.get("use_metadata", True) else []) + case["flags"]
+                ssh_dest = f"localhost:{dest_dir}_ssh"
+                cmd = client_prefix + BASE_CLIENT_CMD + [source_dir, ssh_dest] + flags
+                print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
+                try:
+                    r = run_single_test(cmd, case["name"], source_dir, f"{dest_dir}_ssh", no_server=True)
+                    r["suite"] = profile_name
+                    results.append(r)
+                except Exception as e:
+                    results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
 
         port, conf, daemon = start_rsync_daemon(source_dir)
         try:
@@ -348,7 +371,28 @@ def format_throughput(bps):
     return f"{bps:.0f} B/s"
 
 
+SSH_AVAILABLE = False
+
+def check_ssh_localhost():
+    global SSH_AVAILABLE
+    build_dir = os.path.abspath("build")
+    server_path = os.path.join(build_dir, "server")
+
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                        "localhost", "which", "fastsync-server"],
+                       capture_output=True, timeout=10)
+    if r.returncode != 0:
+        install = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost",
+                                  f"mkdir -p ~/.local/bin && ln -sf {server_path} ~/.local/bin/fastsync-server"],
+                                 capture_output=True, timeout=10)
+        if install.returncode == 0:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost",
+                                "which", "fastsync-server"], capture_output=True, timeout=10)
+    SSH_AVAILABLE = r.returncode == 0
+
+
 def preflight_checks():
+    global SSH_AVAILABLE
     errors = []
     print("Pre-flight checks:")
     print("  [1] --help flag...", end=" ")
@@ -384,6 +428,13 @@ def preflight_checks():
     else:
         print("FAIL")
         errors.append("Posix arg syntax failed")
+
+    check_ssh_localhost()
+    print("  [5] SSH to localhost...", end=" ")
+    if SSH_AVAILABLE:
+        print("OK")
+    else:
+        print("SKIP (install fastsync-server in PATH on remote)")
 
     if errors:
         print(f"\n  {len(errors)} pre-flight check(s) failed: {', '.join(errors)}")
