@@ -382,12 +382,19 @@ def check_ssh_localhost():
                         "localhost", "which", "fastsync-server"],
                        capture_output=True, timeout=10)
     if r.returncode != 0:
-        install = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost",
-                                  f"mkdir -p ~/.local/bin && ln -sf {server_path} ~/.local/bin/fastsync-server"],
-                                 capture_output=True, timeout=10)
-        if install.returncode == 0:
-            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost",
-                                "which", "fastsync-server"], capture_output=True, timeout=10)
+        path_r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "localhost",
+             "echo $PATH | tr ':' '\\n' | while read d; do [ -w \"$d\" ] && echo \"$d\" && break; done"],
+            capture_output=True, timeout=10, text=True)
+        remote_bin_dir = path_r.stdout.strip()
+        if remote_bin_dir:
+            install = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "localhost",
+                 f"ln -sf {server_path} {remote_bin_dir}/fastsync-server"],
+                capture_output=True, timeout=10)
+            if install.returncode == 0:
+                r = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost",
+                                    "which", "fastsync-server"], capture_output=True, timeout=10)
     SSH_AVAILABLE = r.returncode == 0
 
 

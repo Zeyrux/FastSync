@@ -20,5 +20,6 @@ pkgs.mkShell {
   shellHook = ''
     export NIX_ENFORCE_PURITY=0
     cmake -B build
+    export PATH="$PWD/build:$PATH"
   '';
 }
