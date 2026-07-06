@@ -392,6 +392,10 @@ def preflight_checks():
 
 
 def main():
+    os.system("cmake -B build -S . > /dev/null 2>&1")
+    if os.system("cd build && make -j$(nproc) 2>&1 | tail -3") != 0:
+        print("Build failed")
+        sys.exit(1)
     preflight_checks()
     parser = argparse.ArgumentParser(description="FastSync integration test / benchmark")
     parser.add_argument("--source-dir", default=DEFAULT_SOURCE_DIR)
@@ -400,11 +404,6 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--wan", action="store_true")
     args = parser.parse_args()
-
-    os.system("cmake -B build -S . > /dev/null 2>&1")
-    if os.system("cd build && make -j$(nproc) 2>&1 | tail -3") != 0:
-        print("Build failed")
-        sys.exit(1)
 
     total_bytes = generate_test_files(args.source_dir)
     if os.path.exists(args.dest_dir):
