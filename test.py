@@ -368,11 +368,14 @@ def preflight_checks():
         errors.append("SSH detection failed")
 
     print("  [3] Server --stdio flag...", end=" ")
-    r = subprocess.run(["./build/server", "--stdio"], capture_output=True, text=True, timeout=3)
-    if r.returncode != 0 and ("receiving" in r.stderr or "receiving" in r.stdout or "Receiving" in r.stderr):
-        print("OK (started in stdio mode)")
-    else:
-        print("WARN (stdio exited: rc=%d)" % r.returncode)
+    try:
+        r = subprocess.run(["./build/server", "--stdio"], capture_output=True, text=True, timeout=3)
+        if r.returncode != 0 and ("receiving" in r.stderr or "receiving" in r.stdout or "Receiving" in r.stderr):
+            print("OK (started in stdio mode)")
+        else:
+            print("WARN (stdio exited: rc=%d)" % r.returncode)
+    except subprocess.TimeoutExpired:
+        print("OK (waiting for stdin)")
 
     print("  [4] Posix arg syntax (no server, expect failure)...", end=" ")
     r = subprocess.run(BASE_CLIENT_CMD + ["/tmp/x", "/tmp/y"], capture_output=True, text=True, timeout=5)
