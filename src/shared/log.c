@@ -4,7 +4,11 @@
 #include <time.h>
 
 static const char *log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
-static LogLevel current_log_level = LOG_LEVEL_DEBUG;
+static LogLevel current_log_level = LOG_LEVEL_WARNING;
+
+void set_log_level(LogLevel level) {
+  current_log_level = level;
+}
 
 void log_message(LogLevel log_level, char *format, ...) {
   if (log_level < current_log_level)

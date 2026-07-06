@@ -169,10 +169,14 @@ void handler(int file_descriptor) {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc > 1 && strcmp(argv[1], "--stdio") == 0) {
-    io_set_fds(STDIN_FILENO, STDOUT_FILENO);
-    handler(STDIN_FILENO);
-    return 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--stdio") == 0) {
+      io_set_fds(STDIN_FILENO, STDOUT_FILENO);
+      handler(STDIN_FILENO);
+      return 0;
+    } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+      set_log_level(LOG_LEVEL_DEBUG);
+    }
   }
   Server *server = server_create(8080);
   server_listen(server, handler);

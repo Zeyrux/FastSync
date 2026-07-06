@@ -214,6 +214,7 @@ static void print_usage(void) {
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
+  printf("  -v, --verbose       Enable debug logging\n");
   printf("  -M, --preserve      Preserve file metadata\n");
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");
@@ -282,6 +283,8 @@ int main(int argc, char *argv[]) {
       server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       server_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+      set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();

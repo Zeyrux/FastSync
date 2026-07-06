@@ -9,5 +9,6 @@ typedef enum {
 } LogLevel;
 
 void log_message(LogLevel log_level, char *message, ...);
+void set_log_level(LogLevel level);
 
 #endif
