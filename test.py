@@ -71,6 +71,11 @@ SSH_CASES = [
     {"name": "SSH (localhost)", "flags": []},
     {"name": "SSH Multithreading (-m)", "flags": ["-m"]},
     {"name": "SSH Compression (-c)", "flags": ["-c"]},
+    {"name": "SSH Chunk Serialization (-s)", "flags": ["-s"]},
+    {"name": "SSH Compression + Chunk Serialization (-c -s)", "flags": ["-c", "-s"]},
+    {"name": "SSH Multithreading + Compression (-m -c)", "flags": ["-m", "-c"]},
+    {"name": "SSH Multithreading + Chunk Serialization (-m -s)", "flags": ["-m", "-s"]},
+    {"name": "SSH Multithreading + Compression + Chunk Serialization (-m -c -s)", "flags": ["-m", "-c", "-s"]},
 ]
 
 RSYNC_CASES = [
