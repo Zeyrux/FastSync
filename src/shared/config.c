@@ -22,6 +22,8 @@ Config *config_create(char *version, char *send_directory,
   config->compression_level = compression_level;
   config->num_connections = num_connections;
   config->use_sendfile = use_sendfile;
+  config->transport = TRANSPORT_TCP;
+  config->ssh_destination = NULL;
   return config;
 }
 
@@ -29,6 +31,7 @@ void config_delete(Config *config) {
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
+  free(config->ssh_destination);
   free(config);
 }
 
@@ -63,6 +66,8 @@ Config *config_receive(int file_descriptor) {
   config->compression_level = receive_int(file_descriptor);
   config->num_connections = receive_int(file_descriptor);
   config->use_sendfile = receive_int(file_descriptor);
+  config->transport = TRANSPORT_TCP;
+  config->ssh_destination = NULL;
   send_status(file_descriptor, STATUS_OK);
   return config;
 }

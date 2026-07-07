@@ -21,13 +21,16 @@ typedef struct Client {
   struct sockaddr_in address;
   unsigned int address_length;
   int file_descriptor;
+  pid_t ssh_child_pid;
 } Client;
 
 Client *client_create();
 void client_disconnect(Client *client);
 void client_delete(Client *client);
 void client_connect(Client *client, char *host, int port);
+Client *client_connect_ssh(char *destination);
 
+void io_set_fds(int read_fd, int write_fd);
 void send_n_data(int file_descriptor, void *data, size_t data_size);
 void receive_n_data(int file_descriptor, void *data, size_t data_size);
 void send_str(int file_descriptor, char *data);

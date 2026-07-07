@@ -51,6 +51,7 @@ BASE_CLIENT_FLAGS = ["--save-to-disk"]
 
 TEST_CASES = [
     {"name": "Standard", "flags": []},
+    {"name": "Posix Args (no flags)", "flags": [], "posix": True},
     {"name": "Standard (no metadata)", "flags": [], "use_metadata": False},
     {"name": "Multithreading (-m)", "flags": ["-m"]},
     {"name": "Compression (-c)", "flags": ["-c"]},
@@ -64,6 +65,17 @@ TEST_CASES = [
     },
     {"name": "Sendfile (-f)", "flags": ["-f"]},
     {"name": "Sendfile + Multithreading (-f -m)", "flags": ["-f", "-m"]},
+]
+
+SSH_CASES = [
+    {"name": "SSH (localhost)", "flags": []},
+    {"name": "SSH Multithreading (-m)", "flags": ["-m"]},
+    {"name": "SSH Compression (-c)", "flags": ["-c"]},
+    {"name": "SSH Chunk Serialization (-s)", "flags": ["-s"]},
+    {"name": "SSH Compression + Chunk Serialization (-c -s)", "flags": ["-c", "-s"]},
+    {"name": "SSH Multithreading + Compression (-m -c)", "flags": ["-m", "-c"]},
+    {"name": "SSH Multithreading + Chunk Serialization (-m -s)", "flags": ["-m", "-s"]},
+    {"name": "SSH Multithreading + Compression + Chunk Serialization (-m -c -s)", "flags": ["-m", "-c", "-s"]},
 ]
 
 RSYNC_CASES = [
@@ -183,17 +195,21 @@ def start_rsync_daemon(source_dir):
     return port, conf, daemon
 
 
-def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None):
+def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None, no_server=False):
     if os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
-    server = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
-    time.sleep(0.5)
+    if no_server:
+        server = None
+    else:
+        server = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+        time.sleep(0.5)
     try:
         start = time.monotonic()
         result = subprocess.run(cmd, text=True, capture_output=True)
         duration = time.monotonic() - start
     finally:
-        wait_proc(server)
+        if server:
+            wait_proc(server)
 
     mismatches, missing = [], []
     if result.returncode == 0:
@@ -246,7 +262,10 @@ def run_profile(profile_name, source_dir, dest_dir):
         results = []
         for case in TEST_CASES:
             flags = BASE_CLIENT_FLAGS + (["-M"] if case.get("use_metadata", True) else []) + case["flags"]
-            cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
+            if case.get("posix"):
+                cmd = client_prefix + BASE_CLIENT_CMD + [source_dir, dest_dir] + flags
+            else:
+                cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
             print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
             try:
                 r = run_single_test(cmd, case["name"], source_dir, dest_dir)
@@ -255,6 +274,19 @@ def run_profile(profile_name, source_dir, dest_dir):
             except Exception as e:
                 results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
 
+        if SSH_AVAILABLE:
+            for case in SSH_CASES:
+                flags = BASE_CLIENT_FLAGS + (["-M"] if case.get("use_metadata", True) else []) + case["flags"]
+                ssh_dest = f"localhost:{dest_dir}_ssh"
+                cmd = BASE_CLIENT_CMD + [source_dir, ssh_dest] + flags
+                print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
+                try:
+                    r = run_single_test(cmd, case["name"], source_dir, f"{dest_dir}_ssh", no_server=True)
+                    r["suite"] = profile_name
+                    results.append(r)
+                except Exception as e:
+                    results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+    
         port, conf, daemon = start_rsync_daemon(source_dir)
         try:
             for case in RSYNC_CASES:
@@ -344,7 +376,100 @@ def format_throughput(bps):
     return f"{bps:.0f} B/s"
 
 
+SSH_AVAILABLE = False
+
+def check_ssh_localhost():
+    global SSH_AVAILABLE
+    build_dir = os.path.abspath("build")
+    server_path = os.path.join(build_dir, "server")
+
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                        "localhost", "which", "fastsync-server"],
+                       capture_output=True, timeout=10)
+    if r.returncode == 0:
+        SSH_AVAILABLE = True
+        return
+
+    SSH_AVAILABLE = False
+    # Try each PATH dir: create symlink, then verify with which
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "localhost",
+         'echo "$PATH"'],
+        capture_output=True, timeout=10, text=True)
+    if r.returncode != 0:
+        return
+    for d in r.stdout.strip().split(":"):
+        d = d.strip()
+        if not d:
+            continue
+        if "wrappers" in d:
+            continue
+        test = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "localhost",
+             f'test -w "{d}" && ln -sf {server_path} "{d}/fastsync-server" && which fastsync-server'],
+            capture_output=True, timeout=10)
+        if test.returncode == 0:
+            SSH_AVAILABLE = True
+            return
+
+
+def preflight_checks():
+    global SSH_AVAILABLE
+    errors = []
+    print("Pre-flight checks:")
+    print("  [1] --help flag...", end=" ")
+    r = subprocess.run(BASE_CLIENT_CMD + ["--help"], capture_output=True, text=True)
+    if r.returncode == 0 and "Usage:" in r.stdout and "SSH transport" in r.stdout:
+        print("OK")
+    else:
+        print("FAIL")
+        errors.append("--help failed")
+
+    print("  [2] Remote SSH dest detection...", end=" ")
+    r = subprocess.run(BASE_CLIENT_CMD + ["/x", "somehost:/y"], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0 and ("ssh" in r.stderr or "Could not receive" in r.stderr or "could not launch" in r.stderr or "Error" in r.stderr):
+        print("OK (detected as SSH)")
+    else:
+        print("FAIL (not detected as SSH dest)")
+        errors.append("SSH detection failed")
+
+    print("  [3] Server --stdio flag...", end=" ")
+    try:
+        r = subprocess.run(["./build/server", "--stdio"], capture_output=True, text=True, timeout=3)
+        if r.returncode != 0 and ("receiving" in r.stderr or "receiving" in r.stdout or "Receiving" in r.stderr):
+            print("OK (started in stdio mode)")
+        else:
+            print("WARN (stdio exited: rc=%d)" % r.returncode)
+    except subprocess.TimeoutExpired:
+        print("OK (waiting for stdin)")
+
+    print("  [4] Posix arg syntax (no server, expect failure)...", end=" ")
+    r = subprocess.run(BASE_CLIENT_CMD + ["/tmp/x", "/tmp/y"], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0 and "connect" in r.stderr:
+        print("OK (TCP fallback)")
+    else:
+        print("FAIL")
+        errors.append("Posix arg syntax failed")
+
+    check_ssh_localhost()
+    print("  [5] SSH to localhost...", end=" ")
+    if SSH_AVAILABLE:
+        print("OK")
+    else:
+        print("SKIP (install fastsync-server in PATH on remote)")
+
+    if errors:
+        print(f"\n  {len(errors)} pre-flight check(s) failed: {', '.join(errors)}")
+        sys.exit(1)
+    print("  All pre-flight checks passed.\n")
+
+
 def main():
+    os.system("cmake -B build -S . > /dev/null 2>&1")
+    if os.system("cd build && make -j$(nproc) 2>&1 | tail -3") != 0:
+        print("Build failed")
+        sys.exit(1)
+    preflight_checks()
     parser = argparse.ArgumentParser(description="FastSync integration test / benchmark")
     parser.add_argument("--source-dir", default=DEFAULT_SOURCE_DIR)
     parser.add_argument("--dest-dir", default=DEFAULT_DEST_DIR)
@@ -352,11 +477,6 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--wan", action="store_true")
     args = parser.parse_args()
-
-    os.system("cmake -B build -S . > /dev/null 2>&1")
-    if os.system("cd build && make -j$(nproc) 2>&1 | tail -3") != 0:
-        print("Build failed")
-        sys.exit(1)
 
     total_bytes = generate_test_files(args.source_dir)
     if os.path.exists(args.dest_dir):

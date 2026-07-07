@@ -3,6 +3,11 @@
 
 #include <stdbool.h>
 
+typedef enum {
+  TRANSPORT_TCP,
+  TRANSPORT_SSH
+} TransportType;
+
 typedef struct Config {
   char *version;
   char *send_directory;
@@ -16,6 +21,8 @@ typedef struct Config {
   bool use_metadata;
   int compression_level;
   int num_connections;
+  TransportType transport;
+  char *ssh_destination;
 } Config;
 
 Config *config_create(char *version, char *send_directory,
