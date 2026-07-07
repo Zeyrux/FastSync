@@ -30,16 +30,15 @@ File *file_receive(Config *config, int file_descriptor) {
   return file;
 }
 
-static void receive_chunk_enqueue(int file_descriptor, Config *config,
+static void receive_chunk_enqueue(int file_descriptor,
                                   PipelineContextReceiver *context) {
-  (void)config;
   Data *chunk_data = receive_data(file_descriptor);
   Data *data_to_process = chunk_data;
-  if (config->use_compression) {
+  if (context->config->use_compression) {
     data_to_process = data_decompress(chunk_data);
     data_destroy(chunk_data);
   }
-  Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
+  Chunk *chunk = chunk_deserialize(data_to_process, context->config->use_metadata);
   data_destroy(data_to_process);
 
   for (int i = 0; i < chunk->element_count; i++) {
@@ -63,7 +62,7 @@ int receive_thread(void *pipeline_context) {
   Status status = receive_status(file_descriptor);
   while (status == STATUS_NEXT || status == STATUS_CHUNK) {
     if (status == STATUS_CHUNK) {
-      receive_chunk_enqueue(file_descriptor, config, context);
+      receive_chunk_enqueue(file_descriptor, context);
     } else {
       File *file = file_receive(config, file_descriptor);
       queue_enqueue_multithreaded(context->queue, file, &context->mutex,
@@ -180,6 +179,6 @@ int main(int argc, char *argv[]) {
   }
   Server *server = server_create(8080);
   server_listen(server, handler);
-  server_delete(server);
+  server_delete(&server);
   return 0;
 }

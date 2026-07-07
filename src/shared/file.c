@@ -80,18 +80,11 @@ void file_load_data(File *file) {
       exit(EXIT_FAILURE);
     }
   }
-  printf("%ld is file big", file->data->size);
   size_t bytes_read = file_content_to_buffer(file);
   if (bytes_read != file->data->size) {
     log_message(STATUS_ERROR, "Didnt read expected amount of bytes from file");
     exit(EXIT_FAILURE);
   }
-}
-
-void file_print(void *item) {
-  if (item == NULL)
-    return;
-  printf("%s\n", ((File *)item)->path);
 }
 
 static void metadata_send(int file_descriptor, FileMetadata *m) {
@@ -127,7 +120,6 @@ void file_send_single_calls(File *file, int file_descriptor, bool use_metadata) 
   send_str(file_descriptor, file->path);
   if (use_metadata)
     metadata_send(file_descriptor, file->metadata);
-  printf("Sending File: %ld", file->data->size);
   send_data(file_descriptor, file->data->data, file->data->size);
 }
 

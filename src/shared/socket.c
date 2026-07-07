@@ -167,10 +167,11 @@ Server *server_create(int port) {
   return server;
 }
 
-void server_delete(Server *server) {
-  free(server);
-  server = NULL;
-};
+void server_delete(Server **server) {
+  if (server == NULL || *server == NULL) return;
+  free(*server);
+  *server = NULL;
+}
 
 void server_listen(Server *server, void (*handler)(int file_descriptor)) {
   log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",

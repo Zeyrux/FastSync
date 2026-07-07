@@ -15,7 +15,7 @@ typedef struct Server {
 
 Server *server_create(int port);
 void server_listen(Server *server, void (*handler)(int file_descriptor));
-void server_delete(Server *server);
+void server_delete(Server **server);
 
 typedef struct Client {
   struct sockaddr_in address;

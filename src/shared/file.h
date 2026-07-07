@@ -22,7 +22,6 @@ typedef struct {
 File *file_create(const char *path);
 void file_destroy(void *item);
 void file_load_data(File *file);
-void file_print(void *item);
 void file_send_single_calls(File *file, int file_descriptor, bool use_metadata);
 void file_send_sendfile(File *file, int file_descriptor, bool use_metadata);
 size_t file_content_to_buffer(File *file);

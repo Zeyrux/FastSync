@@ -125,7 +125,7 @@ int send_chunks_multithreaded(void *pipeline_context) {
       int ok = receive_status(client->file_descriptor) == STATUS_OK;
       client_disconnect(client);
       client_delete(client);
-      return ok ? thrd_success : 1;
+      return ok ? thrd_success : thrd_error;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
       perror("Something unexpected happend while sending the chunk");
@@ -187,16 +187,6 @@ int send_files_multithreaded(Config *config) {
 
   pipeline_context_sender_destroy(context);
   return 0;
-}
-
-static int is_remote_dest(const char *s) {
-  const char *colon = strchr(s, ':');
-  if (!colon) return 0;
-  if (colon == s) return 0;
-  for (const char *p = s; p < colon; p++) {
-    if (*p == '/') return 0;
-  }
-  return 1;
 }
 
 static void print_usage(void) {
@@ -307,14 +297,7 @@ int main(int argc, char *argv[]) {
     config->receive_root_directory = str_dup(argv[positional_args[1]]);
     config->save_to_disk = true;
 
-    if (is_remote_dest(config->receive_root_directory)) {
-      config->transport = TRANSPORT_SSH;
-      config->ssh_destination = str_dup(config->receive_root_directory);
-      char *colon = strchr(config->receive_root_directory, ':');
-      char *path = str_dup(colon + 1);
-      free(config->receive_root_directory);
-      config->receive_root_directory = path;
-    }
+    config_parse_ssh_dest(config);
   } else if (positional_count == 1) {
     fprintf(stderr, "Error: missing destination argument\n");
     print_usage();
