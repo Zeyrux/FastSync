@@ -27,6 +27,6 @@ void file_send_sendfile(File *file, int file_descriptor, bool use_metadata);
 size_t file_content_to_buffer(File *file);
 FileMetadata *file_metadata_create(struct stat *stats);
 void file_metadata_destroy(void *metadata);
-FileMetadata *file_receive_metadata(int file_descriptor);
+void to_disk(const char *path, const void *data, unsigned long long data_size);
 
 #endif

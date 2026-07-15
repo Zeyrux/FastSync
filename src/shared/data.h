@@ -12,7 +12,5 @@ Data *data_create_empty(size_t data_size);
 Data *data_create_reserve(size_t size);
 Data *data_create(void *data, size_t data_size);
 void data_destroy(Data *data);
-Data *data_compress(Data *data_to_compress, int compression_level);
-Data *data_decompress(Data *compressed_data);
 
 #endif

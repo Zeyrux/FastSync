@@ -1,5 +1,6 @@
 #include "test_utils.h"
 #include "chunk.h"
+#include "compression.h"
 #include "data.h"
 #include "file.h"
 #include "utils.h"

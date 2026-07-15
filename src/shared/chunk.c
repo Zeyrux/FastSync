@@ -1,17 +1,15 @@
-#include <dirent.h>
-#include <libgen.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "chunk.h"
 #include "array_list.h"
+#include "chunk.h"
+#include "compression.h"
 #include "data.h"
 #include "file.h"
 #include "log.h"
-
-#define FILE_METADATA_WIRE_SIZE (sizeof(mode_t) + sizeof(uid_t) + sizeof(gid_t) + sizeof(time_t) + sizeof(long))
+#include "metadata.h"
 
 Chunk *chunk_create(File **items, int element_count) {
   Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
@@ -47,34 +45,6 @@ void chunk_destroy(void *item) {
   }
   free(chunk->items);
   free(chunk);
-}
-
-static void metadata_to_buf(char **buf, FileMetadata *m) {
-  int present = (m != NULL) ? 1 : 0;
-  memcpy(*buf, &present, sizeof(int));
-  *buf += sizeof(int);
-  if (m == NULL)
-    return;
-  memcpy(*buf, &m->mode, sizeof(mode_t));        *buf += sizeof(mode_t);
-  memcpy(*buf, &m->uid, sizeof(uid_t));          *buf += sizeof(uid_t);
-  memcpy(*buf, &m->gid, sizeof(gid_t));          *buf += sizeof(gid_t);
-  memcpy(*buf, &m->mtime_sec, sizeof(time_t));   *buf += sizeof(time_t);
-  memcpy(*buf, &m->mtime_nsec, sizeof(long));    *buf += sizeof(long);
-}
-
-static FileMetadata *metadata_from_buf(char **buf) {
-  int present;
-  memcpy(&present, *buf, sizeof(int));
-  *buf += sizeof(int);
-  if (!present)
-    return NULL;
-  FileMetadata *m = malloc(sizeof(FileMetadata));
-  memcpy(&m->mode, *buf, sizeof(mode_t));        *buf += sizeof(mode_t);
-  memcpy(&m->uid, *buf, sizeof(uid_t));          *buf += sizeof(uid_t);
-  memcpy(&m->gid, *buf, sizeof(gid_t));          *buf += sizeof(gid_t);
-  memcpy(&m->mtime_sec, *buf, sizeof(time_t));   *buf += sizeof(time_t);
-  memcpy(&m->mtime_nsec, *buf, sizeof(long));    *buf += sizeof(long);
-  return m;
 }
 
 static unsigned long long per_file_serialize_size(File *file, bool use_metadata) {

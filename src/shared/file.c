@@ -6,13 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <zstd.h>
 
 #include "data.h"
 #include "file.h"
+#include "io.h"
 #include "log.h"
-#include "socket.h"
+#include "metadata.h"
+#include "protocol.h"
+#include "utils.h"
 
 File *file_create(const char *path) {
   File *file = (File *)malloc(sizeof(File));
@@ -87,40 +90,26 @@ void file_load_data(File *file) {
   }
 }
 
-static void metadata_send(int file_descriptor, FileMetadata *m) {
-  if (m == NULL) {
-    int zero = 0;
-    send_n_data(file_descriptor, &zero, sizeof(int));
-    return;
-  }
-  int present = 1;
-  send_n_data(file_descriptor, &present, sizeof(int));
-  send_n_data(file_descriptor, &m->mode, sizeof(mode_t));
-  send_n_data(file_descriptor, &m->uid, sizeof(uid_t));
-  send_n_data(file_descriptor, &m->gid, sizeof(gid_t));
-  send_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t));
-  send_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
-}
-
-FileMetadata *file_receive_metadata(int file_descriptor) {
-  int present;
-  receive_n_data(file_descriptor, &present, sizeof(int));
-  if (!present)
-    return NULL;
-  FileMetadata *m = malloc(sizeof(FileMetadata));
-  receive_n_data(file_descriptor, &m->mode, sizeof(mode_t));
-  receive_n_data(file_descriptor, &m->uid, sizeof(uid_t));
-  receive_n_data(file_descriptor, &m->gid, sizeof(gid_t));
-  receive_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t));
-  receive_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
-  return m;
-}
-
 void file_send_single_calls(File *file, int file_descriptor, bool use_metadata) {
   send_str(file_descriptor, file->path);
   if (use_metadata)
     metadata_send(file_descriptor, file->metadata);
   send_data(file_descriptor, file->data->data, file->data->size);
+}
+
+void to_disk(const char *path, const void *data, unsigned long long data_size) {
+  char *directory = str_dup(path);
+  char *dir_to_free = directory;
+  directory = dirname(directory);
+  mkdir_r(directory);
+  FILE *file_pointer = fopen(path, "wb");
+  if (file_pointer == NULL) {
+    perror("Could not open File");
+    exit(EXIT_FAILURE);
+  }
+  fwrite(data, 1, data_size, file_pointer);
+  fclose(file_pointer);
+  free(dir_to_free);
 }
 
 void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
@@ -165,3 +154,5 @@ size_t file_content_to_buffer(File *file) {
   fclose(file_pointer);
   return bytes_read;
 }
+
+

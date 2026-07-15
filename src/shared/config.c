@@ -1,5 +1,5 @@
 #include "config.h"
-#include "socket.h"
+#include "protocol.h"
 #include "utils.h"
 #include <stdbool.h>
 #include <stdio.h>
