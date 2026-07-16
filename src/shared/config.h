@@ -17,7 +17,6 @@ typedef struct Config {
   bool use_chunk_serialization;
   bool use_compression;
   bool use_sendfile;
-  bool use_single_send_per_file;
   bool use_metadata;
   int compression_level;
   int num_connections;
@@ -33,5 +32,7 @@ Config *config_create(char *version, char *send_directory,
 void config_delete(Config *config);
 void config_send(int file_descriptor, Config *config);
 Config *config_receive(int file_descriptor);
+bool is_remote_dest(const char *s);
+void config_parse_ssh_dest(Config *config);
 
 #endif

@@ -15,13 +15,10 @@ typedef struct {
 
 Chunk *chunk_create(File **items, int element_count);
 void chunk_destroy(void *chunk);
-void chunk_print(void *chunk);
-Data *chunk_format(Chunk *chunk);
 Data *chunk_serialize(Chunk *chunk, bool use_metadata);
 Chunk *chunk_deserialize(Data *data, bool use_metadata);
 Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata);
 Chunk *chunk_decompress(Data *compressed_data, bool use_metadata);
 
-Data *chunk_data_create(void *data, unsigned long long data_size);
-void chunk_data_delete(void *chunk);
+
 #endif

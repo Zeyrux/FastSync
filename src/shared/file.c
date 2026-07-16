@@ -6,13 +6,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <zstd.h>
 
+#include "compression.h"
+#include "config.h"
 #include "data.h"
 #include "file.h"
 #include "log.h"
-#include "socket.h"
+#include "metadata.h"
+#include "protocol.h"
+#include "utils.h"
 
 File *file_create(const char *path) {
   File *file = (File *)malloc(sizeof(File));
@@ -80,7 +84,6 @@ void file_load_data(File *file) {
       exit(EXIT_FAILURE);
     }
   }
-  printf("%ld is file big", file->data->size);
   size_t bytes_read = file_content_to_buffer(file);
   if (bytes_read != file->data->size) {
     log_message(STATUS_ERROR, "Didnt read expected amount of bytes from file");
@@ -88,47 +91,31 @@ void file_load_data(File *file) {
   }
 }
 
-void file_print(void *item) {
-  if (item == NULL)
-    return;
-  printf("%s\n", ((File *)item)->path);
-}
-
-static void metadata_send(int file_descriptor, FileMetadata *m) {
-  if (m == NULL) {
-    int zero = 0;
-    send_n_data(file_descriptor, &zero, sizeof(int));
-    return;
+void file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
+  if (compression_level > 0) {
+    Data *compressed_data = data_compress(file->data, compression_level);
+    data_destroy(file->data);
+    file->data = compressed_data;
   }
-  int present = 1;
-  send_n_data(file_descriptor, &present, sizeof(int));
-  send_n_data(file_descriptor, &m->mode, sizeof(mode_t));
-  send_n_data(file_descriptor, &m->uid, sizeof(uid_t));
-  send_n_data(file_descriptor, &m->gid, sizeof(gid_t));
-  send_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t));
-  send_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
-}
-
-FileMetadata *file_receive_metadata(int file_descriptor) {
-  int present;
-  receive_n_data(file_descriptor, &present, sizeof(int));
-  if (!present)
-    return NULL;
-  FileMetadata *m = malloc(sizeof(FileMetadata));
-  receive_n_data(file_descriptor, &m->mode, sizeof(mode_t));
-  receive_n_data(file_descriptor, &m->uid, sizeof(uid_t));
-  receive_n_data(file_descriptor, &m->gid, sizeof(gid_t));
-  receive_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t));
-  receive_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
-  return m;
-}
-
-void file_send_single_calls(File *file, int file_descriptor, bool use_metadata) {
   send_str(file_descriptor, file->path);
   if (use_metadata)
     metadata_send(file_descriptor, file->metadata);
-  printf("Sending File: %ld", file->data->size);
-  send_data(file_descriptor, file->data->data, file->data->size);
+  send_data(file_descriptor, file->data);
+}
+
+void to_disk(const char *path, const void *data, unsigned long long data_size) {
+  char *directory = str_dup(path);
+  char *dir_to_free = directory;
+  directory = dirname(directory);
+  mkdir_r(directory);
+  FILE *file_pointer = fopen(path, "wb");
+  if (file_pointer == NULL) {
+    perror("Could not open File");
+    exit(EXIT_FAILURE);
+  }
+  fwrite(data, 1, data_size, file_pointer);
+  fclose(file_pointer);
+  free(dir_to_free);
 }
 
 void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
@@ -158,6 +145,23 @@ void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
   close(fd);
 }
 
+File *file_receive(Config *config, int file_descriptor) {
+  char *path = (char *)receive_str(file_descriptor);
+  File *file = file_create(path);
+  free(path);
+  if (config->use_metadata)
+    file->metadata = metadata_receive(file_descriptor);
+  Data *file_data = receive_data(file_descriptor);
+  if (config->use_compression) {
+    Data *file_data_uncompressed = data_decompress(file_data);
+    data_destroy(file_data);
+    file_data = file_data_uncompressed;
+  }
+  data_destroy(file->data);
+  file->data = file_data;
+  return file;
+}
+
 size_t file_content_to_buffer(File *file) {
   FILE *file_pointer = fopen(file->path, "rb");
   if (file_pointer == NULL) {
@@ -173,3 +177,5 @@ size_t file_content_to_buffer(File *file) {
   fclose(file_pointer);
   return bytes_read;
 }
+
+

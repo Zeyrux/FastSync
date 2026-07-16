@@ -4,6 +4,7 @@
 #include <threads.h>
 
 #include "config.h"
+#include "file.h"
 #include "queue.h"
 
 typedef struct {
@@ -38,4 +39,6 @@ PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
                                                           Queue *queue_receiver,
                                                           int file_descriptor);
 void pipeline_context_receiver_destroy(PipelineContextReceiver *context);
+int receive_thread(void *pipeline_context);
+int write_thread(void *pipeline_context);
 #endif

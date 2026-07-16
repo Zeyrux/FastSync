@@ -1,8 +1,10 @@
 #include "config.h"
-#include "socket.h"
+#include "protocol.h"
+#include "utils.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 Config *config_create(char *version, char *send_directory,
                       char *receive_directory, bool save_to_disk,
@@ -25,6 +27,27 @@ Config *config_create(char *version, char *send_directory,
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
   return config;
+}
+
+bool is_remote_dest(const char *s) {
+  if (s == NULL) return false;
+  const char *colon = strchr(s, ':');
+  if (colon == NULL) return false;
+  if (colon == s) return false;
+  for (const char *p = s; p < colon; p++) {
+    if (*p == '/') return false;
+  }
+  return true;
+}
+
+void config_parse_ssh_dest(Config *config) {
+  if (!is_remote_dest(config->receive_root_directory)) return;
+  config->transport = TRANSPORT_SSH;
+  config->ssh_destination = str_dup(config->receive_root_directory);
+  char *colon = strchr(config->receive_root_directory, ':');
+  char *path = str_dup(colon + 1);
+  free(config->receive_root_directory);
+  config->receive_root_directory = path;
 }
 
 void config_delete(Config *config) {

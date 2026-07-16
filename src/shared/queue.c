@@ -59,7 +59,7 @@ bool queue_is_full(Queue *queue) {
   return queue->size == queue->capacity;
 }
 
-void queue_double_capacity(Queue *queue) {
+static void queue_double_capacity(Queue *queue) {
   if (queue == NULL)
     return;
   unsigned int new_capacity = queue->capacity * 2;

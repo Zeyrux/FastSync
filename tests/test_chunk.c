@@ -80,77 +80,9 @@ static void test_chunk_operations() {
   EXPECT_EQ_INT(memcmp(deserialized->items[0]->data->data, content1, len1), 0);
   EXPECT_EQ_INT(memcmp(deserialized->items[1]->data->data, content2, len2), 0);
 
-  chunk_data_delete(serialized);
+  data_destroy(serialized);
   chunk_destroy(deserialized);
 
-  // Test chunk_format layout (old format)
-  Data *formatted = chunk_format(chunk);
-  EXPECT_NOT_NULL(formatted);
-
-  unsigned long long expected_size =
-      (sizeof(int) + strlen(path1) + sizeof(int) + sizeof(unsigned long long) + len1) +
-      (sizeof(int) + strlen(path2) + sizeof(int) + sizeof(unsigned long long) + len2);
-  EXPECT_EQ_INT((int)formatted->size, (int)expected_size);
-
-  char *ptr = (char *)formatted->data;
-
-  // File 1
-  int p_len1;
-  memcpy(&p_len1, ptr, sizeof(int));
-  ptr += sizeof(int);
-  EXPECT_EQ_INT(p_len1, (int)strlen(path1));
-
-  char read_path1[256];
-  memcpy(read_path1, ptr, p_len1);
-  read_path1[p_len1] = '\0';
-  ptr += p_len1;
-  EXPECT_EQ_STR(read_path1, path1);
-
-  int meta_present1;
-  memcpy(&meta_present1, ptr, sizeof(int));
-  ptr += sizeof(int);
-  EXPECT_EQ_INT(meta_present1, 0);
-
-  unsigned long long d_len1;
-  memcpy(&d_len1, ptr, sizeof(unsigned long long));
-  ptr += sizeof(unsigned long long);
-  EXPECT_EQ_INT((int)d_len1, (int)len1);
-
-  char read_content1[256];
-  memcpy(read_content1, ptr, d_len1);
-  read_content1[d_len1] = '\0';
-  ptr += d_len1;
-  EXPECT_EQ_STR(read_content1, content1);
-
-  // File 2
-  int p_len2;
-  memcpy(&p_len2, ptr, sizeof(int));
-  ptr += sizeof(int);
-  EXPECT_EQ_INT(p_len2, (int)strlen(path2));
-
-  char read_path2[256];
-  memcpy(read_path2, ptr, p_len2);
-  read_path2[p_len2] = '\0';
-  ptr += p_len2;
-  EXPECT_EQ_STR(read_path2, path2);
-
-  int meta_present2;
-  memcpy(&meta_present2, ptr, sizeof(int));
-  ptr += sizeof(int);
-  EXPECT_EQ_INT(meta_present2, 0);
-
-  unsigned long long d_len2;
-  memcpy(&d_len2, ptr, sizeof(unsigned long long));
-  ptr += sizeof(unsigned long long);
-  EXPECT_EQ_INT((int)d_len2, (int)len2);
-
-  char read_content2[256];
-  memcpy(read_content2, ptr, d_len2);
-  read_content2[d_len2] = '\0';
-  ptr += d_len2;
-  EXPECT_EQ_STR(read_content2, content2);
-
-  chunk_data_delete(formatted);
   chunk_destroy(chunk);
 
   unlink(path1);
