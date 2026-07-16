@@ -86,7 +86,10 @@ static void test_chunk_compress_decompress_roundtrip() {
   Data *compressed = chunk_compress(chunk, 3, false);
   EXPECT_NOT_NULL(compressed);
 
-  Chunk *decompressed_chunk = chunk_decompress(compressed, false);
+  Data *decompressed_data = data_decompress(compressed);
+  EXPECT_NOT_NULL(decompressed_data);
+
+  Chunk *decompressed_chunk = chunk_deserialize(decompressed_data, false);
   EXPECT_NOT_NULL(decompressed_chunk);
   EXPECT_EQ_INT(decompressed_chunk->element_count, 2);
 
@@ -100,6 +103,7 @@ static void test_chunk_compress_decompress_roundtrip() {
 
   chunk_destroy(chunk);
   data_destroy(compressed);
+  data_destroy(decompressed_data);
   chunk_destroy(decompressed_chunk);
 
   unlink(path1);

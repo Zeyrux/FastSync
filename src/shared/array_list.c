@@ -35,14 +35,6 @@ void array_list_delete(ArrayList *array_list) {
   free(array_list);
 }
 
-void array_list_clear(ArrayList *array_list) {
-  if (array_list == NULL)
-    return;
-  for (int i = 0; i < array_list->size; i++)
-    array_list->items[i] = NULL;
-  array_list->size = 0;
-}
-
 void array_list_extend(ArrayList *array_list) {
   if (array_list == NULL)
     return;

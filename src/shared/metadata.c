@@ -8,8 +8,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define FILE_METADATA_WIRE_SIZE (sizeof(mode_t) + sizeof(uid_t) + sizeof(gid_t) + sizeof(time_t) + sizeof(long))
-
 void metadata_to_buf(char **buf, FileMetadata *m) {
   int present = (m != NULL) ? 1 : 0;
   memcpy(*buf, &present, sizeof(int));
