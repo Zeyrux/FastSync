@@ -11,12 +11,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata) {
+DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size) {
   DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
   scanner->directories = queue_create(100, free);
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->use_metadata = use_metadata;
+  scanner->chunk_size = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
   queue_enqueue(scanner->directories, str_dup(root_directory));
   return scanner;
 }
@@ -99,7 +100,7 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
         file->metadata = file_metadata_create(&stats);
       array_list_add(chunk_data, file);
       chunk_data_size += file->data->size;
-      if (chunk_data_size > DESIRED_CHUNK_SIZE) {
+      if (chunk_data_size > scanner->chunk_size) {
         free(cur_path);
         return chunk_data_to_chunk(chunk_data);
       }

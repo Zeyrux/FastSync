@@ -8,7 +8,7 @@
 
 static void test_config_lifecycle() {
   Config *cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("/dst"),
-                              true, true, false, false, false, 1, false);
+                              true, true, false, false, false, 1, false, 0);
   EXPECT_NOT_NULL(cfg);
   EXPECT_EQ_STR(cfg->version, "1.0");
   EXPECT_EQ_STR(cfg->send_directory, "/src");
@@ -24,7 +24,7 @@ static void test_config_lifecycle() {
 
 static void test_config_ssh_dest() {
   Config *cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("user@host:/dst"),
-                              true, false, false, false, false, 1, false);
+                              true, false, false, false, false, 1, false, 0);
   EXPECT_NOT_NULL(cfg);
   EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
   EXPECT_NULL(cfg->ssh_destination);
@@ -39,7 +39,7 @@ static void test_config_ssh_dest() {
 
 static void test_config_ssh_dest_local_path() {
   Config *cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("/local/path"),
-                              true, false, false, false, false, 1, false);
+                              true, false, false, false, false, 1, false, 0);
   config_parse_ssh_dest(cfg);
   EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
   EXPECT_NULL(cfg->ssh_destination);
@@ -49,7 +49,7 @@ static void test_config_ssh_dest_local_path() {
 
 static void test_config_ssh_dest_no_user() {
   Config *cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("host:/remote"),
-                              true, false, false, false, false, 1, false);
+                              true, false, false, false, false, 1, false, 0);
   config_parse_ssh_dest(cfg);
   EXPECT_EQ_INT(cfg->transport, TRANSPORT_SSH);
   EXPECT_EQ_STR(cfg->ssh_destination, "host:/remote");
@@ -59,7 +59,7 @@ static void test_config_ssh_dest_no_user() {
 
 static void test_pipeline_sender_lifecycle() {
   Config *cfg = config_create(str_dup("2.0"), str_dup("/src2"),
-                              str_dup("/dst2"), false, false, true, true, false, 1, false);
+                              str_dup("/dst2"), false, false, true, true, false, 1, false, 0);
   Queue *q1 = queue_create(5, NULL);
   Queue *q2 = queue_create(15, NULL);
 
@@ -76,7 +76,7 @@ static void test_pipeline_sender_lifecycle() {
 
 static void test_pipeline_receiver_lifecycle() {
   Config *cfg = config_create(str_dup("3.0"), str_dup("/src3"),
-                              str_dup("/dst3"), true, true, true, true, false, 1, false);
+                              str_dup("/dst3"), true, true, true, true, false, 1, false, 0);
   Queue *q = queue_create(20, NULL);
 
   PipelineContextReceiver *pcr = pipeline_context_receiver_create(cfg, q, 42);

@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 
-#define DESIRED_CHUNK_SIZE 10 * 1024 * 1024
+#define DESIRED_CHUNK_SIZE (10 * 1024 * 1024)
 
 typedef struct {
   File **items;

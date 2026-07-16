@@ -26,6 +26,7 @@ static void print_usage(void) {
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -M, --preserve      Preserve file metadata\n");
+  printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");
   printf("  --save-to-disk      Write received files to disk\n");
@@ -46,7 +47,7 @@ int main(int argc, char *argv[]) {
   }
 
   Config *config = config_create(str_dup("1.0.0"), NULL, NULL,
-                                 save_to_disk, false, false, false, false, 5, false);
+                                 save_to_disk, false, false, false, false, 5, false, 0);
 
   int positional_args[2];
   int positional_count = 0;
@@ -93,6 +94,10 @@ int main(int argc, char *argv[]) {
       server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       server_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
+      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      if (val > 0)
+        config->chunk_size = val;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {
