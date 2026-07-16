@@ -161,7 +161,13 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
       tls_ca = argv[++i];
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      port = atoi(argv[++i]);
+      char *end;
+      long p = strtol(argv[++i], &end, 10);
+      if (*end || p <= 0 || p > 65535) {
+        fprintf(stderr, "Error: invalid port '%s' (must be 1-65535)\n", argv[i]);
+        return 1;
+      }
+      port = (int)p;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_server_usage();
@@ -169,9 +175,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (port < 1 || port > 65535) {
-    fprintf(stderr, "Error: port must be between 1 and 65535\n");
-    return 1;
+  if (tls_ca && !use_tls) {
+    log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
   }
 
   signal(SIGINT, cleanup);
