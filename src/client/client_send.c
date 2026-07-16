@@ -1,6 +1,5 @@
 #include "client_send.h"
 #include "chunk.h"
-#include "compression.h"
 #include "config.h"
 #include "data.h"
 #include "file.h"
@@ -24,11 +23,9 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     if (config->use_compression) {
       data = chunk_compress(chunk, config->compression_level, config->use_metadata);
     } else {
-      for (int i = 0; i < chunk->element_count; i++)
-        file_load_data(chunk->items[i]);
       data = chunk_serialize(chunk, config->use_metadata);
     }
-    send_data(client->file_descriptor, data->data, data->size);
+    send_data(client->file_descriptor, data);
     data_destroy(data);
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
@@ -38,14 +35,9 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
       send_status(client->file_descriptor, STATUS_NEXT);
-      File *file = chunk->items[i];
-      if (config->use_compression) {
-        Data *compressed_data =
-            data_compress(file->data, config->compression_level);
-        data_destroy(file->data);
-        file->data = compressed_data;
-      }
-      file_send_single_calls(file, client->file_descriptor, config->use_metadata);
+      file_send_single_calls(chunk->items[i], client->file_descriptor,
+                            config->use_metadata,
+                            config->use_compression ? config->compression_level : 0);
     }
   }
   return 0;

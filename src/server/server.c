@@ -3,7 +3,6 @@
 #include "config.h"
 #include "data.h"
 #include "file.h"
-#include "io.h"
 #include "log.h"
 #include "metadata.h"
 #include "multiprocessing.h"

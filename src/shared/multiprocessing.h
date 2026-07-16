@@ -39,7 +39,6 @@ PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
                                                           Queue *queue_receiver,
                                                           int file_descriptor);
 void pipeline_context_receiver_destroy(PipelineContextReceiver *context);
-File *file_receive(Config *config, int file_descriptor);
 int receive_thread(void *pipeline_context);
 int write_thread(void *pipeline_context);
 #endif
