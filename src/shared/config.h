@@ -19,10 +19,15 @@ typedef struct Config {
   bool use_sendfile;
   bool use_metadata;
   bool show_progress;
+  bool dry_run;
+  bool use_delete;
   int compression_level;
   unsigned long long chunk_size;
+  int ssh_port;
   TransportType transport;
   char *ssh_destination;
+  char **exclude_patterns;
+  int exclude_count;
 } Config;
 
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)

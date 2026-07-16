@@ -1,3 +1,4 @@
+#include "array_list.h"
 #include "chunk.h"
 #include "compression.h"
 #include "config.h"
@@ -53,6 +54,16 @@ int receive_files(Config *config, int file_descriptor) {
       }
       file_destroy(file);
     }
+    status = receive_status(file_descriptor);
+  }
+  if (status == STATUS_MANIFEST) {
+    int count = receive_int(file_descriptor);
+    ArrayList *manifest = array_list_create(free);
+    for (int i = 0; i < count; i++)
+      array_list_add(manifest, receive_str(file_descriptor));
+    fprintf(stderr, "Deleting files not in manifest...\n");
+    delete_extras(config->receive_root_directory, manifest);
+    array_list_delete(manifest);
     status = receive_status(file_descriptor);
   }
   if (status != STATUS_FINISHED) {

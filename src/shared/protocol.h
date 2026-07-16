@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 typedef int Status;
-enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK };
+enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK, STATUS_MANIFEST };
 
 void io_set_fds(int read_fd, int write_fd);
 void send_n_data(int file_descriptor, void *data, size_t data_size);

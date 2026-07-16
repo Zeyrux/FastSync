@@ -12,9 +12,11 @@ typedef struct {
   char *current_path;
   bool use_metadata;
   unsigned long long chunk_size;
+  char **exclude_patterns;
+  int exclude_count;
 } DirectoryScanner;
 
-DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size);
+DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size, char **exclude_patterns, int exclude_count);
 Chunk *directory_scanner_next(DirectoryScanner *scanner);
 void directory_scanner_destroy(DirectoryScanner *scanner);
 

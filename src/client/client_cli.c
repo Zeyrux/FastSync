@@ -22,7 +22,12 @@ static void print_usage(void) {
   printf("Options:\n");
   printf("  -c [level]          Enable compression (level 1-22, default 5)\n");
   printf("  -z [level]          Alias for -c\n");
+  printf("  -a, --archive       Archive mode (-c -m -M)\n");
+  printf("  -n, --dry-run       Show what would be transferred\n");
+  printf("  -p <port>           SSH port (default: 22)\n");
   printf("  --progress          Show transfer progress\n");
+  printf("  --delete            Delete files on receiver not in source\n");
+  printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -58,6 +63,21 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
       return 0;
+    } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
+      config->use_compression = true;
+      config->use_multithreading = true;
+      config->use_metadata = true;
+      log_message(LOG_LEVEL_INFO, "Enabled archive mode (-c -m -M)");
+    } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
+      config->dry_run = true;
+    } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+      config->ssh_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--delete") == 0) {
+      config->use_delete = true;
+    } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
+      int idx = config->exclude_count++;
+      config->exclude_patterns = realloc(config->exclude_patterns, config->exclude_count * sizeof(char *));
+      config->exclude_patterns[idx] = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");

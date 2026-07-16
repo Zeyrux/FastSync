@@ -1,4 +1,5 @@
 #include "client_send.h"
+#include "array_list.h"
 #include "chunk.h"
 #include "config.h"
 #include "data.h"
@@ -52,7 +53,7 @@ static int send_chunks_multithreaded(void *pipeline_context) {
       fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
       return 1;
     }
-    client = client_connect_ssh(context->config->ssh_destination);
+    client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port);
   } else {
     client = client_create();
     client_connect(client, server_host, server_port);
@@ -65,6 +66,13 @@ static int send_chunks_multithreaded(void *pipeline_context) {
         &context->condition_not_empty_loader,
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
+      if (context->config->use_delete) {
+        send_status(client->file_descriptor, STATUS_MANIFEST);
+        send_int(client->file_descriptor, context->manifest->size);
+        for (int i = 0; i < context->manifest->size; i++)
+          send_str(client->file_descriptor,
+                   (char *)context->manifest->items[i]);
+      }
       send_status(client->file_descriptor, STATUS_FINISHED);
       int ok = receive_status(client->file_descriptor) == STATUS_OK;
       client_disconnect(client);
@@ -82,16 +90,28 @@ static int send_chunks_multithreaded(void *pipeline_context) {
 static int scan_directory_multithreaded(void *pipeline_context) {
   PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
   mtx_lock(&context->mutex_scanner);
-  DirectoryScanner *scanner =
-      directory_scanner_create(context->config->send_directory, context->config->use_metadata, context->config->chunk_size);
+  DirectoryScanner *scanner = directory_scanner_create(
+      context->config->send_directory, context->config->use_metadata,
+      context->config->chunk_size, context->config->exclude_patterns,
+      context->config->exclude_count);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk *current_chunk;
-  while ((current_chunk = directory_scanner_next(scanner)) != NULL)
+  while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
+    if (context->config->use_delete) {
+      mtx_lock(&context->mutex_scanner);
+      for (int i = 0; i < current_chunk->element_count; i++) {
+        const char *p = current_chunk->items[i]->path;
+        if (*p == '/') p++;
+        array_list_add(context->manifest, str_dup(p));
+      }
+      mtx_unlock(&context->mutex_scanner);
+    }
     queue_enqueue_multithreaded(context->queue_scanner, current_chunk,
                                 &context->mutex_scanner,
                                 &context->condition_not_empty_scanner,
                                 &context->condition_not_full_scanner);
+  }
   mtx_lock(&context->mutex_scanner);
   context->scanner_done = true;
   cnd_signal(&context->condition_not_empty_scanner);
@@ -127,27 +147,59 @@ static int load_files_multithreaded(void *pipeline_context) {
 }
 
 int send_files(Config *config) {
+  if (config->dry_run) {
+    DirectoryScanner *scanner = directory_scanner_create(
+        config->send_directory, config->use_metadata, config->chunk_size,
+        config->exclude_patterns, config->exclude_count);
+    Chunk *chunk;
+    int file_count = 0;
+    unsigned long long total_bytes = 0;
+    printf("Dry run: files to be transferred\n");
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        printf("  %s (%zu bytes)\n", chunk->items[i]->path,
+               chunk->items[i]->data->size);
+        total_bytes += chunk->items[i]->data->size;
+        file_count++;
+      }
+      chunk_destroy(chunk);
+    }
+    directory_scanner_destroy(scanner);
+    printf("Total: %d files, %.1f MB\n", file_count,
+           total_bytes / 1048576.0);
+    return 0;
+  }
+
   Client *client;
   if (config->transport == TRANSPORT_SSH) {
     if (config->use_sendfile) {
       fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
       return 1;
     }
-    client = client_connect_ssh(config->ssh_destination);
+    client = client_connect_ssh(config->ssh_destination, config->ssh_port);
   } else {
     client = client_create();
     client_connect(client, server_host, server_port);
   }
   config_send(client->file_descriptor, config);
-  DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata, config->chunk_size);
+  DirectoryScanner *scanner = directory_scanner_create(
+      config->send_directory, config->use_metadata, config->chunk_size,
+      config->exclude_patterns, config->exclude_count);
   Chunk *current_chunk;
   unsigned long long total_bytes = 0;
   time_t last_progress = 0;
   time_t start = time(NULL);
+  ArrayList *manifest = config->use_delete ? array_list_create(free) : NULL;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     unsigned long long chunk_bytes = 0;
-    for (int i = 0; i < current_chunk->element_count; i++)
+    for (int i = 0; i < current_chunk->element_count; i++) {
       chunk_bytes += current_chunk->items[i]->data->size;
+      if (manifest) {
+        const char *p = current_chunk->items[i]->path;
+        if (*p == '/') p++;
+        array_list_add(manifest, str_dup(p));
+      }
+    }
     if (!config->use_sendfile) {
       for (int i = 0; i < current_chunk->element_count; i++)
         file_load_data(current_chunk->items[i]);
@@ -166,6 +218,13 @@ int send_files(Config *config) {
     }
     chunk_destroy(current_chunk);
   }
+  if (config->use_delete) {
+    send_status(client->file_descriptor, STATUS_MANIFEST);
+    send_int(client->file_descriptor, manifest->size);
+    for (int i = 0; i < manifest->size; i++)
+      send_str(client->file_descriptor, (char *)manifest->items[i]);
+    array_list_delete(manifest);
+  }
   send_status(client->file_descriptor, STATUS_FINISHED);
   int ok = receive_status(client->file_descriptor) == STATUS_OK;
   if (config->show_progress) {
@@ -180,9 +239,34 @@ int send_files(Config *config) {
 }
 
 int send_files_multithreaded(Config *config) {
+  if (config->dry_run) {
+    DirectoryScanner *scanner = directory_scanner_create(
+        config->send_directory, config->use_metadata, config->chunk_size,
+        config->exclude_patterns, config->exclude_count);
+    Chunk *chunk;
+    int file_count = 0;
+    unsigned long long total_bytes = 0;
+    printf("Dry run: files to be transferred\n");
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        printf("  %s (%zu bytes)\n", chunk->items[i]->path,
+               chunk->items[i]->data->size);
+        total_bytes += chunk->items[i]->data->size;
+        file_count++;
+      }
+      chunk_destroy(chunk);
+    }
+    directory_scanner_destroy(scanner);
+    printf("Total: %d files, %.1f MB\n", file_count,
+           total_bytes / 1048576.0);
+    return 0;
+  }
+
   PipelineContextSender *context =
       pipeline_context_sender_create(config, queue_create(100, chunk_destroy),
                                      queue_create(100, chunk_destroy));
+  if (config->use_delete)
+    context->manifest = array_list_create(free);
 
   thrd_t scanner, loader, sender;
   if (thrd_create(&scanner, scan_directory_multithreaded, context) !=

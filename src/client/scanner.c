@@ -11,13 +11,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size) {
+DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size, char **exclude_patterns, int exclude_count) {
   DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
   scanner->directories = queue_create(100, free);
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->use_metadata = use_metadata;
   scanner->chunk_size = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
+  scanner->exclude_patterns = exclude_patterns;
+  scanner->exclude_count = exclude_count;
   queue_enqueue(scanner->directories, str_dup(root_directory));
   return scanner;
 }
@@ -94,6 +96,17 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
     if (S_ISDIR(stats.st_mode)) {
       queue_enqueue(scanner->directories, (void *)cur_path);
     } else {
+      bool excluded = false;
+      for (int i = 0; i < scanner->exclude_count; i++) {
+        if (glob_match(scanner->exclude_patterns[i], entry->d_name)) {
+          excluded = true;
+          break;
+        }
+      }
+      if (excluded) {
+        free(cur_path);
+        continue;
+      }
       File *file = file_create(cur_path);
       file->data->size = stats.st_size;
       if (scanner->use_metadata)
