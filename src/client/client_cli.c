@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
     save_to_disk = true;
   }
 
-  Config *config = config_create(str_dup("1.0.0"), NULL, NULL,
+  Config *config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL,
                                  save_to_disk, false, false, false, false, 5, false, 0);
 
   int positional_args[2];

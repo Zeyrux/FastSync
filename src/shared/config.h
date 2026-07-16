@@ -30,6 +30,7 @@ typedef struct Config {
   int exclude_count;
 } Config;
 
+#define PROTOCOL_VERSION "1.0.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config *config_create(char *version, char *send_directory,

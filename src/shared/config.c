@@ -90,6 +90,14 @@ void config_send(int file_descriptor, Config *config) {
 Config *config_receive(int file_descriptor) {
   Config *config = (Config *)malloc(sizeof(Config));
   config->version = receive_str(file_descriptor);
+  if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
+    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n",
+            config->version, PROTOCOL_VERSION);
+    free(config->version);
+    free(config);
+    send_status(file_descriptor, STATUS_ERROR);
+    exit(EXIT_FAILURE);
+  }
   config->send_directory = receive_str(file_descriptor);
   config->receive_root_directory = receive_str(file_descriptor);
   config->save_to_disk = receive_int(file_descriptor);

@@ -85,6 +85,10 @@ static void receive_chunk_enqueue(int file_descriptor,
   if (context->config->use_compression) {
     data_to_process = data_decompress(chunk_data);
     data_destroy(chunk_data);
+    if (data_to_process == NULL) {
+      log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk, skipping");
+      return;
+    }
   }
   Chunk *chunk = chunk_deserialize(data_to_process, context->config->use_metadata);
   data_destroy(data_to_process);

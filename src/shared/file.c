@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "compression.h"
+#include "log.h"
 #include "config.h"
 #include "data.h"
 #include "file.h"
@@ -95,6 +96,10 @@ void file_send_single_calls(File *file, int file_descriptor, bool use_metadata, 
   if (compression_level > 0) {
     Data *compressed_data = data_compress(file->data, compression_level);
     data_destroy(file->data);
+    if (compressed_data == NULL) {
+      log_message(LOG_LEVEL_ERROR, "Compression failed in file_send_single_calls");
+      exit(EXIT_FAILURE);
+    }
     file->data = compressed_data;
   }
   send_str(file_descriptor, file->path);

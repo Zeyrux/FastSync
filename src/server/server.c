@@ -26,6 +26,11 @@ int receive_files(Config *config, int file_descriptor) {
       if (config->use_compression) {
         data_to_process = data_decompress(chunk_data);
         data_destroy(chunk_data);
+        if (data_to_process == NULL) {
+          log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");
+          send_status(file_descriptor, STATUS_ERROR);
+          return -1;
+        }
       }
       Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
       data_destroy(data_to_process);
@@ -95,6 +100,16 @@ void handler(int file_descriptor) {
   close(file_descriptor);
 }
 
+static Server *g_server = NULL;
+
+static void cleanup(int sig) {
+  (void)sig;
+  if (g_server) {
+    server_delete(&g_server);
+  }
+  _exit(0);
+}
+
 int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
@@ -106,8 +121,9 @@ int main(int argc, char *argv[]) {
       set_log_level(LOG_LEVEL_DEBUG);
     }
   }
-  Server *server = server_create(8080);
-  server_listen(server, handler);
-  server_delete(&server);
+  signal(SIGINT, cleanup);
+  signal(SIGTERM, cleanup);
+  g_server = server_create(8080);
+  server_listen(g_server, handler);
   return 0;
 }
