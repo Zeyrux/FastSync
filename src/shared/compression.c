@@ -4,6 +4,8 @@
 #include "stdlib.h"
 #include "zstd.h"
 
+#define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
+
 Data *data_compress(Data *data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
@@ -50,19 +52,25 @@ Data *data_decompress(Data *compressed_data) {
     return NULL;
   }
 
-  Data *uncompressed_data = data_create_empty((size_t)dst_size);
-  if (uncompressed_data == NULL) return NULL;
-
   ZSTD_DCtx *dctx = ZSTD_createDCtx();
   if (!dctx) {
     log_message(LOG_LEVEL_ERROR,
                 "Failed to create ZSTD decompression context");
-    data_destroy(uncompressed_data);
+    return NULL;
+  }
+
+  size_t buf_size = (!ZSTD_isError(dst_size) && dst_size > 0)
+                        ? (size_t)dst_size
+                        : INITIAL_DECOMPRESS_BUF_SIZE;
+  Data *uncompressed_data = data_create_empty(buf_size);
+  if (!uncompressed_data) {
+    log_message(LOG_LEVEL_ERROR, "Failed to allocate decompression buffer");
+    ZSTD_freeDCtx(dctx);
     return NULL;
   }
 
   ZSTD_inBuffer input = {compressed_data->data, compressed_data->size, 0};
-  ZSTD_outBuffer output = {uncompressed_data->data, (size_t)dst_size, 0};
+  ZSTD_outBuffer output = {uncompressed_data->data, buf_size, 0};
 
   size_t ret;
   do {
@@ -73,6 +81,19 @@ Data *data_decompress(Data *compressed_data) {
       ZSTD_freeDCtx(dctx);
       data_destroy(uncompressed_data);
       return NULL;
+    }
+    if (ret > 0 && output.pos == output.size) {
+      buf_size *= 2;
+      void *new_data = realloc(uncompressed_data->data, buf_size);
+      if (!new_data) {
+        log_message(LOG_LEVEL_ERROR, "Failed to grow decompression buffer");
+        ZSTD_freeDCtx(dctx);
+        data_destroy(uncompressed_data);
+        return NULL;
+      }
+      uncompressed_data->data = new_data;
+      output.dst = new_data;
+      output.size = buf_size;
     }
   } while (ret > 0);
 

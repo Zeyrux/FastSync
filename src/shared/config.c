@@ -103,6 +103,14 @@ Config *config_receive(int file_descriptor) {
   if (config == NULL) return NULL;
   config->version = receive_str(file_descriptor);
   if (!config->version) { free(config); return NULL; }
+  if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
+    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n",
+            config->version, PROTOCOL_VERSION);
+    free(config->version);
+    free(config);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
   config->send_directory = receive_str(file_descriptor);
   if (!config->send_directory) { free(config->version); free(config); return NULL; }
   config->receive_root_directory = receive_str(file_descriptor);

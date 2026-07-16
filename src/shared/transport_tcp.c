@@ -1,6 +1,7 @@
 #include "transport_tcp.h"
 #include "log.h"
 #include <arpa/inet.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,7 @@ Server *server_create(int port) {
 
 void server_delete(Server **server) {
   if (server == NULL || *server == NULL) return;
+  close((*server)->file_descriptor);
   free(*server);
   *server = NULL;
 }
@@ -61,17 +63,28 @@ bool server_listen(Server *server, void (*handler)(int file_descriptor)) {
     return false;
   }
 
-  int file_descriptor =
-      accept(server->file_descriptor, (struct sockaddr *)&server->address,
-             &server->address_length);
-  if (file_descriptor < 0) {
-    perror("Could not accept the connection");
-    return false;
+  signal(SIGCHLD, SIG_IGN);
+
+  while (1) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int file_descriptor =
+        accept(server->file_descriptor, (struct sockaddr *)&client_addr,
+               &client_len);
+    if (file_descriptor < 0) {
+      perror("Could not accept the connection");
+      continue;
+    }
+    log_message(LOG_LEVEL_INFO, "Received Connection");
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(server->file_descriptor);
+      handler(file_descriptor);
+      close(file_descriptor);
+      _exit(0);
+    }
+    close(file_descriptor);
   }
-  log_message(LOG_LEVEL_INFO, "Received Connection");
-  handler(file_descriptor);
-  close(server->file_descriptor);
-  close(file_descriptor);
   return true;
 }
 

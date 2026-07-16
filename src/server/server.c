@@ -142,6 +142,16 @@ void handler(int file_descriptor) {
   close(file_descriptor);
 }
 
+static Server *g_server = NULL;
+
+static void cleanup(int sig) {
+  (void)sig;
+  if (g_server) {
+    server_delete(&g_server);
+  }
+  _exit(0);
+}
+
 int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
@@ -153,12 +163,13 @@ int main(int argc, char *argv[]) {
       set_log_level(LOG_LEVEL_DEBUG);
     }
   }
-  Server *server = server_create(8080);
-  if (server == NULL) {
+  signal(SIGINT, cleanup);
+  signal(SIGTERM, cleanup);
+  g_server = server_create(8080);
+  if (g_server == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
     return 1;
   }
-  server_listen(server, handler);
-  server_delete(&server);
+  server_listen(g_server, handler);
   return 0;
 }
