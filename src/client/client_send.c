@@ -20,26 +20,29 @@
 
 int send_chunk(Client *client, Chunk *chunk, Config *config) {
   if (config->use_chunk_serialization) {
-    send_status(client->file_descriptor, STATUS_CHUNK);
+    if (!send_status(client->file_descriptor, STATUS_CHUNK)) return -1;
     Data *data;
     if (config->use_compression) {
       data = chunk_compress(chunk, config->compression_level, config->use_metadata);
     } else {
       data = chunk_serialize(chunk, config->use_metadata);
     }
-    send_data(client->file_descriptor, data);
+    if (data == NULL) return -1;
+    if (!send_data(client->file_descriptor, data)) { data_destroy(data); return -1; }
     data_destroy(data);
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
-      send_status(client->file_descriptor, STATUS_NEXT);
-      file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata);
+      if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+      if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata))
+        return -1;
     }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
-      send_status(client->file_descriptor, STATUS_NEXT);
-      file_send_single_calls(chunk->items[i], client->file_descriptor,
+      if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+      if (!file_send_single_calls(chunk->items[i], client->file_descriptor,
                             config->use_metadata,
-                            config->use_compression ? config->compression_level : 0);
+                            config->use_compression ? config->compression_level : 0))
+        return -1;
     }
   }
   return 0;
@@ -56,9 +59,17 @@ static int send_chunks_multithreaded(void *pipeline_context) {
     client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port);
   } else {
     client = client_create();
-    client_connect(client, server_host, server_port);
+    if (!client || !client_connect(client, server_host, server_port)) {
+      if (client) client_delete(client);
+      fprintf(stderr, "Error: could not connect to server\n");
+      return thrd_error;
+    }
   }
-  config_send(client->file_descriptor, context->config);
+  if (!config_send(client->file_descriptor, context->config)) {
+    client_disconnect(client);
+    client_delete(client);
+    return thrd_error;
+  }
 
   while (true) {
     Chunk *current_chunk = queue_dequeue_multithreaded(
@@ -74,14 +85,17 @@ static int send_chunks_multithreaded(void *pipeline_context) {
                    (char *)context->manifest->items[i]);
       }
       send_status(client->file_descriptor, STATUS_FINISHED);
-      int ok = receive_status(client->file_descriptor) == STATUS_OK;
+      Status s;
+      int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
       client_disconnect(client);
       client_delete(client);
       return ok ? thrd_success : thrd_error;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
-      perror("Something unexpected happend while sending the chunk");
-      exit(EXIT_FAILURE);
+      fprintf(stderr, "Error: unexpected error while sending chunk\n");
+      client_disconnect(client);
+      client_delete(client);
+      return thrd_error;
     }
     chunk_destroy(current_chunk);
   }
@@ -93,7 +107,9 @@ static int scan_directory_multithreaded(void *pipeline_context) {
   DirectoryScanner *scanner = directory_scanner_create(
       context->config->send_directory, context->config->use_metadata,
       context->config->chunk_size, context->config->exclude_patterns,
-      context->config->exclude_count);
+      context->config->exclude_count, context->config->include_patterns,
+      context->config->include_count, context->config->max_size,
+      context->config->min_size);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk *current_chunk;
@@ -136,8 +152,13 @@ static int load_files_multithreaded(void *pipeline_context) {
       return thrd_success;
     }
     if (!context->config->use_sendfile) {
-      for (int i = 0; i < chunk->element_count; i++)
-        file_load_data(chunk->items[i]);
+      for (int i = 0; i < chunk->element_count; i++) {
+        if (!file_load_data(chunk->items[i])) {
+          log_message(LOG_LEVEL_ERROR, "Failed to load file data, skipping");
+          file_destroy(chunk->items[i]);
+          chunk->items[i] = NULL;
+        }
+      }
     }
     queue_enqueue_multithreaded(context->queue_loader, chunk,
                                 &context->mutex_loader,
@@ -150,7 +171,9 @@ int send_files(Config *config) {
   if (config->dry_run) {
     DirectoryScanner *scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size,
-        config->exclude_patterns, config->exclude_count);
+        config->exclude_patterns, config->exclude_count,
+        config->include_patterns, config->include_count,
+        config->max_size, config->min_size);
     Chunk *chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
@@ -177,14 +200,25 @@ int send_files(Config *config) {
       return 1;
     }
     client = client_connect_ssh(config->ssh_destination, config->ssh_port);
+    if (!client) return 1;
   } else {
     client = client_create();
-    client_connect(client, server_host, server_port);
+    if (!client || !client_connect(client, server_host, server_port)) {
+      if (client) client_delete(client);
+      fprintf(stderr, "Error: could not connect to server\n");
+      return 1;
+    }
   }
-  config_send(client->file_descriptor, config);
+  if (!config_send(client->file_descriptor, config)) {
+    client_disconnect(client);
+    client_delete(client);
+    return 1;
+  }
   DirectoryScanner *scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size,
-      config->exclude_patterns, config->exclude_count);
+      config->exclude_patterns, config->exclude_count,
+      config->include_patterns, config->include_count,
+      config->max_size, config->min_size);
   Chunk *current_chunk;
   unsigned long long total_bytes = 0;
   time_t last_progress = 0;
@@ -201,10 +235,18 @@ int send_files(Config *config) {
       }
     }
     if (!config->use_sendfile) {
-      for (int i = 0; i < current_chunk->element_count; i++)
-        file_load_data(current_chunk->items[i]);
+      for (int i = 0; i < current_chunk->element_count; i++) {
+        if (!file_load_data(current_chunk->items[i])) {
+          log_message(LOG_LEVEL_ERROR, "Failed to load file data");
+          continue;
+        }
+      }
     }
-    send_chunk(client, current_chunk, config);
+    if (send_chunk(client, current_chunk, config) != 0) {
+      log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
+      chunk_destroy(current_chunk);
+      break;
+    }
     if (config->show_progress) {
       total_bytes += chunk_bytes;
       time_t now = time(NULL);
@@ -226,7 +268,8 @@ int send_files(Config *config) {
     array_list_delete(manifest);
   }
   send_status(client->file_descriptor, STATUS_FINISHED);
-  int ok = receive_status(client->file_descriptor) == STATUS_OK;
+  Status s;
+  int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
   if (config->show_progress) {
     double elapsed = difftime(time(NULL), start);
     double rate = elapsed > 0 ? total_bytes / (1048576.0 * elapsed) : 0;
@@ -242,7 +285,9 @@ int send_files_multithreaded(Config *config) {
   if (config->dry_run) {
     DirectoryScanner *scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size,
-        config->exclude_patterns, config->exclude_count);
+        config->exclude_patterns, config->exclude_count,
+        config->include_patterns, config->include_count,
+        config->max_size, config->min_size);
     Chunk *chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
@@ -262,9 +307,20 @@ int send_files_multithreaded(Config *config) {
     return 0;
   }
 
+  Queue *q1 = queue_create(100, chunk_destroy);
+  Queue *q2 = queue_create(100, chunk_destroy);
+  if (!q1 || !q2) {
+    if (q1) queue_destroy(q1);
+    if (q2) queue_destroy(q2);
+    return 1;
+  }
   PipelineContextSender *context =
-      pipeline_context_sender_create(config, queue_create(100, chunk_destroy),
-                                     queue_create(100, chunk_destroy));
+      pipeline_context_sender_create(config, q1, q2);
+  if (!context) {
+    queue_destroy(q1);
+    queue_destroy(q2);
+    return 1;
+  }
   if (config->use_delete)
     context->manifest = array_list_create(free);
 
@@ -275,6 +331,7 @@ int send_files_multithreaded(Config *config) {
       thrd_create(&sender, send_chunks_multithreaded, context) !=
           thrd_success) {
     perror("Error creating threads.\n");
+    pipeline_context_sender_destroy(context);
     return 1;
   }
 

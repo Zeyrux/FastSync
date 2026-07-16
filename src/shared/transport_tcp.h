@@ -2,6 +2,7 @@
 #define TRANSPORT_TCP_H
 
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <sys/types.h>
 
 typedef struct Server {
@@ -18,10 +19,10 @@ typedef struct Client {
 } Client;
 
 Server *server_create(int port);
-void server_listen(Server *server, void (*handler)(int file_descriptor));
+bool server_listen(Server *server, void (*handler)(int file_descriptor));
 void server_delete(Server **server);
 Client *client_create();
-void client_connect(Client *client, char *host, int port);
+bool client_connect(Client *client, char *host, int port);
 void client_disconnect(Client *client);
 void client_delete(Client *client);
 

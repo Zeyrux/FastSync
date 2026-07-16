@@ -14,16 +14,14 @@
 Chunk *chunk_create(File **items, int element_count) {
   Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
   if (chunk == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for chunk structure");
-    exit(EXIT_FAILURE);
+    perror("ERROR: Could not allocate memory for chunk structure");
+    return NULL;
   }
 
   chunk->items = (File **)malloc(element_count * sizeof(File *));
   if (chunk->items == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for items of chunk "
-           "structure");
     free(chunk);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   for (int i = 0; i < element_count; i++) {
@@ -62,7 +60,7 @@ Data *chunk_serialize(Chunk *chunk, bool use_metadata) {
   if (data == NULL) {
     log_message(LOG_LEVEL_ERROR,
                 "Could not allocate memory for chunk serialization");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
   char *data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
@@ -172,8 +170,10 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
 Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress chunk");
   Data *serialized = chunk_serialize(chunk, use_metadata);
+  if (serialized == NULL) return NULL;
   Data *compressed = data_compress(serialized, compression_level);
   data_destroy(serialized);
+  if (compressed == NULL) return NULL;
   log_message(LOG_LEVEL_DEBUG, "Chunk successfully compressed");
   return compressed;
 }

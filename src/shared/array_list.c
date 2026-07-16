@@ -6,15 +6,14 @@
 ArrayList *array_list_create(void (*item_destroyer)(void *item)) {
   ArrayList *list = (ArrayList *)malloc(sizeof(ArrayList));
   if (list == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for array list struct");
-    exit(EXIT_FAILURE);
+    perror("ERROR: Could not allocate memory for array list struct");
+    return NULL;
   }
 
   list->items = malloc(INITIAL_ARRAY_SIZE * sizeof(void *));
   if (list->items == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for list items");
     free(list);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
   list->size = 0;
   list->capacity = INITIAL_ARRAY_SIZE;
@@ -35,29 +34,30 @@ void array_list_delete(ArrayList *array_list) {
   free(array_list);
 }
 
-void array_list_extend(ArrayList *array_list) {
-  if (array_list == NULL)
-    return;
+bool array_list_extend(ArrayList *array_list) {
+  if (array_list == NULL) return false;
   int new_capacity = array_list->capacity * 2;
   if (new_capacity == 0)
     new_capacity = INITIAL_ARRAY_SIZE;
-  array_list->items = realloc(array_list->items, new_capacity * sizeof(void *));
-  if (array_list->items == NULL) {
-    perror("FATAL ERROR: Could not reallocate memory for array list struct");
-    exit(EXIT_FAILURE);
+  void *new_items = realloc(array_list->items, new_capacity * sizeof(void *));
+  if (new_items == NULL) {
+    perror("ERROR: Could not reallocate memory for array list items");
+    return false;
   }
+  array_list->items = new_items;
   array_list->capacity = new_capacity;
+  return true;
 }
 
-void array_list_add(ArrayList *array_list, void *item) {
-  if (array_list == NULL) {
-    return;
-  }
+bool array_list_add(ArrayList *array_list, void *item) {
+  if (array_list == NULL) return false;
   if (array_list->capacity == array_list->size) {
-    array_list_extend(array_list);
+    if (!array_list_extend(array_list))
+      return false;
   }
   array_list->items[array_list->size] = item;
   array_list->size += 1;
+  return true;
 }
 
 void **array_list_to_array(ArrayList *array_list) {

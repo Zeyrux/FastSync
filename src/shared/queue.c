@@ -9,15 +9,14 @@
 Queue *queue_create(int capacity, void (*destroyer)(void *item)) {
   Queue *queue = (Queue *)malloc(sizeof(Queue));
   if (queue == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for queue structure");
-    exit(EXIT_FAILURE);
+    perror("ERROR: Could not allocate memory for queue structure");
+    return NULL;
   }
 
   queue->items = malloc(capacity * sizeof(void *));
   if (queue->items == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for queue items");
     free(queue);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   for (int i = 0; i < capacity; ++i) {
@@ -59,17 +58,15 @@ bool queue_is_full(Queue *queue) {
   return queue->size == queue->capacity;
 }
 
-static void queue_double_capacity(Queue *queue) {
-  if (queue == NULL)
-    return;
+static bool queue_double_capacity(Queue *queue) {
+  if (queue == NULL) return false;
   unsigned int new_capacity = queue->capacity * 2;
   if (new_capacity <= 1)
     new_capacity = 100;
   void **new_items = malloc(new_capacity * sizeof(void *));
   if (new_items == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for doubling capacity of "
-           "queue.");
-    exit(EXIT_FAILURE);
+    perror("ERROR: Could not allocate memory for doubling capacity of queue.");
+    return false;
   }
   for (int i = 0; i < queue->size; i++)
     new_items[i] = queue->items[(i + queue->front) % queue->capacity];
@@ -78,29 +75,30 @@ static void queue_double_capacity(Queue *queue) {
   queue->front = 0;
   queue->rear = queue->size;
   queue->capacity = new_capacity;
+  return true;
 }
 
-void queue_enqueue(Queue *queue, void *item) {
-  if (queue == NULL || item == NULL) {
-    perror("ERROR: Cannot enqueue with a null queue or item.\n");
-    exit(EXIT_FAILURE);
+bool queue_enqueue(Queue *queue, void *item) {
+  if (queue == NULL || item == NULL) return false;
+  if (queue_is_full(queue)) {
+    if (!queue_double_capacity(queue)) return false;
   }
-  if (queue_is_full(queue))
-    queue_double_capacity(queue);
   queue->items[queue->rear] = item;
   queue->rear = (queue->rear + 1) % queue->capacity;
   queue->size++;
+  return true;
 }
 
-void queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
+bool queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
                                  cnd_t *condition_not_empty,
                                  cnd_t *condition_not_full) {
   mtx_lock(mutex);
   while (queue_is_full(queue))
     cnd_wait(condition_not_full, mutex);
-  queue_enqueue(queue, item);
+  bool ok = queue_enqueue(queue, item);
   cnd_signal(condition_not_empty);
   mtx_unlock(mutex);
+  return ok;
 }
 
 void *queue_dequeue(Queue *queue) {

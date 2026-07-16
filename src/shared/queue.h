@@ -17,8 +17,8 @@ Queue *queue_create(int capacity, void (*destroyer)(void *item));
 void queue_destroy(Queue *queue);
 bool queue_is_empty(Queue *queue);
 bool queue_is_full(Queue *queue);
-void queue_enqueue(Queue *queue, void *item);
-void queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
+bool queue_enqueue(Queue *queue, void *item);
+bool queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
                                  cnd_t *condition_not_empty,
                                  cnd_t *condition_not_full);
 void *queue_dequeue(Queue *queue);

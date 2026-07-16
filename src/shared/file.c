@@ -21,20 +21,24 @@
 File *file_create(const char *path) {
   File *file = (File *)malloc(sizeof(File));
   if (file == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for file struct");
-    exit(EXIT_FAILURE);
+    perror("ERROR: Could not allocate memory for file struct");
+    return NULL;
   }
 
   int path_len = strlen(path);
   file->path = (char *)malloc(path_len + 1);
   if (file->path == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for path file string");
     free(file);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   strcpy(file->path, path);
   file->data = data_create_reserve(0);
+  if (file->data == NULL) {
+    free(file->path);
+    free(file);
+    return NULL;
+  }
   file->metadata = NULL;
   return file;
 }
@@ -55,8 +59,8 @@ void file_destroy(void *item) {
 FileMetadata *file_metadata_create(struct stat *stats) {
   FileMetadata *m = malloc(sizeof(FileMetadata));
   if (m == NULL) {
-    perror("FATAL ERROR: Could not allocate memory for file metadata");
-    exit(EXIT_FAILURE);
+    perror("ERROR: Could not allocate memory for file metadata");
+    return NULL;
   }
   m->mode = stats->st_mode;
   m->uid = stats->st_uid;
@@ -74,67 +78,79 @@ void file_metadata_destroy(void *metadata) {
   free(metadata);
 }
 
-void file_load_data(File *file) {
-  if (file == NULL)
-    return;
+bool file_load_data(File *file) {
+  if (file == NULL) return false;
   if (file->data->data == NULL) {
     file->data->data = malloc(file->data->size);
     if (file->data->data == NULL) {
       perror("Could not allocate memory for file data");
-      exit(EXIT_FAILURE);
+      return false;
     }
   }
   size_t bytes_read = file_content_to_buffer(file);
   if (bytes_read != file->data->size) {
-    log_message(STATUS_ERROR, "Didnt read expected amount of bytes from file");
-    exit(EXIT_FAILURE);
+    log_message(LOG_LEVEL_ERROR, "Did not read expected amount of bytes from file");
+    return false;
   }
+  return true;
 }
 
-void file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
+bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
   if (compression_level > 0) {
     Data *compressed_data = data_compress(file->data, compression_level);
+    if (compressed_data == NULL) {
+      log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
+      return false;
+    }
     data_destroy(file->data);
     file->data = compressed_data;
   }
-  send_str(file_descriptor, file->path);
-  if (use_metadata)
-    metadata_send(file_descriptor, file->metadata);
-  send_data(file_descriptor, file->data);
+  if (!send_str(file_descriptor, file->path)) return false;
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
+  if (!send_data(file_descriptor, file->data)) return false;
+  return true;
 }
 
-void to_disk(const char *path, const void *data, unsigned long long data_size) {
+bool to_disk(const char *path, const void *data, unsigned long long data_size) {
   char *directory = str_dup(path);
   char *dir_to_free = directory;
   directory = dirname(directory);
-  mkdir_r(directory);
+  if (!mkdir_r(directory)) {
+    free(dir_to_free);
+    return false;
+  }
   FILE *file_pointer = fopen(path, "wb");
   if (file_pointer == NULL) {
     perror("Could not open File");
-    exit(EXIT_FAILURE);
+    free(dir_to_free);
+    return false;
   }
   if (fwrite(data, 1, data_size, file_pointer) != data_size) {
     perror("Failed to write all data to disk");
     fclose(file_pointer);
-    exit(EXIT_FAILURE);
+    free(dir_to_free);
+    return false;
   }
   fclose(file_pointer);
   free(dir_to_free);
+  return true;
 }
 
-void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
-  send_str(file_descriptor, file->path);
-  if (use_metadata)
-    metadata_send(file_descriptor, file->metadata);
+bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
+  if (!send_str(file_descriptor, file->path)) return false;
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
 
   int fd = open(file->path, O_RDONLY);
   if (fd == -1) {
     perror("Could not open file for sendfile");
-    exit(EXIT_FAILURE);
+    return false;
   }
 
   unsigned long long file_size = file->data->size;
-  send_n_data(file_descriptor, &file_size, sizeof(unsigned long long));
+  if (!send_n_data(file_descriptor, &file_size, sizeof(unsigned long long))) {
+    close(fd);
+    return false;
+  }
 
   off_t offset = 0;
   while (offset < file_size) {
@@ -142,23 +158,35 @@ void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
     if (sent == -1) {
       perror("sendfile failed");
       close(fd);
-      exit(EXIT_FAILURE);
+      return false;
     }
   }
 
   close(fd);
+  return true;
 }
 
 File *file_receive(Config *config, int file_descriptor) {
-  char *path = (char *)receive_str(file_descriptor);
+  char *path = receive_str(file_descriptor);
+  if (path == NULL) return NULL;
   File *file = file_create(path);
   free(path);
-  if (config->use_metadata)
+  if (file == NULL) return NULL;
+  if (config->use_metadata) {
     file->metadata = metadata_receive(file_descriptor);
+  }
   Data *file_data = receive_data(file_descriptor);
+  if (file_data == NULL) {
+    file_destroy(file);
+    return NULL;
+  }
   if (config->use_compression) {
     Data *file_data_uncompressed = data_decompress(file_data);
     data_destroy(file_data);
+    if (file_data_uncompressed == NULL) {
+      file_destroy(file);
+      return NULL;
+    }
     file_data = file_data_uncompressed;
   }
   data_destroy(file->data);
