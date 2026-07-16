@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
+#include <time.h>
 
 int send_chunk(Client *client, Chunk *chunk, Config *config) {
   if (config->use_chunk_serialization) {
@@ -140,16 +141,38 @@ int send_files(Config *config) {
   config_send(client->file_descriptor, config);
   DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata, config->chunk_size);
   Chunk *current_chunk;
+  unsigned long long total_bytes = 0;
+  time_t last_progress = 0;
+  time_t start = time(NULL);
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
+    unsigned long long chunk_bytes = 0;
+    for (int i = 0; i < current_chunk->element_count; i++)
+      chunk_bytes += current_chunk->items[i]->data->size;
     if (!config->use_sendfile) {
       for (int i = 0; i < current_chunk->element_count; i++)
         file_load_data(current_chunk->items[i]);
     }
     send_chunk(client, current_chunk, config);
+    if (config->show_progress) {
+      total_bytes += chunk_bytes;
+      time_t now = time(NULL);
+      if (now - last_progress >= 1) {
+        last_progress = now;
+        double elapsed = difftime(now, start);
+        double rate = elapsed > 0 ? total_bytes / (1048576.0 * elapsed) : 0;
+        fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  ", total_bytes / 1048576.0, rate);
+        fflush(stderr);
+      }
+    }
     chunk_destroy(current_chunk);
   }
   send_status(client->file_descriptor, STATUS_FINISHED);
   int ok = receive_status(client->file_descriptor) == STATUS_OK;
+  if (config->show_progress) {
+    double elapsed = difftime(time(NULL), start);
+    double rate = elapsed > 0 ? total_bytes / (1048576.0 * elapsed) : 0;
+    fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  Done.\n", total_bytes / 1048576.0, rate);
+  }
   directory_scanner_destroy(scanner);
   client_disconnect(client);
   client_delete(client);

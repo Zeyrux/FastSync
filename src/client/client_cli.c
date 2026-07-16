@@ -21,6 +21,8 @@ static void print_usage(void) {
   printf("\n");
   printf("Options:\n");
   printf("  -c [level]          Enable compression (level 1-22, default 5)\n");
+  printf("  -z [level]          Alias for -c\n");
+  printf("  --progress          Show transfer progress\n");
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -56,7 +58,7 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
       return 0;
-    } else if (strcmp(argv[i], "-c") == 0) {
+    } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
       if (i + 1 < argc) {
@@ -94,6 +96,8 @@ int main(int argc, char *argv[]) {
       server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       server_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--progress") == 0) {
+      config->show_progress = true;
     } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
       unsigned long long val = strtoull(argv[++i], NULL, 10);
       if (val > 0)

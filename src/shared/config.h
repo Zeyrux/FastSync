@@ -18,6 +18,7 @@ typedef struct Config {
   bool use_compression;
   bool use_sendfile;
   bool use_metadata;
+  bool show_progress;
   int compression_level;
   unsigned long long chunk_size;
   TransportType transport;

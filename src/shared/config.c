@@ -22,6 +22,7 @@ Config *config_create(char *version, char *send_directory,
   config->use_chunk_serialization = use_chunk_serialization;
   config->use_compression = use_compression;
   config->use_metadata = use_metadata;
+  config->show_progress = false;
   config->compression_level = compression_level;
   config->use_sendfile = use_sendfile;
   config->chunk_size = chunk_size > 0 ? chunk_size : DEFAULT_CHUNK_SIZE;
