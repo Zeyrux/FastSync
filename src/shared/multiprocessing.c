@@ -38,8 +38,6 @@ PipelineContextSender *pipeline_context_sender_create(Config *config,
 
 void pipeline_context_sender_destroy(PipelineContextSender *context) {
   if (context->manifest) {
-    for (int i = 0; i < context->manifest->size; i++)
-      free(context->manifest->items[i]);
     array_list_delete(context->manifest);
   }
   config_delete(context->config);

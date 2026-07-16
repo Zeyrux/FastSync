@@ -100,9 +100,11 @@ static int scan_directory_multithreaded(void *pipeline_context) {
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     if (context->config->use_delete) {
       mtx_lock(&context->mutex_scanner);
-      for (int i = 0; i < current_chunk->element_count; i++)
-        array_list_add(context->manifest,
-                       str_dup(current_chunk->items[i]->path));
+      for (int i = 0; i < current_chunk->element_count; i++) {
+        const char *p = current_chunk->items[i]->path;
+        if (*p == '/') p++;
+        array_list_add(context->manifest, str_dup(p));
+      }
       mtx_unlock(&context->mutex_scanner);
     }
     queue_enqueue_multithreaded(context->queue_scanner, current_chunk,
@@ -192,8 +194,11 @@ int send_files(Config *config) {
     unsigned long long chunk_bytes = 0;
     for (int i = 0; i < current_chunk->element_count; i++) {
       chunk_bytes += current_chunk->items[i]->data->size;
-      if (manifest)
-        array_list_add(manifest, str_dup(current_chunk->items[i]->path));
+      if (manifest) {
+        const char *p = current_chunk->items[i]->path;
+        if (*p == '/') p++;
+        array_list_add(manifest, str_dup(p));
+      }
     }
     if (!config->use_sendfile) {
       for (int i = 0; i < current_chunk->element_count; i++)
@@ -218,8 +223,6 @@ int send_files(Config *config) {
     send_int(client->file_descriptor, manifest->size);
     for (int i = 0; i < manifest->size; i++)
       send_str(client->file_descriptor, (char *)manifest->items[i]);
-    for (int i = 0; i < manifest->size; i++)
-      free(manifest->items[i]);
     array_list_delete(manifest);
   }
   send_status(client->file_descriptor, STATUS_FINISHED);
