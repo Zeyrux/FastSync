@@ -74,23 +74,6 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver *context) {
   free(context);
 }
 
-File *file_receive(Config *config, int file_descriptor) {
-  char *path = (char *)receive_str(file_descriptor);
-  File *file = file_create(path);
-  free(path);
-  if (config->use_metadata)
-    file->metadata = metadata_receive(file_descriptor);
-  Data *file_data = receive_data(file_descriptor);
-  if (config->use_compression) {
-    Data *file_data_uncompressed = data_decompress(file_data);
-    data_destroy(file_data);
-    file_data = file_data_uncompressed;
-  }
-  data_destroy(file->data);
-  file->data = file_data;
-  return file;
-}
-
 static void receive_chunk_enqueue(int file_descriptor,
                                   PipelineContextReceiver *context) {
   Data *chunk_data = receive_data(file_descriptor);

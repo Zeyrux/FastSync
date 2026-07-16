@@ -1,6 +1,7 @@
 #ifndef FILE_H
 #define FILE_H
 
+#include "config.h"
 #include "data.h"
 #include <stdbool.h>
 #include <sys/stat.h>
@@ -22,7 +23,8 @@ typedef struct {
 File *file_create(const char *path);
 void file_destroy(void *item);
 void file_load_data(File *file);
-void file_send_single_calls(File *file, int file_descriptor, bool use_metadata);
+File *file_receive(Config *config, int file_descriptor);
+void file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level);
 void file_send_sendfile(File *file, int file_descriptor, bool use_metadata);
 size_t file_content_to_buffer(File *file);
 FileMetadata *file_metadata_create(struct stat *stats);

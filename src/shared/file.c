@@ -9,9 +9,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "compression.h"
+#include "config.h"
 #include "data.h"
 #include "file.h"
-#include "io.h"
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
@@ -90,11 +91,16 @@ void file_load_data(File *file) {
   }
 }
 
-void file_send_single_calls(File *file, int file_descriptor, bool use_metadata) {
+void file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
+  if (compression_level > 0) {
+    Data *compressed_data = data_compress(file->data, compression_level);
+    data_destroy(file->data);
+    file->data = compressed_data;
+  }
   send_str(file_descriptor, file->path);
   if (use_metadata)
     metadata_send(file_descriptor, file->metadata);
-  send_data(file_descriptor, file->data->data, file->data->size);
+  send_data(file_descriptor, file->data);
 }
 
 void to_disk(const char *path, const void *data, unsigned long long data_size) {
@@ -137,6 +143,23 @@ void file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
   }
 
   close(fd);
+}
+
+File *file_receive(Config *config, int file_descriptor) {
+  char *path = (char *)receive_str(file_descriptor);
+  File *file = file_create(path);
+  free(path);
+  if (config->use_metadata)
+    file->metadata = metadata_receive(file_descriptor);
+  Data *file_data = receive_data(file_descriptor);
+  if (config->use_compression) {
+    Data *file_data_uncompressed = data_decompress(file_data);
+    data_destroy(file_data);
+    file_data = file_data_uncompressed;
+  }
+  data_destroy(file->data);
+  file->data = file_data;
+  return file;
 }
 
 size_t file_content_to_buffer(File *file) {
