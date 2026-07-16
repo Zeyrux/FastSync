@@ -1,6 +1,7 @@
 import argparse
 import filecmp
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -145,12 +146,15 @@ def generate_test_files(source_dir):
     while written < target_total:
         chunk_size = min(5 * 1024 * 1024, target_total - written)
         with open(os.path.join(source_dir, f"bulk/file_{i}.dat"), "wb") as f:
-            f.write(b"0" * chunk_size)
+            f.write(random.randbytes(chunk_size))
         written += chunk_size
         i += 1
 
     total_mb = written / (1024 * 1024)
-    print(f"  Generated {total_mb:.1f} MB of test data in {source_dir}")
+    small_bytes = sum(len(c) for c in files.values())
+    print(f"  Generated {total_mb:.1f} MB of test data in {source_dir} "
+          f"({(written - small_bytes)/(1024*1024):.1f} MB random, "
+          f"{small_bytes} B structured)")
     return written
 
 
@@ -491,7 +495,7 @@ def print_metrics(profile_name, results, total_bytes):
         t = float(r["time"].rstrip("s"))
         if r["name"].startswith("rsync"):
             rsync_times[r["name"]] = t
-        else:
+        elif "Dry run" not in r["name"]:
             client_times.append((t, r["name"]))
     if not client_times or len(rsync_times) < 2:
         return
