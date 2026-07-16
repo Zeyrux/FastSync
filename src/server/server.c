@@ -8,6 +8,7 @@
 #include "protocol.h"
 #include "queue.h"
 #include "transport_tcp.h"
+#include "transport_tls.h"
 #include "unistd.h"
 #include "utils.h"
 #include <signal.h>
@@ -119,6 +120,11 @@ static void cleanup(int sig) {
 }
 
 int main(int argc, char *argv[]) {
+  bool use_tls = false;
+  char *tls_cert = NULL;
+  char *tls_key = NULL;
+  int port = 8080;
+
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--stdio") == 0) {
@@ -127,15 +133,38 @@ int main(int argc, char *argv[]) {
       return 0;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
+    } else if (strcmp(argv[i], "--tls") == 0) {
+      use_tls = true;
+    } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
+      tls_cert = argv[++i];
+    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
+      tls_key = argv[++i];
+    } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+      port = atoi(argv[++i]);
     }
   }
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
-  g_server = server_create(8080);
+  g_server = server_create(port);
   if (g_server == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
     return 1;
   }
-  server_listen(g_server, handler);
+  if (use_tls) {
+    if (!tls_cert || !tls_key) {
+      fprintf(stderr, "Error: --tls requires --cert and --key\n");
+      server_delete(&g_server);
+      return 1;
+    }
+    tls_global_init();
+    if (!server_create_tls(g_server, tls_cert, tls_key)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
+      server_delete(&g_server);
+      return 1;
+    }
+    server_listen_tls(g_server, handler);
+  } else {
+    server_listen(g_server, handler);
+  }
   return 0;
 }

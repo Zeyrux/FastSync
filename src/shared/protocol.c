@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "log.h"
 #include <errno.h>
+#include <openssl/ssl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
+static SSL *io_ssl = NULL;
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
@@ -54,6 +56,10 @@ static void bw_throttle(size_t bytes_written) {
   }
 }
 
+void io_set_ssl(SSL *ssl) {
+  io_ssl = ssl;
+}
+
 static int io_fd(int dir_fd, int file_descriptor) {
   return (dir_fd != -1) ? dir_fd : file_descriptor;
 }
@@ -66,8 +72,11 @@ bool send_n_data(int file_descriptor, void *data, size_t data_size) {
     size_t chunk = data_size - total_bytes_send;
     if (io_bwlimit > 0 && chunk > 65536)
       chunk = 65536;
-    ssize_t bytes_send =
-        write(fd, (char *)data + total_bytes_send, chunk);
+    ssize_t bytes_send;
+    if (io_ssl)
+      bytes_send = SSL_write(io_ssl, (char *)data + total_bytes_send, chunk);
+    else
+      bytes_send = write(fd, (char *)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
@@ -84,8 +93,13 @@ bool receive_n_data(int file_descriptor, void *data, size_t data_size) {
   int fd = io_fd(io_read_fd, file_descriptor);
   size_t total_bytes_received = 0;
   while (total_bytes_received < data_size) {
-    ssize_t bytes_received =
-        read(fd, (char *)data + total_bytes_received, data_size - total_bytes_received);
+    ssize_t bytes_received;
+    if (io_ssl)
+      bytes_received = SSL_read(io_ssl, (char *)data + total_bytes_received,
+                                data_size - total_bytes_received);
+    else
+      bytes_received = read(fd, (char *)data + total_bytes_received,
+                             data_size - total_bytes_received);
     if (bytes_received <= 0) {
       if (bytes_received == 0)
         log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");

@@ -33,6 +33,9 @@ typedef struct Config {
   unsigned long long max_size;
   unsigned long long min_size;
   bool use_incremental;
+  bool use_tls;
+  char *tls_cert;
+  char *tls_key;
 } Config;
 
 #define PROTOCOL_VERSION "1.1.0"

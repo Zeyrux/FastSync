@@ -47,6 +47,10 @@ static void print_usage(void) {
   printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
   printf("  --server-port <n>   Server port (default: 8080)\n");
   printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
+  printf("  --tls               Enable TLS encryption\n");
+  printf("  --cert <path>       TLS certificate file (PEM)\n");
+  printf("  --key <path>        TLS private key file (PEM)\n");
+  printf("  --ca <path>         CA certificate for verification (PEM)\n");
   printf("  --help              Show this help\n");
 }
 
@@ -154,6 +158,17 @@ int main(int argc, char *argv[]) {
       unsigned long long val = strtoull(argv[++i], NULL, 10);
       if (val > 0)
         config->chunk_size = val;
+    } else if (strcmp(argv[i], "--tls") == 0) {
+      config->use_tls = true;
+    } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
+      free(config->tls_cert);
+      config->tls_cert = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
+      free(config->tls_key);
+      config->tls_key = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
+      free(config->tls_ca);
+      config->tls_ca = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {

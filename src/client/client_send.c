@@ -11,6 +11,7 @@
 #include "scanner.h"
 #include "transport_tcp.h"
 #include "transport_ssh.h"
+#include "transport_tls.h"
 #include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +99,16 @@ static int send_chunks_multithreaded(void *pipeline_context) {
       return 1;
     }
     client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port);
+  } else if (context->config->use_tls) {
+    tls_global_init();
+    client = client_create();
+    if (!client || !client_connect_tls(client, server_host, server_port,
+                                       context->config->tls_cert,
+                                       context->config->tls_key)) {
+      if (client) client_delete(client);
+      fprintf(stderr, "Error: could not connect to server via TLS\n");
+      return thrd_error;
+    }
   } else {
     client = client_create();
     if (!client || !client_connect(client, server_host, server_port)) {
@@ -242,6 +253,15 @@ int send_files(Config *config) {
     }
     client = client_connect_ssh(config->ssh_destination, config->ssh_port);
     if (!client) return 1;
+  } else if (config->use_tls) {
+    tls_global_init();
+    client = client_create();
+    if (!client || !client_connect_tls(client, server_host, server_port,
+                                       config->tls_cert, config->tls_key)) {
+      if (client) client_delete(client);
+      fprintf(stderr, "Error: could not connect to server via TLS\n");
+      return 1;
+    }
   } else {
     client = client_create();
     if (!client || !client_connect(client, server_host, server_port)) {

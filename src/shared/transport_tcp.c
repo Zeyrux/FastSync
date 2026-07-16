@@ -36,6 +36,7 @@ Server *server_create(int port) {
   server->address.sin_addr.s_addr = INADDR_ANY;
   server->address.sin_port = htons(port);
   server->address_length = sizeof(server->address);
+  server->ssl_ctx = NULL;
 
   if (bind(server->file_descriptor, (struct sockaddr *)&server->address,
            server->address_length) < 0) {
@@ -104,6 +105,8 @@ Client *client_create() {
   client->address.sin_family = AF_INET;
   client->address_length = sizeof(client->address);
   client->ssh_child_pid = -1;
+  client->ssl = NULL;
+  client->ssl_ctx = NULL;
   return client;
 }
 

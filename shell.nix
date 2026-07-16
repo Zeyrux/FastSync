@@ -14,6 +14,7 @@ pkgs.mkShell {
 
   buildInputs = with pkgs; [
     zstd
+    openssl
   ];
 
   NIX_ENFORCE_PURITY = 0;

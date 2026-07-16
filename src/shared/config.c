@@ -39,6 +39,9 @@ Config *config_create(char *version, char *send_directory,
   config->max_size = 0;
   config->min_size = 0;
   config->use_incremental = false;
+  config->use_tls = false;
+  config->tls_cert = NULL;
+  config->tls_key = NULL;
   return config;
 }
 
@@ -74,6 +77,8 @@ void config_delete(Config *config) {
   for (int i = 0; i < config->include_count; i++)
     free(config->include_patterns[i]);
   free(config->include_patterns);
+  free(config->tls_cert);
+  free(config->tls_key);
   free(config);
 }
 
