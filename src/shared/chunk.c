@@ -178,24 +178,5 @@ Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata) {
   return compressed;
 }
 
-Chunk *chunk_decompress(Data *compressed_data, bool use_metadata) {
-  log_message(LOG_LEVEL_DEBUG, "Starting to decompress chunk");
-  Data *uncompressed_data = data_decompress(compressed_data);
-  if (uncompressed_data == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk data");
-    return NULL;
-  }
-
-  Chunk *chunk = chunk_deserialize(uncompressed_data, use_metadata);
-  if (chunk == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk data");
-    data_destroy(uncompressed_data);
-    return NULL;
-  }
-
-  data_destroy(uncompressed_data);
-  log_message(LOG_LEVEL_DEBUG, "Chunk successfully decompressed");
-  return chunk;
-}
 
 

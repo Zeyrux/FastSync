@@ -84,6 +84,10 @@ static void receive_chunk_enqueue(int file_descriptor,
   }
   Chunk *chunk = chunk_deserialize(data_to_process, context->config->use_metadata);
   data_destroy(data_to_process);
+  if (chunk == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk, skipping");
+    return;
+  }
 
   for (int i = 0; i < chunk->element_count; i++) {
     File *file = chunk->items[i];

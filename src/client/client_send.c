@@ -171,10 +171,11 @@ int send_files_multithreaded(Config *config) {
     return 1;
   }
 
+  int sender_result;
   thrd_join(scanner, NULL);
   thrd_join(loader, NULL);
-  thrd_join(sender, NULL);
+  thrd_join(sender, &sender_result);
 
   pipeline_context_sender_destroy(context);
-  return 0;
+  return sender_result == thrd_success ? 0 : -1;
 }

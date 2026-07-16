@@ -46,7 +46,7 @@ int main(int argc, char *argv[]) {
   }
 
   Config *config = config_create(str_dup("1.0.0"), NULL, NULL,
-                                 save_to_disk, false, false, false, false, 5, 20, false);
+                                 save_to_disk, false, false, false, false, 5, false);
 
   int positional_args[2];
   int positional_count = 0;

@@ -113,7 +113,11 @@ void to_disk(const char *path, const void *data, unsigned long long data_size) {
     perror("Could not open File");
     exit(EXIT_FAILURE);
   }
-  fwrite(data, 1, data_size, file_pointer);
+  if (fwrite(data, 1, data_size, file_pointer) != data_size) {
+    perror("Failed to write all data to disk");
+    fclose(file_pointer);
+    exit(EXIT_FAILURE);
+  }
   fclose(file_pointer);
   free(dir_to_free);
 }
@@ -171,7 +175,8 @@ size_t file_content_to_buffer(File *file) {
   size_t bytes_read =
       fread(file->data->data, 1, file->data->size, file_pointer);
   if (bytes_read != (size_t)file->data->size) {
-    perror("Read to many or to less bytes from File!");
+    fclose(file_pointer);
+    perror("Read unexpected number of bytes from File!");
     return 0;
   }
   fclose(file_pointer);

@@ -91,12 +91,12 @@ void send_data(int file_descriptor, Data *data) {
 }
 
 Data *receive_data(int file_descriptor) {
-  size_t size = 0;
+  unsigned long long size = 0;
   receive_n_data(file_descriptor, &size, sizeof(unsigned long long));
-  void *data = malloc(size);
-  receive_n_data(file_descriptor, data, size);
+  void *data = malloc((size_t)size);
+  receive_n_data(file_descriptor, data, (size_t)size);
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
-  return data_create(data, size);
+  return data_create(data, (size_t)size);
 }
 
 void send_int(int file_descriptor, int data) {

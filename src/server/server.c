@@ -11,6 +11,7 @@
 #include "transport_tcp.h"
 #include "unistd.h"
 #include "utils.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,11 @@ int receive_files(Config *config, int file_descriptor) {
       }
       Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
       data_destroy(data_to_process);
+      if (chunk == NULL) {
+        log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk, skipping");
+        send_status(file_descriptor, STATUS_ERROR);
+        return -1;
+      }
 
       for (int i = 0; i < chunk->element_count; i++) {
         if (config->save_to_disk) {
@@ -79,6 +85,7 @@ void handler(int file_descriptor) {
 }
 
 int main(int argc, char *argv[]) {
+  signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--stdio") == 0) {
       io_set_fds(STDIN_FILENO, STDOUT_FILENO);

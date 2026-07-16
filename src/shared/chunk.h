@@ -18,7 +18,5 @@ void chunk_destroy(void *chunk);
 Data *chunk_serialize(Chunk *chunk, bool use_metadata);
 Chunk *chunk_deserialize(Data *data, bool use_metadata);
 Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata);
-Chunk *chunk_decompress(Data *compressed_data, bool use_metadata);
-
 
 #endif

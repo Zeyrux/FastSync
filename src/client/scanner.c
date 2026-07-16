@@ -90,7 +90,7 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
       continue;
     }
 
-    if (!S_ISREG(stats.st_mode)) {
+    if (S_ISDIR(stats.st_mode)) {
       queue_enqueue(scanner->directories, (void *)cur_path);
     } else {
       File *file = file_create(cur_path);
@@ -99,8 +99,10 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
         file->metadata = file_metadata_create(&stats);
       array_list_add(chunk_data, file);
       chunk_data_size += file->data->size;
-      if (chunk_data_size > DESIRED_CHUNK_SIZE)
+      if (chunk_data_size > DESIRED_CHUNK_SIZE) {
+        free(cur_path);
         return chunk_data_to_chunk(chunk_data);
+      }
       free(cur_path);
     }
   }

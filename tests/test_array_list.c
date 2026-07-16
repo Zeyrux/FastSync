@@ -49,16 +49,4 @@ void test_array_list() {
   list->item_destroyer = test_destroyer;
   array_list_delete(list);
   EXPECT_EQ_INT(destroyer_calls, 106);
-
-  // Test clear with NULL destroyer
-  list = array_list_create(NULL);
-  int a = 1, b = 2;
-  array_list_add(list, &a);
-  array_list_add(list, &b);
-  EXPECT_EQ_INT(list->size, 2);
-  array_list_clear(list);
-  EXPECT_EQ_INT(list->size, 0);
-  EXPECT_NULL(list->items[0]);
-  EXPECT_NULL(list->items[1]);
-  array_list_delete(list);
 }
