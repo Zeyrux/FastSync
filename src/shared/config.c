@@ -42,6 +42,7 @@ Config *config_create(char *version, char *send_directory,
   config->use_tls = false;
   config->tls_cert = NULL;
   config->tls_key = NULL;
+  config->tls_ca = NULL;
   return config;
 }
 
@@ -79,6 +80,7 @@ void config_delete(Config *config) {
   free(config->include_patterns);
   free(config->tls_cert);
   free(config->tls_key);
+  free(config->tls_ca);
   free(config);
 }
 
@@ -154,6 +156,10 @@ Config *config_receive(int file_descriptor) {
   config->include_count = 0;
   config->max_size = 0;
   config->min_size = 0;
+  config->use_tls = false;
+  config->tls_cert = NULL;
+  config->tls_key = NULL;
+  config->tls_ca = NULL;
   if (!send_status(file_descriptor, STATUS_OK)) goto error;
   return config;
 

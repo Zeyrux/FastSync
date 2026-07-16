@@ -1,6 +1,7 @@
 #include "transport_tls.h"
 #include "log.h"
 #include "protocol.h"
+#include "transport_tcp.h"
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -12,50 +13,67 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static SSL_CTX *g_ssl_ctx = NULL;
-
 bool tls_global_init(void) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   SSL_library_init();
   OpenSSL_add_all_algorithms();
   SSL_load_error_strings();
+#endif
   return true;
 }
 
-void tls_global_cleanup(void) {
-  if (g_ssl_ctx) {
-    SSL_CTX_free(g_ssl_ctx);
-    g_ssl_ctx = NULL;
+static void log_ssl_errors(void) {
+  unsigned long err;
+  char buf[256];
+  while ((err = ERR_get_error()) != 0) {
+    ERR_error_string_n(err, buf, sizeof(buf));
+    log_message(LOG_LEVEL_ERROR, "SSL error: %s", buf);
   }
-  EVP_cleanup();
 }
 
-static SSL_CTX *create_ssl_ctx(bool is_server, const char *cert, const char *key) {
-  const SSL_METHOD *method = is_server ? TLS_server_method() : TLS_client_method();
+static SSL_CTX *create_ssl_ctx(bool is_server, const char *cert,
+                                const char *key, const char *ca_path) {
+  const SSL_METHOD *method =
+      is_server ? TLS_server_method() : TLS_client_method();
   SSL_CTX *ctx = SSL_CTX_new(method);
   if (!ctx) {
     log_message(LOG_LEVEL_ERROR, "Unable to create SSL context");
-    ERR_print_errors_fp(stderr);
+    log_ssl_errors();
     return NULL;
   }
+
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
   if (cert && key) {
     if (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s", cert);
-      ERR_print_errors_fp(stderr);
+      log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s", key);
-      ERR_print_errors_fp(stderr);
+      log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
     }
     if (!SSL_CTX_check_private_key(ctx)) {
-      log_message(LOG_LEVEL_ERROR, "Private key does not match certificate");
+      log_message(LOG_LEVEL_ERROR,
+                  "Private key does not match certificate");
       SSL_CTX_free(ctx);
       return NULL;
     }
+  }
+
+  if (ca_path) {
+    if (!SSL_CTX_load_verify_locations(ctx, ca_path, NULL)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to load CA: %s", ca_path);
+      log_ssl_errors();
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_verify_depth(ctx, 4);
   }
 
   return ctx;
@@ -75,78 +93,60 @@ static SSL *wrap_fd_with_ssl(int fd, SSL_CTX *ctx, bool is_server) {
     ret = SSL_connect(ssl);
 
   if (ret <= 0) {
-    log_message(LOG_LEVEL_ERROR, "SSL %s failed", is_server ? "accept" : "connect");
-    ERR_print_errors_fp(stderr);
+    log_message(LOG_LEVEL_ERROR, "SSL %s failed",
+                is_server ? "accept" : "connect");
+    log_ssl_errors();
     SSL_free(ssl);
     return NULL;
   }
   return ssl;
 }
 
-bool server_create_tls(Server *server, const char *cert_path, const char *key_path) {
-  SSL_CTX *ctx = create_ssl_ctx(true, cert_path, key_path);
+bool server_create_tls(Server *server, const char *cert_path,
+                        const char *key_path, const char *ca_path) {
+  SSL_CTX *ctx = create_ssl_ctx(true, cert_path, key_path, ca_path);
   if (!ctx) return false;
   server->ssl_ctx = ctx;
   return true;
 }
 
+struct tls_child_ctx {
+  void (*handler)(int);
+  SSL_CTX *ssl_ctx;
+};
+
+static void tls_child_fn(int fd, void *arg) {
+  struct tls_child_ctx *ctx = (struct tls_child_ctx *)arg;
+  SSL *ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true);
+  if (!ssl) return;
+  io_set_ssl(ssl);
+  ctx->handler(fd);
+  SSL_shutdown(ssl);
+  SSL_free(ssl);
+  io_set_ssl(NULL);
+}
+
 bool server_listen_tls(Server *server, void (*handler)(int file_descriptor)) {
-  log_message(LOG_LEVEL_INFO, "Start TLS Listening on Port: %d",
-              ntohs(server->address.sin_port));
-  if (listen(server->file_descriptor, SOMAXCONN) < 0) {
-    perror("Could not listen on port!");
-    return false;
-  }
-
-  signal(SIGCHLD, SIG_IGN);
-
-  while (1) {
-    struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int file_descriptor =
-        accept(server->file_descriptor, (struct sockaddr *)&client_addr,
-               &client_len);
-    if (file_descriptor < 0) {
-      perror("Could not accept the connection");
-      continue;
-    }
-    log_message(LOG_LEVEL_INFO, "Received TLS Connection");
-    pid_t pid = fork();
-    if (pid == 0) {
-      close(server->file_descriptor);
-
-      SSL *ssl = wrap_fd_with_ssl(file_descriptor, (SSL_CTX *)server->ssl_ctx, true);
-      if (!ssl) {
-        close(file_descriptor);
-        _exit(1);
-      }
-      io_set_ssl(ssl);
-      handler(file_descriptor);
-      SSL_shutdown(ssl);
-      SSL_free(ssl);
-      io_set_ssl(NULL);
-      close(file_descriptor);
-      _exit(0);
-    }
-    close(file_descriptor);
-  }
+  struct tls_child_ctx ctx = {handler, (SSL_CTX *)server->ssl_ctx};
+  server_accept_loop(server, tls_child_fn, &ctx, "Received TLS Connection");
   return true;
 }
 
 bool client_connect_tls(Client *client, char *host, int port,
-                        const char *cert_path, const char *key_path) {
+                         const char *cert_path, const char *key_path,
+                         const char *ca_path) {
   client->address.sin_port = htons(port);
   if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
     perror("Could not convert host address!");
     return false;
   }
   if (connect(client->file_descriptor, (struct sockaddr *)&client->address,
-              client->address_length) < 0) {
+               client->address_length) < 0) {
     perror("Could not connect to Server!");
     return false;
   }
 
-  SSL_CTX *ctx = create_ssl_ctx(false, cert_path, key_path);
+  SSL_CTX *ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
   if (!ctx) return false;
   client->ssl_ctx = ctx;
 

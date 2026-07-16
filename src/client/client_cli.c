@@ -2,6 +2,7 @@
 #include "config.h"
 #include "log.h"
 #include "protocol.h"
+#include "transport_tls.h"
 #include "utils.h"
 #include <errno.h>
 #include <limits.h>
@@ -50,7 +51,7 @@ static void print_usage(void) {
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
-  printf("  --ca <path>         CA certificate for verification (PEM)\n");
+  printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  --help              Show this help\n");
 }
 
@@ -228,6 +229,14 @@ int main(int argc, char *argv[]) {
   if (config->use_incremental && !config->use_metadata) {
     log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
     config->use_metadata = true;
+  }
+
+  if (config->use_tls) {
+    if (!config->tls_cert || !config->tls_key) {
+      fprintf(stderr, "Error: --tls requires --cert and --key\n");
+      return 1;
+    }
+    tls_global_init();
   }
 
   if (config->use_multithreading)

@@ -119,15 +119,34 @@ static void cleanup(int sig) {
   _exit(0);
 }
 
+static void print_server_usage(void) {
+  printf("FastSync Server\n");
+  printf("Usage: fastsync-server [options]\n");
+  printf("\n");
+  printf("Options:\n");
+  printf("  --stdio             Run in stdio mode (SSH transport)\n");
+  printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
+  printf("  --tls               Enable TLS encryption\n");
+  printf("  --cert <path>       TLS certificate file (PEM)\n");
+  printf("  --key <path>        TLS private key file (PEM)\n");
+  printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  -v, --verbose       Enable debug logging\n");
+  printf("  --help              Show this help\n");
+}
+
 int main(int argc, char *argv[]) {
   bool use_tls = false;
   char *tls_cert = NULL;
   char *tls_key = NULL;
+  char *tls_ca = NULL;
   int port = 8080;
 
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--stdio") == 0) {
+    if (strcmp(argv[i], "--help") == 0) {
+      print_server_usage();
+      return 0;
+    } else if (strcmp(argv[i], "--stdio") == 0) {
       io_set_fds(STDIN_FILENO, STDOUT_FILENO);
       handler(STDIN_FILENO);
       return 0;
@@ -139,10 +158,22 @@ int main(int argc, char *argv[]) {
       tls_cert = argv[++i];
     } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
       tls_key = argv[++i];
+    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
+      tls_ca = argv[++i];
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
       port = atoi(argv[++i]);
+    } else if (argv[i][0] == '-') {
+      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      print_server_usage();
+      return 1;
     }
   }
+
+  if (port < 1 || port > 65535) {
+    fprintf(stderr, "Error: port must be between 1 and 65535\n");
+    return 1;
+  }
+
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
   g_server = server_create(port);
@@ -157,7 +188,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     tls_global_init();
-    if (!server_create_tls(g_server, tls_cert, tls_key)) {
+    if (!server_create_tls(g_server, tls_cert, tls_key, tls_ca)) {
       log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
       server_delete(&g_server);
       return 1;

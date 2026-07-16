@@ -36,6 +36,7 @@ typedef struct Config {
   bool use_tls;
   char *tls_cert;
   char *tls_key;
+  char *tls_ca;
 } Config;
 
 #define PROTOCOL_VERSION "1.1.0"

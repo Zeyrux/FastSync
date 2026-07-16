@@ -1,6 +1,7 @@
 #include "transport_tcp.h"
 #include "log.h"
 #include <arpa/inet.h>
+#include <openssl/ssl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,41 +53,61 @@ Server *server_create(int port) {
 void server_delete(Server **server) {
   if (server == NULL || *server == NULL) return;
   close((*server)->file_descriptor);
+  if ((*server)->ssl_ctx) {
+    SSL_CTX_free((*server)->ssl_ctx);
+    (*server)->ssl_ctx = NULL;
+  }
   free(*server);
   *server = NULL;
 }
 
-bool server_listen(Server *server, void (*handler)(int file_descriptor)) {
-  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",
-              server->address.sin_port);
+static void accept_loop(Server *server, void (*child_fn)(int, void *),
+                        void *child_ctx, const char *log_fmt) {
   if (listen(server->file_descriptor, SOMAXCONN) < 0) {
     perror("Could not listen on port!");
-    return false;
+    return;
   }
-
   signal(SIGCHLD, SIG_IGN);
-
   while (1) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-    int file_descriptor =
-        accept(server->file_descriptor, (struct sockaddr *)&client_addr,
-               &client_len);
-    if (file_descriptor < 0) {
+    int fd = accept(server->file_descriptor, (struct sockaddr *)&client_addr,
+                    &client_len);
+    if (fd < 0) {
       perror("Could not accept the connection");
       continue;
     }
-    log_message(LOG_LEVEL_INFO, "Received Connection");
+    log_message(LOG_LEVEL_INFO, "%s", log_fmt);
     pid_t pid = fork();
     if (pid == 0) {
       close(server->file_descriptor);
-      handler(file_descriptor);
-      close(file_descriptor);
+      child_fn(fd, child_ctx);
+      close(fd);
       _exit(0);
     }
-    close(file_descriptor);
+    close(fd);
   }
+}
+
+struct plain_ctx { void (*handler)(int); };
+
+static void plain_child_fn(int fd, void *ctx) {
+  ((struct plain_ctx *)ctx)->handler(fd);
+}
+
+bool server_listen(Server *server, void (*handler)(int file_descriptor)) {
+  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",
+              ntohs(server->address.sin_port));
+  struct plain_ctx ctx = {handler};
+  accept_loop(server, plain_child_fn, &ctx, "Received Connection");
   return true;
+}
+
+void server_accept_loop(Server *server, void (*child_fn)(int, void *),
+                        void *child_ctx, const char *log_fmt) {
+  log_message(LOG_LEVEL_INFO, "Start TLS Listening on Port: %d",
+              ntohs(server->address.sin_port));
+  accept_loop(server, child_fn, child_ctx, log_fmt);
 }
 
 Client *client_create() {
@@ -127,6 +148,11 @@ bool client_connect(Client *client, char *host, int port) {
 }
 
 void client_disconnect(Client *client) {
+  if (client->ssl) {
+    SSL_shutdown(client->ssl);
+    SSL_free(client->ssl);
+    client->ssl = NULL;
+  }
   close(client->file_descriptor);
   if (client->ssh_child_pid > 0) {
     int status;
@@ -136,7 +162,10 @@ void client_disconnect(Client *client) {
 }
 
 void client_delete(Client *client) {
-  if (client == NULL)
-    return;
+  if (client == NULL) return;
+  if (client->ssl_ctx) {
+    SSL_CTX_free(client->ssl_ctx);
+    client->ssl_ctx = NULL;
+  }
   free(client);
 }

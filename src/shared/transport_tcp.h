@@ -23,6 +23,8 @@ typedef struct Client {
 
 Server *server_create(int port);
 bool server_listen(Server *server, void (*handler)(int file_descriptor));
+void server_accept_loop(Server *server, void (*child_fn)(int, void *),
+                        void *child_ctx, const char *log_fmt);
 void server_delete(Server **server);
 Client *client_create();
 bool client_connect(Client *client, char *host, int port);

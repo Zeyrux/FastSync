@@ -100,11 +100,11 @@ static int send_chunks_multithreaded(void *pipeline_context) {
     }
     client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port);
   } else if (context->config->use_tls) {
-    tls_global_init();
     client = client_create();
     if (!client || !client_connect_tls(client, server_host, server_port,
-                                       context->config->tls_cert,
-                                       context->config->tls_key)) {
+                                        context->config->tls_cert,
+                                        context->config->tls_key,
+                                        context->config->tls_ca)) {
       if (client) client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
       return thrd_error;
@@ -254,10 +254,10 @@ int send_files(Config *config) {
     client = client_connect_ssh(config->ssh_destination, config->ssh_port);
     if (!client) return 1;
   } else if (config->use_tls) {
-    tls_global_init();
     client = client_create();
     if (!client || !client_connect_tls(client, server_host, server_port,
-                                       config->tls_cert, config->tls_key)) {
+                                        config->tls_cert, config->tls_key,
+                                        config->tls_ca)) {
       if (client) client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
       return 1;
