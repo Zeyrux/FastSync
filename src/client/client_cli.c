@@ -28,6 +28,9 @@ static void print_usage(void) {
   printf("  --progress          Show transfer progress\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
+  printf("  --include <pattern> Only include files matching pattern\n");
+  printf("  --max-size <n>      Skip files larger than n bytes\n");
+  printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -78,6 +81,14 @@ int main(int argc, char *argv[]) {
       int idx = config->exclude_count++;
       config->exclude_patterns = realloc(config->exclude_patterns, config->exclude_count * sizeof(char *));
       config->exclude_patterns[idx] = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--include") == 0 && i + 1 < argc) {
+      int idx = config->include_count++;
+      config->include_patterns = realloc(config->include_patterns, config->include_count * sizeof(char *));
+      config->include_patterns[idx] = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
+      config->max_size = strtoull(argv[++i], NULL, 10);
+    } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
+      config->min_size = strtoull(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");

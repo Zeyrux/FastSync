@@ -8,11 +8,13 @@ Data *data_compress(Data *data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data *compressed_data = data_create_empty(dst_size);
+  if (compressed_data == NULL) return NULL;
 
   ZSTD_CCtx *cctx = ZSTD_createCCtx();
   if (!cctx) {
     log_message(LOG_LEVEL_ERROR, "Failed to create ZSTD compression context");
-    exit(EXIT_FAILURE);
+    data_destroy(compressed_data);
+    return NULL;
   }
 
   ZSTD_inBuffer input = {data_to_compress->data, data_to_compress->size, 0};
@@ -24,7 +26,9 @@ Data *data_compress(Data *data_to_compress, int compression_level) {
     if (ZSTD_isError(ret)) {
       log_message(LOG_LEVEL_ERROR, "Compression failed: %s",
                   ZSTD_getErrorName(ret));
-      exit(EXIT_FAILURE);
+      ZSTD_freeCCtx(cctx);
+      data_destroy(compressed_data);
+      return NULL;
     }
   } while (ret > 0);
 
@@ -43,16 +47,18 @@ Data *data_decompress(Data *compressed_data) {
   if (ZSTD_isError(dst_size)) {
     log_message(LOG_LEVEL_ERROR, "Failed to get decompressed size: %s",
                 ZSTD_getErrorName(dst_size));
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   Data *uncompressed_data = data_create_empty((size_t)dst_size);
+  if (uncompressed_data == NULL) return NULL;
 
   ZSTD_DCtx *dctx = ZSTD_createDCtx();
   if (!dctx) {
     log_message(LOG_LEVEL_ERROR,
                 "Failed to create ZSTD decompression context");
-    exit(EXIT_FAILURE);
+    data_destroy(uncompressed_data);
+    return NULL;
   }
 
   ZSTD_inBuffer input = {compressed_data->data, compressed_data->size, 0};
@@ -64,7 +70,9 @@ Data *data_decompress(Data *compressed_data) {
     if (ZSTD_isError(ret)) {
       log_message(LOG_LEVEL_ERROR, "Decompression failed: %s",
                   ZSTD_getErrorName(ret));
-      exit(EXIT_FAILURE);
+      ZSTD_freeDCtx(dctx);
+      data_destroy(uncompressed_data);
+      return NULL;
     }
   } while (ret > 0);
 

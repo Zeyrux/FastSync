@@ -46,13 +46,13 @@ Client *client_connect_ssh(char *destination, int port) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     fprintf(stderr, "Invalid remote destination: %s\n", destination);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
     perror("socketpair failed");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   int buf_size = 1024 * 1024;
@@ -64,13 +64,16 @@ Client *client_connect_ssh(char *destination, int port) {
   int exec_pipe[2];
   if (pipe(exec_pipe) < 0) {
     perror("pipe failed");
-    exit(EXIT_FAILURE);
+    close(sv[0]); close(sv[1]);
+    return NULL;
   }
 
   pid_t pid = fork();
   if (pid < 0) {
     perror("fork failed");
-    exit(EXIT_FAILURE);
+    close(sv[0]); close(sv[1]);
+    close(exec_pipe[0]); close(exec_pipe[1]);
+    return NULL;
   }
 
   if (pid == 0) {
@@ -127,10 +130,15 @@ Client *client_connect_ssh(char *destination, int port) {
     close(sv[0]);
     waitpid(pid, NULL, 0);
     fprintf(stderr, "Error: could not launch 'fastsync-server --stdio' on remote\n");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   Client *client = malloc(sizeof(Client));
+  if (client == NULL) {
+    close(sv[0]);
+    waitpid(pid, NULL, 0);
+    return NULL;
+  }
   client->file_descriptor = sv[0];
   client->address.sin_family = AF_UNIX;
   client->address_length = 0;

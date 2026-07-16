@@ -28,6 +28,10 @@ typedef struct Config {
   char *ssh_destination;
   char **exclude_patterns;
   int exclude_count;
+  char **include_patterns;
+  int include_count;
+  unsigned long long max_size;
+  unsigned long long min_size;
 } Config;
 
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
@@ -39,7 +43,7 @@ Config *config_create(char *version, char *send_directory,
                        int compression_level, bool use_sendfile,
                        unsigned long long chunk_size);
 void config_delete(Config *config);
-void config_send(int file_descriptor, Config *config);
+bool config_send(int file_descriptor, Config *config);
 Config *config_receive(int file_descriptor);
 bool is_remote_dest(const char *s);
 void config_parse_ssh_dest(Config *config);
