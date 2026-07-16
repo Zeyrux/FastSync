@@ -131,6 +131,10 @@ int main(int argc, char *argv[]) {
       server_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
       unsigned long long kbps = strtoull(argv[++i], NULL, 10);
+      if (kbps == 0) {
+        fprintf(stderr, "Error: --bwlimit must be greater than 0\n");
+        return 1;
+      }
       io_set_bwlimit(kbps * 1024);
       log_message(LOG_LEVEL_INFO, "Set bandwidth limit to %llu KB/s", kbps);
     } else if (strcmp(argv[i], "--progress") == 0) {

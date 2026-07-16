@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include "log.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,9 +10,9 @@
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
 
-static __thread unsigned long long io_bwlimit = 0;
-static __thread long long bw_tokens = 0;
-static __thread struct timespec bw_last_refill = {0, 0};
+static unsigned long long io_bwlimit = 0;
+static long long bw_tokens = 0;
+static struct timespec bw_last_refill = {0, 0};
 
 void io_set_fds(int read_fd, int write_fd) {
   io_read_fd = read_fd;
@@ -43,10 +44,11 @@ static void bw_throttle(size_t bytes_written) {
 
   if (bw_tokens < 0) {
     long long deficit_ns = (long long)((double)(-bw_tokens) / io_bwlimit * 1000000000.0);
-    struct timespec sleep_time;
+    struct timespec sleep_time, remaining;
     sleep_time.tv_sec = deficit_ns / 1000000000LL;
     sleep_time.tv_nsec = deficit_ns % 1000000000LL;
-    nanosleep(&sleep_time, NULL);
+    while (nanosleep(&sleep_time, &remaining) < 0 && errno == EINTR)
+      sleep_time = remaining;
     bw_tokens = 0;
     clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
   }
