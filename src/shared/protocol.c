@@ -111,6 +111,8 @@ static const char *status_to_string(Status status) {
     return "NEXT";
   case STATUS_CHUNK:
     return "CHUNK";
+  case STATUS_CHECK:
+    return "CHECK";
   default:
     return "UNKNOWN";
   }

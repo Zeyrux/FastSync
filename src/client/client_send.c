@@ -32,17 +32,47 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     data_destroy(data);
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
-      if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+      if (config->use_incremental) {
+        if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
+        if (!send_str(client->file_descriptor, chunk->items[i]->path)) return -1;
+        unsigned long long fsize = chunk->items[i]->data->size;
+        long long mtime = chunk->items[i]->metadata ? chunk->items[i]->metadata->mtime_sec : 0;
+        if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize))) return -1;
+        if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
+        Status s;
+        if (!receive_status(client->file_descriptor, &s)) return -1;
+        if (s == STATUS_OK) continue;
+        if (s != STATUS_NEXT) return -1;
+      } else {
+        if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+      }
       if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata))
         return -1;
     }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
-      if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
-      if (!file_send_single_calls(chunk->items[i], client->file_descriptor,
-                            config->use_metadata,
-                            config->use_compression ? config->compression_level : 0))
-        return -1;
+      if (config->use_incremental) {
+        if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
+        if (!send_str(client->file_descriptor, chunk->items[i]->path)) return -1;
+        unsigned long long fsize = chunk->items[i]->data->size;
+        long long mtime = chunk->items[i]->metadata ? chunk->items[i]->metadata->mtime_sec : 0;
+        if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize))) return -1;
+        if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
+        Status s;
+        if (!receive_status(client->file_descriptor, &s)) return -1;
+        if (s == STATUS_OK) continue;
+        if (s != STATUS_NEXT) return -1;
+        if (!file_send_single_calls_no_path(chunk->items[i], client->file_descriptor,
+                                       config->use_metadata,
+                                       config->use_compression ? config->compression_level : 0))
+          return -1;
+      } else {
+        if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+        if (!file_send_single_calls(chunk->items[i], client->file_descriptor,
+                               config->use_metadata,
+                               config->use_compression ? config->compression_level : 0))
+          return -1;
+      }
     }
   }
   return 0;

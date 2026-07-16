@@ -96,6 +96,21 @@ bool file_load_data(File *file) {
   return true;
 }
 
+bool file_send_single_calls_no_path(File *file, int file_descriptor, bool use_metadata, int compression_level) {
+  if (compression_level > 0) {
+    Data *compressed_data = data_compress(file->data, compression_level);
+    if (compressed_data == NULL) {
+      log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
+      return false;
+    }
+    data_destroy(file->data);
+    file->data = compressed_data;
+  }
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
+  if (!send_data(file_descriptor, file->data)) return false;
+  return true;
+}
+
 bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
   if (compression_level > 0) {
     Data *compressed_data = data_compress(file->data, compression_level);

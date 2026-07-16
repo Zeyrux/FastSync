@@ -32,6 +32,7 @@ typedef struct Config {
   int include_count;
   unsigned long long max_size;
   unsigned long long min_size;
+  bool use_incremental;
 } Config;
 
 #define PROTOCOL_VERSION "1.0.0"

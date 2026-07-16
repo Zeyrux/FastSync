@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <threads.h>
 
 PipelineContextSender *pipeline_context_sender_create(Config *config,
@@ -126,8 +127,56 @@ int receive_thread(void *pipeline_context) {
 
   Status status;
   if (!receive_status(file_descriptor, &status)) return thrd_error;
-  while (status == STATUS_NEXT || status == STATUS_CHUNK) {
-    if (status == STATUS_CHUNK) {
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
+    if (status == STATUS_CHECK) {
+      char *check_path = receive_str(file_descriptor);
+      if (check_path == NULL) return thrd_error;
+      unsigned long long check_size;
+      long long check_mtime;
+      if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
+          !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
+        free(check_path);
+        return thrd_error;
+      }
+      char *full_path = path_cat(config->receive_root_directory, check_path);
+      struct stat st;
+      bool match = false;
+      if (full_path && stat(full_path, &st) == 0 &&
+          (unsigned long long)st.st_size == check_size &&
+          (long long)st.st_mtime == check_mtime) {
+        match = true;
+      }
+      free(full_path);
+      if (match) {
+        if (!send_status(file_descriptor, STATUS_OK)) { free(check_path); return thrd_error; }
+        free(check_path);
+      } else {
+        if (!send_status(file_descriptor, STATUS_NEXT)) { free(check_path); return thrd_error; }
+        File *file = file_create(check_path);
+        free(check_path);
+        if (file == NULL) { send_status(file_descriptor, STATUS_ERROR); return thrd_error; }
+        if (config->use_metadata) {
+          file->metadata = metadata_receive(file_descriptor);
+        }
+        Data *file_data = receive_data(file_descriptor);
+        if (file_data == NULL) {
+          file_destroy(file);
+          send_status(file_descriptor, STATUS_ERROR);
+          return thrd_error;
+        }
+        if (config->use_compression) {
+          Data *uncompressed = data_decompress(file_data);
+          data_destroy(file_data);
+          if (uncompressed == NULL) { file_destroy(file); send_status(file_descriptor, STATUS_ERROR); return thrd_error; }
+          file_data = uncompressed;
+        }
+        data_destroy(file->data);
+        file->data = file_data;
+        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
+                                    &context->condition_not_empty,
+                                    &context->condition_not_full);
+      }
+    } else if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, context);
     } else {
       File *file = file_receive(config, file_descriptor);

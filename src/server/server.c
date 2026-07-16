@@ -16,12 +16,68 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 int receive_files(Config *config, int file_descriptor) {
   Status status;
   if (!receive_status(file_descriptor, &status)) return -1;
-  while (status == STATUS_NEXT || status == STATUS_CHUNK) {
-    if (status == STATUS_CHUNK) {
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
+    if (status == STATUS_CHECK) {
+      char *check_path = receive_str(file_descriptor);
+      if (check_path == NULL) { send_status(file_descriptor, STATUS_ERROR); return -1; }
+      unsigned long long check_size;
+      long long check_mtime;
+      if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
+          !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
+        free(check_path);
+        send_status(file_descriptor, STATUS_ERROR);
+        return -1;
+      }
+      char *full_path = path_cat(config->receive_root_directory, check_path);
+      struct stat st;
+      bool match = false;
+      if (full_path && stat(full_path, &st) == 0 &&
+          (unsigned long long)st.st_size == check_size &&
+          (long long)st.st_mtime == check_mtime) {
+        match = true;
+      }
+      free(full_path);
+      if (match) {
+        if (!send_status(file_descriptor, STATUS_OK)) { free(check_path); return -1; }
+        free(check_path);
+      } else {
+        if (!send_status(file_descriptor, STATUS_NEXT)) { free(check_path); return -1; }
+        File *file = file_create(check_path);
+        free(check_path);
+        if (file == NULL) { send_status(file_descriptor, STATUS_ERROR); return -1; }
+        if (config->use_metadata) {
+          file->metadata = metadata_receive(file_descriptor);
+        }
+        Data *file_data = receive_data(file_descriptor);
+        if (file_data == NULL) {
+          file_destroy(file);
+          send_status(file_descriptor, STATUS_ERROR);
+          return -1;
+        }
+        if (config->use_compression) {
+          Data *uncompressed = data_decompress(file_data);
+          data_destroy(file_data);
+          if (uncompressed == NULL) { file_destroy(file); send_status(file_descriptor, STATUS_ERROR); return -1; }
+          file_data = uncompressed;
+        }
+        data_destroy(file->data);
+        file->data = file_data;
+        if (config->save_to_disk) {
+          char *disk_path = path_cat(config->receive_root_directory, file->path);
+          if (disk_path) {
+            to_disk(disk_path, file->data->data, file->data->size);
+            file_restore_metadata(disk_path, file->metadata);
+            free(disk_path);
+          }
+        }
+        file_destroy(file);
+      }
+    } else if (status == STATUS_CHUNK) {
       Data *chunk_data = receive_data(file_descriptor);
       if (chunk_data == NULL) {
         log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
