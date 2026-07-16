@@ -91,10 +91,12 @@ Client *client_connect_ssh(char *destination) {
       snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
 
     execlp("ssh", "ssh", "-o", "Compression=no", "-o",
-           "ControlMaster=no", ssh_user, "fastsync-server", "--stdio",
-           (char *)NULL);
+           "ControlMaster=auto", "-o",
+           "ControlPath=~/.cache/fastsync-%r@%h:%p", ssh_user,
+           "fastsync-server", "--stdio", (char *)NULL);
     perror("exec of ssh failed");
-    (void)write(exec_pipe[1], "x", 1);
+    ssize_t wret = write(exec_pipe[1], "x", 1);
+    (void)wret;
     _exit(1);
   }
 
