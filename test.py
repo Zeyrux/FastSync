@@ -195,7 +195,7 @@ def start_rsync_daemon(source_dir):
     return port, conf, daemon
 
 
-def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None, no_server=False):
+def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None, no_server=False, expected_missing=None):
     if os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
     if no_server:
@@ -216,6 +216,8 @@ def run_single_test(cmd, name, source_dir, dest_dir, *, source_prefix=None, no_s
         received = os.path.join(dest_dir, source_prefix if source_prefix is not None
                                 else os.path.abspath(source_dir).lstrip(os.sep))
         mismatches, missing = verify_transfer(source_dir, received)
+        if expected_missing:
+            missing = [m for m in missing if m not in expected_missing]
 
     first_line = lambda s: (s or "").strip().split("\n")[0]
     entry = {
@@ -317,6 +319,152 @@ def run_profile(profile_name, source_dir, dest_dir):
                 os.unlink(conf)
             except Exception:
                 pass
+
+        # Feature-specific tests for rsync-compatible flags
+        print("\n  " + "─" * 56 + "\n  Feature Tests\n  " + "─" * 56)
+
+        # Dry run (-n) — no server needed
+        print("\n  --- Dry run (-n) ---")
+        flags = BASE_CLIENT_FLAGS + ["-n"]
+        cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
+        print(f"    Running: {' '.join(cmd)}")
+        try:
+            start = time.monotonic()
+            result = subprocess.run(cmd, text=True, capture_output=True)
+            duration = time.monotonic() - start
+            r = {"name": "Dry run (-n)", "suite": profile_name}
+            if result.returncode == 0 and "Dry run:" in result.stdout:
+                r["status"] = "Success"
+                r["time"] = f"{duration:.4f}s"
+                r["error"] = ""
+            else:
+                r["status"] = "Failed"
+                r["time"] = "N/A"
+                r["error"] = f"Exit {result.returncode}: {(result.stderr or result.stdout)[:100]}"
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Dry run (-n)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        # Archive mode (-a)
+        feature_flags = BASE_CLIENT_FLAGS + ["-a"]
+        cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags
+        print(f"\n  --- Archive mode (-a) ---\n    Running: {' '.join(cmd)}")
+        try:
+            r = run_single_test(cmd, "Archive mode (-a)", source_dir, dest_dir)
+            r["suite"] = profile_name
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Archive mode (-a)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        # Exclude (--exclude small.txt)
+        feature_flags = BASE_CLIENT_FLAGS + ["--exclude", "small.txt"]
+        cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags
+        print(f"\n  --- Exclude (--exclude small.txt) ---\n    Running: {' '.join(cmd)}")
+        try:
+            r = run_single_test(cmd, "Exclude (--exclude small.txt)", source_dir, dest_dir,
+                                expected_missing=["small.txt"])
+            r["suite"] = profile_name
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Exclude (--exclude small.txt)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        # Progress (--progress)
+        feature_flags = BASE_CLIENT_FLAGS + ["--progress"]
+        cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags
+        print(f"\n  --- Progress (--progress) ---\n    Running: {' '.join(cmd)}")
+        try:
+            r = run_single_test(cmd, "Progress (--progress)", source_dir, dest_dir)
+            r["suite"] = profile_name
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Progress (--progress)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        # Chunk size (--chunk-size 5242880)
+        feature_flags = BASE_CLIENT_FLAGS + ["--chunk-size", "5242880"]
+        cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags
+        print(f"\n  --- Chunk size (--chunk-size 5242880) ---\n    Running: {' '.join(cmd)}")
+        try:
+            r = run_single_test(cmd, "Chunk size (--chunk-size 5242880)", source_dir, dest_dir)
+            r["suite"] = profile_name
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Chunk size (--chunk-size 5242880)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        # Delete (--delete) — pre-populate dest, add extra files, then sync with --delete
+        # Note: server handles one client per launch, so we restart between syncs
+        print(f"\n  --- Delete (--delete) ---")
+        try:
+            flags = BASE_CLIENT_FLAGS + ["-M"]
+            # First sync (no delete) to populate dest
+            s1 = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+            time.sleep(0.5)
+            first_cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
+            r1 = subprocess.run(first_cmd, text=True, capture_output=True)
+            wait_proc(s1)
+            if r1.returncode != 0:
+                raise RuntimeError(f"First sync failed: {r1.stderr[:100]}")
+            # Add extra files to received dir
+            received = os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
+            extra_path = os.path.join(received, "extra_file.txt")
+            with open(extra_path, "w") as f:
+                f.write("should be deleted")
+            extra_dir = os.path.join(received, "extra_dir")
+            os.makedirs(extra_dir, exist_ok=True)
+            with open(os.path.join(extra_dir, "nested.txt"), "w") as f:
+                f.write("nested extra")
+            # Second sync with --delete (fresh server)
+            s2 = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+            time.sleep(0.5)
+            second_cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags + ["--delete"]
+            start = time.monotonic()
+            r2 = subprocess.run(second_cmd, text=True, capture_output=True)
+            duration = time.monotonic() - start
+            wait_proc(s2)
+            r = {"name": "Delete (--delete)", "suite": profile_name}
+            if r2.returncode == 0 and not os.path.exists(extra_path) and not os.path.exists(extra_dir):
+                mismatches, missing = verify_transfer(source_dir, received)
+                if not mismatches and not missing:
+                    r["status"] = "Success"
+                    r["time"] = f"{duration:.4f}s"
+                    r["error"] = ""
+                else:
+                    r["status"] = "Failed"
+                    r["time"] = "N/A"
+                    r["error"] = f"post-delete verify: mismatches={len(mismatches)}, missing={len(missing)}"
+            else:
+                r["status"] = "Failed"
+                r["time"] = "N/A"
+                errs = []
+                if r2.returncode != 0:
+                    errs.append(f"Exit {r2.returncode}: {(r2.stderr or r2.stdout)[:60]}")
+                if os.path.exists(extra_path):
+                    errs.append("extra_file.txt remains")
+                if os.path.exists(extra_dir):
+                    errs.append("extra_dir remains")
+                r["error"] = " | ".join(errs)
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Delete (--delete)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
+        # SSH feature tests
+        if SSH_AVAILABLE:
+            ssh_dest = f"localhost:{dest_dir}_ssh"
+            ssh_feature_cases = [
+                {"name": "SSH Archive (-a)", "flags": ["-a"]},
+                {"name": "SSH Exclude (--exclude small.txt)", "flags": ["--exclude", "small.txt"], "expected_missing": ["small.txt"]},
+            ]
+            for case in ssh_feature_cases:
+                flags = BASE_CLIENT_FLAGS + case["flags"]
+                cmd = BASE_CLIENT_CMD + [source_dir, ssh_dest] + flags
+                print(f"\n  --- {case['name']} ---\n    Running: {' '.join(cmd)}")
+                try:
+                    r = run_single_test(cmd, case["name"], source_dir, f"{dest_dir}_ssh",
+                                        no_server=True,
+                                        expected_missing=case.get("expected_missing"))
+                    r["suite"] = profile_name
+                    results.append(r)
+                except Exception as e:
+                    results.append({"name": case["name"], "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
 
     except (subprocess.CalledProcessError, RuntimeError) as e:
         print(f"  Error: {e}")

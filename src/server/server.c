@@ -63,8 +63,6 @@ int receive_files(Config *config, int file_descriptor) {
       array_list_add(manifest, receive_str(file_descriptor));
     fprintf(stderr, "Deleting files not in manifest...\n");
     delete_extras(config->receive_root_directory, manifest);
-    for (int i = 0; i < manifest->size; i++)
-      free(manifest->items[i]);
     array_list_delete(manifest);
     status = receive_status(file_descriptor);
   }
