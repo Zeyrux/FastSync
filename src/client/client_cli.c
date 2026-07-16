@@ -205,6 +205,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  if (config->use_incremental && config->use_chunk_serialization) {
+    fprintf(stderr, "Error: --incremental is not supported with -s (chunk serialization)\n");
+    return 1;
+  }
+
+  if (config->use_incremental && !config->use_metadata) {
+    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
+    config->use_metadata = true;
+  }
+
   if (config->use_multithreading)
     return send_files_multithreaded(config);
   return send_files(config);

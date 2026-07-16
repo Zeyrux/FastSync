@@ -41,13 +41,16 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
         if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
         Status s;
         if (!receive_status(client->file_descriptor, &s)) return -1;
+        if (s == STATUS_ERROR) { log_message(LOG_LEVEL_ERROR, "Server reported error for file"); return -1; }
         if (s == STATUS_OK) continue;
-        if (s != STATUS_NEXT) return -1;
+        if (s != STATUS_NEXT) { log_message(LOG_LEVEL_ERROR, "Unexpected server status"); return -1; }
+        if (!file_send_sendfile_no_path(chunk->items[i], client->file_descriptor, config->use_metadata))
+          return -1;
       } else {
         if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata))
+          return -1;
       }
-      if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata))
-        return -1;
     }
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
@@ -60,8 +63,9 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
         if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
         Status s;
         if (!receive_status(client->file_descriptor, &s)) return -1;
+        if (s == STATUS_ERROR) { log_message(LOG_LEVEL_ERROR, "Server reported error for file"); return -1; }
         if (s == STATUS_OK) continue;
-        if (s != STATUS_NEXT) return -1;
+        if (s != STATUS_NEXT) { log_message(LOG_LEVEL_ERROR, "Unexpected server status"); return -1; }
         if (!file_send_single_calls_no_path(chunk->items[i], client->file_descriptor,
                                        config->use_metadata,
                                        config->use_compression ? config->compression_level : 0))

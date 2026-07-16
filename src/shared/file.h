@@ -27,6 +27,7 @@ File *file_receive(Config *config, int file_descriptor);
 bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level);
 bool file_send_single_calls_no_path(File *file, int file_descriptor, bool use_metadata, int compression_level);
 bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata);
+bool file_send_sendfile_no_path(File *file, int file_descriptor, bool use_metadata);
 size_t file_content_to_buffer(File *file);
 FileMetadata *file_metadata_create(struct stat *stats);
 void file_metadata_destroy(void *metadata);
