@@ -55,6 +55,12 @@ Client *client_connect_ssh(char *destination) {
     exit(EXIT_FAILURE);
   }
 
+  int buf_size = 1024 * 1024;
+  setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+  setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+  setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+  setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+
   int exec_pipe[2];
   if (pipe(exec_pipe) < 0) {
     perror("pipe failed");

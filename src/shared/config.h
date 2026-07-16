@@ -19,15 +19,19 @@ typedef struct Config {
   bool use_sendfile;
   bool use_metadata;
   int compression_level;
+  unsigned long long chunk_size;
   TransportType transport;
   char *ssh_destination;
 } Config;
+
+#define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config *config_create(char *version, char *send_directory,
                       char *receive_directory, bool save_to_disk,
                       bool use_multithreading, bool use_chunk_serialization,
                        bool use_compression, bool use_metadata,
-                       int compression_level, bool use_sendfile);
+                       int compression_level, bool use_sendfile,
+                       unsigned long long chunk_size);
 void config_delete(Config *config);
 void config_send(int file_descriptor, Config *config);
 Config *config_receive(int file_descriptor);

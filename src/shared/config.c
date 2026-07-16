@@ -10,7 +10,8 @@ Config *config_create(char *version, char *send_directory,
                       char *receive_directory, bool save_to_disk,
                       bool use_multithreading, bool use_chunk_serialization,
                        bool use_compression, bool use_metadata,
-                       int compression_level, bool use_sendfile) {
+                       int compression_level, bool use_sendfile,
+                       unsigned long long chunk_size) {
 
   Config *config = malloc(sizeof(Config));
   config->version = version;
@@ -23,6 +24,7 @@ Config *config_create(char *version, char *send_directory,
   config->use_metadata = use_metadata;
   config->compression_level = compression_level;
   config->use_sendfile = use_sendfile;
+  config->chunk_size = chunk_size > 0 ? chunk_size : DEFAULT_CHUNK_SIZE;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
   return config;
@@ -67,6 +69,7 @@ void config_send(int file_descriptor, Config *config) {
   send_int(file_descriptor, config->use_compression);
   send_int(file_descriptor, config->use_metadata);
   send_int(file_descriptor, config->compression_level);
+  send_int(file_descriptor, (int)config->chunk_size);
   send_int(file_descriptor, config->use_sendfile);
   if (receive_status(file_descriptor) != STATUS_OK) {
     perror("Error transmitting config!");
@@ -85,6 +88,7 @@ Config *config_receive(int file_descriptor) {
   config->use_compression = receive_int(file_descriptor);
   config->use_metadata = receive_int(file_descriptor);
   config->compression_level = receive_int(file_descriptor);
+  config->chunk_size = (unsigned long long)receive_int(file_descriptor);
   config->use_sendfile = receive_int(file_descriptor);
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;

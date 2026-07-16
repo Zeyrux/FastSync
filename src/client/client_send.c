@@ -82,7 +82,7 @@ static int scan_directory_multithreaded(void *pipeline_context) {
   PipelineContextSender *context = (PipelineContextSender *)pipeline_context;
   mtx_lock(&context->mutex_scanner);
   DirectoryScanner *scanner =
-      directory_scanner_create(context->config->send_directory, context->config->use_metadata);
+      directory_scanner_create(context->config->send_directory, context->config->use_metadata, context->config->chunk_size);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk *current_chunk;
@@ -138,7 +138,7 @@ int send_files(Config *config) {
     client_connect(client, server_host, server_port);
   }
   config_send(client->file_descriptor, config);
-  DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata);
+  DirectoryScanner *scanner = directory_scanner_create(config->send_directory, config->use_metadata, config->chunk_size);
   Chunk *current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     if (!config->use_sendfile) {

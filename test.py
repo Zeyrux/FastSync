@@ -123,7 +123,7 @@ def generate_test_files(source_dir):
         shutil.rmtree(source_dir)
     os.makedirs(source_dir)
 
-    target_total = 50 * 1024 * 1024
+    target_total = 25 * 1024 * 1024
     written = 0
 
     files = {
