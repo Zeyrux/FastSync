@@ -3,6 +3,7 @@
 
 #include <threads.h>
 
+#include "array_list.h"
 #include "config.h"
 #include "file.h"
 #include "queue.h"
@@ -19,6 +20,7 @@ typedef struct {
   cnd_t condition_not_full_loader;
   cnd_t condition_not_empty_loader;
   bool loader_done;
+  ArrayList *manifest;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {

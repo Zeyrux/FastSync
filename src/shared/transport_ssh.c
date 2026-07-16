@@ -42,7 +42,7 @@ static int parse_remote_dest(const char *dest, RemoteDest *r) {
   return 0;
 }
 
-Client *client_connect_ssh(char *destination) {
+Client *client_connect_ssh(char *destination, int port) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     fprintf(stderr, "Invalid remote destination: %s\n", destination);
@@ -90,10 +90,26 @@ Client *client_connect_ssh(char *destination) {
     else
       snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
 
-    execlp("ssh", "ssh", "-o", "Compression=no", "-o",
-           "ControlMaster=auto", "-o",
-           "ControlPath=~/.cache/fastsync-%r@%h:%p", ssh_user,
-           "fastsync-server", "--stdio", (char *)NULL);
+    char *ssh_argv[16];
+    int ac = 0;
+    char port_str[16];
+    ssh_argv[ac++] = "ssh";
+    ssh_argv[ac++] = "-o";
+    ssh_argv[ac++] = "Compression=no";
+    ssh_argv[ac++] = "-o";
+    ssh_argv[ac++] = "ControlMaster=auto";
+    ssh_argv[ac++] = "-o";
+    ssh_argv[ac++] = "ControlPath=~/.cache/fastsync-%r@%h:%p";
+    if (port > 0 && port != 22) {
+      ssh_argv[ac++] = "-p";
+      snprintf(port_str, sizeof(port_str), "%d", port);
+      ssh_argv[ac++] = port_str;
+    }
+    ssh_argv[ac++] = ssh_user;
+    ssh_argv[ac++] = "fastsync-server";
+    ssh_argv[ac++] = "--stdio";
+    ssh_argv[ac] = NULL;
+    execvp("ssh", ssh_argv);
     perror("exec of ssh failed");
     ssize_t wret = write(exec_pipe[1], "x", 1);
     (void)wret;

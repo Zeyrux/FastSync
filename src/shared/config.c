@@ -23,11 +23,16 @@ Config *config_create(char *version, char *send_directory,
   config->use_compression = use_compression;
   config->use_metadata = use_metadata;
   config->show_progress = false;
+  config->dry_run = false;
+  config->use_delete = false;
   config->compression_level = compression_level;
   config->use_sendfile = use_sendfile;
   config->chunk_size = chunk_size > 0 ? chunk_size : DEFAULT_CHUNK_SIZE;
+  config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
+  config->exclude_patterns = NULL;
+  config->exclude_count = 0;
   return config;
 }
 
@@ -57,6 +62,9 @@ void config_delete(Config *config) {
   free(config->send_directory);
   free(config->receive_root_directory);
   free(config->ssh_destination);
+  for (int i = 0; i < config->exclude_count; i++)
+    free(config->exclude_patterns[i]);
+  free(config->exclude_patterns);
   free(config);
 }
 
@@ -72,6 +80,7 @@ void config_send(int file_descriptor, Config *config) {
   send_int(file_descriptor, config->compression_level);
   send_int(file_descriptor, (int)config->chunk_size);
   send_int(file_descriptor, config->use_sendfile);
+  send_int(file_descriptor, config->use_delete);
   if (receive_status(file_descriptor) != STATUS_OK) {
     perror("Error transmitting config!");
     exit(EXIT_FAILURE);
@@ -91,8 +100,14 @@ Config *config_receive(int file_descriptor) {
   config->compression_level = receive_int(file_descriptor);
   config->chunk_size = (unsigned long long)receive_int(file_descriptor);
   config->use_sendfile = receive_int(file_descriptor);
+  config->use_delete = receive_int(file_descriptor);
+  config->show_progress = false;
+  config->dry_run = false;
+  config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
+  config->exclude_patterns = NULL;
+  config->exclude_count = 0;
   send_status(file_descriptor, STATUS_OK);
   return config;
 }

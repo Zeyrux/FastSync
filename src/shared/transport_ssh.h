@@ -3,6 +3,6 @@
 
 #include "transport_tcp.h"
 
-Client *client_connect_ssh(char *destination);
+Client *client_connect_ssh(char *destination, int port);
 
 #endif

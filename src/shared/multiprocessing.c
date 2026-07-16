@@ -1,4 +1,5 @@
 #include "multiprocessing.h"
+#include "array_list.h"
 #include "chunk.h"
 #include "compression.h"
 #include "config.h"
@@ -36,6 +37,11 @@ PipelineContextSender *pipeline_context_sender_create(Config *config,
 }
 
 void pipeline_context_sender_destroy(PipelineContextSender *context) {
+  if (context->manifest) {
+    for (int i = 0; i < context->manifest->size; i++)
+      free(context->manifest->items[i]);
+    array_list_delete(context->manifest);
+  }
   config_delete(context->config);
   queue_destroy(context->queue_scanner);
   queue_destroy(context->queue_loader);
@@ -117,6 +123,17 @@ int receive_thread(void *pipeline_context) {
                                   &context->condition_not_empty,
                                   &context->condition_not_full);
     }
+    status = receive_status(file_descriptor);
+  }
+  if (status == STATUS_MANIFEST) {
+    int count = receive_int(file_descriptor);
+    ArrayList *manifest = array_list_create(free);
+    for (int i = 0; i < count; i++)
+      array_list_add(manifest, receive_str(file_descriptor));
+    delete_extras(context->config->receive_root_directory, manifest);
+    for (int i = 0; i < manifest->size; i++)
+      free(manifest->items[i]);
+    array_list_delete(manifest);
     status = receive_status(file_descriptor);
   }
   mtx_lock(&context->mutex);
