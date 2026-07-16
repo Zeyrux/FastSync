@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size, char **exclude_patterns, int exclude_count) {
+DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size, char **exclude_patterns, int exclude_count, char **include_patterns, int include_count, unsigned long long max_size, unsigned long long min_size) {
   DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
   scanner->directories = queue_create(100, free);
   scanner->current_dir = NULL;
@@ -20,6 +20,10 @@ DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metada
   scanner->chunk_size = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
   scanner->exclude_patterns = exclude_patterns;
   scanner->exclude_count = exclude_count;
+  scanner->include_patterns = include_patterns;
+  scanner->include_count = include_count;
+  scanner->max_size = max_size;
+  scanner->min_size = min_size;
   queue_enqueue(scanner->directories, str_dup(root_directory));
   return scanner;
 }
@@ -58,8 +62,10 @@ static int open_next_directory(DirectoryScanner *scanner) {
   scanner->current_path = (char *)queue_dequeue(scanner->directories);
   scanner->current_dir = opendir(scanner->current_path);
   if (scanner->current_dir == NULL) {
-    perror("Could not open directory!");
-    exit(EXIT_FAILURE);
+    perror("Could not open directory");
+    free(scanner->current_path);
+    scanner->current_path = NULL;
+    return 0;
   }
   return 1;
 }
@@ -107,7 +113,32 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
         free(cur_path);
         continue;
       }
+
+      if (scanner->include_count > 0) {
+        bool included = false;
+        for (int i = 0; i < scanner->include_count; i++) {
+          if (glob_match(scanner->include_patterns[i], entry->d_name)) {
+            included = true;
+            break;
+          }
+        }
+        if (!included) {
+          free(cur_path);
+          continue;
+        }
+      }
+
+      if ((scanner->max_size > 0 && (unsigned long long)stats.st_size > scanner->max_size) ||
+          (scanner->min_size > 0 && (unsigned long long)stats.st_size < scanner->min_size)) {
+        free(cur_path);
+        continue;
+      }
+
       File *file = file_create(cur_path);
+      if (file == NULL) {
+        free(cur_path);
+        continue;
+      }
       file->data->size = stats.st_size;
       if (scanner->use_metadata)
         file->metadata = file_metadata_create(&stats);

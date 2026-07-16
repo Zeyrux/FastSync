@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 static void create_test_file(const char *path, const char *content) {
-  to_disk(path, content, strlen(content));
+  (void)to_disk(path, content, strlen(content));
 }
 
 static void test_scanner_single_file() {
@@ -18,7 +18,7 @@ static void test_scanner_single_file() {
   mkdir(dir, 0755);
   create_test_file(file1, content1);
 
-  DirectoryScanner *scanner = directory_scanner_create((char *)dir, false, 0, NULL, 0);
+  DirectoryScanner *scanner = directory_scanner_create((char *)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   Chunk *chunk = directory_scanner_next(scanner);
@@ -46,7 +46,7 @@ static void test_scanner_multiple_files() {
   create_test_file(file1, content1);
   create_test_file(file2, content2);
 
-  DirectoryScanner *scanner = directory_scanner_create((char *)dir, false, 0, NULL, 0);
+  DirectoryScanner *scanner = directory_scanner_create((char *)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   Chunk *chunk = directory_scanner_next(scanner);
@@ -83,7 +83,7 @@ static void test_scanner_subdirectory() {
   create_test_file(root_file, content);
   create_test_file(sub_file, content);
 
-  DirectoryScanner *scanner = directory_scanner_create((char *)root, false, 0, NULL, 0);
+  DirectoryScanner *scanner = directory_scanner_create((char *)root, false, 0, NULL, 0, NULL, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   int total_files = 0;
@@ -106,7 +106,7 @@ static void test_scanner_empty_directory() {
 
   mkdir(dir, 0755);
 
-  DirectoryScanner *scanner = directory_scanner_create((char *)dir, false, 0, NULL, 0);
+  DirectoryScanner *scanner = directory_scanner_create((char *)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   Chunk *chunk = directory_scanner_next(scanner);

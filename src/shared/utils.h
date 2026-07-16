@@ -4,7 +4,7 @@
 #include "array_list.h"
 #include <stdbool.h>
 
-void mkdir_r(char *path);
+bool mkdir_r(char *path);
 char *str_dup(const char *string);
 char *path_cat(char *path1, char *path2);
 bool glob_match(const char *pattern, const char *str);

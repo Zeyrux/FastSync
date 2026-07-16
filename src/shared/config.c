@@ -1,4 +1,5 @@
 #include "config.h"
+#include "log.h"
 #include "protocol.h"
 #include "utils.h"
 #include <stdbool.h>
@@ -33,6 +34,10 @@ Config *config_create(char *version, char *send_directory,
   config->ssh_destination = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
+  config->include_patterns = NULL;
+  config->include_count = 0;
+  config->max_size = 0;
+  config->min_size = 0;
   return config;
 }
 
@@ -65,50 +70,70 @@ void config_delete(Config *config) {
   for (int i = 0; i < config->exclude_count; i++)
     free(config->exclude_patterns[i]);
   free(config->exclude_patterns);
+  for (int i = 0; i < config->include_count; i++)
+    free(config->include_patterns[i]);
+  free(config->include_patterns);
   free(config);
 }
 
-void config_send(int file_descriptor, Config *config) {
-  send_str(file_descriptor, config->version);
-  send_str(file_descriptor, config->send_directory);
-  send_str(file_descriptor, config->receive_root_directory);
-  send_int(file_descriptor, config->save_to_disk);
-  send_int(file_descriptor, config->use_multithreading);
-  send_int(file_descriptor, config->use_chunk_serialization);
-  send_int(file_descriptor, config->use_compression);
-  send_int(file_descriptor, config->use_metadata);
-  send_int(file_descriptor, config->compression_level);
-  send_int(file_descriptor, (int)config->chunk_size);
-  send_int(file_descriptor, config->use_sendfile);
-  send_int(file_descriptor, config->use_delete);
-  if (receive_status(file_descriptor) != STATUS_OK) {
-    perror("Error transmitting config!");
-    exit(EXIT_FAILURE);
+bool config_send(int file_descriptor, Config *config) {
+  if (!send_str(file_descriptor, config->version)) return false;
+  if (!send_str(file_descriptor, config->send_directory)) return false;
+  if (!send_str(file_descriptor, config->receive_root_directory)) return false;
+  if (!send_int(file_descriptor, config->save_to_disk)) return false;
+  if (!send_int(file_descriptor, config->use_multithreading)) return false;
+  if (!send_int(file_descriptor, config->use_chunk_serialization)) return false;
+  if (!send_int(file_descriptor, config->use_compression)) return false;
+  if (!send_int(file_descriptor, config->use_metadata)) return false;
+  if (!send_int(file_descriptor, config->compression_level)) return false;
+  if (!send_int(file_descriptor, (int)config->chunk_size)) return false;
+  if (!send_int(file_descriptor, config->use_sendfile)) return false;
+  if (!send_int(file_descriptor, config->use_delete)) return false;
+  Status status;
+  if (!receive_status(file_descriptor, &status)) return false;
+  if (status != STATUS_OK) {
+    log_message(LOG_LEVEL_ERROR, "Error transmitting config");
+    return false;
   }
+  return true;
 }
 
 Config *config_receive(int file_descriptor) {
   Config *config = (Config *)malloc(sizeof(Config));
+  if (config == NULL) return NULL;
   config->version = receive_str(file_descriptor);
+  if (!config->version) { free(config); return NULL; }
   if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
     fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n",
             config->version, PROTOCOL_VERSION);
     free(config->version);
     free(config);
     send_status(file_descriptor, STATUS_ERROR);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
   config->send_directory = receive_str(file_descriptor);
+  if (!config->send_directory) { free(config->version); free(config); return NULL; }
   config->receive_root_directory = receive_str(file_descriptor);
-  config->save_to_disk = receive_int(file_descriptor);
-  config->use_multithreading = receive_int(file_descriptor);
-  config->use_chunk_serialization = receive_int(file_descriptor);
-  config->use_compression = receive_int(file_descriptor);
-  config->use_metadata = receive_int(file_descriptor);
-  config->compression_level = receive_int(file_descriptor);
-  config->chunk_size = (unsigned long long)receive_int(file_descriptor);
-  config->use_sendfile = receive_int(file_descriptor);
-  config->use_delete = receive_int(file_descriptor);
+  if (!config->receive_root_directory) { free(config->version); free(config->send_directory); free(config); return NULL; }
+  int tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->save_to_disk = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_multithreading = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_chunk_serialization = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_compression = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_metadata = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->compression_level = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->chunk_size = (unsigned long long)tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_sendfile = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_delete = tmp;
   config->show_progress = false;
   config->dry_run = false;
   config->ssh_port = 22;
@@ -116,6 +141,17 @@ Config *config_receive(int file_descriptor) {
   config->ssh_destination = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
-  send_status(file_descriptor, STATUS_OK);
+  config->include_patterns = NULL;
+  config->include_count = 0;
+  config->max_size = 0;
+  config->min_size = 0;
+  if (!send_status(file_descriptor, STATUS_OK)) goto error;
   return config;
+
+error:
+  free(config->version);
+  free(config->send_directory);
+  free(config->receive_root_directory);
+  free(config);
+  return NULL;
 }

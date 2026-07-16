@@ -13,13 +13,14 @@ Server *server_create(int port) {
   Server *server = (Server *)malloc(sizeof(Server));
   if (server == NULL) {
     perror("Could not allocate space for Server");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
   if (file_descriptor < 0) {
     perror("Could not create Socket!");
-    exit(EXIT_FAILURE);
+    free(server);
+    return NULL;
   }
   server->file_descriptor = file_descriptor;
   int opt = 1;
@@ -28,7 +29,7 @@ Server *server_create(int port) {
     perror("Error setting a socket option!");
     close(server->file_descriptor);
     free(server);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   server->address.sin_family = AF_INET;
@@ -41,7 +42,7 @@ Server *server_create(int port) {
     perror("Could not bind server");
     close(server->file_descriptor);
     free(server);
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   return server;
@@ -54,12 +55,12 @@ void server_delete(Server **server) {
   *server = NULL;
 }
 
-void server_listen(Server *server, void (*handler)(int file_descriptor)) {
+bool server_listen(Server *server, void (*handler)(int file_descriptor)) {
   log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",
               server->address.sin_port);
   if (listen(server->file_descriptor, SOMAXCONN) < 0) {
     perror("Could not listen on port!");
-    exit(EXIT_FAILURE);
+    return false;
   }
 
   signal(SIGCHLD, SIG_IGN);
@@ -84,16 +85,21 @@ void server_listen(Server *server, void (*handler)(int file_descriptor)) {
     }
     close(file_descriptor);
   }
+  return true;
 }
 
 Client *client_create() {
   int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
   if (file_descriptor < 0) {
     perror("Could not create Socket!");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
 
   Client *client = (Client *)malloc(sizeof(Client));
+  if (client == NULL) {
+    close(file_descriptor);
+    return NULL;
+  }
   client->file_descriptor = file_descriptor;
   client->address.sin_family = AF_INET;
   client->address_length = sizeof(client->address);
@@ -101,19 +107,20 @@ Client *client_create() {
   return client;
 }
 
-void client_connect(Client *client, char *host, int port) {
+bool client_connect(Client *client, char *host, int port) {
   client->address.sin_port = htons(port);
 
   if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
     perror("Could not convert host address!");
-    exit(EXIT_FAILURE);
+    return false;
   }
 
   if (connect(client->file_descriptor, (struct sockaddr *)&client->address,
               client->address_length) < 0) {
     perror("Could not connect to Server!");
-    exit(EXIT_FAILURE);
+    return false;
   }
+  return true;
 }
 
 void client_disconnect(Client *client) {

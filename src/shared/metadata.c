@@ -36,32 +36,36 @@ FileMetadata *metadata_from_buf(char **buf) {
   return m;
 }
 
-void metadata_send(int file_descriptor, FileMetadata *m) {
+bool metadata_send(int file_descriptor, FileMetadata *m) {
   if (m == NULL) {
     int zero = 0;
-    send_n_data(file_descriptor, &zero, sizeof(int));
-    return;
+    return send_n_data(file_descriptor, &zero, sizeof(int));
   }
   int present = 1;
-  send_n_data(file_descriptor, &present, sizeof(int));
-  send_n_data(file_descriptor, &m->mode, sizeof(mode_t));
-  send_n_data(file_descriptor, &m->uid, sizeof(uid_t));
-  send_n_data(file_descriptor, &m->gid, sizeof(gid_t));
-  send_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t));
-  send_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
+  return send_n_data(file_descriptor, &present, sizeof(int)) &&
+         send_n_data(file_descriptor, &m->mode, sizeof(mode_t)) &&
+         send_n_data(file_descriptor, &m->uid, sizeof(uid_t)) &&
+         send_n_data(file_descriptor, &m->gid, sizeof(gid_t)) &&
+         send_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t)) &&
+         send_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
 }
 
 FileMetadata *metadata_receive(int file_descriptor) {
   int present;
-  receive_n_data(file_descriptor, &present, sizeof(int));
+  if (!receive_n_data(file_descriptor, &present, sizeof(int)))
+    return NULL;
   if (!present)
     return NULL;
   FileMetadata *m = malloc(sizeof(FileMetadata));
-  receive_n_data(file_descriptor, &m->mode, sizeof(mode_t));
-  receive_n_data(file_descriptor, &m->uid, sizeof(uid_t));
-  receive_n_data(file_descriptor, &m->gid, sizeof(gid_t));
-  receive_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t));
-  receive_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
+  if (m == NULL) return NULL;
+  if (!receive_n_data(file_descriptor, &m->mode, sizeof(mode_t)) ||
+      !receive_n_data(file_descriptor, &m->uid, sizeof(uid_t)) ||
+      !receive_n_data(file_descriptor, &m->gid, sizeof(gid_t)) ||
+      !receive_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t)) ||
+      !receive_n_data(file_descriptor, &m->mtime_nsec, sizeof(long))) {
+    free(m);
+    return NULL;
+  }
   return m;
 }
 

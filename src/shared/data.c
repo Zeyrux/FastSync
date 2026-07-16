@@ -6,7 +6,7 @@ Data *data_create_empty(size_t data_size) {
   void *data = malloc(data_size);
   if (data == NULL) {
     log_message(LOG_LEVEL_ERROR, "Could not allocate memory for empty data");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
   return data_create(data, data_size);
 }
@@ -15,7 +15,7 @@ Data *data_create_reserve(size_t size) {
   Data *d = malloc(sizeof(Data));
   if (d == NULL) {
     log_message(LOG_LEVEL_ERROR, "Could not allocate memory for data");
-    exit(EXIT_FAILURE);
+    return NULL;
   }
   d->data = NULL;
   d->size = size;
@@ -26,7 +26,8 @@ Data *data_create(void *data, size_t data_size) {
   Data *new_data = malloc(sizeof(Data));
   if (new_data == NULL) {
     log_message(LOG_LEVEL_ERROR, "Could not allocate memory for data");
-    exit(EXIT_FAILURE);
+    free(data);
+    return NULL;
   }
   new_data->data = data;
   new_data->size = data_size;

@@ -19,19 +19,22 @@ PipelineContextSender *pipeline_context_sender_create(Config *config,
                                                       Queue *queue_scanner,
                                                       Queue *queue_loader) {
   PipelineContextSender *context = malloc(sizeof(PipelineContextSender));
+  if (context == NULL) return NULL;
   context->config = config;
   context->queue_scanner = queue_scanner;
   context->queue_loader = queue_loader;
   context->scanner_done = false;
   context->loader_done = false;
+  context->manifest = NULL;
   if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full_scanner) != thrd_success ||
       cnd_init(&context->condition_not_empty_scanner) != thrd_success ||
       mtx_init(&context->mutex_loader, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full_loader) != thrd_success ||
       cnd_init(&context->condition_not_empty_loader) != thrd_success) {
-    perror("Error initializing synchronization objects!");
-    exit(EXIT_FAILURE);
+    perror("Error initializing synchronization objects");
+    free(context);
+    return NULL;
   }
   return context;
 }
@@ -56,6 +59,7 @@ PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
                                                           Queue *queue,
                                                           int file_descriptor) {
   PipelineContextReceiver *context = malloc(sizeof(PipelineContextReceiver));
+  if (context == NULL) return NULL;
   context->config = config;
   context->queue = queue;
   context->file_descriptor = file_descriptor;
@@ -63,8 +67,9 @@ PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full) != thrd_success ||
       cnd_init(&context->condition_not_empty) != thrd_success) {
-    perror("Error initializing synchronization objects!");
-    exit(EXIT_FAILURE);
+    perror("Error initializing synchronization objects");
+    free(context);
+    return NULL;
   }
   return context;
 }
@@ -81,12 +86,16 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver *context) {
 static void receive_chunk_enqueue(int file_descriptor,
                                   PipelineContextReceiver *context) {
   Data *chunk_data = receive_data(file_descriptor);
+  if (chunk_data == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
+    return;
+  }
   Data *data_to_process = chunk_data;
   if (context->config->use_compression) {
     data_to_process = data_decompress(chunk_data);
     data_destroy(chunk_data);
     if (data_to_process == NULL) {
-      log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk, skipping");
+      log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");
       return;
     }
   }
@@ -115,28 +124,40 @@ int receive_thread(void *pipeline_context) {
   Config *config = context->config;
   mtx_unlock(&context->mutex);
 
-  Status status = receive_status(file_descriptor);
+  Status status;
+  if (!receive_status(file_descriptor, &status)) return thrd_error;
   while (status == STATUS_NEXT || status == STATUS_CHUNK) {
     if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, context);
     } else {
       File *file = file_receive(config, file_descriptor);
-      queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                  &context->condition_not_empty,
-                                  &context->condition_not_full);
+      if (file) {
+        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
+                                    &context->condition_not_empty,
+                                    &context->condition_not_full);
+      } else {
+        log_message(LOG_LEVEL_ERROR, "Failed to receive file");
+      }
     }
-    status = receive_status(file_descriptor);
+    if (!receive_status(file_descriptor, &status)) return thrd_error;
   }
   if (status == STATUS_MANIFEST) {
-    int count = receive_int(file_descriptor);
+    int count;
+    if (!receive_int(file_descriptor, &count)) return thrd_error;
     ArrayList *manifest = array_list_create(free);
-    for (int i = 0; i < count; i++)
-      array_list_add(manifest, receive_str(file_descriptor));
-    delete_extras(context->config->receive_root_directory, manifest);
-    for (int i = 0; i < manifest->size; i++)
-      free(manifest->items[i]);
-    array_list_delete(manifest);
-    status = receive_status(file_descriptor);
+    if (manifest) {
+      for (int i = 0; i < count; i++) {
+        char *s = receive_str(file_descriptor);
+        if (s) {
+          array_list_add(manifest, s);
+        }
+      }
+      delete_extras(context->config->receive_root_directory, manifest);
+      for (int i = 0; i < manifest->size; i++)
+        free(manifest->items[i]);
+      array_list_delete(manifest);
+    }
+    if (!receive_status(file_descriptor, &status)) return thrd_error;
   }
   mtx_lock(&context->mutex);
   context->receiver_done = true;
@@ -163,9 +184,11 @@ int write_thread(void *pipeline_context) {
     }
     if (save_to_disk) {
       char *disk_path = path_cat(root_directory, file->path);
-      to_disk(disk_path, file->data->data, file->data->size);
-      file_restore_metadata(disk_path, file->metadata);
-      free(disk_path);
+      if (disk_path) {
+        to_disk(disk_path, file->data->data, file->data->size);
+        file_restore_metadata(disk_path, file->metadata);
+        free(disk_path);
+      }
     }
     file_destroy(file);
   }

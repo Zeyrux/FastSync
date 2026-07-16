@@ -10,10 +10,7 @@ Data *data_compress(Data *data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data *compressed_data = data_create_empty(dst_size);
-  if (!compressed_data) {
-    log_message(LOG_LEVEL_ERROR, "Failed to allocate compression buffer");
-    return NULL;
-  }
+  if (compressed_data == NULL) return NULL;
 
   ZSTD_CCtx *cctx = ZSTD_createCCtx();
   if (!cctx) {
@@ -49,6 +46,11 @@ Data *data_decompress(Data *compressed_data) {
   log_message(LOG_LEVEL_DEBUG, "Start to decompress data");
   unsigned long long dst_size = ZSTD_getFrameContentSize(
       compressed_data->data, compressed_data->size);
+  if (ZSTD_isError(dst_size)) {
+    log_message(LOG_LEVEL_ERROR, "Failed to get decompressed size: %s",
+                ZSTD_getErrorName(dst_size));
+    return NULL;
+  }
 
   ZSTD_DCtx *dctx = ZSTD_createDCtx();
   if (!dctx) {
