@@ -3,6 +3,8 @@
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,9 +132,15 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       server_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
-      unsigned long long kbps = strtoull(argv[++i], NULL, 10);
-      if (kbps == 0) {
-        fprintf(stderr, "Error: --bwlimit must be greater than 0\n");
+      char *end;
+      errno = 0;
+      unsigned long long kbps = strtoull(argv[++i], &end, 10);
+      if (errno != 0 || *end != '\0' || kbps == 0) {
+        fprintf(stderr, "Error: --bwlimit must be a positive integer\n");
+        return 1;
+      }
+      if (kbps > ULLONG_MAX / 1024) {
+        fprintf(stderr, "Error: --bwlimit value too large\n");
         return 1;
       }
       io_set_bwlimit(kbps * 1024);

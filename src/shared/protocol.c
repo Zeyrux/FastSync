@@ -21,7 +21,7 @@ void io_set_fds(int read_fd, int write_fd) {
 
 void io_set_bwlimit(unsigned long long bytes_per_sec) {
   io_bwlimit = bytes_per_sec;
-  bw_tokens = 0;
+  bw_tokens = (long long)io_bwlimit;
   clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
 }
 
