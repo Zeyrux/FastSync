@@ -18,6 +18,27 @@
 #include <threads.h>
 #include <time.h>
 
+static int incremental_check(Client *client, File *file) {
+  if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
+  if (!send_str(client->file_descriptor, file->path)) return -1;
+  unsigned long long fsize = file->data->size;
+  long long mtime = file->metadata ? file->metadata->mtime_sec : 0;
+  if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize))) return -1;
+  if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
+  Status s;
+  if (!receive_status(client->file_descriptor, &s)) return -1;
+  if (s == STATUS_ERROR) {
+    log_message(LOG_LEVEL_ERROR, "Server reported error for file");
+    return -1;
+  }
+  if (s == STATUS_OK) return 1;
+  if (s != STATUS_NEXT) {
+    log_message(LOG_LEVEL_ERROR, "Unexpected server status");
+    return -1;
+  }
+  return 0;
+}
+
 int send_chunk(Client *client, Chunk *chunk, Config *config) {
   if (config->use_chunk_serialization) {
     if (!send_status(client->file_descriptor, STATUS_CHUNK)) return -1;
@@ -33,17 +54,9 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
       if (config->use_incremental) {
-        if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
-        if (!send_str(client->file_descriptor, chunk->items[i]->path)) return -1;
-        unsigned long long fsize = chunk->items[i]->data->size;
-        long long mtime = chunk->items[i]->metadata ? chunk->items[i]->metadata->mtime_sec : 0;
-        if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize))) return -1;
-        if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
-        Status s;
-        if (!receive_status(client->file_descriptor, &s)) return -1;
-        if (s == STATUS_ERROR) { log_message(LOG_LEVEL_ERROR, "Server reported error for file"); return -1; }
-        if (s == STATUS_OK) continue;
-        if (s != STATUS_NEXT) { log_message(LOG_LEVEL_ERROR, "Unexpected server status"); return -1; }
+        int rc = incremental_check(client, chunk->items[i]);
+        if (rc < 0) return -1;
+        if (rc > 0) continue;
         if (!file_send_sendfile_no_path(chunk->items[i], client->file_descriptor, config->use_metadata))
           return -1;
       } else {
@@ -55,17 +68,9 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
       if (config->use_incremental) {
-        if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
-        if (!send_str(client->file_descriptor, chunk->items[i]->path)) return -1;
-        unsigned long long fsize = chunk->items[i]->data->size;
-        long long mtime = chunk->items[i]->metadata ? chunk->items[i]->metadata->mtime_sec : 0;
-        if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize))) return -1;
-        if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime))) return -1;
-        Status s;
-        if (!receive_status(client->file_descriptor, &s)) return -1;
-        if (s == STATUS_ERROR) { log_message(LOG_LEVEL_ERROR, "Server reported error for file"); return -1; }
-        if (s == STATUS_OK) continue;
-        if (s != STATUS_NEXT) { log_message(LOG_LEVEL_ERROR, "Unexpected server status"); return -1; }
+        int rc = incremental_check(client, chunk->items[i]);
+        if (rc < 0) return -1;
+        if (rc > 0) continue;
         if (!file_send_single_calls_no_path(chunk->items[i], client->file_descriptor,
                                        config->use_metadata,
                                        config->use_compression ? config->compression_level : 0))

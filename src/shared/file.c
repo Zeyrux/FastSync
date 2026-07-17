@@ -237,7 +237,9 @@ File *file_receive(Config *config, int file_descriptor) {
   free(path);
   if (file == NULL) return NULL;
   if (config->use_metadata) {
-    file->metadata = metadata_receive(file_descriptor);
+    int meta_ok = 1;
+    file->metadata = metadata_receive(file_descriptor, &meta_ok);
+    if (!meta_ok) { file_destroy(file); return NULL; }
   }
   Data *file_data = receive_data(file_descriptor);
   if (file_data == NULL) {

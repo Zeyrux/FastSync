@@ -130,12 +130,13 @@ int receive_thread(void *pipeline_context) {
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
     if (status == STATUS_CHECK) {
       char *check_path = receive_str(file_descriptor);
-      if (check_path == NULL) return thrd_error;
+      if (check_path == NULL) { send_status(file_descriptor, STATUS_ERROR); return thrd_error; }
       unsigned long long check_size;
       long long check_mtime;
       if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
           !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
         free(check_path);
+        send_status(file_descriptor, STATUS_ERROR);
         return thrd_error;
       }
       char *full_path = path_cat(config->receive_root_directory, check_path);
@@ -156,7 +157,9 @@ int receive_thread(void *pipeline_context) {
         free(check_path);
         if (file == NULL) { send_status(file_descriptor, STATUS_ERROR); return thrd_error; }
         if (config->use_metadata) {
-          file->metadata = metadata_receive(file_descriptor);
+          int meta_ok = 1;
+          file->metadata = metadata_receive(file_descriptor, &meta_ok);
+          if (!meta_ok) { file_destroy(file); send_status(file_descriptor, STATUS_ERROR); return thrd_error; }
         }
         Data *file_data = receive_data(file_descriptor);
         if (file_data == NULL) {
