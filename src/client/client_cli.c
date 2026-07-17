@@ -1,7 +1,10 @@
 #include "client_send.h"
 #include "config.h"
 #include "log.h"
+#include "protocol.h"
 #include "utils.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +45,7 @@ static void print_usage(void) {
   printf("  --save-to-disk      Write received files to disk\n");
   printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
   printf("  --server-port <n>   Server port (default: 8080)\n");
+  printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
   printf("  --help              Show this help\n");
 }
 
@@ -127,6 +131,20 @@ int main(int argc, char *argv[]) {
       server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       server_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
+      char *end;
+      errno = 0;
+      unsigned long long kbps = strtoull(argv[++i], &end, 10);
+      if (errno != 0 || *end != '\0' || kbps == 0) {
+        fprintf(stderr, "Error: --bwlimit must be a positive integer\n");
+        return 1;
+      }
+      if (kbps > ULLONG_MAX / 1024) {
+        fprintf(stderr, "Error: --bwlimit value too large\n");
+        return 1;
+      }
+      io_set_bwlimit(kbps * 1024);
+      log_message(LOG_LEVEL_INFO, "Set bandwidth limit to %llu KB/s", kbps);
     } else if (strcmp(argv[i], "--progress") == 0) {
       config->show_progress = true;
     } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {

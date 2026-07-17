@@ -1,16 +1,57 @@
 #include "protocol.h"
 #include "log.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
 
+static unsigned long long io_bwlimit = 0;
+static long long bw_tokens = 0;
+static struct timespec bw_last_refill = {0, 0};
+
 void io_set_fds(int read_fd, int write_fd) {
   io_read_fd = read_fd;
   io_write_fd = write_fd;
+}
+
+void io_set_bwlimit(unsigned long long bytes_per_sec) {
+  io_bwlimit = bytes_per_sec;
+  bw_tokens = (long long)io_bwlimit;
+  clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
+}
+
+static void bw_throttle(size_t bytes_written) {
+  if (io_bwlimit == 0) return;
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  long long elapsed_ns = (now.tv_sec - bw_last_refill.tv_sec) * 1000000000LL +
+                         (now.tv_nsec - bw_last_refill.tv_nsec);
+  bw_last_refill = now;
+
+  long long tokens_to_add = (long long)((double)io_bwlimit * elapsed_ns / 1000000000.0);
+  bw_tokens += tokens_to_add;
+  if (bw_tokens > (long long)io_bwlimit)
+    bw_tokens = (long long)io_bwlimit;
+
+  bw_tokens -= (long long)bytes_written;
+
+  if (bw_tokens < 0) {
+    long long deficit_ns = (long long)((double)(-bw_tokens) / io_bwlimit * 1000000000.0);
+    struct timespec sleep_time, remaining;
+    sleep_time.tv_sec = deficit_ns / 1000000000LL;
+    sleep_time.tv_nsec = deficit_ns % 1000000000LL;
+    while (nanosleep(&sleep_time, &remaining) < 0 && errno == EINTR)
+      sleep_time = remaining;
+    bw_tokens = 0;
+    clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
+  }
 }
 
 static int io_fd(int dir_fd, int file_descriptor) {
@@ -22,12 +63,16 @@ bool send_n_data(int file_descriptor, void *data, size_t data_size) {
   int fd = io_fd(io_write_fd, file_descriptor);
   ssize_t total_bytes_send = 0;
   while (total_bytes_send < data_size) {
+    size_t chunk = data_size - total_bytes_send;
+    if (io_bwlimit > 0 && chunk > 65536)
+      chunk = 65536;
     ssize_t bytes_send =
-        write(fd, (char *)data + total_bytes_send, data_size - total_bytes_send);
+        write(fd, (char *)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
     }
+    bw_throttle((size_t)bytes_send);
     total_bytes_send += bytes_send;
   }
   log_message(LOG_LEVEL_DEBUG, "    Send n Data: %zu", total_bytes_send);

@@ -383,6 +383,17 @@ def run_profile(profile_name, source_dir, dest_dir):
         except Exception as e:
             results.append({"name": "Progress (--progress)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
 
+        # Bandwidth limit (--bwlimit 10240 = 10 MB/s)
+        feature_flags = BASE_CLIENT_FLAGS + ["--bwlimit", "10240"]
+        cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags
+        print(f"\n  --- Bandwidth limit (--bwlimit 10240 KB/s) ---\n    Running: {' '.join(cmd)}")
+        try:
+            r = run_single_test(cmd, "Bandwidth limit (--bwlimit 10240)", source_dir, dest_dir)
+            r["suite"] = profile_name
+            results.append(r)
+        except Exception as e:
+            results.append({"name": "Bandwidth limit (--bwlimit 10240)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
+
         # Chunk size (--chunk-size 5242880)
         feature_flags = BASE_CLIENT_FLAGS + ["--chunk-size", "5242880"]
         cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags
