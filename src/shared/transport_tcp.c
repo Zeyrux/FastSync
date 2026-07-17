@@ -1,5 +1,6 @@
 #include "transport_tcp.h"
 #include "log.h"
+#include "protocol.h"
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <signal.h>
@@ -152,6 +153,7 @@ void client_disconnect(Client *client) {
     SSL_shutdown(client->ssl);
     SSL_free(client->ssl);
     client->ssl = NULL;
+    io_set_ssl(NULL);
   }
   close(client->file_descriptor);
   if (client->ssh_child_pid > 0) {

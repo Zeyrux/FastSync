@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+typedef struct ssl_st SSL;
+
 typedef int Status;
 enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK, STATUS_MANIFEST, STATUS_CHECK };
 
