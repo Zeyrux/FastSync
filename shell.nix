@@ -8,6 +8,7 @@ pkgs.mkShell {
     cmake
     gnumake
     pkg-config
+    docker
     tea
   ];
 
