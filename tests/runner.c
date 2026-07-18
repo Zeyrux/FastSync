@@ -2,6 +2,7 @@
 #include "test_chunk.h"
 #include "test_compression.h"
 #include "test_config.h"
+#include "test_delta.h"
 #include "test_queue.h"
 #include "test_scanner.h"
 #include "test_shared_utils.h"
@@ -23,6 +24,7 @@ int main() {
   RUN_TEST(test_config);
   RUN_TEST(test_compression);
   RUN_TEST(test_scanner);
+  RUN_TEST(test_delta);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);

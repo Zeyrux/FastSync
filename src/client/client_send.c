@@ -1,9 +1,12 @@
 #include "client_send.h"
 #include "array_list.h"
 #include "chunk.h"
+#include "compression.h"
 #include "config.h"
 #include "data.h"
+#include "delta.h"
 #include "file.h"
+#include "metadata.h"
 #include "log.h"
 #include "multiprocessing.h"
 #include "protocol.h"
@@ -19,7 +22,9 @@
 #include <threads.h>
 #include <time.h>
 
-static int incremental_check(Client *client, File *file) {
+static int incremental_check(Client *client, File *file,
+                              DeltaSignature **out_sig) {
+  *out_sig = NULL;
   if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
   if (!send_str(client->file_descriptor, file->path)) return -1;
   unsigned long long fsize = file->data->size;
@@ -33,11 +38,53 @@ static int incremental_check(Client *client, File *file) {
     return -1;
   }
   if (s == STATUS_OK) return 1;
+  if (s == STATUS_DELTA_SIGNATURE) {
+    Data *sig_data = receive_data(client->file_descriptor);
+    if (!sig_data) return -1;
+    DeltaSignature *sig = delta_signature_deserialize(sig_data);
+    data_destroy(sig_data);
+    if (!sig) return -1;
+    *out_sig = sig;
+    return 2;
+  }
   if (s != STATUS_NEXT) {
     log_message(LOG_LEVEL_ERROR, "Unexpected server status");
     return -1;
   }
   return 0;
+}
+
+static int send_delta(Client *client, File *file, DeltaSignature *sig,
+                       Config *config) {
+  Delta *delta = delta_compute(file->data->data, file->data->size,
+                                sig, config->delta_block_size);
+  if (!delta) return 1;
+
+  if (!delta_is_worthwhile(delta, file->data->size)) {
+    delta_destroy(delta);
+    if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+    return 1;
+  }
+
+  Data *delta_data = delta_serialize(delta);
+  delta_destroy(delta);
+  if (!delta_data) return -1;
+
+  Data *to_send = delta_data;
+  if (config->use_compression) {
+    to_send = data_compress(delta_data, config->compression_level);
+    data_destroy(delta_data);
+    if (!to_send) return -1;
+  }
+
+  bool ok = send_status(client->file_descriptor, STATUS_DELTA_DATA) &&
+            send_data(client->file_descriptor, to_send);
+
+  if (ok && config->use_metadata)
+    ok = metadata_send(client->file_descriptor, file->metadata);
+
+  data_destroy(to_send);
+  return ok ? 0 : -1;
 }
 
 int send_chunk(Client *client, Chunk *chunk, Config *config) {
@@ -55,9 +102,18 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
   } else if (config->use_sendfile && !config->use_compression) {
     for (int i = 0; i < chunk->element_count; i++) {
       if (config->use_incremental) {
-        int rc = incremental_check(client, chunk->items[i]);
-        if (rc < 0) return -1;
-        if (rc > 0) continue;
+        DeltaSignature *sig = NULL;
+        int rc = incremental_check(client, chunk->items[i], &sig);
+        if (rc < 0) { delta_signature_destroy(sig); return -1; }
+        if (rc == 1) { delta_signature_destroy(sig); continue; }
+        if (rc == 2 && config->use_delta) {
+          int drc = send_delta(client, chunk->items[i], sig, config);
+          delta_signature_destroy(sig);
+          if (drc == 0) continue;
+          if (drc < 0) return -1;
+        } else {
+          delta_signature_destroy(sig);
+        }
         if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata, false))
           return -1;
       } else {
@@ -69,9 +125,18 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
   } else {
     for (int i = 0; i < chunk->element_count; i++) {
       if (config->use_incremental) {
-        int rc = incremental_check(client, chunk->items[i]);
-        if (rc < 0) return -1;
-        if (rc > 0) continue;
+        DeltaSignature *sig = NULL;
+        int rc = incremental_check(client, chunk->items[i], &sig);
+        if (rc < 0) { delta_signature_destroy(sig); return -1; }
+        if (rc == 1) { delta_signature_destroy(sig); continue; }
+        if (rc == 2 && config->use_delta) {
+          int drc = send_delta(client, chunk->items[i], sig, config);
+          delta_signature_destroy(sig);
+          if (drc == 0) continue;
+          if (drc < 0) return -1;
+        } else {
+          delta_signature_destroy(sig);
+        }
         if (!file_send_single_calls(chunk->items[i], client->file_descriptor,
                                    config->use_metadata,
                                    config->use_compression ? config->compression_level : 0,

@@ -127,6 +127,10 @@ static const char *status_to_string(Status status) {
     return "CHUNK";
   case STATUS_CHECK:
     return "CHECK";
+  case STATUS_DELTA_SIGNATURE:
+    return "DELTA_SIGNATURE";
+  case STATUS_DELTA_DATA:
+    return "DELTA_DATA";
   default:
     return "UNKNOWN";
   }

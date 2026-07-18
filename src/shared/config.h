@@ -2,6 +2,7 @@
 #define CONFIG_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum {
   TRANSPORT_TCP,
@@ -33,13 +34,15 @@ typedef struct Config {
   unsigned long long max_size;
   unsigned long long min_size;
   bool use_incremental;
+  bool use_delta;
+  uint32_t delta_block_size;
   bool use_tls;
   char *tls_cert;
   char *tls_key;
   char *tls_ca;
 } Config;
 
-#define PROTOCOL_VERSION "1.1.0"
+#define PROTOCOL_VERSION "1.2.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config *config_create(char *version, char *send_directory,

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "delta.h"
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
@@ -39,6 +40,8 @@ Config *config_create(char *version, char *send_directory,
   config->max_size = 0;
   config->min_size = 0;
   config->use_incremental = false;
+  config->use_delta = false;
+  config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
   config->use_tls = false;
   config->tls_cert = NULL;
   config->tls_key = NULL;
@@ -98,6 +101,8 @@ bool config_send(int file_descriptor, Config *config) {
   if (!send_int(file_descriptor, config->use_sendfile)) return false;
   if (!send_int(file_descriptor, config->use_delete)) return false;
   if (!send_int(file_descriptor, config->use_incremental)) return false;
+  if (!send_int(file_descriptor, config->use_delta)) return false;
+  if (!send_int(file_descriptor, (int)config->delta_block_size)) return false;
   Status status;
   if (!receive_status(file_descriptor, &status)) return false;
   if (status != STATUS_OK) {
@@ -145,6 +150,10 @@ Config *config_receive(int file_descriptor) {
   config->use_delete = tmp;
   if (!receive_int(file_descriptor, &tmp)) goto error;
   config->use_incremental = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_delta = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->delta_block_size = (uint32_t)tmp;
   config->show_progress = false;
   config->dry_run = false;
   config->ssh_port = 22;
