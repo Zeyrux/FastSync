@@ -28,7 +28,7 @@ class ServerManager:
         cmd = SERVER_CMD + ["-p", str(self._port)]
         if extra_args:
             cmd += extra_args
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=None)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _wait_for_port(self._port, timeout=5)
 
     def stop(self):
