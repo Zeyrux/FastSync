@@ -283,8 +283,6 @@ def run_profile(profile_name, source_dir, dest_dir, *, full=False, test_cases=No
     try:
         if is_limited and full:
             netem_apply(profile_name)
-        else:
-            netem_reset()
 
         results = []
         for case in test_cases:
