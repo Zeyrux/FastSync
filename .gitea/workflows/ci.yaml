@@ -5,14 +5,10 @@ on: [push, pull_request]
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc cmake libzstd-dev
 
       - name: Configure
         run: cmake -B build -S .
