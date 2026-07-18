@@ -96,24 +96,101 @@ bool file_load_data(File *file) {
   return true;
 }
 
-bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
+bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level, bool send_path) {
+  Data *data_to_send = file->data;
+  Data *compressed_data = NULL;
   if (compression_level > 0) {
-    Data *compressed_data = data_compress(file->data, compression_level);
+    compressed_data = data_compress(file->data, compression_level);
     if (compressed_data == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
       return false;
     }
-    data_destroy(file->data);
-    if (compressed_data == NULL) {
-      log_message(LOG_LEVEL_ERROR, "Compression failed in file_send_single_calls");
-      exit(EXIT_FAILURE);
-    }
-    file->data = compressed_data;
+    data_to_send = compressed_data;
   }
-  if (!send_str(file_descriptor, file->path)) return false;
-  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
-  if (!send_data(file_descriptor, file->data)) return false;
+  if (send_path && !send_str(file_descriptor, file->path)) {
+    data_destroy(compressed_data);
+    return false;
+  }
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) {
+    data_destroy(compressed_data);
+    return false;
+  }
+  if (!send_data(file_descriptor, data_to_send)) {
+    data_destroy(compressed_data);
+    return false;
+  }
+  data_destroy(compressed_data);
   return true;
+}
+
+bool file_save_to_disk(const char *root_directory, File *file) {
+  char *disk_path = path_cat((char *)root_directory, file->path);
+  if (disk_path == NULL) return false;
+  bool ok = to_disk(disk_path, file->data->data, file->data->size);
+  if (ok) file_restore_metadata(disk_path, file->metadata);
+  free(disk_path);
+  return ok;
+}
+
+File *receive_incremental_check(int fd, Config *config, bool *skipped) {  *skipped = false;
+  char *check_path = receive_str(fd);
+  if (check_path == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
+
+  unsigned long long check_size;
+  long long check_mtime;
+  if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
+      !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
+  char *full_path = path_cat(config->receive_root_directory, check_path);
+  struct stat st;
+  bool match = false;
+  if (full_path && stat(full_path, &st) == 0 &&
+      (unsigned long long)st.st_size == check_size &&
+      (long long)st.st_mtime == check_mtime) {
+    match = true;
+  }
+  free(full_path);
+
+  if (match) {
+    if (!send_status(fd, STATUS_OK)) { free(check_path); return NULL; }
+    free(check_path);
+    *skipped = true;
+    return NULL;
+  }
+
+  if (!send_status(fd, STATUS_NEXT)) { free(check_path); return NULL; }
+
+  File *file = file_create(check_path);
+  free(check_path);
+  if (file == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
+
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok) { file_destroy(file); send_status(fd, STATUS_ERROR); return NULL; }
+  }
+
+  Data *file_data = receive_data(fd);
+  if (file_data == NULL) {
+    file_destroy(file);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
+  if (config->use_compression) {
+    Data *uncompressed = data_decompress(file_data);
+    data_destroy(file_data);
+    if (uncompressed == NULL) { file_destroy(file); send_status(fd, STATUS_ERROR); return NULL; }
+    file_data = uncompressed;
+  }
+
+  data_destroy(file->data);
+  file->data = file_data;
+  return file;
 }
 
 bool to_disk(const char *path, const void *data, unsigned long long data_size) {
@@ -141,8 +218,8 @@ bool to_disk(const char *path, const void *data, unsigned long long data_size) {
   return true;
 }
 
-bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
-  if (!send_str(file_descriptor, file->path)) return false;
+bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata, bool send_path) {
+  if (send_path && !send_str(file_descriptor, file->path)) return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
 
   int fd = open(file->path, O_RDONLY);
@@ -178,7 +255,9 @@ File *file_receive(Config *config, int file_descriptor) {
   free(path);
   if (file == NULL) return NULL;
   if (config->use_metadata) {
-    file->metadata = metadata_receive(file_descriptor);
+    int meta_ok = 1;
+    file->metadata = metadata_receive(file_descriptor, &meta_ok);
+    if (!meta_ok) { file_destroy(file); return NULL; }
   }
   Data *file_data = receive_data(file_descriptor);
   if (file_data == NULL) {
@@ -214,6 +293,23 @@ size_t file_content_to_buffer(File *file) {
   }
   fclose(file_pointer);
   return bytes_read;
+}
+
+int receive_manifest(int fd, Config *config, int *next_status) {
+  int count;
+  if (!receive_int(fd, &count)) return -1;
+  ArrayList *manifest = array_list_create(free);
+  if (manifest) {
+    for (int i = 0; i < count; i++) {
+      char *s = receive_str(fd);
+      if (s) array_list_add(manifest, s);
+    }
+    fprintf(stderr, "Deleting files not in manifest...\n");
+    delete_extras(config->receive_root_directory, manifest);
+    array_list_delete(manifest);
+  }
+  if (!receive_status(fd, next_status)) return -1;
+  return 0;
 }
 
 

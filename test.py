@@ -415,6 +415,33 @@ def run_profile(profile_name, source_dir, dest_dir, *, full=False, test_cases=No
             except Exception as e:
                 results.append({"name": "Bandwidth limit (--bwlimit 10240)", "suite": profile_name, "status": "Error", "time": "N/A", "error": str(e)})
 
+            # Incremental sync (--incremental) — first sync, then second sync should skip all
+            print(f"\n  --- Incremental (--incremental) ---")
+            try:
+                flags = BASE_CLIENT_FLAGS + ["-M"]
+                srv = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+                time.sleep(0.5)
+                first_cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags
+                r1 = subprocess.run(first_cmd, text=True, capture_output=True)
+                wait_proc(srv)
+                if r1.returncode != 0:
+                    raise RuntimeError(f"First sync failed: {r1.stderr[:100]}")
+                srv2 = subprocess.Popen(SERVER_CMD, stdout=subprocess.DEVNULL, stderr=None)
+                time.sleep(0.5)
+                second_cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + flags + ["--incremental"]
+                start = time.monotonic()
+                r2 = subprocess.run(second_cmd, text=True, capture_output=True, timeout=30)
+                duration = time.monotonic() - start
+                wait_proc(srv2)
+                r = {"name": "Incremental (--incremental)", "suite": profile_name,
+                     "status": "Success" if r2.returncode == 0 else "Failed",
+                     "time": f"{duration:.4f}s" if r2.returncode == 0 else "N/A",
+                     "error": "" if r2.returncode == 0 else f"Exit {r2.returncode}: {(r2.stderr or r2.stdout)[:60]}"}
+                results.append(r)
+            except Exception as e:
+                results.append({"name": "Incremental (--incremental)", "suite": profile_name,
+                                "status": "Error", "time": "N/A", "error": str(e)})
+
             # Chunk size (--chunk-size 5242880)
             feature_flags = BASE_CLIENT_FLAGS + ["--chunk-size", "5242880"]
             cmd = client_prefix + BASE_CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir] + feature_flags

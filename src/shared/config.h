@@ -32,9 +32,10 @@ typedef struct Config {
   int include_count;
   unsigned long long max_size;
   unsigned long long min_size;
+  bool use_incremental;
 } Config;
 
-#define PROTOCOL_VERSION "1.0.0"
+#define PROTOCOL_VERSION "1.1.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config *config_create(char *version, char *send_directory,

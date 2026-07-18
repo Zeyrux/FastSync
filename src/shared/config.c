@@ -38,6 +38,7 @@ Config *config_create(char *version, char *send_directory,
   config->include_count = 0;
   config->max_size = 0;
   config->min_size = 0;
+  config->use_incremental = false;
   return config;
 }
 
@@ -89,6 +90,7 @@ bool config_send(int file_descriptor, Config *config) {
   if (!send_int(file_descriptor, (int)config->chunk_size)) return false;
   if (!send_int(file_descriptor, config->use_sendfile)) return false;
   if (!send_int(file_descriptor, config->use_delete)) return false;
+  if (!send_int(file_descriptor, config->use_incremental)) return false;
   Status status;
   if (!receive_status(file_descriptor, &status)) return false;
   if (status != STATUS_OK) {
@@ -134,6 +136,8 @@ Config *config_receive(int file_descriptor) {
   config->use_sendfile = tmp;
   if (!receive_int(file_descriptor, &tmp)) goto error;
   config->use_delete = tmp;
+  if (!receive_int(file_descriptor, &tmp)) goto error;
+  config->use_incremental = tmp;
   config->show_progress = false;
   config->dry_run = false;
   config->ssh_port = 22;

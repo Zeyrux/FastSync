@@ -50,22 +50,28 @@ bool metadata_send(int file_descriptor, FileMetadata *m) {
          send_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
 }
 
-FileMetadata *metadata_receive(int file_descriptor) {
+FileMetadata *metadata_receive(int file_descriptor, int *ok) {
   int present;
-  if (!receive_n_data(file_descriptor, &present, sizeof(int)))
+  if (!receive_n_data(file_descriptor, &present, sizeof(int))) {
+    if (ok) *ok = 0;
     return NULL;
-  if (!present)
+  }
+  if (!present) {
+    if (ok) *ok = 1;
     return NULL;
+  }
   FileMetadata *m = malloc(sizeof(FileMetadata));
-  if (m == NULL) return NULL;
+  if (m == NULL) { if (ok) *ok = 0; return NULL; }
   if (!receive_n_data(file_descriptor, &m->mode, sizeof(mode_t)) ||
       !receive_n_data(file_descriptor, &m->uid, sizeof(uid_t)) ||
       !receive_n_data(file_descriptor, &m->gid, sizeof(gid_t)) ||
       !receive_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t)) ||
       !receive_n_data(file_descriptor, &m->mtime_nsec, sizeof(long))) {
     free(m);
+    if (ok) *ok = 0;
     return NULL;
   }
+  if (ok) *ok = 1;
   return m;
 }
 

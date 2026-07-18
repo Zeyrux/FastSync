@@ -34,6 +34,7 @@ static void print_usage(void) {
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --max-size <n>      Skip files larger than n bytes\n");
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
+  printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -93,6 +94,8 @@ int main(int argc, char *argv[]) {
       config->max_size = strtoull(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
       config->min_size = strtoull(argv[++i], NULL, 10);
+    } else if (strcmp(argv[i], "--incremental") == 0) {
+      config->use_incremental = true;
     } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
@@ -200,6 +203,16 @@ int main(int argc, char *argv[]) {
   if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
     fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
     return 1;
+  }
+
+  if (config->use_incremental && config->use_chunk_serialization) {
+    fprintf(stderr, "Error: --incremental is not supported with -s (chunk serialization)\n");
+    return 1;
+  }
+
+  if (config->use_incremental && !config->use_metadata) {
+    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
+    config->use_metadata = true;
   }
 
   if (config->use_multithreading)

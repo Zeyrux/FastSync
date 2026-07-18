@@ -1,12 +1,10 @@
 #include "multiprocessing.h"
 #include "array_list.h"
 #include "chunk.h"
-#include "compression.h"
 #include "config.h"
 #include "data.h"
 #include "file.h"
 #include "log.h"
-#include "metadata.h"
 #include "protocol.h"
 #include "queue.h"
 #include "utils.h"
@@ -85,26 +83,8 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver *context) {
 
 static void receive_chunk_enqueue(int file_descriptor,
                                   PipelineContextReceiver *context) {
-  Data *chunk_data = receive_data(file_descriptor);
-  if (chunk_data == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
-    return;
-  }
-  Data *data_to_process = chunk_data;
-  if (context->config->use_compression) {
-    data_to_process = data_decompress(chunk_data);
-    data_destroy(chunk_data);
-    if (data_to_process == NULL) {
-      log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");
-      return;
-    }
-  }
-  Chunk *chunk = chunk_deserialize(data_to_process, context->config->use_metadata);
-  data_destroy(data_to_process);
-  if (chunk == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk, skipping");
-    return;
-  }
+  Chunk *chunk = receive_chunk_data(file_descriptor, context->config);
+  if (chunk == NULL) return;
 
   for (int i = 0; i < chunk->element_count; i++) {
     File *file = chunk->items[i];
@@ -126,8 +106,17 @@ int receive_thread(void *pipeline_context) {
 
   Status status;
   if (!receive_status(file_descriptor, &status)) return thrd_error;
-  while (status == STATUS_NEXT || status == STATUS_CHUNK) {
-    if (status == STATUS_CHUNK) {
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
+    if (status == STATUS_CHECK) {
+      bool skipped;
+      File *file = receive_incremental_check(file_descriptor, config, &skipped);
+      if (!skipped) {
+        if (file == NULL) return thrd_error;
+        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
+                                    &context->condition_not_empty,
+                                    &context->condition_not_full);
+      }
+    } else if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, context);
     } else {
       File *file = file_receive(config, file_descriptor);
@@ -142,22 +131,7 @@ int receive_thread(void *pipeline_context) {
     if (!receive_status(file_descriptor, &status)) return thrd_error;
   }
   if (status == STATUS_MANIFEST) {
-    int count;
-    if (!receive_int(file_descriptor, &count)) return thrd_error;
-    ArrayList *manifest = array_list_create(free);
-    if (manifest) {
-      for (int i = 0; i < count; i++) {
-        char *s = receive_str(file_descriptor);
-        if (s) {
-          array_list_add(manifest, s);
-        }
-      }
-      delete_extras(context->config->receive_root_directory, manifest);
-      for (int i = 0; i < manifest->size; i++)
-        free(manifest->items[i]);
-      array_list_delete(manifest);
-    }
-    if (!receive_status(file_descriptor, &status)) return thrd_error;
+    if (receive_manifest(file_descriptor, config, &status) != 0) return thrd_error;
   }
   mtx_lock(&context->mutex);
   context->receiver_done = true;
@@ -182,14 +156,8 @@ int write_thread(void *pipeline_context) {
       free(root_directory);
       return thrd_success;
     }
-    if (save_to_disk) {
-      char *disk_path = path_cat(root_directory, file->path);
-      if (disk_path) {
-        to_disk(disk_path, file->data->data, file->data->size);
-        file_restore_metadata(disk_path, file->metadata);
-        free(disk_path);
-      }
-    }
+    if (save_to_disk)
+      file_save_to_disk(root_directory, file);
     file_destroy(file);
   }
 }
