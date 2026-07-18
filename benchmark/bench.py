@@ -21,6 +21,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -54,6 +55,59 @@ RSYNC_CONFIGS = [
     {"name": "rsync -z",           "flags": ["-z"],                 "tool": "rsync"},
     {"name": "rsync -z --zstd",    "flags": ["-z", "--zc", "zstd"],"tool": "rsync"},
 ]
+
+class RsyncDaemon:
+    """Manages an rsync daemon for network-fair benchmarking."""
+
+    def __init__(self):
+        self._proc = None
+        self._port = None
+        self._conf_dir = None
+        self._module_path = None
+
+    def start(self, source_dir):
+        self._port = find_free_port()
+        self._conf_dir = tempfile.mkdtemp(prefix="rsyncd_")
+        self._module_path = source_dir
+
+        conf_path = os.path.join(self._conf_dir, "rsyncd.conf")
+        log_path = os.path.join(self._conf_dir, "rsyncd.log")
+
+        with open(conf_path, "w") as f:
+            f.write(f"uid = 0\ngid = 0\nuse chroot = no\nlog file = {log_path}\n")
+            f.write(f"[bench]\n\tpath = {source_dir}\n\tread only = yes\n")
+
+        self._proc = subprocess.Popen(
+            ["rsync", "--daemon", "--no-detach",
+             "--port", str(self._port),
+             "--config", conf_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        wait_for_port(self._port, timeout=5)
+
+    def stop(self):
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+            self._proc = None
+        if self._conf_dir:
+            shutil.rmtree(self._conf_dir, ignore_errors=True)
+            self._conf_dir = None
+
+    @property
+    def source_url(self):
+        return f"rsync://127.0.0.1:{self._port}/bench/"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
 
 STRUCTURED_FILES = {
     "small.txt": b"hello world\n",
@@ -170,9 +224,11 @@ def run_fastsync(source_dir, dest_dir, flags, port):
     return None
 
 
-def run_rsync(source_dir, dest_dir, flags):
+def run_rsync(source_dir, dest_dir, flags, rsync_daemon=None):
     """Run rsync. Returns duration or None."""
     src = source_dir.rstrip("/") + "/"
+    if rsync_daemon:
+        src = rsync_daemon.source_url
     cmd = ["rsync", "-a", "--delete"] + flags + [src, dest_dir + "/"]
     try:
         start = time.monotonic()
@@ -185,10 +241,10 @@ def run_rsync(source_dir, dest_dir, flags):
     return None
 
 
-def run_transfer(config, source_dir, dest_dir, port=None):
+def run_transfer(config, source_dir, dest_dir, port=None, rsync_daemon=None):
     """Route to the right tool. Returns duration or None."""
     if config["tool"] == "rsync":
-        return run_rsync(source_dir, dest_dir, config["flags"])
+        return run_rsync(source_dir, dest_dir, config["flags"], rsync_daemon)
     else:
         return run_fastsync(source_dir, dest_dir, config["flags"], port)
 
@@ -196,10 +252,16 @@ def run_transfer(config, source_dir, dest_dir, port=None):
 def run_benchmark(source_dir, dest_dir, configs, runs, profile_name):
     """Run benchmark for all configs, returns list of results."""
     is_limited = profile_name != "unlimited"
+    has_rsync = any(c["tool"] == "rsync" for c in configs)
     if is_limited:
         netem_apply_profile(profile_name)
 
+    rsync_daemon = None
     try:
+        if is_limited and has_rsync:
+            rsync_daemon = RsyncDaemon()
+            rsync_daemon.start(source_dir)
+
         results = []
         for config in configs:
             times = []
@@ -218,7 +280,7 @@ def run_benchmark(source_dir, dest_dir, configs, runs, profile_name):
                         )
                         wait_for_port(port)
 
-                    t = run_transfer(config, source_dir, dest_dir, port)
+                    t = run_transfer(config, source_dir, dest_dir, port, rsync_daemon)
                     if t is not None:
                         times.append(t)
                 finally:
@@ -241,6 +303,8 @@ def run_benchmark(source_dir, dest_dir, configs, runs, profile_name):
             results.append(entry)
         return results
     finally:
+        if rsync_daemon:
+            rsync_daemon.stop()
         if is_limited:
             netem_reset()
 
