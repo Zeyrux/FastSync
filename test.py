@@ -569,19 +569,26 @@ def check_ssh_localhost():
     build_dir = os.path.abspath("build")
     server_path = os.path.join(build_dir, "server")
 
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                        "localhost", "which", "fastsync-server"],
-                       capture_output=True, timeout=10)
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                            "localhost", "which", "fastsync-server"],
+                           capture_output=True, timeout=10)
+    except FileNotFoundError:
+        SSH_AVAILABLE = False
+        return
     if r.returncode == 0:
         SSH_AVAILABLE = True
         return
 
     SSH_AVAILABLE = False
     # Try each PATH dir: create symlink, then verify with which
-    r = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "localhost",
-         'echo "$PATH"'],
-        capture_output=True, timeout=10, text=True)
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "localhost",
+             'echo "$PATH"'],
+            capture_output=True, timeout=10, text=True)
+    except FileNotFoundError:
+        return
     if r.returncode != 0:
         return
     for d in r.stdout.strip().split(":"):
