@@ -165,7 +165,7 @@ def run_benchmark(source_dir, dest_dir, configs, runs, profile_name):
                 port = find_free_port()
                 server = subprocess.Popen(
                     SERVER_CMD + ["-p", str(port)],
-                    stdout=subprocess.DEVNULL, stderr=None,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 try:
                     wait_for_port(port)
