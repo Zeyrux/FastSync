@@ -175,6 +175,77 @@ bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, 
   return true;
 }
 
+bool file_save_to_disk(const char *root_directory, File *file) {
+  char *disk_path = path_cat((char *)root_directory, file->path);
+  if (disk_path == NULL) return false;
+  bool ok = to_disk(disk_path, file->data->data, file->data->size);
+  if (ok) file_restore_metadata(disk_path, file->metadata);
+  free(disk_path);
+  return ok;
+}
+
+File *receive_incremental_check(int fd, Config *config, bool *skipped) {
+  *skipped = false;
+  char *check_path = receive_str(fd);
+  if (check_path == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
+
+  unsigned long long check_size;
+  long long check_mtime;
+  if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
+      !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
+  char *full_path = path_cat(config->receive_root_directory, check_path);
+  struct stat st;
+  bool match = false;
+  if (full_path && stat(full_path, &st) == 0 &&
+      (unsigned long long)st.st_size == check_size &&
+      (long long)st.st_mtime == check_mtime) {
+    match = true;
+  }
+  free(full_path);
+
+  if (match) {
+    if (!send_status(fd, STATUS_OK)) { free(check_path); return NULL; }
+    free(check_path);
+    *skipped = true;
+    return NULL;
+  }
+
+  if (!send_status(fd, STATUS_NEXT)) { free(check_path); return NULL; }
+
+  File *file = file_create(check_path);
+  free(check_path);
+  if (file == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
+
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok) { file_destroy(file); send_status(fd, STATUS_ERROR); return NULL; }
+  }
+
+  Data *file_data = receive_data(fd);
+  if (file_data == NULL) {
+    file_destroy(file);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
+  if (config->use_compression) {
+    Data *uncompressed = data_decompress(file_data);
+    data_destroy(file_data);
+    if (uncompressed == NULL) { file_destroy(file); send_status(fd, STATUS_ERROR); return NULL; }
+    file_data = uncompressed;
+  }
+
+  data_destroy(file->data);
+  file->data = file_data;
+  return file;
+}
+
 bool to_disk(const char *path, const void *data, unsigned long long data_size) {
   char *directory = str_dup(path);
   char *dir_to_free = directory;
