@@ -57,11 +57,11 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
         int rc = incremental_check(client, chunk->items[i]);
         if (rc < 0) return -1;
         if (rc > 0) continue;
-        if (!file_send_sendfile_no_path(chunk->items[i], client->file_descriptor, config->use_metadata))
+        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata, false))
           return -1;
       } else {
         if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
-        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata))
+        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata, true))
           return -1;
       }
     }
@@ -71,15 +71,17 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
         int rc = incremental_check(client, chunk->items[i]);
         if (rc < 0) return -1;
         if (rc > 0) continue;
-        if (!file_send_single_calls_no_path(chunk->items[i], client->file_descriptor,
-                                       config->use_metadata,
-                                       config->use_compression ? config->compression_level : 0))
+        if (!file_send_single_calls(chunk->items[i], client->file_descriptor,
+                                   config->use_metadata,
+                                   config->use_compression ? config->compression_level : 0,
+                                   false))
           return -1;
       } else {
         if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
         if (!file_send_single_calls(chunk->items[i], client->file_descriptor,
                                config->use_metadata,
-                               config->use_compression ? config->compression_level : 0))
+                               config->use_compression ? config->compression_level : 0,
+                               true))
           return -1;
       }
     }

@@ -96,7 +96,7 @@ bool file_load_data(File *file) {
   return true;
 }
 
-bool file_send_single_calls_no_path(File *file, int file_descriptor, bool use_metadata, int compression_level) {
+bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level, bool send_path) {
   Data *data_to_send = file->data;
   Data *compressed_data = NULL;
   if (compression_level > 0) {
@@ -107,59 +107,7 @@ bool file_send_single_calls_no_path(File *file, int file_descriptor, bool use_me
     }
     data_to_send = compressed_data;
   }
-  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) {
-    data_destroy(compressed_data);
-    return false;
-  }
-  if (!send_data(file_descriptor, data_to_send)) {
-    data_destroy(compressed_data);
-    return false;
-  }
-  data_destroy(compressed_data);
-  return true;
-}
-
-bool file_send_sendfile_no_path(File *file, int file_descriptor, bool use_metadata) {
-  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
-
-  int fd = open(file->path, O_RDONLY);
-  if (fd == -1) {
-    perror("Could not open file for sendfile");
-    return false;
-  }
-
-  unsigned long long file_size = file->data->size;
-  if (!send_n_data(file_descriptor, &file_size, sizeof(unsigned long long))) {
-    close(fd);
-    return false;
-  }
-
-  off_t offset = 0;
-  while (offset < file_size) {
-    ssize_t sent = sendfile(file_descriptor, fd, &offset, file_size - offset);
-    if (sent == -1) {
-      perror("sendfile failed");
-      close(fd);
-      return false;
-    }
-  }
-
-  close(fd);
-  return true;
-}
-
-bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level) {
-  Data *data_to_send = file->data;
-  Data *compressed_data = NULL;
-  if (compression_level > 0) {
-    compressed_data = data_compress(file->data, compression_level);
-    if (compressed_data == NULL) {
-      log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
-      return false;
-    }
-    data_to_send = compressed_data;
-  }
-  if (!send_str(file_descriptor, file->path)) {
+  if (send_path && !send_str(file_descriptor, file->path)) {
     data_destroy(compressed_data);
     return false;
   }
@@ -270,8 +218,8 @@ bool to_disk(const char *path, const void *data, unsigned long long data_size) {
   return true;
 }
 
-bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata) {
-  if (!send_str(file_descriptor, file->path)) return false;
+bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata, bool send_path) {
+  if (send_path && !send_str(file_descriptor, file->path)) return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
 
   int fd = open(file->path, O_RDONLY);
