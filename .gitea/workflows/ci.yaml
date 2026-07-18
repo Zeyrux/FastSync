@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v4
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v5
     steps:
       - name: Checkout
         uses: actions/checkout@v4

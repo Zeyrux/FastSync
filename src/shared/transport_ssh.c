@@ -143,5 +143,7 @@ Client *client_connect_ssh(char *destination, int port) {
   client->address.sin_family = AF_UNIX;
   client->address_length = 0;
   client->ssh_child_pid = pid;
+  client->ssl = NULL;
+  client->ssl_ctx = NULL;
   return client;
 }

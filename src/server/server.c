@@ -8,6 +8,7 @@
 #include "protocol.h"
 #include "queue.h"
 #include "transport_tcp.h"
+#include "transport_tls.h"
 #include "unistd.h"
 #include "utils.h"
 #include <signal.h>
@@ -118,24 +119,88 @@ static void cleanup(int sig) {
   _exit(0);
 }
 
+static void print_server_usage(void) {
+  printf("FastSync Server\n");
+  printf("Usage: fastsync-server [options]\n");
+  printf("\n");
+  printf("Options:\n");
+  printf("  --stdio             Run in stdio mode (SSH transport)\n");
+  printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
+  printf("  --tls               Enable TLS encryption\n");
+  printf("  --cert <path>       TLS certificate file (PEM)\n");
+  printf("  --key <path>        TLS private key file (PEM)\n");
+  printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  -v, --verbose       Enable debug logging\n");
+  printf("  --help              Show this help\n");
+}
+
 int main(int argc, char *argv[]) {
+  bool use_tls = false;
+  char *tls_cert = NULL;
+  char *tls_key = NULL;
+  char *tls_ca = NULL;
+  int port = 8080;
+
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--stdio") == 0) {
+    if (strcmp(argv[i], "--help") == 0) {
+      print_server_usage();
+      return 0;
+    } else if (strcmp(argv[i], "--stdio") == 0) {
       io_set_fds(STDIN_FILENO, STDOUT_FILENO);
       handler(STDIN_FILENO);
       return 0;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
+    } else if (strcmp(argv[i], "--tls") == 0) {
+      use_tls = true;
+    } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
+      tls_cert = argv[++i];
+    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
+      tls_key = argv[++i];
+    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
+      tls_ca = argv[++i];
+    } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+      char *end;
+      long p = strtol(argv[++i], &end, 10);
+      if (*end || p <= 0 || p > 65535) {
+        fprintf(stderr, "Error: invalid port '%s' (must be 1-65535)\n", argv[i]);
+        return 1;
+      }
+      port = (int)p;
+    } else if (argv[i][0] == '-') {
+      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      print_server_usage();
+      return 1;
     }
   }
+
+  if (tls_ca && !use_tls) {
+    log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
+  }
+
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
-  g_server = server_create(8080);
+  g_server = server_create(port);
   if (g_server == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
     return 1;
   }
-  server_listen(g_server, handler);
+  if (use_tls) {
+    if (!tls_cert || !tls_key) {
+      fprintf(stderr, "Error: --tls requires --cert and --key\n");
+      server_delete(&g_server);
+      return 1;
+    }
+    tls_global_init();
+    if (!server_create_tls(g_server, tls_cert, tls_key, tls_ca)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
+      server_delete(&g_server);
+      return 1;
+    }
+    server_listen_tls(g_server, handler);
+  } else {
+    server_listen(g_server, handler);
+  }
   return 0;
 }

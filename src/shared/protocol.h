@@ -5,11 +5,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+typedef struct ssl_st SSL;
+
 typedef int Status;
 enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK, STATUS_MANIFEST, STATUS_CHECK };
 
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
+typedef struct ssl_st SSL;
+void io_set_ssl(SSL *ssl);
 bool send_n_data(int file_descriptor, void *data, size_t data_size);
 bool receive_n_data(int file_descriptor, void *data, size_t data_size);
 
