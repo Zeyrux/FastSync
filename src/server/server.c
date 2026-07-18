@@ -1,6 +1,5 @@
 #include "array_list.h"
 #include "chunk.h"
-#include "compression.h"
 #include "config.h"
 #include "data.h"
 #include "file.h"
@@ -16,53 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int receive_chunk(int fd, Config *config) {
-  Data *chunk_data = receive_data(fd);
-  if (chunk_data == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
-    return -1;
-  }
-  Data *data_to_process = chunk_data;
-  if (config->use_compression) {
-    data_to_process = data_decompress(chunk_data);
-    data_destroy(chunk_data);
-    if (data_to_process == NULL) {
-      log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");
-      return -1;
-    }
-  }
-  Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
-  data_destroy(data_to_process);
-  if (chunk == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk, skipping");
-    return -1;
-  }
-
-  for (int i = 0; i < chunk->element_count; i++) {
-    if (config->save_to_disk)
-      file_save_to_disk(config->receive_root_directory, chunk->items[i]);
-  }
-  chunk_destroy(chunk);
-  return 0;
-}
-
-static int receive_manifest(int fd, Config *config, Status *next_status) {
-  int count;
-  if (!receive_int(fd, &count)) return -1;
-  ArrayList *manifest = array_list_create(free);
-  if (manifest) {
-    for (int i = 0; i < count; i++) {
-      char *s = receive_str(fd);
-      if (s) array_list_add(manifest, s);
-    }
-    fprintf(stderr, "Deleting files not in manifest...\n");
-    delete_extras(config->receive_root_directory, manifest);
-    array_list_delete(manifest);
-  }
-  if (!receive_status(fd, next_status)) return -1;
-  return 0;
-}
-
 int receive_files(Config *config, int fd) {
   Status status;
   if (!receive_status(fd, &status)) return -1;
@@ -77,10 +29,16 @@ int receive_files(Config *config, int fd) {
         file_save_to_disk(config->receive_root_directory, file);
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
-      if (receive_chunk(fd, config) != 0) {
+      Chunk *chunk = receive_chunk_data(fd, config);
+      if (chunk == NULL) {
         send_status(fd, STATUS_ERROR);
         return -1;
       }
+      for (int i = 0; i < chunk->element_count; i++) {
+        if (config->save_to_disk)
+          file_save_to_disk(config->receive_root_directory, chunk->items[i]);
+      }
+      chunk_destroy(chunk);
     } else {
       File *file = file_receive(config, fd);
       if (file == NULL) {

@@ -184,8 +184,7 @@ bool file_save_to_disk(const char *root_directory, File *file) {
   return ok;
 }
 
-File *receive_incremental_check(int fd, Config *config, bool *skipped) {
-  *skipped = false;
+File *receive_incremental_check(int fd, Config *config, bool *skipped) {  *skipped = false;
   char *check_path = receive_str(fd);
   if (check_path == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
 
@@ -346,6 +345,23 @@ size_t file_content_to_buffer(File *file) {
   }
   fclose(file_pointer);
   return bytes_read;
+}
+
+int receive_manifest(int fd, Config *config, int *next_status) {
+  int count;
+  if (!receive_int(fd, &count)) return -1;
+  ArrayList *manifest = array_list_create(free);
+  if (manifest) {
+    for (int i = 0; i < count; i++) {
+      char *s = receive_str(fd);
+      if (s) array_list_add(manifest, s);
+    }
+    fprintf(stderr, "Deleting files not in manifest...\n");
+    delete_extras(config->receive_root_directory, manifest);
+    array_list_delete(manifest);
+  }
+  if (!receive_status(fd, next_status)) return -1;
+  return 0;
 }
 
 

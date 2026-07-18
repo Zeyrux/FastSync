@@ -10,6 +10,7 @@
 #include "file.h"
 #include "log.h"
 #include "metadata.h"
+#include "protocol.h"
 
 Chunk *chunk_create(File **items, int element_count) {
   Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
@@ -176,6 +177,28 @@ Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata) {
   if (compressed == NULL) return NULL;
   log_message(LOG_LEVEL_DEBUG, "Chunk successfully compressed");
   return compressed;
+}
+
+Chunk *receive_chunk_data(int fd, Config *config) {
+  Data *chunk_data = receive_data(fd);
+  if (chunk_data == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
+    return NULL;
+  }
+  Data *data_to_process = chunk_data;
+  if (config->use_compression) {
+    data_to_process = data_decompress(chunk_data);
+    data_destroy(chunk_data);
+    if (data_to_process == NULL) {
+      log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");
+      return NULL;
+    }
+  }
+  Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
+  data_destroy(data_to_process);
+  if (chunk == NULL)
+    log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk, skipping");
+  return chunk;
 }
 
 
