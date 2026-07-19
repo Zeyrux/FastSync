@@ -53,6 +53,9 @@ jobs:
       - name: Build
         run: cmake --build build-${{ matrix.sanitizer }} -j$(nproc)
 
+      - name: Symlink for integration tests
+        run: ln -sf build-${{ matrix.sanitizer }} build
+
       - name: Unit Tests
         run: ./build-${{ matrix.sanitizer }}/tests
 
