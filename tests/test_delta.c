@@ -307,6 +307,7 @@ static void test_large_file_delta() {
     else
       match_count++;
   }
+  EXPECT_TRUE(total_literal > 0);
   EXPECT_TRUE(match_count > 0);
   EXPECT_TRUE(delta->delta_size < new_size / 2);
 

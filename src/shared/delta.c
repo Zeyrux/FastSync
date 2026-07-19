@@ -422,7 +422,7 @@ void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
     return NULL;
 
   uint8_t* out = (uint8_t*)output;
-  uint8_t* old = (uint8_t*)old_data;
+  const uint8_t* old = (const uint8_t*)old_data;
   uint64_t out_pos = 0;
 
   for (uint32_t i = 0; i < delta->instruction_count; i++) {
