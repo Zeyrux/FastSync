@@ -118,6 +118,39 @@ STRUCTURED_FILES = {
 }
 
 
+class Progress:
+    """Simple progress bar with ETA."""
+
+    def __init__(self, total, label="Progress"):
+        self.total = total
+        self.current = 0
+        self.label = label
+        self.start_time = time.monotonic()
+        self._print()
+
+    def tick(self, detail=""):
+        self.current += 1
+        self._print(detail)
+
+    def _print(self, detail=""):
+        elapsed = time.monotonic() - self.start_time
+        if self.current > 0:
+            eta = elapsed / self.current * (self.total - self.current)
+            eta_str = f"ETA {eta:.0f}s"
+        else:
+            eta_str = "ETA ..."
+        pct = self.current / self.total * 100 if self.total else 0
+        bar_len = 30
+        filled = int(bar_len * self.current / self.total) if self.total else 0
+        bar = "#" * filled + "-" * (bar_len - filled)
+        detail_str = f"  {detail}" if detail else ""
+        sys.stderr.write(f"\r  [{bar}] {pct:5.1f}%  {self.current}/{self.total}  {eta_str}{detail_str}  ")
+        sys.stderr.flush()
+        if self.current >= self.total:
+            sys.stderr.write(f"\r  [{'#' * bar_len}] 100.0%  {self.total}/{self.total}  done in {elapsed:.1f}s" + " " * 30 + "\n")
+            sys.stderr.flush()
+
+
 def generate_bench_data(source_dir, size_mb=25, random_ratio=0.75):
     """Generate test data. ~random_ratio is incompressible, rest is structured."""
     if os.path.exists(source_dir):
@@ -249,7 +282,7 @@ def run_transfer(config, source_dir, dest_dir, port=None, rsync_daemon=None):
         return run_fastsync(source_dir, dest_dir, config["flags"], port)
 
 
-def run_benchmark(source_dir, dest_dir, configs, runs, profile_name):
+def run_benchmark(source_dir, dest_dir, configs, runs, profile_name, progress=None):
     """Run benchmark for all configs, returns list of results."""
     is_limited = profile_name != "unlimited"
     has_rsync = any(c["tool"] == "rsync" for c in configs)
@@ -286,6 +319,9 @@ def run_benchmark(source_dir, dest_dir, configs, runs, profile_name):
                 finally:
                     if server:
                         wait_proc(server)
+
+                if progress:
+                    progress.tick(f"{config['name']} (run {run_idx+1}/{runs})")
 
             entry = {
                 "config": config["name"],
@@ -404,6 +440,8 @@ Examples:
                         help="Custom packet loss (e.g. 1%%)")
     parser.add_argument("--no-rsync", action="store_true",
                         help="Skip rsync comparison")
+    parser.add_argument("--progress", action="store_true",
+                        help="Show progress bar with ETA")
     parser.add_argument("--output", choices=["table", "json"], default="table",
                         help="Output format")
     parser.add_argument("--keep-data", action="store_true",
@@ -455,10 +493,15 @@ Examples:
         configs += RSYNC_CONFIGS
 
     # Run benchmarks
+    total_runs = len(configs) * args.runs * len(profiles_to_run)
+    progress = Progress(total_runs, "Benchmarking") if args.progress else None
+    if progress:
+        print(f"Running {total_runs} transfers...")
+
     all_results = []
     try:
         for profile in profiles_to_run:
-            results = run_benchmark(source_dir, dest_dir, configs, args.runs, profile)
+            results = run_benchmark(source_dir, dest_dir, configs, args.runs, profile, progress)
             all_results.extend(results)
     finally:
         if not args.keep_data:
