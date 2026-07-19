@@ -69,6 +69,7 @@ tests/         — test sources (globbed as TEST_SRCS)
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
 - Sanitizer support is commented out but present (`-fsanitize=address`).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.
+- Install dependencies only via the project's custom Docker image (repo-root `Dockerfile`, same image CI uses) — never via host package installs; see `AGENTS.md`.
 
 ## When Making Changes
 
