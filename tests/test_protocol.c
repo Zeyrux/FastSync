@@ -163,7 +163,7 @@ static void test_receive_str_truncated() {
   io_set_bwlimit(0);
   close(p[1]);
 
-  char* received = receive_str(0);
+  const char* received = receive_str(0);
   EXPECT_NULL(received);
 
   close(p[0]);

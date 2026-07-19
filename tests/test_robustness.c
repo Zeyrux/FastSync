@@ -30,7 +30,7 @@ static void test_chunk_deserialize_truncated() {
   size_t orig_size = serialized->size;
   serialized->size = orig_size / 2;
 
-  Chunk* result = chunk_deserialize(serialized, false);
+  const Chunk* result = chunk_deserialize(serialized, false);
   EXPECT_NULL(result);
 
   serialized->size = orig_size;
@@ -45,7 +45,7 @@ static void test_chunk_deserialize_empty() {
   EXPECT_NOT_NULL(d);
   memcpy(d->data, garbage, sizeof(garbage));
 
-  Chunk* result = chunk_deserialize(d, false);
+  const Chunk* result = chunk_deserialize(d, false);
   EXPECT_NULL(result);
 
   data_destroy(d);
@@ -57,7 +57,7 @@ static void test_chunk_deserialize_garbage() {
   EXPECT_NOT_NULL(d);
   memcpy(d->data, garbage, sizeof(garbage));
 
-  Chunk* result = chunk_deserialize(d, false);
+  const Chunk* result = chunk_deserialize(d, false);
   EXPECT_NULL(result);
 
   data_destroy(d);
@@ -77,7 +77,7 @@ static void test_delta_deserialize_truncated() {
   EXPECT_NOT_NULL(serialized);
 
   serialized->size = 4;
-  Delta* result = delta_deserialize(serialized);
+  const Delta* result = delta_deserialize(serialized);
   EXPECT_NULL(result);
 
   data_destroy(serialized);
@@ -91,7 +91,7 @@ static void test_delta_deserialize_empty() {
   EXPECT_NOT_NULL(d);
   memcpy(d->data, garbage, sizeof(garbage));
 
-  Delta* result = delta_deserialize(d);
+  const Delta* result = delta_deserialize(d);
   EXPECT_NULL(result);
 
   data_destroy(d);
@@ -103,7 +103,7 @@ static void test_delta_deserialize_garbage() {
   EXPECT_NOT_NULL(d);
   memcpy(d->data, garbage, sizeof(garbage));
 
-  Delta* result = delta_deserialize(d);
+  const Delta* result = delta_deserialize(d);
   EXPECT_NULL(result);
 
   data_destroy(d);
@@ -119,7 +119,7 @@ static void test_delta_signature_deserialize_truncated() {
   EXPECT_NOT_NULL(serialized);
 
   serialized->size = 4;
-  DeltaSignature* result = delta_signature_deserialize(serialized);
+  const DeltaSignature* result = delta_signature_deserialize(serialized);
   EXPECT_NULL(result);
 
   data_destroy(serialized);
@@ -127,7 +127,7 @@ static void test_delta_signature_deserialize_truncated() {
 }
 
 static void test_delta_apply_null() {
-  void* result = delta_apply(NULL, 0, NULL, 0);
+  const void* result = delta_apply(NULL, 0, NULL, 0);
   EXPECT_NULL(result);
 }
 
@@ -151,7 +151,7 @@ static void test_receive_data_closed_pipe() {
   io_set_bwlimit(0);
   close(p[1]);
 
-  Data* result = receive_data(0);
+  const Data* result = receive_data(0);
   EXPECT_NULL(result);
 
   close(p[0]);
@@ -164,7 +164,7 @@ static void test_receive_str_closed_pipe() {
   io_set_bwlimit(0);
   close(p[1]);
 
-  char* result = receive_str(0);
+  const char* result = receive_str(0);
   EXPECT_NULL(result);
 
   close(p[0]);

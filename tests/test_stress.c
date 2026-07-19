@@ -24,15 +24,6 @@ typedef struct {
   mtx_t* mutex;
   cnd_t* cnd_empty;
   cnd_t* cnd_full;
-  volatile bool* done;
-  int sum;
-} ConsumerCtx;
-
-typedef struct {
-  Queue* q;
-  mtx_t* mutex;
-  cnd_t* cnd_empty;
-  cnd_t* cnd_full;
   volatile int* producers_remaining;
   volatile bool* producers_done;
 } ConsumerMPMC;

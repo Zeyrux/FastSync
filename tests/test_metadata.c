@@ -55,7 +55,7 @@ static void test_metadata_from_buf_null() {
   memcpy(buf, &present, sizeof(int));
 
   char* read_ptr = buf;
-  FileMetadata* result = metadata_from_buf(&read_ptr);
+  const FileMetadata* result = metadata_from_buf(&read_ptr);
 
   EXPECT_NULL(result);
 
@@ -101,7 +101,7 @@ static void test_metadata_send_null() {
   EXPECT_TRUE(metadata_send(p[1], NULL));
 
   int ok = 0;
-  FileMetadata* received = metadata_receive(p[0], &ok);
+  const FileMetadata* received = metadata_receive(p[0], &ok);
   EXPECT_NULL(received);
   EXPECT_EQ_INT(ok, 1);
 
