@@ -99,7 +99,7 @@ int receive_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
   mtx_lock(&context->mutex);
   int file_descriptor = context->file_descriptor;
-  Config* config = context->config;
+  const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
   Status status;
