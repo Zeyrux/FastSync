@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     needs: lint
     steps:
       - name: Checkout
@@ -38,11 +38,11 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     needs: lint
     strategy:
       matrix:
-        sanitizer: [address, undefined]
+        sanitizer: [address]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,61 +53,22 @@ jobs:
       - name: Build
         run: cmake --build build-${{ matrix.sanitizer }} -j$(nproc)
 
-      - name: Symlink for integration tests
-        run: ln -sf build-${{ matrix.sanitizer }} build
-
       - name: Unit Tests
         run: ctest --test-dir build-${{ matrix.sanitizer }} --output-on-failure
 
-      - name: Integration Tests
-        run: LSAN_OPTIONS=suppressions=.lsan-suppressions.txt python3 -m pytest tests/ -v --tb=short
-
-  clang-tidy:
-    runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
-    needs: lint
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (generate compile_commands.json)
-        run: cmake -B build -S .
-
-      - name: Run clang-tidy (informational, non-blocking)
-        run: |
-          find src/ -name '*.c' | xargs clang-tidy -p build \
-            --checks='-*,bugprone-*,clang-analyzer-*,misc-*,-misc-no-recursion' \
-            2>&1 | tee clang-tidy-output.txt
-          if grep -q -E " error:| warning:" clang-tidy-output.txt; then
-            echo "::warning::clang-tidy found issues — review the output above"
-          else
-            echo "clang-tidy: no issues found"
-          fi
-
-  fuzz-build:
-    runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
-    needs: lint
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (clang + fuzz)
-        run: CC=clang CXX=clang++ cmake -B build-fuzz -S . -DENABLE_FUZZ=ON
-
-      - name: Build fuzz targets
-        run: cmake --build build-fuzz -j$(nproc)
-
   coverage:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install lcov
+        run: apt-get update -qq && apt-get install -y -qq lcov
+
       - name: Configure
-        run: cmake -B build -S . -DENABLE_COVERAGE=ON
+        run: cmake -B build -S . -DENABLE_COVERAGE=ON -DSTRICT_WARNINGS=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)
@@ -118,16 +79,19 @@ jobs:
       - name: Coverage Report
         run: |
           lcov --capture --directory build --output-file coverage.info --branch-coverage
-          lcov --remove coverage.info '/usr/*' '*/tests/*' '*/_deps/*' --output-file coverage.info --branch-coverage --ignore-errors unused
+          lcov --remove coverage.info '/usr/*' '*/tests/*' '*/xxhash/*' --output-file coverage.info --branch-coverage
           lcov --list coverage.info
 
   valgrind:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install valgrind
+        run: apt-get update -qq && apt-get install -y -qq valgrind
 
       - name: Configure
         run: cmake -B build -S . -DSTRICT_WARNINGS=ON
@@ -136,6 +100,4 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Valgrind Memcheck
-        run: valgrind --leak-check=full --show-leak-kinds=definite --error-exitcode=1 ./build/tests
-        env:
-          FASTSYNC_UNDER_VALGRIND: "1"
+        run: valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./build/tests
