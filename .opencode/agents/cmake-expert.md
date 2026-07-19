@@ -31,6 +31,8 @@ if(SANITIZER STREQUAL "address")
 elseif(SANITIZER STREQUAL "thread")
   add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=thread)
+elseif(NOT SANITIZER STREQUAL "none")
+  message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, none")
 endif()
 
 option(STRICT_WARNINGS "Enable strict warnings" OFF)
@@ -47,7 +49,7 @@ find_package(Threads REQUIRED)
 
 find_library(ZSTD_LIBRARY zstd)
 if(NOT ZSTD_LIBRARY)
-  message(FATAL_ERROR "zstd library not found")
+  message(FATAL_ERROR "zstd library not found. Ensure it is in your nix-shell!")
 endif()
 find_package(OpenSSL REQUIRED)
 
@@ -80,13 +82,15 @@ tests/         — test sources (globbed as TEST_SRCS)
 ### Dependencies
 - **zstd** — found via `find_library(ZSTD_LIBRARY zstd)`
 - **pthreads** — found via `find_package(Threads REQUIRED)`
+- **OpenSSL** — found via `find_package(OpenSSL REQUIRED)`
+- **xxhash** — fetched via `FetchContent` from GitHub (v0.8.3)
 - **C11 standard** — required
 - **CMake 3.22+** — minimum version
 
 ## Conventions
 
 - Use `file(GLOB ...)` for source collection (existing pattern).
-- All targets link `Threads::Threads` and `${ZSTD_LIBRARY}`.
+- All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
 - Sanitizer support: pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (live option in CMakeLists.txt).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.
@@ -104,35 +108,20 @@ tests/         — test sources (globbed as TEST_SRCS)
 
 ## Sanitizer Configurations
 
-### AddressSanitizer (memory errors)
+Use the project's built-in `-DSANITIZER=` option (matching the CI matrix):
 ```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake -B build -S . -DSANITIZER=address   # AddressSanitizer (memory errors)
+cmake --build build -j$(nproc)
+
+cmake -B build -S . -DSANITIZER=thread    # ThreadSanitizer (race conditions)
 cmake --build build -j$(nproc)
 ```
 
-### ThreadSanitizer (race conditions)
-```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
-cmake --build build -j$(nproc)
-```
-
-### UndefinedBehaviorSanitizer
+For UndefinedBehaviorSanitizer (no `-DSANITIZER=undefined` option in CMakeLists.txt yet), use the manual flag approach:
 ```bash
 cmake -B build -S . \
   -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
-cmake --build build -j$(nproc)
-```
-
-### Combined Sanitizers
-```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 cmake --build build -j$(nproc)
 ```
 

@@ -14,6 +14,8 @@ docker pull gitea.tap-tap.win/taptap/fastsync-ci:v7
 docker tag gitea.tap-tap.win/taptap/fastsync-ci:v7 fastsync-ci:local
 
 # Or build the image from the repo-root Dockerfile
+# (Note: the prebuilt :v7 image reflects the previous Dockerfile state;
+#  rebuild from source to pick up any newly added packages like lcov/valgrind.)
 docker build -t fastsync-ci:local .
 
 # Build, run unit tests, and run integration tests inside the container
@@ -39,7 +41,7 @@ cmake -B build -S . -DSANITIZER=address           # AddressSanitizer (ASan)
 cmake -B build -S . -DSANITIZER=thread            # ThreadSanitizer (TSan)
 ```
 
-The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), build + test (unit + integration), and sanitizer jobs sequentially.
+The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), build + test (unit + integration), and sanitizer (currently only `address`) jobs sequentially.
 
 ## Build
 
