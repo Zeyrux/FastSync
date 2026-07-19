@@ -5,13 +5,10 @@ on: [push, pull_request]
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v6
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install lint tools
-        run: apt-get update && apt-get install -y cppcheck clang-format
 
       - name: clang-format check
         run: clang-format --dry-run --Werror src/ tests/
@@ -21,7 +18,7 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v6
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     needs: lint
     steps:
       - name: Checkout
@@ -41,7 +38,7 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v6
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     needs: lint
     strategy:
       matrix:
