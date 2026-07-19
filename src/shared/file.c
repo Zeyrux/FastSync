@@ -136,7 +136,7 @@ bool file_save_to_disk(const char* root_directory, File* file) {
   return ok;
 }
 
-File* receive_incremental_check(int fd, Config* config, bool* skipped) {
+File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   *skipped = false;
   char* check_path = receive_str(fd);
   if (check_path == NULL) {

@@ -32,7 +32,7 @@ FileMetadata* file_metadata_create(const struct stat* stats);
 void file_metadata_destroy(void* metadata);
 bool to_disk(const char* path, const void* data, unsigned long long data_size);
 bool file_save_to_disk(const char* root_directory, File* file);
-File* receive_incremental_check(int fd, Config* config, bool* skipped);
+File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 int receive_manifest(int fd, const Config* config, int* next_status);
 
 #endif
