@@ -158,5 +158,6 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
 
   if (chunk_data->size > 0)
     return chunk_data_to_chunk(chunk_data);
+  array_list_delete(chunk_data);
   return NULL;
 }
