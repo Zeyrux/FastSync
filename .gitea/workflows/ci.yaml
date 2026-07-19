@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
     needs: lint
     steps:
       - name: Checkout
@@ -38,7 +38,7 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
     needs: lint
     strategy:
       matrix:
@@ -58,14 +58,11 @@ jobs:
 
   fuzz-build:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
     needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install clang
-        run: apt-get update -qq && apt-get install -y -qq clang
 
       - name: Configure (clang + fuzz)
         run: CC=clang CXX=clang++ cmake -B build-fuzz -S . -DENABLE_FUZZ=ON
@@ -75,14 +72,11 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
     needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install lcov
-        run: apt-get update -qq && apt-get install -y -qq lcov
 
       - name: Configure
         run: cmake -B build -S . -DENABLE_COVERAGE=ON -DSTRICT_WARNINGS=ON
@@ -101,14 +95,11 @@ jobs:
 
   valgrind:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
     needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install valgrind
-        run: apt-get update -qq && apt-get install -y -qq valgrind
 
       - name: Configure
         run: cmake -B build -S . -DSTRICT_WARNINGS=ON
