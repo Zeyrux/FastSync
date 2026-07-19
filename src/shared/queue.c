@@ -117,7 +117,7 @@ void* queue_dequeue(Queue* queue) {
 }
 
 void* queue_dequeue_multithreaded(Queue* queue, mtx_t* mutex, cnd_t* condition_not_empty,
-                                   cnd_t* condition_not_full, const bool* other_thread_done) {
+                                  cnd_t* condition_not_full, const bool* other_thread_done) {
   mtx_lock(mutex);
   while (queue_is_empty(queue) && !*other_thread_done)
     cnd_wait(condition_not_empty, mutex);
