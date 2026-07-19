@@ -28,6 +28,13 @@ if(STRICT_WARNINGS)
 	add_compile_options(-Wextra -Wpedantic -Werror)
 endif()
 
+# --- Coverage option ---
+option(ENABLE_COVERAGE "Enable gcov coverage" OFF)
+if(ENABLE_COVERAGE)
+	add_compile_options(--coverage -fprofile-arcs -ftest-coverage -O0 -g)
+	add_link_options(--coverage)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(
   xxhash
@@ -50,8 +57,8 @@ find_package(OpenSSL REQUIRED)
 file(GLOB SHARED_SRCS "src/shared/*.c")
 file(GLOB SERVER_SRCS "src/server/*.c")
 file(GLOB CLIENT_SRCS "src/client/*.c")
-file(GLOB TEST_SRCS "tests/*.c")
 
+# --- Main executables ---
 add_executable(server ${SERVER_SRCS} ${SHARED_SRCS})
 target_include_directories(server PRIVATE src/shared src/server src/client)
 target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
@@ -60,7 +67,30 @@ add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
 target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
-add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
-target_include_directories(tests PRIVATE tests src/shared src/server src/client)
-target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+# --- Testing ---
+enable_testing()
 
+# Common test libraries
+set(TEST_LIBS Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+set(TEST_INCLUDES tests src/shared src/server src/client)
+
+# Monolithic test binary (backward compatible)
+file(GLOB TEST_SRCS "tests/test_*.c" "tests/runner.c")
+add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
+target_include_directories(tests PRIVATE ${TEST_INCLUDES})
+target_link_libraries(tests PRIVATE ${TEST_LIBS})
+add_test(NAME unit_all COMMAND tests)
+
+# --- Fuzz targets (requires clang) ---
+option(ENABLE_FUZZ "Build fuzz targets (requires clang)" OFF)
+if(ENABLE_FUZZ)
+	file(GLOB FUZZ_SRCS "tests/fuzz/*.c")
+	foreach(FUZZ_SRC ${FUZZ_SRCS})
+		get_filename_component(FUZZ_NAME ${FUZZ_SRC} NAME_WE)
+		add_executable(${FUZZ_NAME} ${FUZZ_SRC} ${SHARED_SRCS})
+		target_include_directories(${FUZZ_NAME} PRIVATE ${TEST_INCLUDES})
+		target_compile_options(${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+		target_link_options(${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined)
+		target_link_libraries(${FUZZ_NAME} PRIVATE ${TEST_LIBS})
+	endforeach()
+endif()
