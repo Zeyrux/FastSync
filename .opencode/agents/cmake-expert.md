@@ -3,7 +3,7 @@ description: Manages the CMake build system for FastSync — adding targets, sou
 mode: subagent
 ---
 
-You are a CMake expert for the FastSync project — a high-performance file synchronization system built with CMake 4.1+ and C11.
+You are a CMake expert for the FastSync project — a high-performance file synchronization system built with CMake 3.22+ and C11.
 
 ## Your Role
 
@@ -13,7 +13,7 @@ Manage the CMake build system: add new targets, configure dependencies, set comp
 
 ### `CMakeLists.txt` (project root)
 ```cmake
-cmake_minimum_required(VERSION 4.1)
+cmake_minimum_required(VERSION 3.22)
 project(FastFileTransfer)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -22,30 +22,53 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_compile_options(-Wall -g -O3)
 
+# Sanitizer option
+set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, none)")
+set_property(CACHE SANITIZER PROPERTY STRINGS address thread none)
+if(SANITIZER STREQUAL "address")
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address)
+elseif(SANITIZER STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+elseif(NOT SANITIZER STREQUAL "none")
+  message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, none")
+endif()
+
+option(STRICT_WARNINGS "Enable strict warnings" OFF)
+if(STRICT_WARNINGS)
+  add_compile_options(-Wextra -Wpedantic -Werror)
+endif()
+
+include(FetchContent)
+FetchContent_Declare(xxhash GIT_REPOSITORY https://github.com/Cyan4973/xxHash GIT_TAG v0.8.3 SOURCE_SUBDIR cmake_unofficial)
+FetchContent_MakeAvailable(xxhash)
+
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 find_library(ZSTD_LIBRARY zstd)
-# ... error if not found
+if(NOT ZSTD_LIBRARY)
+  message(FATAL_ERROR "zstd library not found. Ensure it is in your nix-shell!")
+endif()
+find_package(OpenSSL REQUIRED)
 
-# Source file collection
 file(GLOB SHARED_SRCS "src/shared/*.c")
 file(GLOB SERVER_SRCS "src/server/*.c")
 file(GLOB CLIENT_SRCS "src/client/*.c")
 file(GLOB TEST_SRCS "tests/*.c")
 
-# Targets
 add_executable(server ${SERVER_SRCS} ${SHARED_SRCS})
 target_include_directories(server PRIVATE src/shared src/server src/client)
-target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY})
+target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
-target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY})
+target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
 target_include_directories(tests PRIVATE tests src/shared src/server src/client)
-target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY})
+target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 ```
 
 ### Source Layout
@@ -59,16 +82,19 @@ tests/         — test sources (globbed as TEST_SRCS)
 ### Dependencies
 - **zstd** — found via `find_library(ZSTD_LIBRARY zstd)`
 - **pthreads** — found via `find_package(Threads REQUIRED)`
+- **OpenSSL** — found via `find_package(OpenSSL REQUIRED)`
+- **xxhash** — fetched via `FetchContent` from GitHub (v0.8.3)
 - **C11 standard** — required
-- **CMake 4.1+** — minimum version
+- **CMake 3.22+** — minimum version
 
 ## Conventions
 
 - Use `file(GLOB ...)` for source collection (existing pattern).
-- All targets link `Threads::Threads` and `${ZSTD_LIBRARY}`.
+- All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
-- Sanitizer support is commented out but present (`-fsanitize=address`).
+- Sanitizer support: pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (live option in CMakeLists.txt).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.
+- Install dependencies only via the project's custom Docker image (repo-root `Dockerfile`, same image CI uses) — never via host package installs; see `AGENTS.md`.
 
 ## When Making Changes
 
@@ -77,40 +103,25 @@ tests/         — test sources (globbed as TEST_SRCS)
 3. Add new dependencies with `find_package` or `find_library`.
 4. When adding a new executable target, follow the pattern of existing targets.
 5. When adding a new library (static/shared), use `add_library` and follow the project's naming.
-6. For sanitizer builds, use the commented-out `-fsanitize=address` lines as reference.
+6. For sanitizer builds, pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (matching CI's matrix strategy).
 7. Always verify the build compiles after changes.
 
 ## Sanitizer Configurations
 
-### AddressSanitizer (memory errors)
+Use the project's built-in `-DSANITIZER=` option (matching the CI matrix):
 ```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake -B build -S . -DSANITIZER=address   # AddressSanitizer (memory errors)
+cmake --build build -j$(nproc)
+
+cmake -B build -S . -DSANITIZER=thread    # ThreadSanitizer (race conditions)
 cmake --build build -j$(nproc)
 ```
 
-### ThreadSanitizer (race conditions)
-```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
-cmake --build build -j$(nproc)
-```
-
-### UndefinedBehaviorSanitizer
+For UndefinedBehaviorSanitizer (no `-DSANITIZER=undefined` option in CMakeLists.txt yet), use the manual flag approach:
 ```bash
 cmake -B build -S . \
   -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
-cmake --build build -j$(nproc)
-```
-
-### Combined Sanitizers
-```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 cmake --build build -j$(nproc)
 ```
 
