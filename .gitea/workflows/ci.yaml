@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     steps:
       - name: Checkout
@@ -38,7 +38,7 @@ jobs:
 
   sanitizers:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     strategy:
       matrix:
@@ -58,7 +58,7 @@ jobs:
 
   fuzz-build:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     steps:
       - name: Checkout
@@ -72,7 +72,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     steps:
       - name: Checkout
@@ -95,7 +95,7 @@ jobs:
 
   valgrind:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v8
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     steps:
       - name: Checkout
