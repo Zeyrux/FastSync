@@ -8,7 +8,7 @@
 typedef struct ssl_st SSL;
 
 typedef int Status;
-enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK, STATUS_MANIFEST, STATUS_CHECK };
+enum NET_STATUS { STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT, STATUS_CHUNK, STATUS_MANIFEST, STATUS_CHECK, STATUS_DELTA_SIGNATURE, STATUS_DELTA_DATA };
 
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
