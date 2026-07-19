@@ -3,14 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-ArrayList *array_list_create(void (*item_destroyer)(void *item)) {
-  ArrayList *list = (ArrayList *)malloc(sizeof(ArrayList));
+ArrayList* array_list_create(void (*item_destroyer)(void* item)) {
+  ArrayList* list = (ArrayList*)malloc(sizeof(ArrayList));
   if (list == NULL) {
     perror("ERROR: Could not allocate memory for array list struct");
     return NULL;
   }
 
-  list->items = malloc(INITIAL_ARRAY_SIZE * sizeof(void *));
+  list->items = malloc(INITIAL_ARRAY_SIZE * sizeof(void*));
   if (list->items == NULL) {
     free(list);
     return NULL;
@@ -21,7 +21,7 @@ ArrayList *array_list_create(void (*item_destroyer)(void *item)) {
   return list;
 }
 
-void array_list_delete(ArrayList *array_list) {
+void array_list_delete(ArrayList* array_list) {
   if (array_list == NULL)
     return;
   if (array_list->item_destroyer != NULL) {
@@ -34,12 +34,13 @@ void array_list_delete(ArrayList *array_list) {
   free(array_list);
 }
 
-bool array_list_extend(ArrayList *array_list) {
-  if (array_list == NULL) return false;
+bool array_list_extend(ArrayList* array_list) {
+  if (array_list == NULL)
+    return false;
   int new_capacity = array_list->capacity * 2;
   if (new_capacity == 0)
     new_capacity = INITIAL_ARRAY_SIZE;
-  void *new_items = realloc(array_list->items, new_capacity * sizeof(void *));
+  void* new_items = realloc(array_list->items, new_capacity * sizeof(void*));
   if (new_items == NULL) {
     perror("ERROR: Could not reallocate memory for array list items");
     return false;
@@ -49,8 +50,9 @@ bool array_list_extend(ArrayList *array_list) {
   return true;
 }
 
-bool array_list_add(ArrayList *array_list, void *item) {
-  if (array_list == NULL) return false;
+bool array_list_add(ArrayList* array_list, void* item) {
+  if (array_list == NULL)
+    return false;
   if (array_list->capacity == array_list->size) {
     if (!array_list_extend(array_list))
       return false;
@@ -60,15 +62,15 @@ bool array_list_add(ArrayList *array_list, void *item) {
   return true;
 }
 
-void **array_list_to_array(ArrayList *array_list) {
+void** array_list_to_array(const ArrayList* array_list) {
   if (array_list == NULL) {
     return NULL;
   }
-  void **array = malloc(array_list->size * sizeof(void *));
+  void** array = malloc(array_list->size * sizeof(void*));
   if (array == NULL) {
     perror("Could not malloc space for array from array list!");
     return NULL;
   }
-  memcpy(array, array_list->items, array_list->size * sizeof(void *));
+  memcpy(array, array_list->items, array_list->size * sizeof(void*));
   return array;
 }

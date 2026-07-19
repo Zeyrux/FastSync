@@ -4,28 +4,28 @@
 #include <stdlib.h>
 
 static int destroyer_calls = 0;
-static void test_destroyer(void *item) {
+static void test_destroyer(void* item) {
   destroyer_calls++;
   free(item);
 }
 
 void test_array_list() {
-  ArrayList *list = array_list_create(free);
+  ArrayList* list = array_list_create(free);
   EXPECT_NOT_NULL(list);
   EXPECT_EQ_INT(list->size, 0);
   EXPECT_EQ_INT(list->capacity, 100);
 
   // Test adding
-  int *val1 = malloc(sizeof(int));
+  int* val1 = malloc(sizeof(int));
   *val1 = 42;
   array_list_add(list, val1);
   EXPECT_EQ_INT(list->size, 1);
-  EXPECT_EQ_INT(*(int *)list->items[0], 42);
+  EXPECT_EQ_INT(*(int*)list->items[0], 42);
 
   // Test extending capacity
   // Initial capacity is 100. Let's add 105 elements.
   for (int i = 0; i < 105; i++) {
-    int *val = malloc(sizeof(int));
+    int* val = malloc(sizeof(int));
     *val = i;
     array_list_add(list, val);
   }
@@ -33,15 +33,15 @@ void test_array_list() {
   EXPECT_EQ_INT(list->capacity, 200); // 100 * 2
 
   // Verify contents
-  EXPECT_EQ_INT(*(int *)list->items[0], 42);
-  EXPECT_EQ_INT(*(int *)list->items[1], 0);
-  EXPECT_EQ_INT(*(int *)list->items[105], 104);
+  EXPECT_EQ_INT(*(int*)list->items[0], 42);
+  EXPECT_EQ_INT(*(int*)list->items[1], 0);
+  EXPECT_EQ_INT(*(int*)list->items[105], 104);
 
   // Test array conversion
-  void **arr = array_list_to_array(list);
+  void** arr = array_list_to_array(list);
   EXPECT_NOT_NULL(arr);
-  EXPECT_EQ_INT(*(int *)arr[0], 42);
-  EXPECT_EQ_INT(*(int *)arr[105], 104);
+  EXPECT_EQ_INT(*(int*)arr[0], 42);
+  EXPECT_EQ_INT(*(int*)arr[105], 104);
   free(arr);
 
   // Delete list, verifying the destroyer is called 106 times

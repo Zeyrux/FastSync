@@ -9,23 +9,23 @@
 #include "queue.h"
 
 typedef struct {
-  Config *config;
-  Queue *queue_scanner;
+  Config* config;
+  Queue* queue_scanner;
   mtx_t mutex_scanner;
   cnd_t condition_not_full_scanner;
   cnd_t condition_not_empty_scanner;
   bool scanner_done;
-  Queue *queue_loader;
+  Queue* queue_loader;
   mtx_t mutex_loader;
   cnd_t condition_not_full_loader;
   cnd_t condition_not_empty_loader;
   bool loader_done;
-  ArrayList *manifest;
+  ArrayList* manifest;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {
-  Queue *queue;
-  Config *config;
+  Queue* queue;
+  Config* config;
   int file_descriptor;
   mtx_t mutex;
   cnd_t condition_not_full;
@@ -33,14 +33,12 @@ typedef struct PipelineContextReceiver {
   bool receiver_done;
 } PipelineContextReceiver;
 
-PipelineContextSender *pipeline_context_sender_create(Config *config,
-                                                      Queue *queue_scanner,
-                                                      Queue *queue_loader);
-void pipeline_context_sender_destroy(PipelineContextSender *context);
-PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
-                                                          Queue *queue_receiver,
+PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
+                                                      Queue* queue_loader);
+void pipeline_context_sender_destroy(PipelineContextSender* context);
+PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,
                                                           int file_descriptor);
-void pipeline_context_receiver_destroy(PipelineContextReceiver *context);
-int receive_thread(void *pipeline_context);
-int write_thread(void *pipeline_context);
+void pipeline_context_receiver_destroy(PipelineContextReceiver* context);
+int receive_thread(void* pipeline_context);
+int write_thread(void* pipeline_context);
 #endif

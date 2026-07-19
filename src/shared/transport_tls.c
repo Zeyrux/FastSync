@@ -31,11 +31,10 @@ static void log_ssl_errors(void) {
   }
 }
 
-static SSL_CTX *create_ssl_ctx(bool is_server, const char *cert,
-                                const char *key, const char *ca_path) {
-  const SSL_METHOD *method =
-      is_server ? TLS_server_method() : TLS_client_method();
-  SSL_CTX *ctx = SSL_CTX_new(method);
+static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key,
+                               const char* ca_path) {
+  const SSL_METHOD* method = is_server ? TLS_server_method() : TLS_client_method();
+  SSL_CTX* ctx = SSL_CTX_new(method);
   if (!ctx) {
     log_message(LOG_LEVEL_ERROR, "Unable to create SSL context");
     log_ssl_errors();
@@ -58,8 +57,7 @@ static SSL_CTX *create_ssl_ctx(bool is_server, const char *cert,
       return NULL;
     }
     if (!SSL_CTX_check_private_key(ctx)) {
-      log_message(LOG_LEVEL_ERROR,
-                  "Private key does not match certificate");
+      log_message(LOG_LEVEL_ERROR, "Private key does not match certificate");
       SSL_CTX_free(ctx);
       return NULL;
     }
@@ -79,8 +77,8 @@ static SSL_CTX *create_ssl_ctx(bool is_server, const char *cert,
   return ctx;
 }
 
-static SSL *wrap_fd_with_ssl(int fd, SSL_CTX *ctx, bool is_server) {
-  SSL *ssl = SSL_new(ctx);
+static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server) {
+  SSL* ssl = SSL_new(ctx);
   if (!ssl) {
     log_message(LOG_LEVEL_ERROR, "Failed to create SSL object");
     return NULL;
@@ -93,8 +91,7 @@ static SSL *wrap_fd_with_ssl(int fd, SSL_CTX *ctx, bool is_server) {
     ret = SSL_connect(ssl);
 
   if (ret <= 0) {
-    log_message(LOG_LEVEL_ERROR, "SSL %s failed",
-                is_server ? "accept" : "connect");
+    log_message(LOG_LEVEL_ERROR, "SSL %s failed", is_server ? "accept" : "connect");
     log_ssl_errors();
     SSL_free(ssl);
     return NULL;
@@ -102,23 +99,25 @@ static SSL *wrap_fd_with_ssl(int fd, SSL_CTX *ctx, bool is_server) {
   return ssl;
 }
 
-bool server_create_tls(Server *server, const char *cert_path,
-                        const char *key_path, const char *ca_path) {
-  SSL_CTX *ctx = create_ssl_ctx(true, cert_path, key_path, ca_path);
-  if (!ctx) return false;
+bool server_create_tls(Server* server, const char* cert_path, const char* key_path,
+                       const char* ca_path) {
+  SSL_CTX* ctx = create_ssl_ctx(true, cert_path, key_path, ca_path);
+  if (!ctx)
+    return false;
   server->ssl_ctx = ctx;
   return true;
 }
 
 struct tls_child_ctx {
   void (*handler)(int);
-  SSL_CTX *ssl_ctx;
+  SSL_CTX* ssl_ctx;
 };
 
-static void tls_child_fn(int fd, void *arg) {
-  struct tls_child_ctx *ctx = (struct tls_child_ctx *)arg;
-  SSL *ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true);
-  if (!ssl) return;
+static void tls_child_fn(int fd, void* arg) {
+  struct tls_child_ctx* ctx = (struct tls_child_ctx*)arg;
+  SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true);
+  if (!ssl)
+    return;
   io_set_ssl(ssl);
   ctx->handler(fd);
   SSL_shutdown(ssl);
@@ -126,31 +125,31 @@ static void tls_child_fn(int fd, void *arg) {
   io_set_ssl(NULL);
 }
 
-bool server_listen_tls(Server *server, void (*handler)(int file_descriptor)) {
-  struct tls_child_ctx ctx = {handler, (SSL_CTX *)server->ssl_ctx};
+bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {
+  struct tls_child_ctx ctx = {handler, (SSL_CTX*)server->ssl_ctx};
   server_accept_loop(server, tls_child_fn, &ctx, "Received TLS Connection");
   return true;
 }
 
-bool client_connect_tls(Client *client, char *host, int port,
-                         const char *cert_path, const char *key_path,
-                         const char *ca_path) {
+bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
+                        const char* key_path, const char* ca_path) {
   client->address.sin_port = htons(port);
   if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
     perror("Could not convert host address!");
     return false;
   }
-  if (connect(client->file_descriptor, (struct sockaddr *)&client->address,
-               client->address_length) < 0) {
+  if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
+      0) {
     perror("Could not connect to Server!");
     return false;
   }
 
-  SSL_CTX *ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
-  if (!ctx) return false;
+  SSL_CTX* ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
+  if (!ctx)
+    return false;
   client->ssl_ctx = ctx;
 
-  SSL *ssl = wrap_fd_with_ssl(client->file_descriptor, ctx, false);
+  SSL* ssl = wrap_fd_with_ssl(client->file_descriptor, ctx, false);
   if (!ssl) {
     SSL_CTX_free(ctx);
     client->ssl_ctx = NULL;

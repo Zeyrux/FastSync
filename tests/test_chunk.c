@@ -7,13 +7,13 @@
 #include <unistd.h>
 
 static void test_file_operations() {
-  char *test_path = "temp_file_test.txt";
-  char *test_content = "Hello, Chunk System!";
+  char* test_path = "temp_file_test.txt";
+  char* test_content = "Hello, Chunk System!";
   unsigned long long test_len = strlen(test_content);
 
   to_disk(test_path, test_content, test_len);
 
-  File *f = file_create(test_path);
+  File* f = file_create(test_path);
   EXPECT_NOT_NULL(f);
   EXPECT_EQ_STR(f->path, test_path);
   EXPECT_NOT_NULL(f->data);
@@ -35,12 +35,12 @@ static void test_file_operations() {
 }
 
 static void test_chunk_operations() {
-  char *path1 = "temp_chunk_1.txt";
-  char *content1 = "chunk item 1";
+  char* path1 = "temp_chunk_1.txt";
+  char* content1 = "chunk item 1";
   unsigned long long len1 = strlen(content1);
 
-  char *path2 = "temp_chunk_2.txt";
-  char *content2 = "chunk item number 2";
+  char* path2 = "temp_chunk_2.txt";
+  char* content2 = "chunk item number 2";
   unsigned long long len2 = strlen(content2);
 
   to_disk(path1, content1, len1);
@@ -50,13 +50,13 @@ static void test_chunk_operations() {
   stat(path1, &st1);
   stat(path2, &st2);
 
-  File *f1 = file_create(path1);
+  File* f1 = file_create(path1);
   f1->data->size = st1.st_size;
-  File *f2 = file_create(path2);
+  File* f2 = file_create(path2);
   f2->data->size = st2.st_size;
 
-  File *files[2] = {f1, f2};
-  Chunk *chunk = chunk_create(files, 2);
+  File* files[2] = {f1, f2};
+  Chunk* chunk = chunk_create(files, 2);
   EXPECT_NOT_NULL(chunk);
   EXPECT_EQ_INT(chunk->element_count, 2);
   EXPECT_NOT_NULL(chunk->items[0]);
@@ -67,10 +67,10 @@ static void test_chunk_operations() {
   file_load_data(f2);
 
   // Test chunk_serialize / chunk_deserialize round-trip
-  Data *serialized = chunk_serialize(chunk, false);
+  Data* serialized = chunk_serialize(chunk, false);
   EXPECT_NOT_NULL(serialized);
 
-  Chunk *deserialized = chunk_deserialize(serialized, false);
+  Chunk* deserialized = chunk_deserialize(serialized, false);
   EXPECT_NOT_NULL(deserialized);
   EXPECT_EQ_INT(deserialized->element_count, 2);
   EXPECT_EQ_STR(deserialized->items[0]->path, path1);

@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-char *server_host = "127.0.0.1";
+char* server_host = "127.0.0.1";
 int server_port = 8080;
 
 static void print_usage(void) {
@@ -38,8 +38,10 @@ static void print_usage(void) {
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
-  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
-  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n", DELTA_MAX_FILE_SIZE);
+  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
+         DELTA_BLOCK_SIZE_DEFAULT);
+  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
+         DELTA_MAX_FILE_SIZE);
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -59,19 +61,18 @@ static void print_usage(void) {
   printf("  --help              Show this help\n");
 }
 
-int main(int argc, char *argv[]) {
-  const char *env_source = getenv("FASTSYNC_SOURCE_DIR");
-  const char *env_dest = getenv("FASTSYNC_DEST_DIR");
-  const char *env_save = getenv("FASTSYNC_SAVE_TO_DISK");
+int main(int argc, char* argv[]) {
+  const char* env_source = getenv("FASTSYNC_SOURCE_DIR");
+  const char* env_dest = getenv("FASTSYNC_DEST_DIR");
+  const char* env_save = getenv("FASTSYNC_SAVE_TO_DISK");
 
   bool save_to_disk = false;
-  if (env_save &&
-      (strcmp(env_save, "true") == 0 || strcmp(env_save, "1") == 0)) {
+  if (env_save && (strcmp(env_save, "true") == 0 || strcmp(env_save, "1") == 0)) {
     save_to_disk = true;
   }
 
-  Config *config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL,
-                                 save_to_disk, false, false, false, false, 5, false, 0);
+  Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
+                                 false, false, 5, false, 0);
 
   int positional_args[2];
   int positional_count = 0;
@@ -93,11 +94,13 @@ int main(int argc, char *argv[]) {
       config->use_delete = true;
     } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
       int idx = config->exclude_count++;
-      config->exclude_patterns = realloc(config->exclude_patterns, config->exclude_count * sizeof(char *));
+      config->exclude_patterns =
+          realloc(config->exclude_patterns, config->exclude_count * sizeof(char*));
       config->exclude_patterns[idx] = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--include") == 0 && i + 1 < argc) {
       int idx = config->include_count++;
-      config->include_patterns = realloc(config->include_patterns, config->include_count * sizeof(char *));
+      config->include_patterns =
+          realloc(config->include_patterns, config->include_count * sizeof(char*));
       config->include_patterns[idx] = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
       config->max_size = strtoull(argv[++i], NULL, 10);
@@ -123,12 +126,11 @@ int main(int argc, char *argv[]) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
       if (i + 1 < argc) {
-        char *end_ptr;
+        char* end_ptr;
         int level = strtol(argv[i + 1], &end_ptr, 10);
         if (*end_ptr == '\0') {
           config->compression_level = level;
-          log_message(LOG_LEVEL_INFO, "Set Compression level to %d",
-                      config->compression_level);
+          log_message(LOG_LEVEL_INFO, "Set Compression level to %d", config->compression_level);
           i++;
         }
       }
@@ -158,7 +160,7 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       server_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
-      char *end;
+      char* end;
       errno = 0;
       unsigned long long kbps = strtoull(argv[++i], &end, 10);
       if (errno != 0 || *end != '\0' || kbps == 0) {
@@ -219,9 +221,9 @@ int main(int argc, char *argv[]) {
     return 1;
   } else {
     if (!config->send_directory && env_source)
-      config->send_directory = str_dup((char *)env_source);
+      config->send_directory = str_dup((char*)env_source);
     if (!config->receive_root_directory && env_dest)
-      config->receive_root_directory = str_dup((char *)env_dest);
+      config->receive_root_directory = str_dup((char*)env_dest);
   }
 
   if (!config->send_directory || !config->receive_root_directory) {
@@ -230,7 +232,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
-    fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk serialization)\n");
+    fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk "
+                    "serialization)\n");
     return 1;
   }
 

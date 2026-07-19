@@ -4,7 +4,7 @@
 #include <stdlib.h>
 
 static void test_adler32_basic() {
-  const char *data = "Hello";
+  const char* data = "Hello";
   uint32_t h = delta_adler32(data, 5);
   EXPECT_TRUE(h != 0);
   uint32_t h2 = delta_adler32(data, 5);
@@ -12,15 +12,15 @@ static void test_adler32_basic() {
 }
 
 static void test_adler32_different_data() {
-  const char *a = "AAAA";
-  const char *b = "BBBB";
+  const char* a = "AAAA";
+  const char* b = "BBBB";
   uint32_t ha = delta_adler32(a, 4);
   uint32_t hb = delta_adler32(b, 4);
   EXPECT_TRUE(ha != hb);
 }
 
 static void test_xxhash32_basic() {
-  const char *data = "Hello";
+  const char* data = "Hello";
   uint32_t h = delta_xxhash32(data, 5);
   EXPECT_TRUE(h != 0);
   uint32_t h2 = delta_xxhash32(data, 5);
@@ -28,8 +28,8 @@ static void test_xxhash32_basic() {
 }
 
 static void test_xxhash32_different_data() {
-  const char *a = "AAAA";
-  const char *b = "BBBB";
+  const char* a = "AAAA";
+  const char* b = "BBBB";
   uint32_t ha = delta_xxhash32(a, 4);
   uint32_t hb = delta_xxhash32(b, 4);
   EXPECT_TRUE(ha != hb);
@@ -37,17 +37,18 @@ static void test_xxhash32_different_data() {
 
 static void test_signature_roundtrip() {
   char old_data[4096];
-  for (int i = 0; i < 4096; i++) old_data[i] = (char)(i % 256);
+  for (int i = 0; i < 4096; i++)
+    old_data[i] = (char)(i % 256);
 
-  DeltaSignature *sig = delta_signature_create(old_data, 4096, 1024);
+  DeltaSignature* sig = delta_signature_create(old_data, 4096, 1024);
   EXPECT_NOT_NULL(sig);
   EXPECT_EQ_INT((int)sig->block_count, 4);
   EXPECT_EQ_INT((int)sig->block_size, 1024);
 
-  Data *serialized = delta_signature_serialize(sig);
+  Data* serialized = delta_signature_serialize(sig);
   EXPECT_NOT_NULL(serialized);
 
-  DeltaSignature *deserialized = delta_signature_deserialize(serialized);
+  DeltaSignature* deserialized = delta_signature_deserialize(serialized);
   EXPECT_NOT_NULL(deserialized);
   EXPECT_EQ_INT((int)deserialized->block_count, (int)sig->block_count);
   EXPECT_EQ_INT((int)deserialized->block_size, (int)sig->block_size);
@@ -64,12 +65,13 @@ static void test_signature_roundtrip() {
 
 static void test_delta_identical_files() {
   char data[2048];
-  for (int i = 0; i < 2048; i++) data[i] = (char)(i % 128);
+  for (int i = 0; i < 2048; i++)
+    data[i] = (char)(i % 128);
 
-  DeltaSignature *sig = delta_signature_create(data, 2048, 512);
+  DeltaSignature* sig = delta_signature_create(data, 2048, 512);
   EXPECT_NOT_NULL(sig);
 
-  Delta *delta = delta_compute(data, 2048, sig, 512);
+  Delta* delta = delta_compute(data, 2048, sig, 512);
   EXPECT_NOT_NULL(delta);
 
   bool has_match = false;
@@ -105,10 +107,10 @@ static void test_delta_small_edit() {
   new_data[101] = 'Y';
   new_data[102] = 'Z';
 
-  DeltaSignature *sig = delta_signature_create(old_data, 4096, 1024);
+  DeltaSignature* sig = delta_signature_create(old_data, 4096, 1024);
   EXPECT_NOT_NULL(sig);
 
-  Delta *delta = delta_compute(new_data, 4096, sig, 1024);
+  Delta* delta = delta_compute(new_data, 4096, sig, 1024);
   EXPECT_NOT_NULL(delta);
 
   uint64_t total_literal = 0;
@@ -122,7 +124,7 @@ static void test_delta_small_edit() {
   EXPECT_TRUE(match_count > 0);
   EXPECT_TRUE(total_literal < 4096);
 
-  void *reconstructed = delta_apply(old_data, 4096, delta, 1024);
+  void* reconstructed = delta_apply(old_data, 4096, delta, 1024);
   EXPECT_NOT_NULL(reconstructed);
   EXPECT_EQ_INT(memcmp(reconstructed, new_data, 4096), 0);
 
@@ -139,10 +141,10 @@ static void test_delta_completely_different() {
     new_data[i] = (char)(i * 13 + 97);
   }
 
-  DeltaSignature *sig = delta_signature_create(old_data, 4096, 1024);
+  DeltaSignature* sig = delta_signature_create(old_data, 4096, 1024);
   EXPECT_NOT_NULL(sig);
 
-  Delta *delta = delta_compute(new_data, 4096, sig, 1024);
+  Delta* delta = delta_compute(new_data, 4096, sig, 1024);
   EXPECT_NOT_NULL(delta);
 
   bool has_match = false;
@@ -169,19 +171,19 @@ static void test_delta_serialize_roundtrip() {
   new_data[500] = 'A';
   new_data[501] = 'B';
 
-  DeltaSignature *sig = delta_signature_create(old_data, 4096, 1024);
-  Delta *delta = delta_compute(new_data, 4096, sig, 1024);
+  DeltaSignature* sig = delta_signature_create(old_data, 4096, 1024);
+  Delta* delta = delta_compute(new_data, 4096, sig, 1024);
   EXPECT_NOT_NULL(delta);
 
-  Data *serialized = delta_serialize(delta);
+  Data* serialized = delta_serialize(delta);
   EXPECT_NOT_NULL(serialized);
 
-  Delta *deserialized = delta_deserialize(serialized);
+  Delta* deserialized = delta_deserialize(serialized);
   EXPECT_NOT_NULL(deserialized);
   EXPECT_EQ_INT((int)deserialized->new_file_size, (int)delta->new_file_size);
   EXPECT_EQ_INT((int)deserialized->instruction_count, (int)delta->instruction_count);
 
-  void *reconstructed = delta_apply(old_data, 4096, deserialized, 1024);
+  void* reconstructed = delta_apply(old_data, 4096, deserialized, 1024);
   EXPECT_NOT_NULL(reconstructed);
   EXPECT_EQ_INT(memcmp(reconstructed, new_data, 4096), 0);
 
@@ -195,17 +197,19 @@ static void test_delta_serialize_roundtrip() {
 static void test_delta_file_growth() {
   char old_data[2048];
   char new_data[3072];
-  for (int i = 0; i < 2048; i++) old_data[i] = (char)(i % 256);
+  for (int i = 0; i < 2048; i++)
+    old_data[i] = (char)(i % 256);
   memcpy(new_data, old_data, 2048);
-  for (int i = 2048; i < 3072; i++) new_data[i] = (char)(i % 256);
+  for (int i = 2048; i < 3072; i++)
+    new_data[i] = (char)(i % 256);
 
-  DeltaSignature *sig = delta_signature_create(old_data, 2048, 512);
+  DeltaSignature* sig = delta_signature_create(old_data, 2048, 512);
   EXPECT_NOT_NULL(sig);
 
-  Delta *delta = delta_compute(new_data, 3072, sig, 512);
+  Delta* delta = delta_compute(new_data, 3072, sig, 512);
   EXPECT_NOT_NULL(delta);
 
-  void *reconstructed = delta_apply(old_data, 2048, delta, 512);
+  void* reconstructed = delta_apply(old_data, 2048, delta, 512);
   EXPECT_NOT_NULL(reconstructed);
   EXPECT_EQ_INT(delta->new_file_size, 3072);
   EXPECT_EQ_INT(memcmp(reconstructed, new_data, 3072), 0);
@@ -218,16 +222,18 @@ static void test_delta_file_growth() {
 static void test_delta_file_shrink() {
   char old_data[3072];
   char new_data[2048];
-  for (int i = 0; i < 3072; i++) old_data[i] = (char)(i % 256);
-  for (int i = 0; i < 2048; i++) new_data[i] = old_data[i];
+  for (int i = 0; i < 3072; i++)
+    old_data[i] = (char)(i % 256);
+  for (int i = 0; i < 2048; i++)
+    new_data[i] = old_data[i];
 
-  DeltaSignature *sig = delta_signature_create(old_data, 3072, 512);
+  DeltaSignature* sig = delta_signature_create(old_data, 3072, 512);
   EXPECT_NOT_NULL(sig);
 
-  Delta *delta = delta_compute(new_data, 2048, sig, 512);
+  Delta* delta = delta_compute(new_data, 2048, sig, 512);
   EXPECT_NOT_NULL(delta);
 
-  void *reconstructed = delta_apply(old_data, 3072, delta, 512);
+  void* reconstructed = delta_apply(old_data, 3072, delta, 512);
   EXPECT_NOT_NULL(reconstructed);
   EXPECT_EQ_INT(delta->new_file_size, 2048);
   EXPECT_EQ_INT(memcmp(reconstructed, new_data, 2048), 0);
@@ -273,24 +279,24 @@ static void test_large_file_delta() {
   uint64_t old_size = 200000;
   uint64_t new_size = 200000;
 
-  void *old_data = malloc((size_t)old_size);
-  void *new_data = malloc((size_t)new_size);
+  void* old_data = malloc((size_t)old_size);
+  void* new_data = malloc((size_t)new_size);
   EXPECT_TRUE(old_data != NULL && new_data != NULL);
 
   for (uint64_t i = 0; i < old_size; i++)
-    ((uint8_t *)old_data)[i] = (uint8_t)(i % 251);
+    ((uint8_t*)old_data)[i] = (uint8_t)(i % 251);
   memcpy(new_data, old_data, (size_t)old_size);
 
   uint64_t offset = 100000;
   uint32_t change_len = 4096;
   for (uint32_t i = 0; i < change_len; i++)
-    ((uint8_t *)new_data)[offset + i] = (uint8_t)((i * 7 + 13) % 256);
+    ((uint8_t*)new_data)[offset + i] = (uint8_t)((i * 7 + 13) % 256);
 
-  DeltaSignature *sig = delta_signature_create(old_data, old_size, block_size);
+  DeltaSignature* sig = delta_signature_create(old_data, old_size, block_size);
   EXPECT_TRUE(sig != NULL);
   EXPECT_TRUE(sig->block_count == (uint32_t)((old_size + block_size - 1) / block_size));
 
-  Delta *delta = delta_compute(new_data, new_size, sig, block_size);
+  Delta* delta = delta_compute(new_data, new_size, sig, block_size);
   EXPECT_TRUE(delta != NULL);
 
   uint64_t total_literal = 0;
@@ -301,10 +307,11 @@ static void test_large_file_delta() {
     else
       match_count++;
   }
+  EXPECT_TRUE(total_literal > 0);
   EXPECT_TRUE(match_count > 0);
   EXPECT_TRUE(delta->delta_size < new_size / 2);
 
-  void *result = delta_apply(old_data, old_size, delta, block_size);
+  void* result = delta_apply(old_data, old_size, delta, block_size);
   EXPECT_TRUE(result != NULL);
   EXPECT_TRUE(delta->new_file_size == new_size);
   EXPECT_TRUE(memcmp(result, new_data, (size_t)new_size) == 0);

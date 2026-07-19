@@ -8,21 +8,25 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-bool mkdir_r(char *path) {
-  char *path_duplicate = malloc(strlen(path) + 1);
-  if (!path_duplicate) return false;
+bool mkdir_r(const char* path) {
+  char* path_duplicate = malloc(strlen(path) + 1);
+  if (!path_duplicate)
+    return false;
   strcpy(path_duplicate, path);
-  char *path_current = (char *)malloc((strlen(path) + 2) * sizeof(char));
-  if (!path_current) { free(path_duplicate); return false; }
-  char *path_current_position = path_current;
+  char* path_current = (char*)malloc((strlen(path) + 2) * sizeof(char));
+  if (!path_current) {
+    free(path_duplicate);
+    return false;
+  }
+  char* path_current_position = path_current;
   if (path[0] == '/') {
     strcpy(path_current, "/");
     path_current_position += 1;
   } else {
     path_current[0] = '\0';
   }
-  const char *delimiter = "/";
-  char *part = strtok(path_duplicate, delimiter);
+  const char* delimiter = "/";
+  const char* part = strtok(path_duplicate, delimiter);
   bool ok = true;
   while (part != NULL) {
     strcpy(path_current_position, part);
@@ -44,15 +48,15 @@ bool mkdir_r(char *path) {
   return ok;
 }
 
-char *str_dup(const char *string) {
+char* str_dup(const char* string) {
   if (string == NULL)
     return NULL;
-  char *new_string = (char *)malloc(strlen(string) + 1);
+  char* new_string = (char*)malloc(strlen(string) + 1);
   strcpy(new_string, string);
   return new_string;
 }
 
-bool glob_match(const char *pattern, const char *str) {
+bool glob_match(const char* pattern, const char* str) {
   while (*pattern) {
     if (*pattern == '*') {
       pattern++;
@@ -77,17 +81,16 @@ bool glob_match(const char *pattern, const char *str) {
   return *str == '\0';
 }
 
-static void delete_extras_walk(const char *abs_path, const char *rel_path,
-                               ArrayList *manifest) {
-  DIR *dir = opendir(abs_path);
+static void delete_extras_walk(const char* abs_path, const char* rel_path, ArrayList* manifest) {
+  DIR* dir = opendir(abs_path);
   if (!dir)
     return;
-  struct dirent *entry;
+  struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    char *child_abs = path_cat((char *)abs_path, entry->d_name);
-    char *child_rel = path_cat((char *)rel_path, entry->d_name);
+    char* child_abs = path_cat((char*)abs_path, entry->d_name);
+    char* child_rel = path_cat((char*)rel_path, entry->d_name);
     struct stat st;
     if (stat(child_abs, &st) != 0) {
       free(child_abs);
@@ -100,7 +103,7 @@ static void delete_extras_walk(const char *abs_path, const char *rel_path,
       // Check if relative path is in manifest
       bool found = false;
       for (int i = 0; i < manifest->size; i++) {
-        if (strcmp((char *)manifest->items[i], child_rel) == 0) {
+        if (strcmp((char*)manifest->items[i], child_rel) == 0) {
           found = true;
           break;
         }
@@ -117,26 +120,27 @@ static void delete_extras_walk(const char *abs_path, const char *rel_path,
   rmdir(abs_path);
 }
 
-void delete_extras(const char *dest_root, ArrayList *manifest) {
+void delete_extras(const char* dest_root, ArrayList* manifest) {
   delete_extras_walk(dest_root, "", manifest);
 }
 
-char *path_cat(char *path1, char *path2) {
+char* path_cat(const char* path1, char* path2) {
   if (path1 == NULL || *path1 == '\0')
     return str_dup(path2);
   if (path2 == NULL || *path2 == '\0')
     return str_dup(path1);
   int path1_len = strlen(path1);
   int path2_len = strlen(path2);
-  char *path2_pointer = path2;
+  char* path2_pointer = path2;
   if (path1[path1_len - 1] == '/')
     path1_len -= 1;
   if (path2[0] == '/') {
     path2_pointer += 1;
     path2_len -= 1;
   }
-  char *new_path = malloc(path1_len + path2_len + 2);
-  if (new_path == NULL) return NULL;
+  char* new_path = malloc(path1_len + path2_len + 2);
+  if (new_path == NULL)
+    return NULL;
   memcpy(new_path, path1, path1_len);
   new_path[path1_len] = '/';
   memcpy(new_path + path1_len + 1, path2_pointer, path2_len);

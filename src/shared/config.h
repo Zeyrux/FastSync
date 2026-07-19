@@ -4,15 +4,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef enum {
-  TRANSPORT_TCP,
-  TRANSPORT_SSH
-} TransportType;
+typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
 
 typedef struct Config {
-  char *version;
-  char *send_directory;
-  char *receive_root_directory;
+  char* version;
+  char* send_directory;
+  char* receive_root_directory;
   bool save_to_disk;
   bool use_multithreading;
   bool use_chunk_serialization;
@@ -26,10 +23,10 @@ typedef struct Config {
   unsigned long long chunk_size;
   int ssh_port;
   TransportType transport;
-  char *ssh_destination;
-  char **exclude_patterns;
+  char* ssh_destination;
+  char** exclude_patterns;
   int exclude_count;
-  char **include_patterns;
+  char** include_patterns;
   int include_count;
   unsigned long long max_size;
   unsigned long long min_size;
@@ -38,24 +35,22 @@ typedef struct Config {
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;
   bool use_tls;
-  char *tls_cert;
-  char *tls_key;
-  char *tls_ca;
+  char* tls_cert;
+  char* tls_key;
+  char* tls_ca;
 } Config;
 
 #define PROTOCOL_VERSION "1.2.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
-Config *config_create(char *version, char *send_directory,
-                      char *receive_directory, bool save_to_disk,
-                      bool use_multithreading, bool use_chunk_serialization,
-                       bool use_compression, bool use_metadata,
-                       int compression_level, bool use_sendfile,
-                       unsigned long long chunk_size);
-void config_delete(Config *config);
-bool config_send(int file_descriptor, Config *config);
-Config *config_receive(int file_descriptor);
-bool is_remote_dest(const char *s);
-void config_parse_ssh_dest(Config *config);
+Config* config_create(char* version, char* send_directory, char* receive_directory,
+                      bool save_to_disk, bool use_multithreading, bool use_chunk_serialization,
+                      bool use_compression, bool use_metadata, int compression_level,
+                      bool use_sendfile, unsigned long long chunk_size);
+void config_delete(Config* config);
+bool config_send(int file_descriptor, const Config* config);
+Config* config_receive(int file_descriptor);
+bool is_remote_dest(const char* s);
+void config_parse_ssh_dest(Config* config);
 
 #endif

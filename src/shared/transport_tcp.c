@@ -11,8 +11,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-Server *server_create(int port) {
-  Server *server = (Server *)malloc(sizeof(Server));
+Server* server_create(int port) {
+  Server* server = (Server*)malloc(sizeof(Server));
   if (server == NULL) {
     perror("Could not allocate space for Server");
     return NULL;
@@ -26,8 +26,7 @@ Server *server_create(int port) {
   }
   server->file_descriptor = file_descriptor;
   int opt = 1;
-  if (setsockopt(server->file_descriptor, SOL_SOCKET, SO_REUSEADDR, &opt,
-                 sizeof(opt))) {
+  if (setsockopt(server->file_descriptor, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
     perror("Error setting a socket option!");
     close(server->file_descriptor);
     free(server);
@@ -40,8 +39,8 @@ Server *server_create(int port) {
   server->address_length = sizeof(server->address);
   server->ssl_ctx = NULL;
 
-  if (bind(server->file_descriptor, (struct sockaddr *)&server->address,
-           server->address_length) < 0) {
+  if (bind(server->file_descriptor, (struct sockaddr*)&server->address, server->address_length) <
+      0) {
     perror("Could not bind server");
     close(server->file_descriptor);
     free(server);
@@ -51,8 +50,9 @@ Server *server_create(int port) {
   return server;
 }
 
-void server_delete(Server **server) {
-  if (server == NULL || *server == NULL) return;
+void server_delete(Server** server) {
+  if (server == NULL || *server == NULL)
+    return;
   close((*server)->file_descriptor);
   if ((*server)->ssl_ctx) {
     SSL_CTX_free((*server)->ssl_ctx);
@@ -62,8 +62,8 @@ void server_delete(Server **server) {
   *server = NULL;
 }
 
-static void accept_loop(Server *server, void (*child_fn)(int, void *),
-                        void *child_ctx, const char *log_fmt) {
+static void accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
+                        const char* log_fmt) {
   if (listen(server->file_descriptor, SOMAXCONN) < 0) {
     perror("Could not listen on port!");
     return;
@@ -72,8 +72,7 @@ static void accept_loop(Server *server, void (*child_fn)(int, void *),
   while (1) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-    int fd = accept(server->file_descriptor, (struct sockaddr *)&client_addr,
-                    &client_len);
+    int fd = accept(server->file_descriptor, (struct sockaddr*)&client_addr, &client_len);
     if (fd < 0) {
       perror("Could not accept the connection");
       continue;
@@ -90,35 +89,35 @@ static void accept_loop(Server *server, void (*child_fn)(int, void *),
   }
 }
 
-struct plain_ctx { void (*handler)(int); };
+struct plain_ctx {
+  void (*handler)(int);
+};
 
-static void plain_child_fn(int fd, void *ctx) {
-  ((struct plain_ctx *)ctx)->handler(fd);
+static void plain_child_fn(int fd, void* ctx) {
+  ((struct plain_ctx*)ctx)->handler(fd);
 }
 
-bool server_listen(Server *server, void (*handler)(int file_descriptor)) {
-  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",
-              ntohs(server->address.sin_port));
+bool server_listen(Server* server, void (*handler)(int file_descriptor)) {
+  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d", ntohs(server->address.sin_port));
   struct plain_ctx ctx = {handler};
   accept_loop(server, plain_child_fn, &ctx, "Received Connection");
   return true;
 }
 
-void server_accept_loop(Server *server, void (*child_fn)(int, void *),
-                        void *child_ctx, const char *log_fmt) {
-  log_message(LOG_LEVEL_INFO, "Start TLS Listening on Port: %d",
-              ntohs(server->address.sin_port));
+void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
+                        const char* log_fmt) {
+  log_message(LOG_LEVEL_INFO, "Start TLS Listening on Port: %d", ntohs(server->address.sin_port));
   accept_loop(server, child_fn, child_ctx, log_fmt);
 }
 
-Client *client_create() {
+Client* client_create() {
   int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
   if (file_descriptor < 0) {
     perror("Could not create Socket!");
     return NULL;
   }
 
-  Client *client = (Client *)malloc(sizeof(Client));
+  Client* client = (Client*)malloc(sizeof(Client));
   if (client == NULL) {
     close(file_descriptor);
     return NULL;
@@ -132,7 +131,7 @@ Client *client_create() {
   return client;
 }
 
-bool client_connect(Client *client, char *host, int port) {
+bool client_connect(Client* client, char* host, int port) {
   client->address.sin_port = htons(port);
 
   if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
@@ -140,15 +139,15 @@ bool client_connect(Client *client, char *host, int port) {
     return false;
   }
 
-  if (connect(client->file_descriptor, (struct sockaddr *)&client->address,
-              client->address_length) < 0) {
+  if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
+      0) {
     perror("Could not connect to Server!");
     return false;
   }
   return true;
 }
 
-void client_disconnect(Client *client) {
+void client_disconnect(Client* client) {
   if (client->ssl) {
     SSL_shutdown(client->ssl);
     SSL_free(client->ssl);
@@ -163,8 +162,9 @@ void client_disconnect(Client *client) {
   }
 }
 
-void client_delete(Client *client) {
-  if (client == NULL) return;
+void client_delete(Client* client) {
+  if (client == NULL)
+    return;
   if (client->ssl_ctx) {
     SSL_CTX_free(client->ssl_ctx);
     client->ssl_ctx = NULL;

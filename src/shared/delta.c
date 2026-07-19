@@ -7,8 +7,8 @@
 #define XXH_IMPLEMENTATION
 #include <xxhash.h>
 
-uint32_t delta_adler32(const void *data, uint32_t len) {
-  const uint8_t *p = (const uint8_t *)data;
+uint32_t delta_adler32(const void* data, uint32_t len) {
+  const uint8_t* p = (const uint8_t*)data;
   uint32_t s1 = 1;
   uint32_t s2 = 0;
   for (uint32_t i = 0; i < len; i++) {
@@ -18,20 +18,20 @@ uint32_t delta_adler32(const void *data, uint32_t len) {
   return (s2 << 16) | s1;
 }
 
-uint32_t delta_xxhash32(const void *data, uint32_t len) {
+uint32_t delta_xxhash32(const void* data, uint32_t len) {
   return XXH32(data, len, 0);
 }
 
-DeltaSignature *delta_signature_create(const void *old_file_data,
-                                        uint64_t old_file_size,
-                                        uint32_t block_size) {
+DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_file_size,
+                                       uint32_t block_size) {
   if (old_file_data == NULL || old_file_size == 0 || block_size == 0)
     return NULL;
 
   uint32_t block_count = (uint32_t)((old_file_size + block_size - 1) / block_size);
 
-  DeltaSignature *sig = malloc(sizeof(DeltaSignature));
-  if (!sig) return NULL;
+  DeltaSignature* sig = malloc(sizeof(DeltaSignature));
+  if (!sig)
+    return NULL;
 
   sig->file_size = old_file_size;
   sig->block_size = block_size;
@@ -42,12 +42,11 @@ DeltaSignature *delta_signature_create(const void *old_file_data,
     return NULL;
   }
 
-  const uint8_t *data = (const uint8_t *)old_file_data;
+  const uint8_t* data = (const uint8_t*)old_file_data;
   for (uint32_t i = 0; i < block_count; i++) {
     uint64_t offset = (uint64_t)i * block_size;
-    uint32_t len = (uint32_t)((old_file_size - offset < block_size)
-                                  ? (old_file_size - offset)
-                                  : block_size);
+    uint32_t len =
+        (uint32_t)((old_file_size - offset < block_size) ? (old_file_size - offset) : block_size);
     sig->blocks[i].adler32 = delta_adler32(data + offset, len);
     sig->blocks[i].xxhash = delta_xxhash32(data + offset, len);
   }
@@ -55,14 +54,16 @@ DeltaSignature *delta_signature_create(const void *old_file_data,
   return sig;
 }
 
-Data *delta_signature_serialize(const DeltaSignature *sig) {
-  if (!sig) return NULL;
+Data* delta_signature_serialize(const DeltaSignature* sig) {
+  if (!sig)
+    return NULL;
 
   uint64_t total = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t) +
                    (uint64_t)sig->block_count * (sizeof(uint32_t) + sizeof(uint32_t));
 
-  uint8_t *buf = malloc((size_t)total);
-  if (!buf) return NULL;
+  uint8_t* buf = malloc((size_t)total);
+  if (!buf)
+    return NULL;
 
   size_t pos = 0;
   memcpy(buf + pos, &sig->file_size, sizeof(uint64_t));
@@ -82,15 +83,16 @@ Data *delta_signature_serialize(const DeltaSignature *sig) {
   return data_create(buf, (size_t)total);
 }
 
-DeltaSignature *delta_signature_deserialize(const Data *data) {
+DeltaSignature* delta_signature_deserialize(const Data* data) {
   if (!data || data->size < sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t))
     return NULL;
 
-  const uint8_t *buf = (const uint8_t *)data->data;
+  const uint8_t* buf = (const uint8_t*)data->data;
   size_t pos = 0;
 
-  DeltaSignature *sig = malloc(sizeof(DeltaSignature));
-  if (!sig) return NULL;
+  DeltaSignature* sig = malloc(sizeof(DeltaSignature));
+  if (!sig)
+    return NULL;
 
   memcpy(&sig->file_size, buf + pos, sizeof(uint64_t));
   pos += sizeof(uint64_t);
@@ -122,31 +124,35 @@ DeltaSignature *delta_signature_deserialize(const Data *data) {
   return sig;
 }
 
-void delta_signature_destroy(DeltaSignature *sig) {
-  if (!sig) return;
+void delta_signature_destroy(DeltaSignature* sig) {
+  if (!sig)
+    return;
   free(sig->blocks);
   free(sig);
 }
 
-static bool ensure_capacity(DeltaInstruction **instrs, uint32_t *capacity,
-                             uint32_t count) {
-  if (count < *capacity) return true;
+static bool ensure_capacity(DeltaInstruction** instrs, uint32_t* capacity, uint32_t count) {
+  if (count < *capacity)
+    return true;
   uint32_t new_cap = *capacity * 2;
-  DeltaInstruction *tmp = realloc(*instrs, new_cap * sizeof(DeltaInstruction));
-  if (!tmp) return false;
+  DeltaInstruction* tmp = realloc(*instrs, new_cap * sizeof(DeltaInstruction));
+  if (!tmp)
+    return false;
   *instrs = tmp;
   *capacity = new_cap;
   return true;
 }
 
-static bool flush_literal(DeltaInstruction **instrs, uint32_t *capacity,
-                           uint32_t *count, const uint8_t *data,
-                           uint64_t start, uint64_t end) {
-  if (start >= end) return true;
+static bool flush_literal(DeltaInstruction** instrs, uint32_t* capacity, uint32_t* count,
+                          const uint8_t* data, uint64_t start, uint64_t end) {
+  if (start >= end)
+    return true;
   uint32_t lit_len = (uint32_t)(end - start);
-  if (!ensure_capacity(instrs, capacity, *count)) return false;
-  uint8_t *lit_data = malloc(lit_len);
-  if (!lit_data) return false;
+  if (!ensure_capacity(instrs, capacity, *count))
+    return false;
+  uint8_t* lit_data = malloc(lit_len);
+  if (!lit_data)
+    return false;
   memcpy(lit_data, data + start, lit_len);
   (*instrs)[*count].type = DELTA_INSTR_LITERAL;
   (*instrs)[*count].literal.data = lit_data;
@@ -155,17 +161,18 @@ static bool flush_literal(DeltaInstruction **instrs, uint32_t *capacity,
   return true;
 }
 
-Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
-                      const DeltaSignature *sig, uint32_t block_size) {
+Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const DeltaSignature* sig,
+                     uint32_t block_size) {
   if (!new_file_data || !sig || new_file_size == 0 || block_size == 0)
     return NULL;
 
-  const uint8_t *new_data = (const uint8_t *)new_file_data;
+  const uint8_t* new_data = (const uint8_t*)new_file_data;
 
   uint32_t capacity = 64;
   uint32_t count = 0;
-  DeltaInstruction *instrs = malloc(capacity * sizeof(DeltaInstruction));
-  if (!instrs) return NULL;
+  DeltaInstruction* instrs = malloc(capacity * sizeof(DeltaInstruction));
+  if (!instrs)
+    return NULL;
 
   uint64_t literal_start = 0;
   bool has_literal = false;
@@ -176,20 +183,17 @@ Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
   bool rolling_valid = false;
 
   while (i < new_file_size) {
-    uint32_t window_len = (uint32_t)((new_file_size - i < block_size)
-                                         ? (new_file_size - i)
-                                         : block_size);
+    uint32_t window_len =
+        (uint32_t)((new_file_size - i < block_size) ? (new_file_size - i) : block_size);
     bool full_window = (window_len == block_size);
 
     uint32_t adler;
     if (rolling_valid && full_window) {
       uint8_t old_byte = new_data[i - 1];
       uint8_t new_byte = new_data[i + block_size - 1];
-      s1 = (s1 + DELTA_ADLER32_MODULUS - old_byte + new_byte) %
-           DELTA_ADLER32_MODULUS;
+      s1 = (s1 + DELTA_ADLER32_MODULUS - old_byte + new_byte) % DELTA_ADLER32_MODULUS;
       s2 = (s2 + DELTA_ADLER32_MODULUS -
-            (uint32_t)((uint64_t)block_size * old_byte % DELTA_ADLER32_MODULUS) +
-            s1 - 1) %
+            (uint32_t)((uint64_t)block_size * old_byte % DELTA_ADLER32_MODULUS) + s1 - 1) %
            DELTA_ADLER32_MODULUS;
       adler = (s2 << 16) | s1;
     } else {
@@ -209,8 +213,7 @@ Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
         uint32_t xxh = delta_xxhash32(new_data + i, window_len);
         if (xxh == sig->blocks[j].xxhash) {
           if (has_literal) {
-            if (!flush_literal(&instrs, &capacity, &count, new_data,
-                               literal_start, i)) {
+            if (!flush_literal(&instrs, &capacity, &count, new_data, literal_start, i)) {
               free(instrs);
               return NULL;
             }
@@ -245,14 +248,13 @@ Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
   }
 
   if (has_literal) {
-    if (!flush_literal(&instrs, &capacity, &count, new_data,
-                       literal_start, new_file_size)) {
+    if (!flush_literal(&instrs, &capacity, &count, new_data, literal_start, new_file_size)) {
       free(instrs);
       return NULL;
     }
   }
 
-  Delta *delta = malloc(sizeof(Delta));
+  Delta* delta = malloc(sizeof(Delta));
   if (!delta) {
     for (uint32_t k = 0; k < count; k++) {
       if (instrs[k].type == DELTA_INSTR_LITERAL)
@@ -279,12 +281,14 @@ Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
   return delta;
 }
 
-Data *delta_serialize(const Delta *delta) {
-  if (!delta) return NULL;
+Data* delta_serialize(const Delta* delta) {
+  if (!delta)
+    return NULL;
 
   uint64_t total = sizeof(uint64_t) + sizeof(uint32_t) + delta->delta_size;
-  uint8_t *buf = malloc((size_t)total);
-  if (!buf) return NULL;
+  uint8_t* buf = malloc((size_t)total);
+  if (!buf)
+    return NULL;
 
   size_t pos = 0;
   memcpy(buf + pos, &delta->new_file_size, sizeof(uint64_t));
@@ -307,8 +311,7 @@ Data *delta_serialize(const Delta *delta) {
     } else {
       memcpy(buf + pos, &delta->instructions[i].literal.length, sizeof(uint32_t));
       pos += sizeof(uint32_t);
-      memcpy(buf + pos, delta->instructions[i].literal.data,
-             delta->instructions[i].literal.length);
+      memcpy(buf + pos, delta->instructions[i].literal.data, delta->instructions[i].literal.length);
       pos += delta->instructions[i].literal.length;
     }
   }
@@ -316,15 +319,16 @@ Data *delta_serialize(const Delta *delta) {
   return data_create(buf, (size_t)total);
 }
 
-Delta *delta_deserialize(const Data *data) {
+Delta* delta_deserialize(const Data* data) {
   if (!data || data->size < sizeof(uint64_t) + sizeof(uint32_t))
     return NULL;
 
-  const uint8_t *buf = (const uint8_t *)data->data;
+  const uint8_t* buf = (const uint8_t*)data->data;
   size_t pos = 0;
 
-  Delta *delta = malloc(sizeof(Delta));
-  if (!delta) return NULL;
+  Delta* delta = malloc(sizeof(Delta));
+  if (!delta)
+    return NULL;
 
   memcpy(&delta->new_file_size, buf + pos, sizeof(uint64_t));
   pos += sizeof(uint64_t);
@@ -372,15 +376,24 @@ Delta *delta_deserialize(const Data *data) {
       delta->delta_size += sizeof(uint32_t) * 3;
     } else if (type == DELTA_OP_LITERAL) {
       if (pos + sizeof(uint32_t) > data->size) {
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
       }
+      delta->instructions[i].type = DELTA_INSTR_LITERAL;
       memcpy(&delta->instructions[i].literal.length, buf + pos, sizeof(uint32_t));
       pos += sizeof(uint32_t);
 
       uint32_t lit_len = delta->instructions[i].literal.length;
       if (pos + lit_len > data->size) {
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
@@ -408,21 +421,22 @@ Delta *delta_deserialize(const Data *data) {
   return delta;
 }
 
-void *delta_apply(const void *old_data, uint64_t old_size, const Delta *delta,
+void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
                   uint32_t block_size) {
-  if (!old_data || !delta) return NULL;
+  if (!old_data || !delta)
+    return NULL;
 
-  void *output = malloc((size_t)delta->new_file_size);
-  if (!output) return NULL;
+  void* output = malloc((size_t)delta->new_file_size);
+  if (!output)
+    return NULL;
 
-  uint8_t *out = (uint8_t *)output;
-  uint8_t *old = (uint8_t *)old_data;
+  uint8_t* out = (uint8_t*)output;
+  const uint8_t* old = (const uint8_t*)old_data;
   uint64_t out_pos = 0;
 
   for (uint32_t i = 0; i < delta->instruction_count; i++) {
     if (delta->instructions[i].type == DELTA_INSTR_BLOCK_MATCH) {
-      uint64_t src_offset = (uint64_t)delta->instructions[i].match.block_index *
-                             block_size;
+      uint64_t src_offset = (uint64_t)delta->instructions[i].match.block_index * block_size;
       src_offset += delta->instructions[i].match.block_offset;
       uint32_t len = delta->instructions[i].match.length;
 
@@ -447,8 +461,9 @@ void *delta_apply(const void *old_data, uint64_t old_size, const Delta *delta,
   return output;
 }
 
-void delta_destroy(Delta *delta) {
-  if (!delta) return;
+void delta_destroy(Delta* delta) {
+  if (!delta)
+    return;
   for (uint32_t i = 0; i < delta->instruction_count; i++) {
     if (delta->instructions[i].type == DELTA_INSTR_LITERAL)
       free(delta->instructions[i].literal.data);
@@ -469,8 +484,9 @@ bool delta_should_attempt(uint64_t old_size, uint64_t new_size, uint64_t max_fil
   return true;
 }
 
-bool delta_is_worthwhile(const Delta *delta, uint64_t new_file_size) {
-  if (!delta || delta->instruction_count == 0) return false;
+bool delta_is_worthwhile(const Delta* delta, uint64_t new_file_size) {
+  if (!delta || delta->instruction_count == 0)
+    return false;
 
   bool has_match = false;
   for (uint32_t i = 0; i < delta->instruction_count; i++) {
@@ -479,7 +495,8 @@ bool delta_is_worthwhile(const Delta *delta, uint64_t new_file_size) {
       break;
     }
   }
-  if (!has_match) return false;
+  if (!has_match)
+    return false;
 
   double ratio = (double)delta->delta_size / (double)new_file_size;
   return ratio < DELTA_FALLBACK_RATIO;
