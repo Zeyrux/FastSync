@@ -72,7 +72,7 @@ void *delta_apply(const void *old_data, uint64_t old_size, const Delta *delta,
                   uint32_t block_size);
 void delta_destroy(Delta *delta);
 
-bool delta_should_attempt(uint64_t old_size, uint64_t new_size);
+bool delta_should_attempt(uint64_t old_size, uint64_t new_size, uint64_t max_file_size);
 bool delta_is_worthwhile(const Delta *delta, uint64_t new_file_size);
 
 uint32_t delta_adler32(const void *data, uint32_t len);

@@ -39,6 +39,7 @@ static void print_usage(void) {
   printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
   printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
+  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n", DELTA_MAX_FILE_SIZE);
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -112,6 +113,12 @@ int main(int argc, char *argv[]) {
         config->delta_block_size = (uint32_t)val;
       else
         fprintf(stderr, "Warning: --delta-block value %llu out of range, using default\n", val);
+    } else if (strcmp(argv[i], "--delta-max") == 0 && i + 1 < argc) {
+      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      if (val >= DELTA_MIN_FILE_SIZE)
+        config->delta_max_file_size = val;
+      else
+        fprintf(stderr, "Warning: --delta-max value %llu too small, using default\n", val);
     } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");

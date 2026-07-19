@@ -238,12 +238,14 @@ static void test_delta_file_shrink() {
 }
 
 static void test_should_attempt() {
-  EXPECT_TRUE(delta_should_attempt(100000, 100000));
-  EXPECT_TRUE(!delta_should_attempt(100, 100));
-  EXPECT_TRUE(!delta_should_attempt(100000, 10));
-  EXPECT_TRUE(!delta_should_attempt(300000000, 300000000));
-  EXPECT_TRUE(delta_should_attempt(50000, 60000));
-  EXPECT_TRUE(!delta_should_attempt(50000, 600000));
+  EXPECT_TRUE(delta_should_attempt(100000, 100000, DELTA_MAX_FILE_SIZE));
+  EXPECT_TRUE(!delta_should_attempt(100, 100, DELTA_MAX_FILE_SIZE));
+  EXPECT_TRUE(!delta_should_attempt(100000, 10, DELTA_MAX_FILE_SIZE));
+  EXPECT_TRUE(!delta_should_attempt(300000000, 300000000, DELTA_MAX_FILE_SIZE));
+  EXPECT_TRUE(delta_should_attempt(50000, 60000, DELTA_MAX_FILE_SIZE));
+  EXPECT_TRUE(!delta_should_attempt(50000, 600000, DELTA_MAX_FILE_SIZE));
+  EXPECT_TRUE(delta_should_attempt(50000, 60000, 500000));
+  EXPECT_TRUE(!delta_should_attempt(100000, 100000, 50000));
 }
 
 static void test_is_worthwhile() {
@@ -266,6 +268,54 @@ static void test_is_worthwhile() {
   EXPECT_TRUE(!delta_is_worthwhile(NULL, 1000));
 }
 
+static void test_large_file_delta() {
+  uint32_t block_size = 8192;
+  uint64_t old_size = 200000;
+  uint64_t new_size = 200000;
+
+  void *old_data = malloc((size_t)old_size);
+  void *new_data = malloc((size_t)new_size);
+  EXPECT_TRUE(old_data != NULL && new_data != NULL);
+
+  for (uint64_t i = 0; i < old_size; i++)
+    ((uint8_t *)old_data)[i] = (uint8_t)(i % 251);
+  memcpy(new_data, old_data, (size_t)old_size);
+
+  uint64_t offset = 100000;
+  uint32_t change_len = 4096;
+  for (uint32_t i = 0; i < change_len; i++)
+    ((uint8_t *)new_data)[offset + i] = (uint8_t)((i * 7 + 13) % 256);
+
+  DeltaSignature *sig = delta_signature_create(old_data, old_size, block_size);
+  EXPECT_TRUE(sig != NULL);
+  EXPECT_TRUE(sig->block_count == (uint32_t)((old_size + block_size - 1) / block_size));
+
+  Delta *delta = delta_compute(new_data, new_size, sig, block_size);
+  EXPECT_TRUE(delta != NULL);
+
+  uint64_t total_literal = 0;
+  uint32_t match_count = 0;
+  for (uint32_t i = 0; i < delta->instruction_count; i++) {
+    if (delta->instructions[i].type == DELTA_INSTR_LITERAL)
+      total_literal += delta->instructions[i].literal.length;
+    else
+      match_count++;
+  }
+  EXPECT_TRUE(match_count > 0);
+  EXPECT_TRUE(delta->delta_size < new_size / 2);
+
+  void *result = delta_apply(old_data, old_size, delta, block_size);
+  EXPECT_TRUE(result != NULL);
+  EXPECT_TRUE(delta->new_file_size == new_size);
+  EXPECT_TRUE(memcmp(result, new_data, (size_t)new_size) == 0);
+
+  free(result);
+  delta_destroy(delta);
+  delta_signature_destroy(sig);
+  free(old_data);
+  free(new_data);
+}
+
 void test_delta() {
   test_adler32_basic();
   test_adler32_different_data();
@@ -280,4 +330,5 @@ void test_delta() {
   test_delta_file_shrink();
   test_should_attempt();
   test_is_worthwhile();
+  test_large_file_delta();
 }

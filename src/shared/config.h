@@ -36,6 +36,7 @@ typedef struct Config {
   bool use_incremental;
   bool use_delta;
   uint32_t delta_block_size;
+  unsigned long long delta_max_file_size;
   bool use_tls;
   char *tls_cert;
   char *tls_key;

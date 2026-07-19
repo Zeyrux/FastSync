@@ -42,6 +42,7 @@ Config *config_create(char *version, char *send_directory,
   config->use_incremental = false;
   config->use_delta = false;
   config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
+  config->delta_max_file_size = DELTA_MAX_FILE_SIZE;
   config->use_tls = false;
   config->tls_cert = NULL;
   config->tls_key = NULL;
@@ -103,6 +104,7 @@ bool config_send(int file_descriptor, Config *config) {
   if (!send_int(file_descriptor, config->use_incremental)) return false;
   if (!send_int(file_descriptor, config->use_delta)) return false;
   if (!send_int(file_descriptor, (int)config->delta_block_size)) return false;
+  if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long))) return false;
   Status status;
   if (!receive_status(file_descriptor, &status)) return false;
   if (status != STATUS_OK) {
@@ -154,6 +156,7 @@ Config *config_receive(int file_descriptor) {
   config->use_delta = tmp;
   if (!receive_int(file_descriptor, &tmp)) goto error;
   config->delta_block_size = (uint32_t)tmp;
+  if (!receive_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long))) goto error;
   config->show_progress = false;
   config->dry_run = false;
   config->ssh_port = 22;

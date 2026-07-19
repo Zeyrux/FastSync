@@ -128,6 +128,33 @@ void delta_signature_destroy(DeltaSignature *sig) {
   free(sig);
 }
 
+static bool ensure_capacity(DeltaInstruction **instrs, uint32_t *capacity,
+                             uint32_t count) {
+  if (count < *capacity) return true;
+  uint32_t new_cap = *capacity * 2;
+  DeltaInstruction *tmp = realloc(*instrs, new_cap * sizeof(DeltaInstruction));
+  if (!tmp) return false;
+  *instrs = tmp;
+  *capacity = new_cap;
+  return true;
+}
+
+static bool flush_literal(DeltaInstruction **instrs, uint32_t *capacity,
+                           uint32_t *count, const uint8_t *data,
+                           uint64_t start, uint64_t end) {
+  if (start >= end) return true;
+  uint32_t lit_len = (uint32_t)(end - start);
+  if (!ensure_capacity(instrs, capacity, *count)) return false;
+  uint8_t *lit_data = malloc(lit_len);
+  if (!lit_data) return false;
+  memcpy(lit_data, data + start, lit_len);
+  (*instrs)[*count].type = DELTA_INSTR_LITERAL;
+  (*instrs)[*count].literal.data = lit_data;
+  (*instrs)[*count].literal.length = lit_len;
+  (*count)++;
+  return true;
+}
+
 Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
                       const DeltaSignature *sig, uint32_t block_size) {
   if (!new_file_data || !sig || new_file_size == 0 || block_size == 0)
@@ -144,49 +171,67 @@ Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
   bool has_literal = false;
 
   uint64_t i = 0;
+
+  uint32_t s1 = 1, s2 = 0;
+  bool rolling_valid = false;
+
   while (i < new_file_size) {
     uint32_t window_len = (uint32_t)((new_file_size - i < block_size)
                                          ? (new_file_size - i)
                                          : block_size);
-    uint32_t adler = delta_adler32(new_data + i, window_len);
-    uint32_t xxh = delta_xxhash32(new_data + i, window_len);
+    bool full_window = (window_len == block_size);
+
+    uint32_t adler;
+    if (rolling_valid && full_window) {
+      uint8_t old_byte = new_data[i - 1];
+      uint8_t new_byte = new_data[i + block_size - 1];
+      s1 = (s1 + DELTA_ADLER32_MODULUS - old_byte + new_byte) %
+           DELTA_ADLER32_MODULUS;
+      s2 = (s2 + DELTA_ADLER32_MODULUS -
+            (uint32_t)((uint64_t)block_size * old_byte % DELTA_ADLER32_MODULUS) +
+            s1 - 1) %
+           DELTA_ADLER32_MODULUS;
+      adler = (s2 << 16) | s1;
+    } else {
+      s1 = 1;
+      s2 = 0;
+      for (uint32_t k = 0; k < window_len; k++) {
+        s1 = (s1 + new_data[i + k]) % DELTA_ADLER32_MODULUS;
+        s2 = (s2 + s1) % DELTA_ADLER32_MODULUS;
+      }
+      adler = (s2 << 16) | s1;
+      rolling_valid = full_window;
+    }
 
     bool matched = false;
     for (uint32_t j = 0; j < sig->block_count; j++) {
-      if (adler == sig->blocks[j].adler32 && xxh == sig->blocks[j].xxhash) {
-        if (has_literal) {
-          uint32_t lit_len = (uint32_t)(i - literal_start);
-          if (count == capacity) {
-            capacity *= 2;
-            DeltaInstruction *tmp = realloc(instrs, capacity * sizeof(DeltaInstruction));
-            if (!tmp) { free(instrs); return NULL; }
-            instrs = tmp;
+      if (adler == sig->blocks[j].adler32 && full_window) {
+        uint32_t xxh = delta_xxhash32(new_data + i, window_len);
+        if (xxh == sig->blocks[j].xxhash) {
+          if (has_literal) {
+            if (!flush_literal(&instrs, &capacity, &count, new_data,
+                               literal_start, i)) {
+              free(instrs);
+              return NULL;
+            }
+            has_literal = false;
           }
-          uint8_t *lit_data = malloc(lit_len);
-          if (!lit_data) { free(instrs); return NULL; }
-          memcpy(lit_data, new_data + literal_start, lit_len);
-          instrs[count].type = DELTA_INSTR_LITERAL;
-          instrs[count].literal.data = lit_data;
-          instrs[count].literal.length = lit_len;
+
+          if (!ensure_capacity(&instrs, &capacity, count)) {
+            free(instrs);
+            return NULL;
+          }
+          instrs[count].type = DELTA_INSTR_BLOCK_MATCH;
+          instrs[count].match.block_index = j;
+          instrs[count].match.block_offset = 0;
+          instrs[count].match.length = window_len;
           count++;
-          has_literal = false;
-        }
 
-        if (count == capacity) {
-          capacity *= 2;
-          DeltaInstruction *tmp = realloc(instrs, capacity * sizeof(DeltaInstruction));
-          if (!tmp) { free(instrs); return NULL; }
-          instrs = tmp;
+          i += window_len;
+          rolling_valid = false;
+          matched = true;
+          break;
         }
-        instrs[count].type = DELTA_INSTR_BLOCK_MATCH;
-        instrs[count].match.block_index = j;
-        instrs[count].match.block_offset = 0;
-        instrs[count].match.length = window_len;
-        count++;
-
-        i += window_len;
-        matched = true;
-        break;
       }
     }
 
@@ -200,20 +245,11 @@ Delta *delta_compute(const void *new_file_data, uint64_t new_file_size,
   }
 
   if (has_literal) {
-    uint32_t lit_len = (uint32_t)(new_file_size - literal_start);
-    if (count == capacity) {
-      capacity *= 2;
-      DeltaInstruction *tmp = realloc(instrs, capacity * sizeof(DeltaInstruction));
-      if (!tmp) { free(instrs); return NULL; }
-      instrs = tmp;
+    if (!flush_literal(&instrs, &capacity, &count, new_data,
+                       literal_start, new_file_size)) {
+      free(instrs);
+      return NULL;
     }
-    uint8_t *lit_data = malloc(lit_len);
-    if (!lit_data) { free(instrs); return NULL; }
-    memcpy(lit_data, new_data + literal_start, lit_len);
-    instrs[count].type = DELTA_INSTR_LITERAL;
-    instrs[count].literal.data = lit_data;
-    instrs[count].literal.length = lit_len;
-    count++;
   }
 
   Delta *delta = malloc(sizeof(Delta));
@@ -421,10 +457,10 @@ void delta_destroy(Delta *delta) {
   free(delta);
 }
 
-bool delta_should_attempt(uint64_t old_size, uint64_t new_size) {
+bool delta_should_attempt(uint64_t old_size, uint64_t new_size, uint64_t max_file_size) {
   if (old_size < DELTA_MIN_FILE_SIZE || new_size < DELTA_MIN_FILE_SIZE)
     return false;
-  if (old_size > DELTA_MAX_FILE_SIZE || new_size > DELTA_MAX_FILE_SIZE)
+  if (old_size > max_file_size || new_size > max_file_size)
     return false;
   double large = (old_size > new_size) ? (double)old_size : (double)new_size;
   double small = (old_size > new_size) ? (double)new_size : (double)old_size;
