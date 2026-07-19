@@ -71,4 +71,53 @@ For each bottleneck found:
 5. **Suggested optimization** — concrete code change or approach
 6. **Expected impact** — estimated speedup or resource savings
 
-Also provide profiling guidance when asked (e.g., `perf`, `valgrind`, `gprof` commands).
+## Profiling Commands
+
+### perf (Linux, recommended)
+```bash
+# Record call graph
+perf record -g ./build/client [args...]
+perf report
+
+# Hardware counters (cache misses, branch mispredictions, etc.)
+perf stat ./build/client [args...]
+
+# Specific events
+perf stat -e cache-misses,cache-references,instructions,cycles ./build/client [args...]
+
+# Flame graph
+perf record -g -F 99 ./build/client [args...]
+perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
+```
+
+### valgrind (memory profiling)
+```bash
+# Callgrind (CPU profiling)
+valgrind --tool=callgrind ./build/client [args...]
+callgrind_annotate callgrind.out.*
+
+# Cachegrind (cache simulation)
+valgrind --tool=cachegrind ./build/client [args...]
+cg_annotate cachegrind.out.*
+
+# Massif (heap profiling)
+valgrind --tool=massif ./build/client [args...]
+ms_print massif.out.*
+```
+
+### gprof
+```bash
+cmake -B build -S . -DCMAKE_C_FLAGS="-pg" -DCMAKE_EXE_LINKER_FLAGS="-pg"
+cmake --build build -j$(nproc)
+./build/client [args...]
+gprof ./build/client gmon.out > analysis.txt
+```
+
+### Time Measurement
+```bash
+# Quick timing
+time ./build/client [args...]
+
+# High precision
+perf stat -e task-clock ./build/client [args...]
+```

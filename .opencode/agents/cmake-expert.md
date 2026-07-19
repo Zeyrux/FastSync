@@ -80,6 +80,67 @@ tests/         — test sources (globbed as TEST_SRCS)
 6. For sanitizer builds, use the commented-out `-fsanitize=address` lines as reference.
 7. Always verify the build compiles after changes.
 
+## Sanitizer Configurations
+
+### AddressSanitizer (memory errors)
+```bash
+cmake -B build -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake --build build -j$(nproc)
+```
+
+### ThreadSanitizer (race conditions)
+```bash
+cmake -B build -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake --build build -j$(nproc)
+```
+
+### UndefinedBehaviorSanitizer
+```bash
+cmake -B build -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
+cmake --build build -j$(nproc)
+```
+
+### Combined Sanitizers
+```bash
+cmake -B build -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build -j$(nproc)
+```
+
+### Using ccache (faster rebuilds)
+```bash
+cmake -B build -S . -DCMAKE_C_COMPILER_LAUNCHER=ccache
+cmake --build build -j$(nproc)
+```
+
+### Cross-Compilation
+```bash
+# ARM cross-compile example
+cmake -B build-arm -S . \
+  -DCMAKE_SYSTEM_NAME=Linux \
+  -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+  -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc
+```
+
+### Release vs Debug Builds
+```bash
+# Release (optimized)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+# Debug (with symbols, no optimization)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
+
+# RelWithDebInfo (optimized + debug symbols)
+cmake -B build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo
+```
+
 ## Build Commands
 
 ```bash
@@ -88,4 +149,33 @@ cmake --build build -j$(nproc)
 ./build/server
 ./build/client
 ./build/tests
+```
+
+## When Adding Sanitizer Support to CMakeLists.txt
+
+Use CMake options for cleaner integration:
+```cmake
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+
+if(ENABLE_ASAN)
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address)
+endif()
+
+if(ENABLE_TSAN)
+  add_compile_options(-fsanitize=thread)
+  add_link_options(-fsanitize=thread)
+endif()
+
+if(ENABLE_UBSAN)
+  add_compile_options(-fsanitize=undefined)
+  add_link_options(-fsanitize=undefined)
+endif()
+```
+
+Then build with:
+```bash
+cmake -B build -S . -DENABLE_ASAN=ON
 ```

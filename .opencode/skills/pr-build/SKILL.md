@@ -32,6 +32,28 @@ cmake --build build -j$(nproc) 2>&1
 
 Capture both stdout and stderr.
 
+### Step 2b: Sanitizer build (if issues suspected)
+
+If the PR touches threading, memory management, or network code, also build with sanitizers:
+
+```bash
+# AddressSanitizer
+rm -rf build-asan
+cmake -B build-asan -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake --build build-asan -j$(nproc)
+./build-asan/tests
+
+# ThreadSanitizer (if threading changes)
+rm -rf build-tsan
+cmake -B build-tsan -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake --build build-tsan -j$(nproc)
+./build-tsan/tests
+```
+
 ### Step 3: Handle build failures
 
 If the build fails, read the error output carefully. Common issues:
@@ -92,6 +114,8 @@ Print a summary:
 Branch: <branch-name>
 Build: [PASS/FAIL]
 Unit tests: [PASS/FAIL] (<passed>/<total>)
+ASan: [CLEAN/ERRORS]
+TSan: [CLEAN/ERRORS/SKIPPED]
 Integration tests: [PASS/FAIL/SKIPPED]
 
 Fixes applied: <count>

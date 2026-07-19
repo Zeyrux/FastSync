@@ -115,6 +115,98 @@ RUN_TEST(test_<module>);
 cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests
 ```
 
+## Fuzzing Targets
+
+When writing fuzzing harnesses, use `AFL++` or `libFuzzer`:
+
+### libFuzzer Harness Example
+```c
+// tests/fuzz_chunk_deserialize.c
+#include "chunk.h"
+#include <stdint.h>
+#include <stdlib.h>
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Create a Data wrapper and try to deserialize
+    Data *input = data_create((void *)data, size);
+    // Exercise the deserialization path
+    // (depends on what function you're fuzzing)
+    data_destroy(input);
+    return 0;
+}
+```
+
+Build for fuzzing:
+```bash
+cmake -B build-fuzz -S . \
+  -DCMAKE_C_FLAGS="-fsanitize=fuzzer,address,undefined -g" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=fuzzer,address,undefined"
+cmake --build build-fuzz -j$(nproc)
+./build-fuzz/tests/fuzz_chunk_deserialize corpus/ -max_len=1048576
+```
+
+### AFL++ Harness
+```c
+// AFL++ uses stdin by default
+#include "protocol.h"
+#include <stdint.h>
+#include <unistd.h>
+
+int main() {
+    uint8_t buf[65536];
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    if (n <= 0) return 0;
+    // Exercise parsing with the input
+    Data *input = data_create(buf, n);
+    data_destroy(input);
+    return 0;
+}
+```
+
+## Integration Test Patterns
+
+When writing integration tests (Python-based), follow the pattern in `test.py`:
+
+### Minimal Integration Test
+```python
+def test_basic_transfer():
+    # Setup
+    source = create_test_files()
+    dest = tempfile.mkdtemp()
+    
+    # Start server
+    server = subprocess.Popen(["./build/server"], ...)
+    time.sleep(0.5)
+    
+    # Run client
+    result = subprocess.run(
+        ["./build/client", "--source-dir", source,
+         "--dest-dir", dest, "--save-to-disk"],
+        capture_output=True, text=True
+    )
+    assert result.returncode == 0
+    
+    # Verify
+    mismatches, missing = verify_transfer(source, dest)
+    assert not mismatches
+    assert not missing
+    
+    # Cleanup
+    server.terminate()
+```
+
+### Edge Case Tests to Write
+- Empty directory sync
+- Single file sync
+- Very large file (> chunk size)
+- Many small files (1000+)
+- Path with spaces/special characters
+- Symlinks in source
+- Permission-restricted files
+- Network interruption mid-transfer
+- Server crash during transfer
+- Concurrent clients (if supported)
+
 ## Output
 
 When asked to write tests, produce:
@@ -122,3 +214,4 @@ When asked to write tests, produce:
 2. The test source file content
 3. The runner.c modification needed
 4. Verify with a build and test run
+5. Suggest fuzzing targets if relevant

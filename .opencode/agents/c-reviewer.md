@@ -52,6 +52,18 @@ Review C source files for correctness, safety, and style. You have deep knowledg
 - No deadlock potential — consistent lock ordering.
 - `done` flags checked properly in consumer loops.
 
+### Security
+- No `strcpy`/`strcat`/`sprintf` — use `snprintf` with bounds.
+- `malloc` size calculations don't overflow (`count * sizeof(...)` checked).
+- Path traversal prevention: no `..` in received filenames.
+- No fixed-size stack buffers for unbounded network input.
+- TLS error codes checked after `SSL_read`/`SSL_write`.
+- No hardcoded certificates, keys, or credentials.
+- Private key file permissions checked.
+- Received file permissions validated (no SUID/SGID injection).
+- Symlink attack prevention in destination directory.
+- Denial of service: bounded memory allocation, malformed messages handled gracefully.
+
 ### Protocol Safety
 - `send_n_data` / `receive_n_data` return values checked.
 - Status codes validated before use.
@@ -69,7 +81,7 @@ Review C source files for correctness, safety, and style. You have deep knowledg
 For each issue found, report:
 1. **File and line** — exact location
 2. **Severity** — critical / warning / style
-3. **Category** — memory / thread / protocol / style
+3. **Category** — memory / thread / protocol / security / style
 4. **Description** — what's wrong and how to fix it
 
 If the code is clean, say so explicitly. Be concise — don't pad with fluff.

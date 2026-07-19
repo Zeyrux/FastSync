@@ -69,12 +69,29 @@ For each changed file, review for:
 - Functions return appropriate error values
 - Error messages are useful
 
+**Security**
+- No `strcpy`/`strcat`/`sprintf` — use `snprintf` with bounds
+- `malloc` size calculations don't overflow
+- Path traversal prevention (`..` in filenames)
+- No fixed-size stack buffers for unbounded input
+- TLS error codes checked after `SSL_read`/`SSL_write`
+- No hardcoded certificates, keys, or credentials
+- Received file permissions validated (no SUID/SGID injection)
+- Denial of service: bounded memory, malformed messages handled
+
+**Performance Impact**
+- Unnecessary memory copies in hot paths
+- Excessive malloc/free in tight loops
+- Missing `sendfile()` opportunity for large files
+- Compression level appropriate for use case
+- Queue sizing appropriate for workload
+
 ### Step 5: Categorize findings
 
 For each issue:
 1. **File:line** — exact location
 2. **Severity** — critical / warning / style
-3. **Category** — memory / thread / protocol / logic / error
+3. **Category** — memory / thread / protocol / security / performance / logic / error
 4. **Description** — what's wrong and how to fix it
 
 ### Step 6: Output report
