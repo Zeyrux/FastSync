@@ -5,7 +5,7 @@
 
 #define XXH_STATIC_LINKING_ONLY
 #define XXH_IMPLEMENTATION
-#include "xxhash.h"
+#include <xxhash.h>
 
 uint32_t delta_adler32(const void *data, uint32_t len) {
   const uint8_t *p = (const uint8_t *)data;
