@@ -28,6 +28,15 @@ if(STRICT_WARNINGS)
 	add_compile_options(-Wextra -Wpedantic -Werror)
 endif()
 
+include(FetchContent)
+FetchContent_Declare(
+  xxhash
+  GIT_REPOSITORY https://github.com/Cyan4973/xxHash
+  GIT_TAG v0.8.3
+  SOURCE_SUBDIR cmake_unofficial
+)
+FetchContent_MakeAvailable(xxhash)
+
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
@@ -45,13 +54,13 @@ file(GLOB TEST_SRCS "tests/*.c")
 
 add_executable(server ${SERVER_SRCS} ${SHARED_SRCS})
 target_include_directories(server PRIVATE src/shared src/server src/client)
-target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
-target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
 target_include_directories(tests PRIVATE tests src/shared src/server src/client)
-target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 

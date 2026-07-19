@@ -15,7 +15,9 @@ enum NET_STATUS {
   STATUS_NEXT,
   STATUS_CHUNK,
   STATUS_MANIFEST,
-  STATUS_CHECK
+  STATUS_CHECK,
+  STATUS_DELTA_SIGNATURE,
+  STATUS_DELTA_DATA
 };
 
 void io_set_fds(int read_fd, int write_fd);

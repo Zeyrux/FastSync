@@ -1,5 +1,6 @@
 #include "client_send.h"
 #include "config.h"
+#include "delta.h"
 #include "log.h"
 #include "protocol.h"
 #include "transport_tls.h"
@@ -36,6 +37,9 @@ static void print_usage(void) {
   printf("  --max-size <n>      Skip files larger than n bytes\n");
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --incremental       Skip files unchanged since last transfer\n");
+  printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
+  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
+  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n", DELTA_MAX_FILE_SIZE);
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
@@ -102,6 +106,20 @@ int main(int argc, char* argv[]) {
       config->min_size = strtoull(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "--incremental") == 0) {
       config->use_incremental = true;
+    } else if (strcmp(argv[i], "--delta") == 0) {
+      config->use_delta = true;
+    } else if (strcmp(argv[i], "--delta-block") == 0 && i + 1 < argc) {
+      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
+        config->delta_block_size = (uint32_t)val;
+      else
+        fprintf(stderr, "Warning: --delta-block value %llu out of range, using default\n", val);
+    } else if (strcmp(argv[i], "--delta-max") == 0 && i + 1 < argc) {
+      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      if (val >= DELTA_MIN_FILE_SIZE)
+        config->delta_max_file_size = val;
+      else
+        fprintf(stderr, "Warning: --delta-max value %llu too small, using default\n", val);
     } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
@@ -229,6 +247,23 @@ int main(int argc, char* argv[]) {
 
   if (config->use_incremental && !config->use_metadata) {
     log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
+    config->use_metadata = true;
+  }
+
+  if (config->use_delta && !config->use_incremental) {
+    fprintf(stderr, "Error: --delta requires --incremental\n");
+    return 1;
+  }
+  if (config->use_delta && config->use_chunk_serialization) {
+    fprintf(stderr, "Error: --delta cannot be combined with -s (chunk serialization)\n");
+    return 1;
+  }
+  if (config->use_delta && config->use_sendfile) {
+    fprintf(stderr, "Error: --delta cannot be combined with -f (sendfile)\n");
+    return 1;
+  }
+  if (config->use_delta && !config->use_metadata) {
+    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --delta");
     config->use_metadata = true;
   }
 
