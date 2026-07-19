@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/root/FastSyncProjects/FastSyncHuman/build-asan/_deps/xxhash-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

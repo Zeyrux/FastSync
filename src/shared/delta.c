@@ -376,15 +376,24 @@ Delta* delta_deserialize(const Data* data) {
       delta->delta_size += sizeof(uint32_t) * 3;
     } else if (type == DELTA_OP_LITERAL) {
       if (pos + sizeof(uint32_t) > data->size) {
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
       }
+      delta->instructions[i].type = DELTA_INSTR_LITERAL;
       memcpy(&delta->instructions[i].literal.length, buf + pos, sizeof(uint32_t));
       pos += sizeof(uint32_t);
 
       uint32_t lit_len = delta->instructions[i].literal.length;
       if (pos + lit_len > data->size) {
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
