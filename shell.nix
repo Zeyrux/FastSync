@@ -15,6 +15,7 @@ pkgs.mkShell {
   buildInputs = with pkgs; [
     zstd
     openssl
+    (python3.withPackages (ps: with ps; [ pytest ]))
   ];
 
   NIX_ENFORCE_PURITY = 0;

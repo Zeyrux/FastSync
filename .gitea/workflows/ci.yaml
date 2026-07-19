@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v5
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v6
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,4 +20,4 @@ jobs:
         run: ./build/tests
 
       - name: Integration Tests
-        run: python3 test.py
+        run: python3 -m pytest tests/ -v --tb=short
