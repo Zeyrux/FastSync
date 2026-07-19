@@ -126,6 +126,35 @@ static void test_delta_signature_deserialize_truncated() {
   delta_signature_destroy(sig);
 }
 
+static void test_delta_deserialize_truncated_instructions() {
+  // Create a real delta with 2 LITERAL instructions, serialize, then
+  // truncate after the header so the instruction-loop error paths are
+  // exercised (earlier tests with tiny buffers die at the 12-byte
+  // header guard and never reach the instruction decoder).
+  char old_data[4096], new_data[4096];
+  for (int i = 0; i < 4096; i++) {
+    old_data[i] = (char)(i % 256);
+    new_data[i] = old_data[i];
+  }
+  // Two small changes to produce 2 LITERAL instructions
+  new_data[100] = 'X';
+  new_data[200] = 'Y';
+
+  DeltaSignature* sig = delta_signature_create(old_data, 4096, 1024);
+  Delta* delta = delta_compute(new_data, 4096, sig, 1024);
+  Data* serialized = delta_serialize(delta);
+  EXPECT_NOT_NULL(serialized);
+
+  // Truncate to include the header (12 bytes) + partial first instruction
+  serialized->size = 14;
+  const Delta* result = delta_deserialize(serialized);
+  EXPECT_NULL(result);
+
+  data_destroy(serialized);
+  delta_destroy(delta);
+  delta_signature_destroy(sig);
+}
+
 static void test_delta_apply_null() {
   const void* result = delta_apply(NULL, 0, NULL, 0);
   EXPECT_NULL(result);
@@ -177,6 +206,7 @@ void test_robustness() {
   test_delta_deserialize_truncated();
   test_delta_deserialize_empty();
   test_delta_deserialize_garbage();
+  test_delta_deserialize_truncated_instructions();
   test_delta_signature_deserialize_truncated();
   test_delta_apply_null();
   test_protocol_receive_n_data_closed_pipe();

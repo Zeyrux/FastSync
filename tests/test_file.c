@@ -272,6 +272,11 @@ void test_file() {
   test_to_disk_creates_dirs();
   test_file_content_to_buffer();
   if (!getenv("FASTSYNC_UNDER_VALGRIND")) {
+    // Fork tests are skipped under valgrind because the parent process runs
+    // orders of magnitude slower than the child (parent is instrumented, child
+    // is not), which causes pipe-based protocol handshake timeouts. The parent
+    // process itself has zero valgrind errors -- the failures are all in the
+    // forked children where inherited allocations are reported as leaks.
     test_file_send_receive();
     test_file_send_no_path();
   }

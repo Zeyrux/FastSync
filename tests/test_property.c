@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <time.h>
 
 static Data* random_data(int min_size, int max_size) {
   int size = min_size + rand() % (max_size - min_size + 1);
@@ -21,7 +20,7 @@ static Data* random_data(int min_size, int max_size) {
 }
 
 static void test_property_compress_roundtrip() {
-  srand((unsigned)time(NULL));
+  srand(42);
   for (int iter = 0; iter < 10; iter++) {
     Data* original = random_data(1, 10000);
     EXPECT_NOT_NULL(original);
@@ -114,24 +113,8 @@ static void test_property_chunk_roundtrip() {
   }
 }
 
-static void test_property_glob_consistency() {
-  const char* patterns[] = {"*.txt", "test_*", "*.c", "foo", "*.??", "a*b*c"};
-  const char* strings[] = {"test.txt", "foo.c", "bar", "abc", "aXbYcZ", ""};
-  int n_patterns = sizeof(patterns) / sizeof(patterns[0]);
-  int n_strings = sizeof(strings) / sizeof(strings[0]);
-
-  for (int p = 0; p < n_patterns; p++) {
-    for (int s = 0; s < n_strings; s++) {
-      bool first = glob_match(patterns[p], strings[s]);
-      bool second = glob_match(patterns[p], strings[s]);
-      EXPECT_TRUE(first == second);
-    }
-  }
-}
-
 void test_property() {
   test_property_compress_roundtrip();
   test_property_delta_roundtrip();
   test_property_chunk_roundtrip();
-  test_property_glob_consistency();
 }

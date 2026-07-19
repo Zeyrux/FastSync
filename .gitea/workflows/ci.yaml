@@ -42,7 +42,7 @@ jobs:
     needs: lint
     strategy:
       matrix:
-        sanitizer: [address]
+        sanitizer: [address, undefined]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,6 +55,23 @@ jobs:
 
       - name: Unit Tests
         run: ctest --test-dir build-${{ matrix.sanitizer }} --output-on-failure
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang
+        run: apt-get update -qq && apt-get install -y -qq clang
+
+      - name: Configure (clang + fuzz)
+        run: CC=clang CXX=clang++ cmake -B build-fuzz -S . -DENABLE_FUZZ=ON
+
+      - name: Build fuzz targets
+        run: cmake --build build-fuzz -j$(nproc)
 
   coverage:
     runs-on: ubuntu-latest
@@ -79,7 +96,7 @@ jobs:
       - name: Coverage Report
         run: |
           lcov --capture --directory build --output-file coverage.info --branch-coverage
-          lcov --remove coverage.info '/usr/*' '*/tests/*' --output-file coverage.info --branch-coverage --ignore-errors unused
+          lcov --remove coverage.info '/usr/*' '*/tests/*' '*/_deps/*' --output-file coverage.info --branch-coverage --ignore-errors unused
           lcov --list coverage.info
 
   valgrind:
