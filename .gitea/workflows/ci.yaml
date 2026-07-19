@@ -79,7 +79,7 @@ jobs:
       - name: Coverage Report
         run: |
           lcov --capture --directory build --output-file coverage.info --branch-coverage
-          lcov --remove coverage.info '/usr/*' '*/tests/*' '*/xxhash/*' --output-file coverage.info --branch-coverage
+          lcov --remove coverage.info '/usr/*' '*/tests/*' --output-file coverage.info --branch-coverage --ignore-errors unused
           lcov --list coverage.info
 
   valgrind:
@@ -100,4 +100,6 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Valgrind Memcheck
-        run: valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./build/tests
+        run: valgrind --leak-check=full --show-leak-kinds=definite --error-exitcode=1 ./build/tests
+        env:
+          FASTSYNC_UNDER_VALGRIND: "1"

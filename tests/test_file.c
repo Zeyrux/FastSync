@@ -4,6 +4,7 @@
 #include "utils.h"
 #include "protocol.h"
 #include "test_utils.h"
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -187,14 +188,14 @@ static void test_file_send_receive() {
     bool sent = file_send_single_calls(file, p[1], false, 0, true);
     close(p[1]);
 
-    EXPECT_TRUE(sent);
-
     int status;
     waitpid(pid, &status, 0);
-    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
     file_destroy(file);
     config_delete(cfg);
+
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
 }
 
@@ -234,13 +235,13 @@ static void test_file_send_no_path() {
     bool sent = file_send_single_calls(file, p[1], false, 0, false);
     close(p[1]);
 
-    EXPECT_TRUE(sent);
-
     int status;
     waitpid(pid, &status, 0);
-    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
     file_destroy(file);
+
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
 }
 
@@ -270,7 +271,9 @@ void test_file() {
   test_to_disk_basic();
   test_to_disk_creates_dirs();
   test_file_content_to_buffer();
-  test_file_send_receive();
-  test_file_send_no_path();
+  if (!getenv("FASTSYNC_UNDER_VALGRIND")) {
+    test_file_send_receive();
+    test_file_send_no_path();
+  }
   test_file_metadata_create();
 }

@@ -3,3 +3,4 @@ data_copied
 test_data/
 __pycache__/
 build-asan
+coverage.info
