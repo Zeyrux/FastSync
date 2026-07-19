@@ -7,9 +7,26 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_compile_options(-Wall -g -O3)
-# add_compile_options(-Wall -g -O1 -fsanitize=address)
 
-# add_link_options(-fsanitize=address)
+# --- Sanitizer option ---
+set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, none)")
+set_property(CACHE SANITIZER PROPERTY STRINGS address thread none)
+
+if(SANITIZER STREQUAL "address")
+	add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+	add_link_options(-fsanitize=address)
+elseif(SANITIZER STREQUAL "thread")
+	add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+	add_link_options(-fsanitize=thread)
+elseif(NOT SANITIZER STREQUAL "none")
+	message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, none")
+endif()
+
+# --- Strict warnings option ---
+option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Werror)" OFF)
+if(STRICT_WARNINGS)
+	add_compile_options(-Wextra -Wpedantic -Werror)
+endif()
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)

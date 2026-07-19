@@ -68,7 +68,7 @@ bool send_n_data(int file_descriptor, void *data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   int fd = io_fd(io_write_fd, file_descriptor);
   ssize_t total_bytes_send = 0;
-  while (total_bytes_send < data_size) {
+  while ((size_t)total_bytes_send < data_size) {
     size_t chunk = data_size - total_bytes_send;
     if (io_bwlimit > 0 && chunk > 65536)
       chunk = 65536;

@@ -7,6 +7,7 @@
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
 
 Data *data_compress(Data *data_to_compress, int compression_level) {
+  (void)compression_level;
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data *compressed_data = data_create_empty(dst_size);

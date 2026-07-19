@@ -3,15 +3,32 @@ name: CI
 on: [push, pull_request]
 
 jobs:
-  build-and-test:
+  lint:
     runs-on: ubuntu-latest
     container: gitea.tap-tap.win/taptap/fastsync-ci:v6
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install lint tools
+        run: apt-get update && apt-get install -y cppcheck clang-format
+
+      - name: clang-format check
+        run: clang-format --dry-run --Werror src/ tests/
+
+      - name: cppcheck
+        run: cppcheck --enable=warning,style,performance,portability --suppress=missingIncludeSystem --error-exitcode=1 --inline-suppr src/ tests/
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v6
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure
-        run: cmake -B build -S .
+        run: cmake -B build -S . -DSTRICT_WARNINGS=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)
@@ -21,3 +38,23 @@ jobs:
 
       - name: Integration Tests
         run: python3 -m pytest tests/ -v --tb=short
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v6
+    needs: lint
+    strategy:
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build-${{ matrix.sanitizer }} -S . -DSANITIZER=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build build-${{ matrix.sanitizer }} -j$(nproc)
+
+      - name: Unit Tests
+        run: ./build-${{ matrix.sanitizer }}/tests
