@@ -99,7 +99,7 @@ bool file_load_data(File* file) {
 
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
-  Data* data_to_send = file->data;
+  const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
   if (compression_level > 0) {
     compressed_data = data_compress(file->data, compression_level);

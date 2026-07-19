@@ -87,7 +87,7 @@ void config_delete(Config* config) {
   free(config);
 }
 
-bool config_send(int file_descriptor, Config* config) {
+bool config_send(int file_descriptor, const Config* config) {
   if (!send_str(file_descriptor, config->version))
     return false;
   if (!send_str(file_descriptor, config->send_directory))

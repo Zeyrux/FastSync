@@ -44,7 +44,7 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
                       bool use_compression, bool use_metadata, int compression_level,
                       bool use_sendfile, unsigned long long chunk_size);
 void config_delete(Config* config);
-bool config_send(int file_descriptor, Config* config);
+bool config_send(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
 bool is_remote_dest(const char* s);
 void config_parse_ssh_dest(Config* config);
