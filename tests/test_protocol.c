@@ -128,7 +128,7 @@ static void test_send_receive_status() {
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
-  Status statuses[] = {STATUS_OK, STATUS_ERROR, STATUS_FINISHED, STATUS_NEXT,
+  Status statuses[] = {STATUS_OK,    STATUS_ERROR, STATUS_FINISHED,        STATUS_NEXT,
                        STATUS_CHUNK, STATUS_CHECK, STATUS_DELTA_SIGNATURE, STATUS_DELTA_DATA};
   int count = sizeof(statuses) / sizeof(statuses[0]);
 

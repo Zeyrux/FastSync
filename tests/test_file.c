@@ -153,8 +153,8 @@ static void test_file_send_receive() {
   memcpy(file->data->data, content, len);
   file->data->size = len;
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
+                              false, false, false, false, 0, false, 0);
 
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);

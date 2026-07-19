@@ -51,7 +51,7 @@ static int mpmc_consumer_func(void* arg) {
   ConsumerMPMC* ctx = (ConsumerMPMC*)arg;
   while (true) {
     int* val = (int*)queue_dequeue_multithreaded(ctx->q, ctx->mutex, ctx->cnd_empty, ctx->cnd_full,
-                                                  (const bool*)ctx->producers_done);
+                                                 (const bool*)ctx->producers_done);
     if (val == NULL)
       break;
     free(val);
@@ -73,11 +73,11 @@ static void test_queue_mpmc_stress() {
   volatile bool producers_done = false;
 
   ConsumerMPMC cctx = {.q = q,
-                        .mutex = &mutex,
-                        .cnd_empty = &cnd_empty,
-                        .cnd_full = &cnd_full,
-                        .producers_remaining = &producers_remaining,
-                        .producers_done = &producers_done};
+                       .mutex = &mutex,
+                       .cnd_empty = &cnd_empty,
+                       .cnd_full = &cnd_full,
+                       .producers_remaining = &producers_remaining,
+                       .producers_done = &producers_done};
 
   thrd_t consumers[NUM_CONSUMERS];
   for (int i = 0; i < NUM_CONSUMERS; i++) {
@@ -88,11 +88,8 @@ static void test_queue_mpmc_stress() {
   ProducerCtx pctxs[NUM_PRODUCERS];
   thrd_t producers[NUM_PRODUCERS];
   for (int i = 0; i < NUM_PRODUCERS; i++) {
-    pctxs[i] = (ProducerCtx){.q = q,
-                              .mutex = &mutex,
-                              .cnd_empty = &cnd_empty,
-                              .cnd_full = &cnd_full,
-                              .producer_id = i};
+    pctxs[i] = (ProducerCtx){
+        .q = q, .mutex = &mutex, .cnd_empty = &cnd_empty, .cnd_full = &cnd_full, .producer_id = i};
     int res = thrd_create(&producers[i], mpmc_producer_func, &pctxs[i]);
     EXPECT_EQ_INT(res, thrd_success);
   }
@@ -144,7 +141,7 @@ static int bp_consumer_func(void* arg) {
   BackpressureCtx* ctx = (BackpressureCtx*)arg;
   while (ctx->items_received < 5) {
     int* val = (int*)queue_dequeue_multithreaded(ctx->q, ctx->mutex, ctx->cnd_empty, ctx->cnd_full,
-                                                  &ctx->done);
+                                                 &ctx->done);
     if (val == NULL)
       break;
     ctx->items_received++;
@@ -164,12 +161,12 @@ static void test_queue_backpressure() {
   cnd_init(&cnd_full);
 
   BackpressureCtx ctx = {.q = q,
-                          .mutex = &mutex,
-                          .cnd_empty = &cnd_empty,
-                          .cnd_full = &cnd_full,
-                          .items_sent = 0,
-                          .items_received = 0,
-                          .done = false};
+                         .mutex = &mutex,
+                         .cnd_empty = &cnd_empty,
+                         .cnd_full = &cnd_full,
+                         .items_sent = 0,
+                         .items_received = 0,
+                         .done = false};
 
   thrd_t producer, consumer;
   int res;
