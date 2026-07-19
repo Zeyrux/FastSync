@@ -22,11 +22,12 @@
 #include <threads.h>
 #include <time.h>
 
-static int incremental_check(Client *client, File *file,
-                              DeltaSignature **out_sig) {
+static int incremental_check(Client* client, File* file, DeltaSignature** out_sig) {
   *out_sig = NULL;
-  if (!send_status(client->file_descriptor, STATUS_CHECK)) return -1;
-  if (!send_str(client->file_descriptor, file->path)) return -1;
+  if (!send_status(client->file_descriptor, STATUS_CHECK))
+    return -1;
+  if (!send_str(client->file_descriptor, file->path))
+    return -1;
   unsigned long long fsize = file->data->size;
   long long mtime = file->metadata ? file->metadata->mtime_sec : 0;
   if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize)))
@@ -40,13 +41,16 @@ static int incremental_check(Client *client, File *file,
     log_message(LOG_LEVEL_ERROR, "Server reported error for file");
     return -1;
   }
-  if (s == STATUS_OK) return 1;
+  if (s == STATUS_OK)
+    return 1;
   if (s == STATUS_DELTA_SIGNATURE) {
-    Data *sig_data = receive_data(client->file_descriptor);
-    if (!sig_data) return -1;
-    DeltaSignature *sig = delta_signature_deserialize(sig_data);
+    Data* sig_data = receive_data(client->file_descriptor);
+    if (!sig_data)
+      return -1;
+    DeltaSignature* sig = delta_signature_deserialize(sig_data);
     data_destroy(sig_data);
-    if (!sig) return -1;
+    if (!sig)
+      return -1;
     *out_sig = sig;
     return 2;
   }
@@ -57,27 +61,29 @@ static int incremental_check(Client *client, File *file,
   return 0;
 }
 
-static int send_delta(Client *client, File *file, DeltaSignature *sig,
-                       Config *config) {
-  Delta *delta = delta_compute(file->data->data, file->data->size,
-                                sig, config->delta_block_size);
-  if (!delta) return 1;
+static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* config) {
+  Delta* delta = delta_compute(file->data->data, file->data->size, sig, config->delta_block_size);
+  if (!delta)
+    return 1;
 
   if (!delta_is_worthwhile(delta, file->data->size)) {
     delta_destroy(delta);
-    if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
+    if (!send_status(client->file_descriptor, STATUS_NEXT))
+      return -1;
     return 1;
   }
 
-  Data *delta_data = delta_serialize(delta);
+  Data* delta_data = delta_serialize(delta);
   delta_destroy(delta);
-  if (!delta_data) return -1;
+  if (!delta_data)
+    return -1;
 
-  Data *to_send = delta_data;
+  Data* to_send = delta_data;
   if (config->use_compression) {
     to_send = data_compress(delta_data, config->compression_level);
     data_destroy(delta_data);
-    if (!to_send) return -1;
+    if (!to_send)
+      return -1;
   }
 
   bool ok = send_status(client->file_descriptor, STATUS_DELTA_DATA) &&
@@ -90,19 +96,26 @@ static int send_delta(Client *client, File *file, DeltaSignature *sig,
   return ok ? 0 : -1;
 }
 
-typedef bool (*file_send_fn)(File *, int, bool, int, bool);
+typedef bool (*file_send_fn)(File*, int, bool, int, bool);
 
-static int send_file_incremental(Client *client, File *file, Config *config,
-                                  file_send_fn send_fn) {
-  DeltaSignature *sig = NULL;
+static int send_file_incremental(Client* client, File* file, Config* config, file_send_fn send_fn) {
+  DeltaSignature* sig = NULL;
   int rc = incremental_check(client, file, &sig);
-  if (rc < 0) { delta_signature_destroy(sig); return -1; }
-  if (rc == 1) { delta_signature_destroy(sig); return 1; }
+  if (rc < 0) {
+    delta_signature_destroy(sig);
+    return -1;
+  }
+  if (rc == 1) {
+    delta_signature_destroy(sig);
+    return 1;
+  }
   if (rc == 2 && config->use_delta) {
     int drc = send_delta(client, file, sig, config);
     delta_signature_destroy(sig);
-    if (drc == 0) return 0;
-    if (drc < 0) return -1;
+    if (drc == 0)
+      return 0;
+    if (drc < 0)
+      return -1;
   } else {
     delta_signature_destroy(sig);
   }
@@ -112,7 +125,7 @@ static int send_file_incremental(Client *client, File *file, Config *config,
   return 0;
 }
 
-int send_chunk(Client *client, Chunk *chunk, Config *config) {
+int send_chunk(Client* client, Chunk* chunk, Config* config) {
   if (config->use_chunk_serialization) {
     if (!send_status(client->file_descriptor, STATUS_CHUNK))
       return -1;
@@ -133,12 +146,16 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     for (int i = 0; i < chunk->element_count; i++) {
       if (config->use_incremental) {
         int rc = send_file_incremental(client, chunk->items[i], config,
-                                        (file_send_fn)file_send_sendfile);
-        if (rc == 1) continue;
-        if (rc < 0) return -1;
+                                       (file_send_fn)file_send_sendfile);
+        if (rc == 1)
+          continue;
+        if (rc < 0)
+          return -1;
       } else {
-        if (!send_status(client->file_descriptor, STATUS_NEXT)) return -1;
-        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata, 0, true))
+        if (!send_status(client->file_descriptor, STATUS_NEXT))
+          return -1;
+        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata, 0,
+                                true))
           return -1;
       }
     }
@@ -146,9 +163,11 @@ int send_chunk(Client *client, Chunk *chunk, Config *config) {
     for (int i = 0; i < chunk->element_count; i++) {
       if (config->use_incremental) {
         int rc = send_file_incremental(client, chunk->items[i], config,
-                                        (file_send_fn)file_send_single_calls);
-        if (rc == 1) continue;
-        if (rc < 0) return -1;
+                                       (file_send_fn)file_send_single_calls);
+        if (rc == 1)
+          continue;
+        if (rc < 0)
+          return -1;
       } else {
         if (!send_status(client->file_descriptor, STATUS_NEXT))
           return -1;

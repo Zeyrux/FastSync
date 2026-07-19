@@ -137,33 +137,50 @@ bool file_save_to_disk(const char* root_directory, File* file) {
   return ok;
 }
 
-static void *old_data_from_path(const char *full_path, unsigned long long old_size) {
-  void *data = malloc((size_t)old_size);
-  if (!data) return NULL;
-  FILE *fp = fopen(full_path, "rb");
-  if (!fp) { free(data); return NULL; }
+static void* old_data_from_path(const char* full_path, unsigned long long old_size) {
+  void* data = malloc((size_t)old_size);
+  if (!data)
+    return NULL;
+  FILE* fp = fopen(full_path, "rb");
+  if (!fp) {
+    free(data);
+    return NULL;
+  }
   size_t nread = fread(data, 1, (size_t)old_size, fp);
   fclose(fp);
-  if (nread != (size_t)old_size) { free(data); return NULL; }
+  if (nread != (size_t)old_size) {
+    free(data);
+    return NULL;
+  }
   return data;
 }
 
-static File *receive_delta_file(int fd, const Config *config, const char *check_path,
-                                 void *old_data, unsigned long long old_size) {
-  if (!old_data) return NULL;
+static File* receive_delta_file(int fd, const Config* config, const char* check_path,
+                                void* old_data, unsigned long long old_size) {
+  if (!old_data)
+    return NULL;
 
-  DeltaSignature *sig = delta_signature_create(old_data, old_size,
-                                                config->delta_block_size);
-  if (!sig) { free(old_data); return NULL; }
+  DeltaSignature* sig = delta_signature_create(old_data, old_size, config->delta_block_size);
+  if (!sig) {
+    free(old_data);
+    return NULL;
+  }
 
-  Data *sig_data = delta_signature_serialize(sig);
-  if (!sig_data) { delta_signature_destroy(sig); free(old_data); return NULL; }
+  Data* sig_data = delta_signature_serialize(sig);
+  if (!sig_data) {
+    delta_signature_destroy(sig);
+    free(old_data);
+    return NULL;
+  }
 
-  bool sig_sent = send_status(fd, STATUS_DELTA_SIGNATURE) &&
-                  send_data(fd, sig_data);
+  bool sig_sent = send_status(fd, STATUS_DELTA_SIGNATURE) && send_data(fd, sig_data);
   data_destroy(sig_data);
 
-  if (!sig_sent) { delta_signature_destroy(sig); free(old_data); return NULL; }
+  if (!sig_sent) {
+    delta_signature_destroy(sig);
+    free(old_data);
+    return NULL;
+  }
 
   Status resp;
   if (!receive_status(fd, &resp)) {
@@ -173,7 +190,7 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
   }
 
   if (resp == STATUS_DELTA_DATA) {
-    Data *delta_data = receive_data(fd);
+    Data* delta_data = receive_data(fd);
     if (!delta_data) {
       delta_signature_destroy(sig);
       free(old_data);
@@ -181,7 +198,7 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
       return NULL;
     }
 
-    Data *raw_delta = delta_data;
+    Data* raw_delta = delta_data;
     if (config->use_compression) {
       raw_delta = data_decompress(delta_data);
       data_destroy(delta_data);
@@ -193,7 +210,7 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
       }
     }
 
-    Delta *delta = delta_deserialize(raw_delta);
+    Delta* delta = delta_deserialize(raw_delta);
     data_destroy(raw_delta);
     if (!delta) {
       free(old_data);
@@ -202,8 +219,7 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
       return NULL;
     }
 
-    void *new_data = delta_apply(old_data, old_size, delta,
-                                  config->delta_block_size);
+    void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
     uint64_t new_size = delta->new_file_size;
     delta_destroy(delta);
 
@@ -214,7 +230,7 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
       return NULL;
     }
 
-    File *file = file_create(check_path);
+    File* file = file_create(check_path);
     if (!file) {
       free(new_data);
       free(old_data);
@@ -248,16 +264,23 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
     delta_signature_destroy(sig);
     free(old_data);
 
-    File *file = file_create(check_path);
-    if (!file) { send_status(fd, STATUS_ERROR); return NULL; }
+    File* file = file_create(check_path);
+    if (!file) {
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
 
     if (config->use_metadata) {
       int meta_ok = 1;
       file->metadata = metadata_receive(fd, &meta_ok);
-      if (!meta_ok) { file_destroy(file); send_status(fd, STATUS_ERROR); return NULL; }
+      if (!meta_ok) {
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return NULL;
+      }
     }
 
-    Data *file_data = receive_data(fd);
+    Data* file_data = receive_data(fd);
     if (file_data == NULL) {
       file_destroy(file);
       send_status(fd, STATUS_ERROR);
@@ -265,9 +288,13 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
     }
 
     if (config->use_compression) {
-      Data *uncompressed = data_decompress(file_data);
+      Data* uncompressed = data_decompress(file_data);
       data_destroy(file_data);
-      if (uncompressed == NULL) { file_destroy(file); send_status(fd, STATUS_ERROR); return NULL; }
+      if (uncompressed == NULL) {
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return NULL;
+      }
       file_data = uncompressed;
     }
 
@@ -284,7 +311,10 @@ static File *receive_delta_file(int fd, const Config *config, const char *check_
 File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   *skipped = false;
   char* check_path = receive_str(fd);
-  if (check_path == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
+  if (check_path == NULL) {
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
 
   unsigned long long check_size;
   long long check_mtime;
@@ -300,12 +330,15 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   bool has_old_file = (full_path && stat(full_path, &st) == 0);
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
 
-  bool match = has_old_file &&
-               (unsigned long long)st.st_size == check_size &&
+  bool match = has_old_file && (unsigned long long)st.st_size == check_size &&
                (long long)st.st_mtime == check_mtime;
 
   if (match) {
-    if (!send_status(fd, STATUS_OK)) { free(full_path); free(check_path); return NULL; }
+    if (!send_status(fd, STATUS_OK)) {
+      free(full_path);
+      free(check_path);
+      return NULL;
+    }
     free(full_path);
     free(check_path);
     *skipped = true;
@@ -316,9 +349,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
                    delta_should_attempt(old_size, check_size, config->delta_max_file_size);
 
   if (try_delta) {
-    void *old_data = old_data_from_path(full_path, old_size);
-    File *delta_file = receive_delta_file(fd, config, check_path,
-                                           old_data, old_size);
+    void* old_data = old_data_from_path(full_path, old_size);
+    File* delta_file = receive_delta_file(fd, config, check_path, old_data, old_size);
     if (delta_file) {
       free(full_path);
       free(check_path);
@@ -338,7 +370,10 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   File* file = file_create(check_path);
   free(check_path);
   free(full_path);
-  if (file == NULL) { send_status(fd, STATUS_ERROR); return NULL; }
+  if (file == NULL) {
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
 
   if (config->use_metadata) {
     int meta_ok = 1;
@@ -398,10 +433,13 @@ bool to_disk(const char* path, const void* data, unsigned long long data_size) {
   return true;
 }
 
-bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata, int compression_level, bool send_path) {
+bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
+                        bool send_path) {
   (void)compression_level;
-  if (send_path && !send_str(file_descriptor, file->path)) return false;
-  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) return false;
+  if (send_path && !send_str(file_descriptor, file->path))
+    return false;
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata))
+    return false;
 
   int fd = open(file->path, O_RDONLY);
   if (fd == -1) {

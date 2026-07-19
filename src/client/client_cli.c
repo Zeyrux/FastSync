@@ -38,8 +38,10 @@ static void print_usage(void) {
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
-  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
-  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n", DELTA_MAX_FILE_SIZE);
+  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
+         DELTA_BLOCK_SIZE_DEFAULT);
+  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
+         DELTA_MAX_FILE_SIZE);
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");

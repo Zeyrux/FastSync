@@ -26,8 +26,8 @@ bool file_load_data(File* file);
 File* file_receive(const Config* config, int file_descriptor);
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path);
-bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata,
-                        int compression_level, bool send_path);
+bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
+                        bool send_path);
 size_t file_content_to_buffer(File* file);
 FileMetadata* file_metadata_create(const struct stat* stats);
 void file_metadata_destroy(void* metadata);

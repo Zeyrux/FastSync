@@ -92,22 +92,38 @@ void config_delete(Config* config) {
 }
 
 bool config_send(int file_descriptor, const Config* config) {
-  if (!send_str(file_descriptor, config->version)) return false;
-  if (!send_str(file_descriptor, config->send_directory)) return false;
-  if (!send_str(file_descriptor, config->receive_root_directory)) return false;
-  if (!send_int(file_descriptor, config->save_to_disk)) return false;
-  if (!send_int(file_descriptor, config->use_multithreading)) return false;
-  if (!send_int(file_descriptor, config->use_chunk_serialization)) return false;
-  if (!send_int(file_descriptor, config->use_compression)) return false;
-  if (!send_int(file_descriptor, config->use_metadata)) return false;
-  if (!send_int(file_descriptor, config->compression_level)) return false;
-  if (!send_int(file_descriptor, (int)config->chunk_size)) return false;
-  if (!send_int(file_descriptor, config->use_sendfile)) return false;
-  if (!send_int(file_descriptor, config->use_delete)) return false;
-  if (!send_int(file_descriptor, config->use_incremental)) return false;
-  if (!send_int(file_descriptor, config->use_delta)) return false;
-  if (!send_int(file_descriptor, (int)config->delta_block_size)) return false;
-  if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long))) return false;
+  if (!send_str(file_descriptor, config->version))
+    return false;
+  if (!send_str(file_descriptor, config->send_directory))
+    return false;
+  if (!send_str(file_descriptor, config->receive_root_directory))
+    return false;
+  if (!send_int(file_descriptor, config->save_to_disk))
+    return false;
+  if (!send_int(file_descriptor, config->use_multithreading))
+    return false;
+  if (!send_int(file_descriptor, config->use_chunk_serialization))
+    return false;
+  if (!send_int(file_descriptor, config->use_compression))
+    return false;
+  if (!send_int(file_descriptor, config->use_metadata))
+    return false;
+  if (!send_int(file_descriptor, config->compression_level))
+    return false;
+  if (!send_int(file_descriptor, (int)config->chunk_size))
+    return false;
+  if (!send_int(file_descriptor, config->use_sendfile))
+    return false;
+  if (!send_int(file_descriptor, config->use_delete))
+    return false;
+  if (!send_int(file_descriptor, config->use_incremental))
+    return false;
+  if (!send_int(file_descriptor, config->use_delta))
+    return false;
+  if (!send_int(file_descriptor, (int)config->delta_block_size))
+    return false;
+  if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
+    return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
     return false;
@@ -179,11 +195,14 @@ Config* config_receive(int file_descriptor) {
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->use_incremental = tmp;
-  if (!receive_int(file_descriptor, &tmp)) goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
   config->use_delta = tmp;
-  if (!receive_int(file_descriptor, &tmp)) goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
   config->delta_block_size = (uint32_t)tmp;
-  if (!receive_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long))) goto error;
+  if (!receive_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
+    goto error;
   config->show_progress = false;
   config->dry_run = false;
   config->ssh_port = 22;
