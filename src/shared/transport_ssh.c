@@ -13,36 +13,41 @@ typedef struct {
   char remote_path[4096];
 } RemoteDest;
 
-static int parse_remote_dest(const char *dest, RemoteDest *r) {
-  const char *colon = strchr(dest, ':');
-  if (!colon) return -1;
+static int parse_remote_dest(const char* dest, RemoteDest* r) {
+  const char* colon = strchr(dest, ':');
+  if (!colon)
+    return -1;
 
   size_t remote_path_len = strlen(colon + 1);
-  if (remote_path_len >= sizeof(r->remote_path)) return -1;
+  if (remote_path_len >= sizeof(r->remote_path))
+    return -1;
   memcpy(r->remote_path, colon + 1, remote_path_len + 1);
 
-  const char *at = memchr(dest, '@', colon - dest);
+  const char* at = memchr(dest, '@', colon - dest);
   if (at) {
     size_t user_len = at - dest;
-    if (user_len >= sizeof(r->user)) return -1;
+    if (user_len >= sizeof(r->user))
+      return -1;
     memcpy(r->user, dest, user_len);
     r->user[user_len] = '\0';
 
     size_t host_len = colon - at - 1;
-    if (host_len >= sizeof(r->host)) return -1;
+    if (host_len >= sizeof(r->host))
+      return -1;
     memcpy(r->host, at + 1, host_len);
     r->host[host_len] = '\0';
   } else {
     r->user[0] = '\0';
     size_t host_len = colon - dest;
-    if (host_len >= sizeof(r->host)) return -1;
+    if (host_len >= sizeof(r->host))
+      return -1;
     memcpy(r->host, dest, host_len);
     r->host[host_len] = '\0';
   }
   return 0;
 }
 
-Client *client_connect_ssh(char *destination, int port) {
+Client* client_connect_ssh(const char* destination, int port) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     fprintf(stderr, "Invalid remote destination: %s\n", destination);
@@ -64,15 +69,18 @@ Client *client_connect_ssh(char *destination, int port) {
   int exec_pipe[2];
   if (pipe(exec_pipe) < 0) {
     perror("pipe failed");
-    close(sv[0]); close(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
     return NULL;
   }
 
   pid_t pid = fork();
   if (pid < 0) {
     perror("fork failed");
-    close(sv[0]); close(sv[1]);
-    close(exec_pipe[0]); close(exec_pipe[1]);
+    close(sv[0]);
+    close(sv[1]);
+    close(exec_pipe[0]);
+    close(exec_pipe[1]);
     return NULL;
   }
 
@@ -85,7 +93,8 @@ Client *client_connect_ssh(char *destination, int port) {
       dup2(sv[1], STDIN_FILENO);
     if (sv[1] != STDOUT_FILENO)
       dup2(sv[1], STDOUT_FILENO);
-    if (sv[1] > 1) close(sv[1]);
+    if (sv[1] > 1)
+      close(sv[1]);
 
     char ssh_user[512];
     if (r.user[0] != '\0')
@@ -93,7 +102,7 @@ Client *client_connect_ssh(char *destination, int port) {
     else
       snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
 
-    char *ssh_argv[16];
+    char* ssh_argv[16];
     int ac = 0;
     char port_str[16];
     ssh_argv[ac++] = "ssh";
@@ -133,7 +142,7 @@ Client *client_connect_ssh(char *destination, int port) {
     return NULL;
   }
 
-  Client *client = malloc(sizeof(Client));
+  Client* client = malloc(sizeof(Client));
   if (client == NULL) {
     close(sv[0]);
     waitpid(pid, NULL, 0);

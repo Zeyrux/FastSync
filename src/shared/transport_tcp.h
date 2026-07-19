@@ -9,7 +9,7 @@ typedef struct Server {
   struct sockaddr_in address;
   unsigned int address_length;
   int file_descriptor;
-  void *ssl_ctx;
+  void* ssl_ctx;
 } Server;
 
 typedef struct Client {
@@ -17,18 +17,18 @@ typedef struct Client {
   unsigned int address_length;
   int file_descriptor;
   pid_t ssh_child_pid;
-  void *ssl;
-  void *ssl_ctx;
+  void* ssl;
+  void* ssl_ctx;
 } Client;
 
-Server *server_create(int port);
-bool server_listen(Server *server, void (*handler)(int file_descriptor));
-void server_accept_loop(Server *server, void (*child_fn)(int, void *),
-                        void *child_ctx, const char *log_fmt);
-void server_delete(Server **server);
-Client *client_create();
-bool client_connect(Client *client, char *host, int port);
-void client_disconnect(Client *client);
-void client_delete(Client *client);
+Server* server_create(int port);
+bool server_listen(Server* server, void (*handler)(int file_descriptor));
+void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
+                        const char* log_fmt);
+void server_delete(Server** server);
+Client* client_create();
+bool client_connect(Client* client, char* host, int port);
+void client_disconnect(Client* client);
+void client_delete(Client* client);
 
 #endif

@@ -6,14 +6,14 @@
 
 #include "queue.h"
 
-Queue *queue_create(int capacity, void (*destroyer)(void *item)) {
-  Queue *queue = (Queue *)malloc(sizeof(Queue));
+Queue* queue_create(int capacity, void (*destroyer)(void* item)) {
+  Queue* queue = (Queue*)malloc(sizeof(Queue));
   if (queue == NULL) {
     perror("ERROR: Could not allocate memory for queue structure");
     return NULL;
   }
 
-  queue->items = malloc(capacity * sizeof(void *));
+  queue->items = malloc(capacity * sizeof(void*));
   if (queue->items == NULL) {
     free(queue);
     return NULL;
@@ -32,7 +32,7 @@ Queue *queue_create(int capacity, void (*destroyer)(void *item)) {
   return queue;
 }
 
-void queue_destroy(Queue *queue) {
+void queue_destroy(Queue* queue) {
   if (queue == NULL)
     return;
 
@@ -46,24 +46,25 @@ void queue_destroy(Queue *queue) {
   free(queue);
 }
 
-bool queue_is_empty(Queue *queue) {
+bool queue_is_empty(const Queue* queue) {
   if (queue == NULL)
     return true;
   return queue->size == 0;
 }
 
-bool queue_is_full(Queue *queue) {
+bool queue_is_full(const Queue* queue) {
   if (queue == NULL)
     return false;
   return queue->size == queue->capacity;
 }
 
-static bool queue_double_capacity(Queue *queue) {
-  if (queue == NULL) return false;
+static bool queue_double_capacity(Queue* queue) {
+  if (queue == NULL)
+    return false;
   unsigned int new_capacity = queue->capacity * 2;
   if (new_capacity <= 1)
     new_capacity = 100;
-  void **new_items = malloc(new_capacity * sizeof(void *));
+  void** new_items = malloc(new_capacity * sizeof(void*));
   if (new_items == NULL) {
     perror("ERROR: Could not allocate memory for doubling capacity of queue.");
     return false;
@@ -78,10 +79,12 @@ static bool queue_double_capacity(Queue *queue) {
   return true;
 }
 
-bool queue_enqueue(Queue *queue, void *item) {
-  if (queue == NULL || item == NULL) return false;
+bool queue_enqueue(Queue* queue, void* item) {
+  if (queue == NULL || item == NULL)
+    return false;
   if (queue_is_full(queue)) {
-    if (!queue_double_capacity(queue)) return false;
+    if (!queue_double_capacity(queue))
+      return false;
   }
   queue->items[queue->rear] = item;
   queue->rear = (queue->rear + 1) % queue->capacity;
@@ -89,9 +92,8 @@ bool queue_enqueue(Queue *queue, void *item) {
   return true;
 }
 
-bool queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
-                                 cnd_t *condition_not_empty,
-                                 cnd_t *condition_not_full) {
+bool queue_enqueue_multithreaded(Queue* queue, void* item, mtx_t* mutex, cnd_t* condition_not_empty,
+                                 cnd_t* condition_not_full) {
   mtx_lock(mutex);
   while (queue_is_full(queue))
     cnd_wait(condition_not_full, mutex);
@@ -101,23 +103,21 @@ bool queue_enqueue_multithreaded(Queue *queue, void *item, mtx_t *mutex,
   return ok;
 }
 
-void *queue_dequeue(Queue *queue) {
+void* queue_dequeue(Queue* queue) {
   if (queue == NULL || queue_is_empty(queue)) {
     perror("ERROR: Could not dequeue from null or empty queue.");
     return NULL;
   }
 
-  void *item = queue->items[queue->front];
+  void* item = queue->items[queue->front];
   queue->items[queue->front] = NULL;
   queue->front = (queue->front + 1) % queue->capacity;
   queue->size--;
   return item;
 }
 
-void *queue_dequeue_multithreaded(Queue *queue, mtx_t *mutex,
-                                  cnd_t *condition_not_empty,
-                                  cnd_t *condition_not_full,
-                                  bool *other_thread_done) {
+void* queue_dequeue_multithreaded(Queue* queue, mtx_t* mutex, cnd_t* condition_not_empty,
+                                   cnd_t* condition_not_full, const bool* other_thread_done) {
   mtx_lock(mutex);
   while (queue_is_empty(queue) && !*other_thread_done)
     cnd_wait(condition_not_empty, mutex);
@@ -125,7 +125,7 @@ void *queue_dequeue_multithreaded(Queue *queue, mtx_t *mutex,
     mtx_unlock(mutex);
     return NULL;
   }
-  void *item = queue_dequeue(queue);
+  void* item = queue_dequeue(queue);
   cnd_signal(condition_not_full);
   mtx_unlock(mutex);
   return item;

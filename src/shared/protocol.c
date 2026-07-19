@@ -10,7 +10,7 @@
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
-static SSL *io_ssl = NULL;
+static SSL* io_ssl = NULL;
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
@@ -28,13 +28,14 @@ void io_set_bwlimit(unsigned long long bytes_per_sec) {
 }
 
 static void bw_throttle(size_t bytes_written) {
-  if (io_bwlimit == 0) return;
+  if (io_bwlimit == 0)
+    return;
 
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
 
-  long long elapsed_ns = (now.tv_sec - bw_last_refill.tv_sec) * 1000000000LL +
-                         (now.tv_nsec - bw_last_refill.tv_nsec);
+  long long elapsed_ns =
+      (now.tv_sec - bw_last_refill.tv_sec) * 1000000000LL + (now.tv_nsec - bw_last_refill.tv_nsec);
   bw_last_refill = now;
 
   long long tokens_to_add = (long long)((double)io_bwlimit * elapsed_ns / 1000000000.0);
@@ -56,7 +57,7 @@ static void bw_throttle(size_t bytes_written) {
   }
 }
 
-void io_set_ssl(SSL *ssl) {
+void io_set_ssl(SSL* ssl) {
   io_ssl = ssl;
 }
 
@@ -64,7 +65,7 @@ static int io_fd(int dir_fd, int file_descriptor) {
   return (dir_fd != -1) ? dir_fd : file_descriptor;
 }
 
-bool send_n_data(int file_descriptor, void *data, size_t data_size) {
+bool send_n_data(int file_descriptor, void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   int fd = io_fd(io_write_fd, file_descriptor);
   ssize_t total_bytes_send = 0;
@@ -74,9 +75,9 @@ bool send_n_data(int file_descriptor, void *data, size_t data_size) {
       chunk = 65536;
     ssize_t bytes_send;
     if (io_ssl)
-      bytes_send = SSL_write(io_ssl, (char *)data + total_bytes_send, chunk);
+      bytes_send = SSL_write(io_ssl, (char*)data + total_bytes_send, chunk);
     else
-      bytes_send = write(fd, (char *)data + total_bytes_send, chunk);
+      bytes_send = write(fd, (char*)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
@@ -88,18 +89,18 @@ bool send_n_data(int file_descriptor, void *data, size_t data_size) {
   return true;
 }
 
-bool receive_n_data(int file_descriptor, void *data, size_t data_size) {
+bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %zu", data_size);
   int fd = io_fd(io_read_fd, file_descriptor);
   size_t total_bytes_received = 0;
   while (total_bytes_received < data_size) {
     ssize_t bytes_received;
     if (io_ssl)
-      bytes_received = SSL_read(io_ssl, (char *)data + total_bytes_received,
-                                data_size - total_bytes_received);
+      bytes_received =
+          SSL_read(io_ssl, (char*)data + total_bytes_received, data_size - total_bytes_received);
     else
-      bytes_received = read(fd, (char *)data + total_bytes_received,
-                             data_size - total_bytes_received);
+      bytes_received =
+          read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
     if (bytes_received <= 0) {
       if (bytes_received == 0)
         log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
@@ -113,7 +114,7 @@ bool receive_n_data(int file_descriptor, void *data, size_t data_size) {
   return true;
 }
 
-static const char *status_to_string(Status status) {
+static const char* status_to_string(Status status) {
   switch (status) {
   case STATUS_OK:
     return "OK";
@@ -132,19 +133,23 @@ static const char *status_to_string(Status status) {
   }
 }
 
-bool send_str(int file_descriptor, char *data) {
+bool send_str(int file_descriptor, char* data) {
   size_t size = strlen(data);
-  if (!send_n_data(file_descriptor, &size, sizeof(size_t))) return false;
-  if (!send_n_data(file_descriptor, data, size)) return false;
+  if (!send_n_data(file_descriptor, &size, sizeof(size_t)))
+    return false;
+  if (!send_n_data(file_descriptor, data, size))
+    return false;
   log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
   return true;
 }
 
-char *receive_str(int file_descriptor) {
+char* receive_str(int file_descriptor) {
   size_t size;
-  if (!receive_n_data(file_descriptor, &size, sizeof(size_t))) return NULL;
-  char *data = (char *)malloc(size + 1);
-  if (data == NULL) return NULL;
+  if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
+    return NULL;
+  char* data = (char*)malloc(size + 1);
+  if (data == NULL)
+    return NULL;
   if (!receive_n_data(file_descriptor, data, size)) {
     free(data);
     return NULL;
@@ -154,7 +159,7 @@ char *receive_str(int file_descriptor) {
   return data;
 }
 
-bool send_data(int file_descriptor, Data *data) {
+bool send_data(int file_descriptor, Data* data) {
   unsigned long long data_size = data->size;
   if (!send_n_data(file_descriptor, &data_size, sizeof(unsigned long long)))
     return false;
@@ -164,12 +169,13 @@ bool send_data(int file_descriptor, Data *data) {
   return true;
 }
 
-Data *receive_data(int file_descriptor) {
+Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
-  void *data = malloc((size_t)size);
-  if (data == NULL) return NULL;
+  void* data = malloc((size_t)size);
+  if (data == NULL)
+    return NULL;
   if (!receive_n_data(file_descriptor, data, (size_t)size)) {
     free(data);
     return NULL;
@@ -179,25 +185,29 @@ Data *receive_data(int file_descriptor) {
 }
 
 bool send_int(int file_descriptor, int data) {
-  if (!send_n_data(file_descriptor, &data, sizeof(int))) return false;
+  if (!send_n_data(file_descriptor, &data, sizeof(int)))
+    return false;
   log_message(LOG_LEVEL_DEBUG, "Send Int: %d", data);
   return true;
 }
 
-bool receive_int(int file_descriptor, int *data) {
-  if (!receive_n_data(file_descriptor, data, sizeof(int))) return false;
+bool receive_int(int file_descriptor, int* data) {
+  if (!receive_n_data(file_descriptor, data, sizeof(int)))
+    return false;
   log_message(LOG_LEVEL_DEBUG, "Received Int: %d", *data);
   return true;
 }
 
 bool send_status(int file_descriptor, Status status) {
-  if (!send_n_data(file_descriptor, &status, sizeof(Status))) return false;
+  if (!send_n_data(file_descriptor, &status, sizeof(Status)))
+    return false;
   log_message(LOG_LEVEL_DEBUG, "Send Status: %s", status_to_string(status));
   return true;
 }
 
-bool receive_status(int file_descriptor, Status *status) {
-  if (!receive_n_data(file_descriptor, status, sizeof(Status))) return false;
+bool receive_status(int file_descriptor, Status* status) {
+  if (!receive_n_data(file_descriptor, status, sizeof(Status)))
+    return false;
   log_message(LOG_LEVEL_DEBUG, "Received Status: %s", status_to_string(*status));
   return true;
 }

@@ -15,23 +15,24 @@ typedef struct {
 } FileMetadata;
 
 typedef struct {
-  char *path;
-  Data *data;
-  FileMetadata *metadata;
+  char* path;
+  Data* data;
+  FileMetadata* metadata;
 } File;
 
-File *file_create(const char *path);
-void file_destroy(void *item);
-bool file_load_data(File *file);
-File *file_receive(Config *config, int file_descriptor);
-bool file_send_single_calls(File *file, int file_descriptor, bool use_metadata, int compression_level, bool send_path);
-bool file_send_sendfile(File *file, int file_descriptor, bool use_metadata, bool send_path);
-size_t file_content_to_buffer(File *file);
-FileMetadata *file_metadata_create(struct stat *stats);
-void file_metadata_destroy(void *metadata);
-bool to_disk(const char *path, const void *data, unsigned long long data_size);
-bool file_save_to_disk(const char *root_directory, File *file);
-File *receive_incremental_check(int fd, Config *config, bool *skipped);
-int receive_manifest(int fd, Config *config, int *next_status);
+File* file_create(const char* path);
+void file_destroy(void* item);
+bool file_load_data(File* file);
+File* file_receive(const Config* config, int file_descriptor);
+bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
+                            int compression_level, bool send_path);
+bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, bool send_path);
+size_t file_content_to_buffer(File* file);
+FileMetadata* file_metadata_create(const struct stat* stats);
+void file_metadata_destroy(void* metadata);
+bool to_disk(const char* path, const void* data, unsigned long long data_size);
+bool file_save_to_disk(const char* root_directory, File* file);
+File* receive_incremental_check(int fd, Config* config, bool* skipped);
+int receive_manifest(int fd, const Config* config, int* next_status);
 
 #endif

@@ -12,14 +12,14 @@
 #include "metadata.h"
 #include "protocol.h"
 
-Chunk *chunk_create(File **items, int element_count) {
-  Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
+Chunk* chunk_create(File** items, int element_count) {
+  Chunk* chunk = (Chunk*)malloc(sizeof(Chunk));
   if (chunk == NULL) {
     perror("ERROR: Could not allocate memory for chunk structure");
     return NULL;
   }
 
-  chunk->items = (File **)malloc(element_count * sizeof(File *));
+  chunk->items = (File**)malloc(element_count * sizeof(File*));
   if (chunk->items == NULL) {
     free(chunk);
     return NULL;
@@ -32,11 +32,11 @@ Chunk *chunk_create(File **items, int element_count) {
   return chunk;
 }
 
-void chunk_destroy(void *item) {
+void chunk_destroy(void* item) {
   if (item == NULL) {
     return;
   }
-  Chunk *chunk = (Chunk *)item;
+  Chunk* chunk = (Chunk*)item;
   for (int i = 0; i < chunk->element_count; ++i) {
     if (chunk->items[i] != NULL) {
       file_destroy(chunk->items[i]);
@@ -46,26 +46,25 @@ void chunk_destroy(void *item) {
   free(chunk);
 }
 
-static unsigned long long per_file_serialize_size(File *file, bool use_metadata) {
+static unsigned long long per_file_serialize_size(File* file, bool use_metadata) {
   return sizeof(size_t) + strlen(file->path) +
          (use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0) +
          sizeof(size_t) + file->data->size;
 }
 
-Data *chunk_serialize(Chunk *chunk, bool use_metadata) {
+Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
   unsigned long long data_size = 0;
   for (int i = 0; i < chunk->element_count; i++) {
     data_size += per_file_serialize_size(chunk->items[i], use_metadata);
   }
-  Data *data = data_create_empty(data_size);
+  Data* data = data_create_empty(data_size);
   if (data == NULL) {
-    log_message(LOG_LEVEL_ERROR,
-                "Could not allocate memory for chunk serialization");
+    log_message(LOG_LEVEL_ERROR, "Could not allocate memory for chunk serialization");
     return NULL;
   }
-  char *data_pointer = data->data;
+  char* data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
-    File *file = chunk->items[i];
+    File* file = chunk->items[i];
     size_t path_len = strlen(file->path);
     memcpy(data_pointer, &path_len, sizeof(size_t));
     data_pointer += sizeof(size_t);
@@ -84,9 +83,9 @@ Data *chunk_serialize(Chunk *chunk, bool use_metadata) {
   return data;
 }
 
-Chunk *chunk_deserialize(Data *data, bool use_metadata) {
-  ArrayList *files = array_list_create(file_destroy);
-  char *data_pointer = data->data;
+Chunk* chunk_deserialize(Data* data, bool use_metadata) {
+  ArrayList* files = array_list_create(file_destroy);
+  char* data_pointer = data->data;
   size_t remaining_size = data->size;
 
   while (remaining_size > 0) {
@@ -96,7 +95,7 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
       return NULL;
     }
 
-    size_t path_len = *(size_t *)data_pointer;
+    size_t path_len = *(size_t*)data_pointer;
     data_pointer += sizeof(size_t);
     remaining_size -= sizeof(size_t);
 
@@ -106,7 +105,7 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
       return NULL;
     }
 
-    char *path = malloc(path_len + 1);
+    char* path = malloc(path_len + 1);
     if (path == NULL) {
       perror("Could not allocate memory for file path");
       array_list_delete(files);
@@ -117,7 +116,7 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
     data_pointer += path_len;
     remaining_size -= path_len;
 
-    File *file = file_create(path);
+    File* file = file_create(path);
     free(path);
 
     if (use_metadata) {
@@ -133,7 +132,7 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
       return NULL;
     }
 
-    size_t file_data_size = *(size_t *)data_pointer;
+    size_t file_data_size = *(size_t*)data_pointer;
     data_pointer += sizeof(size_t);
     remaining_size -= sizeof(size_t);
 
@@ -143,7 +142,7 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
       return NULL;
     }
 
-    void *file_data = malloc(file_data_size);
+    void* file_data = malloc(file_data_size);
     if (file_data == NULL) {
       perror("Could not allocate memory for file data");
       array_list_delete(files);
@@ -158,8 +157,8 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
     array_list_add(files, file);
   }
 
-  File **file_array = (File **)array_list_to_array(files);
-  Chunk *chunk = chunk_create(file_array, files->size);
+  File** file_array = (File**)array_list_to_array(files);
+  Chunk* chunk = chunk_create(file_array, files->size);
 
   free(file_array);
   files->item_destroyer = NULL;
@@ -168,24 +167,26 @@ Chunk *chunk_deserialize(Data *data, bool use_metadata) {
   return chunk;
 }
 
-Data *chunk_compress(Chunk *chunk, int compression_level, bool use_metadata) {
+Data* chunk_compress(Chunk* chunk, int compression_level, bool use_metadata) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress chunk");
-  Data *serialized = chunk_serialize(chunk, use_metadata);
-  if (serialized == NULL) return NULL;
-  Data *compressed = data_compress(serialized, compression_level);
+  Data* serialized = chunk_serialize(chunk, use_metadata);
+  if (serialized == NULL)
+    return NULL;
+  Data* compressed = data_compress(serialized, compression_level);
   data_destroy(serialized);
-  if (compressed == NULL) return NULL;
+  if (compressed == NULL)
+    return NULL;
   log_message(LOG_LEVEL_DEBUG, "Chunk successfully compressed");
   return compressed;
 }
 
-Chunk *receive_chunk_data(int fd, Config *config) {
-  Data *chunk_data = receive_data(fd);
+Chunk* receive_chunk_data(int fd, const Config* config) {
+  Data* chunk_data = receive_data(fd);
   if (chunk_data == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
     return NULL;
   }
-  Data *data_to_process = chunk_data;
+  Data* data_to_process = chunk_data;
   if (config->use_compression) {
     data_to_process = data_decompress(chunk_data);
     data_destroy(chunk_data);
@@ -194,12 +195,9 @@ Chunk *receive_chunk_data(int fd, Config *config) {
       return NULL;
     }
   }
-  Chunk *chunk = chunk_deserialize(data_to_process, config->use_metadata);
+  Chunk* chunk = chunk_deserialize(data_to_process, config->use_metadata);
   data_destroy(data_to_process);
   if (chunk == NULL)
     log_message(LOG_LEVEL_ERROR, "Failed to deserialize chunk, skipping");
   return chunk;
 }
-
-
-

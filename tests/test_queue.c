@@ -7,12 +7,12 @@
 #include <stdio.h>
 
 static void test_queue_basic() {
-  Queue *q = queue_create(10, NULL);
+  Queue* q = queue_create(10, NULL);
   EXPECT_NOT_NULL(q);
   EXPECT_TRUE(queue_is_empty(q));
   EXPECT_FALSE(queue_is_full(q));
 
-  int *vals[5];
+  int* vals[5];
   for (int i = 0; i < 5; i++) {
     vals[i] = malloc(sizeof(int));
     *vals[i] = (i + 1) * 10;
@@ -23,19 +23,19 @@ static void test_queue_basic() {
   EXPECT_FALSE(queue_is_full(q));
   EXPECT_EQ_INT(q->size, 5);
 
-  int *v1 = (int *)queue_dequeue(q);
+  int* v1 = (int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v1);
   EXPECT_EQ_INT(*v1, 10);
   free(v1);
 
-  int *v2 = (int *)queue_dequeue(q);
+  int* v2 = (int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v2);
   EXPECT_EQ_INT(*v2, 20);
   free(v2);
 
   EXPECT_EQ_INT(q->size, 3);
 
-  int *vals2[3];
+  int* vals2[3];
   for (int i = 0; i < 3; i++) {
     vals2[i] = malloc(sizeof(int));
     *vals2[i] = (i + 6) * 10;
@@ -44,9 +44,9 @@ static void test_queue_basic() {
 
   EXPECT_EQ_INT(q->size, 6);
 
-  int expected_vals[] = {30, 40, 50, 60, 70, 80};
+  const int expected_vals[] = {30, 40, 50, 60, 70, 80};
   for (int i = 0; i < 6; i++) {
-    int *v = (int *)queue_dequeue(q);
+    int* v = (int*)queue_dequeue(q);
     EXPECT_NOT_NULL(v);
     EXPECT_EQ_INT(*v, expected_vals[i]);
     free(v);
@@ -57,7 +57,7 @@ static void test_queue_basic() {
 }
 
 static void test_queue_resize() {
-  Queue *q = queue_create(3, NULL);
+  Queue* q = queue_create(3, NULL);
   EXPECT_NOT_NULL(q);
   EXPECT_EQ_INT(q->capacity, 3);
 
@@ -69,34 +69,34 @@ static void test_queue_resize() {
 
   EXPECT_TRUE(queue_is_full(q));
 
-  int *v1 = (int *)queue_dequeue(q);
+  const int* v1 = (const int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v1);
   EXPECT_EQ_INT(*v1, 1);
 
   // Now front = 1, rear = 0, size = 2 (wrapped state)
-  queue_enqueue(q, &d); 
+  queue_enqueue(q, &d);
   EXPECT_TRUE(queue_is_full(q));
 
   // This enqueue triggers capacity doubling
-  queue_enqueue(q, &e); 
+  queue_enqueue(q, &e);
   EXPECT_FALSE(queue_is_full(q));
   EXPECT_EQ_INT(q->capacity, 6);
   EXPECT_EQ_INT(q->size, 4);
 
   // Dequeue all and check order: B, C, D, E
-  int *v2 = (int *)queue_dequeue(q);
+  const int* v2 = (const int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v2);
   EXPECT_EQ_INT(*v2, 2);
 
-  int *v3 = (int *)queue_dequeue(q);
+  const int* v3 = (const int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v3);
   EXPECT_EQ_INT(*v3, 3);
 
-  int *v4 = (int *)queue_dequeue(q);
+  const int* v4 = (const int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v4);
   EXPECT_EQ_INT(*v4, 4);
 
-  int *v5 = (int *)queue_dequeue(q);
+  const int* v5 = (const int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v5);
   EXPECT_EQ_INT(*v5, 5);
 
@@ -105,23 +105,23 @@ static void test_queue_resize() {
 }
 
 static int destroyer_calls = 0;
-static void my_destroyer(void *item) {
+static void my_destroyer(void* item) {
   destroyer_calls++;
   free(item);
 }
 
 static void test_queue_destroyer() {
   destroyer_calls = 0;
-  Queue *q = queue_create(5, my_destroyer);
+  Queue* q = queue_create(5, my_destroyer);
   EXPECT_NOT_NULL(q);
 
   for (int i = 0; i < 3; i++) {
-    int *val = malloc(sizeof(int));
+    int* val = malloc(sizeof(int));
     *val = i;
     queue_enqueue(q, val);
   }
 
-  int *v = (int *)queue_dequeue(q);
+  int* v = (int*)queue_dequeue(q);
   EXPECT_NOT_NULL(v);
   EXPECT_EQ_INT(*v, 0);
   free(v);
@@ -131,18 +131,19 @@ static void test_queue_destroyer() {
 }
 
 typedef struct {
-  Queue *q;
-  mtx_t *mutex;
-  cnd_t *cnd_empty;
-  cnd_t *cnd_full;
+  Queue* q;
+  mtx_t* mutex;
+  cnd_t* cnd_empty;
+  cnd_t* cnd_full;
   bool done;
   int sum;
 } ThreadContext;
 
-static int consumer_func(void *arg) {
-  ThreadContext *ctx = (ThreadContext *)arg;
+static int consumer_func(void* arg) {
+  ThreadContext* ctx = (ThreadContext*)arg;
   while (true) {
-    int *val = (int *)queue_dequeue_multithreaded(ctx->q, ctx->mutex, ctx->cnd_empty, ctx->cnd_full, &ctx->done);
+    int* val = (int*)queue_dequeue_multithreaded(ctx->q, ctx->mutex, ctx->cnd_empty, ctx->cnd_full,
+                                                 &ctx->done);
     if (val == NULL) {
       break;
     }
@@ -153,7 +154,7 @@ static int consumer_func(void *arg) {
 }
 
 static void test_queue_multithreaded() {
-  Queue *q = queue_create(2, NULL);
+  Queue* q = queue_create(2, NULL);
   mtx_t mutex;
   cnd_t cnd_empty;
   cnd_t cnd_full;
@@ -162,21 +163,19 @@ static void test_queue_multithreaded() {
   cnd_init(&cnd_empty);
   cnd_init(&cnd_full);
 
-  ThreadContext ctx = {
-    .q = q,
-    .mutex = &mutex,
-    .cnd_empty = &cnd_empty,
-    .cnd_full = &cnd_full,
-    .done = false,
-    .sum = 0
-  };
+  ThreadContext ctx = {.q = q,
+                       .mutex = &mutex,
+                       .cnd_empty = &cnd_empty,
+                       .cnd_full = &cnd_full,
+                       .done = false,
+                       .sum = 0};
 
   thrd_t consumer;
   int res = thrd_create(&consumer, consumer_func, &ctx);
   EXPECT_EQ_INT(res, thrd_success);
 
   for (int i = 1; i <= 100; i++) {
-    int *val = malloc(sizeof(int));
+    int* val = malloc(sizeof(int));
     *val = i;
     queue_enqueue_multithreaded(q, val, &mutex, &cnd_empty, &cnd_full);
   }

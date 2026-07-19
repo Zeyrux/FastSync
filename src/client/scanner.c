@@ -11,8 +11,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metadata, unsigned long long chunk_size, char **exclude_patterns, int exclude_count, char **include_patterns, int include_count, unsigned long long max_size, unsigned long long min_size) {
-  DirectoryScanner *scanner = malloc(sizeof(DirectoryScanner));
+DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metadata,
+                                           unsigned long long chunk_size, char** exclude_patterns,
+                                           int exclude_count, char** include_patterns,
+                                           int include_count, unsigned long long max_size,
+                                           unsigned long long min_size) {
+  DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
   scanner->directories = queue_create(100, free);
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
@@ -28,7 +32,7 @@ DirectoryScanner *directory_scanner_create(char *root_directory, bool use_metada
   return scanner;
 }
 
-void directory_scanner_destroy(DirectoryScanner *scanner) {
+void directory_scanner_destroy(DirectoryScanner* scanner) {
   if (scanner == NULL)
     return;
   if (scanner->current_dir) {
@@ -40,16 +44,16 @@ void directory_scanner_destroy(DirectoryScanner *scanner) {
   free(scanner);
 }
 
-static Chunk *chunk_data_to_chunk(ArrayList *chunk_data) {
-  void **chunk_items = array_list_to_array(chunk_data);
-  Chunk *chunk = chunk_create((File **)chunk_items, chunk_data->size);
+static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
+  void** chunk_items = array_list_to_array(chunk_data);
+  Chunk* chunk = chunk_create((File**)chunk_items, chunk_data->size);
   free(chunk_items);
   chunk_data->item_destroyer = NULL;
   array_list_delete(chunk_data);
   return chunk;
 }
 
-static int open_next_directory(DirectoryScanner *scanner) {
+static int open_next_directory(DirectoryScanner* scanner) {
   if (scanner->current_dir) {
     closedir(scanner->current_dir);
     scanner->current_dir = NULL;
@@ -59,7 +63,7 @@ static int open_next_directory(DirectoryScanner *scanner) {
   if (queue_is_empty(scanner->directories))
     return 0;
 
-  scanner->current_path = (char *)queue_dequeue(scanner->directories);
+  scanner->current_path = (char*)queue_dequeue(scanner->directories);
   scanner->current_dir = opendir(scanner->current_path);
   if (scanner->current_dir == NULL) {
     perror("Could not open directory");
@@ -70,8 +74,8 @@ static int open_next_directory(DirectoryScanner *scanner) {
   return 1;
 }
 
-Chunk *directory_scanner_next(DirectoryScanner *scanner) {
-  ArrayList *chunk_data = array_list_create(file_destroy);
+Chunk* directory_scanner_next(DirectoryScanner* scanner) {
+  ArrayList* chunk_data = array_list_create(file_destroy);
   unsigned long long chunk_data_size = 0;
 
   while (1) {
@@ -80,7 +84,7 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
         break;
     }
 
-    struct dirent *entry = readdir(scanner->current_dir);
+    struct dirent* entry = readdir(scanner->current_dir);
     if (entry == NULL) {
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
@@ -92,7 +96,7 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
 
-    char *cur_path = path_cat(scanner->current_path, entry->d_name);
+    char* cur_path = path_cat(scanner->current_path, entry->d_name);
     struct stat stats;
     if (stat(cur_path, &stats) != 0) {
       free(cur_path);
@@ -100,7 +104,7 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
     }
 
     if (S_ISDIR(stats.st_mode)) {
-      queue_enqueue(scanner->directories, (void *)cur_path);
+      queue_enqueue(scanner->directories, (void*)cur_path);
     } else {
       bool excluded = false;
       for (int i = 0; i < scanner->exclude_count; i++) {
@@ -134,7 +138,7 @@ Chunk *directory_scanner_next(DirectoryScanner *scanner) {
         continue;
       }
 
-      File *file = file_create(cur_path);
+      File* file = file_create(cur_path);
       if (file == NULL) {
         free(cur_path);
         continue;

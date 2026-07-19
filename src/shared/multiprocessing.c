@@ -13,11 +13,11 @@
 #include <string.h>
 #include <threads.h>
 
-PipelineContextSender *pipeline_context_sender_create(Config *config,
-                                                      Queue *queue_scanner,
-                                                      Queue *queue_loader) {
-  PipelineContextSender *context = malloc(sizeof(PipelineContextSender));
-  if (context == NULL) return NULL;
+PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
+                                                      Queue* queue_loader) {
+  PipelineContextSender* context = malloc(sizeof(PipelineContextSender));
+  if (context == NULL)
+    return NULL;
   context->config = config;
   context->queue_scanner = queue_scanner;
   context->queue_loader = queue_loader;
@@ -37,7 +37,7 @@ PipelineContextSender *pipeline_context_sender_create(Config *config,
   return context;
 }
 
-void pipeline_context_sender_destroy(PipelineContextSender *context) {
+void pipeline_context_sender_destroy(PipelineContextSender* context) {
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
@@ -53,11 +53,11 @@ void pipeline_context_sender_destroy(PipelineContextSender *context) {
   free(context);
 }
 
-PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
-                                                          Queue *queue,
+PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue,
                                                           int file_descriptor) {
-  PipelineContextReceiver *context = malloc(sizeof(PipelineContextReceiver));
-  if (context == NULL) return NULL;
+  PipelineContextReceiver* context = malloc(sizeof(PipelineContextReceiver));
+  if (context == NULL)
+    return NULL;
   context->config = config;
   context->queue = queue;
   context->file_descriptor = file_descriptor;
@@ -72,7 +72,7 @@ PipelineContextReceiver *pipeline_context_receiver_create(Config *config,
   return context;
 }
 
-void pipeline_context_receiver_destroy(PipelineContextReceiver *context) {
+void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   config_delete(context->config);
   queue_destroy(context->queue);
   mtx_destroy(&context->mutex);
@@ -81,57 +81,57 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver *context) {
   free(context);
 }
 
-static void receive_chunk_enqueue(int file_descriptor,
-                                  PipelineContextReceiver *context) {
-  Chunk *chunk = receive_chunk_data(file_descriptor, context->config);
-  if (chunk == NULL) return;
+static void receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
+  Chunk* chunk = receive_chunk_data(file_descriptor, context->config);
+  if (chunk == NULL)
+    return;
 
   for (int i = 0; i < chunk->element_count; i++) {
-    File *file = chunk->items[i];
+    File* file = chunk->items[i];
     chunk->items[i] = NULL;
     queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                &context->condition_not_empty,
-                                &context->condition_not_full);
+                                &context->condition_not_empty, &context->condition_not_full);
   }
   chunk_destroy(chunk);
 }
 
-int receive_thread(void *pipeline_context) {
-  PipelineContextReceiver *context =
-      (PipelineContextReceiver *)pipeline_context;
+int receive_thread(void* pipeline_context) {
+  PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
   mtx_lock(&context->mutex);
   int file_descriptor = context->file_descriptor;
-  Config *config = context->config;
+  Config* config = context->config;
   mtx_unlock(&context->mutex);
 
   Status status;
-  if (!receive_status(file_descriptor, &status)) return thrd_error;
+  if (!receive_status(file_descriptor, &status))
+    return thrd_error;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
     if (status == STATUS_CHECK) {
       bool skipped;
-      File *file = receive_incremental_check(file_descriptor, config, &skipped);
+      File* file = receive_incremental_check(file_descriptor, config, &skipped);
       if (!skipped) {
-        if (file == NULL) return thrd_error;
+        if (file == NULL)
+          return thrd_error;
         queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                    &context->condition_not_empty,
-                                    &context->condition_not_full);
+                                    &context->condition_not_empty, &context->condition_not_full);
       }
     } else if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, context);
     } else {
-      File *file = file_receive(config, file_descriptor);
+      File* file = file_receive(config, file_descriptor);
       if (file) {
         queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                    &context->condition_not_empty,
-                                    &context->condition_not_full);
+                                    &context->condition_not_empty, &context->condition_not_full);
       } else {
         log_message(LOG_LEVEL_ERROR, "Failed to receive file");
       }
     }
-    if (!receive_status(file_descriptor, &status)) return thrd_error;
+    if (!receive_status(file_descriptor, &status))
+      return thrd_error;
   }
   if (status == STATUS_MANIFEST) {
-    if (receive_manifest(file_descriptor, config, &status) != 0) return thrd_error;
+    if (receive_manifest(file_descriptor, config, &status) != 0)
+      return thrd_error;
   }
   mtx_lock(&context->mutex);
   context->receiver_done = true;
@@ -140,18 +140,17 @@ int receive_thread(void *pipeline_context) {
   return thrd_success;
 }
 
-int write_thread(void *pipeline_context) {
-  PipelineContextReceiver *context =
-      (PipelineContextReceiver *)pipeline_context;
+int write_thread(void* pipeline_context) {
+  PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
   mtx_lock(&context->mutex);
   bool save_to_disk = context->config->save_to_disk;
-  char *root_directory = str_dup(context->config->receive_root_directory);
+  char* root_directory = str_dup(context->config->receive_root_directory);
   mtx_unlock(&context->mutex);
 
   while (true) {
-    File *file = queue_dequeue_multithreaded(
-        context->queue, &context->mutex, &context->condition_not_empty,
-        &context->condition_not_full, &context->receiver_done);
+    File* file =
+        queue_dequeue_multithreaded(context->queue, &context->mutex, &context->condition_not_empty,
+                                    &context->condition_not_full, &context->receiver_done);
     if (file == NULL) {
       free(root_directory);
       return thrd_success;
