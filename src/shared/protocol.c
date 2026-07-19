@@ -65,7 +65,7 @@ static int io_fd(int dir_fd, int file_descriptor) {
   return (dir_fd != -1) ? dir_fd : file_descriptor;
 }
 
-bool send_n_data(int file_descriptor, void* data, size_t data_size) {
+bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   int fd = io_fd(io_write_fd, file_descriptor);
   ssize_t total_bytes_send = 0;
@@ -75,9 +75,9 @@ bool send_n_data(int file_descriptor, void* data, size_t data_size) {
       chunk = 65536;
     ssize_t bytes_send;
     if (io_ssl)
-      bytes_send = SSL_write(io_ssl, (char*)data + total_bytes_send, chunk);
+      bytes_send = SSL_write(io_ssl, (const char*)data + total_bytes_send, chunk);
     else
-      bytes_send = write(fd, (char*)data + total_bytes_send, chunk);
+      bytes_send = write(fd, (const char*)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
@@ -133,7 +133,7 @@ static const char* status_to_string(Status status) {
   }
 }
 
-bool send_str(int file_descriptor, char* data) {
+bool send_str(int file_descriptor, const char* data) {
   size_t size = strlen(data);
   if (!send_n_data(file_descriptor, &size, sizeof(size_t)))
     return false;
@@ -159,7 +159,7 @@ char* receive_str(int file_descriptor) {
   return data;
 }
 
-bool send_data(int file_descriptor, Data* data) {
+bool send_data(int file_descriptor, const Data* data) {
   unsigned long long data_size = data->size;
   if (!send_n_data(file_descriptor, &data_size, sizeof(unsigned long long)))
     return false;

@@ -17,6 +17,8 @@ DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metada
                                            int include_count, unsigned long long max_size,
                                            unsigned long long min_size) {
   DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
+  if (scanner == NULL)
+    return NULL;
   scanner->directories = queue_create(100, free);
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
