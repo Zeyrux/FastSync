@@ -55,3 +55,28 @@ jobs:
 
       - name: Unit Tests
         run: ./build-${{ matrix.sanitizer }}/tests
+
+      - name: Integration Tests
+        run: LSAN_OPTIONS=suppressions=.lsan-suppressions.txt python3 -m pytest tests/ -v --tb=short
+
+  clang-tidy:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (generate compile_commands.json)
+        run: cmake -B build -S .
+
+      - name: Run clang-tidy (informational, non-blocking)
+        run: |
+          find src/ -name '*.c' | xargs clang-tidy -p build \
+            --checks='-*,bugprone-*,clang-analyzer-*,misc-*,-misc-no-recursion' \
+            2>&1 | tee clang-tidy-output.txt
+          if grep -q -E " error:| warning:" clang-tidy-output.txt; then
+            echo "::warning::clang-tidy found issues — review the output above"
+          else
+            echo "clang-tidy: no issues found"
+          fi
