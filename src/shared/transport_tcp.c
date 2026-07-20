@@ -41,7 +41,6 @@ Server* server_create(int port) {
     return NULL;
   }
   memset(&server->address, 0, sizeof(server->address));
-  server->ssl_ctx = NULL;
 
   // Try IPv6 first, fall back to IPv4
   int fd = socket(AF_INET6, SOCK_STREAM, 0);
