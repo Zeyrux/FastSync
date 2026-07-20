@@ -2,10 +2,18 @@
 #include "test_chunk.h"
 #include "test_compression.h"
 #include "test_config.h"
+#include "test_data.h"
 #include "test_delta.h"
+#include "test_file.h"
+#include "test_glob.h"
+#include "test_metadata.h"
+#include "test_property.h"
+#include "test_protocol.h"
 #include "test_queue.h"
+#include "test_robustness.h"
 #include "test_scanner.h"
 #include "test_shared_utils.h"
+#include "test_stress.h"
 #include "test_utils.h"
 #include <stdio.h>
 
@@ -25,6 +33,14 @@ int main() {
   RUN_TEST(test_compression);
   RUN_TEST(test_scanner);
   RUN_TEST(test_delta);
+  RUN_TEST(test_data);
+  RUN_TEST(test_protocol);
+  RUN_TEST(test_metadata);
+  RUN_TEST(test_glob);
+  RUN_TEST(test_file);
+  RUN_TEST(test_robustness);
+  RUN_TEST(test_stress);
+  RUN_TEST(test_property);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);

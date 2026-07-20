@@ -5,7 +5,7 @@ on: [push, pull_request]
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     steps:
       - name: Checkout
@@ -31,18 +31,18 @@ jobs:
         run: cmake --build build -j$(nproc)
 
       - name: Unit Tests
-        run: ./build/tests
+        run: ctest --test-dir build --output-on-failure -j$(nproc)
 
       - name: Integration Tests
-        run: python3 -m pytest tests/ -v --tb=short
+        run: python3 -m pytest tests/integration/ -v --tb=short
 
   sanitizers:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     strategy:
       matrix:
-        sanitizer: [address]
+        sanitizer: [address, undefined]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,33 +53,61 @@ jobs:
       - name: Build
         run: cmake --build build-${{ matrix.sanitizer }} -j$(nproc)
 
-      - name: Symlink for integration tests
-        run: ln -sf build-${{ matrix.sanitizer }} build
-
       - name: Unit Tests
-        run: ./build-${{ matrix.sanitizer }}/tests
+        run: ctest --test-dir build-${{ matrix.sanitizer }} --output-on-failure
 
-      - name: Integration Tests
-        run: LSAN_OPTIONS=suppressions=.lsan-suppressions.txt python3 -m pytest tests/ -v --tb=short
-
-  clang-tidy:
+  fuzz-build:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
     needs: lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure (generate compile_commands.json)
-        run: cmake -B build -S .
+      - name: Configure (clang + fuzz)
+        run: CC=clang CXX=clang++ cmake -B build-fuzz -S . -DENABLE_FUZZ=ON
 
-      - name: Run clang-tidy (informational, non-blocking)
+      - name: Build fuzz targets
+        run: cmake --build build-fuzz -j$(nproc)
+
+  coverage:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -S . -DENABLE_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Unit Tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Coverage Report
         run: |
-          find src/ -name '*.c' | xargs clang-tidy -p build \
-            --checks='-*,bugprone-*,clang-analyzer-*,misc-*,-misc-no-recursion' \
-            2>&1 | tee clang-tidy-output.txt
-          if grep -q -E " error:| warning:" clang-tidy-output.txt; then
-            echo "::warning::clang-tidy found issues — review the output above"
-          else
-            echo "clang-tidy: no issues found"
-          fi
+          lcov --capture --directory build --output-file coverage.info --branch-coverage --ignore-errors negative
+          lcov --remove coverage.info '/usr/*' '*/tests/*' '*/_deps/*' --output-file coverage.info --branch-coverage --ignore-errors unused,negative
+          lcov --list coverage.info
+
+  valgrind:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -S . -DSTRICT_WARNINGS=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Valgrind Memcheck
+        run: valgrind --leak-check=full --show-leak-kinds=definite --error-exitcode=1 ./build/tests
+        env:
+          FASTSYNC_UNDER_VALGRIND: "1"

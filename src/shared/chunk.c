@@ -95,7 +95,8 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       return NULL;
     }
 
-    size_t path_len = *(size_t*)data_pointer;
+    size_t path_len;
+    memcpy(&path_len, data_pointer, sizeof(size_t));
     data_pointer += sizeof(size_t);
     remaining_size -= sizeof(size_t);
 
@@ -120,6 +121,19 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     free(path);
 
     if (use_metadata) {
+      if (remaining_size < sizeof(int)) {
+        log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for metadata");
+        array_list_delete(files);
+        return NULL;
+      }
+      // Peek at present flag to determine total size needed before reading
+      int present_flag;
+      memcpy(&present_flag, data_pointer, sizeof(int));
+      if (present_flag && remaining_size < sizeof(int) + FILE_METADATA_WIRE_SIZE) {
+        log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for metadata body");
+        array_list_delete(files);
+        return NULL;
+      }
       file->metadata = metadata_from_buf(&data_pointer);
       remaining_size -= sizeof(int);
       if (file->metadata)
@@ -132,7 +146,8 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       return NULL;
     }
 
-    size_t file_data_size = *(size_t*)data_pointer;
+    size_t file_data_size;
+    memcpy(&file_data_size, data_pointer, sizeof(size_t));
     data_pointer += sizeof(size_t);
     remaining_size -= sizeof(size_t);
 
