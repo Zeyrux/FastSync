@@ -448,6 +448,11 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
                         bool send_path) {
   // sendfile is incompatible with compression (kernel zero-copy).
   // If compression is requested, fall back to the regular send path.
+  // NOTE: This is a safety net only — callers must ensure compression_level == 0
+  // before calling file_send_sendfile. The fallback to file_send_single_calls
+  // preserves the send_path contract, but callers should not rely on it for
+  // correctness (the --sendfile flag is validated to be mutually exclusive with
+  // -c/--compress at the CLI layer).
   if (compression_level > 0)
     return file_send_single_calls(file, file_descriptor, use_metadata, compression_level,
                                   send_path);

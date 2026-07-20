@@ -175,6 +175,13 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
       return -1;
   } else {
     delta_signature_destroy(sig);
+    // rc == 2 can happen if server sends STATUS_DELTA_SIGNATURE but
+    // use_delta is false on the client side. Send STATUS_NEXT to
+    // tell the server to proceed with the full file transfer.
+    if (rc == 2) {
+      if (!send_status(client->file_descriptor, STATUS_NEXT))
+        return -1;
+    }
   }
   if (!send_fn(file, client->file_descriptor, config->use_metadata, compression_level, false))
     return -1;
@@ -254,17 +261,27 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
       if (context->config->use_delete) {
-        send_status(client->file_descriptor, STATUS_MANIFEST);
-        send_int(client->file_descriptor, context->manifest->size);
-        for (int i = 0; i < context->manifest->size; i++)
-          send_str(client->file_descriptor, (char*)context->manifest->items[i]);
+        if (!send_status(client->file_descriptor, STATUS_MANIFEST))
+          goto send_fail;
+        if (!send_int(client->file_descriptor, context->manifest->size))
+          goto send_fail;
+        for (int i = 0; i < context->manifest->size; i++) {
+          if (!send_str(client->file_descriptor, (char*)context->manifest->items[i]))
+            goto send_fail;
+        }
       }
-      send_status(client->file_descriptor, STATUS_FINISHED);
+      if (!send_status(client->file_descriptor, STATUS_FINISHED))
+        goto send_fail;
       Status s;
       int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
       client_disconnect(client);
       client_delete(client);
       return ok ? thrd_success : thrd_error;
+
+    send_fail:
+      client_disconnect(client);
+      client_delete(client);
+      return thrd_error;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
       fprintf(stderr, "Error: unexpected error while sending chunk\n");
@@ -441,13 +458,24 @@ int send_files(Config* config) {
     chunk_destroy(current_chunk);
   }
   if (config->use_delete) {
-    send_status(client->file_descriptor, STATUS_MANIFEST);
-    send_int(client->file_descriptor, manifest->size);
-    for (int i = 0; i < manifest->size; i++)
-      send_str(client->file_descriptor, (char*)manifest->items[i]);
+    if (!send_status(client->file_descriptor, STATUS_MANIFEST)) {
+      array_list_delete(manifest);
+      goto send_fail;
+    }
+    if (!send_int(client->file_descriptor, manifest->size)) {
+      array_list_delete(manifest);
+      goto send_fail;
+    }
+    for (int i = 0; i < manifest->size; i++) {
+      if (!send_str(client->file_descriptor, (char*)manifest->items[i])) {
+        array_list_delete(manifest);
+        goto send_fail;
+      }
+    }
     array_list_delete(manifest);
   }
-  send_status(client->file_descriptor, STATUS_FINISHED);
+  if (!send_status(client->file_descriptor, STATUS_FINISHED))
+    goto send_fail;
   Status s;
   int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
   if (config->show_progress) {
@@ -459,6 +487,12 @@ int send_files(Config* config) {
   client_disconnect(client);
   client_delete(client);
   return ok ? 0 : -1;
+
+send_fail:
+  directory_scanner_destroy(scanner);
+  client_disconnect(client);
+  client_delete(client);
+  return -1;
 }
 
 int send_files_multithreaded(Config* config) {

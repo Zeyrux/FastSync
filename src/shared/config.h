@@ -42,7 +42,7 @@ typedef struct Config {
   char* tls_ca;
 } Config;
 
-#define PROTOCOL_VERSION "1.2.0"
+#define PROTOCOL_VERSION "1.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(char* version, char* send_directory, char* receive_directory,

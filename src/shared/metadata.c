@@ -107,5 +107,6 @@ void file_restore_metadata(const char* path, FileMetadata* metadata) {
   times[0].tv_nsec = UTIME_OMIT;
   times[1].tv_sec = metadata->mtime_sec;
   times[1].tv_nsec = metadata->mtime_nsec;
-  utimensat(AT_FDCWD, path, times, 0);
+  if (utimensat(AT_FDCWD, path, times, 0) != 0)
+    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
 }

@@ -2,6 +2,7 @@
 #include "array_list.h"
 #include "libgen.h"
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,8 +87,8 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   size_t len = strlen(rel_path);
   for (int i = 0; i < manifest->size; i++) {
     const char* entry = (const char*)manifest->items[i];
-    // Check if entry starts with rel_path + '/'
-    if (strncmp(entry, rel_path, len) == 0 && entry[len] == '/')
+    // Check if entry starts with rel_path + '/' or matches exactly
+    if (strncmp(entry, rel_path, len) == 0 && (entry[len] == '/' || entry[len] == '\0'))
       return true;
   }
   return false;
@@ -112,8 +113,9 @@ static void delete_extras_walk(const char* abs_path, const char* rel_path, Array
     }
     if (S_ISDIR(st.st_mode)) {
       delete_extras_walk(child_abs, child_rel, manifest);
-      // After recursion, try to remove the subdirectory if it's now empty
-      if (rmdir(child_abs) != 0) {
+      // After recursion, try to remove the subdirectory if it's now empty.
+      // Ignore ENOENT: the recursive call may have already removed it.
+      if (rmdir(child_abs) != 0 && errno != ENOENT) {
         all_removed = false;
       }
     } else {
