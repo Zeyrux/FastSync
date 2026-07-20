@@ -197,7 +197,7 @@ bool send_data(int file_descriptor, const Data* data) {
   return true;
 }
 
-#define MAX_DATA_SIZE (1024ULL * 1024 * 1024)  // 1 GB
+#define MAX_DATA_SIZE (1024ULL * 1024 * 1024) // 1 GB
 
 Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;

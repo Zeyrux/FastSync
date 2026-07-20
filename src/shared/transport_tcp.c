@@ -165,7 +165,8 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     int fd = accept(server->file_descriptor, (struct sockaddr*)&client_addr, &client_len);
     if (fd < 0) {
       if (errno == EINTR) {
-        if (g_tcp_cleanup_requested) break;
+        if (g_tcp_cleanup_requested)
+          break;
         continue;
       }
       perror("Could not accept the connection");

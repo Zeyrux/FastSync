@@ -203,7 +203,8 @@ bool file_save_to_disk(const char* root_directory, File* file) {
   if (file->type == FILE_TYPE_SYMLINK && file->link_target) {
     // Validate link_target — reject absolute paths or traversal
     if (file->link_target[0] == '/' || strstr(file->link_target, "..") != NULL) {
-      log_message(LOG_LEVEL_ERROR, "Path traversal blocked in symlink target: %s", file->link_target);
+      log_message(LOG_LEVEL_ERROR, "Path traversal blocked in symlink target: %s",
+                  file->link_target);
       return false;
     }
     char* disk_path = path_cat((char*)root_directory, file->path);

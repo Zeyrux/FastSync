@@ -15,7 +15,8 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
                       bool use_sendfile, unsigned long long chunk_size) {
 
   Config* config = malloc(sizeof(Config));
-  if (config == NULL) return NULL;
+  if (config == NULL)
+    return NULL;
   config->version = version;
   config->send_directory = send_directory;
   config->receive_root_directory = receive_directory;
@@ -255,7 +256,8 @@ Config* config_receive(int file_descriptor) {
   if (!receive_int(file_descriptor, &ec))
     goto error;
   if (ec > MAX_PATTERN_COUNT) {
-    log_message(LOG_LEVEL_ERROR, "Exclude pattern count %d exceeds maximum %d", ec, MAX_PATTERN_COUNT);
+    log_message(LOG_LEVEL_ERROR, "Exclude pattern count %d exceeds maximum %d", ec,
+                MAX_PATTERN_COUNT);
     goto error;
   }
   if ((size_t)ec > SIZE_MAX / sizeof(char*)) {
@@ -287,7 +289,8 @@ Config* config_receive(int file_descriptor) {
   if (!receive_int(file_descriptor, &ic))
     goto error;
   if (ic > MAX_PATTERN_COUNT) {
-    log_message(LOG_LEVEL_ERROR, "Include pattern count %d exceeds maximum %d", ic, MAX_PATTERN_COUNT);
+    log_message(LOG_LEVEL_ERROR, "Include pattern count %d exceeds maximum %d", ic,
+                MAX_PATTERN_COUNT);
     goto error;
   }
   if ((size_t)ic > SIZE_MAX / sizeof(char*)) {
