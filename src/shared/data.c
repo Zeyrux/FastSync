@@ -3,7 +3,9 @@
 #include "stdlib.h"
 
 Data* data_create_empty(size_t data_size) {
-  void* data = malloc(data_size);
+  /* malloc(0) is UB; allocate at least 1 byte but preserve requested size */
+  size_t alloc_size = data_size > 0 ? data_size : 1;
+  void* data = malloc(alloc_size);
   if (data == NULL) {
     log_message(LOG_LEVEL_ERROR, "Could not allocate memory for empty data");
     return NULL;

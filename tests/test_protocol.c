@@ -169,6 +169,23 @@ static void test_receive_str_truncated() {
   close(p[0]);
 }
 
+static void test_receive_str_oversized() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  /* Send a size exceeding MAX_STRING_SIZE */
+  size_t huge = MAX_STRING_SIZE + 1;
+  EXPECT_TRUE(send_n_data(0, &huge, sizeof(size_t)));
+
+  char* received = receive_str(0);
+  EXPECT_NULL(received);
+
+  close(p[0]);
+  close(p[1]);
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -179,4 +196,5 @@ void test_protocol() {
   test_send_receive_status();
   test_receive_n_data_truncated();
   test_receive_str_truncated();
+  test_receive_str_oversized();
 }

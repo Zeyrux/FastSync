@@ -24,9 +24,58 @@ DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metada
   scanner->current_path = NULL;
   scanner->use_metadata = use_metadata;
   scanner->chunk_size = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
-  scanner->exclude_patterns = exclude_patterns;
+  /* Deep-copy exclude patterns */
+  if (exclude_count > 0 && exclude_patterns != NULL) {
+    scanner->exclude_patterns = malloc((size_t)exclude_count * sizeof(char*));
+    if (scanner->exclude_patterns == NULL) {
+      queue_destroy(scanner->directories);
+      free(scanner);
+      return NULL;
+    }
+    for (int i = 0; i < exclude_count; i++) {
+      scanner->exclude_patterns[i] = str_dup(exclude_patterns[i]);
+      if (scanner->exclude_patterns[i] == NULL) {
+        for (int j = 0; j < i; j++)
+          free(scanner->exclude_patterns[j]);
+        free(scanner->exclude_patterns);
+        queue_destroy(scanner->directories);
+        free(scanner);
+        return NULL;
+      }
+    }
+  } else {
+    scanner->exclude_patterns = NULL;
+  }
   scanner->exclude_count = exclude_count;
-  scanner->include_patterns = include_patterns;
+
+  /* Deep-copy include patterns */
+  if (include_count > 0 && include_patterns != NULL) {
+    scanner->include_patterns = malloc((size_t)include_count * sizeof(char*));
+    if (scanner->include_patterns == NULL) {
+      for (int i = 0; i < exclude_count; i++)
+        free(scanner->exclude_patterns[i]);
+      free(scanner->exclude_patterns);
+      queue_destroy(scanner->directories);
+      free(scanner);
+      return NULL;
+    }
+    for (int i = 0; i < include_count; i++) {
+      scanner->include_patterns[i] = str_dup(include_patterns[i]);
+      if (scanner->include_patterns[i] == NULL) {
+        for (int j = 0; j < i; j++)
+          free(scanner->include_patterns[j]);
+        free(scanner->include_patterns);
+        for (int j = 0; j < exclude_count; j++)
+          free(scanner->exclude_patterns[j]);
+        free(scanner->exclude_patterns);
+        queue_destroy(scanner->directories);
+        free(scanner);
+        return NULL;
+      }
+    }
+  } else {
+    scanner->include_patterns = NULL;
+  }
   scanner->include_count = include_count;
   scanner->max_size = max_size;
   scanner->min_size = min_size;
@@ -42,6 +91,12 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
     scanner->current_dir = NULL;
   }
   free(scanner->current_path);
+  for (int i = 0; i < scanner->exclude_count; i++)
+    free(scanner->exclude_patterns[i]);
+  free(scanner->exclude_patterns);
+  for (int i = 0; i < scanner->include_count; i++)
+    free(scanner->include_patterns[i]);
+  free(scanner->include_patterns);
   queue_destroy(scanner->directories);
   free(scanner);
 }
