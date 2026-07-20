@@ -22,6 +22,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_compile_options(-Wall -g -O3)
 
+include(FetchContent)
+FetchContent_Declare(xxhash GIT_REPOSITORY https://github.com/Cyan4973/xxHash GIT_TAG v0.8.3 SOURCE_SUBDIR cmake_unofficial)
+FetchContent_MakeAvailable(xxhash)
+
 # Sanitizer option
 set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, none)")
 set_property(CACHE SANITIZER PROPERTY STRINGS address thread none)
@@ -40,10 +44,6 @@ if(STRICT_WARNINGS)
   add_compile_options(-Wextra -Wpedantic -Werror)
 endif()
 
-include(FetchContent)
-FetchContent_Declare(xxhash GIT_REPOSITORY https://github.com/Cyan4973/xxHash GIT_TAG v0.8.3 SOURCE_SUBDIR cmake_unofficial)
-FetchContent_MakeAvailable(xxhash)
-
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
@@ -51,6 +51,7 @@ find_library(ZSTD_LIBRARY zstd)
 if(NOT ZSTD_LIBRARY)
   message(FATAL_ERROR "zstd library not found. Ensure it is in your nix-shell!")
 endif()
+
 find_package(OpenSSL REQUIRED)
 
 file(GLOB SHARED_SRCS "src/shared/*.c")
@@ -76,14 +77,15 @@ target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SS
 src/shared/    — shared libraries (globbed as SHARED_SRCS)
 src/client/    — client sources (globbed as CLIENT_SRCS)
 src/server/    — server sources (globbed as SERVER_SRCS)
-tests/         — test sources (globbed as TEST_SRCS)
+tests/         — unit test sources (globbed as TEST_SRCS)
+tests/integration/ — Python pytest integration tests
 ```
 
 ### Dependencies
 - **zstd** — found via `find_library(ZSTD_LIBRARY zstd)`
+- **OpenSSL** — found via `find_package(OpenSSL REQUIRED)` (TLS 1.2+ transport)
+- **xxHash** — fetched via `FetchContent` from GitHub (delta transfer hashing, v0.8.3)
 - **pthreads** — found via `find_package(Threads REQUIRED)`
-- **OpenSSL** — found via `find_package(OpenSSL REQUIRED)`
-- **xxhash** — fetched via `FetchContent` from GitHub (v0.8.3)
 - **C11 standard** — required
 - **CMake 3.22+** — minimum version
 
@@ -162,34 +164,22 @@ cmake --build build -j$(nproc)
 ./build/tests
 ```
 
-## When Adding Sanitizer Support to CMakeLists.txt
+## Sanitizer Integration
 
-Use CMake options for cleaner integration:
+The project uses a single `SANITIZER` cache variable in `CMakeLists.txt`:
 ```cmake
-option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
-option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
-option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
-
-if(ENABLE_ASAN)
-  add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address)
-endif()
-
-if(ENABLE_TSAN)
-  add_compile_options(-fsanitize=thread)
-  add_link_options(-fsanitize=thread)
-endif()
-
-if(ENABLE_UBSAN)
-  add_compile_options(-fsanitize=undefined)
-  add_link_options(-fsanitize=undefined)
-endif()
+set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, none)")
+set_property(CACHE SANITIZER PROPERTY STRINGS address thread none)
 ```
+Supported values: `address`, `thread`, `none`. Unknown values trigger `FATAL_ERROR`.
 
-Then build with:
+Build with:
 ```bash
-cmake -B build -S . -DENABLE_ASAN=ON
+cmake -B build -S . -DSANITIZER=address
+cmake --build build -j$(nproc)
 ```
+
+To add support for a new sanitizer (e.g., UBSan), add an `elseif(SANITIZER STREQUAL "undefined")` block following the existing `address`/`thread` pattern.
 
 ## CI & Task Execution
 

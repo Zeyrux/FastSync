@@ -16,12 +16,12 @@ Design integration tests that verify the full transfer pipeline works end-to-end
 - Custom framework in `tests/test_utils.h`
 - Run: `./build/tests`
 
-### 2. Integration Tests (existing — `test.py`)
+### 2. Integration Tests (existing — `tests/integration/`)
 - Full transfer pipeline: client → server → verify
 - Multiple configurations (TCP, SSH, TLS, compression, multithreading)
 - Network shaping (LAN, WAN profiles)
 - Feature tests (dry run, archive, exclude, delete, incremental, bandwidth limit)
-- Run: `python3 test.py`
+- Run: `python3 -m pytest tests/ -v --tb=short`
 
 ### 3. New: Focused Integration Tests
 When adding new features or fixing bugs, write targeted integration tests.
@@ -106,10 +106,9 @@ test ! -f /tmp/dst/.../extra.txt
 
 ### Gitea Workflow Structure (`.gitea/workflows/ci.yaml`)
 The project uses Gitea Actions. Key jobs:
-1. **Build** — compile on push/PR
-2. **Unit tests** — run `./build/tests`
-3. **Integration tests** — run `python3 test.py` (light mode)
-4. **Sanitizer builds** — ASan, TSan variants
+1. **build-and-test** — compile, unit tests, integration tests on push/PR
+2. **sanitizer** — ASan + UBSan build and test (separate job)
+3. **clang-tidy** — static analysis on C source files
 
 ### Adding a New CI Job
 ```yaml
@@ -119,17 +118,24 @@ jobs:
     container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run
-        run: |
-          cmake -B build -S . && cmake --build build -j$(nproc)
-          ./build/tests
+      - name: Configure
+        run: cmake -B build-${{ matrix.sanitizer }} -S . -DSANITIZER=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build-${{ matrix.sanitizer }} -j$(nproc)
+      - name: Symlink for integration tests
+        run: ln -sf build-${{ matrix.sanitizer }} build
+      - name: Unit Tests
+        run: ./build-${{ matrix.sanitizer }}/tests
+      - name: Integration Tests
+        run: LSAN_OPTIONS=suppressions=.lsan-suppressions.txt python3 -m pytest tests/ -v --tb=short
 ```
+The symlink step is required because `tests/conftest.py` expects `./build` to exist.
 
 ## Verification Checklist
 
 After any code change:
 - [ ] Unit tests pass: `./build/tests`
-- [ ] Integration tests pass: `python3 test.py` (light mode at minimum)
+- [ ] Integration tests pass: `python3 -m pytest tests/ -v --tb=short`
 - [ ] Build clean: no warnings with `-Wall`
 - [ ] No memory errors: ASan clean
 - [ ] No thread errors: TSan clean (if threading involved)

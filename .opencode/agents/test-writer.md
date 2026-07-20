@@ -165,34 +165,28 @@ int main() {
 
 ## Integration Test Patterns
 
-When writing integration tests (Python-based), follow the pattern in `test.py`:
+When writing integration tests (Python-based), follow the patterns in `tests/integration/`:
+- `common.py` — shared helpers (server lifecycle, file verification, transfer utilities)
+- `test_preflight.py` — preflight checks and configuration validation
+- `test_tcp.py` — TCP transport tests
+- `test_ssh.py` — SSH transport tests
+- `test_tls.py` — TLS transport tests
+- `test_features.py` — feature-specific tests (delete, exclude, incremental, etc.)
+
+Use `tests/conftest.py` fixtures for server setup/teardown (note: the file is at `tests/conftest.py`, not `tests/integration/conftest.py`).
 
 ### Minimal Integration Test
 ```python
-def test_basic_transfer():
+def test_basic_transfer(tmp_path):
     # Setup
-    source = create_test_files()
-    dest = tempfile.mkdtemp()
-    
-    # Start server
-    server = subprocess.Popen(["./build/server"], ...)
-    time.sleep(0.5)
-    
-    # Run client
-    result = subprocess.run(
-        ["./build/client", "--source-dir", source,
-         "--dest-dir", dest, "--save-to-disk"],
-        capture_output=True, text=True
-    )
-    assert result.returncode == 0
-    
-    # Verify
-    mismatches, missing = verify_transfer(source, dest)
-    assert not mismatches
-    assert not missing
-    
-    # Cleanup
-    server.terminate()
+    source = tmp_path / "src"
+    dest = tmp_path / "dst"
+    source.mkdir()
+    dest.mkdir()
+    (source / "file.txt").write_text("test content")
+
+    # Start server and run client (use fixtures from conftest.py)
+    # Verify with helper from common.py
 ```
 
 ### Edge Case Tests to Write
