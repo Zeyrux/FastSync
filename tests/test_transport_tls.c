@@ -34,7 +34,7 @@ static void test_tls_connect_bad_cert() {
    * client_connect_tls will try to connect first, fail, and return false.
    * Note: we use an invalid host to ensure connection failure,
    * which exercises the error path before cert loading. */
-  bool ok = client_connect_tls(client, "192.0.2.1", 12345, "/nonexistent/cert.pem",
+  bool ok = client_connect_tls(client, "127.0.0.1", 1, "/nonexistent/cert.pem",
                                "/nonexistent/key.pem", "/nonexistent/ca.pem");
   EXPECT_FALSE(ok);
 
@@ -51,7 +51,7 @@ static void test_tls_connect_null_paths() {
   EXPECT_NOT_NULL(client);
 
   /* Connect to invalid address — will fail at connect() step */
-  bool ok = client_connect_tls(client, "192.0.2.2", 12346, NULL, NULL, NULL);
+  bool ok = client_connect_tls(client, "127.0.0.1", 1, NULL, NULL, NULL);
   EXPECT_FALSE(ok);
 
   client_delete(client);

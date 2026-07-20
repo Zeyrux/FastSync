@@ -7,27 +7,30 @@
  * and that set_log_level changes behavior. */
 
 static void test_log_message_debug() {
-  /* Default level is WARNING, so DEBUG should be filtered out */
+  set_log_level(LOG_LEVEL_WARNING);
   log_message(LOG_LEVEL_DEBUG, "debug message: %d", 42);
-  /* No assertion needed - if we reach here without crash, success */
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
 static void test_log_message_info() {
-  /* Default level is WARNING, so INFO should be filtered out */
+  set_log_level(LOG_LEVEL_WARNING);
   log_message(LOG_LEVEL_INFO, "info message: %s", "test");
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
 static void test_log_message_warning() {
-  /* Default level is WARNING, so WARNING should be shown */
+  set_log_level(LOG_LEVEL_WARNING);
   log_message(LOG_LEVEL_WARNING, "warning message: %d %s", 1, "test");
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
 static void test_log_message_error() {
-  /* Default level is WARNING, so ERROR should be shown */
+  set_log_level(LOG_LEVEL_WARNING);
   log_message(LOG_LEVEL_ERROR, "error message: %s", "critical");
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
@@ -40,6 +43,7 @@ static void test_log_set_level_debug() {
   log_message(LOG_LEVEL_WARNING, "warning after set");
   log_message(LOG_LEVEL_ERROR, "error after set");
 
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
@@ -52,6 +56,7 @@ static void test_log_set_level_info() {
   log_message(LOG_LEVEL_WARNING, "warning should show");
   log_message(LOG_LEVEL_ERROR, "error should show");
 
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
@@ -64,6 +69,7 @@ static void test_log_set_level_error() {
   log_message(LOG_LEVEL_WARNING, "warning filtered");
   log_message(LOG_LEVEL_ERROR, "error should show");
 
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
@@ -80,6 +86,7 @@ static void test_log_filtering() {
   log_message(LOG_LEVEL_WARNING, "visible warning");
   log_message(LOG_LEVEL_ERROR, "visible error");
 
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
@@ -92,6 +99,7 @@ static void test_log_message_formats() {
   log_message(LOG_LEVEL_WARNING, "string: %s", "hello");
   log_message(LOG_LEVEL_ERROR, "multiple: %d %s %d", 1, "two", 3);
 
+  /* crash regression test — stderr capture would need infrastructure changes */
   EXPECT_TRUE(true);
 }
 
