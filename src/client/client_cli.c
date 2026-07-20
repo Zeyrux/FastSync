@@ -92,7 +92,14 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
       config->dry_run = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      config->ssh_port = atoi(argv[++i]);
+      char* end;
+      long p = strtol(argv[++i], &end, 10);
+      if (*end != '\0' || p <= 0 || p > 65535) {
+        fprintf(stderr, "Error: invalid SSH port '%s' (must be 1-65535)\n", argv[i]);
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->ssh_port = (int)p;
     } else if (strcmp(argv[i], "--delete") == 0) {
       config->use_delete = true;
     } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
@@ -169,7 +176,14 @@ int main(int argc, char* argv[]) {
       free(config->server_host);
       config->server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
-      config->server_port = atoi(argv[++i]);
+      char* end;
+      long p = strtol(argv[++i], &end, 10);
+      if (*end != '\0' || p <= 0 || p > 65535) {
+        fprintf(stderr, "Error: invalid server port '%s' (must be 1-65535)\n", argv[i]);
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->server_port = (int)p;
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;

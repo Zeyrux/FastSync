@@ -113,13 +113,11 @@ void handler(int file_descriptor) {
 }
 
 static Server* g_server = NULL;
+static volatile sig_atomic_t g_server_cleanup_requested = 0;
 
 static void cleanup(int sig) {
   (void)sig;
-  if (g_server) {
-    server_delete(&g_server);
-  }
-  _exit(0);
+  g_server_cleanup_requested = 1;
 }
 
 static void print_server_usage(void) {
@@ -208,6 +206,12 @@ int main(int argc, char* argv[]) {
     server_listen_tls(g_server, handler);
   } else {
     server_listen(g_server, handler);
+  }
+
+  /* Graceful shutdown: if a signal requested cleanup, delete the server */
+  if (g_server_cleanup_requested) {
+    log_message(LOG_LEVEL_INFO, "Shutdown requested, cleaning up");
+    server_delete(&g_server);
   }
   return 0;
 }
