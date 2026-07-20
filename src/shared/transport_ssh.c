@@ -186,7 +186,7 @@ Client* client_connect_ssh(const char* destination, int port) {
     return NULL;
   }
   client->file_descriptor = sv[0];
-  client->address.sin_family = AF_UNIX;
+  client->address.ss_family = AF_UNIX;
   client->address_length = 0;
   client->ssh_child_pid = pid;
   client->ssl = NULL;
