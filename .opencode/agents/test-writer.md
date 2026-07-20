@@ -215,3 +215,15 @@ When asked to write tests, produce:
 3. The runner.c modification needed
 4. Verify with a build and test run
 5. Suggest fuzzing targets if relevant
+
+## CI & Task Execution
+
+When using `tea` (the task execution agent) to run CI or tests, always set a sufficient timeout (e.g., 600000ms) to allow the workflow to finish. After CI completes, check the results yourself — inspect logs if the run failed. Never assume success.
+
+## Branch Strategy
+
+Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+
+## Dependency Installation
+
+All dependencies must be installed via the project's custom Docker image (repo-root `Dockerfile`, same image CI uses) — never via ad-hoc host package installs (no `apt-get install` / `pip install` on the host machine). See `AGENTS.md` for details.

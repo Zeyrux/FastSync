@@ -55,3 +55,20 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 ./build/tests                # unit tests
 python3 -m pytest tests/     # integration tests
 ```
+
+## CI Workflow — Waiting for Results
+
+When running the CI workflow via `tea` (the task execution agent), always set a sufficient timeout (e.g., 600000ms) to allow CI to finish. After CI completes, check the results yourself — do not assume success. Use `gh run watch` or similar to monitor CI status, then inspect logs on failure.
+
+## Branch Strategy
+
+Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch before making changes:
+```bash
+git checkout -b <feature-branch-name>
+```
+After committing changes, push the branch and create a PR:
+```bash
+git push -u origin <feature-branch-name>
+gh pr create --fill
+```
+Wait for CI to pass on the PR before merging.

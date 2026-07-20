@@ -114,20 +114,15 @@ The project uses Gitea Actions. Key jobs:
 ### Adding a New CI Job
 ```yaml
 jobs:
-  sanitizer:
+  new-job:
     runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libzstd-dev libssl-dev
-      - name: Build with ASan
+      - name: Build and run
         run: |
-          cmake -B build -S . \
-            -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
-          cmake --build build -j$(nproc)
-      - name: Run tests
-        run: ./build/tests
+          cmake -B build -S . && cmake --build build -j$(nproc)
+          ./build/tests
 ```
 
 ## Verification Checklist
@@ -148,3 +143,15 @@ When designing integration tests:
 4. **Verification** — how to check success
 5. **Cleanup** — how to remove test artifacts
 6. **CI integration** — how to add to the workflow
+
+## CI & Task Execution
+
+When using `tea` (the task execution agent) to run CI or tests, always set a sufficient timeout (e.g., 600000ms) to allow the workflow to finish. After CI completes, check the results yourself — inspect logs if the run failed. Never assume success.
+
+## Branch Strategy
+
+Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+
+## Dependency Installation
+
+All dependencies must be installed via the project's custom Docker image (repo-root `Dockerfile`, same image CI uses) — never via ad-hoc host package installs (no `apt-get install` / `pip install` on the host machine). See `AGENTS.md` for details.
