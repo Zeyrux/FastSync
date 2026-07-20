@@ -135,7 +135,6 @@ static void print_server_usage(void) {
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  --help              Show this help\n");
-  printf("  -V, --version       Show version and exit\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -149,9 +148,6 @@ int main(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_server_usage();
-      return 0;
-    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-      printf("fastsync-server version %s\n", PROTOCOL_VERSION);
       return 0;
     } else if (strcmp(argv[i], "--stdio") == 0) {
       io_set_fds(STDIN_FILENO, STDOUT_FILENO);

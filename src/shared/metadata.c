@@ -4,7 +4,6 @@
 #include "protocol.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -12,80 +11,60 @@
 #include <unistd.h>
 
 void metadata_to_buf(char** buf, const FileMetadata* m) {
-  int32_t present = (m != NULL) ? 1 : 0;
-  memcpy(*buf, &present, sizeof(present));
-  *buf += sizeof(present);
+  int present = (m != NULL) ? 1 : 0;
+  memcpy(*buf, &present, sizeof(int));
+  *buf += sizeof(int);
   if (m == NULL)
     return;
-  int32_t mode = (int32_t)m->mode;
-  memcpy(*buf, &mode, sizeof(mode));
-  *buf += sizeof(mode);
-  int32_t uid = (int32_t)m->uid;
-  memcpy(*buf, &uid, sizeof(uid));
-  *buf += sizeof(uid);
-  int32_t gid = (int32_t)m->gid;
-  memcpy(*buf, &gid, sizeof(gid));
-  *buf += sizeof(gid);
-  int64_t mtime_sec = (int64_t)m->mtime_sec;
-  memcpy(*buf, &mtime_sec, sizeof(mtime_sec));
-  *buf += sizeof(mtime_sec);
-  int64_t mtime_nsec = (int64_t)m->mtime_nsec;
-  memcpy(*buf, &mtime_nsec, sizeof(mtime_nsec));
-  *buf += sizeof(mtime_nsec);
+  memcpy(*buf, &m->mode, sizeof(mode_t));
+  *buf += sizeof(mode_t);
+  memcpy(*buf, &m->uid, sizeof(uid_t));
+  *buf += sizeof(uid_t);
+  memcpy(*buf, &m->gid, sizeof(gid_t));
+  *buf += sizeof(gid_t);
+  memcpy(*buf, &m->mtime_sec, sizeof(time_t));
+  *buf += sizeof(time_t);
+  memcpy(*buf, &m->mtime_nsec, sizeof(long));
+  *buf += sizeof(long);
 }
 
 FileMetadata* metadata_from_buf(char** buf) {
-  int32_t present;
-  memcpy(&present, *buf, sizeof(present));
-  *buf += sizeof(present);
+  int present;
+  memcpy(&present, *buf, sizeof(int));
+  *buf += sizeof(int);
   if (!present)
     return NULL;
   FileMetadata* m = malloc(sizeof(FileMetadata));
-  int32_t mode;
-  memcpy(&mode, *buf, sizeof(mode));
-  *buf += sizeof(mode);
-  m->mode = (mode_t)mode;
-  int32_t uid;
-  memcpy(&uid, *buf, sizeof(uid));
-  *buf += sizeof(uid);
-  m->uid = (uid_t)uid;
-  int32_t gid;
-  memcpy(&gid, *buf, sizeof(gid));
-  *buf += sizeof(gid);
-  m->gid = (gid_t)gid;
-  int64_t mtime_sec;
-  memcpy(&mtime_sec, *buf, sizeof(mtime_sec));
-  *buf += sizeof(mtime_sec);
-  m->mtime_sec = (time_t)mtime_sec;
-  int64_t mtime_nsec;
-  memcpy(&mtime_nsec, *buf, sizeof(mtime_nsec));
-  *buf += sizeof(mtime_nsec);
-  m->mtime_nsec = (long)mtime_nsec;
+  memcpy(&m->mode, *buf, sizeof(mode_t));
+  *buf += sizeof(mode_t);
+  memcpy(&m->uid, *buf, sizeof(uid_t));
+  *buf += sizeof(uid_t);
+  memcpy(&m->gid, *buf, sizeof(gid_t));
+  *buf += sizeof(gid_t);
+  memcpy(&m->mtime_sec, *buf, sizeof(time_t));
+  *buf += sizeof(time_t);
+  memcpy(&m->mtime_nsec, *buf, sizeof(long));
+  *buf += sizeof(long);
   return m;
 }
 
 bool metadata_send(int file_descriptor, FileMetadata* m) {
   if (m == NULL) {
-    int32_t zero = 0;
-    return send_n_data(file_descriptor, &zero, sizeof(zero));
+    int zero = 0;
+    return send_n_data(file_descriptor, &zero, sizeof(int));
   }
-  int32_t present = 1;
-  int32_t mode = (int32_t)m->mode;
-  int32_t uid = (int32_t)m->uid;
-  int32_t gid = (int32_t)m->gid;
-  int64_t mtime_sec = (int64_t)m->mtime_sec;
-  int64_t mtime_nsec = (int64_t)m->mtime_nsec;
-  return send_n_data(file_descriptor, &present, sizeof(present)) &&
-         send_n_data(file_descriptor, &mode, sizeof(mode)) &&
-         send_n_data(file_descriptor, &uid, sizeof(uid)) &&
-         send_n_data(file_descriptor, &gid, sizeof(gid)) &&
-         send_n_data(file_descriptor, &mtime_sec, sizeof(mtime_sec)) &&
-         send_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec));
+  int present = 1;
+  return send_n_data(file_descriptor, &present, sizeof(int)) &&
+         send_n_data(file_descriptor, &m->mode, sizeof(mode_t)) &&
+         send_n_data(file_descriptor, &m->uid, sizeof(uid_t)) &&
+         send_n_data(file_descriptor, &m->gid, sizeof(gid_t)) &&
+         send_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t)) &&
+         send_n_data(file_descriptor, &m->mtime_nsec, sizeof(long));
 }
 
 FileMetadata* metadata_receive(int file_descriptor, int* ok) {
-  int32_t present;
-  if (!receive_n_data(file_descriptor, &present, sizeof(present))) {
+  int present;
+  if (!receive_n_data(file_descriptor, &present, sizeof(int))) {
     if (ok)
       *ok = 0;
     return NULL;
@@ -101,46 +80,16 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  int32_t mode;
-  if (!receive_n_data(file_descriptor, &mode, sizeof(mode))) {
+  if (!receive_n_data(file_descriptor, &m->mode, sizeof(mode_t)) ||
+      !receive_n_data(file_descriptor, &m->uid, sizeof(uid_t)) ||
+      !receive_n_data(file_descriptor, &m->gid, sizeof(gid_t)) ||
+      !receive_n_data(file_descriptor, &m->mtime_sec, sizeof(time_t)) ||
+      !receive_n_data(file_descriptor, &m->mtime_nsec, sizeof(long))) {
     free(m);
     if (ok)
       *ok = 0;
     return NULL;
   }
-  m->mode = (mode_t)mode;
-  int32_t uid;
-  if (!receive_n_data(file_descriptor, &uid, sizeof(uid))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->uid = (uid_t)uid;
-  int32_t gid;
-  if (!receive_n_data(file_descriptor, &gid, sizeof(gid))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->gid = (gid_t)gid;
-  int64_t mtime_sec;
-  if (!receive_n_data(file_descriptor, &mtime_sec, sizeof(mtime_sec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->mtime_sec = (time_t)mtime_sec;
-  int64_t mtime_nsec;
-  if (!receive_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->mtime_nsec = (long)mtime_nsec;
   if (ok)
     *ok = 1;
   return m;

@@ -56,7 +56,6 @@ static void print_usage(void) {
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  --help              Show this help\n");
-  printf("  -V, --version       Show version and exit\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -80,9 +79,6 @@ int main(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
-      goto cleanup;
-    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-      printf("fastsync version %s\n", PROTOCOL_VERSION);
       goto cleanup;
     } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
       config->use_compression = true;
