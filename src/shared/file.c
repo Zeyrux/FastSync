@@ -414,7 +414,7 @@ bool to_disk(const char* path, const void* data, unsigned long long data_size) {
   char* path_dup = str_dup(path);
   if (!path_dup)
     return false;
-  char* dir_result = dirname(path_dup);
+  const char* dir_result = dirname(path_dup);
   char* directory = str_dup(dir_result);
   free(path_dup);
   if (!directory)
