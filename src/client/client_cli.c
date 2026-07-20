@@ -73,6 +73,8 @@ int main(int argc, char* argv[]) {
 
   Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
                                  false, false, 5, false, 0);
+  int exit_code = 0;
+  bool config_owned_by_pipeline = false;
 
   int positional_args[2];
   int positional_count = 0;
@@ -80,7 +82,7 @@ int main(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
-      return 0;
+      goto cleanup;
     } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
       config->use_compression = true;
       config->use_multithreading = true;
@@ -165,11 +167,13 @@ int main(int argc, char* argv[]) {
       unsigned long long kbps = strtoull(argv[++i], &end, 10);
       if (errno != 0 || *end != '\0' || kbps == 0) {
         fprintf(stderr, "Error: --bwlimit must be a positive integer\n");
-        return 1;
+        exit_code = 1;
+        goto cleanup;
       }
       if (kbps > ULLONG_MAX / 1024) {
         fprintf(stderr, "Error: --bwlimit value too large\n");
-        return 1;
+        exit_code = 1;
+        goto cleanup;
       }
       io_set_bwlimit(kbps * 1024);
       log_message(LOG_LEVEL_INFO, "Set bandwidth limit to %llu KB/s", kbps);
@@ -195,14 +199,16 @@ int main(int argc, char* argv[]) {
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
-      return 1;
+      exit_code = 1;
+      goto cleanup;
     } else {
       if (positional_count < 2)
         positional_args[positional_count++] = i;
       else {
         fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
         print_usage();
-        return 1;
+        exit_code = 1;
+        goto cleanup;
       }
     }
   }
@@ -218,7 +224,8 @@ int main(int argc, char* argv[]) {
   } else if (positional_count == 1) {
     fprintf(stderr, "Error: missing destination argument\n");
     print_usage();
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   } else {
     if (!config->send_directory && env_source)
       config->send_directory = str_dup((char*)env_source);
@@ -229,22 +236,26 @@ int main(int argc, char* argv[]) {
   if (!config->send_directory || !config->receive_root_directory) {
     fprintf(stderr, "Error: source and destination directories are required\n");
     print_usage();
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
   if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
     fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk "
                     "serialization)\n");
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
 
   if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
     fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
 
   if (config->use_incremental && config->use_chunk_serialization) {
     fprintf(stderr, "Error: --incremental is not supported with -s (chunk serialization)\n");
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
 
   if (config->use_incremental && !config->use_metadata) {
@@ -254,15 +265,18 @@ int main(int argc, char* argv[]) {
 
   if (config->use_delta && !config->use_incremental) {
     fprintf(stderr, "Error: --delta requires --incremental\n");
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
   if (config->use_delta && config->use_chunk_serialization) {
     fprintf(stderr, "Error: --delta cannot be combined with -s (chunk serialization)\n");
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
   if (config->use_delta && config->use_sendfile) {
     fprintf(stderr, "Error: --delta cannot be combined with -f (sendfile)\n");
-    return 1;
+    exit_code = 1;
+    goto cleanup;
   }
   if (config->use_delta && !config->use_metadata) {
     log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --delta");
@@ -272,12 +286,21 @@ int main(int argc, char* argv[]) {
   if (config->use_tls) {
     if (!config->tls_cert || !config->tls_key) {
       fprintf(stderr, "Error: --tls requires --cert and --key\n");
-      return 1;
+      exit_code = 1;
+      goto cleanup;
     }
     tls_global_init();
   }
 
-  if (config->use_multithreading)
-    return send_files_multithreaded(config);
-  return send_files(config);
+  if (config->use_multithreading) {
+    config_owned_by_pipeline = true;
+    exit_code = send_files_multithreaded(config);
+  } else {
+    exit_code = send_files(config);
+  }
+
+cleanup:
+  if (!config_owned_by_pipeline)
+    config_delete(config);
+  return exit_code;
 }

@@ -1,0 +1,6 @@
+# LSAN suppressions for FastSync
+# Add suppression entries here for known pre-existing leaks that cannot be
+# fixed immediately. Remove entries as leaks are fixed.
+#
+# Example format:
+# leak:function_name
