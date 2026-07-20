@@ -54,6 +54,7 @@ FileMetadata* metadata_from_buf(char** buf) {
   if (!present)
     return NULL;
   FileMetadata* m = malloc(sizeof(FileMetadata));
+  if (m == NULL) return NULL;
   int32_t mode;
   memcpy(&mode, *buf, sizeof(mode));
   *buf += sizeof(mode);
