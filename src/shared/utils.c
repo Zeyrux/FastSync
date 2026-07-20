@@ -10,19 +10,23 @@
 #include <unistd.h>
 
 bool mkdir_r(const char* path) {
-  char* path_duplicate = malloc(strlen(path) + 1);
+  size_t path_len = strlen(path);
+  char* path_duplicate = malloc(path_len + 1);
   if (!path_duplicate)
     return false;
-  strcpy(path_duplicate, path);
-  char* path_current = (char*)malloc((strlen(path) + 2) * sizeof(char));
+  memcpy(path_duplicate, path, path_len + 1);
+  /* Buffer for building subpaths: path_len + 1 for leading '/' + 1 for null */
+  size_t buf_size = path_len + 2;
+  char* path_current = (char*)malloc(buf_size);
   if (!path_current) {
     free(path_duplicate);
     return false;
   }
-  char* path_current_position = path_current;
+  size_t pos = 0;
   if (path[0] == '/') {
-    strcpy(path_current, "/");
-    path_current_position += 1;
+    path_current[0] = '/';
+    path_current[1] = '\0';
+    pos = 1;
   } else {
     path_current[0] = '\0';
   }
@@ -31,10 +35,16 @@ bool mkdir_r(const char* path) {
   const char* part = strtok_r(path_duplicate, delimiter, &saveptr);
   bool ok = true;
   while (part != NULL) {
-    strcpy(path_current_position, part);
-    path_current_position += strlen(part) * sizeof(char);
-    strcpy(path_current_position, "/");
-    path_current_position += sizeof(char);
+    size_t part_len = strlen(part);
+    if (pos + part_len + 1 >= buf_size) {
+      ok = false;
+      break;
+    }
+    memcpy(path_current + pos, part, part_len);
+    pos += part_len;
+    path_current[pos] = '/';
+    pos++;
+    path_current[pos] = '\0';
     struct stat st;
     if (stat(path_current, &st) != 0) {
       if (mkdir(path_current, 0755) != 0) {
@@ -49,7 +59,6 @@ bool mkdir_r(const char* path) {
   free(path_current);
   return ok;
 }
-
 char* str_dup(const char* string) {
   if (string == NULL)
     return NULL;
