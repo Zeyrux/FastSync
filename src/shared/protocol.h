@@ -5,9 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Maximum allowed string size for receive_str (10 MB) */
-#define MAX_STRING_SIZE (10 * 1024 * 1024)
-
 typedef struct ssl_st SSL;
 
 typedef int Status;

@@ -11,46 +11,10 @@
 #include "transport_tls.h"
 #include "unistd.h"
 #include "utils.h"
-#include <libgen.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Check if a file path should be excluded based on config patterns
-static bool is_excluded(const char* path, const Config* config) {
-  // Extract filename from path
-  char* path_dup = str_dup(path);
-  if (!path_dup)
-    return false;
-  char* fname = basename(path_dup);
-
-  // Check exclude patterns
-  for (int i = 0; i < config->exclude_count; i++) {
-    if (glob_match(config->exclude_patterns[i], fname)) {
-      free(path_dup);
-      return true;
-    }
-  }
-
-  // Check include patterns (if any, file must match at least one)
-  if (config->include_count > 0) {
-    bool included = false;
-    for (int i = 0; i < config->include_count; i++) {
-      if (glob_match(config->include_patterns[i], fname)) {
-        included = true;
-        break;
-      }
-    }
-    if (!included) {
-      free(path_dup);
-      return true;
-    }
-  }
-
-  free(path_dup);
-  return false;
-}
 
 int receive_files(Config* config, int fd) {
   Status status;
@@ -65,7 +29,7 @@ int receive_files(Config* config, int fd) {
         goto next;
       if (file == NULL && !skipped)
         return -1;
-      if (config->save_to_disk && !is_excluded(file->path, config))
+      if (config->save_to_disk)
         file_save_to_disk(config->receive_root_directory, file);
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
@@ -75,7 +39,7 @@ int receive_files(Config* config, int fd) {
         return -1;
       }
       for (int i = 0; i < chunk->element_count; i++) {
-        if (config->save_to_disk && !is_excluded(chunk->items[i]->path, config))
+        if (config->save_to_disk)
           file_save_to_disk(config->receive_root_directory, chunk->items[i]);
       }
       chunk_destroy(chunk);
@@ -86,7 +50,7 @@ int receive_files(Config* config, int fd) {
         send_status(fd, STATUS_ERROR);
         return -1;
       }
-      if (config->save_to_disk && !is_excluded(file->path, config))
+      if (config->save_to_disk)
         file_save_to_disk(config->receive_root_directory, file);
       file_destroy(file);
     }
@@ -149,11 +113,13 @@ void handler(int file_descriptor) {
 }
 
 static Server* g_server = NULL;
-static volatile sig_atomic_t g_server_cleanup_requested = 0;
 
 static void cleanup(int sig) {
   (void)sig;
-  g_server_cleanup_requested = 1;
+  if (g_server) {
+    server_delete(&g_server);
+  }
+  _exit(0);
 }
 
 static void print_server_usage(void) {
@@ -169,7 +135,6 @@ static void print_server_usage(void) {
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  --help              Show this help\n");
-  printf("  -V, --version       Show version and exit\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -183,9 +148,6 @@ int main(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_server_usage();
-      return 0;
-    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-      printf("fastsync-server version %s\n", PROTOCOL_VERSION);
       return 0;
     } else if (strcmp(argv[i], "--stdio") == 0) {
       io_set_fds(STDIN_FILENO, STDOUT_FILENO);
@@ -242,12 +204,6 @@ int main(int argc, char* argv[]) {
     server_listen_tls(g_server, handler);
   } else {
     server_listen(g_server, handler);
-  }
-
-  /* Graceful shutdown: if a signal requested cleanup, delete the server */
-  if (g_server_cleanup_requested) {
-    log_message(LOG_LEVEL_INFO, "Shutdown requested, cleaning up");
-    server_delete(&g_server);
   }
   return 0;
 }

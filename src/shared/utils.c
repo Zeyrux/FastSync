@@ -10,23 +10,19 @@
 #include <unistd.h>
 
 bool mkdir_r(const char* path) {
-  size_t path_len = strlen(path);
-  char* path_duplicate = malloc(path_len + 1);
+  char* path_duplicate = malloc(strlen(path) + 1);
   if (!path_duplicate)
     return false;
-  memcpy(path_duplicate, path, path_len + 1);
-  /* Buffer for building subpaths: path_len + 1 for leading '/' + 1 for null */
-  size_t buf_size = path_len + 2;
-  char* path_current = (char*)malloc(buf_size);
+  strcpy(path_duplicate, path);
+  char* path_current = (char*)malloc((strlen(path) + 2) * sizeof(char));
   if (!path_current) {
     free(path_duplicate);
     return false;
   }
-  size_t pos = 0;
+  char* path_current_position = path_current;
   if (path[0] == '/') {
-    path_current[0] = '/';
-    path_current[1] = '\0';
-    pos = 1;
+    strcpy(path_current, "/");
+    path_current_position += 1;
   } else {
     path_current[0] = '\0';
   }
@@ -35,16 +31,10 @@ bool mkdir_r(const char* path) {
   const char* part = strtok_r(path_duplicate, delimiter, &saveptr);
   bool ok = true;
   while (part != NULL) {
-    size_t part_len = strlen(part);
-    if (pos + part_len + 1 >= buf_size) {
-      ok = false;
-      break;
-    }
-    memcpy(path_current + pos, part, part_len);
-    pos += part_len;
-    path_current[pos] = '/';
-    pos++;
-    path_current[pos] = '\0';
+    strcpy(path_current_position, part);
+    path_current_position += strlen(part) * sizeof(char);
+    strcpy(path_current_position, "/");
+    path_current_position += sizeof(char);
     struct stat st;
     if (stat(path_current, &st) != 0) {
       if (mkdir(path_current, 0755) != 0) {
@@ -59,6 +49,7 @@ bool mkdir_r(const char* path) {
   free(path_current);
   return ok;
 }
+
 char* str_dup(const char* string) {
   if (string == NULL)
     return NULL;
@@ -70,23 +61,6 @@ char* str_dup(const char* string) {
 bool glob_match(const char* pattern, const char* str) {
   while (*pattern) {
     if (*pattern == '*') {
-      /* Check for double-star (globstar) pattern */
-      if (*(pattern + 1) == '*') {
-        pattern += 2;
-        /* Trailing double-star matches everything */
-        if (*pattern == '\0')
-          return true;
-        /* double-star slash: match at any depth */
-        if (*pattern == '/')
-          pattern++;
-        while (*str) {
-          if (glob_match(pattern, str))
-            return true;
-          str++;
-        }
-        return glob_match(pattern, str);
-      }
-      /* Single * — does not cross / boundaries */
       pattern++;
       while (*str && *str != '/') {
         if (glob_match(pattern, str))
@@ -100,17 +74,8 @@ bool glob_match(const char* pattern, const char* str) {
       pattern++;
       str++;
     } else {
-      if (*pattern != *str) {
-        /* If pattern has a '/' followed by '**', allow zero path components */
-        if (*pattern == '/' && *(pattern + 1) == '*' && *(pattern + 2) == '*') {
-          /* Skip over slash-double-star and try to match rest against current str */
-          const char* rest = pattern + 3;
-          if (*rest == '/')
-            rest++;
-          return glob_match(rest, str);
-        }
+      if (*pattern != *str)
         return false;
-      }
       pattern++;
       str++;
     }

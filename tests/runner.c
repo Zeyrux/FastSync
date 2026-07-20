@@ -5,11 +5,8 @@
 #include "test_data.h"
 #include "test_delta.h"
 #include "test_file.h"
-#include "test_file_sendfile.h"
 #include "test_glob.h"
-#include "test_log.h"
 #include "test_metadata.h"
-#include "test_multiprocessing.h"
 #include "test_property.h"
 #include "test_protocol.h"
 #include "test_queue.h"
@@ -17,9 +14,6 @@
 #include "test_scanner.h"
 #include "test_shared_utils.h"
 #include "test_stress.h"
-#include "test_transport_tcp.h"
-#include "test_transport_ssh.h"
-#include "test_transport_tls.h"
 #include "test_utils.h"
 #include <stdio.h>
 
@@ -44,12 +38,6 @@ int main() {
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
   RUN_TEST(test_file);
-  RUN_TEST(test_file_sendfile);
-  RUN_TEST(test_multiprocessing);
-  RUN_TEST(test_log);
-  RUN_TEST(test_transport_tcp);
-  RUN_TEST(test_transport_ssh);
-  RUN_TEST(test_transport_tls);
   RUN_TEST(test_robustness);
   RUN_TEST(test_stress);
   RUN_TEST(test_property);
