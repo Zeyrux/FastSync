@@ -217,6 +217,9 @@ static void test_file_send_no_path() {
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
+    int file_type;
+    EXPECT_TRUE(receive_int(p[0], &file_type));
+    EXPECT_EQ_INT(file_type, 0); /* FILE_TYPE_REGULAR */
     Data* received = receive_data(p[0]);
     close(p[0]);
 

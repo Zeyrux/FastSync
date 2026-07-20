@@ -118,6 +118,11 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
     data_destroy(compressed_data);
     return false;
   }
+  int ft = 0; // FILE_TYPE_REGULAR
+  if (!send_int(file_descriptor, ft)) {
+    data_destroy(compressed_data);
+    return false;
+  }
   if (!send_data(file_descriptor, data_to_send)) {
     data_destroy(compressed_data);
     return false;
@@ -385,6 +390,13 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     }
   }
 
+  int file_type;
+  if (!receive_int(fd, &file_type)) {
+    file_destroy(file);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
   Data* file_data = receive_data(fd);
   if (file_data == NULL) {
     file_destroy(file);
@@ -462,6 +474,10 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
     return false;
 
+  int ft = 0; // FILE_TYPE_REGULAR
+  if (!send_int(file_descriptor, ft))
+    return false;
+
   int fd = open(file->path, O_RDONLY);
   if (fd == -1) {
     perror("Could not open file for sendfile");
@@ -503,6 +519,11 @@ File* file_receive(const Config* config, int file_descriptor) {
       file_destroy(file);
       return NULL;
     }
+  }
+  int file_type;
+  if (!receive_int(file_descriptor, &file_type)) {
+    file_destroy(file);
+    return NULL;
   }
   Data* file_data = receive_data(file_descriptor);
   if (file_data == NULL) {

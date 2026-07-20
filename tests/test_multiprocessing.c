@@ -8,8 +8,8 @@
 
 /* Test pipeline_context_sender_create/destroy with valid arguments */
 static void test_sender_create_destroy() {
-  Config* cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("/dst"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("/dst"), false, false, false,
+                              false, false, 0, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   Queue* q_scanner = queue_create(5, NULL);
@@ -32,8 +32,8 @@ static void test_sender_create_destroy() {
 
 /* Test pipeline_context_receiver_create/destroy with valid arguments */
 static void test_receiver_create_destroy() {
-  Config* cfg = config_create(str_dup("2.0"), str_dup("/src"), str_dup("/dst"),
-                              true, true, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup("2.0"), str_dup("/src"), str_dup("/dst"), true, true, false,
+                              false, false, 0, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   Queue* q = queue_create(20, NULL);
@@ -51,8 +51,8 @@ static void test_receiver_create_destroy() {
 
 /* Test that create handles various queue capacities */
 static void test_sender_queue_capacities() {
-  Config* cfg = config_create(str_dup("3.0"), str_dup("/src"), str_dup("/dst"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup("3.0"), str_dup("/src"), str_dup("/dst"), false, false, false,
+                              false, false, 0, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   /* Single-element queues */
@@ -67,8 +67,8 @@ static void test_sender_queue_capacities() {
 
 /* Test that create handles zero-capacity queues */
 static void test_sender_zero_capacity() {
-  Config* cfg = config_create(str_dup("4.0"), str_dup("/src"), str_dup("/dst"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup("4.0"), str_dup("/src"), str_dup("/dst"), false, false, false,
+                              false, false, 0, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   Queue* q1 = queue_create(0, NULL);
@@ -82,8 +82,8 @@ static void test_sender_zero_capacity() {
 
 /* Test receiver with zero file_descriptor */
 static void test_receiver_fd_zero() {
-  Config* cfg = config_create(str_dup("5.0"), str_dup("/src"), str_dup("/dst"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup("5.0"), str_dup("/src"), str_dup("/dst"), false, false, false,
+                              false, false, 0, false, 0);
   Queue* q = queue_create(5, NULL);
   PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 0);
   EXPECT_NOT_NULL(ctx);
