@@ -74,6 +74,7 @@ int main(int argc, char* argv[]) {
   Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
                                  false, false, 5, false, 0);
   int exit_code = 0;
+  bool config_owned_by_pipeline = false;
 
   int positional_args[2];
   int positional_count = 0;
@@ -291,12 +292,15 @@ int main(int argc, char* argv[]) {
     tls_global_init();
   }
 
-  if (config->use_multithreading)
+  if (config->use_multithreading) {
+    config_owned_by_pipeline = true;
     exit_code = send_files_multithreaded(config);
-  else
+  } else {
     exit_code = send_files(config);
+  }
 
 cleanup:
-  config_delete(config);
+  if (!config_owned_by_pipeline)
+    config_delete(config);
   return exit_code;
 }
