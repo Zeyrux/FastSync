@@ -149,7 +149,7 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
 void file_restore_metadata(const char* path, FileMetadata* metadata) {
   if (metadata == NULL)
     return;
-  if (chmod(path, metadata->mode & 07777) != 0)
+  if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
   if (chown(path, metadata->uid, metadata->gid) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chown %s: %s", path, strerror(errno));

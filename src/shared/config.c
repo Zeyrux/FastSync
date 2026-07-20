@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "utils.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -246,10 +247,20 @@ Config* config_receive(int file_descriptor) {
   config->follow_symlinks = false;
   config->partial = false;
 
+#define MAX_PATTERN_COUNT 10000
+
   // Receive exclude patterns
   int ec;
   if (!receive_int(file_descriptor, &ec))
     goto error;
+  if (ec > MAX_PATTERN_COUNT) {
+    log_message(LOG_LEVEL_ERROR, "Exclude pattern count %d exceeds maximum %d", ec, MAX_PATTERN_COUNT);
+    goto error;
+  }
+  if ((size_t)ec > SIZE_MAX / sizeof(char*)) {
+    log_message(LOG_LEVEL_ERROR, "Exclude pattern count %d would cause integer overflow", ec);
+    goto error;
+  }
   config->exclude_count = ec;
   if (ec > 0) {
     config->exclude_patterns = malloc((size_t)ec * sizeof(char*));
@@ -274,6 +285,14 @@ Config* config_receive(int file_descriptor) {
   int ic;
   if (!receive_int(file_descriptor, &ic))
     goto error;
+  if (ic > MAX_PATTERN_COUNT) {
+    log_message(LOG_LEVEL_ERROR, "Include pattern count %d exceeds maximum %d", ic, MAX_PATTERN_COUNT);
+    goto error;
+  }
+  if ((size_t)ic > SIZE_MAX / sizeof(char*)) {
+    log_message(LOG_LEVEL_ERROR, "Include pattern count %d would cause integer overflow", ic);
+    goto error;
+  }
   config->include_count = ic;
   if (ic > 0) {
     config->include_patterns = malloc((size_t)ic * sizeof(char*));

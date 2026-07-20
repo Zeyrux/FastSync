@@ -126,7 +126,11 @@ static bool file_send_streaming(File* file, int file_descriptor) {
     return false;
   }
 
-  char buf[STREAM_CHUNK_SIZE];
+  char* buf = malloc(STREAM_CHUNK_SIZE);
+  if (!buf) {
+    fclose(fp);
+    return false;
+  }
   unsigned long long remaining = total_size;
   while (remaining > 0) {
     size_t to_read = (size_t)((remaining < STREAM_CHUNK_SIZE) ? remaining : STREAM_CHUNK_SIZE);
@@ -135,15 +139,18 @@ static bool file_send_streaming(File* file, int file_descriptor) {
       if (ferror(fp)) {
         perror("Read error during streaming");
       }
+      free(buf);
       fclose(fp);
       return false;
     }
     if (!send_n_data(file_descriptor, buf, nread)) {
+      free(buf);
       fclose(fp);
       return false;
     }
     remaining -= (unsigned long long)nread;
   }
+  free(buf);
   fclose(fp);
   return true;
 }
@@ -194,9 +201,19 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
 
 bool file_save_to_disk(const char* root_directory, File* file) {
   if (file->type == FILE_TYPE_SYMLINK && file->link_target) {
+    // Validate link_target — reject absolute paths or traversal
+    if (file->link_target[0] == '/' || strstr(file->link_target, "..") != NULL) {
+      log_message(LOG_LEVEL_ERROR, "Path traversal blocked in symlink target: %s", file->link_target);
+      return false;
+    }
     char* disk_path = path_cat((char*)root_directory, file->path);
     if (disk_path == NULL)
       return false;
+    if (strstr(disk_path, "..") != NULL) {
+      log_message(LOG_LEVEL_ERROR, "Path traversal blocked: %s", disk_path);
+      free(disk_path);
+      return false;
+    }
     unlink(disk_path);
     bool ok = (symlink(file->link_target, disk_path) == 0);
     if (ok && file->metadata)
@@ -208,6 +225,11 @@ bool file_save_to_disk(const char* root_directory, File* file) {
   char* disk_path = path_cat((char*)root_directory, file->path);
   if (disk_path == NULL)
     return false;
+  if (strstr(disk_path, "..") != NULL) {
+    log_message(LOG_LEVEL_ERROR, "Path traversal blocked: %s", disk_path);
+    free(disk_path);
+    return false;
+  }
   bool ok = to_disk(disk_path, file->data->data, file->data->size);
   if (ok)
     file_restore_metadata(disk_path, file->metadata);
@@ -423,6 +445,13 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
 
   char* full_path = path_cat(config->receive_root_directory, check_path);
+  if (full_path && strstr(full_path, "..") != NULL) {
+    log_message(LOG_LEVEL_ERROR, "Path traversal blocked: %s", full_path);
+    free(full_path);
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
   struct stat st;
   bool has_old_file = (full_path && stat(full_path, &st) == 0);
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;

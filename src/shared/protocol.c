@@ -198,10 +198,16 @@ bool send_data(int file_descriptor, const Data* data) {
   return true;
 }
 
+#define MAX_DATA_SIZE (1024ULL * 1024 * 1024)  // 1 GB
+
 Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
+  if (size > MAX_DATA_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "receive_data: size %llu exceeds maximum", size);
+    return NULL;
+  }
   void* data = malloc((size_t)size);
   if (data == NULL)
     return NULL;

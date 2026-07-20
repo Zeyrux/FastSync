@@ -168,6 +168,14 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
     client->ssl_ctx = NULL;
     return false;
   }
+
+  // Set SNI and enable hostname verification
+  SSL_set_tlsext_host_name(ssl, host);
+  X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+  if (param) {
+    X509_VERIFY_PARAM_set1_host(param, host, 0);
+  }
+
   client->ssl = ssl;
   io_set_ssl(ssl);
   return true;
