@@ -2,8 +2,23 @@
 #define TEST_UTILS_H
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+
+// Detect if running under valgrind by checking /proc/self/maps for vgpreload.
+// This is used to skip fork-based tests that are incompatible with valgrind
+// (the instrumented parent runs too slowly, causing pipe timeouts).
+static inline bool is_running_under_valgrind(void) {
+  FILE* f = fopen("/proc/self/maps", "r");
+  if (!f)
+    return false;
+  char buf[4096];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+  return strstr(buf, "vgpreload") != NULL;
+}
 
 // Global test suite status
 extern int tests_run;
