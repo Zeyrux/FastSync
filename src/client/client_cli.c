@@ -55,6 +55,7 @@ static void print_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version and exit\n");
 }
@@ -217,6 +218,8 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
       free(config->tls_ca);
       config->tls_ca = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--partial") == 0) {
+      config->partial = true;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {

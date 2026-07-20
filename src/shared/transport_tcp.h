@@ -1,19 +1,21 @@
 #ifndef TRANSPORT_TCP_H
 #define TRANSPORT_TCP_H
 
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdbool.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 
 typedef struct Server {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   unsigned int address_length;
   int file_descriptor;
   void* ssl_ctx;
 } Server;
 
 typedef struct Client {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   unsigned int address_length;
   int file_descriptor;
   pid_t ssh_child_pid;
@@ -30,5 +32,6 @@ Client* client_create();
 bool client_connect(Client* client, char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
+bool set_socket_timeouts(int fd);
 
 #endif
