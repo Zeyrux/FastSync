@@ -111,9 +111,6 @@ Client* client_connect_ssh(const char* destination, int port) {
     close(sv[0]);
     close(exec_pipe[0]);
     fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC);
-    // Child doesn't need the RemoteDest strings
-    remote_dest_destroy(&r);
-
     if (sv[1] != STDIN_FILENO)
       dup2(sv[1], STDIN_FILENO);
     if (sv[1] != STDOUT_FILENO)
