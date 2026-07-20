@@ -55,7 +55,9 @@ static void print_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --help              Show this help\n");
+  printf("  -V, --version       Show version and exit\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -80,6 +82,9 @@ int main(int argc, char* argv[]) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
       goto cleanup;
+    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+      printf("fastsync version %s\n", PROTOCOL_VERSION);
+      goto cleanup;
     } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
       config->use_compression = true;
       config->use_multithreading = true;
@@ -88,7 +93,14 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
       config->dry_run = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      config->ssh_port = atoi(argv[++i]);
+      char* end;
+      long p = strtol(argv[++i], &end, 10);
+      if (*end != '\0' || p <= 0 || p > 65535) {
+        fprintf(stderr, "Error: invalid SSH port '%s' (must be 1-65535)\n", argv[i]);
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->ssh_port = (int)p;
     } else if (strcmp(argv[i], "--delete") == 0) {
       config->use_delete = true;
     } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
@@ -165,7 +177,14 @@ int main(int argc, char* argv[]) {
       free(config->server_host);
       config->server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
-      config->server_port = atoi(argv[++i]);
+      char* end;
+      long p = strtol(argv[++i], &end, 10);
+      if (*end != '\0' || p <= 0 || p > 65535) {
+        fprintf(stderr, "Error: invalid server port '%s' (must be 1-65535)\n", argv[i]);
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->server_port = (int)p;
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;
@@ -199,6 +218,8 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
       free(config->tls_ca);
       config->tls_ca = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--partial") == 0) {
+      config->partial = true;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {

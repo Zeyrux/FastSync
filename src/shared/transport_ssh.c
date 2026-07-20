@@ -124,7 +124,10 @@ Client* client_connect_ssh(const char* destination, int port) {
     else
       snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
 
-    char* ssh_argv[16];
+    size_t ssh_argv_max = 32;
+    char** ssh_argv = calloc(ssh_argv_max, sizeof(char*));
+    if (ssh_argv == NULL)
+      _exit(1);
     int ac = 0;
     char port_str[16];
     ssh_argv[ac++] = "ssh";
@@ -135,15 +138,24 @@ Client* client_connect_ssh(const char* destination, int port) {
     ssh_argv[ac++] = "-o";
     ssh_argv[ac++] = "ControlPath=~/.cache/fastsync-%r@%h:%p";
     if (port > 0 && port != 22) {
+      if ((size_t)ac + 2 >= ssh_argv_max) {
+        free(ssh_argv);
+        _exit(1);
+      }
       ssh_argv[ac++] = "-p";
       snprintf(port_str, sizeof(port_str), "%d", port);
       ssh_argv[ac++] = port_str;
+    }
+    if ((size_t)ac + 3 >= ssh_argv_max) {
+      free(ssh_argv);
+      _exit(1);
     }
     ssh_argv[ac++] = ssh_user;
     ssh_argv[ac++] = "fastsync-server";
     ssh_argv[ac++] = "--stdio";
     ssh_argv[ac] = NULL;
     execvp("ssh", ssh_argv);
+    free(ssh_argv);
     perror("exec of ssh failed");
     ssize_t wret = write(exec_pipe[1], "x", 1);
     (void)wret;
@@ -174,7 +186,7 @@ Client* client_connect_ssh(const char* destination, int port) {
     return NULL;
   }
   client->file_descriptor = sv[0];
-  client->address.sin_family = AF_UNIX;
+  client->address.ss_family = AF_UNIX;
   client->address_length = 0;
   client->ssh_child_pid = pid;
   client->ssl = NULL;

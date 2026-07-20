@@ -1,13 +1,26 @@
 #include "compression.h"
 #include "data.h"
 #include "log.h"
-#include "stdlib.h"
+#include <stdint.h>
+#include <stdlib.h>
 #include "zstd.h"
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
+
+  /* Clamp compression level to valid zstd range [1, 22] */
+  if (compression_level < 1) {
+    log_message(LOG_LEVEL_WARNING, "compression_level %d out of range [1,22], using 1",
+                compression_level);
+    compression_level = 1;
+  } else if (compression_level > 22) {
+    log_message(LOG_LEVEL_WARNING, "compression_level %d out of range [1,22], using 22",
+                compression_level);
+    compression_level = 22;
+  }
+
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data* compressed_data = data_create_empty(dst_size);
   if (compressed_data == NULL)
@@ -66,8 +79,16 @@ Data* data_decompress(Data* compressed_data) {
     return NULL;
   }
 
-  size_t buf_size =
-      (!ZSTD_isError(dst_size) && dst_size > 0) ? (size_t)dst_size : INITIAL_DECOMPRESS_BUF_SIZE;
+  size_t buf_size = INITIAL_DECOMPRESS_BUF_SIZE;
+  if (!ZSTD_isError(dst_size) && dst_size > 0) {
+    if (dst_size > SIZE_MAX) {
+      log_message(LOG_LEVEL_ERROR,
+                  "Decompressed size %llu exceeds addressable memory, using fallback buffer",
+                  dst_size);
+    } else {
+      buf_size = (size_t)dst_size;
+    }
+  }
   Data* uncompressed_data = data_create_empty(buf_size);
   if (!uncompressed_data) {
     log_message(LOG_LEVEL_ERROR, "Failed to allocate decompression buffer");
