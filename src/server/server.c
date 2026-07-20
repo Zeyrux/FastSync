@@ -11,46 +11,10 @@
 #include "transport_tls.h"
 #include "unistd.h"
 #include "utils.h"
-#include <libgen.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Check if a file path should be excluded based on config patterns
-static bool is_excluded(const char* path, const Config* config) {
-  // Extract filename from path
-  char* path_dup = str_dup(path);
-  if (!path_dup)
-    return false;
-  char* fname = basename(path_dup);
-
-  // Check exclude patterns
-  for (int i = 0; i < config->exclude_count; i++) {
-    if (glob_match(config->exclude_patterns[i], fname)) {
-      free(path_dup);
-      return true;
-    }
-  }
-
-  // Check include patterns (if any, file must match at least one)
-  if (config->include_count > 0) {
-    bool included = false;
-    for (int i = 0; i < config->include_count; i++) {
-      if (glob_match(config->include_patterns[i], fname)) {
-        included = true;
-        break;
-      }
-    }
-    if (!included) {
-      free(path_dup);
-      return true;
-    }
-  }
-
-  free(path_dup);
-  return false;
-}
 
 int receive_files(Config* config, int fd) {
   Status status;
@@ -65,7 +29,7 @@ int receive_files(Config* config, int fd) {
         goto next;
       if (file == NULL && !skipped)
         return -1;
-      if (config->save_to_disk && !is_excluded(file->path, config))
+      if (config->save_to_disk)
         file_save_to_disk(config->receive_root_directory, file);
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
@@ -75,7 +39,7 @@ int receive_files(Config* config, int fd) {
         return -1;
       }
       for (int i = 0; i < chunk->element_count; i++) {
-        if (config->save_to_disk && !is_excluded(chunk->items[i]->path, config))
+        if (config->save_to_disk)
           file_save_to_disk(config->receive_root_directory, chunk->items[i]);
       }
       chunk_destroy(chunk);
@@ -86,7 +50,7 @@ int receive_files(Config* config, int fd) {
         send_status(fd, STATUS_ERROR);
         return -1;
       }
-      if (config->save_to_disk && !is_excluded(file->path, config))
+      if (config->save_to_disk)
         file_save_to_disk(config->receive_root_directory, file);
       file_destroy(file);
     }

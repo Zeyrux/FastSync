@@ -18,7 +18,6 @@ typedef struct {
   int include_count;
   unsigned long long max_size;
   unsigned long long min_size;
-  bool follow_symlinks;
 } DirectoryScanner;
 
 DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metadata,
@@ -26,11 +25,6 @@ DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metada
                                            int exclude_count, char** include_patterns,
                                            int include_count, unsigned long long max_size,
                                            unsigned long long min_size);
-DirectoryScanner* directory_scanner_create_full(char* root_directory, bool use_metadata,
-                                           unsigned long long chunk_size, char** exclude_patterns,
-                                           int exclude_count, char** include_patterns,
-                                           int include_count, unsigned long long max_size,
-                                           unsigned long long min_size, bool follow_symlinks);
 Chunk* directory_scanner_next(DirectoryScanner* scanner);
 void directory_scanner_destroy(DirectoryScanner* scanner);
 

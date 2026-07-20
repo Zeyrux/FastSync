@@ -20,9 +20,6 @@
 #include "protocol.h"
 #include "utils.h"
 
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)  /* 64 MB */
-#define STREAM_CHUNK_SIZE (1ULL * 1024 * 1024)  /* 1 MB */
-
 File* file_create(const char* path) {
   File* file = (File*)malloc(sizeof(File));
   if (file == NULL) {
@@ -45,8 +42,6 @@ File* file_create(const char* path) {
     return NULL;
   }
   file->metadata = NULL;
-  file->type = FILE_TYPE_REGULAR;
-  file->link_target = NULL;
   return file;
 }
 
@@ -60,8 +55,6 @@ void file_destroy(void* item) {
   file->metadata = NULL;
   free(file->path);
   file->path = NULL;
-  free(file->link_target);
-  file->link_target = NULL;
   free(file);
 }
 
@@ -90,14 +83,6 @@ void file_metadata_destroy(void* metadata) {
 bool file_load_data(File* file) {
   if (file == NULL)
     return false;
-  // Symlinks have no data to load
-  if (file->type == FILE_TYPE_SYMLINK)
-    return true;
-  // For streaming files, just record the size, don't load into memory
-  if (file->data->size > STREAM_THRESHOLD) {
-    // Don't allocate; streaming will read directly from disk
-    return true;
-  }
   if (file->data->data == NULL) {
     file->data->data = malloc(file->data->size);
     if (file->data->data == NULL) {
@@ -113,69 +98,10 @@ bool file_load_data(File* file) {
   return true;
 }
 
-// Stream file content in chunks without loading entire file into RAM
-static bool file_send_streaming(File* file, int file_descriptor) {
-  unsigned long long total_size = file->data->size;
-  // Send total size prefix (same wire format as send_data)
-  if (!send_n_data(file_descriptor, &total_size, sizeof(total_size)))
-    return false;
-
-  FILE* fp = fopen(file->path, "rb");
-  if (!fp) {
-    perror("Could not open file for streaming");
-    return false;
-  }
-
-  char buf[STREAM_CHUNK_SIZE];
-  unsigned long long remaining = total_size;
-  while (remaining > 0) {
-    size_t to_read = (size_t)((remaining < STREAM_CHUNK_SIZE) ? remaining : STREAM_CHUNK_SIZE);
-    size_t nread = fread(buf, 1, to_read, fp);
-    if (nread != to_read) {
-      if (ferror(fp)) {
-        perror("Read error during streaming");
-      }
-      fclose(fp);
-      return false;
-    }
-    if (!send_n_data(file_descriptor, buf, nread)) {
-      fclose(fp);
-      return false;
-    }
-    remaining -= (unsigned long long)nread;
-  }
-  fclose(fp);
-  return true;
-}
-
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
-  if (send_path && !send_str(file_descriptor, file->path))
-    return false;
-  if (use_metadata && !metadata_send(file_descriptor, file->metadata))
-    return false;
-
-  // Send file type indicator so receiver can distinguish regular from symlink
-  int ft = (int)file->type;
-  if (!send_int(file_descriptor, ft))
-    return false;
-
-  if (file->type == FILE_TYPE_SYMLINK) {
-    // Send link target, then zero-length data
-    if (!send_str(file_descriptor, file->link_target ? file->link_target : ""))
-      return false;
-    Data empty = {NULL, 0};
-    return send_data(file_descriptor, &empty);
-  }
-
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
-
-  // Streaming mode: for large files without compression, stream from disk
-  if (file->data->size > STREAM_THRESHOLD && compression_level == 0) {
-    return file_send_streaming(file, file_descriptor);
-  }
-
   if (compression_level > 0) {
     compressed_data = data_compress(file->data, compression_level);
     if (compressed_data == NULL) {
@@ -183,6 +109,14 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
       return false;
     }
     data_to_send = compressed_data;
+  }
+  if (send_path && !send_str(file_descriptor, file->path)) {
+    data_destroy(compressed_data);
+    return false;
+  }
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata)) {
+    data_destroy(compressed_data);
+    return false;
   }
   if (!send_data(file_descriptor, data_to_send)) {
     data_destroy(compressed_data);
@@ -193,18 +127,6 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
 }
 
 bool file_save_to_disk(const char* root_directory, File* file) {
-  if (file->type == FILE_TYPE_SYMLINK && file->link_target) {
-    char* disk_path = path_cat((char*)root_directory, file->path);
-    if (disk_path == NULL)
-      return false;
-    unlink(disk_path);
-    bool ok = (symlink(file->link_target, disk_path) == 0);
-    if (ok && file->metadata)
-      file_restore_metadata(disk_path, file->metadata);
-    free(disk_path);
-    return ok;
-  }
-
   char* disk_path = path_cat((char*)root_directory, file->path);
   if (disk_path == NULL)
     return false;
@@ -427,18 +349,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   bool has_old_file = (full_path && stat(full_path, &st) == 0);
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
 
-  // Check for partial file if enabled
-  if (config->partial && !has_old_file && full_path) {
-    char* partial_path = malloc(strlen(full_path) + 20);
-    if (partial_path) {
-      sprintf(partial_path, "%s.fastsync-partial", full_path);
-      has_old_file = (stat(partial_path, &st) == 0);
-      if (has_old_file)
-        old_size = (unsigned long long)st.st_size;
-      free(partial_path);
-    }
-  }
-
   bool match = has_old_file && (unsigned long long)st.st_size == check_size &&
                (long long)st.st_mtime == check_mtime;
 
@@ -486,26 +396,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 
   if (!receive_and_assign_metadata(fd, config, file))
     return NULL;
-
-  // Read file type indicator
-  int file_type;
-  if (!receive_int(fd, &file_type)) {
-    file_destroy(file);
-    send_status(fd, STATUS_ERROR);
-    return NULL;
-  }
-  file->type = (FileType)file_type;
-
-  if (file->type == FILE_TYPE_SYMLINK) {
-    char* link_target = receive_str(fd);
-    if (link_target) {
-      file->link_target = link_target;
-    }
-    Data* empty_data = receive_data(fd);
-    if (empty_data)
-      data_destroy(empty_data);
-    return file;
-  }
 
   Data* file_data = receive_and_decompress(fd, config);
   if (file_data == NULL) {
@@ -557,14 +447,13 @@ done:
 
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path) {
-  // Handle symlinks
-  if (file->type == FILE_TYPE_SYMLINK) {
-    return file_send_single_calls(file, file_descriptor, use_metadata, compression_level,
-                                  send_path);
-  }
-
   // sendfile is incompatible with compression (kernel zero-copy).
   // If compression is requested, fall back to the regular send path.
+  // NOTE: This is a safety net only — callers must ensure compression_level == 0
+  // before calling file_send_sendfile. The fallback to file_send_single_calls
+  // preserves the send_path contract, but callers should not rely on it for
+  // correctness (the --sendfile flag is validated to be mutually exclusive with
+  // -c/--compress at the CLI layer).
   if (compression_level > 0)
     return file_send_single_calls(file, file_descriptor, use_metadata, compression_level,
                                   send_path);
@@ -572,11 +461,6 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
   if (send_path && !send_str(file_descriptor, file->path))
     return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
-    return false;
-
-  // Send file type indicator
-  int ft = (int)file->type;
-  if (!send_int(file_descriptor, ft))
     return false;
 
   int fd = open(file->path, O_RDONLY);
@@ -621,30 +505,6 @@ File* file_receive(const Config* config, int file_descriptor) {
       return NULL;
     }
   }
-
-  // Receive file type indicator
-  int file_type;
-  if (!receive_int(file_descriptor, &file_type)) {
-    file_destroy(file);
-    return NULL;
-  }
-  file->type = (FileType)file_type;
-
-  if (file->type == FILE_TYPE_SYMLINK) {
-    char* link_target = receive_str(file_descriptor);
-    if (link_target == NULL) {
-      file_destroy(file);
-      return NULL;
-    }
-    file->link_target = link_target;
-    // Receive and discard zero-length data
-    Data* empty_data = receive_data(file_descriptor);
-    if (empty_data)
-      data_destroy(empty_data);
-    return file;
-  }
-
-  // Regular file - receive data
   Data* file_data = receive_data(file_descriptor);
   if (file_data == NULL) {
     file_destroy(file);
@@ -659,7 +519,6 @@ File* file_receive(const Config* config, int file_descriptor) {
     }
     file_data = file_data_uncompressed;
   }
-
   data_destroy(file->data);
   file->data = file_data;
   return file;
