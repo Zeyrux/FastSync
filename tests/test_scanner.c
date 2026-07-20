@@ -15,7 +15,7 @@ static void test_scanner_single_file() {
   const char* file1 = "test_scan_dir_single/file1.txt";
   const char* content1 = "hello scanner";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(file1, content1);
 
   DirectoryScanner* scanner =
@@ -43,7 +43,7 @@ static void test_scanner_multiple_files() {
   const char* content1 = "alpha";
   const char* content2 = "beta";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(file1, content1);
   create_test_file(file2, content2);
 
@@ -82,8 +82,8 @@ static void test_scanner_subdirectory() {
   const char* sub_file = "test_scan_sub/sub/sub_file.txt";
   const char* content = "nested content";
 
-  mkdir(root, 0755);
-  mkdir(sub, 0755);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
   create_test_file(root_file, content);
   create_test_file(sub_file, content);
 
@@ -109,7 +109,7 @@ static void test_scanner_subdirectory() {
 static void test_scanner_empty_directory() {
   const char* dir = "test_scan_empty";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
 
   DirectoryScanner* scanner =
       directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
@@ -130,7 +130,7 @@ static void test_scanner_exclude_pattern() {
   const char* f_tmp = "test_scan_excl/remove.tmp";
   const char* content = "data";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(f_txt, content);
   create_test_file(f_tmp, content);
 
@@ -163,8 +163,8 @@ static void test_scanner_exclude_subdirectory() {
   const char* sub_tmp = "test_scan_excl_sub/sub/temp.tmp";
   const char* content = "data";
 
-  mkdir(root, 0755);
-  mkdir(sub, 0755);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
   create_test_file(root_txt, content);
   create_test_file(sub_txt, content);
   create_test_file(sub_tmp, content);
@@ -207,7 +207,7 @@ static void test_scanner_include_and_exclude() {
   const char* f_bak = "test_scan_inc_exc/c.bak";
   const char* content = "filter";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(f_txt, content);
   create_test_file(f_log, content);
   create_test_file(f_bak, content);
@@ -248,7 +248,7 @@ static void test_scanner_max_size() {
   const char* dir = "test_scan_max";
   const char* small = "test_scan_max/small.txt";
   const char* large = "test_scan_max/large.txt";
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(small, "tiny");
   create_test_file(large, "this_content_is_longer_than_ten_chars");
 
@@ -276,7 +276,7 @@ static void test_scanner_min_size() {
   const char* empty_f = "test_scan_min/empty.txt";
   const char* data_f = "test_scan_min/data.txt";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(empty_f, "");
   create_test_file(data_f, "some content here");
 
@@ -305,7 +305,7 @@ static void test_scanner_size_range() {
   const char* medium = "test_scan_range/med.txt";
   const char* huge = "test_scan_range/huge.txt";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(tiny, "ab");
   create_test_file(medium, "hello world");
   create_test_file(huge, "this is a much larger file for testing size filters");
@@ -338,7 +338,7 @@ static void test_scanner_mixed_patterns() {
   const char* c_txt = "test_scan_mixed/c.txt"; /* size ~= 5  */
   const char* d_bak = "test_scan_mixed/d.bak"; /* size ~= 42 */
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(a_txt, "aaaaa");
   create_test_file(b_bin, "bbbbbbbbbbbbb");
   create_test_file(c_txt, "ccccc");
@@ -374,7 +374,7 @@ static void test_scanner_no_patterns() {
   const char* f1 = "test_scan_none/f1.txt";
   const char* f2 = "test_scan_none/f2.txt";
 
-  mkdir(dir, 0755);
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(f1, "first");
   create_test_file(f2, "second");
 
