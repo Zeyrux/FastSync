@@ -114,25 +114,32 @@ static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata) {
 
 // Process one file in a chunk: either via incremental check or direct send.
 // Returns 0 on success, 1 if skipped (incremental match), -1 on error.
-static int send_single_file(Client* client, File* file, Config* config,
-                            bool use_incremental, bool use_sendfile) {
+static int send_single_file(Client* client, File* file, Config* config, bool use_incremental,
+                            bool use_sendfile) {
   int compression_level = config->use_compression ? config->compression_level : 0;
 
   if (!use_incremental) {
     if (use_sendfile) {
-      return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata)
-                 ? 0 : -1;
+      return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata) ? 0
+                                                                                            : -1;
     }
-    return send_file_direct(file, client->file_descriptor, config->use_metadata,
-                            compression_level) ? 0 : -1;
+    return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level)
+               ? 0
+               : -1;
   }
 
   // Incremental path: use sendfile for the actual data if enabled and no compression
   if (use_sendfile) {
     DeltaSignature* sig = NULL;
     int rc = incremental_check(client, file, &sig);
-    if (rc == 1) { delta_signature_destroy(sig); return 1; }
-    if (rc < 0)  { delta_signature_destroy(sig); return -1; }
+    if (rc == 1) {
+      delta_signature_destroy(sig);
+      return 1;
+    }
+    if (rc < 0) {
+      delta_signature_destroy(sig);
+      return -1;
+    }
     // rc == 0 or rc == 2 (delta not possible with sendfile)
     delta_signature_destroy(sig);
     // Fall through: send full file via sendfile (pass 0 for compression_level)
@@ -156,8 +163,10 @@ static int send_single_file(Client* client, File* file, Config* config,
   if (rc == 2 && config->use_delta) {
     int drc = send_delta(client, file, sig, config);
     delta_signature_destroy(sig);
-    if (drc == 0) return 0;
-    if (drc < 0)  return -1;
+    if (drc == 0)
+      return 0;
+    if (drc < 0)
+      return -1;
   } else {
     delta_signature_destroy(sig);
   }
@@ -188,8 +197,8 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
 
   bool use_sendfile = config->use_sendfile && !config->use_compression;
   for (int i = 0; i < chunk->element_count; i++) {
-    int rc = send_single_file(client, chunk->items[i], config,
-                              config->use_incremental, use_sendfile);
+    int rc =
+        send_single_file(client, chunk->items[i], config, config->use_incremental, use_sendfile);
     if (rc == 1)
       continue;
     if (rc < 0)
@@ -210,9 +219,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   } else if (context->config->use_tls) {
     client = client_create();
     if (!client || !client_connect_tls(client, context->config->server_host,
-                                       context->config->server_port,
-                                       context->config->tls_cert, context->config->tls_key,
-                                       context->config->tls_ca)) {
+                                       context->config->server_port, context->config->tls_cert,
+                                       context->config->tls_key, context->config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
@@ -220,8 +228,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     }
   } else {
     client = client_create();
-    if (!client || !client_connect(client, context->config->server_host,
-                                   context->config->server_port)) {
+    if (!client ||
+        !client_connect(client, context->config->server_host, context->config->server_port)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server\n");
