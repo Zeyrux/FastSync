@@ -20,8 +20,8 @@
 #include "protocol.h"
 #include "utils.h"
 
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)  /* 64 MB */
-#define STREAM_CHUNK_SIZE (1ULL * 1024 * 1024)  /* 1 MB */
+#define STREAM_THRESHOLD (64ULL * 1024 * 1024) /* 64 MB */
+#define STREAM_CHUNK_SIZE (1ULL * 1024 * 1024) /* 1 MB */
 
 File* file_create(const char* path) {
   File* file = (File*)malloc(sizeof(File));

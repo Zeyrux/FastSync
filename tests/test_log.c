@@ -47,7 +47,7 @@ static void test_log_set_level_info() {
   set_log_level(LOG_LEVEL_INFO);
 
   /* INFO level should show INFO, WARNING, ERROR but not DEBUG */
-  log_message(LOG_LEVEL_DEBUG, "debug should be filtered");   /* filtered */
+  log_message(LOG_LEVEL_DEBUG, "debug should be filtered"); /* filtered */
   log_message(LOG_LEVEL_INFO, "info should show");
   log_message(LOG_LEVEL_WARNING, "warning should show");
   log_message(LOG_LEVEL_ERROR, "error should show");

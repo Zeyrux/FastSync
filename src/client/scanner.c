@@ -16,17 +16,17 @@ DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metada
                                            int exclude_count, char** include_patterns,
                                            int include_count, unsigned long long max_size,
                                            unsigned long long min_size) {
-  return directory_scanner_create_full(root_directory, use_metadata, chunk_size,
-                                       exclude_patterns, exclude_count,
-                                       include_patterns, include_count,
-                                       max_size, min_size, true);
+  return directory_scanner_create_full(root_directory, use_metadata, chunk_size, exclude_patterns,
+                                       exclude_count, include_patterns, include_count, max_size,
+                                       min_size, true);
 }
 
 DirectoryScanner* directory_scanner_create_full(char* root_directory, bool use_metadata,
-                                           unsigned long long chunk_size, char** exclude_patterns,
-                                           int exclude_count, char** include_patterns,
-                                           int include_count, unsigned long long max_size,
-                                           unsigned long long min_size, bool follow_symlinks) {
+                                                unsigned long long chunk_size,
+                                                char** exclude_patterns, int exclude_count,
+                                                char** include_patterns, int include_count,
+                                                unsigned long long max_size,
+                                                unsigned long long min_size, bool follow_symlinks) {
   DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;

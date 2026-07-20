@@ -22,8 +22,8 @@ static void test_sendfile_basic() {
   /* Set the size so file_send_sendfile can report it */
   file->data->size = len;
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
+                              false, false, false, false, 0, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   int p[2];
@@ -80,8 +80,8 @@ static void test_sendfile_empty_file() {
   EXPECT_NOT_NULL(file);
   file->data->size = 0;
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"),
-                              false, false, false, false, false, 0, false, 0);
+  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
+                              false, false, false, false, 0, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   int p[2];
@@ -161,8 +161,8 @@ static void test_sendfile_compression_fallback() {
   file->data->size = (size_t)st.st_size;
   EXPECT_TRUE(file_load_data(file));
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"),
-                              false, false, false, true, false, 3, false, 0);
+  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
+                              false, false, true, false, 3, false, 0);
   EXPECT_NOT_NULL(cfg);
 
   int p[2];
@@ -226,7 +226,8 @@ static void test_sendfile_no_path() {
     close(p[1]);
     /* When send_path is false, the sender still sends file_type + data */
     int file_type;
-    receive_int(p[0], &file_type);
+    EXPECT_TRUE(receive_int(p[0], &file_type));
+    EXPECT_EQ_INT(file_type, (int)FILE_TYPE_REGULAR);
     Data* received = receive_data(p[0]);
     close(p[0]);
 

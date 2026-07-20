@@ -44,8 +44,10 @@ Server* server_create(int port) {
 
   // Try IPv6 first, fall back to IPv4
   int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  sa_family_t domain = AF_INET6;
   if (fd < 0) {
     fd = socket(AF_INET, SOCK_STREAM, 0);
+    domain = AF_INET;
   }
   if (fd < 0) {
     perror("Could not create Socket!");
@@ -69,32 +71,29 @@ Server* server_create(int port) {
     return NULL;
   }
 
-  // Determine address family from the actual socket
+  // Use the domain from the socket we actually created
   struct sockaddr_storage* addr = &server->address;
-  socklen_t addr_len = sizeof(*addr);
-  if (getsockname(fd, (struct sockaddr*)addr, &addr_len) == 0) {
-    // Use the family of the socket we actually created
-  }
-
   struct sockaddr_in* addr4 = (struct sockaddr_in*)addr;
   struct sockaddr_in6* addr6 = (struct sockaddr_in6*)addr;
 
-  if (addr->ss_family == AF_INET6) {
+  if (domain == AF_INET6) {
     addr6->sin6_family = AF_INET6;
     addr6->sin6_addr = in6addr_any;
     addr6->sin6_port = htons(port);
+    addr->ss_family = AF_INET6;
     server->address_length = sizeof(struct sockaddr_in6);
   } else {
     addr4->sin_family = AF_INET;
     addr4->sin_addr.s_addr = INADDR_ANY;
     addr4->sin_port = htons(port);
+    addr->ss_family = AF_INET;
     server->address_length = sizeof(struct sockaddr_in);
   }
 
   if (bind(server->file_descriptor, (struct sockaddr*)&server->address, server->address_length) <
       0) {
     // If IPv6 bind failed (maybe no IPv6), try IPv4
-    if (addr->ss_family == AF_INET6) {
+    if (domain == AF_INET6) {
       close(fd);
       fd = socket(AF_INET, SOCK_STREAM, 0);
       if (fd < 0) {
@@ -254,8 +253,11 @@ bool client_connect(Client* client, char* host, int port) {
   }
 
   // Save the connected address
-  memcpy(&client->address, rp->ai_addr, rp->ai_addrlen);
-  client->address_length = rp->ai_addrlen;
+  socklen_t addr_len = rp->ai_addrlen;
+  if (addr_len > sizeof(client->address))
+    addr_len = sizeof(client->address);
+  memcpy(&client->address, rp->ai_addr, addr_len);
+  client->address_length = addr_len;
   freeaddrinfo(res);
 
   // Close old fd if any and set new one

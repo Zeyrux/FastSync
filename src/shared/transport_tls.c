@@ -34,7 +34,7 @@ static void log_ssl_errors(void) {
 }
 
 static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key,
-                                const char* ca_path) {
+                               const char* ca_path) {
   const SSL_METHOD* method = is_server ? TLS_server_method() : TLS_client_method();
   SSL_CTX* ctx = SSL_CTX_new(method);
   if (!ctx) {

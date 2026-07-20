@@ -336,10 +336,10 @@ static void test_scanner_size_range() {
 static void test_scanner_mixed_patterns() {
   /* Combine exclude, include, and size filters together */
   const char* dir = "test_scan_mixed";
-  const char* a_txt = "test_scan_mixed/a.txt";     /* size ~= 5  */
-  const char* b_bin = "test_scan_mixed/b.bin";     /* size ~= 13 */
-  const char* c_txt = "test_scan_mixed/c.txt";     /* size ~= 5  */
-  const char* d_bak = "test_scan_mixed/d.bak";     /* size ~= 42 */
+  const char* a_txt = "test_scan_mixed/a.txt"; /* size ~= 5  */
+  const char* b_bin = "test_scan_mixed/b.bin"; /* size ~= 13 */
+  const char* c_txt = "test_scan_mixed/c.txt"; /* size ~= 5  */
+  const char* d_bak = "test_scan_mixed/d.bak"; /* size ~= 42 */
 
   mkdir(dir, 0755);
   create_test_file(a_txt, "aaaaa");
