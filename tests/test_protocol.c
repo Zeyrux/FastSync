@@ -179,6 +179,7 @@ static void test_receive_str_oversized() {
   size_t huge = MAX_STRING_SIZE + 1;
   EXPECT_TRUE(send_n_data(0, &huge, sizeof(size_t)));
 
+  /* cppcheck-suppress constVariablePointer */
   char* received = receive_str(0);
   EXPECT_NULL(received);
 

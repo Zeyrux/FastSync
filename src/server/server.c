@@ -153,6 +153,7 @@ static volatile sig_atomic_t g_server_cleanup_requested = 0;
 
 static void cleanup(int sig) {
   (void)sig;
+  server_request_shutdown();
   g_server_cleanup_requested = 1;
 }
 

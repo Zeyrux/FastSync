@@ -2,6 +2,7 @@
 #include "log.h"
 #include "protocol.h"
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netdb.h>
 #include <openssl/ssl.h>
 #include <signal.h>
@@ -142,6 +143,15 @@ void server_delete(Server** server) {
   *server = NULL;
 }
 
+/* Flag set by server_request_shutdown() to request graceful shutdown
+   of the accept loop. Accessed only from transport_tcp.c so it won't
+   cause linker errors when this file is compiled into client/test targets. */
+static volatile sig_atomic_t g_tcp_cleanup_requested = 0;
+
+void server_request_shutdown(void) {
+  g_tcp_cleanup_requested = 1;
+}
+
 static void accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
                         const char* log_fmt) {
   if (listen(server->file_descriptor, SOMAXCONN) < 0) {
@@ -149,11 +159,13 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     return;
   }
   signal(SIGCHLD, SIG_IGN);
-  while (1) {
+  while (!g_tcp_cleanup_requested) {
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
     int fd = accept(server->file_descriptor, (struct sockaddr*)&client_addr, &client_len);
     if (fd < 0) {
+      if (errno == EINTR)
+        break;
       perror("Could not accept the connection");
       continue;
     }
