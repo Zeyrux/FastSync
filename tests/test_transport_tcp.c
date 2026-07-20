@@ -8,8 +8,8 @@
 static void test_client_create_delete() {
   Client* client = client_create();
   EXPECT_NOT_NULL(client);
-  EXPECT_TRUE(client->file_descriptor >= 0);
-  EXPECT_EQ_INT(client->address.sin_family, AF_INET);
+  EXPECT_EQ_INT(client->file_descriptor, -1);
+  EXPECT_TRUE(client->address.ss_family == AF_UNSPEC);
   EXPECT_EQ_INT(client->ssh_child_pid, -1);
   EXPECT_NULL(client->ssl);
   EXPECT_NULL(client->ssl_ctx);
@@ -30,7 +30,7 @@ static void test_server_create_delete() {
   Server* server = server_create(0);
   EXPECT_NOT_NULL(server);
   EXPECT_TRUE(server->file_descriptor >= 0);
-  EXPECT_EQ_INT(server->address.sin_family, AF_INET);
+  EXPECT_TRUE(server->address.ss_family == AF_INET || server->address.ss_family == AF_INET6);
   EXPECT_NULL(server->ssl_ctx);
 
   /* Clean up */
@@ -57,9 +57,8 @@ static void test_client_create_multiple() {
   Client* c2 = client_create();
   EXPECT_NOT_NULL(c1);
   EXPECT_NOT_NULL(c2);
-  EXPECT_TRUE(c1->file_descriptor >= 0);
-  EXPECT_TRUE(c2->file_descriptor >= 0);
-  EXPECT_TRUE(c1->file_descriptor != c2->file_descriptor);
+  EXPECT_EQ_INT(c1->file_descriptor, -1);
+  EXPECT_EQ_INT(c2->file_descriptor, -1);
 
   client_delete(c1);
   client_delete(c2);
