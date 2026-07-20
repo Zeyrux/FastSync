@@ -35,6 +35,8 @@ typedef struct Config {
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;
   bool use_tls;
+  char* server_host;
+  int server_port;
   char* tls_cert;
   char* tls_key;
   char* tls_ca;

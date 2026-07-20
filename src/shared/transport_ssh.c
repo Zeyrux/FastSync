@@ -1,4 +1,5 @@
 #include "transport_ssh.h"
+#include "utils.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,39 +9,58 @@
 #include <unistd.h>
 
 typedef struct {
-  char user[256];
-  char host[256];
-  char remote_path[4096];
+  char* user;
+  char* host;
+  char* remote_path;
 } RemoteDest;
 
+static void remote_dest_destroy(RemoteDest* r) {
+  free(r->user);
+  free(r->host);
+  free(r->remote_path);
+}
+
 static int parse_remote_dest(const char* dest, RemoteDest* r) {
+  memset(r, 0, sizeof(*r));
   const char* colon = strchr(dest, ':');
   if (!colon)
     return -1;
 
-  size_t remote_path_len = strlen(colon + 1);
-  if (remote_path_len >= sizeof(r->remote_path))
+  r->remote_path = str_dup(colon + 1);
+  if (!r->remote_path)
     return -1;
-  memcpy(r->remote_path, colon + 1, remote_path_len + 1);
 
   const char* at = memchr(dest, '@', colon - dest);
   if (at) {
     size_t user_len = at - dest;
-    if (user_len >= sizeof(r->user))
+    r->user = malloc(user_len + 1);
+    if (!r->user) {
+      remote_dest_destroy(r);
       return -1;
+    }
     memcpy(r->user, dest, user_len);
     r->user[user_len] = '\0';
 
     size_t host_len = colon - at - 1;
-    if (host_len >= sizeof(r->host))
+    r->host = malloc(host_len + 1);
+    if (!r->host) {
+      remote_dest_destroy(r);
       return -1;
+    }
     memcpy(r->host, at + 1, host_len);
     r->host[host_len] = '\0';
   } else {
-    r->user[0] = '\0';
-    size_t host_len = colon - dest;
-    if (host_len >= sizeof(r->host))
+    r->user = str_dup("");
+    if (!r->user) {
+      remote_dest_destroy(r);
       return -1;
+    }
+    size_t host_len = colon - dest;
+    r->host = malloc(host_len + 1);
+    if (!r->host) {
+      remote_dest_destroy(r);
+      return -1;
+    }
     memcpy(r->host, dest, host_len);
     r->host[host_len] = '\0';
   }
@@ -57,6 +77,7 @@ Client* client_connect_ssh(const char* destination, int port) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
     perror("socketpair failed");
+    remote_dest_destroy(&r);
     return NULL;
   }
 
@@ -71,6 +92,7 @@ Client* client_connect_ssh(const char* destination, int port) {
     perror("pipe failed");
     close(sv[0]);
     close(sv[1]);
+    remote_dest_destroy(&r);
     return NULL;
   }
 
@@ -81,6 +103,7 @@ Client* client_connect_ssh(const char* destination, int port) {
     close(sv[1]);
     close(exec_pipe[0]);
     close(exec_pipe[1]);
+    remote_dest_destroy(&r);
     return NULL;
   }
 
@@ -88,6 +111,8 @@ Client* client_connect_ssh(const char* destination, int port) {
     close(sv[0]);
     close(exec_pipe[0]);
     fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC);
+    // Child doesn't need the RemoteDest strings
+    remote_dest_destroy(&r);
 
     if (sv[1] != STDIN_FILENO)
       dup2(sv[1], STDIN_FILENO);
@@ -97,7 +122,7 @@ Client* client_connect_ssh(const char* destination, int port) {
       close(sv[1]);
 
     char ssh_user[512];
-    if (r.user[0] != '\0')
+    if (r.user && r.user[0] != '\0')
       snprintf(ssh_user, sizeof(ssh_user), "%s@%s", r.user, r.host);
     else
       snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
@@ -138,9 +163,12 @@ Client* client_connect_ssh(const char* destination, int port) {
   if (n > 0) {
     close(sv[0]);
     waitpid(pid, NULL, 0);
+    remote_dest_destroy(&r);
     fprintf(stderr, "Error: could not launch 'fastsync-server --stdio' on remote\n");
     return NULL;
   }
+
+  remote_dest_destroy(&r);
 
   Client* client = malloc(sizeof(Client));
   if (client == NULL) {

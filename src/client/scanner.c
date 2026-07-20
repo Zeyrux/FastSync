@@ -55,6 +55,7 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
   return chunk;
 }
 
+// Returns: 1 on success, 0 if no more directories in queue, -1 on opendir failure
 static int open_next_directory(DirectoryScanner* scanner) {
   if (scanner->current_dir) {
     closedir(scanner->current_dir);
@@ -71,7 +72,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
     perror("Could not open directory");
     free(scanner->current_path);
     scanner->current_path = NULL;
-    return 0;
+    return -1;
   }
   return 1;
 }
@@ -82,8 +83,11 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
 
   while (1) {
     if (scanner->current_dir == NULL) {
-      if (!open_next_directory(scanner))
+      int ret = open_next_directory(scanner);
+      if (ret == 0)
         break;
+      if (ret < 0)
+        continue;
     }
 
     struct dirent* entry = readdir(scanner->current_dir);

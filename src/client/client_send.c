@@ -98,7 +98,51 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
 
 typedef bool (*file_send_fn)(File*, int, bool, int, bool);
 
-static int send_file_incremental(Client* client, File* file, Config* config, file_send_fn send_fn) {
+// Send a single file directly (non-incremental path).
+static bool send_file_direct(File* file, int fd, bool use_metadata, int compression_level) {
+  if (!send_status(fd, STATUS_NEXT))
+    return false;
+  return file_send_single_calls(file, fd, use_metadata, compression_level, true);
+}
+
+// Send a single file directly via sendfile (non-incremental path).
+static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata) {
+  if (!send_status(fd, STATUS_NEXT))
+    return false;
+  return file_send_sendfile(file, fd, use_metadata, 0, true);
+}
+
+// Process one file in a chunk: either via incremental check or direct send.
+// Returns 0 on success, 1 if skipped (incremental match), -1 on error.
+static int send_single_file(Client* client, File* file, Config* config,
+                            bool use_incremental, bool use_sendfile) {
+  int compression_level = config->use_compression ? config->compression_level : 0;
+
+  if (!use_incremental) {
+    if (use_sendfile) {
+      return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata)
+                 ? 0 : -1;
+    }
+    return send_file_direct(file, client->file_descriptor, config->use_metadata,
+                            compression_level) ? 0 : -1;
+  }
+
+  // Incremental path: use sendfile for the actual data if enabled and no compression
+  if (use_sendfile) {
+    DeltaSignature* sig = NULL;
+    int rc = incremental_check(client, file, &sig);
+    if (rc == 1) { delta_signature_destroy(sig); return 1; }
+    if (rc < 0)  { delta_signature_destroy(sig); return -1; }
+    // rc == 0 or rc == 2 (delta not possible with sendfile)
+    delta_signature_destroy(sig);
+    // Fall through: send full file via sendfile (pass 0 for compression_level)
+    if (!file_send_sendfile(file, client->file_descriptor, config->use_metadata, 0, false))
+      return -1;
+    return 0;
+  }
+
+  // Incremental path with single_calls (supports compression and delta)
+  file_send_fn send_fn = (file_send_fn)file_send_single_calls;
   DeltaSignature* sig = NULL;
   int rc = incremental_check(client, file, &sig);
   if (rc < 0) {
@@ -112,15 +156,12 @@ static int send_file_incremental(Client* client, File* file, Config* config, fil
   if (rc == 2 && config->use_delta) {
     int drc = send_delta(client, file, sig, config);
     delta_signature_destroy(sig);
-    if (drc == 0)
-      return 0;
-    if (drc < 0)
-      return -1;
+    if (drc == 0) return 0;
+    if (drc < 0)  return -1;
   } else {
     delta_signature_destroy(sig);
   }
-  if (!send_fn(file, client->file_descriptor, config->use_metadata,
-               config->use_compression ? config->compression_level : 0, false))
+  if (!send_fn(file, client->file_descriptor, config->use_metadata, compression_level, false))
     return -1;
   return 0;
 }
@@ -142,40 +183,17 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
       return -1;
     }
     data_destroy(data);
-  } else if (config->use_sendfile && !config->use_compression) {
-    for (int i = 0; i < chunk->element_count; i++) {
-      if (config->use_incremental) {
-        int rc = send_file_incremental(client, chunk->items[i], config,
-                                       (file_send_fn)file_send_sendfile);
-        if (rc == 1)
-          continue;
-        if (rc < 0)
-          return -1;
-      } else {
-        if (!send_status(client->file_descriptor, STATUS_NEXT))
-          return -1;
-        if (!file_send_sendfile(chunk->items[i], client->file_descriptor, config->use_metadata, 0,
-                                true))
-          return -1;
-      }
-    }
-  } else {
-    for (int i = 0; i < chunk->element_count; i++) {
-      if (config->use_incremental) {
-        int rc = send_file_incremental(client, chunk->items[i], config,
-                                       (file_send_fn)file_send_single_calls);
-        if (rc == 1)
-          continue;
-        if (rc < 0)
-          return -1;
-      } else {
-        if (!send_status(client->file_descriptor, STATUS_NEXT))
-          return -1;
-        if (!file_send_single_calls(chunk->items[i], client->file_descriptor, config->use_metadata,
-                                    config->use_compression ? config->compression_level : 0, true))
-          return -1;
-      }
-    }
+    return 0;
+  }
+
+  bool use_sendfile = config->use_sendfile && !config->use_compression;
+  for (int i = 0; i < chunk->element_count; i++) {
+    int rc = send_single_file(client, chunk->items[i], config,
+                              config->use_incremental, use_sendfile);
+    if (rc == 1)
+      continue;
+    if (rc < 0)
+      return -1;
   }
   return 0;
 }
@@ -191,8 +209,10 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port);
   } else if (context->config->use_tls) {
     client = client_create();
-    if (!client || !client_connect_tls(client, server_host, server_port, context->config->tls_cert,
-                                       context->config->tls_key, context->config->tls_ca)) {
+    if (!client || !client_connect_tls(client, context->config->server_host,
+                                       context->config->server_port,
+                                       context->config->tls_cert, context->config->tls_key,
+                                       context->config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
@@ -200,7 +220,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     }
   } else {
     client = client_create();
-    if (!client || !client_connect(client, server_host, server_port)) {
+    if (!client || !client_connect(client, context->config->server_host,
+                                   context->config->server_port)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server\n");
@@ -338,8 +359,8 @@ int send_files(Config* config) {
       return 1;
   } else if (config->use_tls) {
     client = client_create();
-    if (!client || !client_connect_tls(client, server_host, server_port, config->tls_cert,
-                                       config->tls_key, config->tls_ca)) {
+    if (!client || !client_connect_tls(client, config->server_host, config->server_port,
+                                       config->tls_cert, config->tls_key, config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
@@ -347,7 +368,7 @@ int send_files(Config* config) {
     }
   } else {
     client = client_create();
-    if (!client || !client_connect(client, server_host, server_port)) {
+    if (!client || !client_connect(client, config->server_host, config->server_port)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server\n");

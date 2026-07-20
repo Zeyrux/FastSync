@@ -409,33 +409,48 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 }
 
 bool to_disk(const char* path, const void* data, unsigned long long data_size) {
-  char* directory = str_dup(path);
-  char* dir_to_free = directory;
-  directory = dirname(directory);
-  if (!mkdir_r(directory)) {
-    free(dir_to_free);
+  // dirname() may modify its argument and may return a pointer to static storage.
+  // We must use a copy of the result to be safe.
+  char* path_dup = str_dup(path);
+  if (!path_dup)
     return false;
+  char* dir_result = dirname(path_dup);
+  char* directory = str_dup(dir_result);
+  free(path_dup);
+  if (!directory)
+    return false;
+
+  bool ok = true;
+  if (!mkdir_r(directory)) {
+    ok = false;
+    goto done;
   }
   FILE* file_pointer = fopen(path, "wb");
   if (file_pointer == NULL) {
     perror("Could not open File");
-    free(dir_to_free);
-    return false;
+    ok = false;
+    goto done;
   }
   if (fwrite(data, 1, data_size, file_pointer) != data_size) {
     perror("Failed to write all data to disk");
     fclose(file_pointer);
-    free(dir_to_free);
-    return false;
+    ok = false;
+    goto done;
   }
   fclose(file_pointer);
-  free(dir_to_free);
-  return true;
+
+done:
+  free(directory);
+  return ok;
 }
 
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path) {
-  (void)compression_level;
+  // sendfile is incompatible with compression (kernel zero-copy).
+  // If compression is requested, fall back to the regular send path.
+  if (compression_level > 0)
+    return file_send_single_calls(file, file_descriptor, use_metadata, compression_level, send_path);
+
   if (send_path && !send_str(file_descriptor, file->path))
     return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))

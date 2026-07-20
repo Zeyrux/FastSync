@@ -11,9 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-char* server_host = "127.0.0.1";
-int server_port = 8080;
-
 static void print_usage(void) {
   printf("Usage:\n");
   printf("  fastsync [options] <source> <destination>\n");
@@ -157,10 +154,10 @@ int main(int argc, char* argv[]) {
       config->use_chunk_serialization = true;
       log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
     } else if (strcmp(argv[i], "--server-host") == 0 && i + 1 < argc) {
-      free(server_host);
-      server_host = str_dup(argv[++i]);
+      free(config->server_host);
+      config->server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
-      server_port = atoi(argv[++i]);
+      config->server_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;
