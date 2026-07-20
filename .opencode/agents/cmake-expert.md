@@ -94,7 +94,7 @@ tests/         — test sources (globbed as TEST_SRCS)
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
 - Sanitizer support: pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (live option in CMakeLists.txt).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.
-- Install dependencies only via the project's custom Docker image (repo-root `Dockerfile`, same image CI uses) — never via host package installs; see `AGENTS.md`.
+- For CI, dependencies are provided by the project's custom Docker image (repo-root `Dockerfile`, same image CI uses). For local development, use `nix-shell`. Never add `apt-get install` / `pip install` to CI workflows. See `AGENTS.md`.
 
 ## When Making Changes
 
@@ -201,4 +201,4 @@ Never push directly to `main`. All changes must be developed on a feature branch
 
 ## Dependency Installation
 
-All dependencies must be installed via the project's custom Docker image (repo-root `Dockerfile`, same image CI uses) — never via ad-hoc host package installs (no `apt-get install` / `pip install` on the host machine). See `AGENTS.md` for details.
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. **Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. See `AGENTS.md` for details.

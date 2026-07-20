@@ -4,9 +4,9 @@ FastSync is a high-performance file synchronization system written in C11. It su
 
 ## Dependency installation
 
-**Rule: always install dependencies using the project's custom Docker image — never via ad-hoc system package installs on the host** (no `apt-get install` / `pip install` on the host machine).
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v7`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest, openssh-client, and Node.js.
 
-The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v7`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest, openssh-client, and Node.js.
+**Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. The Docker image can also be used locally for CI parity.
 
 ```bash
 # Use the prebuilt CI image directly (faster, guaranteed CI parity)
@@ -30,7 +30,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" \
 
 > **Note:** The first `cmake configure` (`cmake -B build -S .`) fetches xxHash from GitHub via `FetchContent` — network access is required. Subsequent reconfigures reuse the cached source.
 
-If a dependency is missing from the image, add it to the `Dockerfile` (and rebuild) rather than installing it on the host.
+If a dependency is missing from the CI image, add it to the `Dockerfile` (and rebuild) rather than adding an install step to the CI workflow.
 
 ## CI Conventions
 
