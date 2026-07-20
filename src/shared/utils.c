@@ -70,6 +70,23 @@ char* str_dup(const char* string) {
 bool glob_match(const char* pattern, const char* str) {
   while (*pattern) {
     if (*pattern == '*') {
+      /* Check for double-star (globstar) pattern */
+      if (*(pattern + 1) == '*') {
+        pattern += 2;
+        /* Trailing double-star matches everything */
+        if (*pattern == '\0')
+          return true;
+        /* double-star slash: match at any depth */
+        if (*pattern == '/')
+          pattern++;
+        while (*str) {
+          if (glob_match(pattern, str))
+            return true;
+          str++;
+        }
+        return glob_match(pattern, str);
+      }
+      /* Single * — does not cross / boundaries */
       pattern++;
       while (*str && *str != '/') {
         if (glob_match(pattern, str))
@@ -83,8 +100,17 @@ bool glob_match(const char* pattern, const char* str) {
       pattern++;
       str++;
     } else {
-      if (*pattern != *str)
+      if (*pattern != *str) {
+        /* If pattern has a '/' followed by '**', allow zero path components */
+        if (*pattern == '/' && *(pattern + 1) == '*' && *(pattern + 2) == '*') {
+          /* Skip over slash-double-star and try to match rest against current str */
+          const char* rest = pattern + 3;
+          if (*rest == '/')
+            rest++;
+          return glob_match(rest, str);
+        }
         return false;
+      }
       pattern++;
       str++;
     }
