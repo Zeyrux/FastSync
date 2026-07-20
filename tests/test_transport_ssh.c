@@ -8,12 +8,14 @@
 /* Test client_connect_ssh with invalid destination (missing colon) */
 static void test_ssh_connect_invalid_dest() {
   /* Missing colon — parse_remote_dest should fail and return NULL */
+  /* cppcheck-suppress constVariablePointer */
   Client* client = client_connect_ssh("invalid-destination-no-colon", 22);
   EXPECT_NULL(client);
 }
 
 /* Test client_connect_ssh with empty destination */
 static void test_ssh_connect_empty_dest() {
+  /* cppcheck-suppress constVariablePointer */
   Client* client = client_connect_ssh("", 22);
   EXPECT_NULL(client);
 }
