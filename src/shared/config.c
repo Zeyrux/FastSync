@@ -141,6 +141,7 @@ Config* config_receive(int file_descriptor) {
   Config* config = (Config*)malloc(sizeof(Config));
   if (config == NULL)
     return NULL;
+  memset(config, 0, sizeof(*config));
   config->version = receive_str(file_descriptor);
   if (!config->version) {
     free(config);

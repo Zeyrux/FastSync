@@ -140,8 +140,14 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
       delta_signature_destroy(sig);
       return -1;
     }
-    // rc == 0 or rc == 2 (delta not possible with sendfile)
+    // rc == 0: unchanged file, skip
+    // rc == 2: server sent delta signature but sendfile doesn't support delta
     delta_signature_destroy(sig);
+    if (rc == 2) {
+      // Server is waiting for STATUS_NEXT after delta handshake
+      if (!send_status(client->file_descriptor, STATUS_NEXT))
+        return -1;
+    }
     // Fall through: send full file via sendfile (pass 0 for compression_level)
     if (!file_send_sendfile(file, client->file_descriptor, config->use_metadata, 0, false))
       return -1;
