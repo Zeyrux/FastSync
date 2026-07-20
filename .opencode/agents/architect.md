@@ -115,7 +115,16 @@ When proposing architecture changes:
 
 ## CI & Task Execution
 
-When using `tea` (the task execution agent) to run CI or tests, always set a sufficient timeout (e.g., 600000ms) to allow the workflow to finish. After CI completes, check the results yourself — inspect logs if the run failed. Never assume success.
+**Always wait for CI to finish after every push.** Never report a task as complete or move on until CI has passed on the PR branch.
+
+After every push:
+1. Use `tea actions runs list` to get the latest run ID for the branch.
+2. Poll its status until it leaves the "running" state (use a loop with sleep + sufficient timeout, e.g., 600000ms).
+3. Once completed, inspect the logs with `tea actions runs log <ID>` for every job.
+4. If any job failed, fix the issue, push again, and repeat from step 1.
+5. Only report done when ALL CI jobs pass.
+
+Do not wait for the user to tell you CI failed — check proactively. The user should never have to inform you of a CI failure you could have caught yourself.
 
 ## Branch Strategy
 

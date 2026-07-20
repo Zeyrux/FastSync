@@ -11,9 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-char* server_host = "127.0.0.1";
-int server_port = 8080;
-
 static void print_usage(void) {
   printf("Usage:\n");
   printf("  fastsync [options] <source> <destination>\n");
@@ -95,15 +92,23 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "--delete") == 0) {
       config->use_delete = true;
     } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
-      int idx = config->exclude_count++;
-      config->exclude_patterns =
-          realloc(config->exclude_patterns, config->exclude_count * sizeof(char*));
-      config->exclude_patterns[idx] = str_dup(argv[++i]);
+      char** tmp = realloc(config->exclude_patterns, (config->exclude_count + 1) * sizeof(char*));
+      if (!tmp) {
+        fprintf(stderr, "Error: memory allocation failed for --exclude\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->exclude_patterns = tmp;
+      config->exclude_patterns[config->exclude_count++] = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--include") == 0 && i + 1 < argc) {
-      int idx = config->include_count++;
-      config->include_patterns =
-          realloc(config->include_patterns, config->include_count * sizeof(char*));
-      config->include_patterns[idx] = str_dup(argv[++i]);
+      char** tmp = realloc(config->include_patterns, (config->include_count + 1) * sizeof(char*));
+      if (!tmp) {
+        fprintf(stderr, "Error: memory allocation failed for --include\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->include_patterns = tmp;
+      config->include_patterns[config->include_count++] = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
       config->max_size = strtoull(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
@@ -157,10 +162,10 @@ int main(int argc, char* argv[]) {
       config->use_chunk_serialization = true;
       log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
     } else if (strcmp(argv[i], "--server-host") == 0 && i + 1 < argc) {
-      free(server_host);
-      server_host = str_dup(argv[++i]);
+      free(config->server_host);
+      config->server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
-      server_port = atoi(argv[++i]);
+      config->server_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;

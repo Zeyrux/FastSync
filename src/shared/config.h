@@ -35,12 +35,14 @@ typedef struct Config {
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;
   bool use_tls;
+  char* server_host;
+  int server_port;
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
 } Config;
 
-#define PROTOCOL_VERSION "1.2.0"
+#define PROTOCOL_VERSION "1.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(char* version, char* send_directory, char* receive_directory,

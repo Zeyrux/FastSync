@@ -1,6 +1,8 @@
 #include "metadata.h"
 #include "file.h"
+#include "log.h"
 #include "protocol.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,13 +98,15 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
 void file_restore_metadata(const char* path, FileMetadata* metadata) {
   if (metadata == NULL)
     return;
-  chmod(path, metadata->mode & 07777);
-  int chown_ret = chown(path, metadata->uid, metadata->gid);
-  (void)chown_ret;
+  if (chmod(path, metadata->mode & 07777) != 0)
+    log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
+  if (chown(path, metadata->uid, metadata->gid) != 0)
+    log_message(LOG_LEVEL_WARNING, "Failed to chown %s: %s", path, strerror(errno));
   struct timespec times[2];
   times[0].tv_sec = 0;
   times[0].tv_nsec = UTIME_OMIT;
   times[1].tv_sec = metadata->mtime_sec;
   times[1].tv_nsec = metadata->mtime_nsec;
-  utimensat(AT_FDCWD, path, times, 0);
+  if (utimensat(AT_FDCWD, path, times, 0) != 0)
+    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
 }

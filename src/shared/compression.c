@@ -7,7 +7,6 @@
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
-  (void)compression_level;
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data* compressed_data = data_create_empty(dst_size);
@@ -17,6 +16,14 @@ Data* data_compress(Data* data_to_compress, int compression_level) {
   ZSTD_CCtx* cctx = ZSTD_createCCtx();
   if (!cctx) {
     log_message(LOG_LEVEL_ERROR, "Failed to create ZSTD compression context");
+    data_destroy(compressed_data);
+    return NULL;
+  }
+
+  size_t zret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, compression_level);
+  if (ZSTD_isError(zret)) {
+    log_message(LOG_LEVEL_ERROR, "Failed to set compression level: %s", ZSTD_getErrorName(zret));
+    ZSTD_freeCCtx(cctx);
     data_destroy(compressed_data);
     return NULL;
   }

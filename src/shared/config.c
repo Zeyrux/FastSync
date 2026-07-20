@@ -45,6 +45,8 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
   config->tls_cert = NULL;
   config->tls_key = NULL;
   config->tls_ca = NULL;
+  config->server_host = str_dup("127.0.0.1");
+  config->server_port = 8080;
   return config;
 }
 
@@ -88,6 +90,7 @@ void config_delete(Config* config) {
   free(config->tls_cert);
   free(config->tls_key);
   free(config->tls_ca);
+  free(config->server_host);
   free(config);
 }
 
@@ -110,7 +113,7 @@ bool config_send(int file_descriptor, const Config* config) {
     return false;
   if (!send_int(file_descriptor, config->compression_level))
     return false;
-  if (!send_int(file_descriptor, (int)config->chunk_size))
+  if (!send_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
     return false;
   if (!send_int(file_descriptor, config->use_sendfile))
     return false;
@@ -138,6 +141,7 @@ Config* config_receive(int file_descriptor) {
   Config* config = (Config*)malloc(sizeof(Config));
   if (config == NULL)
     return NULL;
+  memset(config, 0, sizeof(*config));
   config->version = receive_str(file_descriptor);
   if (!config->version) {
     free(config);
@@ -183,9 +187,8 @@ Config* config_receive(int file_descriptor) {
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->compression_level = tmp;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
     goto error;
-  config->chunk_size = (unsigned long long)tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->use_sendfile = tmp;
@@ -218,6 +221,8 @@ Config* config_receive(int file_descriptor) {
   config->tls_cert = NULL;
   config->tls_key = NULL;
   config->tls_ca = NULL;
+  config->server_host = str_dup("127.0.0.1");
+  config->server_port = 8080;
   if (!send_status(file_descriptor, STATUS_OK))
     goto error;
   return config;
@@ -226,6 +231,7 @@ error:
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
+  free(config->server_host);
   free(config);
   return NULL;
 }
