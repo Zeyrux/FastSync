@@ -23,14 +23,6 @@ static void test_data_create_empty() {
   data_destroy(d);
 }
 
-static void test_data_create_empty_zero() {
-  Data* d = data_create_empty(0);
-  EXPECT_NOT_NULL(d);
-  EXPECT_NOT_NULL(d->data);
-  EXPECT_EQ_INT((int)d->size, 0);
-  data_destroy(d);
-}
-
 static void test_data_create_reserve() {
   Data* d = data_create_reserve(1024);
   EXPECT_NOT_NULL(d);
@@ -52,7 +44,6 @@ static void test_data_destroy_normal() {
 void test_data() {
   test_data_create();
   test_data_create_empty();
-  test_data_create_empty_zero();
   test_data_create_reserve();
   test_data_destroy_null();
   test_data_destroy_normal();

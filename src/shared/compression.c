@@ -1,8 +1,7 @@
 #include "compression.h"
 #include "data.h"
 #include "log.h"
-#include <stdint.h>
-#include <stdlib.h>
+#include "stdlib.h"
 #include "zstd.h"
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
@@ -67,16 +66,8 @@ Data* data_decompress(Data* compressed_data) {
     return NULL;
   }
 
-  size_t buf_size = INITIAL_DECOMPRESS_BUF_SIZE;
-  if (!ZSTD_isError(dst_size) && dst_size > 0) {
-    if (dst_size > SIZE_MAX) {
-      log_message(LOG_LEVEL_ERROR,
-                  "Decompressed size %llu exceeds addressable memory, using fallback buffer",
-                  dst_size);
-    } else {
-      buf_size = (size_t)dst_size;
-    }
-  }
+  size_t buf_size =
+      (!ZSTD_isError(dst_size) && dst_size > 0) ? (size_t)dst_size : INITIAL_DECOMPRESS_BUF_SIZE;
   Data* uncompressed_data = data_create_empty(buf_size);
   if (!uncompressed_data) {
     log_message(LOG_LEVEL_ERROR, "Failed to allocate decompression buffer");

@@ -138,10 +138,6 @@ static const char* status_to_string(Status status) {
 }
 
 bool send_str(int file_descriptor, const char* data) {
-  if (data == NULL) {
-    log_message(LOG_LEVEL_ERROR, "send_str called with NULL data");
-    return false;
-  }
   size_t size = strlen(data);
   if (!send_n_data(file_descriptor, &size, sizeof(size_t)))
     return false;
@@ -155,11 +151,6 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_STRING_SIZE) {
-    log_message(LOG_LEVEL_ERROR, "receive_str: size %zu exceeds maximum %zu", size,
-                (size_t)MAX_STRING_SIZE);
-    return NULL;
-  }
   char* data = (char*)malloc(size + 1);
   if (data == NULL)
     return NULL;
