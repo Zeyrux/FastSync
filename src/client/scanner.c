@@ -230,6 +230,11 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       if (link_len >= 0) {
         link_buf[link_len] = '\0';
         file->link_target = str_dup(link_buf);
+        if (file->link_target == NULL) {
+          file_destroy(file);
+          free(cur_path);
+          continue;
+        }
       }
       file->data->size = 0;
       if (scanner->use_metadata)

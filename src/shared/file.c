@@ -37,7 +37,7 @@ File* file_create(const char* path) {
     return NULL;
   }
 
-  strcpy(file->path, path);
+  memcpy(file->path, path, path_len + 1);
   file->data = data_create_reserve(0);
   if (file->data == NULL) {
     free(file->path);
@@ -460,7 +460,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (config->partial && !has_old_file && full_path) {
     char* partial_path = malloc(strlen(full_path) + 20);
     if (partial_path) {
-      sprintf(partial_path, "%s.fastsync-partial", full_path);
+      snprintf(partial_path, strlen(full_path) + 20, "%s.fastsync-partial", full_path);
       has_old_file = (stat(partial_path, &st) == 0);
       if (has_old_file)
         old_size = (unsigned long long)st.st_size;

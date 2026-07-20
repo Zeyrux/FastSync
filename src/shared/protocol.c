@@ -1,7 +1,6 @@
 #include "protocol.h"
 #include "log.h"
 #include <errno.h>
-#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <stdio.h>
 #include <stdlib.h>
