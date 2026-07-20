@@ -139,7 +139,6 @@ Client* client_connect_ssh(const char* destination, int port) {
     ssh_argv[ac++] = "ControlPath=~/.cache/fastsync-%r@%h:%p";
     if (port > 0 && port != 22) {
       if ((size_t)ac + 2 >= ssh_argv_max) {
-        free(ssh_argv);
         _exit(1);
       }
       ssh_argv[ac++] = "-p";
@@ -147,7 +146,6 @@ Client* client_connect_ssh(const char* destination, int port) {
       ssh_argv[ac++] = port_str;
     }
     if ((size_t)ac + 3 >= ssh_argv_max) {
-      free(ssh_argv);
       _exit(1);
     }
     ssh_argv[ac++] = ssh_user;
