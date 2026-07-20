@@ -3,10 +3,10 @@
 
 #include "file.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/stat.h>
 
-#define FILE_METADATA_WIRE_SIZE                                                                    \
-  (sizeof(mode_t) + sizeof(uid_t) + sizeof(gid_t) + sizeof(time_t) + sizeof(long))
+#define FILE_METADATA_WIRE_SIZE (sizeof(int32_t) * 3 + sizeof(int64_t) * 2)
 
 void metadata_to_buf(char** buf, const FileMetadata* m);
 FileMetadata* metadata_from_buf(char** buf);
