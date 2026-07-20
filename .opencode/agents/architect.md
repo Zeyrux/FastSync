@@ -9,7 +9,7 @@ You are a system architect for the FastSync project — a high-performance file 
 
 Make high-level design decisions. Evaluate trade-offs, plan module interactions, design data flow, and ensure architectural coherence across the codebase.
 
-> **Environment rule:** dependency installation must always use the project's custom Docker image (repo-root `Dockerfile`, same as CI) — never ad-hoc host package installs. See `AGENTS.md`.
+> **Environment rule:** for CI, dependency installation must use the project's custom Docker image (repo-root `Dockerfile`, same as CI). For local development, use `nix-shell` (see `README.md`). See `AGENTS.md`.
 
 ## Project Architecture
 
@@ -112,3 +112,15 @@ When proposing architecture changes:
 - Hardcoded constants that should be configurable
 - Missing error propagation (silent failures)
 - Thread safety violations when adding new shared state
+
+## CI & Task Execution
+
+When using `tea` (the task execution agent) to run CI or tests, always set a sufficient timeout (e.g., 600000ms) to allow the workflow to finish. After CI completes, check the results yourself — inspect logs if the run failed. Never assume success.
+
+## Branch Strategy
+
+Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+
+## Dependency Installation
+
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. **Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. See `AGENTS.md` for details.

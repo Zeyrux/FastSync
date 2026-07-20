@@ -155,3 +155,15 @@ For each bug found:
 3. **Reproduction** — exact command to trigger
 4. **Fix** — the minimal code change needed
 5. **Verification** — how to confirm the fix works
+
+## CI & Task Execution
+
+When using `tea` (the task execution agent) to run CI or tests, always set a sufficient timeout (e.g., 600000ms) to allow the workflow to finish. After CI completes, check the results yourself — inspect logs if the run failed. Never assume success.
+
+## Branch Strategy
+
+Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+
+## Dependency Installation
+
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. **Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. See `AGENTS.md` for details.
