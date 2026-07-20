@@ -20,7 +20,6 @@ static Data* random_data(int min_size, int max_size) {
 }
 
 static void test_property_compress_roundtrip() {
-  srand(42);
   for (int iter = 0; iter < 10; iter++) {
     Data* original = random_data(1, 10000);
     EXPECT_NOT_NULL(original);
@@ -114,6 +113,7 @@ static void test_property_chunk_roundtrip() {
 }
 
 void test_property() {
+  srand(42);
   test_property_compress_roundtrip();
   test_property_delta_roundtrip();
   test_property_chunk_roundtrip();
