@@ -155,43 +155,6 @@ static void* old_data_from_path(const char* full_path, unsigned long long old_si
   return data;
 }
 
-/**
- * Helper: receive data from wire, optionally decompress, and store in file.
- * On success, returns the received Data* (caller owns it). On failure, returns NULL.
- * If `file_data` is received via receive_data(fd), this function handles decompression
- * when config->use_compression is set.
- */
-static Data* receive_and_decompress(int fd, const Config* config) {
-  Data* file_data = receive_data(fd);
-  if (file_data == NULL)
-    return NULL;
-  if (config->use_compression) {
-    Data* uncompressed = data_decompress(file_data);
-    data_destroy(file_data);
-    if (uncompressed == NULL)
-      return NULL;
-    file_data = uncompressed;
-  }
-  return file_data;
-}
-
-/**
- * Helper: receive metadata from wire and assign to file.
- * Returns true on success (metadata may be NULL if absent), false on I/O error.
- */
-static bool receive_and_assign_metadata(int fd, const Config* config, File* file) {
-  if (!config->use_metadata)
-    return true;
-  int meta_ok = 1;
-  file->metadata = metadata_receive(fd, &meta_ok);
-  if (!meta_ok) {
-    file_destroy(file);
-    send_status(fd, STATUS_ERROR);
-    return false;
-  }
-  return true;
-}
-
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
                                 void* old_data, unsigned long long old_size) {
   if (!old_data)
@@ -307,14 +270,32 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       return NULL;
     }
 
-    if (!receive_and_assign_metadata(fd, config, file))
-      return NULL;
+    if (config->use_metadata) {
+      int meta_ok = 1;
+      file->metadata = metadata_receive(fd, &meta_ok);
+      if (!meta_ok) {
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return NULL;
+      }
+    }
 
-    Data* file_data = receive_and_decompress(fd, config);
+    Data* file_data = receive_data(fd);
     if (file_data == NULL) {
       file_destroy(file);
       send_status(fd, STATUS_ERROR);
       return NULL;
+    }
+
+    if (config->use_compression) {
+      Data* uncompressed = data_decompress(file_data);
+      data_destroy(file_data);
+      if (uncompressed == NULL) {
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return NULL;
+      }
+      file_data = uncompressed;
     }
 
     data_destroy(file->data);
@@ -394,14 +375,32 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
-  if (!receive_and_assign_metadata(fd, config, file))
-    return NULL;
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok) {
+      file_destroy(file);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
+  }
 
-  Data* file_data = receive_and_decompress(fd, config);
+  Data* file_data = receive_data(fd);
   if (file_data == NULL) {
     file_destroy(file);
     send_status(fd, STATUS_ERROR);
     return NULL;
+  }
+
+  if (config->use_compression) {
+    Data* uncompressed = data_decompress(file_data);
+    data_destroy(file_data);
+    if (uncompressed == NULL) {
+      file_destroy(file);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
+    file_data = uncompressed;
   }
 
   data_destroy(file->data);

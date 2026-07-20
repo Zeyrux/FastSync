@@ -9,18 +9,6 @@
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
-
-  /* Clamp compression level to valid zstd range [1, 22] */
-  if (compression_level < 1) {
-    log_message(LOG_LEVEL_WARNING, "compression_level %d out of range [1,22], using 1",
-                compression_level);
-    compression_level = 1;
-  } else if (compression_level > 22) {
-    log_message(LOG_LEVEL_WARNING, "compression_level %d out of range [1,22], using 22",
-                compression_level);
-    compression_level = 22;
-  }
-
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data* compressed_data = data_create_empty(dst_size);
   if (compressed_data == NULL)
