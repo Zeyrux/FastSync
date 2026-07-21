@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
 
@@ -40,11 +41,18 @@ typedef struct Config {
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
-  bool follow_symlinks;
-  bool partial;
+  int timeout;
+  int contimeout;
+  bool quiet;
+  bool backup;
+  char* backup_dir;
+  bool stats;
+  int max_depth;
+  FILE* log_file;
+  int queue_size;
 } Config;
 
-#define PROTOCOL_VERSION "2.0.0"
+#define PROTOCOL_VERSION "1.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(char* version, char* send_directory, char* receive_directory,

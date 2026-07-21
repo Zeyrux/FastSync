@@ -118,19 +118,20 @@ Client* client_connect_ssh(const char* destination, int port) {
     if (sv[1] > 1)
       close(sv[1]);
 
-    char ssh_user[512];
-    int needed;
+    size_t ssh_user_len;
     if (r.user && r.user[0] != '\0')
-      needed = snprintf(ssh_user, sizeof(ssh_user), "%s@%s", r.user, r.host);
+      ssh_user_len = strlen(r.user) + 1 + strlen(r.host) + 1;
     else
-      needed = snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
-    if ((size_t)needed >= sizeof(ssh_user))
-      fprintf(stderr, "Warning: ssh_user string truncated\n");
-
-    size_t ssh_argv_max = 32;
-    char** ssh_argv = calloc(ssh_argv_max, sizeof(char*));
-    if (ssh_argv == NULL)
+      ssh_user_len = strlen(r.host) + 1;
+    char* ssh_user = malloc(ssh_user_len);
+    if (!ssh_user)
       _exit(1);
+    if (r.user && r.user[0] != '\0')
+      snprintf(ssh_user, ssh_user_len, "%s@%s", r.user, r.host);
+    else
+      snprintf(ssh_user, ssh_user_len, "%s", r.host);
+
+    char* ssh_argv[16];
     int ac = 0;
     char port_str[16];
     ssh_argv[ac++] = "ssh";
@@ -141,22 +142,15 @@ Client* client_connect_ssh(const char* destination, int port) {
     ssh_argv[ac++] = "-o";
     ssh_argv[ac++] = "ControlPath=~/.cache/fastsync-%r@%h:%p";
     if (port > 0 && port != 22) {
-      if ((size_t)ac + 2 >= ssh_argv_max) {
-        _exit(1);
-      }
       ssh_argv[ac++] = "-p";
       snprintf(port_str, sizeof(port_str), "%d", port);
       ssh_argv[ac++] = port_str;
-    }
-    if ((size_t)ac + 3 >= ssh_argv_max) {
-      _exit(1);
     }
     ssh_argv[ac++] = ssh_user;
     ssh_argv[ac++] = "fastsync-server";
     ssh_argv[ac++] = "--stdio";
     ssh_argv[ac] = NULL;
     execvp("ssh", ssh_argv);
-    free(ssh_argv);
     perror("exec of ssh failed");
     ssize_t wret = write(exec_pipe[1], "x", 1);
     (void)wret;
@@ -187,7 +181,7 @@ Client* client_connect_ssh(const char* destination, int port) {
     return NULL;
   }
   client->file_descriptor = sv[0];
-  client->address.ss_family = AF_UNIX;
+  client->address.sin_family = AF_UNIX;
   client->address_length = 0;
   client->ssh_child_pid = pid;
   client->ssl = NULL;
