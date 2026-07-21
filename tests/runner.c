@@ -14,6 +14,9 @@
 #include "test_scanner.h"
 #include "test_shared_utils.h"
 #include "test_stress.h"
+#include "test_transport_tcp.h"
+#include "test_transport_ssh.h"
+#include "test_transport_tls.h"
 #include "test_utils.h"
 #include <stdio.h>
 
@@ -41,6 +44,9 @@ int main() {
   RUN_TEST(test_robustness);
   RUN_TEST(test_stress);
   RUN_TEST(test_property);
+  RUN_TEST(test_transport_tcp);
+  RUN_TEST(test_transport_ssh);
+  RUN_TEST(test_transport_tls);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);
