@@ -11,6 +11,19 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * Wire format serialization (protocol version 2.0.0+):
+ * All metadata fields are serialized as fixed-width integers (int32_t / int64_t)
+ * to ensure cross-platform binary compatiblity.  See metadata.h for the
+ * exact wire layout.
+ *
+ * Compile-time assertions verify that the native platform types fit within
+ * the chosen fixed-width representations.
+ */
+typedef char static_assert_mode_t_fits[(sizeof(mode_t) <= sizeof(int32_t)) ? 1 : -1];
+typedef char static_assert_uid_t_fits[(sizeof(uid_t) <= sizeof(int32_t)) ? 1 : -1];
+typedef char static_assert_gid_t_fits[(sizeof(gid_t) <= sizeof(int32_t)) ? 1 : -1];
+
 void metadata_to_buf(char** buf, const FileMetadata* m) {
   int32_t present = (m != NULL) ? 1 : 0;
   memcpy(*buf, &present, sizeof(present));
