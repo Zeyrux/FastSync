@@ -138,10 +138,12 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
 
     if (S_ISDIR(stats.st_mode)) {
       int next_depth = scanner->current_depth + 1;
-      if (scanner->max_depth <= 0 || next_depth < scanner->max_depth)
-        queue_enqueue(scanner->directories, dir_entry_create(cur_path, next_depth));
-      else
-        free(cur_path);
+      if (scanner->max_depth <= 0 || next_depth < scanner->max_depth) {
+        DirEntry* de = dir_entry_create(cur_path, next_depth);
+        if (!queue_enqueue(scanner->directories, de))
+          dir_entry_destroy(de);
+      }
+      free(cur_path);
     } else {
       if (scanner->max_depth > 0 && scanner->current_depth + 1 > scanner->max_depth) {
         free(cur_path);
