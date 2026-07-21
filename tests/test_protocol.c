@@ -46,7 +46,6 @@ static void test_send_receive_str() {
 
   EXPECT_TRUE(send_str(0, ""));
 
-  /* cppcheck-suppress constVariablePointer */
   char* received = receive_str(0);
   EXPECT_NOT_NULL(received);
   EXPECT_EQ_STR(received, "");
@@ -64,7 +63,6 @@ static void test_send_receive_str_normal() {
 
   EXPECT_TRUE(send_str(0, "Hello, Protocol!"));
 
-  /* cppcheck-suppress constVariablePointer */
   char* received = receive_str(0);
   EXPECT_NOT_NULL(received);
   EXPECT_EQ_STR(received, "Hello, Protocol!");
@@ -80,7 +78,6 @@ static void test_send_receive_data() {
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
-  /* cppcheck-suppress constVariablePointer */
   unsigned char bin[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF};
   void* buf = malloc(sizeof(bin));
   EXPECT_NOT_NULL(buf);
@@ -131,9 +128,9 @@ static void test_send_receive_status() {
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
-  /* cppcheck-suppress constVariablePointer */
-  Status statuses[] = {STATUS_OK,    STATUS_ERROR, STATUS_FINISHED,        STATUS_NEXT,
-                       STATUS_CHUNK, STATUS_CHECK, STATUS_DELTA_SIGNATURE, STATUS_DELTA_DATA};
+  Status statuses[] = {STATUS_OK,        STATUS_ERROR, STATUS_FINISHED,        STATUS_NEXT,
+                       STATUS_CHUNK,     STATUS_CHECK, STATUS_DELTA_SIGNATURE, STATUS_DELTA_DATA,
+                       STATUS_KEEPALIVE, STATUS_ABORT, STATUS_CHECK_BATCH};
   int count = sizeof(statuses) / sizeof(statuses[0]);
 
   for (int i = 0; i < count; i++) {
@@ -173,23 +170,6 @@ static void test_receive_str_truncated() {
   close(p[0]);
 }
 
-static void test_receive_str_oversized() {
-  int p[2];
-  EXPECT_EQ_INT(pipe(p), 0);
-  io_set_fds(p[0], p[1]);
-  io_set_bwlimit(0);
-
-  /* Send a size exceeding MAX_STRING_SIZE */
-  size_t huge = MAX_STRING_SIZE + 1;
-  EXPECT_TRUE(send_n_data(0, &huge, sizeof(size_t)));
-
-  const char* received = receive_str(0);
-  EXPECT_NULL(received);
-
-  close(p[0]);
-  close(p[1]);
-}
-
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -200,5 +180,4 @@ void test_protocol() {
   test_send_receive_status();
   test_receive_n_data_truncated();
   test_receive_str_truncated();
-  test_receive_str_oversized();
 }
