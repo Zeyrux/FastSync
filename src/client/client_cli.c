@@ -56,6 +56,8 @@ static void print_usage(void) {
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
+  printf("  --fastsync-server-path <path>\n");
+  printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version and exit\n");
 }
@@ -224,6 +226,9 @@ int main(int argc, char* argv[]) {
       config->tls_ca = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--partial") == 0) {
       config->partial = true;
+    } else if (strcmp(argv[i], "--fastsync-server-path") == 0 && i + 1 < argc) {
+      free(config->fastsync_server_path);
+      config->fastsync_server_path = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {

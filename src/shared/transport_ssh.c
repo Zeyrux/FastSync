@@ -67,7 +67,7 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
   return 0;
 }
 
-Client* client_connect_ssh(const char* destination, int port) {
+Client* client_connect_ssh(const char* destination, int port, const char* server_path) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     fprintf(stderr, "Invalid remote destination: %s\n", destination);
@@ -152,7 +152,7 @@ Client* client_connect_ssh(const char* destination, int port) {
       _exit(1);
     }
     ssh_argv[ac++] = ssh_user;
-    ssh_argv[ac++] = "fastsync-server";
+    ssh_argv[ac++] = (char*)(server_path ? server_path : "fastsync-server");
     ssh_argv[ac++] = "--stdio";
     ssh_argv[ac] = NULL;
     execvp("ssh", ssh_argv);
@@ -174,7 +174,8 @@ Client* client_connect_ssh(const char* destination, int port) {
     close(sv[0]);
     waitpid(pid, NULL, 0);
     remote_dest_destroy(&r);
-    fprintf(stderr, "Error: could not launch 'fastsync-server --stdio' on remote\n");
+    fprintf(stderr, "Error: could not launch '%s --stdio' on remote\n",
+            server_path ? server_path : "fastsync-server");
     return NULL;
   }
 
