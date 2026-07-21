@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
 
@@ -40,6 +41,15 @@ typedef struct Config {
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
+  int timeout;
+  int contimeout;
+  bool quiet;
+  bool backup;
+  char* backup_dir;
+  bool stats;
+  int max_depth;
+  FILE* log_file;
+  int queue_size;
 } Config;
 
 #define PROTOCOL_VERSION "1.3.0"

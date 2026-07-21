@@ -19,7 +19,7 @@ static void test_scanner_single_file() {
   create_test_file(file1, content1);
 
   DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
+      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -48,7 +48,7 @@ static void test_scanner_multiple_files() {
   create_test_file(file2, content2);
 
   DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
+      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   const Chunk* chunk = directory_scanner_next(scanner);
@@ -88,7 +88,7 @@ static void test_scanner_subdirectory() {
   create_test_file(sub_file, content);
 
   DirectoryScanner* scanner =
-      directory_scanner_create((char*)root, false, 0, NULL, 0, NULL, 0, 0, 0);
+      directory_scanner_create((char*)root, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   int total_files = 0;
@@ -112,7 +112,7 @@ static void test_scanner_empty_directory() {
   mkdir(dir, 0755);
 
   DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0);
+      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
   EXPECT_NOT_NULL(scanner);
 
   const Chunk* chunk = directory_scanner_next(scanner);

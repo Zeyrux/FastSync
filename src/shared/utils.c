@@ -149,6 +149,25 @@ void delete_extras(const char* dest_root, ArrayList* manifest) {
   delete_extras_walk(dest_root, "", manifest);
 }
 
+bool has_path_traversal(const char* path) {
+  if (!path)
+    return false;
+  char* dup = str_dup(path);
+  if (!dup)
+    return false;
+  char* saveptr;
+  const char* part = strtok_r(dup, "/", &saveptr);
+  while (part) {
+    if (strcmp(part, "..") == 0) {
+      free(dup);
+      return true;
+    }
+    part = strtok_r(NULL, "/", &saveptr);
+  }
+  free(dup);
+  return false;
+}
+
 char* path_cat(const char* path1, char* path2) {
   if (path1 == NULL || *path1 == '\0')
     return str_dup(path2);

@@ -21,7 +21,17 @@ int receive_files(Config* config, int fd) {
   if (!receive_status(fd, &status))
     return -1;
 
-  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT ||
+         status == STATUS_CHECK_BATCH) {
+    if (status == STATUS_KEEPALIVE) {
+      send_status(fd, STATUS_KEEPALIVE);
+      goto next;
+    }
+    if (status == STATUS_ABORT) {
+      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
+      return -1;
+    }
     if (status == STATUS_CHECK) {
       bool skipped;
       File* file = receive_incremental_check(fd, config, &skipped);
@@ -30,7 +40,7 @@ int receive_files(Config* config, int fd) {
       if (file == NULL && !skipped)
         return -1;
       if (config->save_to_disk)
-        file_save_to_disk(config->receive_root_directory, file);
+        file_save_to_disk(config->receive_root_directory, file, NULL);
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
       Chunk* chunk = receive_chunk_data(fd, config);
@@ -40,9 +50,37 @@ int receive_files(Config* config, int fd) {
       }
       for (int i = 0; i < chunk->element_count; i++) {
         if (config->save_to_disk)
-          file_save_to_disk(config->receive_root_directory, chunk->items[i]);
+          file_save_to_disk(config->receive_root_directory, chunk->items[i], NULL);
       }
       chunk_destroy(chunk);
+    } else if (status == STATUS_CHECK_BATCH) {
+      int count;
+      if (!receive_int(fd, &count))
+        return -1;
+      for (int i = 0; i < count; i++) {
+        char* check_path = receive_str(fd);
+        if (!check_path)
+          return -1;
+        unsigned long long check_size;
+        long long check_mtime;
+        if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
+            !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
+          free(check_path);
+          return -1;
+        }
+        char* full_path = path_cat(config->receive_root_directory, check_path);
+        struct stat st;
+        bool has_old = full_path && stat(full_path, &st) == 0;
+        bool match = has_old && (unsigned long long)st.st_size == check_size &&
+                     (long long)st.st_mtime == check_mtime;
+        if (match)
+          send_status(fd, STATUS_OK);
+        else
+          send_status(fd, STATUS_NEXT);
+        free(full_path);
+        free(check_path);
+      }
+      goto next;
     } else {
       File* file = file_receive(config, fd);
       if (file == NULL) {
@@ -51,7 +89,7 @@ int receive_files(Config* config, int fd) {
         return -1;
       }
       if (config->save_to_disk)
-        file_save_to_disk(config->receive_root_directory, file);
+        file_save_to_disk(config->receive_root_directory, file, NULL);
       file_destroy(file);
     }
   next:

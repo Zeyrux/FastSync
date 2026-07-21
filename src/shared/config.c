@@ -47,6 +47,15 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
   config->tls_ca = NULL;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
+  config->timeout = 30;
+  config->contimeout = 10;
+  config->quiet = false;
+  config->backup = false;
+  config->backup_dir = NULL;
+  config->stats = false;
+  config->max_depth = 0;
+  config->log_file = NULL;
+  config->queue_size = 100;
   return config;
 }
 
@@ -90,6 +99,7 @@ void config_delete(Config* config) {
   free(config->tls_cert);
   free(config->tls_key);
   free(config->tls_ca);
+  free(config->backup_dir);
   free(config->server_host);
   free(config);
 }
@@ -126,6 +136,10 @@ bool config_send(int file_descriptor, const Config* config) {
   if (!send_int(file_descriptor, (int)config->delta_block_size))
     return false;
   if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
+    return false;
+  if (!send_int(file_descriptor, config->backup))
+    return false;
+  if (!send_str(file_descriptor, config->backup_dir ? config->backup_dir : ""))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -221,6 +235,19 @@ Config* config_receive(int file_descriptor) {
   config->tls_cert = NULL;
   config->tls_key = NULL;
   config->tls_ca = NULL;
+  config->timeout = 30;
+  config->contimeout = 10;
+  config->quiet = false;
+  config->stats = false;
+  config->max_depth = 0;
+  config->log_file = NULL;
+  config->queue_size = 100;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->backup = tmp;
+  config->backup_dir = receive_str(file_descriptor);
+  if (config->backup_dir == NULL)
+    goto error;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
   if (!send_status(file_descriptor, STATUS_OK))
