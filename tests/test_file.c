@@ -217,6 +217,10 @@ static void test_file_send_no_path() {
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
+    // Read file type indicator
+    int file_type;
+    EXPECT_TRUE(receive_int(p[0], &file_type));
+    EXPECT_EQ_INT(file_type, (int)FILE_TYPE_REGULAR);
     Data* received = receive_data(p[0]);
     close(p[0]);
 
@@ -271,7 +275,7 @@ void test_file() {
   test_to_disk_basic();
   test_to_disk_creates_dirs();
   test_file_content_to_buffer();
-  if (!getenv("FASTSYNC_UNDER_VALGRIND")) {
+  if (!is_running_under_valgrind()) {
     // Fork tests are skipped under valgrind because the parent process runs
     // orders of magnitude slower than the child (parent is instrumented, child
     // is not), which causes pipe-based protocol handshake timeouts. The parent

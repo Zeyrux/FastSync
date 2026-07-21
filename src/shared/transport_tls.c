@@ -5,6 +5,8 @@
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +74,12 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_verify_depth(ctx, 4);
+  } else {
+    if (!is_server) {
+      log_message(LOG_LEVEL_WARNING,
+                  "No CA path provided — TLS server certificate will not be verified");
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
   }
 
   return ctx;
@@ -84,6 +92,7 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server) {
     return NULL;
   }
   SSL_set_fd(ssl, fd);
+
   int ret;
   if (is_server)
     ret = SSL_accept(ssl);
@@ -96,6 +105,17 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server) {
     SSL_free(ssl);
     return NULL;
   }
+
+  // In client mode, check verification result if peer verification was requested
+  if (!is_server) {
+    long verify_result = SSL_get_verify_result(ssl);
+    if (verify_result != X509_V_OK) {
+      log_message(LOG_LEVEL_ERROR, "TLS certificate verification failed: %ld", verify_result);
+      SSL_free(ssl);
+      return NULL;
+    }
+  }
+
   return ssl;
 }
 
@@ -133,16 +153,9 @@ bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {
 
 bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
                         const char* key_path, const char* ca_path) {
-  client->address.sin_port = htons(port);
-  if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
-    perror("Could not convert host address!");
+  // Use the common TCP connection logic (with IPv6 support)
+  if (!client_connect(client, host, port))
     return false;
-  }
-  if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
-      0) {
-    perror("Could not connect to Server!");
-    return false;
-  }
 
   SSL_CTX* ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
   if (!ctx)
@@ -155,6 +168,14 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
     client->ssl_ctx = NULL;
     return false;
   }
+
+  // Set SNI and enable hostname verification
+  SSL_set_tlsext_host_name(ssl, host);
+  X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+  if (param) {
+    X509_VERIFY_PARAM_set1_host(param, host, 0);
+  }
+
   client->ssl = ssl;
   io_set_ssl(ssl);
   return true;

@@ -34,11 +34,14 @@ static void bw_throttle(size_t bytes_written) {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
 
-  long long elapsed_ns =
-      (now.tv_sec - bw_last_refill.tv_sec) * 1000000000LL + (now.tv_nsec - bw_last_refill.tv_nsec);
+  /* Use unsigned long long for elapsed_ns to avoid overflow in multiplication.
+   * time_t differences fit comfortably in 64-bit for any practical runtime. */
+  unsigned long long elapsed_ns =
+      (unsigned long long)(now.tv_sec - bw_last_refill.tv_sec) * 1000000000ULL +
+      (unsigned long long)(now.tv_nsec - bw_last_refill.tv_nsec);
   bw_last_refill = now;
 
-  long long tokens_to_add = (long long)((double)io_bwlimit * elapsed_ns / 1000000000.0);
+  long long tokens_to_add = (long long)((double)io_bwlimit * (double)elapsed_ns / 1000000000.0);
   bw_tokens += tokens_to_add;
   if (bw_tokens > (long long)io_bwlimit)
     bw_tokens = (long long)io_bwlimit;
@@ -46,7 +49,9 @@ static void bw_throttle(size_t bytes_written) {
   bw_tokens -= (long long)bytes_written;
 
   if (bw_tokens < 0) {
-    long long deficit_ns = (long long)((double)(-bw_tokens) / io_bwlimit * 1000000000.0);
+    long long deficit_ns = (long long)((double)(-bw_tokens) / (double)io_bwlimit * 1000000000.0);
+    if (deficit_ns < 0)
+      deficit_ns = 0;
     struct timespec sleep_time, remaining;
     sleep_time.tv_sec = deficit_ns / 1000000000LL;
     sleep_time.tv_nsec = deficit_ns % 1000000000LL;
@@ -79,6 +84,11 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
     else
       bytes_send = write(fd, (const char*)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
+      if (io_ssl) {
+        int ssl_err = SSL_get_error(io_ssl, (int)bytes_send);
+        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ)
+          continue;
+      }
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
     }
@@ -102,6 +112,11 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
       bytes_received =
           read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
     if (bytes_received <= 0) {
+      if (io_ssl) {
+        int ssl_err = SSL_get_error(io_ssl, (int)bytes_received);
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+          continue;
+      }
       if (bytes_received == 0)
         log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
       else
@@ -138,6 +153,10 @@ static const char* status_to_string(Status status) {
 }
 
 bool send_str(int file_descriptor, const char* data) {
+  if (data == NULL) {
+    log_message(LOG_LEVEL_ERROR, "send_str called with NULL data");
+    return false;
+  }
   size_t size = strlen(data);
   if (!send_n_data(file_descriptor, &size, sizeof(size_t)))
     return false;
@@ -151,6 +170,11 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
+  if (size > MAX_STRING_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "receive_str: size %zu exceeds maximum %zu", size,
+                (size_t)MAX_STRING_SIZE);
+    return NULL;
+  }
   char* data = (char*)malloc(size + 1);
   if (data == NULL)
     return NULL;
@@ -173,10 +197,16 @@ bool send_data(int file_descriptor, const Data* data) {
   return true;
 }
 
+#define MAX_DATA_SIZE (1024ULL * 1024 * 1024) // 1 GB
+
 Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
+  if (size > MAX_DATA_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "receive_data: size %llu exceeds maximum", size);
+    return NULL;
+  }
   void* data = malloc((size_t)size);
   if (data == NULL)
     return NULL;

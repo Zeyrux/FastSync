@@ -40,6 +40,8 @@ typedef struct Config {
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
+  bool follow_symlinks;
+  bool partial;
 } Config;
 
 #define PROTOCOL_VERSION "1.3.0"
