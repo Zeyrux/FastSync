@@ -121,8 +121,8 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto cleanup;
   }
-  config = config_create(config_version, NULL, NULL, save_to_disk, false, false, false,
-                         false, 5, false, 0);
+  config = config_create(config_version, NULL, NULL, save_to_disk, false, false, false, false, 5,
+                         false, 0);
 
   int positional_args[2];
   int positional_count = 0;
