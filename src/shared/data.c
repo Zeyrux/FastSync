@@ -1,6 +1,6 @@
 #include "data.h"
 #include "log.h"
-#include "stdlib.h"
+#include <stdlib.h>
 
 Data* data_create_empty(size_t data_size) {
   /* malloc(0) is UB; allocate at least 1 byte but preserve requested size */
