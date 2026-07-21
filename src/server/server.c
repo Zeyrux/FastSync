@@ -23,6 +23,8 @@ static bool is_excluded(const char* path, const Config* config) {
   char* path_dup = str_dup(path);
   if (!path_dup)
     return false;
+  /* basename(3) may return a pointer into path_dup or a static buffer;
+   * either way we free path_dup, not fname. */
   char* fname = basename(path_dup);
 
   // Check exclude patterns

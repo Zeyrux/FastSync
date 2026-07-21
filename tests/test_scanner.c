@@ -248,8 +248,6 @@ static void test_scanner_max_size() {
   const char* dir = "test_scan_max";
   const char* small = "test_scan_max/small.txt";
   const char* large = "test_scan_max/large.txt";
-  create_test_file(small, "tiny");
-  create_test_file(large, "this_content_is_longer_than_ten_chars");
 
   mkdir(dir, 0755);
   create_test_file(small, "tiny");
