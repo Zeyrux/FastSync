@@ -6,3 +6,4 @@ build-asan
 coverage.info
 build-*/
 build3/
+build_docker2/
