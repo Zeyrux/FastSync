@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

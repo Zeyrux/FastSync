@@ -1,2 +1,0 @@
-/nix/store/788mx070y81zjlg5ipcl0cra3afviw9k-gcc-wrapper-15.2.0/bin/ar qc libxxhash.a CMakeFiles/xxhash.dir/__/xxhash.c.o
-/nix/store/788mx070y81zjlg5ipcl0cra3afviw9k-gcc-wrapper-15.2.0/bin/ranlib libxxhash.a
