@@ -34,6 +34,7 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
+  config->fastsync_server_path = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
   config->include_patterns = NULL;
@@ -88,6 +89,7 @@ void config_delete(Config* config) {
   free(config->send_directory);
   free(config->receive_root_directory);
   free(config->ssh_destination);
+  free(config->fastsync_server_path);
   for (int i = 0; i < config->exclude_count; i++)
     free(config->exclude_patterns[i]);
   free(config->exclude_patterns);
@@ -238,6 +240,7 @@ Config* config_receive(int file_descriptor) {
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
+  config->fastsync_server_path = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
   config->include_patterns = NULL;
