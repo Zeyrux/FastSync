@@ -2,9 +2,27 @@
 #include "data.h"
 #include "log.h"
 #include "stdlib.h"
+#include "string.h"
+#include <strings.h>
 #include "zstd.h"
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
+
+static const char* SKIP_COMPRESSION_EXTENSIONS[] = {".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mkv",
+                                                    ".zip", ".gz",   ".xz",  ".zst", NULL};
+
+bool compression_should_skip(const char* path) {
+  if (!path)
+    return false;
+  const char* dot = strrchr(path, '.');
+  if (!dot)
+    return false;
+  for (int i = 0; SKIP_COMPRESSION_EXTENSIONS[i]; i++) {
+    if (strcasecmp(dot, SKIP_COMPRESSION_EXTENSIONS[i]) == 0)
+      return true;
+  }
+  return false;
+}
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
