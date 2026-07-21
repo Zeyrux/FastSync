@@ -108,7 +108,7 @@ static void delete_extras_walk(const char* abs_path, const char* rel_path, Array
   if (!dir)
     return;
   bool all_removed = true;
-  struct dirent* entry;
+  const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
