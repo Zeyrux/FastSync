@@ -119,10 +119,13 @@ Client* client_connect_ssh(const char* destination, int port) {
       close(sv[1]);
 
     char ssh_user[512];
+    int needed;
     if (r.user && r.user[0] != '\0')
-      snprintf(ssh_user, sizeof(ssh_user), "%s@%s", r.user, r.host);
+      needed = snprintf(ssh_user, sizeof(ssh_user), "%s@%s", r.user, r.host);
     else
-      snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
+      needed = snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
+    if ((size_t)needed >= sizeof(ssh_user))
+      fprintf(stderr, "Warning: ssh_user string truncated\n");
 
     size_t ssh_argv_max = 32;
     char** ssh_argv = calloc(ssh_argv_max, sizeof(char*));

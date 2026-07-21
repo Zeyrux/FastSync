@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +110,9 @@ bool file_load_data(File* file) {
   size_t bytes_read = file_content_to_buffer(file);
   if (bytes_read != file->data->size) {
     log_message(LOG_LEVEL_ERROR, "Did not read expected amount of bytes from file");
+    free(file->data->data);
+    file->data->data = NULL;
+    file->data->size = 0;
     return false;
   }
   return true;
@@ -140,11 +144,13 @@ static bool file_send_streaming(File* file, int file_descriptor) {
       if (ferror(fp)) {
         perror("Read error during streaming");
       }
+      send_status(file_descriptor, STATUS_ERROR);
       free(buf);
       fclose(fp);
       return false;
     }
     if (!send_n_data(file_descriptor, buf, nread)) {
+      send_status(file_descriptor, STATUS_ERROR);
       free(buf);
       fclose(fp);
       return false;
@@ -626,8 +632,13 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
 
   off_t offset = 0;
   while ((unsigned long long)offset < file_size) {
-    ssize_t sent = sendfile(file_descriptor, fd, &offset, file_size - offset);
+    size_t send_count = (size_t)(file_size - (unsigned long long)offset);
+    if ((unsigned long long)send_count != file_size - (unsigned long long)offset)
+      send_count = SIZE_MAX;
+    ssize_t sent = sendfile(file_descriptor, fd, &offset, send_count);
     if (sent == -1) {
+      if (errno == EINTR)
+        continue;
       perror("sendfile failed");
       close(fd);
       return false;

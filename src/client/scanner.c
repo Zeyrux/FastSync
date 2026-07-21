@@ -91,7 +91,19 @@ DirectoryScanner* directory_scanner_create_full(char* root_directory, bool use_m
   scanner->max_size = max_size;
   scanner->min_size = min_size;
   scanner->follow_symlinks = follow_symlinks;
-  queue_enqueue(scanner->directories, str_dup(root_directory));
+  char* root_copy = str_dup(root_directory);
+  if (root_copy == NULL) {
+    for (int i = 0; i < scanner->include_count; i++)
+      free(scanner->include_patterns[i]);
+    free(scanner->include_patterns);
+    for (int i = 0; i < scanner->exclude_count; i++)
+      free(scanner->exclude_patterns[i]);
+    free(scanner->exclude_patterns);
+    queue_destroy(scanner->directories);
+    free(scanner);
+    return NULL;
+  }
+  queue_enqueue(scanner->directories, root_copy);
   return scanner;
 }
 

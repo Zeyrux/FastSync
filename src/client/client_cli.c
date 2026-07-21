@@ -70,10 +70,14 @@ int main(int argc, char* argv[]) {
     save_to_disk = true;
   }
 
-  Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
-                                 false, false, 5, false, 0);
   int exit_code = 0;
   bool config_owned_by_pipeline = false;
+  Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
+                                 false, false, 5, false, 0);
+  if (config == NULL) {
+    exit_code = 1;
+    goto cleanup;
+  }
 
   int positional_args[2];
   int positional_count = 0;

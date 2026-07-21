@@ -20,6 +20,9 @@
  * serialized as fixed-width integers.
  */
 
+/* Size of metadata fields on wire, excluding the int32_t `present` field that
+ * is always sent first. The total wire size for present metadata is
+ * sizeof(int32_t) + FILE_METADATA_WIRE_SIZE (32 bytes on most platforms). */
 #define FILE_METADATA_WIRE_SIZE (sizeof(int32_t) * 3 + sizeof(int64_t) * 2)
 
 void metadata_to_buf(char** buf, const FileMetadata* m);

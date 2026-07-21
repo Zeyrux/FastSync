@@ -16,6 +16,8 @@ void log_message(LogLevel log_level, const char* format, ...) {
   time_t now = time(NULL);
   struct tm result_buf;
   const struct tm* t = localtime_r(&now, &result_buf);
+  if (t == NULL)
+    return;
 
   fprintf(stderr, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900, t->tm_mon + 1,
           t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, log_level_strings[log_level]);

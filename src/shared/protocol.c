@@ -10,7 +10,7 @@
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
-static SSL* io_ssl = NULL;
+static __thread SSL* io_ssl = NULL;
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
