@@ -72,3 +72,90 @@ git push -u origin <feature-branch-name>
 gh pr create --fill
 ```
 Wait for CI to pass on the PR before merging.
+
+## Batch PR Workflow
+
+When handling multiple issues split across several PRs that target the same files:
+
+1. **Group issues by logical category** into separate PR branches (e.g., memory-safety, refactoring, test-coverage).
+2. **Fix and push** each branch independently. Let CI run on each PR.
+3. **Run all 3 reviewer types** on each PR and post results to Gitea via `tea pr approve/reject` or the Gitea API:
+   - `reviewer` — general code correctness
+   - `code-quality-guardian` — code quality, duplication, complexity
+   - `security-auditor` — vulnerability assessment
+4. **Iterate**: if any reviewer requests changes, fix, push, re-review. Repeat until all 3 approve.
+5. **Merge approved PRs** one at a time into `main`.
+6. **Create a combined merge branch** for the remaining PRs that conflict with the new `main`:
+   ```bash
+   git checkout -b merge-all origin/main
+   for branch in branch1 branch2 branch3; do
+     git merge origin/$branch --no-edit || true
+     # Resolve conflicts, build, test
+   done
+   ```
+7. **Run review again** on the combined branch. Fix issues, push, re-review until approved.
+8. **Merge** the combined PR, **close** the redundant individual PRs, and **close all resolved issues** via the Gitea API:
+   ```bash
+   curl -s -X PATCH -H "Authorization: token $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"state":"closed"}' \
+     "https://gitea.tap-tap.win/api/v1/repos/owner/repo/issues/<number>"
+   ```
+
+## CI Troubleshooting
+
+### If lint (clang-format) fails
+Run clang-format in the CI Docker image to match the exact CI version:
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v9 \
+  sh -c 'find src/ tests/ -name "*.c" -o -name "*.h" | xargs clang-format -i'
+```
+
+### If cppcheck fails
+Fix reported issues locally, then verify with:
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v9 \
+  sh -c 'cppcheck --enable=warning,style,performance,portability --suppress=missingIncludeSystem --error-exitcode=1 --inline-suppr src/ tests/'
+```
+
+### If integration tests fail
+Run locally before pushing:
+```bash
+python3 -m pytest tests/ -v --tb=short
+```
+
+## Gitea API & tea CLI
+
+### Check CI status via API
+```bash
+TOKEN="<token>"
+curl -s -H "Authorization: token $TOKEN" \
+  "https://gitea.tap-tap.win/api/v1/repos/TapTap/FastSync/actions/runs?limit=5" \
+  | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+for r in d.get('workflow_runs',[]):
+    path = r.get('path','')
+    prn = path.split('@')[1].replace('refs/pull/','').replace('/head','') if '@' in path else ''
+    print(f'PR #{prn}: sha={r[\"head_sha\"][:8]} {r[\"status\"]} {r.get(\"conclusion\",\"\")}')
+"
+```
+
+### Post review comments
+```bash
+curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+  -d '{"body":"MARKDOWN_REVIEW_BODY"}' \
+  "https://gitea.tap-tap.win/api/v1/repos/TapTap/FastSync/issues/<PR_NUMBER>/comments"
+```
+
+### Use tea for PR operations
+```bash
+tea pr list --repo TapTap/FastSync
+tea pr close <number> --repo TapTap/FastSync
+```
+
+## Common pitfalls
+
+- **`__thread` on shared SSL context**: io_ssl must NOT be thread-local — worker threads inherit the SSL context from the main thread. Use regular `static SSL* io_ssl`.
+- **SSL WANT_READ/WANT_WRITE retry**: Always retry on `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE` in `send_n_data`/`receive_n_data`. Removing these breaks TLS multithreaded transfers.
+- **clang-format version**: The CI image uses clang-format 18. Always format inside the CI Docker container for exact match.
+- **Merge order matters**: Merge the most comprehensive branch first, then smaller ones, to minimize conflicts when creating a combined branch.
