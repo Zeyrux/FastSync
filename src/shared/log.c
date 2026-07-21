@@ -15,7 +15,7 @@ void log_set_file(FILE* fp) {
   log_fp = fp;
 }
 
-void log_message(LogLevel log_level, char* format, ...) {
+void log_message(LogLevel log_level, const char* format, ...) {
   if (log_level < current_log_level)
     return;
   time_t now = time(NULL);

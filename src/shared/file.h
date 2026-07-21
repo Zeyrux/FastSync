@@ -6,6 +6,8 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 
+typedef enum { FILE_TYPE_REGULAR, FILE_TYPE_SYMLINK, FILE_TYPE_DIR } FileType;
+
 typedef struct {
   mode_t mode;
   uid_t uid;

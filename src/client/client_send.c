@@ -305,7 +305,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->send_directory, context->config->use_metadata, context->config->chunk_size,
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
-      context->config->min_size, 4);
+      context->config->min_size, context->config->max_depth, 4);
 
   Chunk* current_chunk;
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -368,7 +368,7 @@ int send_files(Config* config) {
     DirectoryScanner* scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
         config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size);
+        config->min_size, config->max_depth);
     Chunk* chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
@@ -421,7 +421,7 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-      config->min_size);
+      config->min_size, config->max_depth);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   time_t last_progress = 0;
@@ -510,7 +510,7 @@ int send_files_multithreaded(Config* config) {
     DirectoryScanner* scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
         config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size);
+        config->min_size, config->max_depth);
     Chunk* chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;

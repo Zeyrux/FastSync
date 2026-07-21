@@ -61,6 +61,19 @@ char* str_dup(const char* string) {
 bool glob_match(const char* pattern, const char* str) {
   while (*pattern) {
     if (*pattern == '*') {
+      if (*(pattern + 1) == '*') {
+        pattern += 2;
+        if (*pattern == '\0')
+          return true;
+        if (*pattern == '/')
+          pattern++;
+        while (*str) {
+          if (glob_match(pattern, str))
+            return true;
+          str++;
+        }
+        return glob_match(pattern, str);
+      }
       pattern++;
       while (*str && *str != '/') {
         if (glob_match(pattern, str))
@@ -74,8 +87,15 @@ bool glob_match(const char* pattern, const char* str) {
       pattern++;
       str++;
     } else {
-      if (*pattern != *str)
+      if (*pattern != *str) {
+        if (*pattern == '/' && *(pattern + 1) == '*' && *(pattern + 2) == '*') {
+          const char* rest = pattern + 3;
+          if (*rest == '/')
+            rest++;
+          return glob_match(rest, str);
+        }
         return false;
+      }
       pattern++;
       str++;
     }
@@ -168,18 +188,18 @@ bool has_path_traversal(const char* path) {
   return false;
 }
 
-char* path_cat(const char* path1, char* path2) {
+char* path_cat(const char* path1, const char* path2) {
   if (path1 == NULL || *path1 == '\0')
     return str_dup(path2);
   if (path2 == NULL || *path2 == '\0')
     return str_dup(path1);
-  int path1_len = strlen(path1);
-  int path2_len = strlen(path2);
-  char* path2_pointer = path2;
+  size_t path1_len = strlen(path1);
+  size_t path2_len = strlen(path2);
+  size_t offset = 0;
   if (path1[path1_len - 1] == '/')
     path1_len -= 1;
   if (path2[0] == '/') {
-    path2_pointer += 1;
+    offset = 1;
     path2_len -= 1;
   }
   char* new_path = malloc(path1_len + path2_len + 2);
@@ -187,7 +207,7 @@ char* path_cat(const char* path1, char* path2) {
     return NULL;
   memcpy(new_path, path1, path1_len);
   new_path[path1_len] = '/';
-  memcpy(new_path + path1_len + 1, path2_pointer, path2_len);
+  memcpy(new_path + path1_len + 1, path2 + offset, path2_len);
   new_path[path1_len + path2_len + 1] = '\0';
   return new_path;
 }
