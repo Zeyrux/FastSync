@@ -1,4 +1,5 @@
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <stddef.h>
@@ -42,6 +43,7 @@ File* file_create(const char* path) {
     return NULL;
   }
   file->metadata = NULL;
+  file->skip = false;
   return file;
 }
 
@@ -126,7 +128,12 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
   return true;
 }
 
-bool file_save_to_disk(const char* root_directory, File* file) {
+bool file_save_to_disk(const char* root_directory, File* file, const Config* config) {
+  (void)config;
+  if (has_path_traversal(file->path)) {
+    log_message(LOG_LEVEL_ERROR, "Path traversal detected in file path: %s", file->path);
+    return false;
+  }
   char* disk_path = path_cat((char*)root_directory, file->path);
   if (disk_path == NULL)
     return false;
@@ -325,6 +332,13 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
+  if (has_path_traversal(check_path)) {
+    log_message(LOG_LEVEL_ERROR, "Path traversal detected: %s", check_path);
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
   char* full_path = path_cat(config->receive_root_directory, check_path);
   struct stat st;
   bool has_old_file = (full_path && stat(full_path, &st) == 0);
@@ -409,37 +423,55 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 }
 
 bool to_disk(const char* path, const void* data, unsigned long long data_size) {
-  // dirname() may modify its argument and may return a pointer to static storage.
-  // We must use a copy of the result to be safe.
+  char* tmp_path = NULL;
+  char* directory = NULL;
+
   char* path_dup = str_dup(path);
   if (!path_dup)
     return false;
   const char* dir_result = dirname(path_dup);
-  char* directory = str_dup(dir_result);
+  directory = str_dup(dir_result);
   free(path_dup);
   if (!directory)
     return false;
 
   bool ok = true;
-  if (!mkdir_r(directory)) {
+  if (!mkdir_r(directory))
+    goto done;
+
+  size_t path_len = strlen(path);
+  tmp_path = malloc(path_len + 5);
+  if (!tmp_path) {
     ok = false;
     goto done;
   }
-  FILE* file_pointer = fopen(path, "wb");
+  memcpy(tmp_path, path, path_len);
+  memcpy(tmp_path + path_len, ".tmp", 5);
+
+  FILE* file_pointer = fopen(tmp_path, "wb");
   if (file_pointer == NULL) {
-    perror("Could not open File");
+    perror("Could not open temporary file");
     ok = false;
     goto done;
   }
   if (fwrite(data, 1, data_size, file_pointer) != data_size) {
-    perror("Failed to write all data to disk");
+    perror("Failed to write all data to temporary file");
     fclose(file_pointer);
+    unlink(tmp_path);
     ok = false;
     goto done;
   }
   fclose(file_pointer);
 
+  if (rename(tmp_path, path) != 0) {
+    perror("Failed to atomically rename temporary file");
+    unlink(tmp_path);
+    ok = false;
+    goto done;
+  }
+
 done:
+  free(tmp_path);
   free(directory);
   return ok;
 }

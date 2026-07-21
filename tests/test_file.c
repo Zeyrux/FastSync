@@ -69,7 +69,7 @@ static void test_file_save_to_disk() {
   memcpy(f->data->data, content, strlen(content));
   f->data->size = strlen(content);
 
-  EXPECT_TRUE(file_save_to_disk("test_save_tmp", f));
+  EXPECT_TRUE(file_save_to_disk("test_save_tmp", f, NULL));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_save_tmp/saved_file.txt", &st), 0);

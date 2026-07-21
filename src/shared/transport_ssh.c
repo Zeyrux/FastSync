@@ -118,11 +118,18 @@ Client* client_connect_ssh(const char* destination, int port) {
     if (sv[1] > 1)
       close(sv[1]);
 
-    char ssh_user[512];
+    size_t ssh_user_len;
     if (r.user && r.user[0] != '\0')
-      snprintf(ssh_user, sizeof(ssh_user), "%s@%s", r.user, r.host);
+      ssh_user_len = strlen(r.user) + 1 + strlen(r.host) + 1;
     else
-      snprintf(ssh_user, sizeof(ssh_user), "%s", r.host);
+      ssh_user_len = strlen(r.host) + 1;
+    char* ssh_user = malloc(ssh_user_len);
+    if (!ssh_user)
+      _exit(1);
+    if (r.user && r.user[0] != '\0')
+      snprintf(ssh_user, ssh_user_len, "%s@%s", r.user, r.host);
+    else
+      snprintf(ssh_user, ssh_user_len, "%s", r.host);
 
     char* ssh_argv[16];
     int ac = 0;

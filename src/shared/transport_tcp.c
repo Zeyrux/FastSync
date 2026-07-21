@@ -2,6 +2,7 @@
 #include "log.h"
 #include "protocol.h"
 #include <arpa/inet.h>
+#include <errno.h>
 #include <openssl/ssl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -10,6 +11,18 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static volatile unsigned int g_active_connections = 0;
+
+static void sigchld_handler(int sig) {
+  (void)sig;
+  int saved_errno = errno;
+  while (waitpid(-1, NULL, WNOHANG) > 0) {
+    if (g_active_connections > 0)
+      g_active_connections--;
+  }
+  errno = saved_errno;
+}
 
 Server* server_create(int port) {
   Server* server = (Server*)malloc(sizeof(Server));
@@ -38,6 +51,8 @@ Server* server_create(int port) {
   server->address.sin_port = htons(port);
   server->address_length = sizeof(server->address);
   server->ssl_ctx = NULL;
+  server->max_connections = 100;
+  server->active_connections = 0;
 
   if (bind(server->file_descriptor, (struct sockaddr*)&server->address, server->address_length) <
       0) {
@@ -68,13 +83,19 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     perror("Could not listen on port!");
     return;
   }
-  signal(SIGCHLD, SIG_IGN);
+  signal(SIGCHLD, sigchld_handler);
   while (1) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     int fd = accept(server->file_descriptor, (struct sockaddr*)&client_addr, &client_len);
     if (fd < 0) {
       perror("Could not accept the connection");
+      continue;
+    }
+    if (g_active_connections >= server->max_connections) {
+      log_message(LOG_LEVEL_WARNING, "Max connections (%u) reached, rejecting",
+                  server->max_connections);
+      close(fd);
       continue;
     }
     log_message(LOG_LEVEL_INFO, "%s", log_fmt);
@@ -84,6 +105,8 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       child_fn(fd, child_ctx);
       close(fd);
       _exit(0);
+    } else if (pid > 0) {
+      g_active_connections++;
     }
     close(fd);
   }
@@ -110,6 +133,24 @@ void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
   accept_loop(server, child_fn, child_ctx, log_fmt);
 }
 
+static int g_timeout_sec = 30;
+static int g_contimeout_sec = 10;
+
+void tcp_set_timeouts(int timeout_sec, int contimeout_sec) {
+  if (timeout_sec > 0)
+    g_timeout_sec = timeout_sec;
+  if (contimeout_sec > 0)
+    g_contimeout_sec = contimeout_sec;
+}
+
+static void tcp_apply_socket_timeout(int fd) {
+  struct timeval tv;
+  tv.tv_sec = g_timeout_sec;
+  tv.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 Client* client_create() {
   int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
   if (file_descriptor < 0) {
@@ -133,17 +174,27 @@ Client* client_create() {
 
 bool client_connect(Client* client, char* host, int port) {
   client->address.sin_port = htons(port);
+  client->address.sin_family = AF_INET;
+  client->address_length = sizeof(client->address);
 
   if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
     perror("Could not convert host address!");
     return false;
   }
 
+  struct timeval ct;
+  ct.tv_sec = g_contimeout_sec;
+  ct.tv_usec = 0;
+  setsockopt(client->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &ct, sizeof(ct));
+  setsockopt(client->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &ct, sizeof(ct));
+
   if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
       0) {
     perror("Could not connect to Server!");
     return false;
   }
+
+  tcp_apply_socket_timeout(client->file_descriptor);
   return true;
 }
 

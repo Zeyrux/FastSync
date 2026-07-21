@@ -8,6 +8,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#define MAX_DATA_SIZE (256ULL * 1024 * 1024)          /* 256 MB max per message */
+#define RECEIVE_TIMEOUT_SEC 60                        /* 60 second per-message timeout */
+#define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
+
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
 static SSL* io_ssl = NULL;
@@ -15,6 +19,8 @@ static SSL* io_ssl = NULL;
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
 static struct timespec bw_last_refill = {0, 0};
+
+static __thread unsigned long long total_allocated_bytes = 0;
 
 void io_set_fds(int read_fd, int write_fd) {
   io_read_fd = read_fd;
@@ -92,8 +98,21 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
 bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %zu", data_size);
   int fd = io_fd(io_read_fd, file_descriptor);
+
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += RECEIVE_TIMEOUT_SEC;
+
   size_t total_bytes_received = 0;
   while (total_bytes_received < data_size) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > deadline.tv_sec ||
+        (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec)) {
+      log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
+      return false;
+    }
+
     ssize_t bytes_received;
     if (io_ssl)
       bytes_received =
@@ -132,6 +151,12 @@ static const char* status_to_string(Status status) {
     return "DELTA_SIGNATURE";
   case STATUS_DELTA_DATA:
     return "DELTA_DATA";
+  case STATUS_KEEPALIVE:
+    return "KEEPALIVE";
+  case STATUS_ABORT:
+    return "ABORT";
+  case STATUS_CHECK_BATCH:
+    return "CHECK_BATCH";
   default:
     return "UNKNOWN";
   }
@@ -151,6 +176,11 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
+  if (size > MAX_DATA_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
+                (unsigned long long)MAX_DATA_SIZE);
+    return NULL;
+  }
   char* data = (char*)malloc(size + 1);
   if (data == NULL)
     return NULL;
@@ -177,6 +207,17 @@ Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
+  if (size > MAX_DATA_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
+                (unsigned long long)MAX_DATA_SIZE);
+    return NULL;
+  }
+  if (total_allocated_bytes + size > MAX_CONNECTION_MEMORY) {
+    log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
+                (unsigned long long)total_allocated_bytes, size,
+                (unsigned long long)MAX_CONNECTION_MEMORY);
+    return NULL;
+  }
   void* data = malloc((size_t)size);
   if (data == NULL)
     return NULL;
@@ -184,6 +225,7 @@ Data* receive_data(int file_descriptor) {
     free(data);
     return NULL;
   }
+  total_allocated_bytes += size;
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
   return data_create(data, (size_t)size);
 }

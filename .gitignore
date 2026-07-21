@@ -5,3 +5,4 @@ __pycache__/
 build-asan
 coverage.info
 build-*/
+build3/

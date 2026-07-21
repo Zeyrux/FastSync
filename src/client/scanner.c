@@ -11,15 +11,38 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+typedef struct {
+  char* path;
+  int depth;
+} DirEntry;
+
+static void dir_entry_destroy(void* item) {
+  if (item) {
+    DirEntry* de = (DirEntry*)item;
+    free(de->path);
+    free(de);
+  }
+}
+
+static DirEntry* dir_entry_create(const char* path, int depth) {
+  DirEntry* de = malloc(sizeof(DirEntry));
+  if (de) {
+    de->path = str_dup(path);
+    de->depth = depth;
+  }
+  return de;
+}
+
 DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metadata,
                                            unsigned long long chunk_size, char** exclude_patterns,
                                            int exclude_count, char** include_patterns,
                                            int include_count, unsigned long long max_size,
-                                           unsigned long long min_size) {
+                                           unsigned long long min_size,
+                                           int max_depth) {
   DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;
-  scanner->directories = queue_create(100, free);
+  scanner->directories = queue_create(100, dir_entry_destroy);
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->use_metadata = use_metadata;
@@ -30,7 +53,9 @@ DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metada
   scanner->include_count = include_count;
   scanner->max_size = max_size;
   scanner->min_size = min_size;
-  queue_enqueue(scanner->directories, str_dup(root_directory));
+  scanner->max_depth = max_depth;
+  scanner->current_depth = 0;
+  queue_enqueue(scanner->directories, dir_entry_create(root_directory, 0));
   return scanner;
 }
 
@@ -66,7 +91,10 @@ static int open_next_directory(DirectoryScanner* scanner) {
   if (queue_is_empty(scanner->directories))
     return 0;
 
-  scanner->current_path = (char*)queue_dequeue(scanner->directories);
+  DirEntry* de = (DirEntry*)queue_dequeue(scanner->directories);
+  scanner->current_path = de->path;
+  scanner->current_depth = de->depth;
+  free(de);
   scanner->current_dir = opendir(scanner->current_path);
   if (scanner->current_dir == NULL) {
     perror("Could not open directory");
@@ -110,8 +138,16 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     }
 
     if (S_ISDIR(stats.st_mode)) {
-      queue_enqueue(scanner->directories, (void*)cur_path);
+      int next_depth = scanner->current_depth + 1;
+      if (scanner->max_depth <= 0 || next_depth < scanner->max_depth)
+        queue_enqueue(scanner->directories, dir_entry_create(cur_path, next_depth));
+      else
+        free(cur_path);
     } else {
+      if (scanner->max_depth > 0 && scanner->current_depth + 1 > scanner->max_depth) {
+        free(cur_path);
+        continue;
+      }
       bool excluded = false;
       for (int i = 0; i < scanner->exclude_count; i++) {
         if (glob_match(scanner->exclude_patterns[i], entry->d_name)) {

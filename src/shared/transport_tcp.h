@@ -10,6 +10,8 @@ typedef struct Server {
   unsigned int address_length;
   int file_descriptor;
   void* ssl_ctx;
+  unsigned int max_connections;
+  volatile unsigned int active_connections;
 } Server;
 
 typedef struct Client {
@@ -30,5 +32,6 @@ Client* client_create();
 bool client_connect(Client* client, char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
+void tcp_set_timeouts(int timeout_sec, int contimeout_sec);
 
 #endif

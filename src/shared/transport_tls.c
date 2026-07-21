@@ -72,6 +72,8 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_verify_depth(ctx, 4);
+  } else {
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
   }
 
   return ctx;

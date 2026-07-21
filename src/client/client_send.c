@@ -16,11 +16,22 @@
 #include "transport_ssh.h"
 #include "transport_tls.h"
 #include "utils.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <time.h>
+
+static volatile sig_atomic_t g_abort_requested = 0;
+static int g_abort_fd = -1;
+
+static void handle_sigint(int sig) {
+  (void)sig;
+  g_abort_requested = 1;
+}
+
+#define KEEPALIVE_INTERVAL 30
 
 static int incremental_check(Client* client, File* file, DeltaSignature** out_sig) {
   *out_sig = NULL;
@@ -96,6 +107,35 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
   return ok ? 0 : -1;
 }
 
+static bool batch_incremental_check(Client* client, ArrayList* files) {
+  if (!send_status(client->file_descriptor, STATUS_CHECK_BATCH))
+    return false;
+  if (!send_int(client->file_descriptor, files->size))
+    return false;
+  for (int i = 0; i < files->size; i++) {
+    File* file = (File*)files->items[i];
+    if (!send_str(client->file_descriptor, file->path))
+      return false;
+    unsigned long long fsize = file->data ? file->data->size : 0;
+    long long mtime = file->metadata ? file->metadata->mtime_sec : 0;
+    if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize)))
+      return false;
+    if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime)))
+      return false;
+  }
+  for (int i = 0; i < files->size; i++) {
+    Status s;
+    if (!receive_status(client->file_descriptor, &s))
+      return false;
+    File* file = (File*)files->items[i];
+    if (s == STATUS_OK)
+      file->skip = true;
+    else if (s == STATUS_ERROR)
+      return false;
+  }
+  return true;
+}
+
 typedef bool (*file_send_fn)(File*, int, bool, int, bool);
 
 // Send a single file directly (non-incremental path).
@@ -117,6 +157,9 @@ static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata) {
 static int send_single_file(Client* client, File* file, Config* config, bool use_incremental,
                             bool use_sendfile) {
   int compression_level = config->use_compression ? config->compression_level : 0;
+
+  if (file->skip)
+    return 1;
 
   if (!use_incremental) {
     if (use_sendfile) {
@@ -255,7 +298,30 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     return thrd_error;
   }
 
+  g_abort_fd = client->file_descriptor;
+  time_t last_activity = time(NULL);
   while (true) {
+    if (g_abort_requested) {
+      send_status(client->file_descriptor, STATUS_ABORT);
+      client_disconnect(client);
+      client_delete(client);
+      return thrd_error;
+    }
+    time_t now = time(NULL);
+    if (now - last_activity >= KEEPALIVE_INTERVAL) {
+      if (!send_status(client->file_descriptor, STATUS_KEEPALIVE)) {
+        client_disconnect(client);
+        client_delete(client);
+        return thrd_error;
+      }
+      Status s;
+      if (!receive_status(client->file_descriptor, &s)) {
+        client_disconnect(client);
+        client_delete(client);
+        return thrd_error;
+      }
+      last_activity = now;
+    }
     Chunk* current_chunk = queue_dequeue_multithreaded(
         context->queue_loader, &context->mutex_loader, &context->condition_not_empty_loader,
         &context->condition_not_full_loader, &context->loader_done);
@@ -299,8 +365,8 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   DirectoryScanner* scanner = directory_scanner_create(
       context->config->send_directory, context->config->use_metadata, context->config->chunk_size,
       context->config->exclude_patterns, context->config->exclude_count,
-      context->config->include_patterns, context->config->include_count, context->config->max_size,
-      context->config->min_size);
+       context->config->include_patterns, context->config->include_count, context->config->max_size,
+       context->config->min_size, context->config->max_depth);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk* current_chunk;
@@ -361,21 +427,24 @@ int send_files(Config* config) {
     DirectoryScanner* scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
         config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size);
+        config->min_size, config->max_depth);
     Chunk* chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
-    printf("Dry run: files to be transferred\n");
+    if (!config->quiet)
+      printf("Dry run: files to be transferred\n");
     while ((chunk = directory_scanner_next(scanner)) != NULL) {
       for (int i = 0; i < chunk->element_count; i++) {
-        printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+        if (!config->quiet)
+          printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
         total_bytes += chunk->items[i]->data->size;
         file_count++;
       }
       chunk_destroy(chunk);
     }
     directory_scanner_destroy(scanner);
-    printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
+    if (!config->quiet)
+      printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
     return 0;
   }
 
@@ -411,42 +480,98 @@ int send_files(Config* config) {
     client_delete(client);
     return 1;
   }
+
+  g_abort_fd = client->file_descriptor;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = handle_sigint;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+
   DirectoryScanner* scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-      config->min_size);
-  Chunk* current_chunk;
-  unsigned long long total_bytes = 0;
-  time_t last_progress = 0;
-  time_t start = time(NULL);
+       config->min_size, config->max_depth);
+  ArrayList* all_files = array_list_create(NULL);
   ArrayList* manifest = config->use_delete ? array_list_create(free) : NULL;
+  Chunk* current_chunk;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
-    unsigned long long chunk_bytes = 0;
     for (int i = 0; i < current_chunk->element_count; i++) {
-      chunk_bytes += current_chunk->items[i]->data->size;
+      File* f = current_chunk->items[i];
+      array_list_add(all_files, f);
+      current_chunk->items[i] = NULL;
       if (manifest) {
-        const char* p = current_chunk->items[i]->path;
+        const char* p = f->path;
         if (*p == '/')
           p++;
         array_list_add(manifest, str_dup(p));
       }
     }
-    if (!config->use_sendfile) {
-      for (int i = 0; i < current_chunk->element_count; i++) {
-        if (!file_load_data(current_chunk->items[i])) {
-          log_message(LOG_LEVEL_ERROR, "Failed to load file data");
-          continue;
-        }
-      }
+    chunk_destroy(current_chunk);
+  }
+  directory_scanner_destroy(scanner);
+  scanner = NULL;
+
+  bool batch_ok = true;
+  if (config->use_incremental && all_files->size > 0) {
+    if (!batch_incremental_check(client, all_files)) {
+      log_message(LOG_LEVEL_ERROR, "Batch incremental check failed");
+      batch_ok = false;
     }
-    if (send_chunk(client, current_chunk, config) != 0) {
-      log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
-      chunk_destroy(current_chunk);
+  }
+
+  unsigned long long total_bytes = 0;
+  time_t last_progress = 0;
+  time_t last_activity = 0;
+  time_t start = time(NULL);
+  bool use_sendfile = config->use_sendfile && !config->use_compression;
+  for (int i = 0; i < all_files->size; i++) {
+    File* file = (File*)all_files->items[i];
+    if (file->skip)
+      continue;
+    if (g_abort_requested) {
+      send_status(client->file_descriptor, STATUS_ABORT);
+      batch_ok = false;
       break;
     }
+    time_t now = time(NULL);
+    if (now - last_activity >= KEEPALIVE_INTERVAL) {
+      if (!send_status(client->file_descriptor, STATUS_KEEPALIVE)) {
+        batch_ok = false;
+        break;
+      }
+      Status s;
+      if (!receive_status(client->file_descriptor, &s)) {
+        batch_ok = false;
+        break;
+      }
+      last_activity = now;
+    }
+    int compression_level = config->use_compression ? config->compression_level : 0;
+    if (!send_status(client->file_descriptor, STATUS_NEXT)) {
+      batch_ok = false;
+      break;
+    }
+    if (use_sendfile) {
+      if (!file_send_sendfile(file, client->file_descriptor, config->use_metadata, 0, true)) {
+        log_message(LOG_LEVEL_ERROR, "Failed to send file via sendfile");
+        batch_ok = false;
+        break;
+      }
+    } else {
+      if (!file_load_data(file)) {
+        log_message(LOG_LEVEL_ERROR, "Failed to load file data");
+        continue;
+      }
+      if (!file_send_single_calls(file, client->file_descriptor, config->use_metadata,
+                                   compression_level, true)) {
+        log_message(LOG_LEVEL_ERROR, "Failed to send file");
+        batch_ok = false;
+        break;
+      }
+    }
+    total_bytes += file->data ? file->data->size : 0;
     if (config->show_progress) {
-      total_bytes += chunk_bytes;
-      time_t now = time(NULL);
       if (now - last_progress >= 1) {
         last_progress = now;
         double elapsed = difftime(now, start);
@@ -455,71 +580,71 @@ int send_files(Config* config) {
         fflush(stderr);
       }
     }
-    chunk_destroy(current_chunk);
   }
-  if (config->use_delete) {
-    if (!send_status(client->file_descriptor, STATUS_MANIFEST)) {
-      array_list_delete(manifest);
-      goto send_fail;
-    }
-    if (!send_int(client->file_descriptor, manifest->size)) {
-      array_list_delete(manifest);
-      goto send_fail;
-    }
-    for (int i = 0; i < manifest->size; i++) {
-      if (!send_str(client->file_descriptor, (char*)manifest->items[i])) {
-        array_list_delete(manifest);
-        goto send_fail;
+
+  if (batch_ok && config->use_delete && manifest) {
+    if (!send_status(client->file_descriptor, STATUS_MANIFEST))
+      batch_ok = false;
+    else if (!send_int(client->file_descriptor, manifest->size))
+      batch_ok = false;
+    else {
+      for (int i = 0; i < manifest->size && batch_ok; i++) {
+        if (!send_str(client->file_descriptor, (char*)manifest->items[i]))
+          batch_ok = false;
       }
     }
-    array_list_delete(manifest);
   }
-  if (!send_status(client->file_descriptor, STATUS_FINISHED))
-    goto send_fail;
+  array_list_delete(manifest);
+
+  if (batch_ok && !send_status(client->file_descriptor, STATUS_FINISHED))
+    batch_ok = false;
   Status s;
-  int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
+  int ok = 0;
+  if (batch_ok)
+    ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
   if (config->show_progress) {
     double elapsed = difftime(time(NULL), start);
     double rate = elapsed > 0 ? total_bytes / (1048576.0 * elapsed) : 0;
     fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  Done.\n", total_bytes / 1048576.0, rate);
   }
-  directory_scanner_destroy(scanner);
+  for (int i = 0; i < all_files->size; i++)
+    file_destroy(all_files->items[i]);
+  array_list_delete(all_files);
   client_disconnect(client);
   client_delete(client);
-  return ok ? 0 : -1;
-
-send_fail:
-  directory_scanner_destroy(scanner);
-  client_disconnect(client);
-  client_delete(client);
-  return -1;
+  return (batch_ok && ok) ? 0 : -1;
 }
 
 int send_files_multithreaded(Config* config) {
+  time_t start_time = time(NULL);
   if (config->dry_run) {
     DirectoryScanner* scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
         config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size);
+        config->min_size, config->max_depth);
     Chunk* chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
-    printf("Dry run: files to be transferred\n");
+    if (!config->quiet)
+      printf("Dry run: files to be transferred\n");
     while ((chunk = directory_scanner_next(scanner)) != NULL) {
       for (int i = 0; i < chunk->element_count; i++) {
-        printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+        if (!config->quiet)
+          printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
         total_bytes += chunk->items[i]->data->size;
         file_count++;
       }
       chunk_destroy(chunk);
     }
     directory_scanner_destroy(scanner);
-    printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
+    if (!config->quiet)
+      printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
     return 0;
   }
 
-  Queue* q1 = queue_create(100, chunk_destroy);
-  Queue* q2 = queue_create(100, chunk_destroy);
+  int qsize = config->queue_size > 0 ? config->queue_size : 100;
+  Queue* q1 = queue_create(qsize, chunk_destroy);
+  Queue* q2 = queue_create(qsize, chunk_destroy);
   if (!q1 || !q2) {
     if (q1)
       queue_destroy(q1);
@@ -549,6 +674,12 @@ int send_files_multithreaded(Config* config) {
   thrd_join(scanner, NULL);
   thrd_join(loader, NULL);
   thrd_join(sender, &sender_result);
+
+  if (config->stats && !config->quiet) {
+    double elapsed = difftime(time(NULL), start_time);
+    printf("\nTransfer statistics:\n");
+    printf("  Elapsed time: %.1f sec\n", elapsed);
+  }
 
   pipeline_context_sender_destroy(context);
   return sender_result == thrd_success ? 0 : -1;
