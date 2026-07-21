@@ -162,17 +162,21 @@ static void* old_data_from_path(const char* full_path, unsigned long long old_si
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
                                 void* old_data, unsigned long long old_size) {
-  if (!old_data)
+  if (!old_data) {
+    send_status(fd, STATUS_ERROR);
     return NULL;
+  }
 
   DeltaSignature* sig = delta_signature_create(old_data, old_size, config->delta_block_size);
   if (!sig) {
+    send_status(fd, STATUS_ERROR);
     free(old_data);
     return NULL;
   }
 
   Data* sig_data = delta_signature_serialize(sig);
   if (!sig_data) {
+    send_status(fd, STATUS_ERROR);
     delta_signature_destroy(sig);
     free(old_data);
     return NULL;
