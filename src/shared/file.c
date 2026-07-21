@@ -296,17 +296,21 @@ static bool receive_and_assign_metadata(int fd, const Config* config, File* file
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
                                 void* old_data, unsigned long long old_size) {
-  if (!old_data)
+  if (!old_data) {
+    send_status(fd, STATUS_ERROR);
     return NULL;
+  }
 
   DeltaSignature* sig = delta_signature_create(old_data, old_size, config->delta_block_size);
   if (!sig) {
+    send_status(fd, STATUS_ERROR);
     free(old_data);
     return NULL;
   }
 
   Data* sig_data = delta_signature_serialize(sig);
   if (!sig_data) {
+    send_status(fd, STATUS_ERROR);
     delta_signature_destroy(sig);
     free(old_data);
     return NULL;
@@ -518,7 +522,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (!receive_and_assign_metadata(fd, config, file))
     return NULL;
 
-  // Read file type indicator
   int file_type;
   if (!receive_int(fd, &file_type)) {
     file_destroy(file);
@@ -605,7 +608,6 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
     return false;
 
-  // Send file type indicator
   int ft = (int)file->type;
   if (!send_int(file_descriptor, ft))
     return false;
