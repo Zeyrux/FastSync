@@ -365,8 +365,8 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   DirectoryScanner* scanner = directory_scanner_create(
       context->config->send_directory, context->config->use_metadata, context->config->chunk_size,
       context->config->exclude_patterns, context->config->exclude_count,
-       context->config->include_patterns, context->config->include_count, context->config->max_size,
-       context->config->min_size, context->config->max_depth);
+      context->config->include_patterns, context->config->include_count, context->config->max_size,
+      context->config->min_size, context->config->max_depth);
   mtx_unlock(&context->mutex_scanner);
 
   Chunk* current_chunk;
@@ -491,7 +491,7 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-       config->min_size, config->max_depth);
+      config->min_size, config->max_depth);
   ArrayList* all_files = array_list_create(NULL);
   ArrayList* manifest = config->use_delete ? array_list_create(free) : NULL;
   Chunk* current_chunk;
@@ -564,7 +564,7 @@ int send_files(Config* config) {
         continue;
       }
       if (!file_send_single_calls(file, client->file_descriptor, config->use_metadata,
-                                   compression_level, true)) {
+                                  compression_level, true)) {
         log_message(LOG_LEVEL_ERROR, "Failed to send file");
         batch_ok = false;
         break;

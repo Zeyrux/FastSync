@@ -37,8 +37,7 @@ DirectoryScanner* directory_scanner_create(char* root_directory, bool use_metada
                                            unsigned long long chunk_size, char** exclude_patterns,
                                            int exclude_count, char** include_patterns,
                                            int include_count, unsigned long long max_size,
-                                           unsigned long long min_size,
-                                           int max_depth) {
+                                           unsigned long long min_size, int max_depth) {
   DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;

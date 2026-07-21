@@ -106,8 +106,7 @@ int receive_thread(void* pipeline_context) {
   if (!receive_status(file_descriptor, &status))
     return thrd_error;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
-         status == STATUS_KEEPALIVE || status == STATUS_ABORT ||
-         status == STATUS_CHECK_BATCH) {
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
     if (status == STATUS_KEEPALIVE) {
       send_status(file_descriptor, STATUS_KEEPALIVE);
       goto next;

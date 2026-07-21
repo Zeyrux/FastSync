@@ -22,8 +22,7 @@ int receive_files(Config* config, int fd) {
     return -1;
 
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
-         status == STATUS_KEEPALIVE || status == STATUS_ABORT ||
-         status == STATUS_CHECK_BATCH) {
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
     if (status == STATUS_KEEPALIVE) {
       send_status(fd, STATUS_KEEPALIVE);
       goto next;
