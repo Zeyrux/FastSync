@@ -178,7 +178,7 @@ bool send_data(int file_descriptor, const Data* data) {
     return false;
   if (!send_n_data(file_descriptor, data->data, data_size))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send %lld data", data_size);
+  log_message(LOG_LEVEL_DEBUG, "Send %llu data", data_size);
   return true;
 }
 
@@ -193,7 +193,7 @@ Data* receive_data(int file_descriptor) {
     free(data);
     return NULL;
   }
-  log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
+  log_message(LOG_LEVEL_DEBUG, "Received %llu data", size);
   return data_create(data, (size_t)size);
 }
 

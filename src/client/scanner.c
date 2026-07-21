@@ -159,7 +159,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
 
     char* cur_path = path_cat(scanner->current_path, entry->d_name);
     struct stat stats;
-    if (stat(cur_path, &stats) != 0) {
+    if (lstat(cur_path, &stats) != 0) {
       free(cur_path);
       continue;
     }
