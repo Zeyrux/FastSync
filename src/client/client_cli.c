@@ -290,14 +290,14 @@ int main(int argc, char* argv[]) {
         goto cleanup;
       }
     } else if (strcmp(argv[i], "--exclude-from") == 0 && i + 1 < argc) {
-      if (read_patterns_from_file(argv[++i], &config->exclude_patterns,
-                                  &config->exclude_count) != 0) {
+      if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
+          0) {
         exit_code = 1;
         goto cleanup;
       }
     } else if (strcmp(argv[i], "--include-from") == 0 && i + 1 < argc) {
-      if (read_patterns_from_file(argv[++i], &config->include_patterns,
-                                  &config->include_count) != 0) {
+      if (read_patterns_from_file(argv[++i], &config->include_patterns, &config->include_count) !=
+          0) {
         exit_code = 1;
         goto cleanup;
       }
