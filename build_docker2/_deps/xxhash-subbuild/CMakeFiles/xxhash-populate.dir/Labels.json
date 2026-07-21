@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/CMakeFiles/xxhash-populate"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/CMakeFiles/xxhash-populate.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/CMakeFiles/xxhash-populate-complete.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-build.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-configure.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-download.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-install.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-mkdir.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-patch.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-test.rule"
+		},
+		{
+			"file" : "/workspace/build_docker2/_deps/xxhash-subbuild/xxhash-populate-prefix/src/xxhash-populate-stamp/xxhash-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"xxhash-populate"
+		],
+		"name" : "xxhash-populate"
+	}
+}
