@@ -46,6 +46,7 @@ static void test_send_receive_str() {
 
   EXPECT_TRUE(send_str(0, ""));
 
+  /* cppcheck-suppress constVariablePointer */
   char* received = receive_str(0);
   EXPECT_NOT_NULL(received);
   EXPECT_EQ_STR(received, "");
@@ -63,6 +64,7 @@ static void test_send_receive_str_normal() {
 
   EXPECT_TRUE(send_str(0, "Hello, Protocol!"));
 
+  /* cppcheck-suppress constVariablePointer */
   char* received = receive_str(0);
   EXPECT_NOT_NULL(received);
   EXPECT_EQ_STR(received, "Hello, Protocol!");
@@ -78,6 +80,7 @@ static void test_send_receive_data() {
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
+  /* cppcheck-suppress constVariablePointer */
   unsigned char bin[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF};
   void* buf = malloc(sizeof(bin));
   EXPECT_NOT_NULL(buf);
@@ -128,6 +131,7 @@ static void test_send_receive_status() {
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
+  /* cppcheck-suppress constVariablePointer */
   Status statuses[] = {STATUS_OK,    STATUS_ERROR, STATUS_FINISHED,        STATUS_NEXT,
                        STATUS_CHUNK, STATUS_CHECK, STATUS_DELTA_SIGNATURE, STATUS_DELTA_DATA};
   int count = sizeof(statuses) / sizeof(statuses[0]);
@@ -179,8 +183,7 @@ static void test_receive_str_oversized() {
   size_t huge = MAX_STRING_SIZE + 1;
   EXPECT_TRUE(send_n_data(0, &huge, sizeof(size_t)));
 
-  /* cppcheck-suppress constVariablePointer */
-  char* received = receive_str(0);
+  const char* received = receive_str(0);
   EXPECT_NULL(received);
 
   close(p[0]);

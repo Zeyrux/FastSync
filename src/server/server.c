@@ -247,10 +247,9 @@ int main(int argc, char* argv[]) {
     server_listen(g_server, handler);
   }
 
-  /* Graceful shutdown: if a signal requested cleanup, delete the server */
-  if (g_server_cleanup_requested) {
+  /* Graceful shutdown: delete the server */
+  if (g_server_cleanup_requested)
     log_message(LOG_LEVEL_INFO, "Shutdown requested, cleaning up");
-    server_delete(&g_server);
-  }
+  server_delete(&g_server);
   return 0;
 }

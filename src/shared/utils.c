@@ -134,7 +134,7 @@ static void delete_extras_walk(const char* abs_path, const char* rel_path, Array
   if (!dir)
     return;
   bool all_removed = true;
-  struct dirent* entry;
+  const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
@@ -184,18 +184,17 @@ void delete_extras(const char* dest_root, ArrayList* manifest) {
   delete_extras_walk(dest_root, "", manifest);
 }
 
-char* path_cat(const char* path1, char* path2) {
+char* path_cat(const char* path1, const char* path2) {
   if (path1 == NULL || *path1 == '\0')
     return str_dup(path2);
   if (path2 == NULL || *path2 == '\0')
     return str_dup(path1);
   int path1_len = strlen(path1);
   int path2_len = strlen(path2);
-  char* path2_pointer = path2;
   if (path1[path1_len - 1] == '/')
     path1_len -= 1;
   if (path2[0] == '/') {
-    path2_pointer += 1;
+    path2++;
     path2_len -= 1;
   }
   char* new_path = malloc(path1_len + path2_len + 2);
@@ -203,7 +202,7 @@ char* path_cat(const char* path1, char* path2) {
     return NULL;
   memcpy(new_path, path1, path1_len);
   new_path[path1_len] = '/';
-  memcpy(new_path + path1_len + 1, path2_pointer, path2_len);
+  memcpy(new_path + path1_len + 1, path2, path2_len);
   new_path[path1_len + path2_len + 1] = '\0';
   return new_path;
 }

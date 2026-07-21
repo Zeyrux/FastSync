@@ -82,6 +82,8 @@ void config_parse_ssh_dest(Config* config) {
 }
 
 void config_delete(Config* config) {
+  if (config == NULL)
+    return;
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
@@ -260,10 +262,6 @@ Config* config_receive(int file_descriptor) {
                 MAX_PATTERN_COUNT);
     goto error;
   }
-  if ((size_t)ec > SIZE_MAX / sizeof(char*)) {
-    log_message(LOG_LEVEL_ERROR, "Exclude pattern count %d would cause integer overflow", ec);
-    goto error;
-  }
   config->exclude_count = ec;
   if (ec > 0) {
     config->exclude_patterns = malloc((size_t)ec * sizeof(char*));
@@ -291,10 +289,6 @@ Config* config_receive(int file_descriptor) {
   if (ic > MAX_PATTERN_COUNT) {
     log_message(LOG_LEVEL_ERROR, "Include pattern count %d exceeds maximum %d", ic,
                 MAX_PATTERN_COUNT);
-    goto error;
-  }
-  if ((size_t)ic > SIZE_MAX / sizeof(char*)) {
-    log_message(LOG_LEVEL_ERROR, "Include pattern count %d would cause integer overflow", ic);
     goto error;
   }
   config->include_count = ic;
@@ -340,6 +334,16 @@ error:
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
+  for (int i = 0; i < config->exclude_count; i++)
+    free(config->exclude_patterns[i]);
+  free(config->exclude_patterns);
+  for (int i = 0; i < config->include_count; i++)
+    free(config->include_patterns[i]);
+  free(config->include_patterns);
+  free(config->tls_cert);
+  free(config->tls_key);
+  free(config->tls_ca);
+  free(config->ssh_destination);
   free(config->server_host);
   free(config);
   return NULL;
