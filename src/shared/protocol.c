@@ -10,7 +10,7 @@
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
-static __thread SSL* io_ssl = NULL;
+static SSL* io_ssl = NULL;
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
@@ -79,6 +79,11 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
     else
       bytes_send = write(fd, (const char*)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
+      if (io_ssl) {
+        int ssl_err = SSL_get_error(io_ssl, (int)bytes_send);
+        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ)
+          continue;
+      }
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
     }
@@ -102,6 +107,11 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
       bytes_received =
           read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
     if (bytes_received <= 0) {
+      if (io_ssl && bytes_received < 0) {
+        int ssl_err = SSL_get_error(io_ssl, (int)bytes_received);
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+          continue;
+      }
       if (bytes_received == 0)
         log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
       else
