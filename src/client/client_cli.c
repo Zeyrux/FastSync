@@ -112,10 +112,17 @@ int main(int argc, char* argv[]) {
     save_to_disk = true;
   }
 
-  Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
-                                 false, false, 5, false, 0);
   int exit_code = 0;
+  Config* config = NULL;
   bool config_owned_by_pipeline = false;
+
+  char* config_version = str_dup(PROTOCOL_VERSION);
+  if (!config_version) {
+    exit_code = 1;
+    goto cleanup;
+  }
+  config = config_create(config_version, NULL, NULL, save_to_disk, false, false, false,
+                         false, 5, false, 0);
 
   int positional_args[2];
   int positional_count = 0;
@@ -409,9 +416,11 @@ int main(int argc, char* argv[]) {
   }
 
 cleanup:
-  if (config->log_file)
-    fclose(config->log_file);
-  if (!config_owned_by_pipeline)
-    config_delete(config);
+  if (config) {
+    if (config->log_file)
+      fclose(config->log_file);
+    if (!config_owned_by_pipeline)
+      config_delete(config);
+  }
   return exit_code;
 }

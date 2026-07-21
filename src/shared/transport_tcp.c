@@ -12,7 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static volatile unsigned int g_active_connections = 0;
+static volatile sig_atomic_t g_active_connections = 0;
 
 static void sigchld_handler(int sig) {
   (void)sig;
@@ -92,7 +92,7 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       perror("Could not accept the connection");
       continue;
     }
-    if (g_active_connections >= server->max_connections) {
+    if ((unsigned int)g_active_connections >= server->max_connections) {
       log_message(LOG_LEVEL_WARNING, "Max connections (%u) reached, rejecting",
                   server->max_connections);
       close(fd);

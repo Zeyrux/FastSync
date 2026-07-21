@@ -14,6 +14,8 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
                       bool use_sendfile, unsigned long long chunk_size) {
 
   Config* config = malloc(sizeof(Config));
+  if (!config)
+    return NULL;
   config->version = version;
   config->send_directory = send_directory;
   config->receive_root_directory = receive_directory;
@@ -259,6 +261,7 @@ error:
   free(config->send_directory);
   free(config->receive_root_directory);
   free(config->server_host);
+  free(config->backup_dir);
   free(config);
   return NULL;
 }

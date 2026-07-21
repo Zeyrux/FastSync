@@ -1,0 +1,15 @@
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/server.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/client.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/tests.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/package.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/package_source.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/test.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/edit_cache.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/CMakeFiles/rebuild_cache.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/xxhash.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/xxhsum.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/package.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/package_source.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/test.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/edit_cache.dir
+/root/FastSyncProjects/FastSyncBuilder3/build2/_deps/xxhash-build/CMakeFiles/rebuild_cache.dir
