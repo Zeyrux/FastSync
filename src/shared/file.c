@@ -104,7 +104,7 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
-  if (compression_level > 0) {
+  if (compression_level > 0 && !compression_should_skip(file->path)) {
     compressed_data = data_compress(file->data, compression_level);
     if (compressed_data == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to compress file data");

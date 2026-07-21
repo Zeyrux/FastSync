@@ -2,6 +2,7 @@
 #include "log.h"
 #include <errno.h>
 #include <openssl/ssl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +15,7 @@
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
-static SSL* io_ssl = NULL;
+static SSL* io_ssl;
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
@@ -52,12 +53,11 @@ static void bw_throttle(size_t bytes_written) {
   bw_tokens -= (long long)bytes_written;
 
   if (bw_tokens < 0) {
-    long long deficit_ns = (long long)((double)(-bw_tokens) / io_bwlimit * 1000000000.0);
-    struct timespec sleep_time, remaining;
-    sleep_time.tv_sec = deficit_ns / 1000000000LL;
-    sleep_time.tv_nsec = deficit_ns % 1000000000LL;
-    while (nanosleep(&sleep_time, &remaining) < 0 && errno == EINTR)
-      sleep_time = remaining;
+    long long deficit_us = (long long)((double)(-bw_tokens) / io_bwlimit * 1000000.0);
+    if (deficit_us >= 1000)
+      poll(NULL, 0, (int)(deficit_us / 1000));
+    else
+      usleep((useconds_t)deficit_us);
     bw_tokens = 0;
     clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
   }
