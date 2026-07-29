@@ -54,7 +54,7 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
 }
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue,
-                                                           int file_descriptor, SSL* ssl) {
+                                                          int file_descriptor, SSL* ssl) {
   PipelineContextReceiver* context = malloc(sizeof(PipelineContextReceiver));
   if (context == NULL)
     return NULL;

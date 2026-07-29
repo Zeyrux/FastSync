@@ -126,7 +126,8 @@ void handler(int file_descriptor) {
       close(file_descriptor);
       return;
     }
-    PipelineContextReceiver* context = pipeline_context_receiver_create(config, q, file_descriptor, ssl);
+    PipelineContextReceiver* context =
+        pipeline_context_receiver_create(config, q, file_descriptor, ssl);
     if (context == NULL) {
       queue_destroy(q);
       config_delete(config);

@@ -116,7 +116,6 @@ static void test_receiver_fd_zero() {
   pipeline_context_receiver_destroy(ctx);
 }
 
-
 /* Test that receive_thread completes cleanly when sent FINISHED immediately */
 static void test_receive_thread_finished() {
   Config* cfg = config_create();
