@@ -42,4 +42,6 @@ static void test_ssh_connect_unreachable() {
 void test_transport_ssh() {
   test_ssh_connect_invalid_dest_no_colon();
   test_ssh_connect_invalid_dest_empty();
+  test_ssh_connect_malformed();
+  test_ssh_connect_unreachable();
 }

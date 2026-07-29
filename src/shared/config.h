@@ -51,6 +51,8 @@ typedef struct Config {
   int max_depth;
   FILE* log_file;
   int queue_size;
+  bool follow_symlinks;
+  bool partial;
 } Config;
 
 #define PROTOCOL_VERSION "1.3.0"
