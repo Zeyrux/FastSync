@@ -71,6 +71,39 @@ static void print_usage(void) {
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
+  printf("  -l, --links         Copy symlinks as symlinks\n");
+  printf("  --copy-links        Transform symlinks into referent files\n");
+  printf("  --safe-links        Skip symlinks that point outside transfer tree\n");
+  printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
+  printf("  -H, --hard-links    Preserve hard links\n");
+  printf("  -A, --acls          Preserve ACLs\n");
+  printf("  -X, --xattrs        Preserve extended attributes\n");
+  printf("  -D, --devices       Preserve device files\n");
+  printf("  -S, --sparse        Handle sparse files efficiently\n");
+  printf("  -i, --itemize-changes  Show per-file change summary\n");
+  printf("  --out-format <fmt>  Custom output format string\n");
+  printf("  --info <flags>      Info verbosity level\n");
+  printf("  --debug <flags>     Debug verbosity level\n");
+  printf("  --list-only         List files without transferring\n");
+  printf("  -h, --human-readable  Human-readable numbers\n");
+  printf("  -u, --update        Skip files newer on destination\n");
+  printf("  --inplace           Update files in-place (no temp+rename)\n");
+  printf("  --append            Append data to shorter files\n");
+  printf("  --append-verify     Append with verify\n");
+  printf("  --delete-excluded   Also delete excluded files\n");
+  printf("  --delete-after      Delete after transfer, not before\n");
+  printf("  --max-delete <n>    Maximum number of files to delete\n");
+  printf("  --filter <rule>     Add file filtering rule\n");
+  printf("  --files-from <file> Read file list from file\n");
+  printf("  --cvs-exclude       Auto-ignore CVS files\n");
+  printf("  --prune-empty-dirs  Omit empty directories from transfer\n");
+  printf("  -R, --relative      Use relative paths\n");
+  printf("  -e, --rsh <cmd>     Specify remote shell\n");
+  printf("  --rsync-path <path> Path to remote binary\n");
+  printf("  --temp-dir <dir>    Temporary directory for files\n");
+  printf("  --compare-dest <dir>  Compare destination\n");
+  printf("  --copy-dest <dir>   Copy destination\n");
+  printf("  --link-dest <dir>   Link destination\n");
   printf("  --help              Show this help\n");
 }
 
@@ -318,6 +351,103 @@ int main(int argc, char* argv[]) {
       config->fastsync_server_path = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
+    } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--links") == 0) {
+      config->follow_symlinks = true;
+      log_message(LOG_LEVEL_INFO, "Enabled symlink preservation");
+    } else if (strcmp(argv[i], "--copy-links") == 0) {
+      config->copy_links = true;
+      log_message(LOG_LEVEL_INFO, "Enabled copy-links (dereference symlinks)");
+    } else if (strcmp(argv[i], "--safe-links") == 0) {
+      config->safe_links = true;
+      log_message(LOG_LEVEL_INFO, "Enabled safe-links (skip unsafe symlinks)");
+    } else if (strcmp(argv[i], "--copy-unsafe-links") == 0) {
+      config->copy_unsafe_links = true;
+      log_message(LOG_LEVEL_INFO, "Enabled copy-unsafe-links");
+    } else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--hard-links") == 0) {
+      config->preserve_hard_links = true;
+      log_message(LOG_LEVEL_INFO, "Enabled hard link preservation");
+    } else if (strcmp(argv[i], "-A") == 0 || strcmp(argv[i], "--acls") == 0) {
+      config->preserve_acls = true;
+      log_message(LOG_LEVEL_INFO, "Enabled ACL preservation");
+    } else if (strcmp(argv[i], "-X") == 0 || strcmp(argv[i], "--xattrs") == 0) {
+      config->preserve_xattrs = true;
+      log_message(LOG_LEVEL_INFO, "Enabled xattr preservation");
+    } else if (strcmp(argv[i], "-D") == 0 || strcmp(argv[i], "--devices") == 0) {
+      config->preserve_devices = true;
+      log_message(LOG_LEVEL_INFO, "Enabled device file preservation");
+    } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--sparse") == 0) {
+      config->preserve_sparse = true;
+      log_message(LOG_LEVEL_INFO, "Enabled sparse file handling");
+    } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--itemize-changes") == 0) {
+      config->itemize_changes = true;
+    } else if (strcmp(argv[i], "--out-format") == 0 && i + 1 < argc) {
+      free(config->out_format);
+      config->out_format = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--info") == 0 && i + 1 < argc) {
+      config->info_level = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
+      config->debug_level = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--list-only") == 0) {
+      config->list_only = true;
+    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--human-readable") == 0) {
+      config->human_readable = true;
+    } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--update") == 0) {
+      config->update = true;
+    } else if (strcmp(argv[i], "--inplace") == 0) {
+      config->inplace = true;
+    } else if (strcmp(argv[i], "--append") == 0) {
+      config->append = true;
+    } else if (strcmp(argv[i], "--append-verify") == 0) {
+      config->append_verify = true;
+    } else if (strcmp(argv[i], "--delete-excluded") == 0) {
+      config->delete_excluded = true;
+    } else if (strcmp(argv[i], "--delete-after") == 0) {
+      config->delete_after = true;
+    } else if (strcmp(argv[i], "--max-delete") == 0 && i + 1 < argc) {
+      config->max_delete = atoi(argv[++i]);
+      if (config->max_delete < 0) {
+        fprintf(stderr, "Error: --max-delete must be a non-negative integer\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+      if (!config->filters) {
+        config->filters = array_list_create(free);
+      }
+      array_list_add(config->filters, str_dup(argv[++i]));
+    } else if (strcmp(argv[i], "--files-from") == 0 && i + 1 < argc) {
+      free(config->files_from);
+      config->files_from = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--cvs-exclude") == 0) {
+      config->cvs_exclude = true;
+    } else if (strcmp(argv[i], "--prune-empty-dirs") == 0) {
+      config->prune_empty_dirs = true;
+    } else if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--relative") == 0) {
+      config->relative = true;
+    } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--rsh") == 0) {
+      if (i + 1 < argc) {
+        free(config->rsh_command);
+        config->rsh_command = str_dup(argv[++i]);
+      } else {
+        fprintf(stderr, "Error: -e/--rsh requires a command argument\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "--rsync-path") == 0 && i + 1 < argc) {
+      free(config->rsync_path);
+      config->rsync_path = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--temp-dir") == 0 && i + 1 < argc) {
+      free(config->temp_dir);
+      config->temp_dir = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--compare-dest") == 0 && i + 1 < argc) {
+      free(config->compare_dest);
+      config->compare_dest = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--copy-dest") == 0 && i + 1 < argc) {
+      free(config->copy_dest);
+      config->copy_dest = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--link-dest") == 0 && i + 1 < argc) {
+      free(config->link_dest);
+      config->link_dest = str_dup(argv[++i]);
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
