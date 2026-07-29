@@ -224,6 +224,10 @@ static void test_sendfile_no_path() {
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
+    /* When send_path is false, the sender still sends file_type + data */
+    int file_type;
+    EXPECT_TRUE(receive_int(p[0], &file_type));
+    EXPECT_EQ_INT(file_type, (int)FILE_TYPE_REGULAR);
     Data* received = receive_data(p[0]);
     close(p[0]);
 

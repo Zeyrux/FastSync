@@ -69,7 +69,7 @@ static void test_file_save_to_disk() {
   memcpy(f->data->data, content, strlen(content));
   f->data->size = strlen(content);
 
-  EXPECT_TRUE(file_save_to_disk("test_save_tmp", f, NULL));
+  EXPECT_TRUE(file_save_to_disk("test_save_tmp", f));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_save_tmp/saved_file.txt", &st), 0);
@@ -217,6 +217,10 @@ static void test_file_send_no_path() {
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
+    // Read file type indicator
+    int file_type;
+    EXPECT_TRUE(receive_int(p[0], &file_type));
+    EXPECT_EQ_INT(file_type, (int)FILE_TYPE_REGULAR);
     Data* received = receive_data(p[0]);
     close(p[0]);
 

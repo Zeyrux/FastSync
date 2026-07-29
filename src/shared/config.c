@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "utils.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +15,7 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
                       bool use_sendfile, unsigned long long chunk_size) {
 
   Config* config = malloc(sizeof(Config));
-  if (!config)
+  if (config == NULL)
     return NULL;
   config->version = version;
   config->send_directory = send_directory;
@@ -48,17 +49,10 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
   config->tls_cert = NULL;
   config->tls_key = NULL;
   config->tls_ca = NULL;
+  config->follow_symlinks = false;
+  config->partial = false;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
-  config->timeout = 30;
-  config->contimeout = 10;
-  config->quiet = false;
-  config->backup = false;
-  config->backup_dir = NULL;
-  config->stats = false;
-  config->max_depth = 0;
-  config->log_file = NULL;
-  config->queue_size = 100;
   return config;
 }
 
@@ -89,6 +83,8 @@ void config_parse_ssh_dest(Config* config) {
 }
 
 void config_delete(Config* config) {
+  if (config == NULL)
+    return;
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
@@ -103,7 +99,6 @@ void config_delete(Config* config) {
   free(config->tls_cert);
   free(config->tls_key);
   free(config->tls_ca);
-  free(config->backup_dir);
   free(config->server_host);
   free(config);
 }
@@ -141,9 +136,25 @@ bool config_send(int file_descriptor, const Config* config) {
     return false;
   if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
     return false;
-  if (!send_int(file_descriptor, config->backup))
+  if (!send_int(file_descriptor, config->exclude_count))
     return false;
-  if (!send_str(file_descriptor, config->backup_dir ? config->backup_dir : ""))
+  for (int i = 0; i < config->exclude_count; i++) {
+    if (!send_str(file_descriptor, config->exclude_patterns[i]))
+      return false;
+  }
+  if (!send_int(file_descriptor, config->include_count))
+    return false;
+  for (int i = 0; i < config->include_count; i++) {
+    if (!send_str(file_descriptor, config->include_patterns[i]))
+      return false;
+  }
+  if (!send_n_data(file_descriptor, &config->max_size, sizeof(config->max_size)))
+    return false;
+  if (!send_n_data(file_descriptor, &config->min_size, sizeof(config->min_size)))
+    return false;
+  if (!send_int(file_descriptor, config->follow_symlinks))
+    return false;
+  if (!send_int(file_descriptor, config->partial))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -240,19 +251,82 @@ Config* config_receive(int file_descriptor) {
   config->tls_cert = NULL;
   config->tls_key = NULL;
   config->tls_ca = NULL;
-  config->timeout = 30;
-  config->contimeout = 10;
-  config->quiet = false;
-  config->stats = false;
-  config->max_depth = 0;
-  config->log_file = NULL;
-  config->queue_size = 100;
-  if (!receive_int(file_descriptor, &tmp))
+  config->follow_symlinks = false;
+  config->partial = false;
+
+#define MAX_PATTERN_COUNT 10000
+
+  // Receive exclude patterns
+  int ec;
+  if (!receive_int(file_descriptor, &ec))
     goto error;
-  config->backup = tmp;
-  config->backup_dir = receive_str(file_descriptor);
-  if (config->backup_dir == NULL)
+  if (ec > MAX_PATTERN_COUNT) {
+    log_message(LOG_LEVEL_ERROR, "Exclude pattern count %d exceeds maximum %d", ec,
+                MAX_PATTERN_COUNT);
     goto error;
+  }
+  config->exclude_count = ec;
+  if (ec > 0) {
+    config->exclude_patterns = malloc((size_t)ec * sizeof(char*));
+    if (!config->exclude_patterns) {
+      config->exclude_count = 0;
+      goto error;
+    }
+    for (int i = 0; i < ec; i++) {
+      config->exclude_patterns[i] = receive_str(file_descriptor);
+      if (!config->exclude_patterns[i]) {
+        for (int j = 0; j < i; j++)
+          free(config->exclude_patterns[j]);
+        free(config->exclude_patterns);
+        config->exclude_patterns = NULL;
+        config->exclude_count = 0;
+        goto error;
+      }
+    }
+  }
+
+  // Receive include patterns
+  int ic;
+  if (!receive_int(file_descriptor, &ic))
+    goto error;
+  if (ic > MAX_PATTERN_COUNT) {
+    log_message(LOG_LEVEL_ERROR, "Include pattern count %d exceeds maximum %d", ic,
+                MAX_PATTERN_COUNT);
+    goto error;
+  }
+  config->include_count = ic;
+  if (ic > 0) {
+    config->include_patterns = malloc((size_t)ic * sizeof(char*));
+    if (!config->include_patterns) {
+      config->include_count = 0;
+      goto error;
+    }
+    for (int i = 0; i < ic; i++) {
+      config->include_patterns[i] = receive_str(file_descriptor);
+      if (!config->include_patterns[i]) {
+        for (int j = 0; j < i; j++)
+          free(config->include_patterns[j]);
+        free(config->include_patterns);
+        config->include_patterns = NULL;
+        config->include_count = 0;
+        goto error;
+      }
+    }
+  }
+
+  if (!receive_n_data(file_descriptor, &config->max_size, sizeof(config->max_size)))
+    goto error;
+  if (!receive_n_data(file_descriptor, &config->min_size, sizeof(config->min_size)))
+    goto error;
+  int tmp_follow;
+  if (!receive_int(file_descriptor, &tmp_follow))
+    goto error;
+  config->follow_symlinks = tmp_follow;
+  int tmp_partial;
+  if (!receive_int(file_descriptor, &tmp_partial))
+    goto error;
+  config->partial = tmp_partial;
+
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
   if (!send_status(file_descriptor, STATUS_OK))
@@ -263,8 +337,17 @@ error:
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
+  for (int i = 0; i < config->exclude_count; i++)
+    free(config->exclude_patterns[i]);
+  free(config->exclude_patterns);
+  for (int i = 0; i < config->include_count; i++)
+    free(config->include_patterns[i]);
+  free(config->include_patterns);
+  free(config->tls_cert);
+  free(config->tls_key);
+  free(config->tls_ca);
+  free(config->ssh_destination);
   free(config->server_host);
-  free(config->backup_dir);
   free(config);
   return NULL;
 }

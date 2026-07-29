@@ -9,6 +9,5 @@ char* str_dup(const char* string);
 char* path_cat(const char* path1, const char* path2);
 bool glob_match(const char* pattern, const char* str);
 void delete_extras(const char* dest_root, ArrayList* manifest);
-bool has_path_traversal(const char* path);
 
 #endif

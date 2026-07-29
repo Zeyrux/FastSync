@@ -21,9 +21,6 @@
 #include <string.h>
 #include <threads.h>
 #include <time.h>
-#include <unistd.h>
-
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
 static int incremental_check(Client* client, File* file, DeltaSignature** out_sig) {
   *out_sig = NULL;
@@ -211,13 +208,10 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
     return 0;
   }
 
+  bool use_sendfile = config->use_sendfile && !config->use_compression;
   for (int i = 0; i < chunk->element_count; i++) {
-    File* f = chunk->items[i];
-    if (f == NULL)
-      continue;
-    bool stream = f->data->data == NULL && f->data->size > 0;
-    bool use_sendfile = (config->use_sendfile && !config->use_compression) || stream;
-    int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
+    int rc =
+        send_single_file(client, chunk->items[i], config, config->use_incremental, use_sendfile);
     if (rc == 1)
       continue;
     if (rc < 0)
@@ -302,14 +296,16 @@ static int send_chunks_multithreaded(void* pipeline_context) {
 
 static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
-  ParallelScanner* scanner = parallel_scanner_create(
+  mtx_lock(&context->mutex_scanner);
+  DirectoryScanner* scanner = directory_scanner_create(
       context->config->send_directory, context->config->use_metadata, context->config->chunk_size,
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
-      context->config->min_size, context->config->max_depth, 4);
+      context->config->min_size);
+  mtx_unlock(&context->mutex_scanner);
 
   Chunk* current_chunk;
-  while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
+  while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     if (context->config->use_delete) {
       mtx_lock(&context->mutex_scanner);
       for (int i = 0; i < current_chunk->element_count; i++) {
@@ -329,7 +325,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   cnd_signal(&context->condition_not_empty_scanner);
   mtx_unlock(&context->mutex_scanner);
 
-  parallel_scanner_destroy(scanner);
+  directory_scanner_destroy(scanner);
   return thrd_success;
 }
 
@@ -348,12 +344,9 @@ static int load_files_multithreaded(void* pipeline_context) {
     }
     if (!context->config->use_sendfile) {
       for (int i = 0; i < chunk->element_count; i++) {
-        File* f = chunk->items[i];
-        if (f->data->size > STREAM_THRESHOLD)
-          continue;
-        if (!file_load_data(f)) {
+        if (!file_load_data(chunk->items[i])) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data, skipping");
-          file_destroy(f);
+          file_destroy(chunk->items[i]);
           chunk->items[i] = NULL;
         }
       }
@@ -369,7 +362,7 @@ int send_files(Config* config) {
     DirectoryScanner* scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
         config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size, config->max_depth);
+        config->min_size);
     Chunk* chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
@@ -423,7 +416,7 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-      config->min_size, config->max_depth);
+      config->min_size);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   time_t last_progress = 0;
@@ -442,10 +435,7 @@ int send_files(Config* config) {
     }
     if (!config->use_sendfile) {
       for (int i = 0; i < current_chunk->element_count; i++) {
-        File* f = current_chunk->items[i];
-        if (f->data->size > STREAM_THRESHOLD)
-          continue;
-        if (!file_load_data(f)) {
+        if (!file_load_data(current_chunk->items[i])) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
           continue;
         }
@@ -512,7 +502,7 @@ int send_files_multithreaded(Config* config) {
     DirectoryScanner* scanner = directory_scanner_create(
         config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
         config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size, config->max_depth);
+        config->min_size);
     Chunk* chunk;
     int file_count = 0;
     unsigned long long total_bytes = 0;
@@ -530,20 +520,8 @@ int send_files_multithreaded(Config* config) {
     return 0;
   }
 
-  long pages = sysconf(_SC_AVPHYS_PAGES);
-  long page_size = sysconf(_SC_PAGE_SIZE);
-  unsigned long long available_memory =
-      pages > 0 && page_size > 0 ? (unsigned long long)pages * (unsigned long long)page_size
-                                 : 512ULL * 1024 * 1024;
-  unsigned long long avg_file_size = 1024 * 1024;
-  int qsize = (int)(available_memory / avg_file_size);
-  if (qsize < 10)
-    qsize = 10;
-  if (qsize > 1000)
-    qsize = 1000;
-
-  Queue* q1 = queue_create(qsize, chunk_destroy);
-  Queue* q2 = queue_create(qsize, chunk_destroy);
+  Queue* q1 = queue_create(100, chunk_destroy);
+  Queue* q2 = queue_create(100, chunk_destroy);
   if (!q1 || !q2) {
     if (q1)
       queue_destroy(q1);

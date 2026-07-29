@@ -47,12 +47,12 @@ int main() {
   RUN_TEST(test_file_sendfile);
   RUN_TEST(test_multiprocessing);
   RUN_TEST(test_log);
-  RUN_TEST(test_robustness);
-  RUN_TEST(test_stress);
-  RUN_TEST(test_property);
   RUN_TEST(test_transport_tcp);
   RUN_TEST(test_transport_ssh);
   RUN_TEST(test_transport_tls);
+  RUN_TEST(test_robustness);
+  RUN_TEST(test_stress);
+  RUN_TEST(test_property);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);
