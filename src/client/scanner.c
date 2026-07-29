@@ -35,12 +35,12 @@ static DirEntry* dir_entry_create(const char* path, int depth) {
 }
 
 DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,
-                                            unsigned long long chunk_size, char** exclude_patterns,
-                                            int exclude_count, char** include_patterns,
-                                            int include_count, unsigned long long max_size,
-                                            unsigned long long min_size, int max_depth,
-                                            bool follow_symlinks, bool copy_links,
-                                            bool safe_links, bool copy_unsafe_links) {
+                                           unsigned long long chunk_size, char** exclude_patterns,
+                                           int exclude_count, char** include_patterns,
+                                           int include_count, unsigned long long max_size,
+                                           unsigned long long min_size, int max_depth,
+                                           bool follow_symlinks, bool copy_links, bool safe_links,
+                                           bool copy_unsafe_links) {
   DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;
@@ -145,7 +145,8 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     }
     is_symlink = S_ISLNK(lstats.st_mode);
 
-    if (is_symlink && !scanner->follow_symlinks && !scanner->copy_links && !scanner->safe_links && !scanner->copy_unsafe_links) {
+    if (is_symlink && !scanner->follow_symlinks && !scanner->copy_links && !scanner->safe_links &&
+        !scanner->copy_unsafe_links) {
       free(cur_path);
       continue;
     }
@@ -306,13 +307,12 @@ static int parallel_worker_thread(void* arg) {
 }
 
 ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata,
-                                          unsigned long long chunk_size, char** exclude_patterns,
-                                          int exclude_count, char** include_patterns,
-                                          int include_count, unsigned long long max_size,
-                                          unsigned long long min_size, int max_depth,
-                                          int num_threads,
-                                          bool follow_symlinks, bool copy_links,
-                                          bool safe_links, bool copy_unsafe_links) {
+                                         unsigned long long chunk_size, char** exclude_patterns,
+                                         int exclude_count, char** include_patterns,
+                                         int include_count, unsigned long long max_size,
+                                         unsigned long long min_size, int max_depth,
+                                         int num_threads, bool follow_symlinks, bool copy_links,
+                                         bool safe_links, bool copy_unsafe_links) {
   ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
   if (!ps)
     return NULL;

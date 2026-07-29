@@ -48,8 +48,8 @@ static void test_config_lifecycle() {
 }
 
 static void test_config_ssh_dest() {
-  Config* cfg = make_config("1.0", "/src", "user@host:/dst", true, false, false, false, false, 1,
-                            false, 0);
+  Config* cfg =
+      make_config("1.0", "/src", "user@host:/dst", true, false, false, false, false, 1, false, 0);
   EXPECT_NOT_NULL(cfg);
   EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
   EXPECT_NULL(cfg->ssh_destination);
@@ -63,8 +63,8 @@ static void test_config_ssh_dest() {
 }
 
 static void test_config_ssh_dest_local_path() {
-  Config* cfg = make_config("1.0", "/src", "/local/path", true, false, false, false, false, 1,
-                            false, 0);
+  Config* cfg =
+      make_config("1.0", "/src", "/local/path", true, false, false, false, false, 1, false, 0);
   config_parse_ssh_dest(cfg);
   EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
   EXPECT_NULL(cfg->ssh_destination);
@@ -73,8 +73,8 @@ static void test_config_ssh_dest_local_path() {
 }
 
 static void test_config_ssh_dest_no_user() {
-  Config* cfg = make_config("1.0", "/src", "host:/remote", true, false, false, false, false, 1,
-                            false, 0);
+  Config* cfg =
+      make_config("1.0", "/src", "host:/remote", true, false, false, false, false, 1, false, 0);
   config_parse_ssh_dest(cfg);
   EXPECT_EQ_INT(cfg->transport, TRANSPORT_SSH);
   EXPECT_EQ_STR(cfg->ssh_destination, "host:/remote");

@@ -183,7 +183,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   size_t root_len = strlen(resolved_root);
   if (strncmp(resolved_dir, resolved_root, root_len) != 0 ||
       (resolved_dir[root_len] != '\0' && resolved_dir[root_len] != '/')) {
-    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path, root_directory);
+    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path,
+                root_directory);
     free(resolved_dir);
     free(resolved_root);
     free(disk_path);

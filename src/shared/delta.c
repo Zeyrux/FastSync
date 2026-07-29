@@ -9,8 +9,8 @@
 #include <xxhash.h>
 
 /* Maximum number of blocks/instructions allowed from the wire to prevent OOM */
-#define MAX_DELTA_BLOCKS       (1024U * 1024U)   /* 1M signature blocks */
-#define MAX_DELTA_INSTRUCTIONS (1024U * 1024U)   /* 1M delta instructions */
+#define MAX_DELTA_BLOCKS (1024U * 1024U)       /* 1M signature blocks */
+#define MAX_DELTA_INSTRUCTIONS (1024U * 1024U) /* 1M delta instructions */
 
 uint32_t delta_adler32(const void* data, uint32_t len) {
   const uint8_t* p = (const uint8_t*)data;

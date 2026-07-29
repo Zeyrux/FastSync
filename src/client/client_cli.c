@@ -311,7 +311,8 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
       config->itemize_changes = true;
     } else if (strcmp(argv[i], "--out-format") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->out_format);
       config->out_format = dup;
     } else if (strcmp(argv[i], "--info") == 0 && i + 1 < argc) {
@@ -345,11 +346,13 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
       if (!config->filters)
         config->filters = array_list_create(free);
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       array_list_add(config->filters, dup);
     } else if (strcmp(argv[i], "--files-from") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->files_from);
       config->files_from = dup;
     } else if (strcmp(argv[i], "--cvs-exclude") == 0) {
@@ -361,7 +364,8 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
     } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--rsh") == 0) {
       if (i + 1 < argc) {
         char* dup = str_dup(argv[++i]);
-        if (!dup) return -1;
+        if (!dup)
+          return -1;
         free(config->rsh_command);
         config->rsh_command = dup;
       } else {
@@ -370,27 +374,32 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
       }
     } else if (strcmp(argv[i], "--rsync-path") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->rsync_path);
       config->rsync_path = dup;
     } else if (strcmp(argv[i], "--temp-dir") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->temp_dir);
       config->temp_dir = dup;
     } else if (strcmp(argv[i], "--compare-dest") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->compare_dest);
       config->compare_dest = dup;
     } else if (strcmp(argv[i], "--copy-dest") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->copy_dest);
       config->copy_dest = dup;
     } else if (strcmp(argv[i], "--link-dest") == 0 && i + 1 < argc) {
       char* dup = str_dup(argv[++i]);
-      if (!dup) return -1;
+      if (!dup)
+        return -1;
       free(config->link_dest);
       config->link_dest = dup;
     } else if (argv[i][0] == '-') {

@@ -89,7 +89,6 @@ Config* config_create(void) {
   config->compare_dest = NULL;
   config->copy_dest = NULL;
   config->link_dest = NULL;
->>>>>>> origin/fix/rsync-parity-all
   return config;
 }
 
