@@ -68,6 +68,9 @@ static void print_usage(void) {
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  --log-file <path>   Write log messages to file\n");
   printf("  --queue-size <n>    Queue capacity for multithreaded mode (default: 100)\n");
+  printf("  --partial           Keep partial files on interrupted transfer\n");
+  printf("  --fastsync-server-path <path>\n");
+  printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf("  --help              Show this help\n");
 }
 
@@ -308,6 +311,11 @@ int main(int argc, char* argv[]) {
         exit_code = 1;
         goto cleanup;
       }
+    } else if (strcmp(argv[i], "--partial") == 0) {
+      config->partial = true;
+    } else if (strcmp(argv[i], "--fastsync-server-path") == 0 && i + 1 < argc) {
+      free(config->fastsync_server_path);
+      config->fastsync_server_path = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (argv[i][0] == '-') {

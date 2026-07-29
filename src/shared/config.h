@@ -25,6 +25,7 @@ typedef struct Config {
   int ssh_port;
   TransportType transport;
   char* ssh_destination;
+  char* fastsync_server_path;
   char** exclude_patterns;
   int exclude_count;
   char** include_patterns;

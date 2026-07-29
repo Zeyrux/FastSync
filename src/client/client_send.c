@@ -234,7 +234,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
       return 1;
     }
-    client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port);
+    client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port,
+                                context->config->fastsync_server_path);
   } else if (context->config->use_tls) {
     client = client_create();
     if (!client || !client_connect_tls(client, context->config->server_host,
@@ -392,7 +393,8 @@ int send_files(Config* config) {
       fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
       return 1;
     }
-    client = client_connect_ssh(config->ssh_destination, config->ssh_port);
+    client =
+        client_connect_ssh(config->ssh_destination, config->ssh_port, config->fastsync_server_path);
     if (!client)
       return 1;
   } else if (config->use_tls) {
