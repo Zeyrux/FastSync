@@ -3,6 +3,7 @@
 #include "delta.h"
 #include "log.h"
 #include "protocol.h"
+#include "transport_tcp.h"
 #include "transport_tls.h"
 #include "utils.h"
 #include <errno.h>
@@ -31,6 +32,8 @@ static void print_usage(void) {
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
+  printf("  --exclude-from <file> Read exclude patterns from file\n");
+  printf("  --include-from <file> Read include patterns from file\n");
   printf("  --max-size <n>      Skip files larger than n bytes\n");
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --incremental       Skip files unchanged since last transfer\n");
@@ -55,11 +58,51 @@ static void print_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
+  printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
+  printf("  -q, --quiet         Suppress non-error output\n");
+  printf("  --silent            Alias for --quiet\n");
+  printf("  --backup            Backup existing files before overwriting\n");
+  printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
+  printf("  --stats             Print transfer statistics at end\n");
+  printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
+  printf("  --log-file <path>   Write log messages to file\n");
+  printf("  --queue-size <n>    Queue capacity for multithreaded mode (default: 100)\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf("  --help              Show this help\n");
-  printf("  -V, --version       Show version and exit\n");
+}
+
+static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
+  FILE* fp = fopen(filepath, "r");
+  if (!fp) {
+    fprintf(stderr, "Error: could not open pattern file '%s': %s\n", filepath, strerror(errno));
+    return -1;
+  }
+  char line[4096];
+  while (fgets(line, sizeof(line), fp)) {
+    char* p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (*p == '#' || *p == '\n' || *p == '\0')
+      continue;
+    size_t len = strlen(p);
+    while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r'))
+      p[--len] = '\0';
+    if (len == 0)
+      continue;
+    char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
+    if (!tmp) {
+      fprintf(stderr, "Error: memory allocation failed for pattern file\n");
+      fclose(fp);
+      return -1;
+    }
+    *patterns = tmp;
+    (*patterns)[(*count)++] = str_dup(p);
+  }
+  fclose(fp);
+  return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -73,13 +116,16 @@ int main(int argc, char* argv[]) {
   }
 
   int exit_code = 0;
+  Config* config = NULL;
   bool config_owned_by_pipeline = false;
-  Config* config = config_create(str_dup(PROTOCOL_VERSION), NULL, NULL, save_to_disk, false, false,
-                                 false, false, 5, false, 0);
-  if (config == NULL) {
+
+  char* config_version = str_dup(PROTOCOL_VERSION);
+  if (!config_version) {
     exit_code = 1;
     goto cleanup;
   }
+  config = config_create(config_version, NULL, NULL, save_to_disk, false, false, false, false, 5,
+                         false, 0);
 
   int positional_args[2];
   int positional_count = 0;
@@ -87,9 +133,6 @@ int main(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
-      goto cleanup;
-    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-      printf("fastsync version %s\n", PROTOCOL_VERSION);
       goto cleanup;
     } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
       config->use_compression = true;
@@ -99,14 +142,7 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
       config->dry_run = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      char* end;
-      long p = strtol(argv[++i], &end, 10);
-      if (*end != '\0' || p <= 0 || p > 65535) {
-        fprintf(stderr, "Error: invalid SSH port '%s' (must be 1-65535)\n", argv[i]);
-        exit_code = 1;
-        goto cleanup;
-      }
-      config->ssh_port = (int)p;
+      config->ssh_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--delete") == 0) {
       config->use_delete = true;
     } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
@@ -183,14 +219,7 @@ int main(int argc, char* argv[]) {
       free(config->server_host);
       config->server_host = str_dup(argv[++i]);
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
-      char* end;
-      long p = strtol(argv[++i], &end, 10);
-      if (*end != '\0' || p <= 0 || p > 65535) {
-        fprintf(stderr, "Error: invalid server port '%s' (must be 1-65535)\n", argv[i]);
-        exit_code = 1;
-        goto cleanup;
-      }
-      config->server_port = (int)p;
+      config->server_port = atoi(argv[++i]);
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;
@@ -224,6 +253,64 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
       free(config->tls_ca);
       config->tls_ca = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+      config->timeout = atoi(argv[++i]);
+      if (config->timeout <= 0) {
+        fprintf(stderr, "Error: --timeout must be a positive integer\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "--contimeout") == 0 && i + 1 < argc) {
+      config->contimeout = atoi(argv[++i]);
+      if (config->contimeout <= 0) {
+        fprintf(stderr, "Error: --contimeout must be a positive integer\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0 ||
+               strcmp(argv[i], "--silent") == 0) {
+      config->quiet = true;
+    } else if (strcmp(argv[i], "--backup") == 0) {
+      config->backup = true;
+    } else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc) {
+      config->backup_dir = str_dup(argv[++i]);
+    } else if (strcmp(argv[i], "--stats") == 0) {
+      config->stats = true;
+    } else if (strcmp(argv[i], "--max-depth") == 0 && i + 1 < argc) {
+      config->max_depth = atoi(argv[++i]);
+      if (config->max_depth < 0) {
+        fprintf(stderr, "Error: --max-depth must be a non-negative integer\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+      FILE* lf = fopen(argv[++i], "a");
+      if (!lf) {
+        fprintf(stderr, "Error: could not open log file '%s': %s\n", argv[i], strerror(errno));
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->log_file = lf;
+      log_set_file(lf);
+    } else if (strcmp(argv[i], "--queue-size") == 0 && i + 1 < argc) {
+      config->queue_size = atoi(argv[++i]);
+      if (config->queue_size <= 0) {
+        fprintf(stderr, "Error: --queue-size must be a positive integer\n");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "--exclude-from") == 0 && i + 1 < argc) {
+      if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
+          0) {
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else if (strcmp(argv[i], "--include-from") == 0 && i + 1 < argc) {
+      if (read_patterns_from_file(argv[++i], &config->include_patterns, &config->include_count) !=
+          0) {
+        exit_code = 1;
+        goto cleanup;
+      }
     } else if (strcmp(argv[i], "--partial") == 0) {
       config->partial = true;
     } else if (strcmp(argv[i], "--fastsync-server-path") == 0 && i + 1 < argc) {
@@ -327,6 +414,8 @@ int main(int argc, char* argv[]) {
     tls_global_init();
   }
 
+  tcp_set_timeouts(config->timeout, config->contimeout);
+
   if (config->use_multithreading) {
     config_owned_by_pipeline = true;
     exit_code = send_files_multithreaded(config);
@@ -335,7 +424,11 @@ int main(int argc, char* argv[]) {
   }
 
 cleanup:
-  if (!config_owned_by_pipeline)
-    config_delete(config);
+  if (config) {
+    if (config->log_file)
+      fclose(config->log_file);
+    if (!config_owned_by_pipeline)
+      config_delete(config);
+  }
   return exit_code;
 }

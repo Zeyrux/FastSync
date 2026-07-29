@@ -1,20 +1,14 @@
 #include "test_transport_ssh.h"
-#include "transport_ssh.h"
 #include "test_utils.h"
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/wait.h>
+#include "transport_ssh.h"
 
-/* Test client_connect_ssh with invalid destination (missing colon) */
-static void test_ssh_connect_invalid_dest() {
-  /* Missing colon — parse_remote_dest should fail and return NULL */
+static void test_ssh_connect_invalid_dest_no_colon() {
   /* cppcheck-suppress constVariablePointer */
   Client* client = client_connect_ssh("invalid-destination-no-colon", 22, NULL);
   EXPECT_NULL(client);
 }
 
-/* Test client_connect_ssh with empty destination */
-static void test_ssh_connect_empty_dest() {
+static void test_ssh_connect_invalid_dest_empty() {
   /* cppcheck-suppress constVariablePointer */
   Client* client = client_connect_ssh("", 22, NULL);
   EXPECT_NULL(client);
@@ -46,8 +40,8 @@ static void test_ssh_connect_unreachable() {
 }
 
 void test_transport_ssh() {
-  test_ssh_connect_invalid_dest();
-  test_ssh_connect_empty_dest();
+  test_ssh_connect_invalid_dest_no_colon();
+  test_ssh_connect_invalid_dest_empty();
   test_ssh_connect_malformed();
   test_ssh_connect_unreachable();
 }
