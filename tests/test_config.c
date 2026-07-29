@@ -17,6 +17,7 @@ static Config* make_config(const char* version, const char* src, const char* dst
   Config* cfg = config_create();
   if (!cfg)
     return NULL;
+  free(cfg->version);
   cfg->version = str_dup(version);
   cfg->send_directory = str_dup(src);
   cfg->receive_root_directory = str_dup(dst);

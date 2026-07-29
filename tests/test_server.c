@@ -21,6 +21,7 @@
 static void test_receive_files_finished() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/tmp/dst");
@@ -72,6 +73,7 @@ static void test_receive_files_single_file() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/tmp/dst");
@@ -133,6 +135,7 @@ static void test_receive_files_single_file() {
 static void test_receive_files_abort() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/tmp/dst");

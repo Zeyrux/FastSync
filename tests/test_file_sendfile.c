@@ -24,6 +24,7 @@ static void test_sendfile_basic() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/tmp");
   cfg->receive_root_directory = str_dup("/tmp");
@@ -84,6 +85,7 @@ static void test_sendfile_empty_file() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/tmp");
   cfg->receive_root_directory = str_dup("/tmp");
@@ -167,6 +169,7 @@ static void test_sendfile_compression_fallback() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/tmp");
   cfg->receive_root_directory = str_dup("/tmp");

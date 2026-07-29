@@ -16,6 +16,7 @@
 static void test_sender_create_destroy() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup("1.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
@@ -42,6 +43,7 @@ static void test_sender_create_destroy() {
 static void test_receiver_create_destroy() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup("2.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
@@ -65,6 +67,7 @@ static void test_receiver_create_destroy() {
 static void test_sender_queue_capacities() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup("3.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
@@ -83,6 +86,7 @@ static void test_sender_queue_capacities() {
 static void test_sender_zero_capacity() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup("4.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
@@ -100,6 +104,7 @@ static void test_sender_zero_capacity() {
 static void test_receiver_fd_zero() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup("5.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
@@ -115,6 +120,7 @@ static void test_receiver_fd_zero() {
 static void test_receive_thread_finished() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/tmp/dst");
@@ -166,6 +172,7 @@ static void test_receive_thread_finished() {
 static void test_write_thread_done() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/tmp/dst");

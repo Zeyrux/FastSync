@@ -156,6 +156,7 @@ static void test_file_send_receive() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/tmp");
   cfg->receive_root_directory = str_dup("/tmp");
@@ -306,6 +307,7 @@ static void test_file_send_single_calls_compression() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/tmp");
   cfg->receive_root_directory = str_dup("/tmp");
@@ -373,6 +375,7 @@ static void test_file_send_single_calls_metadata_and_path() {
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
   cfg->version = str_dup(PROTOCOL_VERSION);
   cfg->send_directory = str_dup("/tmp");
   cfg->receive_root_directory = str_dup("/tmp");

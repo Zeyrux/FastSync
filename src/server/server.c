@@ -151,9 +151,10 @@ void handler(int file_descriptor) {
   close(file_descriptor);
 }
 
+#ifndef FASTSYNC_SERVER_AS_LIB
 static Server* g_server = NULL;
 
-static void __attribute__((unused)) cleanup(int sig) {
+static void cleanup(int sig) {
   (void)sig;
   if (g_server) {
     server_delete(&g_server);
@@ -161,7 +162,7 @@ static void __attribute__((unused)) cleanup(int sig) {
   _exit(0);
 }
 
-static void __attribute__((unused)) print_server_usage(void) {
+static void print_server_usage(void) {
   printf("FastSync Server\n");
   printf("Usage: fastsync-server [options]\n");
   printf("\n");
@@ -176,7 +177,6 @@ static void __attribute__((unused)) print_server_usage(void) {
   printf("  --help              Show this help\n");
 }
 
-#ifndef FASTSYNC_SERVER_AS_LIB
 int main(int argc, char* argv[]) {
   bool use_tls = false;
   char* tls_cert = NULL;
