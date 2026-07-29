@@ -81,10 +81,10 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   free(context);
 }
 
-static void receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
+static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
   Chunk* chunk = receive_chunk_data(file_descriptor, context->config);
   if (chunk == NULL)
-    return;
+    return false;
 
   for (int i = 0; i < chunk->element_count; i++) {
     File* file = chunk->items[i];
@@ -93,6 +93,7 @@ static void receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
                                 &context->condition_not_empty, &context->condition_not_full);
   }
   chunk_destroy(chunk);
+  return true;
 }
 
 int receive_thread(void* pipeline_context) {
@@ -125,7 +126,8 @@ int receive_thread(void* pipeline_context) {
                                     &context->condition_not_empty, &context->condition_not_full);
       }
     } else if (status == STATUS_CHUNK) {
-      receive_chunk_enqueue(file_descriptor, context);
+      if (!receive_chunk_enqueue(file_descriptor, context))
+        return thrd_error;
     } else if (status == STATUS_CHECK_BATCH) {
       int count;
       if (!receive_int(file_descriptor, &count))
@@ -161,6 +163,7 @@ int receive_thread(void* pipeline_context) {
                                     &context->condition_not_empty, &context->condition_not_full);
       } else {
         log_message(LOG_LEVEL_ERROR, "Failed to receive file");
+        return thrd_error;
       }
     }
   next:

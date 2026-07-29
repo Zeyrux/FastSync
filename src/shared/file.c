@@ -510,6 +510,8 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
   while ((unsigned long long)offset < file_size) {
     ssize_t sent = sendfile(file_descriptor, fd, &offset, file_size - offset);
     if (sent == -1) {
+      if (errno == EAGAIN || errno == EINTR)
+        continue;
       perror("sendfile failed");
       close(fd);
       return false;
