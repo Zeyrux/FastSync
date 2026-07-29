@@ -105,7 +105,16 @@ int receive_thread(void* pipeline_context) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return thrd_error;
-  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
+    if (status == STATUS_KEEPALIVE) {
+      send_status(file_descriptor, STATUS_KEEPALIVE);
+      goto next;
+    }
+    if (status == STATUS_ABORT) {
+      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
+      return thrd_error;
+    }
     if (status == STATUS_CHECK) {
       bool skipped;
       File* file = receive_incremental_check(file_descriptor, config, &skipped);
@@ -117,6 +126,34 @@ int receive_thread(void* pipeline_context) {
       }
     } else if (status == STATUS_CHUNK) {
       receive_chunk_enqueue(file_descriptor, context);
+    } else if (status == STATUS_CHECK_BATCH) {
+      int count;
+      if (!receive_int(file_descriptor, &count))
+        return thrd_error;
+      for (int i = 0; i < count; i++) {
+        char* check_path = receive_str(file_descriptor);
+        if (!check_path)
+          return thrd_error;
+        unsigned long long check_size;
+        long long check_mtime;
+        if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
+            !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
+          free(check_path);
+          return thrd_error;
+        }
+        char* full_path = path_cat(config->receive_root_directory, check_path);
+        struct stat st;
+        bool has_old = full_path && stat(full_path, &st) == 0;
+        bool match = has_old && (unsigned long long)st.st_size == check_size &&
+                     (long long)st.st_mtime == check_mtime;
+        if (match)
+          send_status(file_descriptor, STATUS_OK);
+        else
+          send_status(file_descriptor, STATUS_NEXT);
+        free(full_path);
+        free(check_path);
+      }
+      goto next;
     } else {
       File* file = file_receive(config, file_descriptor);
       if (file) {
@@ -126,6 +163,7 @@ int receive_thread(void* pipeline_context) {
         log_message(LOG_LEVEL_ERROR, "Failed to receive file");
       }
     }
+  next:
     if (!receive_status(file_descriptor, &status))
       return thrd_error;
   }
@@ -156,7 +194,7 @@ int write_thread(void* pipeline_context) {
       return thrd_success;
     }
     if (save_to_disk)
-      file_save_to_disk(root_directory, file);
+      file_save_to_disk(root_directory, file, context->config);
     file_destroy(file);
   }
 }

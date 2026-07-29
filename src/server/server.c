@@ -11,55 +11,26 @@
 #include "transport_tls.h"
 #include "unistd.h"
 #include "utils.h"
-#include <libgen.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Check if a file path should be excluded based on config patterns
-static bool is_excluded(const char* path, const Config* config) {
-  // Extract filename from path
-  char* path_dup = str_dup(path);
-  if (!path_dup)
-    return false;
-  /* basename(3) may return a pointer into path_dup or a static buffer;
-   * either way we free path_dup, not fname. */
-  char* fname = basename(path_dup);
-
-  // Check exclude patterns
-  for (int i = 0; i < config->exclude_count; i++) {
-    if (glob_match(config->exclude_patterns[i], fname)) {
-      free(path_dup);
-      return true;
-    }
-  }
-
-  // Check include patterns (if any, file must match at least one)
-  if (config->include_count > 0) {
-    bool included = false;
-    for (int i = 0; i < config->include_count; i++) {
-      if (glob_match(config->include_patterns[i], fname)) {
-        included = true;
-        break;
-      }
-    }
-    if (!included) {
-      free(path_dup);
-      return true;
-    }
-  }
-
-  free(path_dup);
-  return false;
-}
 
 int receive_files(Config* config, int fd) {
   Status status;
   if (!receive_status(fd, &status))
     return -1;
 
-  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK) {
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
+    if (status == STATUS_KEEPALIVE) {
+      send_status(fd, STATUS_KEEPALIVE);
+      goto next;
+    }
+    if (status == STATUS_ABORT) {
+      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
+      return -1;
+    }
     if (status == STATUS_CHECK) {
       bool skipped;
       File* file = receive_incremental_check(fd, config, &skipped);
@@ -67,8 +38,8 @@ int receive_files(Config* config, int fd) {
         goto next;
       if (file == NULL && !skipped)
         return -1;
-      if (config->save_to_disk && !is_excluded(file->path, config))
-        file_save_to_disk(config->receive_root_directory, file);
+      if (config->save_to_disk)
+        file_save_to_disk(config->receive_root_directory, file, NULL);
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
       Chunk* chunk = receive_chunk_data(fd, config);
@@ -77,10 +48,38 @@ int receive_files(Config* config, int fd) {
         return -1;
       }
       for (int i = 0; i < chunk->element_count; i++) {
-        if (config->save_to_disk && !is_excluded(chunk->items[i]->path, config))
-          file_save_to_disk(config->receive_root_directory, chunk->items[i]);
+        if (config->save_to_disk)
+          file_save_to_disk(config->receive_root_directory, chunk->items[i], NULL);
       }
       chunk_destroy(chunk);
+    } else if (status == STATUS_CHECK_BATCH) {
+      int count;
+      if (!receive_int(fd, &count))
+        return -1;
+      for (int i = 0; i < count; i++) {
+        char* check_path = receive_str(fd);
+        if (!check_path)
+          return -1;
+        unsigned long long check_size;
+        long long check_mtime;
+        if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
+            !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
+          free(check_path);
+          return -1;
+        }
+        char* full_path = path_cat(config->receive_root_directory, check_path);
+        struct stat st;
+        bool has_old = full_path && stat(full_path, &st) == 0;
+        bool match = has_old && (unsigned long long)st.st_size == check_size &&
+                     (long long)st.st_mtime == check_mtime;
+        if (match)
+          send_status(fd, STATUS_OK);
+        else
+          send_status(fd, STATUS_NEXT);
+        free(full_path);
+        free(check_path);
+      }
+      goto next;
     } else {
       File* file = file_receive(config, fd);
       if (file == NULL) {
@@ -88,8 +87,8 @@ int receive_files(Config* config, int fd) {
         send_status(fd, STATUS_ERROR);
         return -1;
       }
-      if (config->save_to_disk && !is_excluded(file->path, config))
-        file_save_to_disk(config->receive_root_directory, file);
+      if (config->save_to_disk)
+        file_save_to_disk(config->receive_root_directory, file, NULL);
       file_destroy(file);
     }
   next:
@@ -151,12 +150,13 @@ void handler(int file_descriptor) {
 }
 
 static Server* g_server = NULL;
-static volatile sig_atomic_t g_server_cleanup_requested = 0;
 
 static void cleanup(int sig) {
   (void)sig;
-  server_request_shutdown();
-  g_server_cleanup_requested = 1;
+  if (g_server) {
+    server_delete(&g_server);
+  }
+  _exit(0);
 }
 
 static void print_server_usage(void) {
@@ -172,7 +172,6 @@ static void print_server_usage(void) {
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  --help              Show this help\n");
-  printf("  -V, --version       Show version and exit\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -186,9 +185,6 @@ int main(int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_server_usage();
-      return 0;
-    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
-      printf("fastsync-server version %s\n", PROTOCOL_VERSION);
       return 0;
     } else if (strcmp(argv[i], "--stdio") == 0) {
       io_set_fds(STDIN_FILENO, STDOUT_FILENO);
@@ -246,10 +242,5 @@ int main(int argc, char* argv[]) {
   } else {
     server_listen(g_server, handler);
   }
-
-  /* Graceful shutdown: delete the server */
-  if (g_server_cleanup_requested)
-    log_message(LOG_LEVEL_INFO, "Shutdown requested, cleaning up");
-  server_delete(&g_server);
   return 0;
 }

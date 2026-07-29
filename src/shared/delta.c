@@ -108,7 +108,12 @@ DeltaSignature* delta_signature_deserialize(const Data* data) {
     return NULL;
   }
 
-  sig->blocks = malloc(sig->block_count * sizeof(DeltaBlockSig));
+  uint64_t blocks_size = (uint64_t)sig->block_count * sizeof(DeltaBlockSig);
+  if (blocks_size > SIZE_MAX) {
+    free(sig);
+    return NULL;
+  }
+  sig->blocks = malloc((size_t)blocks_size);
   if (!sig->blocks) {
     free(sig);
     return NULL;

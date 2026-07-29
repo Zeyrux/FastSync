@@ -10,23 +10,19 @@
 #include <unistd.h>
 
 bool mkdir_r(const char* path) {
-  size_t path_len = strlen(path);
-  char* path_duplicate = malloc(path_len + 1);
+  char* path_duplicate = malloc(strlen(path) + 1);
   if (!path_duplicate)
     return false;
-  memcpy(path_duplicate, path, path_len + 1);
-  /* Buffer for building subpaths: path_len + 1 for leading '/' + 1 for null */
-  size_t buf_size = path_len + 2;
-  char* path_current = (char*)malloc(buf_size);
+  strcpy(path_duplicate, path);
+  char* path_current = (char*)malloc((strlen(path) + 2) * sizeof(char));
   if (!path_current) {
     free(path_duplicate);
     return false;
   }
-  size_t pos = 0;
+  char* path_current_position = path_current;
   if (path[0] == '/') {
-    path_current[0] = '/';
-    path_current[1] = '\0';
-    pos = 1;
+    strcpy(path_current, "/");
+    path_current_position += 1;
   } else {
     path_current[0] = '\0';
   }
@@ -35,16 +31,10 @@ bool mkdir_r(const char* path) {
   const char* part = strtok_r(path_duplicate, delimiter, &saveptr);
   bool ok = true;
   while (part != NULL) {
-    size_t part_len = strlen(part);
-    if (pos + part_len + 1 >= buf_size) {
-      ok = false;
-      break;
-    }
-    memcpy(path_current + pos, part, part_len);
-    pos += part_len;
-    path_current[pos] = '/';
-    pos++;
-    path_current[pos] = '\0';
+    strcpy(path_current_position, part);
+    path_current_position += strlen(part) * sizeof(char);
+    strcpy(path_current_position, "/");
+    path_current_position += sizeof(char);
     struct stat st;
     if (stat(path_current, &st) != 0) {
       if (mkdir(path_current, 0755) != 0) {
@@ -59,24 +49,22 @@ bool mkdir_r(const char* path) {
   free(path_current);
   return ok;
 }
+
 char* str_dup(const char* string) {
   if (string == NULL)
     return NULL;
   char* new_string = (char*)malloc(strlen(string) + 1);
-  memcpy(new_string, string, strlen(string) + 1);
+  strcpy(new_string, string);
   return new_string;
 }
 
 bool glob_match(const char* pattern, const char* str) {
   while (*pattern) {
     if (*pattern == '*') {
-      /* Check for double-star (globstar) pattern */
       if (*(pattern + 1) == '*') {
         pattern += 2;
-        /* Trailing double-star matches everything */
         if (*pattern == '\0')
           return true;
-        /* double-star slash: match at any depth */
         if (*pattern == '/')
           pattern++;
         while (*str) {
@@ -86,7 +74,6 @@ bool glob_match(const char* pattern, const char* str) {
         }
         return glob_match(pattern, str);
       }
-      /* Single * — does not cross / boundaries */
       pattern++;
       while (*str && *str != '/') {
         if (glob_match(pattern, str))
@@ -101,9 +88,7 @@ bool glob_match(const char* pattern, const char* str) {
       str++;
     } else {
       if (*pattern != *str) {
-        /* If pattern has a '/' followed by '**', allow zero path components */
         if (*pattern == '/' && *(pattern + 1) == '*' && *(pattern + 2) == '*') {
-          /* Skip over slash-double-star and try to match rest against current str */
           const char* rest = pattern + 3;
           if (*rest == '/')
             rest++;
@@ -184,17 +169,37 @@ void delete_extras(const char* dest_root, ArrayList* manifest) {
   delete_extras_walk(dest_root, "", manifest);
 }
 
+bool has_path_traversal(const char* path) {
+  if (!path)
+    return false;
+  char* dup = str_dup(path);
+  if (!dup)
+    return false;
+  char* saveptr;
+  const char* part = strtok_r(dup, "/", &saveptr);
+  while (part) {
+    if (strcmp(part, "..") == 0) {
+      free(dup);
+      return true;
+    }
+    part = strtok_r(NULL, "/", &saveptr);
+  }
+  free(dup);
+  return false;
+}
+
 char* path_cat(const char* path1, const char* path2) {
   if (path1 == NULL || *path1 == '\0')
     return str_dup(path2);
   if (path2 == NULL || *path2 == '\0')
     return str_dup(path1);
-  int path1_len = strlen(path1);
-  int path2_len = strlen(path2);
+  size_t path1_len = strlen(path1);
+  size_t path2_len = strlen(path2);
+  size_t offset = 0;
   if (path1[path1_len - 1] == '/')
     path1_len -= 1;
   if (path2[0] == '/') {
-    path2++;
+    offset = 1;
     path2_len -= 1;
   }
   char* new_path = malloc(path1_len + path2_len + 2);
@@ -202,7 +207,7 @@ char* path_cat(const char* path1, const char* path2) {
     return NULL;
   memcpy(new_path, path1, path1_len);
   new_path[path1_len] = '/';
-  memcpy(new_path + path1_len + 1, path2, path2_len);
+  memcpy(new_path + path1_len + 1, path2 + offset, path2_len);
   new_path[path1_len + path2_len + 1] = '\0';
   return new_path;
 }
