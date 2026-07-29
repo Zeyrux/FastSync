@@ -37,15 +37,23 @@ def _generate_certs(cert_dir):
     ], check=True, capture_output=True)
 
     # Server key + CSR + cert (signed by CA)
+    # Use a config file to include IP SAN 127.0.0.1 so hostname verification passes
+    san_config = os.path.join(cert_dir, "server_san.conf")
+    with open(san_config, "w") as f:
+        f.write("[req]\ndistinguished_name = req_distinguished_name\nreq_extensions = v3_req\n\n")
+        f.write("[req_distinguished_name]\nCN = localhost\n\n")
+        f.write("[v3_req]\nsubjectAltName = @alt_names\n\n")
+        f.write("[alt_names]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\n")
     subprocess.run([
         "openssl", "req", "-newkey", "rsa:2048", "-nodes",
         "-keyout", server_key, "-out", os.path.join(cert_dir, "server.csr"),
-        "-subj", "/CN=localhost",
+        "-subj", "/CN=localhost", "-config", san_config,
     ], check=True, capture_output=True)
     subprocess.run([
         "openssl", "x509", "-req", "-in", os.path.join(cert_dir, "server.csr"),
         "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
         "-out", server_cert, "-days", "1",
+        "-extfile", san_config, "-extensions", "v3_req",
     ], check=True, capture_output=True)
 
     # Client key + CSR + cert (signed by CA)

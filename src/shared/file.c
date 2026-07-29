@@ -134,9 +134,64 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
     log_message(LOG_LEVEL_ERROR, "Path traversal detected in file path: %s", file->path);
     return false;
   }
-  char* disk_path = path_cat((char*)root_directory, file->path);
-  if (disk_path == NULL)
+
+  // Resolve the destination root to its real path, preventing symlink-based escapes.
+  // If the root does not yet exist, try to create it so realpath can succeed.
+  char* resolved_root = realpath(root_directory, NULL);
+  if (resolved_root == NULL) {
+    if (mkdir_r(root_directory)) {
+      resolved_root = realpath(root_directory, NULL);
+    }
+  }
+  if (resolved_root == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to resolve destination root: %s", root_directory);
     return false;
+  }
+
+  char* disk_path = path_cat(resolved_root, file->path);
+  if (disk_path == NULL) {
+    free(resolved_root);
+    return false;
+  }
+
+  // Ensure the target directory exists so the parent can be resolved for path safety.
+  char* dir_dup = str_dup(disk_path);
+  if (!dir_dup) {
+    free(resolved_root);
+    free(disk_path);
+    return false;
+  }
+  char* dir_str = dirname(dir_dup);
+  // Create the directory if needed (no-op if it already exists) so realpath can resolve it.
+  if (!mkdir_r(dir_str)) {
+    free(dir_dup);
+    free(resolved_root);
+    free(disk_path);
+    return false;
+  }
+  char* resolved_dir = realpath(dir_str, NULL);
+  free(dir_dup);
+  if (resolved_dir == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to resolve directory for: %s", disk_path);
+    free(resolved_root);
+    free(disk_path);
+    return false;
+  }
+
+  // Verify that the resolved directory is inside the resolved root.
+  // Both are canonical absolute paths — this prevents symlink-based escapes.
+  size_t root_len = strlen(resolved_root);
+  if (strncmp(resolved_dir, resolved_root, root_len) != 0 ||
+      (resolved_dir[root_len] != '\0' && resolved_dir[root_len] != '/')) {
+    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path, root_directory);
+    free(resolved_dir);
+    free(resolved_root);
+    free(disk_path);
+    return false;
+  }
+  free(resolved_dir);
+  free(resolved_root);
+
   bool ok = to_disk(disk_path, file->data->data, file->data->size);
   if (ok)
     file_restore_metadata(disk_path, file->metadata);
@@ -341,7 +396,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 
   char* full_path = path_cat(config->receive_root_directory, check_path);
   struct stat st;
-  bool has_old_file = (full_path && stat(full_path, &st) == 0);
+  bool has_old_file = (full_path && lstat(full_path, &st) == 0);
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
 
   bool match = has_old_file && (unsigned long long)st.st_size == check_size &&
