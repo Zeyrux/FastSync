@@ -103,7 +103,7 @@ static void test_pipeline_receiver_lifecycle() {
   Config* cfg = make_config("3.0", "/src3", "/dst3", true, true, true, true, false, 1, false, 0);
   Queue* q = queue_create(20, NULL);
 
-  PipelineContextReceiver* pcr = pipeline_context_receiver_create(cfg, q, 42);
+  PipelineContextReceiver* pcr = pipeline_context_receiver_create(cfg, q, 42, NULL);
   EXPECT_NOT_NULL(pcr);
   EXPECT_EQ_STR(pcr->config->version, "3.0");
   EXPECT_EQ_INT(pcr->queue->capacity, 20);

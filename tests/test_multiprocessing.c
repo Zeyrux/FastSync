@@ -53,7 +53,7 @@ static void test_receiver_create_destroy() {
   Queue* q = queue_create(20, NULL);
   EXPECT_NOT_NULL(q);
 
-  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 42);
+  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 42, NULL);
   EXPECT_NOT_NULL(ctx);
   EXPECT_EQ_STR(ctx->config->version, "2.0");
   EXPECT_EQ_INT(ctx->queue->capacity, 20);
@@ -109,12 +109,13 @@ static void test_receiver_fd_zero() {
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
   Queue* q = queue_create(5, NULL);
-  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 0);
+  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 0, NULL);
   EXPECT_NOT_NULL(ctx);
   EXPECT_EQ_INT(ctx->file_descriptor, 0);
   EXPECT_FALSE(ctx->receiver_done);
   pipeline_context_receiver_destroy(ctx);
 }
+
 
 /* Test that receive_thread completes cleanly when sent FINISHED immediately */
 static void test_receive_thread_finished() {
@@ -138,7 +139,7 @@ static void test_receive_thread_finished() {
 
     Queue* q = queue_create(5, file_destroy);
     EXPECT_NOT_NULL(q);
-    PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, p[0]);
+    PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, p[0], NULL);
     EXPECT_NOT_NULL(ctx);
 
     int ret = receive_thread(ctx);
@@ -181,7 +182,7 @@ static void test_write_thread_done() {
   Queue* q = queue_create(5, file_destroy);
   EXPECT_NOT_NULL(q);
 
-  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 0);
+  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, 0, NULL);
   EXPECT_NOT_NULL(ctx);
 
   /* Mark receiver as done BEFORE starting the thread so it exits immediately */

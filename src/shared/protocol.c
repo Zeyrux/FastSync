@@ -67,6 +67,10 @@ void io_set_ssl(SSL* ssl) {
   io_ssl = ssl;
 }
 
+SSL* io_get_ssl(void) {
+  return io_ssl;
+}
+
 static int io_fd(int dir_fd, int file_descriptor) {
   return (dir_fd != -1) ? dir_fd : file_descriptor;
 }

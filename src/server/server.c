@@ -112,6 +112,7 @@ int receive_files(Config* config, int fd) {
 }
 
 void handler(int file_descriptor) {
+  SSL* ssl = io_get_ssl();
   Config* config = config_receive(file_descriptor);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
@@ -125,7 +126,7 @@ void handler(int file_descriptor) {
       close(file_descriptor);
       return;
     }
-    PipelineContextReceiver* context = pipeline_context_receiver_create(config, q, file_descriptor);
+    PipelineContextReceiver* context = pipeline_context_receiver_create(config, q, file_descriptor, ssl);
     if (context == NULL) {
       queue_destroy(q);
       config_delete(config);

@@ -32,6 +32,7 @@ enum NET_STATUS {
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
 void io_set_ssl(SSL* ssl);
+SSL* io_get_ssl(void);
 bool send_n_data(int file_descriptor, const void* data, size_t data_size);
 bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 

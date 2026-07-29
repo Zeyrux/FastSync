@@ -54,13 +54,14 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
 }
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue,
-                                                          int file_descriptor) {
+                                                           int file_descriptor, SSL* ssl) {
   PipelineContextReceiver* context = malloc(sizeof(PipelineContextReceiver));
   if (context == NULL)
     return NULL;
   context->config = config;
   context->queue = queue;
   context->file_descriptor = file_descriptor;
+  context->ssl = ssl;
   context->receiver_done = false;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full) != thrd_success ||
@@ -98,6 +99,8 @@ static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
 
 int receive_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
+  if (context->ssl)
+    io_set_ssl(context->ssl);
   mtx_lock(&context->mutex);
   int file_descriptor = context->file_descriptor;
   const Config* config = context->config;
@@ -183,6 +186,8 @@ int receive_thread(void* pipeline_context) {
 
 int write_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
+  if (context->ssl)
+    io_set_ssl(context->ssl);
   mtx_lock(&context->mutex);
   bool save_to_disk = context->config->save_to_disk;
   char* root_directory = str_dup(context->config->receive_root_directory);
