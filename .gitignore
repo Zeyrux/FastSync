@@ -5,3 +5,6 @@ __pycache__/
 build-asan
 coverage.info
 build-*/
+build2/
+build3/
+build_docker2/
