@@ -153,7 +153,7 @@ void handler(int file_descriptor) {
 
 static Server* g_server = NULL;
 
-static void cleanup(int sig) {
+static void __attribute__((unused)) cleanup(int sig) {
   (void)sig;
   if (g_server) {
     server_delete(&g_server);
@@ -161,7 +161,7 @@ static void cleanup(int sig) {
   _exit(0);
 }
 
-static void print_server_usage(void) {
+static void __attribute__((unused)) print_server_usage(void) {
   printf("FastSync Server\n");
   printf("Usage: fastsync-server [options]\n");
   printf("\n");
