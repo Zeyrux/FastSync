@@ -1,6 +1,8 @@
 #include "test_transport_tcp.h"
+#include "protocol.h"
 #include "test_utils.h"
 #include "transport_tcp.h"
+#include <string.h>
 #include <unistd.h>
 
 static void test_server_create_ephemeral() {
@@ -35,9 +37,49 @@ static void test_client_delete_null() {
   client_delete(c);
 }
 
+/* Test tcp_set_timeouts with valid values */
+static void test_tcp_set_timeouts() {
+  tcp_set_timeouts(0, 0);
+  tcp_set_timeouts(60, 20);
+  tcp_set_timeouts(-1, -1);
+  EXPECT_TRUE(true);
+}
+
+/* Test client_connect with an invalid host (should fail gracefully) */
+static void test_client_connect_invalid_host() {
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  bool ok = client_connect(c, "10.255.255.1", 9999);
+  EXPECT_FALSE(ok);
+  client_disconnect(c);
+  client_delete(c);
+}
+
+/* Test server_delete with double-delete safety */
+static void test_server_delete_double() {
+  Server* s = server_create(0);
+  EXPECT_NOT_NULL(s);
+  server_delete(&s);
+  EXPECT_NULL(s);
+  server_delete(&s);
+  EXPECT_NULL(s);
+}
+
+/* Test client_disconnect then client_delete */
+static void test_client_disconnect_delete() {
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  client_disconnect(c);
+  client_delete(c);
+}
+
 void test_transport_tcp() {
   test_server_create_ephemeral();
   test_server_delete_null();
   test_client_create();
   test_client_delete_null();
+  test_tcp_set_timeouts();
+  test_client_connect_invalid_host();
+  test_server_delete_double();
+  test_client_disconnect_delete();
 }

@@ -1,10 +1,16 @@
 #include "test_config.h"
 #include "config.h"
 #include "multiprocessing.h"
+#include "protocol.h"
 #include "queue.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static void test_config_lifecycle() {
   Config* cfg = config_create(str_dup("1.0"), str_dup("/src"), str_dup("/dst"), true, true, false,
@@ -89,6 +95,104 @@ static void test_pipeline_receiver_lifecycle() {
   pipeline_context_receiver_destroy(pcr);
 }
 
+/* Test config_send/config_receive round-trip over a socketpair */
+static void test_config_send_receive() {
+  Config* send_cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/send/src"),
+                                   str_dup("/send/dst"), true, true, true, true, true, 5, false,
+                                   1024);
+  EXPECT_NOT_NULL(send_cfg);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    close(p[0]);
+
+    bool ok = true;
+    if (!recv_cfg) ok = false;
+    else {
+      if (strcmp(recv_cfg->version, PROTOCOL_VERSION) != 0) ok = false;
+      if (strcmp(recv_cfg->send_directory, "/send/src") != 0) ok = false;
+      if (strcmp(recv_cfg->receive_root_directory, "/send/dst") != 0) ok = false;
+      if (!recv_cfg->save_to_disk) ok = false;
+      if (!recv_cfg->use_multithreading) ok = false;
+      if (!recv_cfg->use_chunk_serialization) ok = false;
+      if (recv_cfg->compression_level != 5) ok = false;
+      if (recv_cfg->chunk_size != 1024) ok = false;
+    }
+    config_delete(recv_cfg);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    close(p[1]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    config_delete(send_cfg);
+
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* Test config_send/receive version mismatch rejection */
+static void test_config_send_receive_version_mismatch() {
+  Config* cfg = config_create(str_dup("0.0"), str_dup("/src"), str_dup("/dst"), false, false, false,
+                              false, false, 0, false, 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    close(p[0]);
+    _exit(recv == NULL ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], cfg);
+    close(p[1]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    config_delete(cfg);
+
+    /* config_send should return false because config_receive sends STATUS_ERROR */
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* Test is_remote_dest edge cases */
+static void test_is_remote_dest() {
+  EXPECT_TRUE(is_remote_dest("user@host:/path"));
+  EXPECT_TRUE(is_remote_dest("host:/path"));
+  EXPECT_TRUE(is_remote_dest("user@192.168.1.1:/remote/path"));
+  EXPECT_FALSE(is_remote_dest(NULL));
+  EXPECT_FALSE(is_remote_dest(""));
+  EXPECT_FALSE(is_remote_dest(":"));
+  EXPECT_FALSE(is_remote_dest("/local/path"));
+  EXPECT_FALSE(is_remote_dest("relative/path"));
+  EXPECT_TRUE(is_remote_dest("C:/windows/path"));
+  EXPECT_FALSE(is_remote_dest("noslash"));
+  EXPECT_FALSE(is_remote_dest("/"));
+  EXPECT_TRUE(is_remote_dest("host:"));
+  EXPECT_TRUE(is_remote_dest("user@host:"));
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -96,4 +200,9 @@ void test_config() {
   test_config_ssh_dest_no_user();
   test_pipeline_sender_lifecycle();
   test_pipeline_receiver_lifecycle();
+  if (!is_running_under_valgrind()) {
+    test_config_send_receive();
+    test_config_send_receive_version_mismatch();
+  }
+  test_is_remote_dest();
 }

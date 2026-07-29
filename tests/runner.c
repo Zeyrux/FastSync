@@ -1,11 +1,13 @@
 #include "test_array_list.h"
 #include "test_chunk.h"
+#include "test_client_cli.h"
 #include "test_compression.h"
 #include "test_config.h"
 #include "test_data.h"
 #include "test_delta.h"
 #include "test_file.h"
 #include "test_file_sendfile.h"
+#include "test_fuzz_smoke.h"
 #include "test_glob.h"
 #include "test_log.h"
 #include "test_metadata.h"
@@ -15,6 +17,7 @@
 #include "test_queue.h"
 #include "test_robustness.h"
 #include "test_scanner.h"
+#include "test_server.h"
 #include "test_shared_utils.h"
 #include "test_stress.h"
 #include "test_transport_tcp.h"
@@ -53,6 +56,9 @@ int main() {
   RUN_TEST(test_transport_tcp);
   RUN_TEST(test_transport_ssh);
   RUN_TEST(test_transport_tls);
+  RUN_TEST(test_client_cli);
+  RUN_TEST(test_server);
+  RUN_TEST(test_fuzz_smoke);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);
