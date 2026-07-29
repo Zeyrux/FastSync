@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -25,37 +26,37 @@ static void test_receive_files_finished() {
   cfg->receive_root_directory = str_dup("/tmp/dst");
 
   int p[2];
-  EXPECT_EQ_INT(pipe(p), 0);
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
   pid_t pid = fork();
   if (pid == 0) {
-    /* Child: run receive_files */
+    /* Child: use p[0] for both read and write */
     close(p[1]);
-
+    io_set_fds(p[0], p[0]);
     int ret = receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     _exit(ret == 0 ? 0 : 1);
   } else {
-    /* Parent: send FINISHED then ok */
+    /* Parent: use p[1] for both read and write */
     close(p[0]);
-
+    io_set_fds(p[1], p[1]);
+    send_status(p[1], STATUS_FINISHED);
     /* receive_files expects an initial status, then loops.
      * If we send STATUS_FINISHED first, it won't enter the loop body
      * (status == STATUS_FINISHED doesn't match any case).
      * After the loop, it checks if status == STATUS_FINISHED -> yes.
      * Then sends STATUS_OK and returns 0. */
-    send_status(p[1], STATUS_FINISHED);
     /* receive_files will send STATUS_OK back, read it */
     Status resp;
     receive_status(p[1], &resp);
 
-    close(p[1]);
-
     int status;
     waitpid(pid, &status, 0);
+
+    close(p[1]);
 
     config_delete(cfg);
 
@@ -76,22 +77,23 @@ static void test_receive_files_single_file() {
   cfg->receive_root_directory = str_dup("/tmp/dst");
 
   int p[2];
-  EXPECT_EQ_INT(pipe(p), 0);
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
   pid_t pid = fork();
   if (pid == 0) {
-    /* Child: receive_files will try to call file_receive */
+    /* Child: use p[0] for both read and write */
     close(p[1]);
-
+    io_set_fds(p[0], p[0]);
     int ret = receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     _exit(ret == 0 ? 0 : 1);
   } else {
-    /* Parent: send a file */
+    /* Parent: use p[1] for both read and write */
     close(p[0]);
+    io_set_fds(p[1], p[1]);
 
     /* Send initial status = STATUS_NEXT */
     send_status(p[1], STATUS_NEXT);
@@ -115,10 +117,10 @@ static void test_receive_files_single_file() {
     Status resp;
     receive_status(p[1], &resp);
 
-    close(p[1]);
-
     int status;
     waitpid(pid, &status, 0);
+
+    close(p[1]);
 
     config_delete(cfg);
 
@@ -136,13 +138,14 @@ static void test_receive_files_abort() {
   cfg->receive_root_directory = str_dup("/tmp/dst");
 
   int p[2];
-  EXPECT_EQ_INT(pipe(p), 0);
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
+    io_set_fds(p[0], p[0]);
     int ret = receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
@@ -150,14 +153,14 @@ static void test_receive_files_abort() {
     _exit(ret == -1 ? 0 : 1);
   } else {
     close(p[0]);
-
+    io_set_fds(p[1], p[1]);
     /* Send STATUS_ABORT */
     send_status(p[1], STATUS_ABORT);
 
-    close(p[1]);
-
     int status;
     waitpid(pid, &status, 0);
+
+    close(p[1]);
 
     config_delete(cfg);
 

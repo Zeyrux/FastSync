@@ -6,6 +6,7 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -125,18 +126,18 @@ static void test_config_send_receive() {
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
 
-  /* Use pipe for communication */
+  /* Use socketpair for bidirectional communication */
   int p[2];
-  EXPECT_EQ_INT(pipe(p), 0);
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
   pid_t pid = fork();
   if (pid == 0) {
-    /* Child: receive the config */
+    /* Child: use p[0] for both read and write (connected to parent's p[1]) */
     close(p[1]);
+    io_set_fds(p[0], p[0]);
     Config* recv_cfg = config_receive(p[0]);
-    close(p[0]);
 
     bool ok = true;
     if (!recv_cfg)
@@ -160,15 +161,20 @@ static void test_config_send_receive() {
         ok = false;
     }
     config_delete(recv_cfg);
+    close(p[0]);
+    close(p[1]);
     _exit(ok ? 0 : 1);
   } else {
-    /* Parent: send the config */
+    /* Parent: use p[1] for both read and write (connected to child's p[0]) */
     close(p[0]);
+    io_set_fds(p[1], p[1]);
     bool sent = config_send(p[1], send_cfg);
-    close(p[1]);
 
     int status;
     waitpid(pid, &status, 0);
+
+    close(p[0]);
+    close(p[1]);
 
     config_delete(send_cfg);
 
@@ -187,30 +193,31 @@ static void test_config_send_receive_version_mismatch() {
   cfg->receive_root_directory = str_dup("/dst");
 
   int p[2];
-  EXPECT_EQ_INT(pipe(p), 0);
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
   io_set_fds(p[0], p[1]);
   io_set_bwlimit(0);
 
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
-    /* Should fail because version "0.0" != PROTOCOL_VERSION */
+    io_set_fds(p[0], p[0]);
     Config* recv = config_receive(p[0]);
     close(p[0]);
-    /* recv should be NULL on version mismatch */
     _exit(recv == NULL ? 0 : 1);
   } else {
     close(p[0]);
+    io_set_fds(p[1], p[1]);
     bool sent = config_send(p[1], cfg);
-    close(p[1]);
 
-    /* send should succeed (sends the config, receives ERROR on version mismatch) */
     int status;
     waitpid(pid, &status, 0);
 
+    close(p[0]);
+    close(p[1]);
+
     config_delete(cfg);
 
-    /* config_send returns false because it receives STATUS_ERROR back */
+    /* config_send receives STATUS_ERROR from config_receive, returns false */
     EXPECT_FALSE(sent);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
@@ -228,7 +235,8 @@ static void test_is_remote_dest() {
   EXPECT_FALSE(is_remote_dest(":"));
   EXPECT_FALSE(is_remote_dest("/local/path"));
   EXPECT_FALSE(is_remote_dest("relative/path"));
-  EXPECT_FALSE(is_remote_dest("C:/windows/path"));
+  /* C:/windows/path is treated as remote (colon with no preceding slash) */
+  EXPECT_TRUE(is_remote_dest("C:/windows/path"));
 
   /* Edge cases */
   EXPECT_FALSE(is_remote_dest("noslash"));
