@@ -8,28 +8,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-Config* config_create(char* version, char* send_directory, char* receive_directory,
-                      bool save_to_disk, bool use_multithreading, bool use_chunk_serialization,
-                      bool use_compression, bool use_metadata, int compression_level,
-                      bool use_sendfile, unsigned long long chunk_size) {
-
+Config* config_create(void) {
   Config* config = malloc(sizeof(Config));
   if (!config)
     return NULL;
-  config->version = version;
-  config->send_directory = send_directory;
-  config->receive_root_directory = receive_directory;
-  config->save_to_disk = save_to_disk;
-  config->use_multithreading = use_multithreading;
-  config->use_chunk_serialization = use_chunk_serialization;
-  config->use_compression = use_compression;
-  config->use_metadata = use_metadata;
+  config->version = str_dup(PROTOCOL_VERSION);
+  config->send_directory = NULL;
+  config->receive_root_directory = NULL;
+  config->save_to_disk = false;
+  config->use_multithreading = false;
+  config->use_chunk_serialization = false;
+  config->use_compression = false;
+  config->use_metadata = false;
   config->show_progress = false;
   config->dry_run = false;
   config->use_delete = false;
-  config->compression_level = compression_level;
-  config->use_sendfile = use_sendfile;
-  config->chunk_size = chunk_size > 0 ? chunk_size : DEFAULT_CHUNK_SIZE;
+  config->compression_level = 5;
+  config->use_sendfile = false;
+  config->chunk_size = DEFAULT_CHUNK_SIZE;
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
@@ -59,6 +55,8 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
   config->max_depth = 0;
   config->log_file = NULL;
   config->queue_size = 100;
+  config->follow_symlinks = false;
+  config->partial = false;
   return config;
 }
 

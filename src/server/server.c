@@ -144,8 +144,10 @@ void handler(int file_descriptor) {
     thrd_join(writer, NULL);
     send_status(file_descriptor, STATUS_OK);
     pipeline_context_receiver_destroy(context);
-  } else
+  } else {
     receive_files(config, file_descriptor);
+    config_delete(config);
+  }
   close(file_descriptor);
 }
 
@@ -174,6 +176,7 @@ static void print_server_usage(void) {
   printf("  --help              Show this help\n");
 }
 
+#ifndef FASTSYNC_SERVER_AS_LIB
 int main(int argc, char* argv[]) {
   bool use_tls = false;
   char* tls_cert = NULL;
@@ -244,3 +247,4 @@ int main(int argc, char* argv[]) {
   }
   return 0;
 }
+#endif /* !FASTSYNC_SERVER_AS_LIB */
