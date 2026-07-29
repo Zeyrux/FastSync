@@ -126,7 +126,13 @@ static void delete_extras_walk(const char* abs_path, const char* rel_path, Array
     char* child_abs = path_cat((char*)abs_path, entry->d_name);
     char* child_rel = path_cat((char*)rel_path, entry->d_name);
     struct stat st;
-    if (stat(child_abs, &st) != 0) {
+    if (lstat(child_abs, &st) != 0) {
+      free(child_abs);
+      free(child_rel);
+      continue;
+    }
+    // Skip symlinks to prevent following them outside the destination tree
+    if (S_ISLNK(st.st_mode)) {
       free(child_abs);
       free(child_rel);
       continue;

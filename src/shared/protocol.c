@@ -9,7 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_DATA_SIZE (256ULL * 1024 * 1024)          /* 256 MB max per message */
+#define MAX_DATA_SIZE (100ULL * 1024 * 1024)          /* 100 MB max per data message */
 #define RECEIVE_TIMEOUT_SEC 60                        /* 60 second per-message timeout */
 #define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
 
@@ -186,9 +186,9 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_DATA_SIZE) {
+  if (size > MAX_STRING_SIZE) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
-                (unsigned long long)MAX_DATA_SIZE);
+                (unsigned long long)MAX_STRING_SIZE);
     return NULL;
   }
   char* data = (char*)malloc(size + 1);
