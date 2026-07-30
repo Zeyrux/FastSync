@@ -58,6 +58,8 @@ char* str_dup(const char* string) {
     return NULL;
   size_t str_len = strlen(string);
   char* new_string = (char*)malloc(str_len + 1);
+  if (new_string == NULL)
+    return NULL;
   memcpy(new_string, string, str_len + 1);
   return new_string;
 }

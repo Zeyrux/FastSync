@@ -189,7 +189,7 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
       if (backup_path) {
         char* backup_dir_path = str_dup(backup_path);
         if (backup_dir_path) {
-          char* bdir = dirname(backup_dir_path);
+          const char* bdir = dirname(backup_dir_path);
           mkdir_r(bdir);
           free(backup_dir_path);
         }
