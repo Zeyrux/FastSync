@@ -35,7 +35,8 @@ File* file_create(const char* path) {
     return NULL;
   }
 
-  strcpy(file->path, path);
+  memcpy(file->path, path, path_len);
+  file->path[path_len] = '\0';
   file->data = data_create_reserve(0);
   if (file->data == NULL) {
     free(file->path);
