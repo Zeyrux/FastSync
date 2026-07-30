@@ -148,7 +148,7 @@ int receive_thread(void* pipeline_context) {
         }
         char* full_path = path_cat(config->receive_root_directory, check_path);
         struct stat st;
-        bool has_old = full_path && stat(full_path, &st) == 0;
+        bool has_old = full_path && lstat(full_path, &st) == 0;
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
         if (match)
