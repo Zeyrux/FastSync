@@ -1,0 +1,26 @@
+name: Agent Scheduled Maintenance
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Security audit
+        run: |
+          opencode run --agent security-auditor \
+            "Audit the codebase for vulnerabilities. Create issues for any findings via the Gitea API at https://gitea.tap-tap.win/api/v1/repos/${{ github.repository }}/issues using token ${{ secrets.GITEA_TOKEN }}"
+
+      - name: Code quality scan
+        run: |
+          opencode run --agent code-quality-guardian \
+            "Scan for code quality issues. Create issues for any findings via the Gitea API at https://gitea.tap-tap.win/api/v1/repos/${{ github.repository }}/issues using token ${{ secrets.GITEA_TOKEN }}"

@@ -1,0 +1,43 @@
+name: Agent Issue Fix
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  fix:
+    if: contains(github.event.comment.body, '/opencode fix')
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      - name: Create fix branch and implement
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          BRANCH="auto-fix/issue-${ISSUE_NUM}"
+          git checkout -b "$BRANCH" origin/dev
+          opencode run \
+            "Fix this issue: ${{ github.event.issue.body }}"
+          git add -A
+          git commit -m "auto-fix: address issue #${ISSUE_NUM}" || true
+          git push origin "$BRANCH"
+
+      - name: Create PR
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          TITLE="${{ github.event.issue.title }}"
+          curl -s -X POST -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"title\": \"Fix: ${TITLE:0:80}\",
+              \"body\": \"Automated fix for issue #${ISSUE_NUM}\n\nCloses #${ISSUE_NUM}\",
+              \"head\": \"auto-fix/issue-${ISSUE_NUM}\",
+              \"base\": \"dev\"
+            }" \
+            "https://gitea.tap-tap.win/api/v1/repos/${{ github.repository }}/pulls"
