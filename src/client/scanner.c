@@ -369,7 +369,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         free(cur_path);
         continue;
       }
-      link_target[len] = ' ';
+      link_target[len] = 0;
       if (link_target[0] == '/') {
         free(cur_path);
         continue;
@@ -384,7 +384,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         free(cur_path);
         continue;
       }
-      link_target[len] = ' ';
+      link_target[len] = 0;
       bool unsafe = (link_target[0] == '/');
       if (!unsafe) {
         free(cur_path);
