@@ -22,9 +22,12 @@ static void test_sendfile_basic() {
   /* Set the size so file_send_sendfile can report it */
   file->data->size = len;
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
-                              false, false, false, false, 0, false, 0);
+  Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/tmp");
+  cfg->receive_root_directory = str_dup("/tmp");
 
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -80,9 +83,12 @@ static void test_sendfile_empty_file() {
   EXPECT_NOT_NULL(file);
   file->data->size = 0;
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
-                              false, false, false, false, 0, false, 0);
+  Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/tmp");
+  cfg->receive_root_directory = str_dup("/tmp");
 
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -161,8 +167,14 @@ static void test_sendfile_compression_fallback() {
   file->data->size = (size_t)st.st_size;
   EXPECT_TRUE(file_load_data(file));
 
-  Config* cfg = config_create(str_dup(PROTOCOL_VERSION), str_dup("/tmp"), str_dup("/tmp"), false,
-                              false, false, true, false, 3, false, 0);
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/tmp");
+  cfg->receive_root_directory = str_dup("/tmp");
+  cfg->use_compression = true;
+  cfg->compression_level = 3;
   EXPECT_NOT_NULL(cfg);
 
   int p[2];

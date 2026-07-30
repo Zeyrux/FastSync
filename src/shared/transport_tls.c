@@ -79,25 +79,38 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
   return ctx;
 }
 
-static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server) {
+static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* hostname) {
   SSL* ssl = SSL_new(ctx);
   if (!ssl) {
     log_message(LOG_LEVEL_ERROR, "Failed to create SSL object");
     return NULL;
   }
   SSL_set_fd(ssl, fd);
-  int ret;
-  if (is_server)
-    ret = SSL_accept(ssl);
-  else
-    ret = SSL_connect(ssl);
 
-  if (ret <= 0) {
-    log_message(LOG_LEVEL_ERROR, "SSL %s failed", is_server ? "accept" : "connect");
-    log_ssl_errors();
-    SSL_free(ssl);
-    return NULL;
+  // Enable hostname verification for client connections when a hostname is provided.
+  // Must be done before SSL_connect to take effect during the handshake.
+  if (!is_server && hostname) {
+    SSL_set1_host(ssl, hostname);
   }
+
+  // Retry SSL_accept/SSL_connect on WANT_READ/WANT_WRITE (non-blocking handshake)
+  int ret;
+  do {
+    if (is_server)
+      ret = SSL_accept(ssl);
+    else
+      ret = SSL_connect(ssl);
+
+    if (ret <= 0) {
+      int ssl_err = SSL_get_error(ssl, ret);
+      if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+        continue;
+      log_message(LOG_LEVEL_ERROR, "SSL %s failed", is_server ? "accept" : "connect");
+      log_ssl_errors();
+      SSL_free(ssl);
+      return NULL;
+    }
+  } while (ret <= 0);
   return ssl;
 }
 
@@ -117,7 +130,7 @@ struct tls_child_ctx {
 
 static void tls_child_fn(int fd, void* arg) {
   struct tls_child_ctx* ctx = (struct tls_child_ctx*)arg;
-  SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true);
+  SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true, NULL);
   if (!ssl)
     return;
   io_set_ssl(ssl);
@@ -151,12 +164,16 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
     return false;
   client->ssl_ctx = ctx;
 
-  SSL* ssl = wrap_fd_with_ssl(client->file_descriptor, ctx, false);
+  // Pass the server hostname for TLS hostname verification (SSL_set1_host
+  // is called inside wrap_fd_with_ssl before the handshake when ca_path is set).
+  const char* verify_host = ca_path ? host : NULL;
+  SSL* ssl = wrap_fd_with_ssl(client->file_descriptor, ctx, false, verify_host);
   if (!ssl) {
     SSL_CTX_free(ctx);
     client->ssl_ctx = NULL;
     return false;
   }
+
   client->ssl = ssl;
   io_set_ssl(ssl);
   return true;

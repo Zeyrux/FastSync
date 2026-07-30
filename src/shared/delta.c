@@ -1,11 +1,16 @@
 #include "delta.h"
 #include "log.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define XXH_STATIC_LINKING_ONLY
 #define XXH_IMPLEMENTATION
 #include <xxhash.h>
+
+/* Maximum number of blocks/instructions allowed from the wire to prevent OOM */
+#define MAX_DELTA_BLOCKS (1024U * 1024U)       /* 1M signature blocks */
+#define MAX_DELTA_INSTRUCTIONS (1024U * 1024U) /* 1M delta instructions */
 
 uint32_t delta_adler32(const void* data, uint32_t len) {
   const uint8_t* p = (const uint8_t*)data;
@@ -100,6 +105,14 @@ DeltaSignature* delta_signature_deserialize(const Data* data) {
   pos += sizeof(uint32_t);
   memcpy(&sig->block_count, buf + pos, sizeof(uint32_t));
   pos += sizeof(uint32_t);
+
+  // Reject unreasonably large block counts to prevent OOM
+  if (sig->block_count > MAX_DELTA_BLOCKS) {
+    log_message(LOG_LEVEL_ERROR, "Delta signature block count %u exceeds maximum %u",
+                sig->block_count, MAX_DELTA_BLOCKS);
+    free(sig);
+    return NULL;
+  }
 
   uint64_t expected = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t) +
                       (uint64_t)sig->block_count * (sizeof(uint32_t) + sizeof(uint32_t));
@@ -339,6 +352,14 @@ Delta* delta_deserialize(const Data* data) {
   pos += sizeof(uint64_t);
   memcpy(&delta->instruction_count, buf + pos, sizeof(uint32_t));
   pos += sizeof(uint32_t);
+
+  // Reject unreasonably large instruction counts to prevent OOM
+  if (delta->instruction_count > MAX_DELTA_INSTRUCTIONS) {
+    log_message(LOG_LEVEL_ERROR, "Delta instruction count %u exceeds maximum %u",
+                delta->instruction_count, MAX_DELTA_INSTRUCTIONS);
+    free(delta);
+    return NULL;
+  }
 
   delta->instructions = malloc(delta->instruction_count * sizeof(DeltaInstruction));
   if (!delta->instructions) {

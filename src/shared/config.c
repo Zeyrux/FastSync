@@ -8,28 +8,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-Config* config_create(char* version, char* send_directory, char* receive_directory,
-                      bool save_to_disk, bool use_multithreading, bool use_chunk_serialization,
-                      bool use_compression, bool use_metadata, int compression_level,
-                      bool use_sendfile, unsigned long long chunk_size) {
-
+Config* config_create(void) {
   Config* config = malloc(sizeof(Config));
   if (!config)
     return NULL;
-  config->version = version;
-  config->send_directory = send_directory;
-  config->receive_root_directory = receive_directory;
-  config->save_to_disk = save_to_disk;
-  config->use_multithreading = use_multithreading;
-  config->use_chunk_serialization = use_chunk_serialization;
-  config->use_compression = use_compression;
-  config->use_metadata = use_metadata;
+  config->version = str_dup(PROTOCOL_VERSION);
+  config->send_directory = NULL;
+  config->receive_root_directory = NULL;
+  config->save_to_disk = false;
+  config->use_multithreading = false;
+  config->use_chunk_serialization = false;
+  config->use_compression = false;
+  config->use_metadata = false;
   config->show_progress = false;
   config->dry_run = false;
   config->use_delete = false;
-  config->compression_level = compression_level;
-  config->use_sendfile = use_sendfile;
-  config->chunk_size = chunk_size > 0 ? chunk_size : DEFAULT_CHUNK_SIZE;
+  config->compression_level = 5;
+  config->use_sendfile = false;
+  config->chunk_size = DEFAULT_CHUNK_SIZE;
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
@@ -59,6 +55,40 @@ Config* config_create(char* version, char* send_directory, char* receive_directo
   config->max_depth = 0;
   config->log_file = NULL;
   config->queue_size = 100;
+  config->follow_symlinks = false;
+  config->partial = false;
+  config->copy_links = false;
+  config->safe_links = false;
+  config->copy_unsafe_links = false;
+  config->preserve_hard_links = false;
+  config->preserve_acls = false;
+  config->preserve_xattrs = false;
+  config->preserve_devices = false;
+  config->preserve_sparse = false;
+  config->itemize_changes = false;
+  config->out_format = NULL;
+  config->info_level = 0;
+  config->debug_level = 0;
+  config->list_only = false;
+  config->human_readable = false;
+  config->update = false;
+  config->inplace = false;
+  config->append = false;
+  config->append_verify = false;
+  config->delete_excluded = false;
+  config->delete_after = false;
+  config->max_delete = 0;
+  config->filters = NULL;
+  config->files_from = NULL;
+  config->cvs_exclude = false;
+  config->prune_empty_dirs = false;
+  config->relative = false;
+  config->rsh_command = NULL;
+  config->rsync_path = NULL;
+  config->temp_dir = NULL;
+  config->compare_dest = NULL;
+  config->copy_dest = NULL;
+  config->link_dest = NULL;
   return config;
 }
 
@@ -105,6 +135,17 @@ void config_delete(Config* config) {
   free(config->tls_ca);
   free(config->backup_dir);
   free(config->server_host);
+  free(config->out_format);
+  free(config->files_from);
+  free(config->rsh_command);
+  free(config->rsync_path);
+  free(config->temp_dir);
+  free(config->compare_dest);
+  free(config->copy_dest);
+  free(config->link_dest);
+  if (config->filters) {
+    array_list_delete(config->filters);
+  }
   free(config);
 }
 
@@ -144,6 +185,44 @@ bool config_send(int file_descriptor, const Config* config) {
   if (!send_int(file_descriptor, config->backup))
     return false;
   if (!send_str(file_descriptor, config->backup_dir ? config->backup_dir : ""))
+    return false;
+  if (!send_int(file_descriptor, config->follow_symlinks))
+    return false;
+  if (!send_int(file_descriptor, config->copy_links))
+    return false;
+  if (!send_int(file_descriptor, config->safe_links))
+    return false;
+  if (!send_int(file_descriptor, config->copy_unsafe_links))
+    return false;
+  if (!send_int(file_descriptor, config->preserve_hard_links))
+    return false;
+  if (!send_int(file_descriptor, config->preserve_acls))
+    return false;
+  if (!send_int(file_descriptor, config->preserve_xattrs))
+    return false;
+  if (!send_int(file_descriptor, config->preserve_devices))
+    return false;
+  if (!send_int(file_descriptor, config->preserve_sparse))
+    return false;
+  if (!send_int(file_descriptor, config->update))
+    return false;
+  if (!send_int(file_descriptor, config->inplace))
+    return false;
+  if (!send_int(file_descriptor, config->append))
+    return false;
+  if (!send_int(file_descriptor, config->append_verify))
+    return false;
+  if (!send_int(file_descriptor, config->delete_excluded))
+    return false;
+  if (!send_int(file_descriptor, config->delete_after))
+    return false;
+  if (!send_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
+    return false;
+  if (!send_int(file_descriptor, config->relative))
+    return false;
+  if (!send_int(file_descriptor, config->prune_empty_dirs))
+    return false;
+  if (!send_str(file_descriptor, config->temp_dir ? config->temp_dir : ""))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -247,11 +326,100 @@ Config* config_receive(int file_descriptor) {
   config->max_depth = 0;
   config->log_file = NULL;
   config->queue_size = 100;
+  config->follow_symlinks = false;
+  config->copy_links = false;
+  config->safe_links = false;
+  config->copy_unsafe_links = false;
+  config->preserve_hard_links = false;
+  config->preserve_acls = false;
+  config->preserve_xattrs = false;
+  config->preserve_devices = false;
+  config->preserve_sparse = false;
+  config->itemize_changes = false;
+  config->out_format = NULL;
+  config->info_level = 0;
+  config->debug_level = 0;
+  config->list_only = false;
+  config->human_readable = false;
+  config->update = false;
+  config->inplace = false;
+  config->append = false;
+  config->append_verify = false;
+  config->delete_excluded = false;
+  config->delete_after = false;
+  config->max_delete = 0;
+  config->filters = NULL;
+  config->files_from = NULL;
+  config->cvs_exclude = false;
+  config->prune_empty_dirs = false;
+  config->relative = false;
+  config->rsh_command = NULL;
+  config->rsync_path = NULL;
+  config->temp_dir = NULL;
+  config->compare_dest = NULL;
+  config->copy_dest = NULL;
+  config->link_dest = NULL;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->backup = tmp;
   config->backup_dir = receive_str(file_descriptor);
   if (config->backup_dir == NULL)
+    goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->follow_symlinks = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->copy_links = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->safe_links = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->copy_unsafe_links = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->preserve_hard_links = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->preserve_acls = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->preserve_xattrs = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->preserve_devices = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->preserve_sparse = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->update = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->inplace = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->append = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->append_verify = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->delete_excluded = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->delete_after = tmp;
+  if (!receive_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
+    goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->relative = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->prune_empty_dirs = tmp;
+  config->temp_dir = receive_str(file_descriptor);
+  if (config->temp_dir == NULL)
     goto error;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
@@ -265,6 +433,7 @@ error:
   free(config->receive_root_directory);
   free(config->server_host);
   free(config->backup_dir);
+  free(config->temp_dir);
   free(config);
   return NULL;
 }

@@ -5,8 +5,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Maximum allowed string size for receive_str (10 MB) */
-#define MAX_STRING_SIZE (10 * 1024 * 1024)
+/* Maximum allowed string size for receive_str (64 KB) */
+#define MAX_STRING_SIZE (64 * 1024)
+
+/* Maximum allowed data payload size for receive_data (100 MB) */
+#define MAX_DATA_PAYLOAD_SIZE (100ULL * 1024 * 1024)
 
 typedef struct ssl_st SSL;
 
@@ -29,6 +32,7 @@ enum NET_STATUS {
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
 void io_set_ssl(SSL* ssl);
+SSL* io_get_ssl(void);
 bool send_n_data(int file_descriptor, const void* data, size_t data_size);
 bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 

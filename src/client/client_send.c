@@ -25,6 +25,45 @@
 
 #define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
+/* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
+static int send_dry_run_manifest(Config* config) {
+  DirectoryScanner* scanner = directory_scanner_create(
+      config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
+      config->exclude_count, config->include_patterns, config->include_count, config->max_size,
+      config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
+      config->safe_links, config->copy_unsafe_links);
+  if (!scanner)
+    return -1;
+  Chunk* chunk;
+  int file_count = 0;
+  unsigned long long total_bytes = 0;
+  printf("Dry run: files to be transferred\n");
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+      total_bytes += chunk->items[i]->data->size;
+      file_count++;
+    }
+    chunk_destroy(chunk);
+  }
+  directory_scanner_destroy(scanner);
+  printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
+  return 0;
+}
+
+/* Send the delete manifest (list of files) to the server. Returns 0 on success, -1 on failure. */
+static int send_delete_manifest(int fd, ArrayList* manifest) {
+  if (!send_status(fd, STATUS_MANIFEST))
+    return -1;
+  if (!send_int(fd, manifest->size))
+    return -1;
+  for (int i = 0; i < manifest->size; i++) {
+    if (!send_str(fd, (char*)manifest->items[i]))
+      return -1;
+  }
+  return 0;
+}
+
 static int incremental_check(Client* client, File* file, DeltaSignature** out_sig) {
   *out_sig = NULL;
   if (!send_status(client->file_descriptor, STATUS_CHECK))
@@ -268,14 +307,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
       if (context->config->use_delete) {
-        if (!send_status(client->file_descriptor, STATUS_MANIFEST))
+        if (send_delete_manifest(client->file_descriptor, context->manifest) != 0)
           goto send_fail;
-        if (!send_int(client->file_descriptor, context->manifest->size))
-          goto send_fail;
-        for (int i = 0; i < context->manifest->size; i++) {
-          if (!send_str(client->file_descriptor, (char*)context->manifest->items[i]))
-            goto send_fail;
-        }
       }
       if (!send_status(client->file_descriptor, STATUS_FINISHED))
         goto send_fail;
@@ -306,7 +339,8 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->send_directory, context->config->use_metadata, context->config->chunk_size,
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
-      context->config->min_size, context->config->max_depth, 4);
+      context->config->min_size, context->config->max_depth, 4, context->config->follow_symlinks,
+      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links);
 
   Chunk* current_chunk;
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -365,27 +399,8 @@ static int load_files_multithreaded(void* pipeline_context) {
 }
 
 int send_files(Config* config) {
-  if (config->dry_run) {
-    DirectoryScanner* scanner = directory_scanner_create(
-        config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
-        config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size, config->max_depth);
-    Chunk* chunk;
-    int file_count = 0;
-    unsigned long long total_bytes = 0;
-    printf("Dry run: files to be transferred\n");
-    while ((chunk = directory_scanner_next(scanner)) != NULL) {
-      for (int i = 0; i < chunk->element_count; i++) {
-        printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
-        total_bytes += chunk->items[i]->data->size;
-        file_count++;
-      }
-      chunk_destroy(chunk);
-    }
-    directory_scanner_destroy(scanner);
-    printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
-    return 0;
-  }
+  if (config->dry_run)
+    return send_dry_run_manifest(config);
 
   Client* client;
   if (config->transport == TRANSPORT_SSH) {
@@ -423,7 +438,8 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-      config->min_size, config->max_depth);
+      config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
+      config->safe_links, config->copy_unsafe_links);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   time_t last_progress = 0;
@@ -470,19 +486,9 @@ int send_files(Config* config) {
     chunk_destroy(current_chunk);
   }
   if (config->use_delete) {
-    if (!send_status(client->file_descriptor, STATUS_MANIFEST)) {
+    if (send_delete_manifest(client->file_descriptor, manifest) != 0) {
       array_list_delete(manifest);
       goto send_fail;
-    }
-    if (!send_int(client->file_descriptor, manifest->size)) {
-      array_list_delete(manifest);
-      goto send_fail;
-    }
-    for (int i = 0; i < manifest->size; i++) {
-      if (!send_str(client->file_descriptor, (char*)manifest->items[i])) {
-        array_list_delete(manifest);
-        goto send_fail;
-      }
     }
     array_list_delete(manifest);
   }
@@ -498,37 +504,18 @@ int send_files(Config* config) {
   directory_scanner_destroy(scanner);
   client_disconnect(client);
   client_delete(client);
-  return ok ? 0 : -1;
+  return ok ? 0 : 1;
 
 send_fail:
   directory_scanner_destroy(scanner);
   client_disconnect(client);
   client_delete(client);
-  return -1;
+  return 1;
 }
 
 int send_files_multithreaded(Config* config) {
-  if (config->dry_run) {
-    DirectoryScanner* scanner = directory_scanner_create(
-        config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
-        config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-        config->min_size, config->max_depth);
-    Chunk* chunk;
-    int file_count = 0;
-    unsigned long long total_bytes = 0;
-    printf("Dry run: files to be transferred\n");
-    while ((chunk = directory_scanner_next(scanner)) != NULL) {
-      for (int i = 0; i < chunk->element_count; i++) {
-        printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
-        total_bytes += chunk->items[i]->data->size;
-        file_count++;
-      }
-      chunk_destroy(chunk);
-    }
-    directory_scanner_destroy(scanner);
-    printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
-    return 0;
-  }
+  if (config->dry_run)
+    return send_dry_run_manifest(config);
 
   long pages = sysconf(_SC_AVPHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);
@@ -575,5 +562,5 @@ int send_files_multithreaded(Config* config) {
   thrd_join(sender, &sender_result);
 
   pipeline_context_sender_destroy(context);
-  return sender_result == thrd_success ? 0 : -1;
+  return sender_result == thrd_success ? 0 : 1;
 }

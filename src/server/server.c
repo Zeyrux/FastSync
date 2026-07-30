@@ -69,7 +69,7 @@ int receive_files(Config* config, int fd) {
         }
         char* full_path = path_cat(config->receive_root_directory, check_path);
         struct stat st;
-        bool has_old = full_path && stat(full_path, &st) == 0;
+        bool has_old = full_path && lstat(full_path, &st) == 0;
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
         if (match)
@@ -112,6 +112,7 @@ int receive_files(Config* config, int fd) {
 }
 
 void handler(int file_descriptor) {
+  SSL* ssl = io_get_ssl();
   Config* config = config_receive(file_descriptor);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
@@ -125,7 +126,8 @@ void handler(int file_descriptor) {
       close(file_descriptor);
       return;
     }
-    PipelineContextReceiver* context = pipeline_context_receiver_create(config, q, file_descriptor);
+    PipelineContextReceiver* context =
+        pipeline_context_receiver_create(config, q, file_descriptor, ssl);
     if (context == NULL) {
       queue_destroy(q);
       config_delete(config);
@@ -144,11 +146,14 @@ void handler(int file_descriptor) {
     thrd_join(writer, NULL);
     send_status(file_descriptor, STATUS_OK);
     pipeline_context_receiver_destroy(context);
-  } else
+  } else {
     receive_files(config, file_descriptor);
+    config_delete(config);
+  }
   close(file_descriptor);
 }
 
+#ifndef FASTSYNC_SERVER_AS_LIB
 static Server* g_server = NULL;
 
 static void cleanup(int sig) {
@@ -244,3 +249,4 @@ int main(int argc, char* argv[]) {
   }
   return 0;
 }
+#endif /* !FASTSYNC_SERVER_AS_LIB */

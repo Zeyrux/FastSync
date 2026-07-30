@@ -78,14 +78,21 @@ Data* data_decompress(Data* compressed_data) {
     return NULL;
   }
 
+  // ZSTD_CONTENTSIZE_UNKNOWN (~2^64) can cause massive allocation;
+  // fall back to a conservative estimate (3x compressed size) when unknown.
+  if (dst_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+    dst_size = compressed_data->size * 3;
+    if (dst_size < INITIAL_DECOMPRESS_BUF_SIZE)
+      dst_size = INITIAL_DECOMPRESS_BUF_SIZE;
+  }
+
   ZSTD_DCtx* dctx = ZSTD_createDCtx();
   if (!dctx) {
     log_message(LOG_LEVEL_ERROR, "Failed to create ZSTD decompression context");
     return NULL;
   }
 
-  size_t buf_size =
-      (!ZSTD_isError(dst_size) && dst_size > 0) ? (size_t)dst_size : INITIAL_DECOMPRESS_BUF_SIZE;
+  size_t buf_size = (dst_size > 0) ? (size_t)dst_size : INITIAL_DECOMPRESS_BUF_SIZE;
   Data* uncompressed_data = data_create_empty(buf_size);
   if (!uncompressed_data) {
     log_message(LOG_LEVEL_ERROR, "Failed to allocate decompression buffer");

@@ -18,8 +18,8 @@ static void test_scanner_single_file() {
   EXPECT_EQ_INT(mkdir(dir, 0755), 0);
   create_test_file(file1, content1);
 
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0,
+                                                       0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -47,8 +47,8 @@ static void test_scanner_multiple_files() {
   create_test_file(file1, content1);
   create_test_file(file2, content2);
 
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0,
+                                                       0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   const Chunk* chunk = directory_scanner_next(scanner);
@@ -87,8 +87,8 @@ static void test_scanner_subdirectory() {
   create_test_file(root_file, content);
   create_test_file(sub_file, content);
 
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)root, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)root, false, 0, NULL, 0, NULL, 0, 0,
+                                                       0, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   int total_files = 0;
@@ -111,8 +111,8 @@ static void test_scanner_empty_directory() {
 
   EXPECT_EQ_INT(mkdir(dir, 0755), 0);
 
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0,
+                                                       0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   const Chunk* chunk = directory_scanner_next(scanner);
@@ -135,8 +135,8 @@ static void test_scanner_exclude_pattern() {
   create_test_file(f_tmp, content);
 
   char* exclude[] = {"*.tmp"};
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, exclude, 1, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, exclude, 1, NULL, 0, 0,
+                                                       0, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -168,8 +168,8 @@ static void test_scanner_exclude_subdirectory() {
   create_test_file(sub_tmp, content);
 
   char* exclude[] = {"*.tmp"};
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)root, false, 0, exclude, 1, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)root, false, 0, exclude, 1, NULL, 0,
+                                                       0, 0, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   int total = 0;
@@ -206,8 +206,8 @@ static void test_scanner_include_and_exclude() {
 
   char* exclude[] = {"*.bak"};
   char* include[] = {"*.txt", "*.log"};
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, exclude, 1, include, 2, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, exclude, 1, include, 2,
+                                                       0, 0, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -243,8 +243,8 @@ static void test_scanner_max_size() {
   create_test_file(large, "this_content_is_longer_than_ten_chars");
 
   /* max_size = 10 — only files <= 10 bytes */
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 10, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 10,
+                                                       0, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -271,8 +271,8 @@ static void test_scanner_min_size() {
   create_test_file(data_f, "some content here");
 
   /* min_size = 1 — only files >= 1 byte */
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 1, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 1,
+                                                       0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -301,8 +301,8 @@ static void test_scanner_size_range() {
   create_test_file(huge, "this is a much larger file for testing size filters");
 
   /* Only files between 3 and 20 bytes */
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 20, 3, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 20,
+                                                       3, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -337,8 +337,8 @@ static void test_scanner_mixed_patterns() {
   /* Exclude *.bak, include *.txt, min_size=3, max_size=10 */
   char* exclude[] = {"*.bak"};
   char* include[] = {"*.txt"};
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, exclude, 1, include, 1, 10, 3, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, exclude, 1, include, 1,
+                                                       10, 3, 0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);
@@ -368,8 +368,8 @@ static void test_scanner_no_patterns() {
   create_test_file(f1, "first");
   create_test_file(f2, "second");
 
-  DirectoryScanner* scanner =
-      directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0, 0);
+  DirectoryScanner* scanner = directory_scanner_create((char*)dir, false, 0, NULL, 0, NULL, 0, 0, 0,
+                                                       0, false, false, false, false);
   EXPECT_NOT_NULL(scanner);
 
   Chunk* chunk = directory_scanner_next(scanner);

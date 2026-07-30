@@ -54,13 +54,14 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
 }
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue,
-                                                          int file_descriptor) {
+                                                          int file_descriptor, SSL* ssl) {
   PipelineContextReceiver* context = malloc(sizeof(PipelineContextReceiver));
   if (context == NULL)
     return NULL;
   context->config = config;
   context->queue = queue;
   context->file_descriptor = file_descriptor;
+  context->ssl = ssl;
   context->receiver_done = false;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full) != thrd_success ||
@@ -81,10 +82,10 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   free(context);
 }
 
-static void receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
+static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
   Chunk* chunk = receive_chunk_data(file_descriptor, context->config);
   if (chunk == NULL)
-    return;
+    return false;
 
   for (int i = 0; i < chunk->element_count; i++) {
     File* file = chunk->items[i];
@@ -93,10 +94,13 @@ static void receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
                                 &context->condition_not_empty, &context->condition_not_full);
   }
   chunk_destroy(chunk);
+  return true;
 }
 
 int receive_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
+  if (context->ssl)
+    io_set_ssl(context->ssl);
   mtx_lock(&context->mutex);
   int file_descriptor = context->file_descriptor;
   const Config* config = context->config;
@@ -125,7 +129,8 @@ int receive_thread(void* pipeline_context) {
                                     &context->condition_not_empty, &context->condition_not_full);
       }
     } else if (status == STATUS_CHUNK) {
-      receive_chunk_enqueue(file_descriptor, context);
+      if (!receive_chunk_enqueue(file_descriptor, context))
+        return thrd_error;
     } else if (status == STATUS_CHECK_BATCH) {
       int count;
       if (!receive_int(file_descriptor, &count))
@@ -143,7 +148,7 @@ int receive_thread(void* pipeline_context) {
         }
         char* full_path = path_cat(config->receive_root_directory, check_path);
         struct stat st;
-        bool has_old = full_path && stat(full_path, &st) == 0;
+        bool has_old = full_path && lstat(full_path, &st) == 0;
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
         if (match)
@@ -161,6 +166,7 @@ int receive_thread(void* pipeline_context) {
                                     &context->condition_not_empty, &context->condition_not_full);
       } else {
         log_message(LOG_LEVEL_ERROR, "Failed to receive file");
+        return thrd_error;
       }
     }
   next:
@@ -180,6 +186,8 @@ int receive_thread(void* pipeline_context) {
 
 int write_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
+  if (context->ssl)
+    io_set_ssl(context->ssl);
   mtx_lock(&context->mutex);
   bool save_to_disk = context->config->save_to_disk;
   char* root_directory = str_dup(context->config->receive_root_directory);

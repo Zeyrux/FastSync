@@ -6,7 +6,9 @@
 #include "array_list.h"
 #include "config.h"
 #include "file.h"
+#include "protocol.h"
 #include "queue.h"
+#include <openssl/ssl.h>
 
 typedef struct {
   Config* config;
@@ -27,6 +29,7 @@ typedef struct PipelineContextReceiver {
   Queue* queue;
   Config* config;
   int file_descriptor;
+  SSL* ssl;
   mtx_t mutex;
   cnd_t condition_not_full;
   cnd_t condition_not_empty;
@@ -37,7 +40,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
                                                       Queue* queue_loader);
 void pipeline_context_sender_destroy(PipelineContextSender* context);
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,
-                                                          int file_descriptor);
+                                                          int file_descriptor, SSL* ssl);
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context);
 int receive_thread(void* pipeline_context);
 int write_thread(void* pipeline_context);
