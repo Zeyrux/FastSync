@@ -13,7 +13,7 @@
 static void test_chunk_deserialize_truncated() {
   char* path = "test_rob_trunc.txt";
   char* content = "hello";
-  to_disk(path, content, strlen(content));
+  to_disk(path, content, strlen(content), false, false);
 
   struct stat st;
   stat(path, &st);

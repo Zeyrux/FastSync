@@ -34,7 +34,7 @@ static int send_dry_run_manifest(Config* config) {
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
       config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links, false);
+      config->safe_links, config->copy_unsafe_links, config->checksum);
   if (!scanner)
     return -1;
   Chunk* chunk;
@@ -374,7 +374,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
       context->config->min_size, context->config->max_depth, 4, context->config->follow_symlinks,
-      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links, false);
+      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links, context->config->checksum);
 
   Chunk* current_chunk;
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -509,9 +509,10 @@ int send_files(Config* config) {
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
       config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links, false);
+      config->safe_links, config->copy_unsafe_links, config->checksum);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
+  int total_files = 0;
   time_t last_progress = 0;
   time_t start = time(NULL);
   ArrayList* manifest = config->use_delete ? array_list_create(free) : NULL;
@@ -519,6 +520,7 @@ int send_files(Config* config) {
     unsigned long long chunk_bytes = 0;
     for (int i = 0; i < current_chunk->element_count; i++) {
       chunk_bytes += current_chunk->items[i]->data->size;
+      total_files++;
       if (manifest) {
         const char* p = current_chunk->items[i]->path;
         if (*p == '/')
@@ -566,10 +568,15 @@ int send_files(Config* config) {
     goto send_fail;
   Status s;
   int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
+  double elapsed_total = difftime(time(NULL), start);
   if (config->show_progress) {
-    double elapsed = difftime(time(NULL), start);
-    double rate = elapsed > 0 ? total_bytes / (1048576.0 * elapsed) : 0;
+    double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
     fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  Done.\n", total_bytes / 1048576.0, rate);
+  }
+  if (config->stats) {
+    double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
+    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files,
+            total_bytes / 1048576.0, rate);
   }
   directory_scanner_destroy(scanner);
   client_disconnect(client);
