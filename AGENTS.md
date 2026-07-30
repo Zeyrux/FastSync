@@ -125,39 +125,55 @@ git push origin dev
 
 ## Automated Agent Workflows
 
-When a PR targeting `dev` is opened or synchronized, Gitea Actions workflows automatically run agents to review the code and post results as PR comments. This replaces the manual "invoke 3 reviewers" pattern.
+All agents run locally via the opencode CLI. There is no CI-based agent automation — agents are invoked on-demand by the developer or by this assistant.
 
-### Automated PR Review
-Triggered on `pull_request: [opened, synchronize, ready_for_review]`. Runs security-auditor and code-quality-guardian, posts combined review to PR.
+### One-command batch workflow
 
-### Automated Issue Fix
-Comment `/opencode fix` on any issue — agents will create a fix branch, implement the fix, and open a PR targeting `dev`.
-
-### Scheduled Maintenance
-Runs weekly (Monday 06:00 UTC) — security audit of the full codebase, creates issues for findings.
-
-### Batch Merge Orchestration
-For grouping multiple fixes into one integration PR (like the `integration/all-fixes` pattern):
-1. Push each fix branch independently (targetting `dev`)
-2. Use `workflow_dispatch` on `agent-batch-merge.yml` with comma-separated branch names
-3. The workflow merges all branches into `dev`, resolves conflicts, runs build + tests, and pushes
-
-## Manual PR Invocation
-
-When automated agents are unavailable or you need a targeted review, invoke agents directly:
+For fixing a set of issues and creating one integration PR:
 
 ```bash
-# Run all 3 reviewers on a PR diff
-opencode run --agent reviewer "Review this PR"
-opencode run --agent security-auditor "Audit this PR for vulnerabilities"
-opencode run --agent code-quality-guardian "Check this PR for code quality"
+# 1. Run each subagent on its category
+opencode run --agent security-auditor "Fix all open security issues"
+opencode run --agent debugger "Fix all open bugs"
+opencode run --agent test-writer "Add missing test coverage"
 
-# Post results to Gitea
-curl -s -X POST -H "Authorization: token $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"body":"MARKDOWN_REVIEW_BODY"}' \
-  "https://gitea.tap-tap.win/api/v1/repos/TapTap/FastSync/issues/<PR_NUMBER>/comments"
+# 2. The assistant handles: merging branches, fixing CI failures,
+#    pushing, creating the integration PR, waiting for CI, iterating.
+#    The developer only reviews the final PR.
 ```
+
+### Issue triage loop
+When you want to fix a batch of issues autonomously:
+
+1. Tell the assistant: *"Fix all open issues and create one big PR"*
+2. The assistant delegates to subagents in parallel
+3. Merges their branches, handles CI failures iteratively
+4. Pushes and opens the final PR
+5. You review the PR once CI passes — no intermediate check-ins
+
+### Scheduling
+For periodic maintenance (security audits, code quality scans), run:
+
+```bash
+opencode run --agent security-auditor "Audit the codebase for vulnerabilities"
+opencode run --agent code-quality-guardian "Scan for code quality issues"
+```
+
+This can be cron'd locally if desired (e.g., `crontab -e` with `opencode run`).
+
+## Is opencode a good option?
+
+**Yes, for FastSync's needs.** The hybrid model works well:
+- opencode's 17 specialized agents handle deep code analysis, fixes, tests, and reviews
+- The assistant orchestrates subagents, merges branches, and iterates on CI
+- You only review the final output
+
+The key limitation: opencode is session-based, not a persistent daemon. But for the "fix all issues, one PR" workflow, this is fine — the assistant runs the full pipeline in one shot. Persistent webhook-driven automation isn't available for Gitea, but the one-shot batch approach is simpler and gives you full control over what gets merged.
+
+### Recommendations for this project
+- **Do** use the batch pattern: delegate to subagents, let the assistant merge + iterate CI, review once
+- **Don't** try to run opencode in Gitea Actions — the CI container doesn't have your LLM keys or the interactive context agents need
+- **If** you want fully hands-off periodic scans, set up a local cron job or systemd timer that runs `opencode run` and posts results to Gitea via API
 
 ## Gitea API & tea CLI
 
