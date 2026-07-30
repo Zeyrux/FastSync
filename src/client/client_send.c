@@ -25,13 +25,16 @@
 
 #define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
+/* Forward declaration for progress-reporting thread used in multithreaded send. */
+static int progress_thread_fn(void* arg);
+
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
 static int send_dry_run_manifest(Config* config) {
   DirectoryScanner* scanner = directory_scanner_create(
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
       config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links);
+      config->safe_links, config->copy_unsafe_links, false);
   if (!scanner)
     return -1;
   Chunk* chunk;
@@ -163,7 +166,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   if (!use_incremental) {
     if (use_sendfile) {
       return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata) ? 0
-                                                                                            : -1;
+                                                                                             : -1;
     }
     return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level)
                ? 0
@@ -271,6 +274,9 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   if (context->config->transport == TRANSPORT_SSH) {
     if (context->config->use_sendfile) {
       fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
+      mtx_lock(&context->mutex_progress);
+      context->sender_done = true;
+      mtx_unlock(&context->mutex_progress);
       return 1;
     }
     client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port,
@@ -278,11 +284,14 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   } else if (context->config->use_tls) {
     client = client_create();
     if (!client || !client_connect_tls(client, context->config->server_host,
-                                       context->config->server_port, context->config->tls_cert,
-                                       context->config->tls_key, context->config->tls_ca)) {
+                                        context->config->server_port, context->config->tls_cert,
+                                        context->config->tls_key, context->config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
+      mtx_lock(&context->mutex_progress);
+      context->sender_done = true;
+      mtx_unlock(&context->mutex_progress);
       return thrd_error;
     }
   } else {
@@ -292,12 +301,18 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server\n");
+      mtx_lock(&context->mutex_progress);
+      context->sender_done = true;
+      mtx_unlock(&context->mutex_progress);
       return thrd_error;
     }
   }
   if (!config_send(client->file_descriptor, context->config)) {
     client_disconnect(client);
     client_delete(client);
+    mtx_lock(&context->mutex_progress);
+    context->sender_done = true;
+    mtx_unlock(&context->mutex_progress);
     return thrd_error;
   }
 
@@ -316,18 +331,37 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
       client_disconnect(client);
       client_delete(client);
+      mtx_lock(&context->mutex_progress);
+      context->sender_done = true;
+      mtx_unlock(&context->mutex_progress);
       return ok ? thrd_success : thrd_error;
 
     send_fail:
       client_disconnect(client);
       client_delete(client);
+      mtx_lock(&context->mutex_progress);
+      context->sender_done = true;
+      mtx_unlock(&context->mutex_progress);
       return thrd_error;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
       fprintf(stderr, "Error: unexpected error while sending chunk\n");
       client_disconnect(client);
       client_delete(client);
+      mtx_lock(&context->mutex_progress);
+      context->sender_done = true;
+      mtx_unlock(&context->mutex_progress);
       return thrd_error;
+    }
+    if (context->config->show_progress) {
+      unsigned long long chunk_bytes = 0;
+      for (int i = 0; i < current_chunk->element_count; i++) {
+        if (current_chunk->items[i] && current_chunk->items[i]->data)
+          chunk_bytes += current_chunk->items[i]->data->size;
+      }
+      mtx_lock(&context->mutex_progress);
+      context->progress_bytes += chunk_bytes;
+      mtx_unlock(&context->mutex_progress);
     }
     chunk_destroy(current_chunk);
   }
@@ -340,7 +374,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
       context->config->min_size, context->config->max_depth, 4, context->config->follow_symlinks,
-      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links);
+      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links, false);
 
   Chunk* current_chunk;
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -398,6 +432,42 @@ static int load_files_multithreaded(void* pipeline_context) {
   }
 }
 
+/* Progress-reporting thread for multithreaded send. Runs in parallel with
+   the scanner/loader/sender threads and prints periodic progress to stderr. */
+static int progress_thread_fn(void* arg) {
+  PipelineContextSender* context = (PipelineContextSender*)arg;
+  time_t last_progress = 0;
+  time_t start = time(NULL);
+
+  while (true) {
+    mtx_lock(&context->mutex_progress);
+    bool done = context->sender_done;
+    unsigned long long total = context->progress_bytes;
+    mtx_unlock(&context->mutex_progress);
+
+    if (done) {
+      time_t now = time(NULL);
+      double elapsed = difftime(now, start);
+      double rate = elapsed > 0.0 ? total / (1048576.0 * elapsed) : 0.0;
+      fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  Done.\n", total / 1048576.0, rate);
+      break;
+    }
+
+    time_t now = time(NULL);
+    if (now - last_progress >= 1) {
+      last_progress = now;
+      double elapsed = difftime(now, start);
+      double rate = elapsed > 0.0 ? total / (1048576.0 * elapsed) : 0.0;
+      fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  ", total / 1048576.0, rate);
+      fflush(stderr);
+    }
+
+    struct timespec ts = {0, 100 * 1000000L}; /* 100 ms */
+    thrd_sleep(&ts, NULL);
+  }
+  return thrd_success;
+}
+
 int send_files(Config* config) {
   if (config->dry_run)
     return send_dry_run_manifest(config);
@@ -415,7 +485,7 @@ int send_files(Config* config) {
   } else if (config->use_tls) {
     client = client_create();
     if (!client || !client_connect_tls(client, config->server_host, config->server_port,
-                                       config->tls_cert, config->tls_key, config->tls_ca)) {
+                                        config->tls_cert, config->tls_key, config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
@@ -439,7 +509,7 @@ int send_files(Config* config) {
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
       config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links);
+      config->safe_links, config->copy_unsafe_links, false);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   time_t last_progress = 0;
@@ -547,7 +617,7 @@ int send_files_multithreaded(Config* config) {
   if (config->use_delete)
     context->manifest = array_list_create(free);
 
-  thrd_t scanner, loader, sender;
+  thrd_t scanner, loader, sender, progress;
   if (thrd_create(&scanner, scan_directory_multithreaded, context) != thrd_success ||
       thrd_create(&loader, load_files_multithreaded, context) != thrd_success ||
       thrd_create(&sender, send_chunks_multithreaded, context) != thrd_success) {
@@ -556,10 +626,25 @@ int send_files_multithreaded(Config* config) {
     return 1;
   }
 
+  if (config->show_progress) {
+    if (thrd_create(&progress, progress_thread_fn, context) != thrd_success) {
+      perror("Error creating progress thread.\n");
+      /* Non-fatal; continue without progress reporting */
+    }
+  }
+
   int sender_result;
   thrd_join(scanner, NULL);
   thrd_join(loader, NULL);
   thrd_join(sender, &sender_result);
+
+  if (config->show_progress) {
+    /* Signal progress thread to exit if it hasn't already */
+    mtx_lock(&context->mutex_progress);
+    context->sender_done = true;
+    mtx_unlock(&context->mutex_progress);
+    thrd_join(progress, NULL);
+  }
 
   pipeline_context_sender_destroy(context);
   return sender_result == thrd_success ? 0 : 1;

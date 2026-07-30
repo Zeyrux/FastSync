@@ -23,8 +23,8 @@ static void test_server_delete_null() {
 static void test_client_create() {
   Client* c = client_create();
   EXPECT_NOT_NULL(c);
-  EXPECT_TRUE(c->file_descriptor >= 0);
-  EXPECT_EQ_INT(c->address.sin_family, AF_INET);
+  EXPECT_TRUE(c->file_descriptor == -1);
+  EXPECT_EQ_INT(c->address.ss_family, 0);
   EXPECT_EQ_INT(c->ssh_child_pid, -1);
   EXPECT_NULL(c->ssl);
   EXPECT_NULL(c->ssl_ctx);
