@@ -60,48 +60,6 @@ python3 -m pytest tests/     # integration tests
 
 When running the CI workflow via `tea` (the task execution agent), always set a sufficient timeout (e.g., 600000ms) to allow CI to finish. After CI completes, check the results yourself — do not assume success. Use `gh run watch` or similar to monitor CI status, then inspect logs on failure.
 
-## Branch Strategy
-
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch before making changes:
-```bash
-git checkout -b <feature-branch-name>
-```
-After committing changes, push the branch and create a PR:
-```bash
-git push -u origin <feature-branch-name>
-gh pr create --fill
-```
-Wait for CI to pass on the PR before merging.
-
-## Batch PR Workflow
-
-When handling multiple issues split across several PRs that target the same files:
-
-1. **Group issues by logical category** into separate PR branches (e.g., memory-safety, refactoring, test-coverage).
-2. **Fix and push** each branch independently. Let CI run on each PR.
-3. **Run all 3 reviewer types** on each PR and post results to Gitea via `tea pr approve/reject` or the Gitea API:
-   - `reviewer` — general code correctness
-   - `code-quality-guardian` — code quality, duplication, complexity
-   - `security-auditor` — vulnerability assessment
-4. **Iterate**: if any reviewer requests changes, fix, push, re-review. Repeat until all 3 approve.
-5. **Merge approved PRs** one at a time into `main`.
-6. **Create a combined merge branch** for the remaining PRs that conflict with the new `main`:
-   ```bash
-   git checkout -b merge-all origin/main
-   for branch in branch1 branch2 branch3; do
-     git merge origin/$branch --no-edit || true
-     # Resolve conflicts, build, test
-   done
-   ```
-7. **Run review again** on the combined branch. Fix issues, push, re-review until approved.
-8. **Merge** the combined PR, **close** the redundant individual PRs, and **close all resolved issues** via the Gitea API:
-   ```bash
-   curl -s -X PATCH -H "Authorization: token $TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"state":"closed"}' \
-     "https://gitea.tap-tap.win/api/v1/repos/owner/repo/issues/<number>"
-   ```
-
 ## CI Troubleshooting
 
 ### If lint (clang-format) fails
@@ -122,6 +80,83 @@ docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fast
 Run locally before pushing:
 ```bash
 python3 -m pytest tests/ -v --tb=short
+```
+
+## Branch Strategy
+
+Two main branches: `dev` (integration) and `main` (stable releases).
+
+### Rules
+- **All PRs target `dev`** — never target `main` directly
+- **`dev` is the default branch** in Gitea repo settings
+- **`main` is protected** — only merged from `dev` via PR with 2 approvals + full CI pass
+- **Feature/bug branches** branch from `dev`, PR back to `dev`
+- **`dev` → `main` merges** happen on-demand or weekly, requiring full CI + review
+
+```bash
+# Start a new feature
+git checkout dev && git pull
+git checkout -b feat/my-feature
+# ... work, commit, push
+git push -u origin feat/my-feature
+# Create PR targeting dev
+```
+
+### Creating the `dev` branch (one-time setup)
+```bash
+git checkout main && git pull
+git checkout -b dev
+git push origin dev
+# Then in Gitea: Settings → Repository → Default Branch → dev
+```
+
+### Branch protection (Gitea repo settings)
+**For `dev`:**
+- ✅ Require PR for merging
+- ✅ Require 1 approval
+- ✅ Require status checks (all CI jobs must pass)
+- ✅ Delete branch after merge
+
+**For `main`:**
+- ✅ Require PR from `dev` only
+- ✅ Require CI
+- ✅ Require 2 approvals
+- ✅ No direct pushes
+
+## Automated Agent Workflows
+
+When a PR targeting `dev` is opened or synchronized, Gitea Actions workflows automatically run agents to review the code and post results as PR comments. This replaces the manual "invoke 3 reviewers" pattern.
+
+### Automated PR Review
+Triggered on `pull_request: [opened, synchronize, ready_for_review]`. Runs security-auditor and code-quality-guardian, posts combined review to PR.
+
+### Automated Issue Fix
+Comment `/opencode fix` on any issue — agents will create a fix branch, implement the fix, and open a PR targeting `dev`.
+
+### Scheduled Maintenance
+Runs weekly (Monday 06:00 UTC) — security audit of the full codebase, creates issues for findings.
+
+### Batch Merge Orchestration
+For grouping multiple fixes into one integration PR (like the `integration/all-fixes` pattern):
+1. Push each fix branch independently (targetting `dev`)
+2. Use `workflow_dispatch` on `agent-batch-merge.yml` with comma-separated branch names
+3. The workflow merges all branches into `dev`, resolves conflicts, runs build + tests, and pushes
+
+## Manual PR Invocation
+
+When automated agents are unavailable or you need a targeted review, invoke agents directly:
+
+```bash
+# Run all 3 reviewers on a PR diff
+opencode run --agent reviewer "Review this PR"
+opencode run --agent security-auditor "Audit this PR for vulnerabilities"
+opencode run --agent code-quality-guardian "Check this PR for code quality"
+
+# Post results to Gitea
+curl -s -X POST -H "Authorization: token $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"body":"MARKDOWN_REVIEW_BODY"}' \
+  "https://gitea.tap-tap.win/api/v1/repos/TapTap/FastSync/issues/<PR_NUMBER>/comments"
 ```
 
 ## Gitea API & tea CLI
