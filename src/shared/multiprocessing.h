@@ -23,6 +23,9 @@ typedef struct {
   cnd_t condition_not_empty_loader;
   bool loader_done;
   ArrayList* manifest;
+  mtx_t mutex_progress;
+  unsigned long long progress_bytes;
+  bool sender_done;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {
@@ -37,10 +40,10 @@ typedef struct PipelineContextReceiver {
 } PipelineContextReceiver;
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
-                                                      Queue* queue_loader);
+                                                       Queue* queue_loader);
 void pipeline_context_sender_destroy(PipelineContextSender* context);
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,
-                                                          int file_descriptor, SSL* ssl);
+                                                           int file_descriptor, SSL* ssl);
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context);
 int receive_thread(void* pipeline_context);
 int write_thread(void* pipeline_context);

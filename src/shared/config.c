@@ -89,6 +89,18 @@ Config* config_create(void) {
   config->compare_dest = NULL;
   config->copy_dest = NULL;
   config->link_dest = NULL;
+  config->partial_dir = NULL;
+  config->suffix = NULL;
+  config->delete_before = false;
+  config->address = NULL;
+  config->bind_address = NULL;
+  config->ipv6 = false;
+  config->ipv4 = false;
+  config->daemon = false;
+  config->daemon_config = NULL;
+  config->server_mode = false;
+  config->checksum = false;
+  config->compress_choice = NULL;
   return config;
 }
 
@@ -140,9 +152,18 @@ void config_delete(Config* config) {
   free(config->rsh_command);
   free(config->rsync_path);
   free(config->temp_dir);
+  free(config->partial_dir);
+  free(config->suffix);
+  free(config->compress_choice);
   free(config->compare_dest);
   free(config->copy_dest);
   free(config->link_dest);
+  free(config->partial_dir);
+  free(config->suffix);
+  free(config->address);
+  free(config->bind_address);
+  free(config->daemon_config);
+  free(config->compress_choice);
   if (config->filters) {
     array_list_delete(config->filters);
   }
@@ -225,6 +246,18 @@ bool config_send(int file_descriptor, const Config* config) {
   if (!send_str(file_descriptor, config->temp_dir ? config->temp_dir : ""))
     return false;
   Status status;
+  if (!send_int(file_descriptor, config->partial))
+    return false;
+  if (!send_str(file_descriptor, config->partial_dir ? config->partial_dir : ""))
+    return false;
+  if (!send_str(file_descriptor, config->suffix ? config->suffix : ""))
+    return false;
+  if (!send_int(file_descriptor, config->delete_before))
+    return false;
+  if (!send_int(file_descriptor, config->checksum))
+    return false;
+  if (!send_str(file_descriptor, config->compress_choice ? config->compress_choice : ""))
+    return false;
   if (!receive_status(file_descriptor, &status))
     return false;
   if (status != STATUS_OK) {
@@ -359,6 +392,18 @@ Config* config_receive(int file_descriptor) {
   config->compare_dest = NULL;
   config->copy_dest = NULL;
   config->link_dest = NULL;
+  config->partial_dir = NULL;
+  config->suffix = NULL;
+  config->delete_before = false;
+  config->address = NULL;
+  config->bind_address = NULL;
+  config->ipv6 = false;
+  config->ipv4 = false;
+  config->daemon = false;
+  config->daemon_config = NULL;
+  config->server_mode = false;
+  config->checksum = false;
+  config->compress_choice = NULL;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->backup = tmp;
@@ -434,6 +479,9 @@ error:
   free(config->server_host);
   free(config->backup_dir);
   free(config->temp_dir);
+  free(config->partial_dir);
+  free(config->suffix);
+  free(config->compress_choice);
   free(config);
   return NULL;
 }

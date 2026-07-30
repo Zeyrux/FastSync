@@ -15,7 +15,7 @@ typedef struct Server {
 } Server;
 
 typedef struct Client {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   unsigned int address_length;
   int file_descriptor;
   pid_t ssh_child_pid;
@@ -33,5 +33,6 @@ bool client_connect(Client* client, char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec);
+int tcp_get_contimeout_sec(void);
 
 #endif

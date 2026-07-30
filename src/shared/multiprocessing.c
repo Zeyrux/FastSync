@@ -14,7 +14,7 @@
 #include <threads.h>
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
-                                                      Queue* queue_loader) {
+                                                       Queue* queue_loader) {
   PipelineContextSender* context = malloc(sizeof(PipelineContextSender));
   if (context == NULL)
     return NULL;
@@ -24,11 +24,14 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scanner_done = false;
   context->loader_done = false;
   context->manifest = NULL;
+  context->progress_bytes = 0;
+  context->sender_done = false;
   if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full_scanner) != thrd_success ||
       cnd_init(&context->condition_not_empty_scanner) != thrd_success ||
       mtx_init(&context->mutex_loader, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_full_loader) != thrd_success ||
+      mtx_init(&context->mutex_progress, mtx_plain) != thrd_success ||
       cnd_init(&context->condition_not_empty_loader) != thrd_success) {
     perror("Error initializing synchronization objects");
     free(context);
@@ -50,11 +53,12 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   mtx_destroy(&context->mutex_loader);
   cnd_destroy(&context->condition_not_full_loader);
   cnd_destroy(&context->condition_not_empty_loader);
+  mtx_destroy(&context->mutex_progress);
   free(context);
 }
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue,
-                                                          int file_descriptor, SSL* ssl) {
+                                                           int file_descriptor, SSL* ssl) {
   PipelineContextReceiver* context = malloc(sizeof(PipelineContextReceiver));
   if (context == NULL)
     return NULL;
