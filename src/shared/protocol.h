@@ -11,6 +11,9 @@
 /* Maximum allowed data payload size for receive_data (100 MB) */
 #define MAX_DATA_PAYLOAD_SIZE (100ULL * 1024 * 1024)
 
+/* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
+#define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
+
 typedef struct ssl_st SSL;
 
 typedef int Status;

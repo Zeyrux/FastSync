@@ -345,11 +345,63 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     char* cur_path = path_cat(root_directory, entry->d_name);
     if (!cur_path)
       continue;
-    struct stat st;
-    if (stat(cur_path, &st) != 0) {
+    struct stat lstats;
+    if (lstat(cur_path, &lstats) != 0) {
       free(cur_path);
       continue;
     }
+    bool is_symlink = S_ISLNK(lstats.st_mode);
+
+    // Skip symlinks unless the user explicitly enabled following/copying them.
+    if (is_symlink && !follow_symlinks && !copy_links && !safe_links &&
+        !copy_unsafe_links) {
+      free(cur_path);
+      continue;
+    }
+
+    // --safe-links: reject symlinks pointing outside the source tree.
+    if (is_symlink && safe_links) {
+      char link_target[4096];
+      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
+      if (len < 0) {
+        free(cur_path);
+        continue;
+      }
+      link_target[len] = ' ';
+      if (link_target[0] == '/') {
+        free(cur_path);
+        continue;
+      }
+    }
+
+    // --copy-unsafe-links (without --copy-links): only copy absolute symlinks.
+    if (is_symlink && copy_unsafe_links && !copy_links) {
+      char link_target[4096];
+      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
+      if (len < 0) {
+        free(cur_path);
+        continue;
+      }
+      link_target[len] = ' ';
+      bool unsafe = (link_target[0] == '/');
+      if (!unsafe) {
+        free(cur_path);
+        continue;
+      }
+    }
+
+    // Determine whether to use lstat or stat results for the entry.
+    struct stat st;
+    bool use_lstat_res = is_symlink && follow_symlinks && !copy_links;
+    if (use_lstat_res) {
+      st = lstats;
+    } else {
+      if (stat(cur_path, &st) != 0) {
+        free(cur_path);
+        continue;
+      }
+    }
+
     if (S_ISDIR(st.st_mode)) {
       array_list_add(subdirs, cur_path);
     } else {
