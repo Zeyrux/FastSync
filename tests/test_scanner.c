@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 static void create_test_file(const char* path, const char* content) {
-  (void)to_disk(path, content, strlen(content));
+  (void)to_disk(path, content, strlen(content), false, false);
 }
 
 static void test_scanner_single_file() {

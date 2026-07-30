@@ -402,6 +402,72 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
         return -1;
       free(config->link_dest);
       config->link_dest = dup;
+    } else if (strcmp(argv[i], "--partial-dir") == 0 && i + 1 < argc) {
+      char* dup = str_dup(argv[++i]);
+      if (!dup) {
+        fprintf(stderr, "Error: memory allocation failed for --partial-dir\n");
+        return -1;
+      }
+      free(config->partial_dir);
+      config->partial_dir = dup;
+    } else if (strcmp(argv[i], "--suffix") == 0 && i + 1 < argc) {
+      char* dup = str_dup(argv[++i]);
+      if (!dup) {
+        fprintf(stderr, "Error: memory allocation failed for --suffix\n");
+        return -1;
+      }
+      free(config->suffix);
+      config->suffix = dup;
+    } else if (strcmp(argv[i], "--delete-before") == 0) {
+      config->delete_before = true;
+    } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
+      int val;
+      if (!parse_positive_int(argv[++i], &val)) {
+        fprintf(stderr, "Error: -T must be a positive integer\n");
+        return -1;
+      }
+      config->timeout = val;
+    } else if (strcmp(argv[i], "--address") == 0 && i + 1 < argc) {
+      char* dup = str_dup(argv[++i]);
+      if (!dup)
+        return -1;
+      free(config->address);
+      config->address = dup;
+    } else if (strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
+      char* dup = str_dup(argv[++i]);
+      if (!dup)
+        return -1;
+      free(config->bind_address);
+      config->bind_address = dup;
+    } else if (strcmp(argv[i], "--ipv6") == 0) {
+      config->ipv6 = true;
+    } else if (strcmp(argv[i], "--ipv4") == 0) {
+      config->ipv4 = true;
+    } else if (strcmp(argv[i], "--daemon") == 0) {
+      config->daemon = true;
+    } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+      char* dup = str_dup(argv[++i]);
+      if (!dup)
+        return -1;
+      free(config->daemon_config);
+      config->daemon_config = dup;
+    } else if (strcmp(argv[i], "--server") == 0) {
+      config->server_mode = true;
+    } else if (strcmp(argv[i], "--checksum") == 0) {
+      config->checksum = true;
+    } else if (strcmp(argv[i], "--compress-choice") == 0 && i + 1 < argc) {
+      char* dup = str_dup(argv[++i]);
+      if (!dup)
+        return -1;
+      free(config->compress_choice);
+      config->compress_choice = dup;
+    } else if (strcmp(argv[i], "--compress-level") == 0 && i + 1 < argc) {
+      int val;
+      if (!parse_positive_int(argv[++i], &val)) {
+        fprintf(stderr, "Error: --compress-level must be a positive integer\n");
+        return -1;
+      }
+      config->compression_level = val;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
@@ -507,16 +573,23 @@ static void print_usage(void) {
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
+  printf("  -T <sec>            Alias for --timeout\n");
   printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
+  printf("  --address <host>    Server hostname/IP to connect to\n");
+  printf("  --bind-address <ip> Bind to specific local address\n");
+  printf("  --ipv6              Prefer IPv6 connections\n");
+  printf("  --ipv4              Prefer IPv4 connections\n");
   printf("  -q, --quiet         Suppress non-error output\n");
   printf("  --silent            Alias for --quiet\n");
   printf("  --backup            Backup existing files before overwriting\n");
   printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
+  printf("  --suffix <str>      Backup suffix (default: ~)\n");
   printf("  --stats             Print transfer statistics at end\n");
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  --log-file <path>   Write log messages to file\n");
   printf("  --queue-size <n>    Queue capacity for multithreaded mode (default: 100)\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
+  printf("  --partial-dir <dir> Directory for partial files\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf("  -l, --links         Copy symlinks as symlinks\n");
@@ -538,6 +611,7 @@ static void print_usage(void) {
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf("  --append            Append data to shorter files\n");
   printf("  --append-verify     Append with verify\n");
+  printf("  --delete-before     Delete before transfer\n");
   printf("  --delete-excluded   Also delete excluded files\n");
   printf("  --delete-after      Delete after transfer, not before\n");
   printf("  --max-delete <n>    Maximum number of files to delete\n");
@@ -548,6 +622,12 @@ static void print_usage(void) {
   printf("  -R, --relative      Use relative paths\n");
   printf("  -e, --rsh <cmd>     Specify remote shell\n");
   printf("  --rsync-path <path> Path to remote binary\n");
+  printf("  --daemon            Run in daemon mode\n");
+  printf("  --config <path>     Path to configuration file\n");
+  printf("  --server            Run in server mode\n");
+  printf("  --checksum          Skip files based on checksum, not mod-time/size\n");
+  printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
+  printf("  --compress-level <n>    Compression level (default: 5)\n");
   printf("  --temp-dir <dir>    Temporary directory for files\n");
   printf("  --compare-dest <dir>  Compare destination\n");
   printf("  --copy-dest <dir>   Copy destination\n");

@@ -152,9 +152,6 @@ void config_delete(Config* config) {
   free(config->rsh_command);
   free(config->rsync_path);
   free(config->temp_dir);
-  free(config->partial_dir);
-  free(config->suffix);
-  free(config->compress_choice);
   free(config->compare_dest);
   free(config->copy_dest);
   free(config->link_dest);
@@ -245,7 +242,6 @@ bool config_send(int file_descriptor, const Config* config) {
     return false;
   if (!send_str(file_descriptor, config->temp_dir ? config->temp_dir : ""))
     return false;
-  Status status;
   if (!send_int(file_descriptor, config->partial))
     return false;
   if (!send_str(file_descriptor, config->partial_dir ? config->partial_dir : ""))
@@ -258,6 +254,7 @@ bool config_send(int file_descriptor, const Config* config) {
     return false;
   if (!send_str(file_descriptor, config->compress_choice ? config->compress_choice : ""))
     return false;
+  Status status;
   if (!receive_status(file_descriptor, &status))
     return false;
   if (status != STATUS_OK) {
@@ -392,18 +389,6 @@ Config* config_receive(int file_descriptor) {
   config->compare_dest = NULL;
   config->copy_dest = NULL;
   config->link_dest = NULL;
-  config->partial_dir = NULL;
-  config->suffix = NULL;
-  config->delete_before = false;
-  config->address = NULL;
-  config->bind_address = NULL;
-  config->ipv6 = false;
-  config->ipv4 = false;
-  config->daemon = false;
-  config->daemon_config = NULL;
-  config->server_mode = false;
-  config->checksum = false;
-  config->compress_choice = NULL;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->backup = tmp;
@@ -466,6 +451,31 @@ Config* config_receive(int file_descriptor) {
   config->temp_dir = receive_str(file_descriptor);
   if (config->temp_dir == NULL)
     goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->partial = tmp;
+  config->partial_dir = receive_str(file_descriptor);
+  if (config->partial_dir == NULL)
+    goto error;
+  config->suffix = receive_str(file_descriptor);
+  if (config->suffix == NULL)
+    goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->delete_before = tmp;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  config->checksum = tmp;
+  config->compress_choice = receive_str(file_descriptor);
+  if (config->compress_choice == NULL)
+    goto error;
+  config->address = NULL;
+  config->bind_address = NULL;
+  config->ipv6 = false;
+  config->ipv4 = false;
+  config->daemon = false;
+  config->daemon_config = NULL;
+  config->server_mode = false;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
   if (!send_status(file_descriptor, STATUS_OK))
