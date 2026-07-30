@@ -14,7 +14,7 @@
 #include <threads.h>
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
-                                                       Queue* queue_loader) {
+                                                      Queue* queue_loader) {
   PipelineContextSender* context = malloc(sizeof(PipelineContextSender));
   if (context == NULL)
     return NULL;
@@ -58,7 +58,7 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
 }
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue,
-                                                           int file_descriptor, SSL* ssl) {
+                                                          int file_descriptor, SSL* ssl) {
   PipelineContextReceiver* context = malloc(sizeof(PipelineContextReceiver));
   if (context == NULL)
     return NULL;

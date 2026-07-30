@@ -166,7 +166,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   if (!use_incremental) {
     if (use_sendfile) {
       return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata) ? 0
-                                                                                             : -1;
+                                                                                            : -1;
     }
     return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level)
                ? 0
@@ -284,8 +284,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   } else if (context->config->use_tls) {
     client = client_create();
     if (!client || !client_connect_tls(client, context->config->server_host,
-                                        context->config->server_port, context->config->tls_cert,
-                                        context->config->tls_key, context->config->tls_ca)) {
+                                       context->config->server_port, context->config->tls_cert,
+                                       context->config->tls_key, context->config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
@@ -374,7 +374,8 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
       context->config->min_size, context->config->max_depth, 4, context->config->follow_symlinks,
-      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links, context->config->checksum);
+      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links,
+      context->config->checksum);
 
   Chunk* current_chunk;
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -485,7 +486,7 @@ int send_files(Config* config) {
   } else if (config->use_tls) {
     client = client_create();
     if (!client || !client_connect_tls(client, config->server_host, config->server_port,
-                                        config->tls_cert, config->tls_key, config->tls_ca)) {
+                                       config->tls_cert, config->tls_key, config->tls_ca)) {
       if (client)
         client_delete(client);
       fprintf(stderr, "Error: could not connect to server via TLS\n");
@@ -575,8 +576,8 @@ int send_files(Config* config) {
   }
   if (config->stats) {
     double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
-    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files,
-            total_bytes / 1048576.0, rate);
+    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files, total_bytes / 1048576.0,
+            rate);
   }
   directory_scanner_destroy(scanner);
   client_disconnect(client);

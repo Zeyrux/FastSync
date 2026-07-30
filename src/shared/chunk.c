@@ -162,8 +162,8 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 
     // Reject individual file data larger than the maximum allowed size.
     if (file_data_size > MAX_FILE_DATA_SIZE) {
-      log_message(LOG_LEVEL_ERROR, "File data size %zu exceeds maximum %llu",
-                  file_data_size, (unsigned long long)MAX_FILE_DATA_SIZE);
+      log_message(LOG_LEVEL_ERROR, "File data size %zu exceeds maximum %llu", file_data_size,
+                  (unsigned long long)MAX_FILE_DATA_SIZE);
       array_list_delete(files);
       return NULL;
     }
@@ -224,8 +224,8 @@ Chunk* receive_chunk_data(int fd, const Config* config) {
 
   // Reject chunks larger than the maximum allowed size to prevent OOM.
   if (data_to_process->size > MAX_CHUNK_SIZE) {
-    log_message(LOG_LEVEL_ERROR, "Chunk size %zu exceeds maximum %llu",
-                data_to_process->size, (unsigned long long)MAX_CHUNK_SIZE);
+    log_message(LOG_LEVEL_ERROR, "Chunk size %zu exceeds maximum %llu", data_to_process->size,
+                (unsigned long long)MAX_CHUNK_SIZE);
     data_destroy(data_to_process);
     return NULL;
   }

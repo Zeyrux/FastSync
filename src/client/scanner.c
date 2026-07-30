@@ -309,12 +309,12 @@ static int parallel_worker_thread(void* arg) {
 }
 
 ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata,
-                                          unsigned long long chunk_size, char** exclude_patterns,
-                                          int exclude_count, char** include_patterns,
-                                          int include_count, unsigned long long max_size,
-                                          unsigned long long min_size, int max_depth,
-                                          int num_threads, bool follow_symlinks, bool copy_links,
-                                          bool safe_links, bool copy_unsafe_links, bool checksum) {
+                                         unsigned long long chunk_size, char** exclude_patterns,
+                                         int exclude_count, char** include_patterns,
+                                         int include_count, unsigned long long max_size,
+                                         unsigned long long min_size, int max_depth,
+                                         int num_threads, bool follow_symlinks, bool copy_links,
+                                         bool safe_links, bool copy_unsafe_links, bool checksum) {
   ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
   if (!ps)
     return NULL;
@@ -355,8 +355,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     bool is_symlink = S_ISLNK(lstats.st_mode);
 
     // Skip symlinks unless the user explicitly enabled following/copying them.
-    if (is_symlink && !follow_symlinks && !copy_links && !safe_links &&
-        !copy_unsafe_links) {
+    if (is_symlink && !follow_symlinks && !copy_links && !safe_links && !copy_unsafe_links) {
       free(cur_path);
       continue;
     }

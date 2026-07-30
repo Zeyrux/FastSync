@@ -143,7 +143,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   }
 
   char* resolved_root = NULL;
-  const char* actual_root = (partial_dir && config && config->partial) ? partial_dir : root_directory;
+  const char* actual_root =
+      (partial_dir && config && config->partial) ? partial_dir : root_directory;
   resolved_root = realpath(actual_root, NULL);
   if (resolved_root == NULL) {
     if (mkdir_r(actual_root)) {
@@ -223,8 +224,7 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   size_t root_len = strlen(resolved_root);
   if (strncmp(resolved_dir, resolved_root, root_len) != 0 ||
       (resolved_dir[root_len] != '\0' && resolved_dir[root_len] != '/')) {
-    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path,
-                actual_root);
+    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path, actual_root);
     free(resolved_dir);
     free(resolved_root);
     free(disk_path);
@@ -518,8 +518,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   return file;
 }
 
-bool to_disk(const char* path, const void* data, unsigned long long data_size,
-             bool inplace, bool sparse) {
+bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
+             bool sparse) {
   char* tmp_path = NULL;
   char* directory = NULL;
 
