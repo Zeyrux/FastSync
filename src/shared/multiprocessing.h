@@ -23,6 +23,9 @@ typedef struct {
   cnd_t condition_not_empty_loader;
   bool loader_done;
   ArrayList* manifest;
+  mtx_t mutex_progress;
+  unsigned long long progress_bytes;
+  bool sender_done;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {

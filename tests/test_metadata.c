@@ -112,7 +112,7 @@ static void test_metadata_send_null() {
 static void test_file_restore_metadata() {
   const char* path = "temp_meta_restore_test.txt";
   const char* content = "test content";
-  EXPECT_TRUE(to_disk(path, content, strlen(content)));
+  EXPECT_TRUE(to_disk(path, content, strlen(content), false, false));
 
   FileMetadata m;
   m.mode = 0644;

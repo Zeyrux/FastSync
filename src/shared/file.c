@@ -35,7 +35,8 @@ File* file_create(const char* path) {
     return NULL;
   }
 
-  strcpy(file->path, path);
+  memcpy(file->path, path, path_len);
+  file->path[path_len] = '\0';
   file->data = data_create_reserve(0);
   if (file->data == NULL) {
     free(file->path);
@@ -129,22 +130,29 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
 }
 
 bool file_save_to_disk(const char* root_directory, File* file, const Config* config) {
-  (void)config;
+  bool backup_enabled = config && config->backup;
+  bool inplace = config && config->inplace;
+  bool sparse = config && config->preserve_sparse;
+  const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
+  const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
+  const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
+
   if (has_path_traversal(file->path)) {
     log_message(LOG_LEVEL_ERROR, "Path traversal detected in file path: %s", file->path);
     return false;
   }
 
-  // Resolve the destination root to its real path, preventing symlink-based escapes.
-  // If the root does not yet exist, try to create it so realpath can succeed.
-  char* resolved_root = realpath(root_directory, NULL);
+  char* resolved_root = NULL;
+  const char* actual_root =
+      (partial_dir && config && config->partial) ? partial_dir : root_directory;
+  resolved_root = realpath(actual_root, NULL);
   if (resolved_root == NULL) {
-    if (mkdir_r(root_directory)) {
-      resolved_root = realpath(root_directory, NULL);
+    if (mkdir_r(actual_root)) {
+      resolved_root = realpath(actual_root, NULL);
     }
   }
   if (resolved_root == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to resolve destination root: %s", root_directory);
+    log_message(LOG_LEVEL_ERROR, "Failed to resolve destination root: %s", actual_root);
     return false;
   }
 
@@ -154,7 +162,43 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
     return false;
   }
 
-  // Ensure the target directory exists so the parent can be resolved for path safety.
+  if (backup_enabled) {
+    struct stat backup_stat;
+    if (stat(disk_path, &backup_stat) == 0) {
+      char* backup_path = NULL;
+      if (backup_dir) {
+        char* resolved_backup_dir = realpath(backup_dir, NULL);
+        if (!resolved_backup_dir) {
+          mkdir_r(backup_dir);
+          resolved_backup_dir = realpath(backup_dir, NULL);
+        }
+        if (resolved_backup_dir) {
+          backup_path = path_cat(resolved_backup_dir, file->path);
+          free(resolved_backup_dir);
+        }
+      }
+      if (!backup_path) {
+        size_t path_len = strlen(disk_path);
+        size_t suffix_len = strlen(backup_suffix);
+        backup_path = malloc(path_len + suffix_len + 1);
+        if (backup_path) {
+          memcpy(backup_path, disk_path, path_len);
+          memcpy(backup_path + path_len, backup_suffix, suffix_len + 1);
+        }
+      }
+      if (backup_path) {
+        char* backup_dir_path = str_dup(backup_path);
+        if (backup_dir_path) {
+          const char* bdir = dirname(backup_dir_path);
+          mkdir_r(bdir);
+          free(backup_dir_path);
+        }
+        rename(disk_path, backup_path);
+        free(backup_path);
+      }
+    }
+  }
+
   char* dir_dup = str_dup(disk_path);
   if (!dir_dup) {
     free(resolved_root);
@@ -162,7 +206,6 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
     return false;
   }
   char* dir_str = dirname(dir_dup);
-  // Create the directory if needed (no-op if it already exists) so realpath can resolve it.
   if (!mkdir_r(dir_str)) {
     free(dir_dup);
     free(resolved_root);
@@ -178,13 +221,10 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
     return false;
   }
 
-  // Verify that the resolved directory is inside the resolved root.
-  // Both are canonical absolute paths — this prevents symlink-based escapes.
   size_t root_len = strlen(resolved_root);
   if (strncmp(resolved_dir, resolved_root, root_len) != 0 ||
       (resolved_dir[root_len] != '\0' && resolved_dir[root_len] != '/')) {
-    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path,
-                root_directory);
+    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path, actual_root);
     free(resolved_dir);
     free(resolved_root);
     free(disk_path);
@@ -193,7 +233,7 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   free(resolved_dir);
   free(resolved_root);
 
-  bool ok = to_disk(disk_path, file->data->data, file->data->size);
+  bool ok = to_disk(disk_path, file->data->data, file->data->size, inplace, sparse);
   if (ok)
     file_restore_metadata(disk_path, file->metadata);
   free(disk_path);
@@ -478,7 +518,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   return file;
 }
 
-bool to_disk(const char* path, const void* data, unsigned long long data_size) {
+bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
+             bool sparse) {
   char* tmp_path = NULL;
   char* directory = NULL;
 
@@ -495,6 +536,39 @@ bool to_disk(const char* path, const void* data, unsigned long long data_size) {
   if (!mkdir_r(directory))
     goto done;
 
+  if (inplace) {
+    FILE* file_pointer = fopen(path, "wb");
+    if (file_pointer == NULL) {
+      perror("Could not open file for inplace write");
+      ok = false;
+      goto done;
+    }
+    if (sparse && data_size > 0) {
+      if (fseek(file_pointer, data_size - 1, SEEK_SET) != 0) {
+        perror("Failed to seek for sparse file");
+        fclose(file_pointer);
+        ok = false;
+        goto done;
+      }
+      if (fwrite("", 1, 1, file_pointer) != 1) {
+        perror("Failed to write sparse file");
+        fclose(file_pointer);
+        ok = false;
+        goto done;
+      }
+      rewind(file_pointer);
+    }
+    if (data_size > 0 && fwrite(data, 1, data_size, file_pointer) != data_size) {
+      perror("Failed to write all data to file");
+      fclose(file_pointer);
+      ok = false;
+      goto done;
+    }
+    fclose(file_pointer);
+    free(directory);
+    return true;
+  }
+
   size_t path_len = strlen(path);
   tmp_path = malloc(path_len + 5);
   if (!tmp_path) {
@@ -509,6 +583,21 @@ bool to_disk(const char* path, const void* data, unsigned long long data_size) {
     perror("Could not open temporary file");
     ok = false;
     goto done;
+  }
+  if (sparse && data_size > 0) {
+    if (fseek(file_pointer, data_size - 1, SEEK_SET) != 0) {
+      perror("Failed to seek for sparse file");
+      fclose(file_pointer);
+      ok = false;
+      goto done;
+    }
+    if (fwrite("", 1, 1, file_pointer) != 1) {
+      perror("Failed to write sparse file");
+      fclose(file_pointer);
+      ok = false;
+      goto done;
+    }
+    rewind(file_pointer);
   }
   if (fwrite(data, 1, data_size, file_pointer) != data_size) {
     perror("Failed to write all data to temporary file");
@@ -534,13 +623,6 @@ done:
 
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path) {
-  // sendfile is incompatible with compression (kernel zero-copy).
-  // If compression is requested, fall back to the regular send path.
-  // NOTE: This is a safety net only — callers must ensure compression_level == 0
-  // before calling file_send_sendfile. The fallback to file_send_single_calls
-  // preserves the send_path contract, but callers should not rely on it for
-  // correctness (the --sendfile flag is validated to be mutually exclusive with
-  // -c/--compress at the CLI layer).
   if (compression_level > 0)
     return file_send_single_calls(file, file_descriptor, use_metadata, compression_level,
                                   send_path);

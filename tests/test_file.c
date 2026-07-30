@@ -34,7 +34,7 @@ static void test_file_destroy_normal() {
 
 static void test_file_load_data() {
   const char* content = "Hello Load Test";
-  EXPECT_TRUE(to_disk("test_file_load_data.txt", content, strlen(content)));
+  EXPECT_TRUE(to_disk("test_file_load_data.txt", content, strlen(content), false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_file_load_data.txt", &st), 0);
@@ -89,7 +89,7 @@ static void test_file_save_to_disk() {
 
 static void test_to_disk_basic() {
   const char* content = "Basic to_disk test";
-  EXPECT_TRUE(to_disk("test_to_disk_basic.txt", content, strlen(content)));
+  EXPECT_TRUE(to_disk("test_to_disk_basic.txt", content, strlen(content), false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_to_disk_basic.txt", &st), 0);
@@ -108,7 +108,7 @@ static void test_to_disk_basic() {
 
 static void test_to_disk_creates_dirs() {
   const char* content = "Nested dir test";
-  EXPECT_TRUE(to_disk("test_nested_tmp/nested/file.txt", content, strlen(content)));
+  EXPECT_TRUE(to_disk("test_nested_tmp/nested/file.txt", content, strlen(content), false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_nested_tmp/nested/file.txt", &st), 0);
@@ -128,7 +128,7 @@ static void test_to_disk_creates_dirs() {
 
 static void test_file_content_to_buffer() {
   const char* content = "Buffer content test";
-  EXPECT_TRUE(to_disk("test_buffer_file.txt", content, strlen(content)));
+  EXPECT_TRUE(to_disk("test_buffer_file.txt", content, strlen(content), false, false));
 
   File* f = file_create("test_buffer_file.txt");
   EXPECT_NOT_NULL(f);
@@ -250,7 +250,7 @@ static void test_file_send_no_path() {
 }
 
 static void test_file_metadata_create() {
-  EXPECT_TRUE(to_disk("test_meta_file.txt", "metadata test", 13));
+  EXPECT_TRUE(to_disk("test_meta_file.txt", "metadata test", 13, false, false));
   struct stat st;
   EXPECT_EQ_INT(stat("test_meta_file.txt", &st), 0);
 
@@ -359,7 +359,7 @@ static void test_file_send_single_calls_metadata_and_path() {
   /* Create a real file on disk so we can have metadata */
   const char* content = "File with metadata";
   size_t len = strlen(content);
-  EXPECT_TRUE(to_disk("test_meta_send.txt", content, len));
+  EXPECT_TRUE(to_disk("test_meta_send.txt", content, len, false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_meta_send.txt", &st), 0);

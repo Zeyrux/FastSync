@@ -100,6 +100,32 @@ typedef struct Config {
   char* compare_dest;
   char* copy_dest;
   char* link_dest;
+
+  // PR #174: Partial transfer resumption
+  char* partial_dir;
+
+  // PR #178: Backup versioning
+  char* suffix;
+
+  // PR #179: Delete policies
+  bool delete_before;
+
+  // PR #181: IPv6 and bind address
+  char* address;
+  char* bind_address;
+  bool ipv6;
+  bool ipv4;
+
+  // PR #182: Daemon/server mode
+  bool daemon;
+  char* daemon_config;
+  bool server_mode;
+
+  // PR #183: Checksum comparison
+  bool checksum;
+
+  // PR #184: Compression algorithm negotiation
+  char* compress_choice;
 } Config;
 
 #define PROTOCOL_VERSION "1.3.0"

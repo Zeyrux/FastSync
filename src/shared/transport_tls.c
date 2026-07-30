@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "transport_tcp.h"
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <signal.h>
@@ -148,13 +149,50 @@ bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {
 
 bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
                         const char* key_path, const char* ca_path) {
-  client->address.sin_port = htons(port);
-  if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
-    perror("Could not convert host address!");
+  struct addrinfo hints;
+  struct addrinfo* result;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+
+  char port_str[16];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+
+  int err = getaddrinfo(host, port_str, &hints, &result);
+  if (err != 0 || result == NULL) {
+    fprintf(stderr, "Could not resolve host: %s (%s)\n", host, gai_strerror(err));
     return false;
   }
-  if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
-      0) {
+
+  struct addrinfo* rp;
+  bool connected = false;
+  for (rp = result; rp != NULL; rp = rp->ai_next) {
+    if (client->file_descriptor >= 0)
+      close(client->file_descriptor);
+
+    client->file_descriptor = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (client->file_descriptor < 0)
+      continue;
+
+    struct timeval ct;
+    ct.tv_sec = tcp_get_contimeout_sec();
+    ct.tv_usec = 0;
+    setsockopt(client->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &ct, sizeof(ct));
+    setsockopt(client->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &ct, sizeof(ct));
+
+    memcpy(&client->address, rp->ai_addr, rp->ai_addrlen);
+    client->address_length = rp->ai_addrlen;
+
+    if (connect(client->file_descriptor, (struct sockaddr*)&client->address,
+                client->address_length) == 0) {
+      connected = true;
+      break;
+    }
+  }
+  freeaddrinfo(result);
+
+  if (!connected) {
     perror("Could not connect to Server!");
     return false;
   }

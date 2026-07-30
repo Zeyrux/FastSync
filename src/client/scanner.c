@@ -40,7 +40,7 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            int include_count, unsigned long long max_size,
                                            unsigned long long min_size, int max_depth,
                                            bool follow_symlinks, bool copy_links, bool safe_links,
-                                           bool copy_unsafe_links) {
+                                           bool copy_unsafe_links, bool checksum) {
   DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;
@@ -61,6 +61,7 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
   scanner->copy_links = copy_links;
   scanner->safe_links = safe_links;
   scanner->copy_unsafe_links = copy_unsafe_links;
+  scanner->checksum = checksum;
   queue_enqueue(scanner->directories, dir_entry_create(root_directory, 0));
   return scanner;
 }
@@ -276,6 +277,7 @@ typedef struct {
   bool copy_links;
   bool safe_links;
   bool copy_unsafe_links;
+  bool checksum;
 } ParallelWorkerArg;
 
 static int parallel_worker_thread(void* arg) {
@@ -284,7 +286,7 @@ static int parallel_worker_thread(void* arg) {
     DirectoryScanner* ds = directory_scanner_create(
         wa->dirs[i], wa->use_metadata, wa->chunk_size, wa->exclude_patterns, wa->exclude_count,
         wa->include_patterns, wa->include_count, wa->max_size, wa->min_size, wa->max_depth,
-        wa->follow_symlinks, wa->copy_links, wa->safe_links, wa->copy_unsafe_links);
+        wa->follow_symlinks, wa->copy_links, wa->safe_links, wa->copy_unsafe_links, wa->checksum);
     Chunk* chunk;
     while ((chunk = directory_scanner_next(ds)) != NULL) {
       queue_enqueue_multithreaded(wa->ps->result_queue, chunk, &wa->ps->result_mutex,
@@ -312,7 +314,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
                                          int include_count, unsigned long long max_size,
                                          unsigned long long min_size, int max_depth,
                                          int num_threads, bool follow_symlinks, bool copy_links,
-                                         bool safe_links, bool copy_unsafe_links) {
+                                         bool safe_links, bool copy_unsafe_links, bool checksum) {
   ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
   if (!ps)
     return NULL;
@@ -345,11 +347,62 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     char* cur_path = path_cat(root_directory, entry->d_name);
     if (!cur_path)
       continue;
-    struct stat st;
-    if (stat(cur_path, &st) != 0) {
+    struct stat lstats;
+    if (lstat(cur_path, &lstats) != 0) {
       free(cur_path);
       continue;
     }
+    bool is_symlink = S_ISLNK(lstats.st_mode);
+
+    // Skip symlinks unless the user explicitly enabled following/copying them.
+    if (is_symlink && !follow_symlinks && !copy_links && !safe_links && !copy_unsafe_links) {
+      free(cur_path);
+      continue;
+    }
+
+    // --safe-links: reject symlinks pointing outside the source tree.
+    if (is_symlink && safe_links) {
+      char link_target[4096];
+      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
+      if (len < 0) {
+        free(cur_path);
+        continue;
+      }
+      link_target[len] = 0;
+      if (link_target[0] == '/') {
+        free(cur_path);
+        continue;
+      }
+    }
+
+    // --copy-unsafe-links (without --copy-links): only copy absolute symlinks.
+    if (is_symlink && copy_unsafe_links && !copy_links) {
+      char link_target[4096];
+      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
+      if (len < 0) {
+        free(cur_path);
+        continue;
+      }
+      link_target[len] = 0;
+      bool unsafe = (link_target[0] == '/');
+      if (!unsafe) {
+        free(cur_path);
+        continue;
+      }
+    }
+
+    // Determine whether to use lstat or stat results for the entry.
+    struct stat st;
+    bool use_lstat_res = is_symlink && follow_symlinks && !copy_links;
+    if (use_lstat_res) {
+      st = lstats;
+    } else {
+      if (stat(cur_path, &st) != 0) {
+        free(cur_path);
+        continue;
+      }
+    }
+
     if (S_ISDIR(st.st_mode)) {
       array_list_add(subdirs, cur_path);
     } else {
@@ -475,6 +528,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
       wa->copy_links = copy_links;
       wa->safe_links = safe_links;
       wa->copy_unsafe_links = copy_unsafe_links;
+      wa->checksum = checksum;
       start += count;
       if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
         for (int j = 0; j < count; j++)

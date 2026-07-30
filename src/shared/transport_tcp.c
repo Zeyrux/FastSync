@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <openssl/ssl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -143,6 +144,10 @@ void tcp_set_timeouts(int timeout_sec, int contimeout_sec) {
     g_contimeout_sec = contimeout_sec;
 }
 
+int tcp_get_contimeout_sec(void) {
+  return g_contimeout_sec;
+}
+
 static void tcp_apply_socket_timeout(int fd) {
   struct timeval tv;
   tv.tv_sec = g_timeout_sec;
@@ -152,19 +157,12 @@ static void tcp_apply_socket_timeout(int fd) {
 }
 
 Client* client_create() {
-  int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
-  if (file_descriptor < 0) {
-    perror("Could not create Socket!");
-    return NULL;
-  }
-
   Client* client = (Client*)malloc(sizeof(Client));
   if (client == NULL) {
-    close(file_descriptor);
     return NULL;
   }
-  client->file_descriptor = file_descriptor;
-  client->address.sin_family = AF_INET;
+  client->file_descriptor = -1;
+  memset(&client->address, 0, sizeof(client->address));
   client->address_length = sizeof(client->address);
   client->ssh_child_pid = -1;
   client->ssl = NULL;
@@ -173,23 +171,50 @@ Client* client_create() {
 }
 
 bool client_connect(Client* client, char* host, int port) {
-  client->address.sin_port = htons(port);
-  client->address.sin_family = AF_INET;
-  client->address_length = sizeof(client->address);
+  struct addrinfo hints;
+  struct addrinfo* result;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
 
-  if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
-    perror("Could not convert host address!");
+  char port_str[16];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+
+  int err = getaddrinfo(host, port_str, &hints, &result);
+  if (err != 0 || result == NULL) {
+    fprintf(stderr, "Could not resolve host: %s (%s)\n", host, gai_strerror(err));
     return false;
   }
 
-  struct timeval ct;
-  ct.tv_sec = g_contimeout_sec;
-  ct.tv_usec = 0;
-  setsockopt(client->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &ct, sizeof(ct));
-  setsockopt(client->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &ct, sizeof(ct));
+  struct addrinfo* rp;
+  bool connected = false;
+  for (rp = result; rp != NULL; rp = rp->ai_next) {
+    if (client->file_descriptor >= 0)
+      close(client->file_descriptor);
 
-  if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
-      0) {
+    client->file_descriptor = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (client->file_descriptor < 0)
+      continue;
+
+    struct timeval ct;
+    ct.tv_sec = g_contimeout_sec;
+    ct.tv_usec = 0;
+    setsockopt(client->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &ct, sizeof(ct));
+    setsockopt(client->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &ct, sizeof(ct));
+
+    memcpy(&client->address, rp->ai_addr, rp->ai_addrlen);
+    client->address_length = rp->ai_addrlen;
+
+    if (connect(client->file_descriptor, (struct sockaddr*)&client->address,
+                client->address_length) == 0) {
+      connected = true;
+      break;
+    }
+  }
+  freeaddrinfo(result);
+
+  if (!connected) {
     perror("Could not connect to Server!");
     return false;
   }
@@ -205,7 +230,10 @@ void client_disconnect(Client* client) {
     client->ssl = NULL;
     io_set_ssl(NULL);
   }
-  close(client->file_descriptor);
+  if (client->file_descriptor >= 0) {
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
+  }
   if (client->ssh_child_pid > 0) {
     int status;
     waitpid(client->ssh_child_pid, &status, 0);
