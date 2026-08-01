@@ -6,10 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 44 | Feature works end-to-end |
+| ✅ Implemented | 42 | Feature works end-to-end |
+| 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 31 | Flag parsed/stored but behavior incomplete |
 | ❌ Not Implemented | 66 | Flag not recognized or no behavior |
-| **Total** | **141** | |
+| **Total** | **142** | |
 
 ---
 
@@ -17,6 +18,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
+| `-a`, `--archive` | Archive mode is -rlptgoD | 🔀 Alt Arg | Maps to -c -m -M (compression + multithread + metadata) |
 | `-v`, `--verbose` | Increase verbosity | ✅ Implemented | Sets `log_level=DEBUG` |
 | `-q`, `--quiet` | Suppress non-error messages | ✅ Implemented | `quiet` config field |
 | `-h`, `--help` | Show help | ✅ Implemented | Prints usage and exits |
@@ -122,7 +124,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-A`, `--acls` | Preserve ACLs | ⚠️ Partial | `preserve_acls` stored, not wired |
 | `-X`, `--xattrs` | Preserve extended attributes | ⚠️ Partial | `preserve_xattrs` stored, not wired |
 | `-H`, `--hard-links` | Preserve hard links | ⚠️ Partial | `preserve_hard_links` stored, not wired |
-| `-D` | Same as --devices --specials | ✅ Implemented | Device file preservation |
+| `-D` | Same as --devices --specials | 🔀 Alt Arg | Maps to --devices only (no --specials) |
 | `--devices` | Preserve device files | ⚠️ Partial | `preserve_devices` stored, not wired |
 | `--specials` | Preserve special files | ❌ Not Implemented | |
 | `--copy-devices` | Copy device contents as file | ❌ Not Implemented | |
@@ -169,7 +171,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-z`, `--compress` | Compress file data | ✅ Implemented | zstd streaming compression |
+| `-z`, `--compress` | Compress file data | 🔀 Alt Arg | Always uses zstd (rsync supports multiple algorithms) |
 | `--compress-choice=STR` | Choose compression algorithm | ⚠️ Partial | `compress_choice` stored, always zstd |
 | `--compress-level=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
