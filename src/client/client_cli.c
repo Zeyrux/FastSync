@@ -153,13 +153,25 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
     } else if (strcmp(argv[i], "--delta") == 0) {
       config->use_delta = true;
     } else if (strcmp(argv[i], "--delta-block") == 0 && i + 1 < argc) {
-      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      char* end;
+      errno = 0;
+      unsigned long long val = strtoull(argv[++i], &end, 10);
+      if (errno != 0 || *end != '\0') {
+        fprintf(stderr, "Error: --delta-block must be a positive integer\n");
+        return -1;
+      }
       if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
         config->delta_block_size = (uint32_t)val;
       else
         fprintf(stderr, "Warning: --delta-block value %llu out of range, using default\n", val);
     } else if (strcmp(argv[i], "--delta-max") == 0 && i + 1 < argc) {
-      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      char* end;
+      errno = 0;
+      unsigned long long val = strtoull(argv[++i], &end, 10);
+      if (errno != 0 || *end != '\0') {
+        fprintf(stderr, "Error: --delta-max must be a positive integer\n");
+        return -1;
+      }
       if (val >= DELTA_MIN_FILE_SIZE)
         config->delta_max_file_size = val;
       else
@@ -171,6 +183,10 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
         char* end_ptr;
         long level = strtol(argv[i + 1], &end_ptr, 10);
         if (*end_ptr == '\0') {
+          if (level < 1 || level > 22) {
+            fprintf(stderr, "Error: compression level must be 1-22\n");
+            return -1;
+          }
           config->compression_level = (int)level;
           log_message(LOG_LEVEL_INFO, "Set Compression level to %ld", level);
           i++;
@@ -265,6 +281,8 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
         fprintf(stderr, "Error: could not open log file '%s': %s\n", argv[i], strerror(errno));
         return -1;
       }
+      if (config->log_file)
+        fclose(config->log_file);
       config->log_file = lf;
       log_set_file(lf);
     } else if (strcmp(argv[i], "--queue-size") == 0 && i + 1 < argc) {
