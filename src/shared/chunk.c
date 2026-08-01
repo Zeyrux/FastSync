@@ -12,6 +12,9 @@
 #include "metadata.h"
 #include "protocol.h"
 
+/* Maximum individual file data size within a chunk (64 MB) */
+#define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
+
 Chunk* chunk_create(File** items, int element_count) {
   Chunk* chunk = (Chunk*)malloc(sizeof(Chunk));
   if (chunk == NULL) {
@@ -157,6 +160,14 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       return NULL;
     }
 
+    // Reject individual file data larger than the maximum allowed size.
+    if (file_data_size > MAX_FILE_DATA_SIZE) {
+      log_message(LOG_LEVEL_ERROR, "File data size %zu exceeds maximum %llu", file_data_size,
+                  (unsigned long long)MAX_FILE_DATA_SIZE);
+      array_list_delete(files);
+      return NULL;
+    }
+
     void* file_data = malloc(file_data_size);
     if (file_data == NULL) {
       perror("Could not allocate memory for file data");
@@ -210,6 +221,15 @@ Chunk* receive_chunk_data(int fd, const Config* config) {
       return NULL;
     }
   }
+
+  // Reject chunks larger than the maximum allowed size to prevent OOM.
+  if (data_to_process->size > MAX_CHUNK_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "Chunk size %zu exceeds maximum %llu", data_to_process->size,
+                (unsigned long long)MAX_CHUNK_SIZE);
+    data_destroy(data_to_process);
+    return NULL;
+  }
+
   Chunk* chunk = chunk_deserialize(data_to_process, config->use_metadata);
   data_destroy(data_to_process);
   if (chunk == NULL)

@@ -62,8 +62,8 @@ static void test_chunk_compress_decompress_roundtrip() {
   char* content2 = "chunk compression test file 2 with more data";
   unsigned long long len2 = strlen(content2);
 
-  to_disk(path1, content1, len1);
-  to_disk(path2, content2, len2);
+  to_disk(path1, content1, len1, false, false);
+  to_disk(path2, content2, len2, false, false);
 
   struct stat st1, st2;
   EXPECT_EQ_INT(stat(path1, &st1), 0);

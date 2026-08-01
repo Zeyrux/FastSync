@@ -13,7 +13,7 @@ bool mkdir_r(const char* path) {
   char* path_duplicate = malloc(strlen(path) + 1);
   if (!path_duplicate)
     return false;
-  strcpy(path_duplicate, path);
+  memcpy(path_duplicate, path, strlen(path) + 1);
   char* path_current = (char*)malloc((strlen(path) + 2) * sizeof(char));
   if (!path_current) {
     free(path_duplicate);
@@ -21,7 +21,8 @@ bool mkdir_r(const char* path) {
   }
   char* path_current_position = path_current;
   if (path[0] == '/') {
-    strcpy(path_current, "/");
+    path_current[0] = '/';
+    path_current[1] = '\0';
     path_current_position += 1;
   } else {
     path_current[0] = '\0';
@@ -31,10 +32,12 @@ bool mkdir_r(const char* path) {
   const char* part = strtok_r(path_duplicate, delimiter, &saveptr);
   bool ok = true;
   while (part != NULL) {
-    strcpy(path_current_position, part);
-    path_current_position += strlen(part) * sizeof(char);
-    strcpy(path_current_position, "/");
-    path_current_position += sizeof(char);
+    size_t part_len = strlen(part);
+    memcpy(path_current_position, part, part_len);
+    path_current_position += part_len;
+    path_current_position[0] = '/';
+    path_current_position[1] = '\0';
+    path_current_position++;
     struct stat st;
     if (stat(path_current, &st) != 0) {
       if (mkdir(path_current, 0755) != 0) {
@@ -53,8 +56,11 @@ bool mkdir_r(const char* path) {
 char* str_dup(const char* string) {
   if (string == NULL)
     return NULL;
-  char* new_string = (char*)malloc(strlen(string) + 1);
-  strcpy(new_string, string);
+  size_t str_len = strlen(string);
+  char* new_string = (char*)malloc(str_len + 1);
+  if (new_string == NULL)
+    return NULL;
+  memcpy(new_string, string, str_len + 1);
   return new_string;
 }
 
