@@ -131,6 +131,8 @@ void config_parse_ssh_dest(Config* config) {
 }
 
 void config_delete(Config* config) {
+  if (config == NULL)
+    return;
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
@@ -167,6 +169,16 @@ void config_delete(Config* config) {
   free(config);
 }
 
+/* Wire format order (must match config_receive and be updated when PROTOCOL_VERSION bumps):
+ * version, send_directory, receive_root_directory, save_to_disk, use_multithreading,
+ * use_chunk_serialization, use_compression, use_metadata, compression_level, chunk_size,
+ * use_sendfile, use_delete, use_incremental, use_delta, delta_block_size, delta_max_file_size,
+ * backup, backup_dir, follow_symlinks, copy_links, safe_links, copy_unsafe_links,
+ * preserve_hard_links, preserve_acls, preserve_xattrs, preserve_devices, preserve_sparse,
+ * update, inplace, append, append_verify, delete_excluded, delete_after, max_delete, relative,
+ * prune_empty_dirs, temp_dir, partial, partial_dir, suffix, delete_before, checksum,
+ * compress_choice, status
+ */
 bool config_send(int file_descriptor, const Config* config) {
   if (!send_str(file_descriptor, config->version))
     return false;
@@ -264,6 +276,7 @@ bool config_send(int file_descriptor, const Config* config) {
   return true;
 }
 
+/* Wire format order: see the comment above config_send. */
 Config* config_receive(int file_descriptor) {
   Config* config = (Config*)malloc(sizeof(Config));
   if (config == NULL)

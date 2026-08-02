@@ -18,11 +18,15 @@ void log_set_file(FILE* fp) {
 void log_message(LogLevel log_level, const char* format, ...) {
   if (log_level < current_log_level)
     return;
+  if (log_level < 0 || log_level >= (int)(sizeof(log_level_strings) / sizeof(log_level_strings[0])))
+    return;
   time_t now = time(NULL);
-  const struct tm* t = localtime(&now);
+  struct tm t;
+  if (!localtime_r(&now, &t))
+    return;
 
-  fprintf(stderr, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900, t->tm_mon + 1,
-          t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, log_level_strings[log_level]);
+  fprintf(stderr, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+          t.tm_hour, t.tm_min, t.tm_sec, log_level_strings[log_level]);
 
   va_list args;
   va_start(args, format);
@@ -31,8 +35,8 @@ void log_message(LogLevel log_level, const char* format, ...) {
   fprintf(stderr, "\n");
 
   if (log_fp) {
-    fprintf(log_fp, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900, t->tm_mon + 1,
-            t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, log_level_strings[log_level]);
+    fprintf(log_fp, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t.tm_year + 1900, t.tm_mon + 1,
+            t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, log_level_strings[log_level]);
     va_start(args, format);
     vfprintf(log_fp, format, args);
     va_end(args);

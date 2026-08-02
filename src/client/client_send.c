@@ -346,6 +346,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
       fprintf(stderr, "Error: unexpected error while sending chunk\n");
+      chunk_destroy(current_chunk);
       client_disconnect(client);
       client_delete(client);
       mtx_lock(&context->mutex_progress);
@@ -385,13 +386,31 @@ static int scan_directory_multithreaded(void* pipeline_context) {
         const char* p = current_chunk->items[i]->path;
         if (*p == '/')
           p++;
-        array_list_add(context->manifest, str_dup(p));
+        char* manifest_entry = str_dup(p);
+        if (!manifest_entry) {
+          log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
+          mtx_unlock(&context->mutex_scanner);
+          context->cancelled = true;
+          cnd_broadcast(&context->condition_not_full_scanner);
+          cnd_broadcast(&context->condition_not_empty_scanner);
+          parallel_scanner_destroy(scanner);
+          return thrd_error;
+        }
+        array_list_add(context->manifest, manifest_entry);
       }
       mtx_unlock(&context->mutex_scanner);
     }
-    queue_enqueue_multithreaded(context->queue_scanner, current_chunk, &context->mutex_scanner,
-                                &context->condition_not_empty_scanner,
-                                &context->condition_not_full_scanner);
+    if (!queue_enqueue_multithreaded_cancel(
+            context->queue_scanner, current_chunk, &context->mutex_scanner,
+            &context->condition_not_empty_scanner, &context->condition_not_full_scanner,
+            &context->cancelled)) {
+      chunk_destroy(current_chunk);
+      context->cancelled = true;
+      cnd_broadcast(&context->condition_not_full_scanner);
+      cnd_broadcast(&context->condition_not_empty_scanner);
+      parallel_scanner_destroy(scanner);
+      return thrd_error;
+    }
   }
   mtx_lock(&context->mutex_scanner);
   context->scanner_done = true;
@@ -427,9 +446,16 @@ static int load_files_multithreaded(void* pipeline_context) {
         }
       }
     }
-    queue_enqueue_multithreaded(context->queue_loader, chunk, &context->mutex_loader,
-                                &context->condition_not_empty_loader,
-                                &context->condition_not_full_loader);
+    if (!queue_enqueue_multithreaded_cancel(context->queue_loader, chunk, &context->mutex_loader,
+                                            &context->condition_not_empty_loader,
+                                            &context->condition_not_full_loader,
+                                            &context->cancelled)) {
+      chunk_destroy(chunk);
+      context->cancelled = true;
+      cnd_broadcast(&context->condition_not_full_loader);
+      cnd_broadcast(&context->condition_not_empty_loader);
+      return thrd_error;
+    }
   }
 }
 
@@ -487,16 +513,20 @@ int send_files(Config* config) {
     client = client_create();
     if (!client || !client_connect_tls(client, config->server_host, config->server_port,
                                        config->tls_cert, config->tls_key, config->tls_ca)) {
-      if (client)
+      if (client) {
+        client_disconnect(client);
         client_delete(client);
+      }
       fprintf(stderr, "Error: could not connect to server via TLS\n");
       return 1;
     }
   } else {
     client = client_create();
     if (!client || !client_connect(client, config->server_host, config->server_port)) {
-      if (client)
+      if (client) {
+        client_disconnect(client);
         client_delete(client);
+      }
       fprintf(stderr, "Error: could not connect to server\n");
       return 1;
     }
@@ -526,7 +556,17 @@ int send_files(Config* config) {
         const char* p = current_chunk->items[i]->path;
         if (*p == '/')
           p++;
-        array_list_add(manifest, str_dup(p));
+        char* manifest_entry = str_dup(p);
+        if (!manifest_entry) {
+          log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
+          chunk_destroy(current_chunk);
+          array_list_delete(manifest);
+          directory_scanner_destroy(scanner);
+          client_disconnect(client);
+          client_delete(client);
+          return 1;
+        }
+        array_list_add(manifest, manifest_entry);
       }
     }
     if (!config->use_sendfile) {
@@ -625,17 +665,42 @@ int send_files_multithreaded(Config* config) {
   if (config->use_delete)
     context->manifest = array_list_create(free);
 
-  thrd_t scanner, loader, sender, progress;
-  if (thrd_create(&scanner, scan_directory_multithreaded, context) != thrd_success ||
-      thrd_create(&loader, load_files_multithreaded, context) != thrd_success ||
-      thrd_create(&sender, send_chunks_multithreaded, context) != thrd_success) {
+  thrd_t scanner, loader, sender;
+  bool scanner_created = false;
+  bool loader_created = false;
+  bool sender_created = false;
+
+  scanner_created = (thrd_create(&scanner, scan_directory_multithreaded, context) == thrd_success);
+  if (scanner_created)
+    loader_created = (thrd_create(&loader, load_files_multithreaded, context) == thrd_success);
+  if (scanner_created && loader_created)
+    sender_created = (thrd_create(&sender, send_chunks_multithreaded, context) == thrd_success);
+
+  if (!scanner_created || !loader_created || !sender_created) {
     perror("Error creating threads.\n");
+    context->cancelled = true;
+    context->scanner_done = true;
+    context->loader_done = true;
+    context->sender_done = true;
+    cnd_broadcast(&context->condition_not_full_scanner);
+    cnd_broadcast(&context->condition_not_empty_scanner);
+    cnd_broadcast(&context->condition_not_full_loader);
+    cnd_broadcast(&context->condition_not_empty_loader);
+    if (sender_created)
+      thrd_join(sender, NULL);
+    if (loader_created)
+      thrd_join(loader, NULL);
+    if (scanner_created)
+      thrd_join(scanner, NULL);
     pipeline_context_sender_destroy(context);
     return 1;
   }
 
+  thrd_t progress;
+  bool progress_created = false;
   if (config->show_progress) {
-    if (thrd_create(&progress, progress_thread_fn, context) != thrd_success) {
+    progress_created = (thrd_create(&progress, progress_thread_fn, context) == thrd_success);
+    if (!progress_created) {
       perror("Error creating progress thread.\n");
       /* Non-fatal; continue without progress reporting */
     }
@@ -646,7 +711,7 @@ int send_files_multithreaded(Config* config) {
   thrd_join(loader, NULL);
   thrd_join(sender, &sender_result);
 
-  if (config->show_progress) {
+  if (progress_created) {
     /* Signal progress thread to exit if it hasn't already */
     mtx_lock(&context->mutex_progress);
     context->sender_done = true;

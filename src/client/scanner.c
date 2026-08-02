@@ -27,10 +27,14 @@ static void dir_entry_destroy(void* item) {
 
 static DirEntry* dir_entry_create(const char* path, int depth) {
   DirEntry* de = malloc(sizeof(DirEntry));
-  if (de) {
-    de->path = str_dup(path);
-    de->depth = depth;
+  if (!de)
+    return NULL;
+  de->path = str_dup(path);
+  if (!de->path) {
+    free(de);
+    return NULL;
   }
+  de->depth = depth;
   return de;
 }
 
@@ -62,7 +66,18 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
   scanner->safe_links = safe_links;
   scanner->copy_unsafe_links = copy_unsafe_links;
   scanner->checksum = checksum;
-  queue_enqueue(scanner->directories, dir_entry_create(root_directory, 0));
+  DirEntry* root = dir_entry_create(root_directory, 0);
+  if (!root) {
+    queue_destroy(scanner->directories);
+    free(scanner);
+    return NULL;
+  }
+  if (!queue_enqueue(scanner->directories, root)) {
+    dir_entry_destroy(root);
+    queue_destroy(scanner->directories);
+    free(scanner);
+    return NULL;
+  }
   return scanner;
 }
 
@@ -323,9 +338,28 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     free(ps);
     return NULL;
   }
-  if (mtx_init(&ps->result_mutex, mtx_plain) != thrd_success ||
-      cnd_init(&ps->result_not_empty) != thrd_success ||
-      cnd_init(&ps->result_not_full) != thrd_success) {
+  int init = 0;
+  bool ok = true;
+  if (mtx_init(&ps->result_mutex, mtx_plain) != thrd_success)
+    ok = false;
+  if (ok) {
+    init++;
+    if (cnd_init(&ps->result_not_empty) != thrd_success)
+      ok = false;
+  }
+  if (ok) {
+    // cppcheck-suppress unreadVariable
+    init++;
+    if (cnd_init(&ps->result_not_full) != thrd_success)
+      ok = false;
+  }
+  if (!ok) {
+    if (init >= 3)
+      cnd_destroy(&ps->result_not_full);
+    if (init >= 2)
+      cnd_destroy(&ps->result_not_empty);
+    if (init >= 1)
+      mtx_destroy(&ps->result_mutex);
     queue_destroy(ps->result_queue);
     free(ps);
     return NULL;
@@ -564,6 +598,7 @@ void parallel_scanner_destroy(ParallelScanner* ps) {
     return;
   ps->done = true;
   cnd_signal(&ps->result_not_empty);
+  cnd_broadcast(&ps->result_not_full);
   for (int i = 0; i < ps->num_threads; i++)
     thrd_join(ps->threads[i], NULL);
   free(ps->threads);

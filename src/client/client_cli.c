@@ -276,13 +276,16 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
       if (set_nonneg_int_option(&config->max_depth, argv[++i], "--max-depth") != 0)
         return -1;
     } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+      if (config->log_file) {
+        fclose(config->log_file);
+        config->log_file = NULL;
+        log_set_file(NULL);
+      }
       FILE* lf = fopen(argv[++i], "a");
       if (!lf) {
         fprintf(stderr, "Error: could not open log file '%s': %s\n", argv[i], strerror(errno));
         return -1;
       }
-      if (config->log_file)
-        fclose(config->log_file);
       config->log_file = lf;
       log_set_file(lf);
     } else if (strcmp(argv[i], "--queue-size") == 0 && i + 1 < argc) {
@@ -427,6 +430,10 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
     } else if (strcmp(argv[i], "--compress-level") == 0 && i + 1 < argc) {
       if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)
         return -1;
+      if (config->compression_level < 1 || config->compression_level > 22) {
+        fprintf(stderr, "Error: --compress-level must be between 1 and 22\n");
+        return -1;
+      }
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
@@ -600,8 +607,10 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
     fprintf(stderr, "Error: could not open pattern file '%s': %s\n", filepath, strerror(errno));
     return -1;
   }
-  char line[4096];
-  while (fgets(line, sizeof(line), fp)) {
+  char* line = NULL;
+  size_t line_size = 0;
+  ssize_t n;
+  while ((n = getline(&line, &line_size, fp)) != -1) {
     char* p = line;
     while (*p == ' ' || *p == '\t')
       p++;
@@ -615,6 +624,7 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
     char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
     if (!tmp) {
       fprintf(stderr, "Error: memory allocation failed for pattern file\n");
+      free(line);
       fclose(fp);
       return -1;
     }
@@ -622,11 +632,13 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
     char* dup = str_dup(p);
     if (!dup) {
       fprintf(stderr, "Error: memory allocation failed for pattern file\n");
+      free(line);
       fclose(fp);
       return -1;
     }
     (*patterns)[(*count)++] = dup;
   }
+  free(line);
   fclose(fp);
   return 0;
 }

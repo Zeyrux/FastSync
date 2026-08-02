@@ -10,11 +10,13 @@
 #include <unistd.h>
 
 bool mkdir_r(const char* path) {
-  char* path_duplicate = malloc(strlen(path) + 1);
+  size_t path_len = strlen(path);
+  char* path_duplicate = malloc(path_len + 1);
   if (!path_duplicate)
     return false;
-  memcpy(path_duplicate, path, strlen(path) + 1);
-  char* path_current = (char*)malloc((strlen(path) + 2) * sizeof(char));
+  memcpy(path_duplicate, path, path_len + 1);
+  size_t capacity = path_len + 2;
+  char* path_current = (char*)malloc(capacity * sizeof(char));
   if (!path_current) {
     free(path_duplicate);
     return false;
@@ -33,6 +35,10 @@ bool mkdir_r(const char* path) {
   bool ok = true;
   while (part != NULL) {
     size_t part_len = strlen(part);
+    if ((size_t)(path_current_position - path_current) + part_len + 2 > capacity) {
+      ok = false;
+      break;
+    }
     memcpy(path_current_position, part, part_len);
     path_current_position += part_len;
     path_current_position[0] = '/';
@@ -64,10 +70,18 @@ char* str_dup(const char* string) {
   return new_string;
 }
 
+/* Match a glob pattern against a string. Supported wildcards:
+ *   ?      matches any single character except '/'.
+ *   *      matches any sequence of characters within one path component (no '/').
+ *   **     matches any sequence of characters, including '/' (cross-directory).
+ *   slash-star-star-slash is treated as a cross-directory wildcard when it appears between
+ * literals.
+ */
 bool glob_match(const char* pattern, const char* str) {
   while (*pattern) {
     if (*pattern == '*') {
       if (*(pattern + 1) == '*') {
+        /* globstar: match across directories */
         pattern += 2;
         if (*pattern == '\0')
           return true;
@@ -80,6 +94,7 @@ bool glob_match(const char* pattern, const char* str) {
         }
         return glob_match(pattern, str);
       }
+      /* single *: match within one path component */
       pattern++;
       while (*str && *str != '/') {
         if (glob_match(pattern, str))
@@ -94,6 +109,7 @@ bool glob_match(const char* pattern, const char* str) {
       str++;
     } else {
       if (*pattern != *str) {
+        /* allow literal / ** / rest to match any number of directories */
         if (*pattern == '/' && *(pattern + 1) == '*' && *(pattern + 2) == '*') {
           const char* rest = pattern + 3;
           if (*rest == '/')
