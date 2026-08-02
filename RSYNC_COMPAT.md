@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 42 | Feature works end-to-end |
-| 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
-| ⚠️ Partial | 31 | Flag parsed/stored but behavior incomplete |
-| ❌ Not Implemented | 66 | Flag not recognized or no behavior |
-| **Total** | **142** | |
+| ✅ Implemented | 39 | Feature works end-to-end |
+| 🔀 Alt Arg | 5 | Functionality exists but under different flag/semantics |
+| ⚠️ Partial | 30 | Flag parsed/stored but behavior incomplete |
+| ❌ Not Implemented | 62 | Flag not recognized or no behavior |
+| **Total** | **136** | |
 
 ---
 
@@ -83,7 +83,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--append` | Append data to shorter files | ⚠️ Partial | `append` stored, not wired |
 | `--append-verify` | Append with old-data checksum | ⚠️ Partial | `append_verify` stored, not wired |
 | `-W`, `--whole-file` | Copy whole file (no delta) | ❌ Not Implemented | |
-| `--block-size=SIZE` | Force checksum block-size | ⚠️ Partial | `delta_block_size` configurable |
+| `--block-size=SIZE` | Force checksum block-size | ⚠️ Partial | Parsed as `--delta-block`; controls delta transfer block size |
 
 ## 6. Destination Handling
 
@@ -115,7 +115,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `-M`, `--preserve` | Preserve file metadata | ✅ Implemented | Mode, uid, gid, mtime |
-| `-p`, `--perms` | Preserve permissions | ✅ Implemented | Part of -M |
+| `-p`, `--perms` | Preserve permissions | 🔀 Alt Arg | `-p` means SSH port; permissions preserved via `-M`/`--preserve` |
 | `-o`, `--owner` | Preserve owner | ✅ Implemented | Part of -M |
 | `-g`, `--group` | Preserve group | ✅ Implemented | Part of -M |
 | `-t`, `--times` | Preserve modification times | ✅ Implemented | Part of -M |
@@ -140,7 +140,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-l`, `--links` | Copy symlinks as symlinks | ✅ Implemented | Scanner symlink handling |
+| `-l`, `--links` | Copy symlinks as symlinks | ⚠️ Partial | Scanner includes symlinks; target path not transmitted |
 | `-L`, `--copy-links` | Transform symlink to referent | ✅ Implemented | `copy_links` config field |
 | `--copy-unsafe-links` | Transform unsafe symlinks | ✅ Implemented | `copy_unsafe_links` config field |
 | `--safe-links` | Ignore symlinks outside tree | ✅ Implemented | `safe_links` config field |
@@ -159,9 +159,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-c`, `--checksum` | Skip based on checksum | ⚠️ Partial | `checksum` stored, forwarded to scanner |
+| `-c`, `--checksum` | Skip based on checksum | 🔀 Alt Arg | `-c` means compression; `--checksum` stored and forwarded to scanner |
 | `--checksum-choice=STR` | Choose checksum algorithm | ❌ Not Implemented | xxHash used internally |
-| `--whole-file` | Disable delta-xfer algorithm | ❌ Not Implemented | |
 | `--compare-dest=DIR` | Compare dest files relative to DIR | ⚠️ Partial | `compare_dest` stored, not wired |
 | `--copy-dest=DIR` | Include copies of unchanged files | ⚠️ Partial | `copy_dest` stored, not wired |
 | `--link-dest=DIR` | Hardlink to files when unchanged | ⚠️ Partial | `link_dest` stored, not wired |
@@ -175,7 +174,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--compress-choice=STR` | Choose compression algorithm | ⚠️ Partial | `compress_choice` stored, always zstd |
 | `--compress-level=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
-| `--skip-compress=LIST` | Skip compress for suffixes | ❌ Not Implemented | Smart skip for known types |
+| `--skip-compress=LIST` | Skip compress for suffixes | ❌ Not Implemented | Internal skip for hardcoded types; not user-configurable |
 
 ## 13. Connectivity
 
@@ -187,7 +186,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--sockopts=OPTIONS` | Custom TCP options | ❌ Not Implemented | |
 | `--blocking-io` | Use blocking I/O for remote shell | ❌ Not Implemented | |
 | `--outbuf=N\|L\|B` | Set output buffering | ❌ Not Implemented | |
-| `--address=ADDRESS` | Bind address for outgoing socket | ✅ Implemented | `bind_address` config field |
+| `--address=ADDRESS` | Bind address for outgoing socket | ✅ Implemented | `address` config field |
 | `-4`, `--ipv4` | Prefer IPv4 | ✅ Implemented | `ipv4` config field |
 | `-6`, `--ipv6` | Prefer IPv6 | ✅ Implemented | `ipv6` config field |
 
@@ -212,7 +211,6 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Max data/string/chunk sizes | Prevent OOM attacks | ✅ Implemented | Per-message limits |
 | Per-connection memory limit | 1GB per connection | ✅ Implemented | `MAX_CONNECTION_MEMORY` |
 | `--trust-sender` | Trust remote sender's file list | ❌ Not Implemented | |
-| `--secluded-args` | Send args via protocol | ❌ Not Implemented | |
 | `--old-args` | Disable modern arg protection | ❌ Not Implemented | |
 | `--ignore-missing-args` | Ignore missing source args | ❌ Not Implemented | |
 | `--delete-missing-args` | Delete missing source args | ❌ Not Implemented | |
