@@ -525,6 +525,12 @@ static bool validate_config(const Config* config) {
     fprintf(stderr, "Error: --delta cannot be combined with -f (sendfile)\n");
     return false;
   }
+  if (config->append || config->append_verify) {
+    fprintf(
+        stderr,
+        "Error: --append and --append-verify are not supported yet; refusing to ignore option\n");
+    return false;
+  }
   if (config->use_tls) {
     if (!config->tls_cert || !config->tls_key) {
       fprintf(stderr, "Error: --tls requires --cert and --key\n");

@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +174,17 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   if (disk_path == NULL) {
     free(resolved_root);
     return false;
+  }
+
+  /* --update is receiver-side policy: never replace a newer destination. */
+  if (config && config->update) {
+    struct stat destination_stat;
+    if (stat(disk_path, &destination_stat) == 0 && file->metadata &&
+        destination_stat.st_mtime > file->metadata->mtime_sec) {
+      free(resolved_root);
+      free(disk_path);
+      return true;
+    }
   }
 
   if (backup_enabled) {
@@ -546,8 +558,108 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   return file;
 }
 
+static int open_secure_parent(const char* path, char** leaf_out) {
+  char* copy = str_dup(path);
+  if (!copy)
+    return -1;
+  char* parent = dirname(copy);
+  const char* slash = strrchr(path, '/');
+  char* leaf = str_dup(slash ? slash + 1 : path);
+  if (!leaf) {
+    free(copy);
+    return -1;
+  }
+  int fd = (parent[0] == '/') ? open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                              : open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    free(copy);
+    free(leaf);
+    return -1;
+  }
+  char* save = NULL;
+  char* component = strtok_r(parent, "/", &save);
+  while (component) {
+    if (strcmp(component, ".") != 0 && strcmp(component, "..") != 0) {
+      int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (next < 0 && errno == ENOENT && mkdirat(fd, component, 0755) == 0)
+        next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (next < 0) {
+        close(fd);
+        free(copy);
+        free(leaf);
+        return -1;
+      }
+      close(fd);
+      fd = next;
+    }
+    component = strtok_r(NULL, "/", &save);
+  }
+  free(copy);
+  *leaf_out = leaf;
+  return fd;
+}
+
+static bool write_all(int fd, const void* data, unsigned long long size) {
+  const unsigned char* p = data;
+  unsigned long long done = 0;
+  while (done < size) {
+    ssize_t n = write(fd, p + done, (size_t)(size - done));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return false;
+    done += (unsigned long long)n;
+  }
+  return true;
+}
+
+static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
+                           bool inplace, bool sparse) {
+  char* leaf = NULL;
+  int dirfd = open_secure_parent(path, &leaf);
+  if (dirfd < 0)
+    return false;
+  int fd = -1;
+  bool ok = false;
+  if (inplace) {
+    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd >= 0) {
+      if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
+        ok = write_all(fd, data, data_size);
+    }
+  } else {
+    char tmp[NAME_MAX];
+    for (unsigned int i = 0; i < 100 && !ok; ++i) {
+      snprintf(tmp, sizeof(tmp), ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
+      fd = openat(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (fd < 0)
+        continue;
+      if (sparse && data_size > 0)
+        ok = ftruncate(fd, (off_t)data_size) == 0;
+      if (ok || (!sparse || data_size == 0))
+        ok = write_all(fd, data, data_size);
+      if (close(fd) != 0)
+        ok = false;
+      fd = -1;
+      if (ok && renameat(dirfd, tmp, dirfd, leaf) != 0)
+        ok = false;
+      if (!ok)
+        unlinkat(dirfd, tmp, 0);
+    }
+  }
+  if (fd >= 0)
+    close(fd);
+  close(dirfd);
+  free(leaf);
+  return ok;
+}
+
 bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
              bool sparse) {
+  if (!path || (!data && data_size != 0) || has_path_traversal(path))
+    return false;
+  return to_disk_secure(path, data, data_size, inplace, sparse);
+  /* Kept below only as historical context; all writes use descriptor-relative operations. */
   char* tmp_path = NULL;
   char* directory = NULL;
 

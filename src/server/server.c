@@ -15,6 +15,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static char* authorized_root;
+static bool allow_delete;
+
+static bool path_is_within(const char* root, const char* path) {
+  size_t n = strlen(root);
+  return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+static bool __attribute__((unused)) configure_authorization(const char* root) {
+  char resolved[PATH_MAX];
+  if (!root || !realpath(root, resolved))
+    return false;
+  authorized_root = str_dup(resolved);
+  return authorized_root != NULL;
+}
 
 int receive_files(Config* config, int fd) {
   Status status;
@@ -119,6 +138,36 @@ void handler(int file_descriptor) {
     close(file_descriptor);
     return;
   }
+  if (!authorized_root) {
+    log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
+    config_delete(config);
+    close(file_descriptor);
+    return;
+  }
+  char resolved_destination[PATH_MAX];
+  char* canonical_destination = realpath(config->receive_root_directory, NULL);
+  const char* destination =
+      canonical_destination ? canonical_destination : config->receive_root_directory;
+  if (has_path_traversal(destination) || !path_is_within(authorized_root, destination)) {
+    log_message(LOG_LEVEL_ERROR, "Rejected destination outside authorized root");
+    free(canonical_destination);
+    config_delete(config);
+    close(file_descriptor);
+    return;
+  }
+  if (canonical_destination)
+    snprintf(resolved_destination, sizeof(resolved_destination), "%s", canonical_destination);
+  else
+    snprintf(resolved_destination, sizeof(resolved_destination), "%s", destination);
+  free(canonical_destination);
+  free(config->receive_root_directory);
+  config->receive_root_directory = str_dup(resolved_destination);
+  if (!config->receive_root_directory) {
+    config_delete(config);
+    close(file_descriptor);
+    return;
+  }
+  config->use_delete = config->use_delete && allow_delete;
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {
@@ -178,6 +227,8 @@ static void print_server_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  --destination-root <path>  Authorized destination root (default: .)\n");
+  printf("  --allow-delete      Permit manifest deletion\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  --help              Show this help\n");
 }
@@ -188,6 +239,8 @@ int main(int argc, char* argv[]) {
   char* tls_key = NULL;
   char* tls_ca = NULL;
   int port = 8080;
+  const char* destination_root = ".";
+  bool stdio_mode = false;
 
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
@@ -195,9 +248,7 @@ int main(int argc, char* argv[]) {
       print_server_usage();
       return 0;
     } else if (strcmp(argv[i], "--stdio") == 0) {
-      io_set_fds(STDIN_FILENO, STDOUT_FILENO);
-      handler(STDIN_FILENO);
-      return 0;
+      stdio_mode = true;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (strcmp(argv[i], "--tls") == 0) {
@@ -208,6 +259,10 @@ int main(int argc, char* argv[]) {
       tls_key = argv[++i];
     } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
       tls_ca = argv[++i];
+    } else if (strcmp(argv[i], "--destination-root") == 0 && i + 1 < argc) {
+      destination_root = argv[++i];
+    } else if (strcmp(argv[i], "--allow-delete") == 0) {
+      allow_delete = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
       char* end;
       long p = strtol(argv[++i], &end, 10);
@@ -229,6 +284,16 @@ int main(int argc, char* argv[]) {
 
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
+  if (!configure_authorization(destination_root)) {
+    fprintf(stderr, "Error: invalid destination root '%s'\n", destination_root);
+    return 1;
+  }
+  if (stdio_mode) {
+    io_set_fds(STDIN_FILENO, STDOUT_FILENO);
+    handler(STDIN_FILENO);
+    free(authorized_root);
+    return 0;
+  }
   g_server = server_create(port);
   if (g_server == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");

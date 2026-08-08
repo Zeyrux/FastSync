@@ -126,6 +126,28 @@ static void test_to_disk_creates_dirs() {
   rmdir("test_nested_tmp");
 }
 
+static void test_to_disk_does_not_follow_symlink() {
+  const char* outside = "test_to_disk_outside.txt";
+  const char* link = "test_to_disk_link.txt";
+  const char* content = "confined";
+  unlink(outside);
+  unlink(link);
+  EXPECT_TRUE(to_disk(outside, "outside", 7, false, false));
+  EXPECT_EQ_INT(symlink(outside, link), 0);
+  EXPECT_TRUE(to_disk(link, content, strlen(content), false, false));
+  FILE* fp = fopen(outside, "rb");
+  char buf[16] = {0};
+  EXPECT_NOT_NULL(fp);
+  if (fp) {
+    size_t read_count = fread(buf, 1, sizeof(buf) - 1, fp);
+    EXPECT_TRUE(read_count <= sizeof(buf) - 1);
+    fclose(fp);
+  }
+  EXPECT_EQ_STR(buf, "outside");
+  unlink(outside);
+  unlink(link);
+}
+
 static void test_file_content_to_buffer() {
   const char* content = "Buffer content test";
   EXPECT_TRUE(to_disk("test_buffer_file.txt", content, strlen(content), false, false));
@@ -434,6 +456,7 @@ void test_file() {
   test_file_save_to_disk();
   test_to_disk_basic();
   test_to_disk_creates_dirs();
+  test_to_disk_does_not_follow_symlink();
   test_file_content_to_buffer();
   test_file_save_to_disk_path_traversal();
   test_file_save_to_disk_deep_traversal();
