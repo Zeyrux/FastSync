@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef FASTSYNC_TEST_BUILD
 /* Parse environment variables for source/destination directories and save-to-disk flag. */
 static void parse_environment(const char** out_env_source, const char** out_env_dest,
                               bool* out_save_to_disk) {
@@ -22,6 +23,7 @@ static void parse_environment(const char** out_env_source, const char** out_env_
   if (env_save && (strcmp(env_save, "true") == 0 || strcmp(env_save, "1") == 0))
     *out_save_to_disk = true;
 }
+#endif
 
 /* Parse a string as a positive integer, returning true on success. */
 static bool parse_positive_int(const char* s, int* out_val) {
@@ -84,11 +86,14 @@ static void print_usage(void);
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
-static int parse_args(Config* config, int argc, char* argv[], int* positional_args,
-                      int* positional_count) {
+int parse_args(Config* config, int argc, char* argv[], int* positional_args,
+               int* positional_count) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0) {
       print_usage();
+      return 1;
+    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+      printf("fastsync version %s\n", PROTOCOL_VERSION);
       return 1;
     } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
       config->use_compression = true;
@@ -100,6 +105,10 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->ssh_port)) {
         fprintf(stderr, "Error: invalid --port/-p value: %s\n", argv[i]);
+        return -1;
+      }
+      if (config->ssh_port > 65535) {
+        fprintf(stderr, "Error: SSH port must be 1-65535\n");
         return -1;
       }
     } else if (strcmp(argv[i], "--delete") == 0) {
@@ -218,6 +227,10 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
     } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->server_port)) {
         fprintf(stderr, "Error: invalid --server-port value: %s\n", argv[i]);
+        return -1;
+      }
+      if (config->server_port > 65535) {
+        fprintf(stderr, "Error: server port must be 1-65535\n");
         return -1;
       }
     } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
@@ -451,6 +464,7 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
   return 0;
 }
 
+#ifndef FASTSYNC_TEST_BUILD
 /* Validate config after parsing. Returns true if valid. */
 static bool validate_config(const Config* config) {
   if (!config->send_directory || !config->receive_root_directory) {
@@ -491,6 +505,7 @@ static bool validate_config(const Config* config) {
   }
   return true;
 }
+#endif /* FASTSYNC_TEST_BUILD */
 
 static void print_usage(void) {
   printf("Usage:\n");
@@ -599,6 +614,7 @@ static void print_usage(void) {
   printf("  --copy-dest <dir>   Copy destination\n");
   printf("  --link-dest <dir>   Link destination\n");
   printf("  --help              Show this help\n");
+  printf("  -V, --version       Show version\n");
 }
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
@@ -643,6 +659,7 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
   return 0;
 }
 
+#ifndef FASTSYNC_TEST_BUILD
 int main(int argc, char* argv[]) {
   const char* env_source = NULL;
   const char* env_dest = NULL;
@@ -748,3 +765,4 @@ cleanup:
   }
   return exit_code;
 }
+#endif /* FASTSYNC_TEST_BUILD */

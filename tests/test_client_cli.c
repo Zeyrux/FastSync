@@ -6,6 +6,9 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Declaration of parse_args from client_cli.c */
+int parse_args(Config* config, int argc, char* argv[], int* positional_args, int* positional_count);
+
 /* Test main() with --help flag (early return path, no server connection needed) */
 static void test_cli_help() {
   /* We can't easily call main() because it calls send_files which needs a server.
@@ -80,10 +83,160 @@ static void test_cli_exclude_patterns() {
   config_delete(cfg);
 }
 
+/* Test parse_args with --help returns 1 (clean exit) */
+static void test_parse_args_help() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--help"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 2, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args with -V/--version returns 1 */
+static void test_parse_args_version() {
+  Config* cfg = config_create();
+  char* argv_short[] = {"fastsync", "-V"};
+  char* argv_long[] = {"fastsync", "--version"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 2, argv_short, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 1);
+
+  ret = parse_args(cfg, 2, argv_long, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args with valid port */
+static void test_parse_args_valid_port() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-p", "2222", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 5, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_INT(cfg->ssh_port, 2222);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args rejects port > 65535 */
+static void test_parse_args_invalid_port() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-p", "99999", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 5, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, -1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args rejects non-numeric port */
+static void test_parse_args_non_numeric_port() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-p", "abc", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 5, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, -1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args rejects server port > 65535 */
+static void test_parse_args_invalid_server_port() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--server-port", "70000", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 5, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, -1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args rejects invalid compression level */
+static void test_parse_args_invalid_compression_level() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-c", "25", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 5, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, -1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args accepts valid compression level */
+static void test_parse_args_valid_compression_level() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-c", "10", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 5, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_INT(cfg->compression_level, 10);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args unknown option returns error */
+static void test_parse_args_unknown_option() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--nonexistent", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, -1);
+
+  config_delete(cfg);
+}
+
+/* Test parse_args with --archive flag */
+static void test_parse_args_archive() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--archive", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_TRUE(cfg->use_compression);
+  EXPECT_TRUE(cfg->use_multithreading);
+  EXPECT_TRUE(cfg->use_metadata);
+
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();
   test_cli_delete_flag();
   test_cli_exclude_patterns();
+  test_parse_args_help();
+  test_parse_args_version();
+  test_parse_args_valid_port();
+  test_parse_args_invalid_port();
+  test_parse_args_non_numeric_port();
+  test_parse_args_invalid_server_port();
+  test_parse_args_invalid_compression_level();
+  test_parse_args_valid_compression_level();
+  test_parse_args_unknown_option();
+  test_parse_args_archive();
 }

@@ -10,7 +10,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_DATA_SIZE (100ULL * 1024 * 1024)          /* 100 MB max per data message */
 #define RECEIVE_TIMEOUT_SEC 60                        /* 60 second per-message timeout */
 #define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
 
@@ -236,9 +235,9 @@ Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
-  if (size > MAX_DATA_SIZE) {
+  if (size > MAX_DATA_PAYLOAD_SIZE) {
     log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
-                (unsigned long long)MAX_DATA_SIZE);
+                (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
   }
   if (total_allocated_bytes + size > MAX_CONNECTION_MEMORY) {
