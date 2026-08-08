@@ -1,12 +1,13 @@
 #include "compression.h"
 #include "data.h"
 #include "log.h"
-#include "stdlib.h"
-#include "string.h"
+#include <stdlib.h>
+#include <string.h>
 #include <strings.h>
-#include "zstd.h"
+#include <zstd.h>
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
+#define MAX_DECOMPRESSED_SIZE (100ULL * 1024 * 1024) /* 100 MB hard ceiling */
 
 static const char* SKIP_COMPRESSION_EXTENSIONS[] = {".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mkv",
                                                     ".zip", ".gz",   ".xz",  ".zst", NULL};
@@ -84,6 +85,13 @@ Data* data_decompress(Data* compressed_data) {
     dst_size = compressed_data->size * 3;
     if (dst_size < INITIAL_DECOMPRESS_BUF_SIZE)
       dst_size = INITIAL_DECOMPRESS_BUF_SIZE;
+    if (dst_size > MAX_DECOMPRESSED_SIZE)
+      dst_size = MAX_DECOMPRESSED_SIZE;
+  }
+  if (dst_size > MAX_DECOMPRESSED_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "Declared decompressed size exceeds %llu bytes",
+                (unsigned long long)MAX_DECOMPRESSED_SIZE);
+    return NULL;
   }
 
   ZSTD_DCtx* dctx = ZSTD_createDCtx();
@@ -113,7 +121,16 @@ Data* data_decompress(Data* compressed_data) {
       return NULL;
     }
     if (ret > 0 && output.pos == output.size) {
+      if (buf_size >= MAX_DECOMPRESSED_SIZE) {
+        log_message(LOG_LEVEL_ERROR, "Decompressed data exceeds %llu bytes",
+                    (unsigned long long)MAX_DECOMPRESSED_SIZE);
+        ZSTD_freeDCtx(dctx);
+        data_destroy(uncompressed_data);
+        return NULL;
+      }
       buf_size *= 2;
+      if (buf_size > MAX_DECOMPRESSED_SIZE)
+        buf_size = MAX_DECOMPRESSED_SIZE;
       void* new_data = realloc(uncompressed_data->data, buf_size);
       if (!new_data) {
         log_message(LOG_LEVEL_ERROR, "Failed to grow decompression buffer");

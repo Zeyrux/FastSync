@@ -388,6 +388,10 @@ Delta* delta_deserialize(const Data* data) {
 
     if (type == DELTA_OP_BLOCK_MATCH) {
       if (pos + sizeof(uint32_t) * 3 > data->size) {
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
@@ -426,6 +430,11 @@ Delta* delta_deserialize(const Data* data) {
       }
       delta->instructions[i].literal.data = malloc(lit_len);
       if (!delta->instructions[i].literal.data) {
+        log_message(LOG_LEVEL_ERROR, "Failed to allocate %u bytes for literal data", lit_len);
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;

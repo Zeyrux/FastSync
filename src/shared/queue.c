@@ -103,6 +103,22 @@ bool queue_enqueue_multithreaded(Queue* queue, void* item, mtx_t* mutex, cnd_t* 
   return ok;
 }
 
+bool queue_enqueue_multithreaded_cancel(Queue* queue, void* item, mtx_t* mutex,
+                                        cnd_t* condition_not_empty, cnd_t* condition_not_full,
+                                        const bool* cancelled) {
+  mtx_lock(mutex);
+  while (queue_is_full(queue) && (cancelled == NULL || !*cancelled))
+    cnd_wait(condition_not_full, mutex);
+  if (cancelled != NULL && *cancelled) {
+    mtx_unlock(mutex);
+    return false;
+  }
+  bool ok = queue_enqueue(queue, item);
+  cnd_signal(condition_not_empty);
+  mtx_unlock(mutex);
+  return ok;
+}
+
 void* queue_dequeue(Queue* queue) {
   if (queue == NULL || queue_is_empty(queue)) {
     perror("ERROR: Could not dequeue from null or empty queue.");

@@ -16,7 +16,6 @@
 #include "config.h"
 #include "data.h"
 #include "file.h"
-#include "log.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
@@ -96,6 +95,9 @@ bool file_load_data(File* file) {
   size_t bytes_read = file_content_to_buffer(file);
   if (bytes_read != file->data->size) {
     log_message(LOG_LEVEL_ERROR, "Did not read expected amount of bytes from file");
+    free(file->data->data);
+    file->data->data = NULL;
+    file->data->size = 0;
     return false;
   }
   return true;

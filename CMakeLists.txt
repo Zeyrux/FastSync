@@ -79,8 +79,9 @@ set(TEST_INCLUDES tests src/shared src/server src/client)
 
 # Monolithic test binary (backward compatible)
 file(GLOB TEST_SRCS "tests/test_*.c" "tests/runner.c")
-add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
+add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c src/client/client_cli.c)
 target_include_directories(tests PRIVATE ${TEST_INCLUDES})
+target_compile_definitions(tests PRIVATE FASTSYNC_TEST_BUILD)
 target_link_libraries(tests PRIVATE ${TEST_LIBS})
 add_test(NAME unit_all COMMAND tests)
 

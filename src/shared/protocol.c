@@ -6,10 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_DATA_SIZE (100ULL * 1024 * 1024)          /* 100 MB max per data message */
 #define RECEIVE_TIMEOUT_SEC 60                        /* 60 second per-message timeout */
 #define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
 
@@ -20,6 +20,8 @@ static __thread SSL* io_ssl;
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
 static struct timespec bw_last_refill = {0, 0};
+static mtx_t bw_mutex;
+static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
 static __thread unsigned long long total_allocated_bytes = 0;
 
@@ -28,15 +30,24 @@ void io_set_fds(int read_fd, int write_fd) {
   io_write_fd = write_fd;
 }
 
+static void bw_mutex_init(void) {
+  mtx_init(&bw_mutex, mtx_plain);
+}
+
 void io_set_bwlimit(unsigned long long bytes_per_sec) {
+  call_once(&bw_mutex_once, bw_mutex_init);
+  mtx_lock(&bw_mutex);
   io_bwlimit = bytes_per_sec;
   bw_tokens = (long long)io_bwlimit;
   clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
+  mtx_unlock(&bw_mutex);
 }
 
 static void bw_throttle(size_t bytes_written) {
   if (io_bwlimit == 0)
     return;
+  call_once(&bw_mutex_once, bw_mutex_init);
+  mtx_lock(&bw_mutex);
 
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -61,6 +72,7 @@ static void bw_throttle(size_t bytes_written) {
     bw_tokens = 0;
     clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
   }
+  mtx_unlock(&bw_mutex);
 }
 
 void io_set_ssl(SSL* ssl) {
@@ -177,6 +189,8 @@ static const char* status_to_string(Status status) {
 }
 
 bool send_str(int file_descriptor, const char* data) {
+  if (data == NULL)
+    return false;
   size_t size = strlen(data);
   if (!send_n_data(file_descriptor, &size, sizeof(size_t)))
     return false;
@@ -221,9 +235,9 @@ Data* receive_data(int file_descriptor) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
-  if (size > MAX_DATA_SIZE) {
+  if (size > MAX_DATA_PAYLOAD_SIZE) {
     log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
-                (unsigned long long)MAX_DATA_SIZE);
+                (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
   }
   if (total_allocated_bytes + size > MAX_CONNECTION_MEMORY) {

@@ -26,6 +26,7 @@ typedef struct {
   mtx_t mutex_progress;
   unsigned long long progress_bytes;
   bool sender_done;
+  bool cancelled;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {
@@ -37,6 +38,7 @@ typedef struct PipelineContextReceiver {
   cnd_t condition_not_full;
   cnd_t condition_not_empty;
   bool receiver_done;
+  bool cancelled;
 } PipelineContextReceiver;
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,

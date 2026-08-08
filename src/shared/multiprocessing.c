@@ -26,18 +26,48 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->manifest = NULL;
   context->progress_bytes = 0;
   context->sender_done = false;
-  if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_full_scanner) != thrd_success ||
-      cnd_init(&context->condition_not_empty_scanner) != thrd_success ||
-      mtx_init(&context->mutex_loader, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_full_loader) != thrd_success ||
-      mtx_init(&context->mutex_progress, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_empty_loader) != thrd_success) {
-    perror("Error initializing synchronization objects");
-    free(context);
-    return NULL;
-  }
+  context->cancelled = false;
+  int init = 0;
+  if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_full_scanner) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_empty_scanner) != thrd_success)
+    goto fail;
+  init++;
+  if (mtx_init(&context->mutex_loader, mtx_plain) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_full_loader) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_empty_loader) != thrd_success)
+    goto fail;
+  init++;
+  if (mtx_init(&context->mutex_progress, mtx_plain) != thrd_success)
+    goto fail;
+  // cppcheck-suppress unreadVariable
+  init++;
   return context;
+
+fail:
+  perror("Error initializing synchronization objects");
+  if (init >= 6)
+    cnd_destroy(&context->condition_not_empty_loader);
+  if (init >= 5)
+    cnd_destroy(&context->condition_not_full_loader);
+  if (init >= 4)
+    mtx_destroy(&context->mutex_loader);
+  if (init >= 3)
+    cnd_destroy(&context->condition_not_empty_scanner);
+  if (init >= 2)
+    cnd_destroy(&context->condition_not_full_scanner);
+  if (init >= 1)
+    mtx_destroy(&context->mutex_scanner);
+  free(context);
+  return NULL;
 }
 
 void pipeline_context_sender_destroy(PipelineContextSender* context) {
@@ -67,14 +97,30 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->file_descriptor = file_descriptor;
   context->ssl = ssl;
   context->receiver_done = false;
-  if (mtx_init(&context->mutex, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_full) != thrd_success ||
-      cnd_init(&context->condition_not_empty) != thrd_success) {
-    perror("Error initializing synchronization objects");
-    free(context);
-    return NULL;
-  }
+  context->cancelled = false;
+  int init = 0;
+  if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_full) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_empty) != thrd_success)
+    goto fail;
+  // cppcheck-suppress unreadVariable
+  init++;
   return context;
+
+fail:
+  perror("Error initializing synchronization objects");
+  if (init >= 3)
+    cnd_destroy(&context->condition_not_empty);
+  if (init >= 2)
+    cnd_destroy(&context->condition_not_full);
+  if (init >= 1)
+    mtx_destroy(&context->mutex);
+  free(context);
+  return NULL;
 }
 
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
@@ -94,8 +140,13 @@ static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
   for (int i = 0; i < chunk->element_count; i++) {
     File* file = chunk->items[i];
     chunk->items[i] = NULL;
-    queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                &context->condition_not_empty, &context->condition_not_full);
+    if (!queue_enqueue_multithreaded_cancel(context->queue, file, &context->mutex,
+                                            &context->condition_not_empty,
+                                            &context->condition_not_full, &context->cancelled)) {
+      file_destroy(file);
+      chunk_destroy(chunk);
+      return false;
+    }
   }
   chunk_destroy(chunk);
   return true;
@@ -129,8 +180,12 @@ int receive_thread(void* pipeline_context) {
       if (!skipped) {
         if (file == NULL)
           return thrd_error;
-        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                    &context->condition_not_empty, &context->condition_not_full);
+        if (!queue_enqueue_multithreaded_cancel(
+                context->queue, file, &context->mutex, &context->condition_not_empty,
+                &context->condition_not_full, &context->cancelled)) {
+          file_destroy(file);
+          return thrd_error;
+        }
       }
     } else if (status == STATUS_CHUNK) {
       if (!receive_chunk_enqueue(file_descriptor, context))
@@ -166,8 +221,12 @@ int receive_thread(void* pipeline_context) {
     } else {
       File* file = file_receive(config, file_descriptor);
       if (file) {
-        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                    &context->condition_not_empty, &context->condition_not_full);
+        if (!queue_enqueue_multithreaded_cancel(
+                context->queue, file, &context->mutex, &context->condition_not_empty,
+                &context->condition_not_full, &context->cancelled)) {
+          file_destroy(file);
+          return thrd_error;
+        }
       } else {
         log_message(LOG_LEVEL_ERROR, "Failed to receive file");
         return thrd_error;
