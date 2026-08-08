@@ -138,6 +138,7 @@ static void test_to_disk_does_not_follow_symlink() {
   FILE* fp = fopen(outside, "rb");
   char buf[16] = {0};
   EXPECT_NOT_NULL(fp);
+  // cppcheck-suppress knownConditionTrueFalse
   if (!fp)
     return;
   size_t read_count = fread(buf, 1, sizeof(buf) - 1, fp);

@@ -91,7 +91,9 @@ static void test_sender_zero_capacity() {
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 
+  // cppcheck-suppress constVariablePointer
   Queue* const q1 = queue_create(0, NULL);
+  // cppcheck-suppress constVariablePointer
   Queue* const q2 = queue_create(0, NULL);
   EXPECT_NULL(q1);
   EXPECT_NULL(q2);
