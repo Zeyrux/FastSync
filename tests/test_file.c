@@ -138,11 +138,11 @@ static void test_to_disk_does_not_follow_symlink() {
   FILE* fp = fopen(outside, "rb");
   char buf[16] = {0};
   EXPECT_NOT_NULL(fp);
-  if (fp) {
-    size_t read_count = fread(buf, 1, sizeof(buf) - 1, fp);
-    EXPECT_TRUE(read_count <= sizeof(buf) - 1);
-    fclose(fp);
-  }
+  if (!fp)
+    return;
+  size_t read_count = fread(buf, 1, sizeof(buf) - 1, fp);
+  EXPECT_TRUE(read_count <= sizeof(buf) - 1);
+  fclose(fp);
   EXPECT_EQ_STR(buf, "outside");
   unlink(outside);
   unlink(link);

@@ -873,11 +873,9 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
       return -1;
     }
   }
-  if (manifest) {
-    fprintf(stderr, "Deleting files not in manifest...\n");
-    delete_extras(config->receive_root_directory, manifest);
-    array_list_delete(manifest);
-  }
+  fprintf(stderr, "Deleting files not in manifest...\n");
+  delete_extras(config->receive_root_directory, manifest);
+  array_list_delete(manifest);
   if (!receive_status(fd, next_status))
     return -1;
   return 0;
