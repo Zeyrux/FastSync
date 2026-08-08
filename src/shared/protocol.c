@@ -79,8 +79,8 @@ static int io_fd(int dir_fd, int file_descriptor) {
 static int deadline_remaining_ms(const struct timespec* deadline) {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  long long ns = (long long)(deadline->tv_sec - now.tv_sec) * 1000000000LL +
-                deadline->tv_nsec - now.tv_nsec;
+  long long ns =
+      (long long)(deadline->tv_sec - now.tv_sec) * 1000000000LL + deadline->tv_nsec - now.tv_nsec;
   if (ns <= 0)
     return 0;
   long long ms = (ns + 999999) / 1000000;
