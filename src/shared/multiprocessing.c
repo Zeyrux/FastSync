@@ -101,7 +101,20 @@ static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
   return true;
 }
 
+static void receiver_thread_fail(PipelineContextReceiver* context) {
+  mtx_lock(&context->mutex);
+  context->receiver_done = true;
+  cnd_broadcast(&context->condition_not_empty);
+  cnd_broadcast(&context->condition_not_full);
+  mtx_unlock(&context->mutex);
+}
+
 int receive_thread(void* pipeline_context) {
+#define RECEIVE_THREAD_FAIL()                                                                      \
+  do {                                                                                             \
+    receiver_thread_fail(context);                                                                 \
+    return thrd_error;                                                                             \
+  } while (0)
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
   if (context->ssl)
     io_set_ssl(context->ssl);
@@ -112,53 +125,52 @@ int receive_thread(void* pipeline_context) {
 
   Status status;
   if (!receive_status(file_descriptor, &status))
-    return thrd_error;
+    RECEIVE_THREAD_FAIL();
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
     if (status == STATUS_KEEPALIVE) {
-      send_status(file_descriptor, STATUS_KEEPALIVE);
+      if (!send_status(file_descriptor, STATUS_KEEPALIVE))
+        RECEIVE_THREAD_FAIL();
       goto next;
     }
     if (status == STATUS_ABORT) {
       log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
-      return thrd_error;
+      RECEIVE_THREAD_FAIL();
     }
     if (status == STATUS_CHECK) {
       bool skipped;
       File* file = receive_incremental_check(file_descriptor, config, &skipped);
       if (!skipped) {
         if (file == NULL)
-          return thrd_error;
+          RECEIVE_THREAD_FAIL();
         queue_enqueue_multithreaded(context->queue, file, &context->mutex,
                                     &context->condition_not_empty, &context->condition_not_full);
       }
     } else if (status == STATUS_CHUNK) {
       if (!receive_chunk_enqueue(file_descriptor, context))
-        return thrd_error;
+        RECEIVE_THREAD_FAIL();
     } else if (status == STATUS_CHECK_BATCH) {
       int count;
       if (!receive_int(file_descriptor, &count))
-        return thrd_error;
+        RECEIVE_THREAD_FAIL();
       for (int i = 0; i < count; i++) {
         char* check_path = receive_str(file_descriptor);
         if (!check_path)
-          return thrd_error;
+          RECEIVE_THREAD_FAIL();
         unsigned long long check_size;
         long long check_mtime;
         if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
             !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
           free(check_path);
-          return thrd_error;
+          RECEIVE_THREAD_FAIL();
         }
         char* full_path = path_cat(config->receive_root_directory, check_path);
         struct stat st;
         bool has_old = full_path && lstat(full_path, &st) == 0;
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
-        if (match)
-          send_status(file_descriptor, STATUS_OK);
-        else
-          send_status(file_descriptor, STATUS_NEXT);
+        if (!send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT))
+          RECEIVE_THREAD_FAIL();
         free(full_path);
         free(check_path);
       }
@@ -170,21 +182,24 @@ int receive_thread(void* pipeline_context) {
                                     &context->condition_not_empty, &context->condition_not_full);
       } else {
         log_message(LOG_LEVEL_ERROR, "Failed to receive file");
-        return thrd_error;
+        RECEIVE_THREAD_FAIL();
       }
     }
   next:
     if (!receive_status(file_descriptor, &status))
-      return thrd_error;
+      RECEIVE_THREAD_FAIL();
   }
   if (status == STATUS_MANIFEST) {
     if (receive_manifest(file_descriptor, config, &status) != 0)
-      return thrd_error;
+      RECEIVE_THREAD_FAIL();
   }
+  if (status != STATUS_FINISHED)
+    RECEIVE_THREAD_FAIL();
   mtx_lock(&context->mutex);
   context->receiver_done = true;
   cnd_signal(&context->condition_not_empty);
   mtx_unlock(&context->mutex);
+#undef RECEIVE_THREAD_FAIL
   return thrd_success;
 }
 

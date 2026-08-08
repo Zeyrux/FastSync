@@ -82,7 +82,7 @@ static void test_sender_queue_capacities() {
   pipeline_context_sender_destroy(ctx);
 }
 
-/* Test that create handles zero-capacity queues */
+/* Invalid queue capacities must not create unusable pipeline queues. */
 static void test_sender_zero_capacity() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
@@ -93,11 +93,9 @@ static void test_sender_zero_capacity() {
 
   Queue* q1 = queue_create(0, NULL);
   Queue* q2 = queue_create(0, NULL);
-  PipelineContextSender* ctx = pipeline_context_sender_create(cfg, q1, q2);
-  EXPECT_NOT_NULL(ctx);
-  EXPECT_EQ_INT(ctx->queue_scanner->capacity, 0);
-  EXPECT_EQ_INT(ctx->queue_loader->capacity, 0);
-  pipeline_context_sender_destroy(ctx);
+  EXPECT_NULL(q1);
+  EXPECT_NULL(q2);
+  config_delete(cfg);
 }
 
 /* Test receiver with zero file_descriptor */
@@ -168,6 +166,41 @@ static void test_receive_thread_finished() {
   }
 }
 
+/* A malformed terminal status must wake a writer waiting on an empty queue. */
+static void test_receive_thread_failure_wakes_writer() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  Queue* q = queue_create(1, file_destroy);
+  EXPECT_NOT_NULL(q);
+  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, p[0], NULL);
+  EXPECT_NOT_NULL(ctx);
+
+  thrd_t receiver;
+  thrd_t writer;
+  EXPECT_EQ_INT(thrd_create(&writer, write_thread, ctx), thrd_success);
+  EXPECT_EQ_INT(thrd_create(&receiver, receive_thread, ctx), thrd_success);
+  EXPECT_TRUE(send_status(p[1], STATUS_OK));
+  close(p[1]);
+
+  int receiver_result;
+  int writer_result;
+  EXPECT_EQ_INT(thrd_join(receiver, &receiver_result), thrd_success);
+  EXPECT_EQ_INT(thrd_join(writer, &writer_result), thrd_success);
+  EXPECT_EQ_INT(receiver_result, thrd_error);
+  EXPECT_EQ_INT(writer_result, thrd_success);
+  EXPECT_TRUE(ctx->receiver_done);
+
+  close(p[0]);
+  pipeline_context_receiver_destroy(ctx);
+}
+
 /* Test that write_thread completes cleanly when queue signals done */
 static void test_write_thread_done() {
   Config* cfg = config_create();
@@ -223,6 +256,7 @@ void test_multiprocessing() {
   test_receiver_fd_zero();
   if (!is_running_under_valgrind()) {
     test_receive_thread_finished();
+    test_receive_thread_failure_wakes_writer();
   }
   test_write_thread_done();
 }
