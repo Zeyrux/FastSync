@@ -26,6 +26,7 @@ typedef struct {
 File* file_create(const char* path);
 void file_destroy(void* item);
 bool file_load_data(File* file);
+bool file_checksum(File* file, uint64_t* checksum);
 File* file_receive(const Config* config, int file_descriptor);
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path);

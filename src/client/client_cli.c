@@ -461,6 +461,14 @@ static int parse_args(Config* config, int argc, char* argv[], int* positional_ar
         return -1;
       free(config->compress_choice);
       config->compress_choice = dup;
+      if (strcmp(config->compress_choice, "zstd") == 0)
+        config->use_compression = true;
+      else if (strcmp(config->compress_choice, "none") == 0)
+        config->use_compression = false;
+      else {
+        fprintf(stderr, "Error: --compress-choice must be 'zstd' or 'none'\n");
+        return -1;
+      }
     } else if (strcmp(argv[i], "--compress-level") == 0 && i + 1 < argc) {
       int val;
       if (!parse_positive_int(argv[++i], &val)) {

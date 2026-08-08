@@ -67,7 +67,8 @@ static int send_delete_manifest(int fd, ArrayList* manifest) {
   return 0;
 }
 
-static int incremental_check(Client* client, File* file, DeltaSignature** out_sig) {
+static int incremental_check(Client* client, File* file, const Config* config,
+                             DeltaSignature** out_sig) {
   *out_sig = NULL;
   if (!send_status(client->file_descriptor, STATUS_CHECK))
     return -1;
@@ -79,6 +80,12 @@ static int incremental_check(Client* client, File* file, DeltaSignature** out_si
     return -1;
   if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime)))
     return -1;
+  if (config->checksum) {
+    uint64_t checksum;
+    if (!file_checksum(file, &checksum) ||
+        !send_n_data(client->file_descriptor, &checksum, sizeof(checksum)))
+      return -1;
+  }
   Status s;
   if (!receive_status(client->file_descriptor, &s))
     return -1;
@@ -176,7 +183,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   // Incremental path: use sendfile for the actual data if enabled and no compression
   if (use_sendfile) {
     DeltaSignature* sig = NULL;
-    int rc = incremental_check(client, file, &sig);
+    int rc = incremental_check(client, file, config, &sig);
     if (rc == 1) {
       delta_signature_destroy(sig);
       return 1;
@@ -202,7 +209,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   // Incremental path with single_calls (supports compression and delta)
   file_send_fn send_fn = (file_send_fn)file_send_single_calls;
   DeltaSignature* sig = NULL;
-  int rc = incremental_check(client, file, &sig);
+  int rc = incremental_check(client, file, config, &sig);
   if (rc < 0) {
     delta_signature_destroy(sig);
     return -1;

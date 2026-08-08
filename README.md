@@ -73,7 +73,7 @@ A high-performance file synchronization system with SSH and TCP transport, TLS e
 | `STATUS_NEXT` | Ready for next file (per-file mode) |
 | `STATUS_CHUNK` | Following data is a serialized chunk |
 | `STATUS_MANIFEST` | Following data is a file manifest (for `--delete`) |
-| `STATUS_CHECK` | Incremental check: client sends file path + size + mtime, server responds with OK (skip) or NEXT (send) |
+| `STATUS_CHECK` | Incremental check: client sends file path + size + mtime and, when negotiated, checksum; server responds with OK (skip) or NEXT (send) |
 | `STATUS_CHECK_BATCH` | Batch incremental check: multiple file checks sent in one message |
 | `STATUS_KEEPALIVE` | Keep-alive heartbeat to detect stalled connections |
 | `STATUS_ABORT` | Abort signal: client interrupts, server cleans up and exits |
@@ -95,7 +95,9 @@ Abort (`STATUS_ABORT`) may be sent at any point. On receipt the server cleans up
 
 ### Protocol Version
 
-`1.3.0` — server and client must match. Mismatch results in `STATUS_ERROR`.
+`2.2.0` — server and client must match. This version adds a 64-bit XXH64 checksum to checksum-enabled `STATUS_CHECK` messages and validates the negotiated compression choice (`zstd` or `none`). Older clients and servers must not be mixed with this version; mismatch results in `STATUS_ERROR`.
+
+Config negotiation is sender-driven: the client serializes transfer options and the server applies them while receiving and writing files. `--checksum` compares size and content checksum instead of timestamps. `--compress-choice zstd` enables zstd; `none` disables it. Unsupported choices are rejected during config exchange.
 
 ## Command-Line Arguments
 
@@ -186,7 +188,7 @@ Abort (`STATUS_ABORT`) may be sent at any point. On receipt the server cleans up
 2. **Chunking** — files accumulated until `chunk_size` threshold, then flushed
 3. **Compression** — streaming zstd via `ZSTD_compressStream2` / `ZSTD_decompressStream`
 4. **Network protocol** — status-code-driven exchange with metadata packing, keep-alive, and abort support
-5. **Incremental check** — client sends `STATUS_CHECK` + path + size + mtime; server compares against destination. Can be batched via `STATUS_CHECK_BATCH` for reduced round-trips.
+5. **Incremental check** — client sends `STATUS_CHECK` + path + size + mtime and, with `--checksum`, XXH64 content checksum; server compares against destination. Can be batched via `STATUS_CHECK_BATCH` for reduced round-trips.
 6. **Bandwidth limiting** — token-bucket algorithm with `nanosleep` throttling on 64 KB write chunks
 7. **Metadata restoration** — `chmod()`, `chown()`, `utimensat()` on the receiving side
 8. **`--delete`** — sender tracks all sent paths; receiver walks destination tree and removes unlisted files/directories

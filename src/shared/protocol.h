@@ -13,6 +13,7 @@
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
+#define MAX_MANIFEST_ENTRIES (1024 * 1024)
 
 typedef struct ssl_st SSL;
 

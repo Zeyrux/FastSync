@@ -105,9 +105,14 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  if (!present) {
+  if (present == 0) {
     if (ok)
       *ok = 1;
+    return NULL;
+  }
+  if (present != 1) {
+    if (ok)
+      *ok = 0;
     return NULL;
   }
   FileMetadata* m = malloc(sizeof(FileMetadata));
@@ -156,6 +161,12 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
     return NULL;
   }
   m->mtime_nsec = (long)mtime_nsec;
+  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
   if (ok)
     *ok = 1;
   return m;

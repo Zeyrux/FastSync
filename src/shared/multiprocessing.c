@@ -103,6 +103,7 @@ static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
 
 static void receiver_thread_fail(PipelineContextReceiver* context) {
   mtx_lock(&context->mutex);
+  context->cancelled = true;
   context->receiver_done = true;
   cnd_broadcast(&context->condition_not_empty);
   cnd_broadcast(&context->condition_not_full);

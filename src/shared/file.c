@@ -21,6 +21,19 @@
 #include "protocol.h"
 #include "utils.h"
 
+bool file_checksum(File* file, uint64_t* checksum) {
+  if (!file || !checksum || !file->data)
+    return false;
+  if (file->data->size == 0) {
+    *checksum = delta_xxhash64("", 0);
+    return true;
+  }
+  if (!file->data->data && !file_load_data(file))
+    return false;
+  *checksum = delta_xxhash64(file->data->data, file->data->size);
+  return true;
+}
+
 File* file_create(const char* path) {
   File* file = (File*)malloc(sizeof(File));
   if (file == NULL) {
@@ -421,8 +434,14 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 
   unsigned long long check_size;
   long long check_mtime;
+  uint64_t check_checksum = 0;
   if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
       !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+  if (config->checksum && !receive_n_data(fd, &check_checksum, sizeof(check_checksum))) {
     free(check_path);
     send_status(fd, STATUS_ERROR);
     return NULL;
@@ -440,8 +459,17 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   bool has_old_file = (full_path && lstat(full_path, &st) == 0);
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
 
-  bool match = has_old_file && (unsigned long long)st.st_size == check_size &&
-               (long long)st.st_mtime == check_mtime;
+  bool match = has_old_file && (unsigned long long)st.st_size == check_size;
+  if (match && config->checksum) {
+    void* old_data = old_size > 0 ? old_data_from_path(full_path, old_size) : NULL;
+    uint64_t old_checksum = old_size == 0 ? delta_xxhash64("", 0) : 0;
+    if (old_data)
+      old_checksum = delta_xxhash64(old_data, (size_t)old_size);
+    match = (old_size == 0 || old_data) && old_checksum == check_checksum;
+    free(old_data);
+  } else if (match) {
+    match = (long long)st.st_mtime == check_mtime;
+  }
 
   if (match) {
     if (!send_status(fd, STATUS_OK)) {
@@ -664,6 +692,11 @@ File* file_receive(const Config* config, int file_descriptor) {
   char* path = receive_str(file_descriptor);
   if (path == NULL)
     return NULL;
+  if (path[0] == '\0' || has_path_traversal(path)) {
+    log_message(LOG_LEVEL_ERROR, "Invalid received file path: %s", path);
+    free(path);
+    return NULL;
+  }
   File* file = file_create(path);
   free(path);
   if (file == NULL)
@@ -715,13 +748,20 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
   int count;
   if (!receive_int(fd, &count))
     return -1;
+  if (count < 0 || count > MAX_MANIFEST_ENTRIES)
+    return -1;
   ArrayList* manifest = array_list_create(free);
-  if (manifest) {
-    for (int i = 0; i < count; i++) {
-      char* s = receive_str(fd);
-      if (s)
-        array_list_add(manifest, s);
+  if (!manifest)
+    return -1;
+  for (int i = 0; i < count; i++) {
+    char* s = receive_str(fd);
+    if (!s || s[0] == '\0' || has_path_traversal(s) || !array_list_add(manifest, s)) {
+      free(s);
+      array_list_delete(manifest);
+      return -1;
     }
+  }
+  if (manifest) {
     fprintf(stderr, "Deleting files not in manifest...\n");
     delete_extras(config->receive_root_directory, manifest);
     array_list_delete(manifest);

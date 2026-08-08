@@ -469,6 +469,13 @@ Config* config_receive(int file_descriptor) {
   config->compress_choice = receive_str(file_descriptor);
   if (config->compress_choice == NULL)
     goto error;
+  if (config->compress_choice[0] != '\0' &&
+      strcmp(config->compress_choice, "zstd") != 0 &&
+      strcmp(config->compress_choice, "none") != 0) {
+    fprintf(stderr, "Unsupported compression choice: %s\n", config->compress_choice);
+    send_status(file_descriptor, STATUS_ERROR);
+    goto error;
+  }
   config->address = NULL;
   config->bind_address = NULL;
   config->ipv6 = false;

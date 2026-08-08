@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "log.h"
 #include <errno.h>
+#include <limits.h>
 #include <openssl/ssl.h>
 #include <poll.h>
 #include <stdio.h>
@@ -75,6 +76,17 @@ static int io_fd(int dir_fd, int file_descriptor) {
   return (dir_fd != -1) ? dir_fd : file_descriptor;
 }
 
+static int deadline_remaining_ms(const struct timespec* deadline) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long ns = (long long)(deadline->tv_sec - now.tv_sec) * 1000000000LL +
+                deadline->tv_nsec - now.tv_nsec;
+  if (ns <= 0)
+    return 0;
+  long long ms = (ns + 999999) / 1000000;
+  return ms > INT_MAX ? INT_MAX : (int)ms;
+}
+
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   int fd = io_fd(io_write_fd, file_descriptor);
@@ -114,13 +126,19 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
 
   size_t total_bytes_received = 0;
   while (total_bytes_received < data_size) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (now.tv_sec > deadline.tv_sec ||
-        (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec)) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+    if (poll_result == 0) {
       log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
       return false;
     }
+    if (poll_result < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (pfd.revents & (POLLERR | POLLNVAL))
+      return false;
 
     ssize_t bytes_received;
     if (io_ssl)

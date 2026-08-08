@@ -39,7 +39,7 @@ int receive_files(Config* config, int fd) {
       if (file == NULL && !skipped)
         return -1;
       if (config->save_to_disk)
-        file_save_to_disk(config->receive_root_directory, file, NULL);
+        file_save_to_disk(config->receive_root_directory, file, config);
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
       Chunk* chunk = receive_chunk_data(fd, config);
@@ -49,7 +49,7 @@ int receive_files(Config* config, int fd) {
       }
       for (int i = 0; i < chunk->element_count; i++) {
         if (config->save_to_disk)
-          file_save_to_disk(config->receive_root_directory, chunk->items[i], NULL);
+          file_save_to_disk(config->receive_root_directory, chunk->items[i], config);
       }
       chunk_destroy(chunk);
     } else if (status == STATUS_CHECK_BATCH) {
@@ -88,7 +88,7 @@ int receive_files(Config* config, int fd) {
         return -1;
       }
       if (config->save_to_disk)
-        file_save_to_disk(config->receive_root_directory, file, NULL);
+        file_save_to_disk(config->receive_root_directory, file, config);
       file_destroy(file);
     }
   next:
@@ -142,9 +142,12 @@ void handler(int file_descriptor) {
       close(file_descriptor);
       return;
     }
-    thrd_join(receiver, NULL);
-    thrd_join(writer, NULL);
-    send_status(file_descriptor, STATUS_OK);
+    int receiver_result;
+    int writer_result;
+    thrd_join(receiver, &receiver_result);
+    thrd_join(writer, &writer_result);
+    if (receiver_result == thrd_success && writer_result == thrd_success)
+      send_status(file_descriptor, STATUS_OK);
     pipeline_context_receiver_destroy(context);
   } else {
     receive_files(config, file_descriptor);
