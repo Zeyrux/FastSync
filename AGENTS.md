@@ -206,7 +206,7 @@ tea pr close <number> --repo TapTap/FastSync
 
 ## Common pitfalls
 
-- **`__thread` on shared SSL context**: io_ssl must NOT be thread-local — worker threads inherit the SSL context from the main thread. Use regular `static SSL* io_ssl`.
+- **Per-thread SSL context**: `io_ssl` is stored per-thread (`static __thread SSL* io_ssl`). Each thread that performs protocol I/O must call `io_set_ssl()` to install its own SSL object before using `send_*` / `receive_*` primitives. The main thread's SSL context is not automatically inherited by worker threads.
 - **SSL WANT_READ/WANT_WRITE retry**: Always retry on `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE` in `send_n_data`/`receive_n_data`. Removing these breaks TLS multithreaded transfers.
 - **clang-format version**: The CI image uses clang-format 18. Always format inside the CI Docker container for exact match.
 - **Merge order matters**: Merge the most comprehensive branch first, then smaller ones, to minimize conflicts when creating a combined branch.

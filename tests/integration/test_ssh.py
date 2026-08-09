@@ -52,9 +52,11 @@ def _check_ssh():
         pass
 
 
+_check_ssh()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def setup_test_data():
-    _check_ssh()
     if SSH_AVAILABLE:
         generate_test_files(SOURCE_DIR, full=False)
         clean_dir(DEST_DIR)
@@ -84,8 +86,12 @@ def _run_ssh_test(name, flags, expected_missing=None):
     return make_result(name, True, duration)
 
 
-@pytest.mark.skipif(not SSH_AVAILABLE, reason="SSH to localhost not available")
 class TestSSHStandard:
+    @pytest.fixture(autouse=True)
+    def require_ssh(self):
+        if not SSH_AVAILABLE:
+            pytest.skip("SSH to localhost not available")
+
     def test_standard(self):
         r = _run_ssh_test("SSH (localhost)", [])
         assert r["status"] == "Success", r["error"]
@@ -119,8 +125,12 @@ class TestSSHStandard:
         assert r["status"] == "Success", r["error"]
 
 
-@pytest.mark.skipif(not SSH_AVAILABLE, reason="SSH to localhost not available")
 class TestSSHFeatures:
+    @pytest.fixture(autouse=True)
+    def require_ssh(self):
+        if not SSH_AVAILABLE:
+            pytest.skip("SSH to localhost not available")
+
     def test_archive(self):
         r = _run_ssh_test("SSH Archive (-a)", ["-a"])
         assert r["status"] == "Success", r["error"]

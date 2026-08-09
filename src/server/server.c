@@ -184,11 +184,27 @@ void handler(int file_descriptor) {
       return;
     }
     thrd_t receiver, writer;
-    if (thrd_create(&receiver, receive_thread, context) != thrd_success ||
-        thrd_create(&writer, write_thread, context) != thrd_success) {
+    bool receiver_created = false;
+    bool writer_created = false;
+    receiver_created = (thrd_create(&receiver, receive_thread, context) == thrd_success);
+    if (receiver_created)
+      writer_created = (thrd_create(&writer, write_thread, context) == thrd_success);
+    if (!receiver_created || !writer_created) {
       perror("Error creating Threads");
+      if (receiver_created) {
+        mtx_lock(&context->mutex);
+        context->cancelled = true;
+        cnd_broadcast(&context->condition_not_full);
+        cnd_broadcast(&context->condition_not_empty);
+        mtx_unlock(&context->mutex);
+        close(file_descriptor);
+        thrd_join(receiver, NULL);
+      } else {
+        close(file_descriptor);
+      }
+      if (writer_created)
+        thrd_join(writer, NULL);
       pipeline_context_receiver_destroy(context);
-      close(file_descriptor);
       return;
     }
     int receiver_result;

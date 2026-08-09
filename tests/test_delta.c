@@ -327,6 +327,22 @@ static void test_large_file_delta() {
   free(new_data);
 }
 
+static void test_delta_apply_rejects_output_overflow() {
+  uint8_t old_data[8] = {0};
+  uint8_t literal_data[2] = {'x', 'y'};
+  DeltaInstruction instruction = {
+      .type = DELTA_INSTR_LITERAL,
+      .literal = {.data = literal_data, .length = sizeof(literal_data)},
+  };
+  Delta delta = {
+      .new_file_size = 1,
+      .instruction_count = 1,
+      .instructions = &instruction,
+  };
+
+  EXPECT_TRUE(delta_apply(old_data, sizeof(old_data), &delta, 1) == NULL);
+}
+
 void test_delta() {
   test_adler32_basic();
   test_adler32_different_data();
@@ -343,4 +359,5 @@ void test_delta() {
   test_should_attempt();
   test_is_worthwhile();
   test_large_file_delta();
+  test_delta_apply_rejects_output_overflow();
 }

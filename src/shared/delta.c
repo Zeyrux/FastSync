@@ -392,6 +392,10 @@ Delta* delta_deserialize(const Data* data) {
 
     if (type == DELTA_OP_BLOCK_MATCH) {
       if (pos + sizeof(uint32_t) * 3 > data->size) {
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
@@ -430,6 +434,11 @@ Delta* delta_deserialize(const Data* data) {
       }
       delta->instructions[i].literal.data = malloc(lit_len);
       if (!delta->instructions[i].literal.data) {
+        log_message(LOG_LEVEL_ERROR, "Failed to allocate %u bytes for literal data", lit_len);
+        for (uint32_t k = 0; k < i; k++) {
+          if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+            free(delta->instructions[k].literal.data);
+        }
         free(delta->instructions);
         free(delta);
         return NULL;
@@ -453,7 +462,8 @@ Delta* delta_deserialize(const Data* data) {
 
 void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
                   uint32_t block_size) {
-  if (!old_data || !delta)
+  if (!old_data || !delta || (delta->new_file_size > 0 && delta->instructions == NULL) ||
+      (delta->instruction_count > 0 && block_size == 0))
     return NULL;
 
   void* output = malloc((size_t)delta->new_file_size);
@@ -467,10 +477,15 @@ void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
   for (uint32_t i = 0; i < delta->instruction_count; i++) {
     if (delta->instructions[i].type == DELTA_INSTR_BLOCK_MATCH) {
       uint64_t src_offset = (uint64_t)delta->instructions[i].match.block_index * block_size;
+      if (src_offset > UINT64_MAX - delta->instructions[i].match.block_offset) {
+        free(output);
+        return NULL;
+      }
       src_offset += delta->instructions[i].match.block_offset;
       uint32_t len = delta->instructions[i].match.length;
 
-      if (src_offset + len > old_size) {
+      if (src_offset > old_size || (uint64_t)len > old_size - src_offset ||
+          out_pos > delta->new_file_size || (uint64_t)len > delta->new_file_size - out_pos) {
         free(output);
         return NULL;
       }
@@ -478,6 +493,10 @@ void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
       out_pos += len;
     } else {
       uint32_t len = delta->instructions[i].literal.length;
+      if (out_pos > delta->new_file_size || (uint64_t)len > delta->new_file_size - out_pos) {
+        free(output);
+        return NULL;
+      }
       memcpy(out + out_pos, delta->instructions[i].literal.data, len);
       out_pos += len;
     }

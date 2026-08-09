@@ -258,7 +258,7 @@ class TestProgress:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert len(output) >= 0
+        assert output, "--progress produced no output"
 
 
 class TestBandwidthLimit:
