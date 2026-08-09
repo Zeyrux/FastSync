@@ -3,6 +3,7 @@
 #include "libgen.h"
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,34 +137,36 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   return false;
 }
 
-static void delete_extras_walk(const char* abs_path, const char* rel_path, ArrayList* manifest) {
-  DIR* dir = opendir(abs_path);
-  if (!dir)
+static void delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest) {
+  int scanfd = dup(dirfd);
+  if (scanfd < 0)
     return;
+  DIR* dir = fdopendir(scanfd);
+  if (!dir) {
+    close(scanfd);
+    return;
+  }
   bool all_removed = true;
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    char* child_abs = path_cat((char*)abs_path, entry->d_name);
     char* child_rel = path_cat((char*)rel_path, entry->d_name);
     struct stat st;
-    if (lstat(child_abs, &st) != 0) {
-      free(child_abs);
+    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
       free(child_rel);
       continue;
     }
     // Skip symlinks to prevent following them outside the destination tree
     if (S_ISLNK(st.st_mode)) {
-      free(child_abs);
       free(child_rel);
       continue;
     }
     if (S_ISDIR(st.st_mode)) {
-      delete_extras_walk(child_abs, child_rel, manifest);
-      // After recursion, try to remove the subdirectory if it's now empty.
-      // Ignore ENOENT: the recursive call may have already removed it.
-      if (rmdir(child_abs) != 0 && errno != ENOENT) {
+      int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (childfd >= 0)
+        delete_extras_fd(childfd, child_rel, manifest);
+      if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
         all_removed = false;
       }
     } else {
@@ -176,25 +179,30 @@ static void delete_extras_walk(const char* abs_path, const char* rel_path, Array
         }
       }
       if (!found) {
-        unlink(child_abs);
+        if (unlinkat(dirfd, entry->d_name, 0) != 0 && errno != ENOENT)
+          all_removed = false;
         fprintf(stderr, "  Deleted: %s\n", child_rel);
       } else {
         all_removed = false;
       }
     }
-    free(child_abs);
     free(child_rel);
   }
   closedir(dir);
   // Only remove the directory itself if it is not in the manifest
   // and contained no kept entries.
   if (all_removed && rel_path[0] != '\0' && !is_dir_in_manifest(rel_path, manifest)) {
-    rmdir(abs_path);
+    /* The caller owns the directory fd; removing this name is done by its
+       parent, so recursive callers perform it in their own frame. */
   }
 }
 
 void delete_extras(const char* dest_root, ArrayList* manifest) {
-  delete_extras_walk(dest_root, "", manifest);
+  int rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (rootfd < 0)
+    return;
+  delete_extras_fd(rootfd, "", manifest);
+  close(rootfd);
 }
 
 bool has_path_traversal(const char* path) {

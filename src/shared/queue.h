@@ -2,6 +2,7 @@
 #define QUEUE_H
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <threads.h>
 
 typedef struct Queue {
@@ -22,7 +23,7 @@ bool queue_enqueue_multithreaded(Queue* queue, void* item, mtx_t* mutex, cnd_t* 
                                  cnd_t* condition_not_full);
 bool queue_enqueue_multithreaded_cancel(Queue* queue, void* item, mtx_t* mutex,
                                         cnd_t* condition_not_empty, cnd_t* condition_not_full,
-                                        const bool* cancelled);
+                                        const atomic_bool* cancelled);
 void* queue_dequeue(Queue* queue);
 void* queue_dequeue_multithreaded(Queue* queue, mtx_t* mutex, cnd_t* condition_not_empty,
                                   cnd_t* condition_not_full, const bool* other_thread_done);

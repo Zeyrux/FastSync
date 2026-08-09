@@ -386,6 +386,19 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->checksum);
 
   Chunk* current_chunk;
+  if (scanner == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to create parallel scanner");
+    atomic_store(&context->cancelled, true);
+    cnd_broadcast(&context->condition_not_full_scanner);
+    cnd_broadcast(&context->condition_not_empty_scanner);
+    cnd_broadcast(&context->condition_not_full_loader);
+    cnd_broadcast(&context->condition_not_empty_loader);
+    mtx_lock(&context->mutex_scanner);
+    context->scanner_done = true;
+    cnd_broadcast(&context->condition_not_empty_scanner);
+    mtx_unlock(&context->mutex_scanner);
+    return thrd_error;
+  }
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
     if (context->config->use_delete) {
       mtx_lock(&context->mutex_scanner);
@@ -397,13 +410,22 @@ static int scan_directory_multithreaded(void* pipeline_context) {
         if (!manifest_entry) {
           log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
           mtx_unlock(&context->mutex_scanner);
-          context->cancelled = true;
+          atomic_store(&context->cancelled, true);
           cnd_broadcast(&context->condition_not_full_scanner);
           cnd_broadcast(&context->condition_not_empty_scanner);
           parallel_scanner_destroy(scanner);
           return thrd_error;
         }
-        array_list_add(context->manifest, manifest_entry);
+        if (!array_list_add(context->manifest, manifest_entry)) {
+          free(manifest_entry);
+          atomic_store(&context->cancelled, true);
+          cnd_broadcast(&context->condition_not_full_scanner);
+          cnd_broadcast(&context->condition_not_empty_scanner);
+          mtx_unlock(&context->mutex_scanner);
+          chunk_destroy(current_chunk);
+          parallel_scanner_destroy(scanner);
+          return thrd_error;
+        }
       }
       mtx_unlock(&context->mutex_scanner);
     }
@@ -412,7 +434,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
             &context->condition_not_empty_scanner, &context->condition_not_full_scanner,
             &context->cancelled)) {
       chunk_destroy(current_chunk);
-      context->cancelled = true;
+      atomic_store(&context->cancelled, true);
       cnd_broadcast(&context->condition_not_full_scanner);
       cnd_broadcast(&context->condition_not_empty_scanner);
       parallel_scanner_destroy(scanner);
@@ -458,7 +480,7 @@ static int load_files_multithreaded(void* pipeline_context) {
                                             &context->condition_not_full_loader,
                                             &context->cancelled)) {
       chunk_destroy(chunk);
-      context->cancelled = true;
+      atomic_store(&context->cancelled, true);
       cnd_broadcast(&context->condition_not_full_loader);
       cnd_broadcast(&context->condition_not_empty_loader);
       return thrd_error;
@@ -573,7 +595,15 @@ int send_files(Config* config) {
           client_delete(client);
           return 1;
         }
-        array_list_add(manifest, manifest_entry);
+        if (!array_list_add(manifest, manifest_entry)) {
+          free(manifest_entry);
+          chunk_destroy(current_chunk);
+          array_list_delete(manifest);
+          directory_scanner_destroy(scanner);
+          client_disconnect(client);
+          client_delete(client);
+          return 1;
+        }
       }
     }
     if (!config->use_sendfile) {
@@ -685,7 +715,7 @@ int send_files_multithreaded(Config* config) {
 
   if (!scanner_created || !loader_created || !sender_created) {
     perror("Error creating threads.\n");
-    context->cancelled = true;
+    atomic_store(&context->cancelled, true);
     context->scanner_done = true;
     context->loader_done = true;
     context->sender_done = true;

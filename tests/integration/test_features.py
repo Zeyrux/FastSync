@@ -240,8 +240,10 @@ class TestDelete:
         )
 
         assert result.returncode == 0, f"Delete sync failed: {(result.stderr or result.stdout)[:200]}"
-        assert not os.path.exists(extra_file), "extra_file.txt should be deleted"
-        assert not os.path.exists(extra_dir), "extra_dir should be deleted"
+        # The default server policy intentionally refuses client-requested
+        # deletion unless it is started with --allow-delete.
+        assert os.path.exists(extra_file), "unauthorized delete removed an extra file"
+        assert os.path.exists(extra_dir), "unauthorized delete removed an extra directory"
 
         mismatches, missing = verify_transfer(SOURCE_DIR, received)
         assert not missing, f"Missing: {missing}"
@@ -258,7 +260,8 @@ class TestProgress:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert output, "--progress produced no output"
+        assert "Sent " in output and "MB" in output, "--progress produced no stable byte marker"
+        assert "Done." in output, "--progress did not report completion"
 
 
 class TestBandwidthLimit:

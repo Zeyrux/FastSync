@@ -6,50 +6,45 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import (
-    PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR,
-    CLIENT_CMD, generate_test_files, verify_transfer, clean_dir, make_result,
-)
+from common import (PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR, CLIENT_CMD,
+                    generate_test_files, verify_transfer, clean_dir, make_result,
+                    get_dest_received_dir)
 
 SOURCE_DIR = os.path.join(TEST_DATA_DIR, "ssh_source")
 DEST_DIR = os.path.join(TEST_DATA_DIR, "ssh_dest")
 SSH_AVAILABLE = False
+SSH_SKIP_REASON = "SSH localhost probe was not run"
 
 
 def _check_ssh():
-    global SSH_AVAILABLE
+    global SSH_AVAILABLE, SSH_SKIP_REASON
+    server_path = os.path.join(BUILD_DIR, "server")
+    if not os.path.isfile(server_path):
+        SSH_SKIP_REASON = f"current server binary is missing: {server_path}"
+        return
     try:
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-             "localhost", "which", "fastsync-server"],
-            capture_output=True, timeout=10,
-        )
-        if r.returncode == 0:
-            SSH_AVAILABLE = True
+        path = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost", "echo", "$PATH"],
+                              capture_output=True, timeout=10, text=True)
+        if path.returncode != 0:
+            SSH_SKIP_REASON = "SSH to localhost is unavailable"
             return
-
-        # Try to install server binary into PATH
-        server_path = os.path.join(BUILD_DIR, "server")
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "localhost", 'echo "$PATH"'],
-            capture_output=True, timeout=10, text=True,
-        )
-        if r.returncode != 0:
-            return
-        for d in r.stdout.strip().split(":"):
-            d = d.strip()
-            if not d or "wrappers" in d:
+        for directory in path.stdout.strip().split(":"):
+            if not directory or "wrappers" in directory:
                 continue
-            test = subprocess.run(
+            probe = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "localhost",
-                 f'test -w "{d}" && ln -sf {server_path} "{d}/fastsync-server" && which fastsync-server'],
-                capture_output=True, timeout=10,
-            )
-            if test.returncode == 0:
+                 f'test -w "{directory}" && ln -sf "{server_path}" '
+                 f'"{directory}/fastsync-server" && test -x "{directory}/fastsync-server" '
+                 f'&& "{directory}/fastsync-server" --help'],
+                capture_output=True, timeout=10)
+            if probe.returncode == 0 and b"FastSync Server" in probe.stdout:
                 SSH_AVAILABLE = True
                 return
+        SSH_SKIP_REASON = "SSH setup could not install and validate the current server binary"
     except FileNotFoundError:
-        pass
+        SSH_SKIP_REASON = "ssh executable is unavailable"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        SSH_SKIP_REASON = f"SSH setup failed: {exc}"
 
 
 _check_ssh()
@@ -65,18 +60,17 @@ def setup_test_data():
 
 
 def _run_ssh_test(name, flags, expected_missing=None):
-    """Run an SSH test case (no server process needed, client spawns SSH)."""
     ssh_dest = f"localhost:{DEST_DIR}"
     clean_dir(DEST_DIR)
-    cmd = CLIENT_CMD + [SOURCE_DIR, ssh_dest, "--save-to-disk"] + flags
+    cmd = CLIENT_CMD + [SOURCE_DIR, ssh_dest, "--save-to-disk",
+                        "--fastsync-server-path", os.path.join(BUILD_DIR, "server")] + flags
     start = __import__("time").monotonic()
     result = subprocess.run(cmd, text=True, capture_output=True)
     duration = __import__("time").monotonic() - start
-
     if result.returncode != 0:
-        return make_result(name, False, duration, f"Exit {result.returncode}: {(result.stderr or result.stdout)[:100]}")
-
-    mismatches, missing = verify_transfer(SOURCE_DIR, DEST_DIR)
+        return make_result(name, False, duration,
+                           f"Exit {result.returncode}: {(result.stderr or result.stdout)[:100]}")
+    mismatches, missing = verify_transfer(SOURCE_DIR, get_dest_received_dir(DEST_DIR, SOURCE_DIR))
     if expected_missing:
         missing = [m for m in missing if m not in expected_missing]
     if missing:
@@ -90,7 +84,7 @@ class TestSSHStandard:
     @pytest.fixture(autouse=True)
     def require_ssh(self):
         if not SSH_AVAILABLE:
-            pytest.skip("SSH to localhost not available")
+            pytest.skip(SSH_SKIP_REASON)
 
     def test_standard(self):
         r = _run_ssh_test("SSH (localhost)", [])
@@ -129,7 +123,7 @@ class TestSSHFeatures:
     @pytest.fixture(autouse=True)
     def require_ssh(self):
         if not SSH_AVAILABLE:
-            pytest.skip("SSH to localhost not available")
+            pytest.skip(SSH_SKIP_REASON)
 
     def test_archive(self):
         r = _run_ssh_test("SSH Archive (-a)", ["-a"])
@@ -137,6 +131,5 @@ class TestSSHFeatures:
 
     def test_exclude(self):
         r = _run_ssh_test("SSH Exclude (--exclude small.txt)",
-                          ["--exclude", "small.txt"],
-                          expected_missing=["small.txt"])
+                          ["--exclude", "small.txt"], expected_missing=["small.txt"])
         assert r["status"] == "Success", r["error"]

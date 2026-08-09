@@ -26,7 +26,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->manifest = NULL;
   context->progress_bytes = 0;
   context->sender_done = false;
-  context->cancelled = false;
+  atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success)
     goto fail;
@@ -97,7 +97,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->file_descriptor = file_descriptor;
   context->ssl = ssl;
   context->receiver_done = false;
-  context->cancelled = false;
+  atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
     goto fail;
@@ -154,7 +154,7 @@ static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* 
 
 static void receiver_thread_fail(PipelineContextReceiver* context) {
   mtx_lock(&context->mutex);
-  context->cancelled = true;
+  atomic_store(&context->cancelled, true);
   context->receiver_done = true;
   cnd_broadcast(&context->condition_not_empty);
   cnd_broadcast(&context->condition_not_full);
@@ -207,7 +207,8 @@ int receive_thread(void* pipeline_context) {
         RECEIVE_THREAD_FAIL();
     } else if (status == STATUS_CHECK_BATCH) {
       int count;
-      if (!receive_int(file_descriptor, &count))
+      if (config->checksum || !receive_int(file_descriptor, &count) || count < 0 ||
+          count > MAX_MANIFEST_ENTRIES)
         RECEIVE_THREAD_FAIL();
       for (int i = 0; i < count; i++) {
         char* check_path = receive_str(file_descriptor);
@@ -280,8 +281,16 @@ int write_thread(void* pipeline_context) {
       free(root_directory);
       return thrd_success;
     }
-    if (save_to_disk)
-      file_save_to_disk(root_directory, file, context->config);
+    if (save_to_disk && !file_save_to_disk(root_directory, file, context->config)) {
+      file_destroy(file);
+      mtx_lock(&context->mutex);
+      atomic_store(&context->cancelled, true);
+      cnd_broadcast(&context->condition_not_full);
+      cnd_broadcast(&context->condition_not_empty);
+      mtx_unlock(&context->mutex);
+      free(root_directory);
+      return thrd_error;
+    }
     file_destroy(file);
   }
 }

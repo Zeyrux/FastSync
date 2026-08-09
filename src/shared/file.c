@@ -145,6 +145,14 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
   return true;
 }
 
+static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
+                           bool inplace, bool sparse, FileMetadata* metadata);
+
+static bool path_is_within_root(const char* root, const char* path) {
+  size_t n = strlen(root);
+  return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
 bool file_save_to_disk(const char* root_directory, File* file, const Config* config) {
   bool backup_enabled = config && config->backup;
   bool inplace = config && config->inplace;
@@ -152,15 +160,28 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
+  char *confined_backup = NULL, *confined_partial = NULL;
 
   if (has_path_traversal(file->path)) {
     log_message(LOG_LEVEL_ERROR, "Path traversal detected in file path: %s", file->path);
     return false;
   }
 
+  /* These options arrive from the client.  They are names below the server
+     root, never independent filesystem roots. */
+  if ((backup_dir && (backup_dir[0] == '/' || has_path_traversal(backup_dir))) ||
+      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))))
+    return false;
+  if (backup_dir && !(confined_backup = path_cat(root_directory, backup_dir)))
+    return false;
+  if (partial_dir && !(confined_partial = path_cat(root_directory, partial_dir))) {
+    free(confined_backup);
+    return false;
+  }
+
   char* resolved_root = NULL;
   const char* actual_root =
-      (partial_dir && config && config->partial) ? partial_dir : root_directory;
+      (partial_dir && config && config->partial) ? confined_partial : root_directory;
   resolved_root = realpath(actual_root, NULL);
   if (resolved_root == NULL) {
     if (mkdir_r(actual_root)) {
@@ -169,11 +190,24 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   }
   if (resolved_root == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to resolve destination root: %s", actual_root);
+    free(confined_backup);
+    free(confined_partial);
     return false;
   }
+  char* resolved_base = realpath(root_directory, NULL);
+  if (resolved_base == NULL || !path_is_within_root(resolved_base, resolved_root)) {
+    free(resolved_base);
+    free(confined_backup);
+    free(confined_partial);
+    free(resolved_root);
+    return false;
+  }
+  free(resolved_base);
 
   char* disk_path = path_cat(resolved_root, file->path);
   if (disk_path == NULL) {
+    free(confined_backup);
+    free(confined_partial);
     free(resolved_root);
     return false;
   }
@@ -184,6 +218,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
     if (stat(disk_path, &destination_stat) == 0 && file->metadata &&
         destination_stat.st_mtime > file->metadata->mtime_sec) {
       free(resolved_root);
+      free(confined_backup);
+      free(confined_partial);
       free(disk_path);
       return true;
     }
@@ -194,13 +230,16 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
     if (stat(disk_path, &backup_stat) == 0) {
       char* backup_path = NULL;
       if (backup_dir) {
-        char* resolved_backup_dir = realpath(backup_dir, NULL);
+        char* resolved_backup_dir = realpath(confined_backup, NULL);
         if (!resolved_backup_dir) {
-          mkdir_r(backup_dir);
-          resolved_backup_dir = realpath(backup_dir, NULL);
+          mkdir_r(confined_backup);
+          resolved_backup_dir = realpath(confined_backup, NULL);
         }
         if (resolved_backup_dir) {
-          backup_path = path_cat(resolved_backup_dir, file->path);
+          char* backup_base = realpath(root_directory, NULL);
+          if (backup_base && path_is_within_root(backup_base, resolved_backup_dir))
+            backup_path = path_cat(resolved_backup_dir, file->path);
+          free(backup_base);
           free(resolved_backup_dir);
         }
       }
@@ -228,6 +267,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
 
   char* dir_dup = str_dup(disk_path);
   if (!dir_dup) {
+    free(confined_backup);
+    free(confined_partial);
     free(resolved_root);
     free(disk_path);
     return false;
@@ -235,6 +276,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   char* dir_str = dirname(dir_dup);
   if (!mkdir_r(dir_str)) {
     free(dir_dup);
+    free(confined_backup);
+    free(confined_partial);
     free(resolved_root);
     free(disk_path);
     return false;
@@ -243,6 +286,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   free(dir_dup);
   if (resolved_dir == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to resolve directory for: %s", disk_path);
+    free(confined_backup);
+    free(confined_partial);
     free(resolved_root);
     free(disk_path);
     return false;
@@ -253,6 +298,8 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
       (resolved_dir[root_len] != '\0' && resolved_dir[root_len] != '/')) {
     log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path, actual_root);
     free(resolved_dir);
+    free(confined_backup);
+    free(confined_partial);
     free(resolved_root);
     free(disk_path);
     return false;
@@ -260,9 +307,10 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   free(resolved_dir);
   free(resolved_root);
 
-  bool ok = to_disk(disk_path, file->data->data, file->data->size, inplace, sparse);
-  if (ok)
-    file_restore_metadata(disk_path, file->metadata);
+  bool ok = to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
+                           file->metadata);
+  free(confined_backup);
+  free(confined_partial);
   free(disk_path);
   return ok;
 }
@@ -616,7 +664,7 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
 }
 
 static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                           bool inplace, bool sparse) {
+                           bool inplace, bool sparse, FileMetadata* metadata) {
   char* leaf = NULL;
   int dirfd = open_secure_parent(path, &leaf);
   if (dirfd < 0)
@@ -628,6 +676,8 @@ static bool to_disk_secure(const char* path, const void* data, unsigned long lon
     if (fd >= 0) {
       if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
         ok = write_all(fd, data, data_size);
+      if (ok && metadata)
+        file_restore_metadata_fd(fd, metadata);
     }
   } else {
     char tmp[NAME_MAX];
@@ -640,6 +690,8 @@ static bool to_disk_secure(const char* path, const void* data, unsigned long lon
         ok = ftruncate(fd, (off_t)data_size) == 0;
       if (ok || (!sparse || data_size == 0))
         ok = write_all(fd, data, data_size);
+      if (ok && metadata)
+        file_restore_metadata_fd(fd, metadata);
       if (close(fd) != 0)
         ok = false;
       fd = -1;
@@ -660,7 +712,7 @@ bool to_disk(const char* path, const void* data, unsigned long long data_size, b
              bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return to_disk_secure(path, data, data_size, inplace, sparse);
+  return to_disk_secure(path, data, data_size, inplace, sparse, NULL);
   /* Kept below only as historical context; all writes use descriptor-relative operations. */
   char* tmp_path = NULL;
   char* directory = NULL;
@@ -867,18 +919,30 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
   ArrayList* manifest = array_list_create(free);
   if (!manifest)
     return -1;
+  size_t manifest_bytes = 0;
   for (int i = 0; i < count; i++) {
     char* s = receive_str(fd);
-    if (!s || s[0] == '\0' || has_path_traversal(s) || !array_list_add(manifest, s)) {
+    size_t entry_size = s ? strlen(s) : 0;
+    if (!s || s[0] == '\0' || s[0] == '/' || has_path_traversal(s) ||
+        entry_size > MAX_MANIFEST_BYTES - manifest_bytes ||
+        (manifest_bytes += entry_size) > MAX_MANIFEST_BYTES || !array_list_add(manifest, s)) {
       free(s);
       array_list_delete(manifest);
       return -1;
     }
   }
+  if (!receive_status(fd, next_status)) {
+    array_list_delete(manifest);
+    return -1;
+  }
+  /* Deletion is a commit operation: never perform it until the sender has
+     completed the manifest frame successfully. */
+  if (*next_status != STATUS_FINISHED || !config->use_delete) {
+    array_list_delete(manifest);
+    return *next_status == STATUS_FINISHED ? 0 : -1;
+  }
   fprintf(stderr, "Deleting files not in manifest...\n");
   delete_extras(config->receive_root_directory, manifest);
   array_list_delete(manifest);
-  if (!receive_status(fd, next_status))
-    return -1;
   return 0;
 }

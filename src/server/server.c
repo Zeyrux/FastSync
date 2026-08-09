@@ -57,8 +57,12 @@ int receive_files(Config* config, int fd) {
         goto next;
       if (file == NULL && !skipped)
         return -1;
-      if (config->save_to_disk)
-        file_save_to_disk(config->receive_root_directory, file, config);
+      if (config->save_to_disk &&
+          !file_save_to_disk(config->receive_root_directory, file, config)) {
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return -1;
+      }
       file_destroy(file);
     } else if (status == STATUS_CHUNK) {
       Chunk* chunk = receive_chunk_data(fd, config);
@@ -67,13 +71,19 @@ int receive_files(Config* config, int fd) {
         return -1;
       }
       for (int i = 0; i < chunk->element_count; i++) {
-        if (config->save_to_disk)
-          file_save_to_disk(config->receive_root_directory, chunk->items[i], config);
+        if (config->save_to_disk &&
+            !file_save_to_disk(config->receive_root_directory, chunk->items[i], config)) {
+          chunk_destroy(chunk);
+          send_status(fd, STATUS_ERROR);
+          return -1;
+        }
       }
       chunk_destroy(chunk);
     } else if (status == STATUS_CHECK_BATCH) {
       int count;
-      if (!receive_int(fd, &count))
+      /* Batch framing has no checksum field yet; never silently downgrade a
+         checksum-enabled transfer into mtime-only matching. */
+      if (config->checksum || !receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
         return -1;
       for (int i = 0; i < count; i++) {
         char* check_path = receive_str(fd);
@@ -106,8 +116,12 @@ int receive_files(Config* config, int fd) {
         send_status(fd, STATUS_ERROR);
         return -1;
       }
-      if (config->save_to_disk)
-        file_save_to_disk(config->receive_root_directory, file, config);
+      if (config->save_to_disk &&
+          !file_save_to_disk(config->receive_root_directory, file, config)) {
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return -1;
+      }
       file_destroy(file);
     }
   next:
@@ -193,7 +207,7 @@ void handler(int file_descriptor) {
       perror("Error creating Threads");
       if (receiver_created) {
         mtx_lock(&context->mutex);
-        context->cancelled = true;
+        atomic_store(&context->cancelled, true);
         cnd_broadcast(&context->condition_not_full);
         cnd_broadcast(&context->condition_not_empty);
         mtx_unlock(&context->mutex);
@@ -213,9 +227,12 @@ void handler(int file_descriptor) {
     thrd_join(writer, &writer_result);
     if (receiver_result == thrd_success && writer_result == thrd_success)
       send_status(file_descriptor, STATUS_OK);
+    else
+      send_status(file_descriptor, STATUS_ERROR);
     pipeline_context_receiver_destroy(context);
   } else {
-    receive_files(config, file_descriptor);
+    if (receive_files(config, file_descriptor) != 0)
+      log_message(LOG_LEVEL_ERROR, "Transfer failed");
     config_delete(config);
   }
   close(file_descriptor);

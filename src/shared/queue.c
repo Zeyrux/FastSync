@@ -111,11 +111,11 @@ bool queue_enqueue_multithreaded(Queue* queue, void* item, mtx_t* mutex, cnd_t* 
 
 bool queue_enqueue_multithreaded_cancel(Queue* queue, void* item, mtx_t* mutex,
                                         cnd_t* condition_not_empty, cnd_t* condition_not_full,
-                                        const bool* cancelled) {
+                                        const atomic_bool* cancelled) {
   mtx_lock(mutex);
-  while (queue_is_full(queue) && (cancelled == NULL || !*cancelled))
+  while (queue_is_full(queue) && (cancelled == NULL || !atomic_load(cancelled)))
     cnd_wait(condition_not_full, mutex);
-  if (cancelled != NULL && *cancelled) {
+  if (cancelled != NULL && atomic_load(cancelled)) {
     mtx_unlock(mutex);
     return false;
   }
