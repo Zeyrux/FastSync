@@ -121,8 +121,6 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
       log_message(LOG_LEVEL_ERROR, "Send timeout or poll failure");
       return false;
     }
-    if (poll_result == 0)
-      return false;
     if (poll_result < 0)
       continue;
     if (pfd.revents & (POLLERR | POLLNVAL))
