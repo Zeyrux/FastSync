@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "compression.h"
 #include "delta.h"
@@ -147,6 +149,8 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
 
 static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                            bool inplace, bool sparse, FileMetadata* metadata);
+static int open_secure_parent(const char* path, char** leaf_out);
+static bool rename_secure(const char* old_path, const char* new_path);
 
 static bool path_is_within_root(const char* root, const char* path) {
   size_t n = strlen(root);
@@ -162,7 +166,10 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
   char *confined_backup = NULL, *confined_partial = NULL;
 
-  if (has_path_traversal(file->path)) {
+  if (!file || !file->path || !file->data || has_path_traversal(file->path) ||
+      (backup_enabled &&
+       (!backup_suffix || backup_suffix[0] == '\0' || strchr(backup_suffix, '/') != NULL ||
+        strcmp(backup_suffix, ".") == 0 || strcmp(backup_suffix, "..") == 0))) {
     log_message(LOG_LEVEL_ERROR, "Path traversal detected in file path: %s", file->path);
     return false;
   }
@@ -259,7 +266,14 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
           mkdir_r(bdir);
           free(backup_dir_path);
         }
-        rename(disk_path, backup_path);
+        if (!rename_secure(disk_path, backup_path)) {
+          free(backup_path);
+          free(resolved_root);
+          free(confined_backup);
+          free(confined_partial);
+          free(disk_path);
+          return false;
+        }
         free(backup_path);
       }
     }
@@ -313,24 +327,6 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
   free(confined_partial);
   free(disk_path);
   return ok;
-}
-
-static void* old_data_from_path(const char* full_path, unsigned long long old_size) {
-  void* data = malloc((size_t)old_size);
-  if (!data)
-    return NULL;
-  FILE* fp = fopen(full_path, "rb");
-  if (!fp) {
-    free(data);
-    return NULL;
-  }
-  size_t nread = fread(data, 1, (size_t)old_size, fp);
-  fclose(fp);
-  if (nread != (size_t)old_size) {
-    free(data);
-    return NULL;
-  }
-  return data;
 }
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
@@ -518,22 +514,54 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 
   char* full_path = path_cat(config->receive_root_directory, check_path);
   struct stat st;
-  bool has_old_file = (full_path && lstat(full_path, &st) == 0);
+  bool has_old_file = false;
+  int old_fd = -1;
+  if (full_path) {
+    char* leaf = NULL;
+    int parent_fd = open_secure_parent(full_path, &leaf);
+    if (parent_fd >= 0) {
+      old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      free(leaf);
+      close(parent_fd);
+      has_old_file = old_fd >= 0 && fstat(old_fd, &st) == 0 && S_ISREG(st.st_mode);
+    }
+  }
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
+  void* old_data = NULL;
+  if (has_old_file && old_size > 0) {
+    old_data = malloc((size_t)old_size);
+    if (old_data) {
+      size_t got = 0;
+      while (got < (size_t)old_size) {
+        ssize_t n = read(old_fd, (char*)old_data + got, (size_t)old_size - got);
+        if (n <= 0) {
+          free(old_data);
+          old_data = NULL;
+          break;
+        }
+        got += (size_t)n;
+      }
+    }
+  }
+  if (old_fd >= 0) {
+    close(old_fd);
+    old_fd = -1;
+  }
 
   bool match = has_old_file && (unsigned long long)st.st_size == check_size;
   if (match && config->checksum) {
-    void* old_data = old_size > 0 ? old_data_from_path(full_path, old_size) : NULL;
     uint64_t old_checksum = old_size == 0 ? delta_xxhash64("", 0) : 0;
     if (old_data)
       old_checksum = delta_xxhash64(old_data, (size_t)old_size);
     match = (old_size == 0 || old_data) && old_checksum == check_checksum;
     free(old_data);
+    old_data = NULL;
   } else if (match) {
     match = (long long)st.st_mtime == check_mtime;
   }
 
   if (match) {
+    free(old_data);
     if (!send_status(fd, STATUS_OK)) {
       free(full_path);
       free(check_path);
@@ -549,13 +577,15 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
                    delta_should_attempt(old_size, check_size, config->delta_max_file_size);
 
   if (try_delta) {
-    void* old_data = old_data_from_path(full_path, old_size);
     File* delta_file = receive_delta_file(fd, config, check_path, old_data, old_size);
+    old_data = NULL; /* receive_delta_file consumes the snapshot on every path */
     if (delta_file) {
       free(full_path);
       free(check_path);
       return delta_file;
     }
+    free(old_data);
+    old_data = NULL;
     try_delta = false;
   }
 
@@ -649,6 +679,21 @@ static int open_secure_parent(const char* path, char** leaf_out) {
   return fd;
 }
 
+static bool rename_secure(const char* old_path, const char* new_path) {
+  char *old_leaf = NULL, *new_leaf = NULL;
+  int old_parent = open_secure_parent(old_path, &old_leaf);
+  int new_parent = open_secure_parent(new_path, &new_leaf);
+  bool ok = old_parent >= 0 && new_parent >= 0 &&
+            renameat(old_parent, old_leaf, new_parent, new_leaf) == 0;
+  if (old_parent >= 0)
+    close(old_parent);
+  if (new_parent >= 0)
+    close(new_parent);
+  free(old_leaf);
+  free(new_leaf);
+  return ok;
+}
+
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
   unsigned long long done = 0;
@@ -677,7 +722,7 @@ static bool to_disk_secure(const char* path, const void* data, unsigned long lon
       if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata);
     }
   } else {
     char tmp[NAME_MAX];
@@ -691,7 +736,7 @@ static bool to_disk_secure(const char* path, const void* data, unsigned long lon
       if (ok || (!sparse || data_size == 0))
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata);
       if (close(fd) != 0)
         ok = false;
       fd = -1;
@@ -838,8 +883,35 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
     return false;
   }
 
+  /* sendfile cannot encrypt TLS records.  Keep the framing identical but
+     route encrypted transfers through the deadline-aware IO layer. */
+  if (io_get_ssl() != NULL) {
+    bool loaded = file->data->data != NULL || file_load_data(file);
+    bool ok = loaded && send_n_data(file_descriptor, file->data->data, (size_t)file_size);
+    close(fd);
+    return ok;
+  }
+
   off_t offset = 0;
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += 60;
   while ((unsigned long long)offset < file_size) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long remaining = (long long)(deadline.tv_sec - now.tv_sec) * 1000LL +
+                          (deadline.tv_nsec - now.tv_nsec) / 1000000LL;
+    if (remaining <= 0) {
+      close(fd);
+      return false;
+    }
+    struct pollfd pfd = {.fd = file_descriptor, .events = POLLOUT};
+    int timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+    int polled = poll(&pfd, 1, timeout);
+    if (polled <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      close(fd);
+      return false;
+    }
     ssize_t sent = sendfile(file_descriptor, fd, &offset, file_size - offset);
     if (sent == -1) {
       if (errno == EAGAIN || errno == EINTR)
@@ -911,6 +983,8 @@ size_t file_content_to_buffer(File* file) {
 }
 
 int receive_manifest(int fd, const Config* config, int* next_status) {
+  int received_status = STATUS_ERROR;
+  int* status_out = next_status ? next_status : &received_status;
   int count;
   if (!receive_int(fd, &count))
     return -1;
@@ -931,18 +1005,18 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
       return -1;
     }
   }
-  if (!receive_status(fd, next_status)) {
+  if (!receive_status(fd, status_out)) {
     array_list_delete(manifest);
     return -1;
   }
   /* Deletion is a commit operation: never perform it until the sender has
      completed the manifest frame successfully. */
-  if (*next_status != STATUS_FINISHED || !config->use_delete) {
+  if (*status_out != STATUS_FINISHED || !config->use_delete) {
     array_list_delete(manifest);
-    return *next_status == STATUS_FINISHED ? 0 : -1;
+    return *status_out == STATUS_FINISHED ? 0 : -1;
   }
   fprintf(stderr, "Deleting files not in manifest...\n");
-  delete_extras(config->receive_root_directory, manifest);
+  bool deletion_ok = delete_extras(config->receive_root_directory, manifest);
   array_list_delete(manifest);
-  return 0;
+  return deletion_ok ? 0 : -1;
 }

@@ -188,16 +188,16 @@ void file_restore_metadata(const char* path, FileMetadata* metadata) {
     log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
 }
 
-void file_restore_metadata_fd(int fd, FileMetadata* metadata) {
+bool file_restore_metadata_fd(int fd, FileMetadata* metadata) {
   if (fd < 0 || metadata == NULL)
-    return;
+    return metadata == NULL;
+  bool ok = true;
   if (fchmod(fd, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to fchmod received file: %s", strerror(errno));
-  if (fchown(fd, metadata->uid, metadata->gid) != 0 && errno != EPERM)
-    log_message(LOG_LEVEL_WARNING, "Failed to fchown received file: %s", strerror(errno));
-  struct timespec times[2] = {{.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec},
+    ok = false;
+  /* Client uid/gid values are deliberately not authoritative. */
+  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
                               {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
   if (futimens(fd, times) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to restore received file timestamps: %s",
-                strerror(errno));
+    ok = false;
+  return ok;
 }

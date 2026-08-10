@@ -137,16 +137,17 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   return false;
 }
 
-static void delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest) {
+static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest) {
   int scanfd = dup(dirfd);
   if (scanfd < 0)
-    return;
+    return false;
   DIR* dir = fdopendir(scanfd);
   if (!dir) {
     close(scanfd);
-    return;
+    return false;
   }
   bool all_removed = true;
+  bool operation_ok = true;
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -164,9 +165,15 @@ static void delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
     }
     if (S_ISDIR(st.st_mode)) {
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (childfd >= 0)
-        delete_extras_fd(childfd, child_rel, manifest);
-      if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
+      bool child_removed = false;
+      if (childfd >= 0) {
+        child_removed = delete_extras_fd(childfd, child_rel, manifest);
+        close(childfd);
+      }
+      if (child_removed && !is_dir_in_manifest(child_rel, manifest) &&
+          unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
+        operation_ok = false;
+      } else if (!child_removed) {
         all_removed = false;
       }
     } else {
@@ -180,7 +187,7 @@ static void delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       }
       if (!found) {
         if (unlinkat(dirfd, entry->d_name, 0) != 0 && errno != ENOENT)
-          all_removed = false;
+          operation_ok = false;
         fprintf(stderr, "  Deleted: %s\n", child_rel);
       } else {
         all_removed = false;
@@ -189,20 +196,18 @@ static void delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
     free(child_rel);
   }
   closedir(dir);
-  // Only remove the directory itself if it is not in the manifest
-  // and contained no kept entries.
-  if (all_removed && rel_path[0] != '\0' && !is_dir_in_manifest(rel_path, manifest)) {
-    /* The caller owns the directory fd; removing this name is done by its
-       parent, so recursive callers perform it in their own frame. */
-  }
+  (void)all_removed;
+  return operation_ok;
 }
 
-void delete_extras(const char* dest_root, ArrayList* manifest) {
+bool delete_extras(const char* dest_root, ArrayList* manifest) {
   int rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (rootfd < 0)
-    return;
-  delete_extras_fd(rootfd, "", manifest);
-  close(rootfd);
+    return false;
+  bool ok = delete_extras_fd(rootfd, "", manifest);
+  if (close(rootfd) != 0)
+    ok = false;
+  return ok;
 }
 
 bool has_path_traversal(const char* path) {

@@ -33,6 +33,7 @@ void io_set_fds(int read_fd, int write_fd) {
   /* A descriptor switch starts a new transport; never reuse a TLS object
      belonging to a previous connection or test pipe. */
   io_ssl = NULL;
+  total_allocated_bytes = 0;
 }
 
 static void bw_mutex_init(void) {
@@ -247,7 +248,7 @@ char* receive_str(int file_descriptor) {
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
   if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
-      total_allocated_bytes > MAX_CONNECTION_MEMORY - (size + 1)) {
+      size + 1 > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
@@ -260,6 +261,7 @@ char* receive_str(int file_descriptor) {
     return NULL;
   }
   data[size] = '\0';
+  total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
   return data;
 }
@@ -283,22 +285,28 @@ Data* receive_data(int file_descriptor) {
                 (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
   }
-  if (total_allocated_bytes + size > MAX_CONNECTION_MEMORY) {
+  size_t allocation_size = size == 0 ? 1 : (size_t)size;
+  if (allocation_size > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
     log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
                 (unsigned long long)total_allocated_bytes, size,
                 (unsigned long long)MAX_CONNECTION_MEMORY);
     return NULL;
   }
-  void* data = malloc((size_t)size);
+  void* data = malloc(allocation_size);
   if (data == NULL)
     return NULL;
   if (!receive_n_data(file_descriptor, data, (size_t)size)) {
     free(data);
     return NULL;
   }
-  total_allocated_bytes += size + 1;
+  total_allocated_bytes += allocation_size;
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
-  return data_create(data, (size_t)size);
+  Data* result = data_create(data, (size_t)size);
+  if (!result) {
+    free(data);
+    total_allocated_bytes -= allocation_size;
+  }
+  return result;
 }
 
 bool send_int(int file_descriptor, int data) {

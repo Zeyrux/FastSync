@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <stdbool.h>
 #include <threads.h>
+#include <stdatomic.h>
 
 typedef struct {
   Queue* directories;
@@ -26,6 +27,7 @@ typedef struct {
   bool safe_links;
   bool copy_unsafe_links;
   bool checksum;
+  bool failed;
 } DirectoryScanner;
 
 typedef struct {
@@ -36,6 +38,8 @@ typedef struct {
   int num_threads;
   thrd_t* threads;
   bool done;
+  bool failed;
+  atomic_bool cancelled;
   int completed;
   Chunk* initial_chunk;
 } ParallelScanner;
@@ -48,6 +52,7 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            bool follow_symlinks, bool copy_links, bool safe_links,
                                            bool copy_unsafe_links, bool checksum);
 Chunk* directory_scanner_next(DirectoryScanner* scanner);
+bool directory_scanner_failed(const DirectoryScanner* scanner);
 void directory_scanner_destroy(DirectoryScanner* scanner);
 
 ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata,
@@ -58,6 +63,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
                                          int num_threads, bool follow_symlinks, bool copy_links,
                                          bool safe_links, bool copy_unsafe_links, bool checksum);
 Chunk* parallel_scanner_next(ParallelScanner* scanner);
+bool parallel_scanner_failed(const ParallelScanner* scanner);
 void parallel_scanner_destroy(ParallelScanner* scanner);
 
 #endif

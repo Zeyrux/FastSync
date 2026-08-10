@@ -121,6 +121,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
     perror("Could not open directory");
     free(scanner->current_path);
     scanner->current_path = NULL;
+    scanner->failed = true;
     return -1;
   }
   return 1;
@@ -128,6 +129,10 @@ static int open_next_directory(DirectoryScanner* scanner) {
 
 Chunk* directory_scanner_next(DirectoryScanner* scanner) {
   ArrayList* chunk_data = array_list_create(file_destroy);
+  if (!chunk_data) {
+    scanner->failed = true;
+    return NULL;
+  }
   unsigned long long chunk_data_size = 0;
 
   while (1) {
@@ -136,7 +141,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       if (ret == 0)
         break;
       if (ret < 0)
-        continue;
+        break;
     }
 
     struct dirent* entry = readdir(scanner->current_dir);
@@ -259,7 +264,11 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       file->data->size = stats.st_size;
       if (scanner->use_metadata)
         file->metadata = file_metadata_create(&stats);
-      array_list_add(chunk_data, file);
+      if (!array_list_add(chunk_data, file)) {
+        file_destroy(file);
+        scanner->failed = true;
+        break;
+      }
       chunk_data_size += file->data->size;
       if (chunk_data_size > scanner->chunk_size) {
         free(cur_path);
@@ -273,6 +282,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     return chunk_data_to_chunk(chunk_data);
   array_list_delete(chunk_data);
   return NULL;
+}
+
+bool directory_scanner_failed(const DirectoryScanner* scanner) {
+  return scanner == NULL || scanner->failed;
 }
 
 typedef struct {
@@ -302,10 +315,31 @@ static int parallel_worker_thread(void* arg) {
         wa->dirs[i], wa->use_metadata, wa->chunk_size, wa->exclude_patterns, wa->exclude_count,
         wa->include_patterns, wa->include_count, wa->max_size, wa->min_size, wa->max_depth,
         wa->follow_symlinks, wa->copy_links, wa->safe_links, wa->copy_unsafe_links, wa->checksum);
+    if (!ds) {
+      mtx_lock(&wa->ps->result_mutex);
+      wa->ps->failed = true;
+      atomic_store(&wa->ps->cancelled, true);
+      cnd_broadcast(&wa->ps->result_not_empty);
+      cnd_broadcast(&wa->ps->result_not_full);
+      mtx_unlock(&wa->ps->result_mutex);
+      break;
+    }
     Chunk* chunk;
     while ((chunk = directory_scanner_next(ds)) != NULL) {
-      queue_enqueue_multithreaded(wa->ps->result_queue, chunk, &wa->ps->result_mutex,
-                                  &wa->ps->result_not_empty, &wa->ps->result_not_full);
+      if (!queue_enqueue_multithreaded_cancel(wa->ps->result_queue, chunk, &wa->ps->result_mutex,
+                                              &wa->ps->result_not_empty, &wa->ps->result_not_full,
+                                              &wa->ps->cancelled)) {
+        chunk_destroy(chunk);
+        break;
+      }
+    }
+    if (directory_scanner_failed(ds)) {
+      mtx_lock(&wa->ps->result_mutex);
+      wa->ps->failed = true;
+      atomic_store(&wa->ps->cancelled, true);
+      cnd_broadcast(&wa->ps->result_not_empty);
+      cnd_broadcast(&wa->ps->result_not_full);
+      mtx_unlock(&wa->ps->result_mutex);
     }
     directory_scanner_destroy(ds);
     free(wa->dirs[i]);
@@ -338,6 +372,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     free(ps);
     return NULL;
   }
+  atomic_init(&ps->cancelled, false);
   int init = 0;
   bool ok = true;
   if (mtx_init(&ps->result_mutex, mtx_plain) != thrd_success)
@@ -500,8 +535,10 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         if (!first) {
           first = c;
         } else {
-          queue_enqueue_multithreaded(ps->result_queue, c, &ps->result_mutex, &ps->result_not_empty,
-                                      &ps->result_not_full);
+          if (!queue_enqueue(ps->result_queue, c)) {
+            chunk_destroy(c);
+            ps->failed = true;
+          }
         }
         if (i < root_files->size - 1) {
           batch = array_list_create(NULL);
@@ -585,7 +622,9 @@ Chunk* parallel_scanner_next(ParallelScanner* ps) {
     return c;
   }
   if (ps->num_threads == 0) {
+    mtx_lock(&ps->result_mutex);
     ps->done = true;
+    mtx_unlock(&ps->result_mutex);
     return NULL;
   }
   Chunk* chunk = queue_dequeue_multithreaded(
@@ -593,12 +632,19 @@ Chunk* parallel_scanner_next(ParallelScanner* ps) {
   return chunk;
 }
 
+bool parallel_scanner_failed(const ParallelScanner* ps) {
+  return ps == NULL || ps->failed;
+}
+
 void parallel_scanner_destroy(ParallelScanner* ps) {
   if (!ps)
     return;
+  mtx_lock(&ps->result_mutex);
   ps->done = true;
-  cnd_signal(&ps->result_not_empty);
+  atomic_store(&ps->cancelled, true);
+  cnd_broadcast(&ps->result_not_empty);
   cnd_broadcast(&ps->result_not_full);
+  mtx_unlock(&ps->result_mutex);
   for (int i = 0; i < ps->num_threads; i++)
     thrd_join(ps->threads[i], NULL);
   free(ps->threads);

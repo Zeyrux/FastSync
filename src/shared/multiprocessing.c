@@ -239,6 +239,7 @@ int receive_thread(void* pipeline_context) {
                 context->queue, file, &context->mutex, &context->condition_not_empty,
                 &context->condition_not_full, &context->cancelled)) {
           file_destroy(file);
+          receiver_thread_fail(context);
           return thrd_error;
         }
       } else {
@@ -285,6 +286,7 @@ int write_thread(void* pipeline_context) {
       file_destroy(file);
       mtx_lock(&context->mutex);
       atomic_store(&context->cancelled, true);
+      context->receiver_done = true;
       cnd_broadcast(&context->condition_not_full);
       cnd_broadcast(&context->condition_not_empty);
       mtx_unlock(&context->mutex);
