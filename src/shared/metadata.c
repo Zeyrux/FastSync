@@ -172,7 +172,7 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
   return m;
 }
 
-void file_restore_metadata(const char* path, FileMetadata* metadata) {
+void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   if (metadata == NULL)
     return;
   if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
