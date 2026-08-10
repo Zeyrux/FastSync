@@ -157,7 +157,7 @@ static bool path_is_within_root(const char* root, const char* path) {
   return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
-bool file_save_to_disk(const char* root_directory, File* file, const Config* config) {
+bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
   bool backup_enabled = config && config->backup;
   bool inplace = config && config->inplace;
   bool sparse = config && config->preserve_sparse;
