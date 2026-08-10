@@ -1,4 +1,5 @@
 #include "multiprocessing.h"
+
 #include "array_list.h"
 #include "chunk.h"
 #include "config.h"
@@ -12,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
+
+static bool valid_batch_path(const char* path) {
+  return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path);
+}
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
                                                       Queue* queue_loader) {
@@ -219,6 +224,12 @@ int receive_thread(void* pipeline_context) {
         if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
             !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
           free(check_path);
+          RECEIVE_THREAD_FAIL();
+        }
+        if (!valid_batch_path(check_path)) {
+          free(check_path);
+          if (!send_status(file_descriptor, STATUS_ERROR))
+            RECEIVE_THREAD_FAIL();
           RECEIVE_THREAD_FAIL();
         }
         char* full_path = path_cat(config->receive_root_directory, check_path);

@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <threads.h>
 #include <unistd.h>
+#include <limits.h>
 
 typedef struct {
   char* path;
@@ -38,6 +39,19 @@ static DirEntry* dir_entry_create(const char* path, int depth) {
   return de;
 }
 
+static bool safe_relative_link(const char* source_root, const char* containing_dir,
+                               const char* link_target) {
+  char root[PATH_MAX];
+  if (!realpath(source_root, root))
+    return false;
+  char* joined = path_cat(containing_dir, link_target);
+  char resolved[PATH_MAX];
+  bool safe = joined && realpath(joined, resolved) && strncmp(root, resolved, strlen(root)) == 0 &&
+              (resolved[strlen(root)] == '\0' || resolved[strlen(root)] == '/');
+  free(joined);
+  return safe;
+}
+
 DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,
                                            unsigned long long chunk_size, char** exclude_patterns,
                                            int exclude_count, char** include_patterns,
@@ -45,10 +59,14 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            unsigned long long min_size, int max_depth,
                                            bool follow_symlinks, bool copy_links, bool safe_links,
                                            bool copy_unsafe_links, bool checksum) {
-  DirectoryScanner* scanner = malloc(sizeof(DirectoryScanner));
+  DirectoryScanner* scanner = calloc(1, sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;
   scanner->directories = queue_create(100, dir_entry_destroy);
+  if (!scanner->directories) {
+    free(scanner);
+    return NULL;
+  }
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->use_metadata = use_metadata;
@@ -66,6 +84,7 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
   scanner->safe_links = safe_links;
   scanner->copy_unsafe_links = copy_unsafe_links;
   scanner->checksum = checksum;
+  scanner->failed = false;
   DirEntry* root = dir_entry_create(root_directory, 0);
   if (!root) {
     queue_destroy(scanner->directories);
@@ -95,8 +114,12 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
 
 static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
   void** chunk_items = array_list_to_array(chunk_data);
+  if (!chunk_items)
+    return NULL;
   Chunk* chunk = chunk_create((File**)chunk_items, chunk_data->size);
   free(chunk_items);
+  if (!chunk)
+    return NULL;
   chunk_data->item_destroyer = NULL;
   array_list_delete(chunk_data);
   return chunk;
@@ -157,6 +180,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       continue;
 
     char* cur_path = path_cat(scanner->current_path, entry->d_name);
+    if (!cur_path) {
+      scanner->failed = true;
+      break;
+    }
     struct stat stats;
     struct stat lstats;
     bool is_symlink = false;
@@ -180,7 +207,8 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         continue;
       }
       link_target[len] = '\0';
-      if (link_target[0] == '/') {
+      if (link_target[0] == '/' ||
+          !safe_relative_link(scanner->current_path, scanner->current_path, link_target)) {
         free(cur_path);
         continue;
       }
@@ -215,8 +243,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       int next_depth = scanner->current_depth + 1;
       if (scanner->max_depth <= 0 || next_depth < scanner->max_depth) {
         DirEntry* de = dir_entry_create(cur_path, next_depth);
-        if (!queue_enqueue(scanner->directories, de))
+        if (!de || !queue_enqueue(scanner->directories, de)) {
           dir_entry_destroy(de);
+          scanner->failed = true;
+        }
       }
       free(cur_path);
     } else {
@@ -259,11 +289,18 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       File* file = file_create(cur_path);
       if (file == NULL) {
         free(cur_path);
+        scanner->failed = true;
         continue;
       }
       file->data->size = stats.st_size;
       if (scanner->use_metadata)
         file->metadata = file_metadata_create(&stats);
+      if (scanner->use_metadata && !file->metadata) {
+        file_destroy(file);
+        free(cur_path);
+        scanner->failed = true;
+        break;
+      }
       if (!array_list_add(chunk_data, file)) {
         file_destroy(file);
         scanner->failed = true;
@@ -272,14 +309,21 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       chunk_data_size += file->data->size;
       if (chunk_data_size > scanner->chunk_size) {
         free(cur_path);
-        return chunk_data_to_chunk(chunk_data);
+        Chunk* result = chunk_data_to_chunk(chunk_data);
+        if (!result)
+          scanner->failed = true;
+        return result;
       }
       free(cur_path);
     }
   }
 
-  if (chunk_data->size > 0)
-    return chunk_data_to_chunk(chunk_data);
+  if (chunk_data->size > 0) {
+    Chunk* result = chunk_data_to_chunk(chunk_data);
+    if (!result)
+      scanner->failed = true;
+    return result;
+  }
   array_list_delete(chunk_data);
   return NULL;
 }
@@ -349,7 +393,7 @@ static int parallel_worker_thread(void* arg) {
   free(wa);
   mtx_lock(&ps->result_mutex);
   ps->completed++;
-  if (ps->completed >= ps->num_threads) {
+  if (ps->completed >= ps->expected_threads) {
     ps->done = true;
     cnd_signal(&ps->result_not_empty);
   }
@@ -409,6 +453,13 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
 
   ArrayList* root_files = array_list_create(file_destroy);
   ArrayList* subdirs = array_list_create(free);
+  if (!root_files || !subdirs) {
+    array_list_delete(root_files);
+    array_list_delete(subdirs);
+    closedir(dir);
+    parallel_scanner_destroy(ps);
+    return NULL;
+  }
   struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -438,7 +489,8 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         continue;
       }
       link_target[len] = 0;
-      if (link_target[0] == '/') {
+      if (link_target[0] == '/' ||
+          !safe_relative_link(root_directory, root_directory, link_target)) {
         free(cur_path);
         continue;
       }
@@ -473,7 +525,10 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     }
 
     if (S_ISDIR(st.st_mode)) {
-      array_list_add(subdirs, cur_path);
+      if (!array_list_add(subdirs, cur_path)) {
+        free(cur_path);
+        ps->failed = true;
+      }
     } else {
       bool excluded = false;
       for (int i = 0; i < exclude_count; i++) {
@@ -506,12 +561,22 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
       }
       File* file = file_create(cur_path);
       free(cur_path);
-      if (!file)
+      if (!file) {
+        ps->failed = true;
         continue;
+      }
       file->data->size = st.st_size;
       if (use_metadata)
         file->metadata = file_metadata_create(&st);
-      array_list_add(root_files, file);
+      if (use_metadata && !file->metadata) {
+        file_destroy(file);
+        ps->failed = true;
+        continue;
+      }
+      if (!array_list_add(root_files, file)) {
+        file_destroy(file);
+        ps->failed = true;
+      }
     }
   }
   closedir(dir);
@@ -519,16 +584,40 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
   unsigned long long cs = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
   if (root_files->size > 0) {
     ArrayList* batch = array_list_create(NULL);
+    if (!batch) {
+      ps->failed = true;
+      array_list_delete(root_files);
+      array_list_delete(subdirs);
+      parallel_scanner_destroy(ps);
+      return NULL;
+    }
     unsigned long long batch_size = 0;
     Chunk* first = NULL;
     for (int i = 0; i < root_files->size; i++) {
       File* f = (File*)root_files->items[i];
-      array_list_add(batch, f);
+      if (!array_list_add(batch, f)) {
+        ps->failed = true;
+        break;
+      }
       batch_size += f->data->size;
       if (batch_size >= cs || i == root_files->size - 1) {
         void** items = array_list_to_array(batch);
+        if (!items) {
+          ps->failed = true;
+          batch->item_destroyer = file_destroy;
+          array_list_delete(batch);
+          batch = NULL;
+          break;
+        }
         Chunk* c = chunk_create((File**)items, batch->size);
         free(items);
+        if (!c) {
+          ps->failed = true;
+          batch->item_destroyer = file_destroy;
+          array_list_delete(batch);
+          batch = NULL;
+          break;
+        }
         batch->item_destroyer = NULL;
         array_list_delete(batch);
         batch = NULL;
@@ -542,6 +631,10 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         }
         if (i < root_files->size - 1) {
           batch = array_list_create(NULL);
+          if (!batch) {
+            ps->failed = true;
+            break;
+          }
           batch_size = 0;
         }
       }
@@ -561,6 +654,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
 
   if (subdirs->size > 0) {
     ps->num_threads = n;
+    ps->expected_threads = n;
     ps->threads = calloc(n, sizeof(thrd_t));
     if (!ps->threads) {
       array_list_delete(subdirs);
@@ -570,21 +664,37 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     int dirs_per_thread = subdirs->size / n;
     int remainder = subdirs->size % n;
     int start = 0;
+    ps->num_threads = 0;
     for (int t = 0; t < n; t++) {
       int count = dirs_per_thread + (t < remainder ? 1 : 0);
       if (count == 0)
         break;
       ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
-      if (!wa)
+      if (!wa) {
+        ps->failed = true;
         break;
+      }
       wa->ps = ps;
       wa->dirs = calloc(count, sizeof(char*));
       if (!wa->dirs) {
         free(wa);
+        ps->failed = true;
         break;
       }
-      for (int j = 0; j < count; j++)
+      bool dup_ok = true;
+      for (int j = 0; j < count; j++) {
         wa->dirs[j] = str_dup((char*)subdirs->items[start + j]);
+        if (!wa->dirs[j])
+          dup_ok = false;
+      }
+      if (!dup_ok) {
+        for (int j = 0; j < count; j++)
+          free(wa->dirs[j]);
+        free(wa->dirs);
+        free(wa);
+        ps->failed = true;
+        break;
+      }
       wa->dir_count = count;
       wa->use_metadata = use_metadata;
       wa->chunk_size = cs;
@@ -606,9 +716,17 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
           free(wa->dirs[j]);
         free(wa->dirs);
         free(wa);
-        ps->num_threads = t;
+        ps->failed = true;
+        atomic_store(&ps->cancelled, true);
+        ps->expected_threads = ps->created_threads;
+        mtx_lock(&ps->result_mutex);
+        cnd_broadcast(&ps->result_not_empty);
+        cnd_broadcast(&ps->result_not_full);
+        mtx_unlock(&ps->result_mutex);
         break;
       }
+      ps->num_threads++;
+      ps->created_threads++;
     }
   }
   array_list_delete(subdirs);

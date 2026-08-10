@@ -10,6 +10,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static int authorized_root_fd = -1;
+
+void utils_set_authorized_root_fd(int fd) {
+  authorized_root_fd = fd;
+}
+
 bool mkdir_r(const char* path) {
   size_t path_len = strlen(path);
   char* path_duplicate = malloc(path_len + 1);
@@ -201,7 +207,9 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
 }
 
 bool delete_extras(const char* dest_root, ArrayList* manifest) {
-  int rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int rootfd = authorized_root_fd >= 0
+                   ? dup(authorized_root_fd)
+                   : open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (rootfd < 0)
     return false;
   bool ok = delete_extras_fd(rootfd, "", manifest);

@@ -37,6 +37,8 @@ bool file_checksum(File* file, uint64_t* checksum) {
 }
 
 File* file_create(const char* path) {
+  if (!path)
+    return NULL;
   File* file = (File*)malloc(sizeof(File));
   if (file == NULL) {
     perror("ERROR: Could not allocate memory for file struct");
@@ -102,6 +104,8 @@ bool file_load_data(File* file) {
   if (file == NULL)
     return false;
   if (file->data->data == NULL) {
+    if (file->data->size == 0)
+      return true;
     file->data->data = malloc(file->data->size);
     if (file->data->data == NULL) {
       perror("Could not allocate memory for file data");
@@ -121,6 +125,8 @@ bool file_load_data(File* file) {
 
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
+  if (!file || !file->path || !file->data)
+    return false;
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
   if (compression_level > 0 && !compression_should_skip(file->path)) {
@@ -151,6 +157,14 @@ static bool to_disk_secure(const char* path, const void* data, unsigned long lon
                            bool inplace, bool sparse, const FileMetadata* metadata);
 static int open_secure_parent(const char* path, char** leaf_out);
 static bool rename_secure(const char* old_path, const char* new_path);
+static int authorized_root_fd = -1;
+static char* authorized_root_path;
+
+void file_set_authorized_root(int fd, const char* canonical_path) {
+  authorized_root_fd = fd;
+  free(authorized_root_path);
+  authorized_root_path = canonical_path ? str_dup(canonical_path) : NULL;
+}
 
 static bool path_is_within_root(const char* root, const char* path) {
   size_t n = strlen(root);
@@ -648,8 +662,25 @@ static int open_secure_parent(const char* path, char** leaf_out) {
     free(copy);
     return -1;
   }
-  int fd = (parent[0] == '/') ? open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-                              : open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int fd;
+  if (authorized_root_fd >= 0 && authorized_root_path && path[0] == '/' &&
+      path_is_within_root(authorized_root_path, path)) {
+    fd = dup(authorized_root_fd);
+    size_t root_len = strlen(authorized_root_path);
+    char* relative = str_dup(path + root_len);
+    if (!relative) {
+      free(copy);
+      free(leaf);
+      close(fd);
+      return -1;
+    }
+    free(copy);
+    copy = relative;
+    parent = dirname(copy);
+  } else {
+    fd = (parent[0] == '/') ? open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                            : open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  }
   if (fd < 0) {
     free(copy);
     free(leaf);
@@ -861,6 +892,8 @@ done:
 
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path) {
+  if (!file || !file->path || !file->data)
+    return false;
   if (compression_level > 0)
     return file_send_single_calls(file, file_descriptor, use_metadata, compression_level,
                                   send_path);
@@ -877,6 +910,12 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
   }
 
   unsigned long long file_size = file->data->size;
+  struct stat source_stat;
+  if (fstat(fd, &source_stat) != 0 || !S_ISREG(source_stat.st_mode) ||
+      (unsigned long long)source_stat.st_size < file_size) {
+    close(fd);
+    return false;
+  }
   if (!send_n_data(file_descriptor, &file_size, sizeof(unsigned long long))) {
     close(fd);
     return false;
@@ -885,8 +924,18 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
   /* sendfile cannot encrypt TLS records.  Keep the framing identical but
      route encrypted transfers through the deadline-aware IO layer. */
   if (io_get_ssl() != NULL) {
-    bool loaded = file->data->data != NULL || file_load_data(file);
-    bool ok = loaded && send_n_data(file_descriptor, file->data->data, (size_t)file_size);
+    unsigned char buffer[64 * 1024];
+    unsigned long long remaining = file_size;
+    bool ok = true;
+    while (remaining > 0) {
+      size_t want = remaining > sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
+      ssize_t got = read(fd, buffer, want);
+      if (got <= 0 || !send_n_data(file_descriptor, buffer, (size_t)got)) {
+        ok = false;
+        break;
+      }
+      remaining -= (unsigned long long)got;
+    }
     close(fd);
     return ok;
   }
@@ -916,6 +965,10 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
       if (errno == EAGAIN || errno == EINTR)
         continue;
       perror("sendfile failed");
+      close(fd);
+      return false;
+    }
+    if (sent == 0) {
       close(fd);
       return false;
     }

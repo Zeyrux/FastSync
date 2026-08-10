@@ -177,8 +177,8 @@ void file_restore_metadata(const char* path, FileMetadata* metadata) {
     return;
   if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
-  if (chown(path, metadata->uid, metadata->gid) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to chown %s: %s", path, strerror(errno));
+  /* Never apply client-supplied ownership.  The descriptor API below is the
+     receiver write path; retain this legacy API only for compatibility. */
   struct timespec times[2];
   times[0].tv_sec = 0;
   times[0].tv_nsec = UTIME_OMIT;

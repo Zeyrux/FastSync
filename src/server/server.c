@@ -16,10 +16,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static char* authorized_root;
+static int authorized_root_fd = -1;
 static bool allow_delete;
 
 static bool path_is_within(const char* root, const char* path) {
@@ -27,12 +29,27 @@ static bool path_is_within(const char* root, const char* path) {
   return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
+static bool valid_batch_path(const char* path) {
+  return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path) &&
+         strchr(path, '\0') == path + strlen(path);
+}
+
 static bool __attribute__((unused)) configure_authorization(const char* root) {
   char resolved[PATH_MAX];
   if (!root || !realpath(root, resolved))
     return false;
   authorized_root = str_dup(resolved);
-  return authorized_root != NULL;
+  if (!authorized_root)
+    return false;
+  authorized_root_fd = open(resolved, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (authorized_root_fd < 0) {
+    free(authorized_root);
+    authorized_root = NULL;
+    return false;
+  }
+  file_set_authorized_root(authorized_root_fd, authorized_root);
+  utils_set_authorized_root_fd(authorized_root_fd);
+  return true;
 }
 
 int receive_files(Config* config, int fd) {
@@ -96,17 +113,21 @@ int receive_files(Config* config, int fd) {
           free(check_path);
           return -1;
         }
+        if (!valid_batch_path(check_path)) {
+          free(check_path);
+          send_status(fd, STATUS_ERROR);
+          return -1;
+        }
         char* full_path = path_cat(config->receive_root_directory, check_path);
         struct stat st;
         bool has_old = full_path && lstat(full_path, &st) == 0;
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
-        if (match)
-          send_status(fd, STATUS_OK);
-        else
-          send_status(fd, STATUS_NEXT);
+        bool sent = send_status(fd, match ? STATUS_OK : STATUS_NEXT);
         free(full_path);
         free(check_path);
+        if (!sent)
+          return -1;
       }
       goto next;
     } else {
@@ -324,6 +345,9 @@ int main(int argc, char* argv[]) {
   if (stdio_mode) {
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
     handler(STDIN_FILENO);
+    file_set_authorized_root(-1, NULL);
+    utils_set_authorized_root_fd(-1);
+    close(authorized_root_fd);
     free(authorized_root);
     return 0;
   }

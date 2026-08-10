@@ -11,7 +11,7 @@ A high-performance file synchronization system with SSH and TCP transport, TLS e
 5. **Multithreading**: producer-consumer pipeline with thread-safe queues (scanner → loader → sender)
 6. **Incremental sync**: skip files unchanged since last transfer (compares size + mtime)
 7. **Batch incremental**: send incremental checks in batched groups for reduced round-trips
-8. **Metadata preservation**: `mode`, `uid`, `gid`, `mtime` restored on disk when enabled
+8. **Metadata preservation**: file mode and mtime are restored when enabled; ownership and atime are intentionally not restored
 9. **`sendfile()` zero-copy** on TCP (~2× faster on loopback)
 10. **SSH ControlMaster** for connection reuse across repeated invocations
 11. **Bandwidth limiting**: token-bucket throttling (`--bwlimit`)
@@ -112,7 +112,7 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 | `-m` | Multithreading mode |
 | `-s` | Chunk serialization (batch all files per chunk) |
 | `-f, --sendfile` | Sendfile zero-copy. Incompatible with `-c` / `-s`. TCP only. |
-| `-M, --preserve` | Preserve file metadata (mode, uid, gid, mtime) |
+| `-M, --preserve` | Preserve supported file metadata (mode and mtime; ownership and atime are unsupported) |
 | `-n, --dry-run` | Scan and print what would be transferred |
 | `-p <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
@@ -178,7 +178,7 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 ### Data Structures
 1. **Chunk** — collection of files (~10 MB total by default)
 2. **File** — path, content (`Data`), optional `FileMetadata` pointer
-3. **FileMetadata** — `mode`, `uid`, `gid`, `mtime_sec`, `mtime_nsec`
+3. **FileMetadata** — `mode`, `uid`, `gid`, `mtime_sec`, `mtime_nsec`; uid/gid are advisory wire fields and are never applied by the receiver; atime is unsupported
 4. **Config** — runtime parameters (transported over wire, TLS settings excluded). Includes `timeout`, `contimeout`, `quiet`, `backup`, `backup_dir`, `stats`, `max_depth`, `log_file`, `queue_size`.
 5. **Queue** — thread-safe bounded queue with condition variables
 6. **DirectoryScanner** — recursive BFS traversal with exclude and include pattern support, max-depth enforcement

@@ -36,6 +36,8 @@ typedef struct {
   cnd_t result_not_empty;
   cnd_t result_not_full;
   int num_threads;
+  int expected_threads;
+  int created_threads;
   thrd_t* threads;
   bool done;
   bool failed;

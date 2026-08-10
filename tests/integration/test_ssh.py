@@ -4,6 +4,9 @@ import shutil
 import subprocess
 import sys
 import pytest
+import shlex
+import tempfile
+import shutil
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR, CLIENT_CMD,
@@ -14,37 +17,38 @@ SOURCE_DIR = os.path.join(TEST_DATA_DIR, "ssh_source")
 DEST_DIR = os.path.join(TEST_DATA_DIR, "ssh_dest")
 SSH_AVAILABLE = False
 SSH_SKIP_REASON = "SSH localhost probe was not run"
+SSH_PROBE_DIR = None
 
 
 def _check_ssh():
-    global SSH_AVAILABLE, SSH_SKIP_REASON
+    global SSH_AVAILABLE, SSH_SKIP_REASON, SSH_PROBE_DIR
     server_path = os.path.join(BUILD_DIR, "server")
     if not os.path.isfile(server_path):
         SSH_SKIP_REASON = f"current server binary is missing: {server_path}"
         return
     try:
-        path = subprocess.run(["ssh", "-o", "BatchMode=yes", "localhost", "echo", "$PATH"],
+        SSH_PROBE_DIR = tempfile.mkdtemp(prefix="fastsync-ssh-probe-")
+        probe_server = os.path.join(SSH_PROBE_DIR, "fastsync-server")
+        os.symlink(server_path, probe_server)
+        command = f"{shlex.quote(probe_server)} --help"
+        path = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                               "localhost", "sh", "-c", command],
                               capture_output=True, timeout=10, text=True)
         if path.returncode != 0:
-            SSH_SKIP_REASON = "SSH to localhost is unavailable"
+            SSH_SKIP_REASON = "SSH to localhost is unavailable or current server probe failed"
             return
-        for directory in path.stdout.strip().split(":"):
-            if not directory or "wrappers" in directory:
-                continue
-            probe = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "localhost",
-                 f'test -w "{directory}" && ln -sf "{server_path}" '
-                 f'"{directory}/fastsync-server" && test -x "{directory}/fastsync-server" '
-                 f'&& "{directory}/fastsync-server" --help'],
-                capture_output=True, timeout=10)
-            if probe.returncode == 0 and b"FastSync Server" in probe.stdout:
-                SSH_AVAILABLE = True
-                return
-        SSH_SKIP_REASON = "SSH setup could not install and validate the current server binary"
+        if "FastSync Server" in path.stdout:
+            SSH_AVAILABLE = True
+            return
+        SSH_SKIP_REASON = "SSH probe did not execute the current server binary"
     except FileNotFoundError:
         SSH_SKIP_REASON = "ssh executable is unavailable"
     except (OSError, subprocess.TimeoutExpired) as exc:
         SSH_SKIP_REASON = f"SSH setup failed: {exc}"
+    finally:
+        if SSH_PROBE_DIR:
+            shutil.rmtree(SSH_PROBE_DIR, ignore_errors=True)
+            SSH_PROBE_DIR = None
 
 
 _check_ssh()
