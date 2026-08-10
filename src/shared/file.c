@@ -148,7 +148,7 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
 }
 
 static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                           bool inplace, bool sparse, FileMetadata* metadata);
+                           bool inplace, bool sparse, const FileMetadata* metadata);
 static int open_secure_parent(const char* path, char** leaf_out);
 static bool rename_secure(const char* old_path, const char* new_path);
 
@@ -708,7 +708,7 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
 }
 
 static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                           bool inplace, bool sparse, FileMetadata* metadata) {
+                           bool inplace, bool sparse, const FileMetadata* metadata) {
   char* leaf = NULL;
   int dirfd = open_secure_parent(path, &leaf);
   if (dirfd < 0)
