@@ -188,7 +188,7 @@ void file_restore_metadata(const char* path, FileMetadata* metadata) {
     log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
 }
 
-bool file_restore_metadata_fd(int fd, FileMetadata* metadata) {
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;

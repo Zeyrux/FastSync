@@ -170,7 +170,7 @@ bool file_save_to_disk(const char* root_directory, File* file, const Config* con
       (backup_enabled &&
        (!backup_suffix || backup_suffix[0] == '\0' || strchr(backup_suffix, '/') != NULL ||
         strcmp(backup_suffix, ".") == 0 || strcmp(backup_suffix, "..") == 0))) {
-    log_message(LOG_LEVEL_ERROR, "Path traversal detected in file path: %s", file->path);
+    log_message(LOG_LEVEL_ERROR, "Invalid file or path received");
     return false;
   }
 
@@ -545,7 +545,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
   if (old_fd >= 0) {
     close(old_fd);
-    old_fd = -1;
   }
 
   bool match = has_old_file && (unsigned long long)st.st_size == check_size;
