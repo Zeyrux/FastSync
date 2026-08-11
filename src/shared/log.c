@@ -15,6 +15,15 @@ void log_set_file(FILE* fp) {
   log_fp = fp;
 }
 
+static inline void write_message(FILE* dest_io, LogLevel log_level, struct tm t, const char* format,
+                                 va_list args) {
+  fprintf(dest_io, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t.tm_year + 1900, t.tm_mon + 1,
+          t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, log_level_strings[log_level]);
+
+  vfprintf(dest_io, format, args);
+  fprintf(dest_io, "\n");
+}
+
 void log_message(LogLevel log_level, const char* format, ...) {
   if (log_level < current_log_level)
     return;
@@ -25,22 +34,16 @@ void log_message(LogLevel log_level, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
-  fprintf(stderr, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-          t.tm_hour, t.tm_min, t.tm_sec, log_level_strings[log_level]);
+  FILE* dest_io = stdout;
+  if (log_level == LOG_LEVEL_ERROR) {
+    dest_io = stderr;
+  }
 
   va_list args;
   va_start(args, format);
-  vfprintf(stderr, format, args);
-  va_end(args);
-  fprintf(stderr, "\n");
+  write_message(dest_io, log_level, t, format, args);
 
   if (log_fp) {
-    fprintf(log_fp, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t.tm_year + 1900, t.tm_mon + 1,
-            t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, log_level_strings[log_level]);
-    va_start(args, format);
-    vfprintf(log_fp, format, args);
-    va_end(args);
-    fprintf(log_fp, "\n");
-    fflush(log_fp);
+    write_message(log_fp, log_level, t, format, args);
   }
 }

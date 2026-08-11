@@ -8,9 +8,11 @@
 #include "utils.h"
 #include <errno.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "usage.c"
 
 #ifndef FASTSYNC_TEST_BUILD
 /* Parse environment variables for source/destination directories and save-to-disk flag. */
@@ -25,19 +27,6 @@ static void parse_environment(const char** out_env_source, const char** out_env_
 }
 #endif
 
-/* Parse a string as a positive integer, returning true on success. */
-static bool parse_positive_int(const char* s, int* out_val) {
-  if (!s || *s == '\0')
-    return false;
-  char* endptr;
-  errno = 0;
-  long val = strtol(s, &endptr, 10);
-  if (errno != 0 || *endptr != '\0' || val <= 0 || val > INT_MAX)
-    return false;
-  *out_val = (int)val;
-  return true;
-}
-
 /* Parse a string as a non-negative integer, returning true on success. */
 static bool parse_nonneg_int(const char* s, int* out_val) {
   if (!s || *s == '\0')
@@ -51,9 +40,22 @@ static bool parse_nonneg_int(const char* s, int* out_val) {
   return true;
 }
 
-/* Duplicate a string argument into *dest, freeing the old value. Returns 0 on success, -1 on
+/* Parse a string as a positive integer, returning true on success. */
+static bool parse_positive_int(const char* s, int* out_val) {
+  int temp;
+  if (!parse_nonneg_int(s, &temp)) {
+    return false;
+  }
+  if (temp == 0) {
+    return false;
+  }
+  *out_val = temp;
+  return true;
+}
+
+/* Duplicate a string argument into *dest, freeing the old value. Returns true on success, false on
  * failure. */
-static int set_string_option(char** dest, const char* value, const char* option_name) {
+static bool set_string_option(char** dest, const char* value, const char* option_name) {
   char* dup = str_dup(value);
   if (!dup) {
     fprintf(stderr, "Error: memory allocation failed for %s\n", option_name);
@@ -64,8 +66,8 @@ static int set_string_option(char** dest, const char* value, const char* option_
   return 0;
 }
 
-/* Parse a string as a positive integer into *dest. Returns 0 on success, -1 on error. */
-static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
+/* Parse a string as a positive integer into *dest. Returns true on success, false on error. */
+static bool set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
     fprintf(stderr, "Error: %s must be a positive integer\n", option_name);
     return -1;
@@ -73,8 +75,8 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
   return 0;
 }
 
-/* Parse a string as a non-negative integer into *dest. Returns 0 on success, -1 on error. */
-static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
+/* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
+static bool set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
     fprintf(stderr, "Error: %s must be a non-negative integer\n", option_name);
     return -1;
@@ -82,7 +84,6 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
   return 0;
 }
 
-static void print_usage(void);
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
@@ -103,12 +104,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
       config->dry_run = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      if (!parse_positive_int(argv[++i], &config->ssh_port)) {
-        fprintf(stderr, "Error: invalid --port/-p value: %s\n", argv[i]);
+      if (!set_positive_int_option(&config->ssh_port, argv[++i], "-p"))
         return -1;
-      }
       if (config->ssh_port > 65535) {
-        fprintf(stderr, "Error: SSH port must be 1-65535\n");
+        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535\n");
         return -1;
       }
     } else if (strcmp(argv[i], "--delete") == 0) {
@@ -140,14 +139,8 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       config->include_patterns[config->include_count++] = dup;
     } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long val = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0') {
-        fprintf(stderr, "Error: --max-size must be a non-negative integer\n");
+      if (!set_nonneg_int_option(&config->max_size, argv[++i], "Max Size"))
         return -1;
-      }
-      config->max_size = val;
     } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;
@@ -506,116 +499,6 @@ static bool validate_config(const Config* config) {
   return true;
 }
 #endif /* FASTSYNC_TEST_BUILD */
-
-static void print_usage(void) {
-  printf("Usage:\n");
-  printf("  fastsync [options] <source> <destination>\n");
-  printf("  fastsync [options] --source-dir <src> --dest-dir <dst>\n");
-  printf("\n");
-  printf("Destination formats:\n");
-  printf("  user@host:/path     SSH transport (rsync-style)\n");
-  printf("  host:/path          SSH transport (current user)\n");
-  printf("  /local/path         TCP transport (requires server on localhost:8080)\n");
-  printf("\n");
-  printf("Options:\n");
-  printf("  -c [level]          Enable compression (level 1-22, default 5)\n");
-  printf("  -z [level]          Alias for -c\n");
-  printf("  -a, --archive       Archive mode (-c -m -M)\n");
-  printf("  -n, --dry-run       Show what would be transferred\n");
-  printf("  -p <port>           SSH port (default: 22)\n");
-  printf("  --progress          Show transfer progress\n");
-  printf("  --delete            Delete files on receiver not in source\n");
-  printf("  --exclude <pattern> Exclude files matching pattern\n");
-  printf("  --include <pattern> Only include files matching pattern\n");
-  printf("  --exclude-from <file> Read exclude patterns from file\n");
-  printf("  --include-from <file> Read include patterns from file\n");
-  printf("  --max-size <n>      Skip files larger than n bytes\n");
-  printf("  --min-size <n>      Skip files smaller than n bytes\n");
-  printf("  --incremental       Skip files unchanged since last transfer\n");
-  printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
-  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
-         DELTA_BLOCK_SIZE_DEFAULT);
-  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
-         DELTA_MAX_FILE_SIZE);
-  printf("  -m                  Enable multithreading\n");
-  printf("  -s                  Enable chunk serialization\n");
-  printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
-  printf("  -v, --verbose       Enable debug logging\n");
-  printf("  -M, --preserve      Preserve file metadata\n");
-  printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
-  printf("  --source-dir <path> Source directory\n");
-  printf("  --dest-dir <path>   Destination directory\n");
-  printf("  --save-to-disk      Write received files to disk\n");
-  printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
-  printf("  --server-port <n>   Server port (default: 8080)\n");
-  printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
-  printf("  --tls               Enable TLS encryption\n");
-  printf("  --cert <path>       TLS certificate file (PEM)\n");
-  printf("  --key <path>        TLS private key file (PEM)\n");
-  printf("  --ca <path>         TLS CA certificate file (PEM)\n");
-  printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
-  printf("  -T <sec>            Alias for --timeout\n");
-  printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
-  printf("  --address <host>    Server hostname/IP to connect to\n");
-  printf("  --bind-address <ip> Bind to specific local address\n");
-  printf("  --ipv6              Prefer IPv6 connections\n");
-  printf("  --ipv4              Prefer IPv4 connections\n");
-  printf("  -q, --quiet         Suppress non-error output\n");
-  printf("  --silent            Alias for --quiet\n");
-  printf("  --backup            Backup existing files before overwriting\n");
-  printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
-  printf("  --suffix <str>      Backup suffix (default: ~)\n");
-  printf("  --stats             Print transfer statistics at end\n");
-  printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
-  printf("  --log-file <path>   Write log messages to file\n");
-  printf("  --queue-size <n>    Queue capacity for multithreaded mode (default: 100)\n");
-  printf("  --partial           Keep partial files on interrupted transfer\n");
-  printf("  --partial-dir <dir> Directory for partial files\n");
-  printf("  --fastsync-server-path <path>\n");
-  printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
-  printf("  -l, --links         Copy symlinks as symlinks\n");
-  printf("  --copy-links        Transform symlinks into referent files\n");
-  printf("  --safe-links        Skip symlinks that point outside transfer tree\n");
-  printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
-  printf("  -H, --hard-links    Preserve hard links\n");
-  printf("  -A, --acls          Preserve ACLs\n");
-  printf("  -X, --xattrs        Preserve extended attributes\n");
-  printf("  -D, --devices       Preserve device files\n");
-  printf("  -S, --sparse        Handle sparse files efficiently\n");
-  printf("  -i, --itemize-changes  Show per-file change summary\n");
-  printf("  --out-format <fmt>  Custom output format string\n");
-  printf("  --info <flags>      Info verbosity level\n");
-  printf("  --debug <flags>     Debug verbosity level\n");
-  printf("  --list-only         List files without transferring\n");
-  printf("  -h, --human-readable  Human-readable numbers\n");
-  printf("  -u, --update        Skip files newer on destination\n");
-  printf("  --inplace           Update files in-place (no temp+rename)\n");
-  printf("  --append            Append data to shorter files\n");
-  printf("  --append-verify     Append with verify\n");
-  printf("  --delete-before     Delete before transfer\n");
-  printf("  --delete-excluded   Also delete excluded files\n");
-  printf("  --delete-after      Delete after transfer, not before\n");
-  printf("  --max-delete <n>    Maximum number of files to delete\n");
-  printf("  --filter <rule>     Add file filtering rule\n");
-  printf("  --files-from <file> Read file list from file\n");
-  printf("  --cvs-exclude       Auto-ignore CVS files\n");
-  printf("  --prune-empty-dirs  Omit empty directories from transfer\n");
-  printf("  -R, --relative      Use relative paths\n");
-  printf("  -e, --rsh <cmd>     Specify remote shell\n");
-  printf("  --rsync-path <path> Path to remote binary\n");
-  printf("  --daemon            Run in daemon mode\n");
-  printf("  --config <path>     Path to configuration file\n");
-  printf("  --server            Run in server mode\n");
-  printf("  --checksum          Skip files based on checksum, not mod-time/size\n");
-  printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
-  printf("  --compress-level <n>    Compression level (default: 5)\n");
-  printf("  --temp-dir <dir>    Temporary directory for files\n");
-  printf("  --compare-dest <dir>  Compare destination\n");
-  printf("  --copy-dest <dir>   Copy destination\n");
-  printf("  --link-dest <dir>   Link destination\n");
-  printf("  --help              Show this help\n");
-  printf("  -V, --version       Show version\n");
-}
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
   FILE* fp = fopen(filepath, "r");
