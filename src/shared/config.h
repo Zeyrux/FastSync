@@ -128,8 +128,7 @@ typedef struct Config {
   char* compress_choice;
 } Config;
 
-/* This version must be bumped whenever config_send / config_receive wire format changes. */
-#define PROTOCOL_VERSION "2.1.0"
+#define PROTOCOL_VERSION "2.2.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

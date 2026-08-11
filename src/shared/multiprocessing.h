@@ -2,6 +2,7 @@
 #define MULTIPROCESSING_H
 
 #include <threads.h>
+#include <stdatomic.h>
 
 #include "array_list.h"
 #include "config.h"
@@ -26,7 +27,7 @@ typedef struct {
   mtx_t mutex_progress;
   unsigned long long progress_bytes;
   bool sender_done;
-  bool cancelled;
+  atomic_bool cancelled;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {
@@ -38,7 +39,7 @@ typedef struct PipelineContextReceiver {
   cnd_t condition_not_full;
   cnd_t condition_not_empty;
   bool receiver_done;
-  bool cancelled;
+  atomic_bool cancelled;
 } PipelineContextReceiver;
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,

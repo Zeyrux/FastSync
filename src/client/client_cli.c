@@ -440,6 +440,14 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strcmp(argv[i], "--compress-choice") == 0 && i + 1 < argc) {
       if (set_string_option(&config->compress_choice, argv[++i], "--compress-choice") != 0)
         return -1;
+      if (strcmp(config->compress_choice, "zstd") == 0)
+        config->use_compression = true;
+      else if (strcmp(config->compress_choice, "none") == 0)
+        config->use_compression = false;
+      else {
+        fprintf(stderr, "Error: --compress-choice must be 'zstd' or 'none'\n");
+        return -1;
+      }
     } else if (strcmp(argv[i], "--compress-level") == 0 && i + 1 < argc) {
       if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)
         return -1;
@@ -495,6 +503,12 @@ static bool validate_config(const Config* config) {
   }
   if (config->use_delta && config->use_sendfile) {
     fprintf(stderr, "Error: --delta cannot be combined with -f (sendfile)\n");
+    return false;
+  }
+  if (config->append || config->append_verify) {
+    fprintf(
+        stderr,
+        "Error: --append and --append-verify are not supported yet; refusing to ignore option\n");
     return false;
   }
   if (config->use_tls) {

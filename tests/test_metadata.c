@@ -109,6 +109,19 @@ static void test_metadata_send_null() {
   close(p[1]);
 }
 
+static void test_metadata_rejects_invalid_values() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+  int32_t present = 2;
+  EXPECT_TRUE(send_n_data(p[1], &present, sizeof(present)));
+  int ok = 1;
+  EXPECT_NULL(metadata_receive(p[0], &ok));
+  EXPECT_EQ_INT(ok, 0);
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_file_restore_metadata() {
   const char* path = "temp_meta_restore_test.txt";
   const char* content = "test content";
@@ -137,5 +150,6 @@ void test_metadata() {
   test_metadata_from_buf_null();
   test_metadata_send_receive_roundtrip();
   test_metadata_send_null();
+  test_metadata_rejects_invalid_values();
   test_file_restore_metadata();
 }

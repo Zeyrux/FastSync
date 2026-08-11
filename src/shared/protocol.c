@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "log.h"
 #include <errno.h>
+#include <limits.h>
 #include <openssl/ssl.h>
 #include <poll.h>
 #include <stdio.h>
@@ -10,7 +11,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define RECEIVE_TIMEOUT_SEC 60                        /* 60 second per-message timeout */
+#define RECEIVE_TIMEOUT_SEC 60 /* 60 second per-message timeout */
+#define SEND_TIMEOUT_SEC 60
 #define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
 
 static __thread int io_read_fd = -1;
@@ -28,6 +30,10 @@ static __thread unsigned long long total_allocated_bytes = 0;
 void io_set_fds(int read_fd, int write_fd) {
   io_read_fd = read_fd;
   io_write_fd = write_fd;
+  /* A descriptor switch starts a new transport; never reuse a TLS object
+     belonging to a previous connection or test pipe. */
+  io_ssl = NULL;
+  total_allocated_bytes = 0;
 }
 
 static void bw_mutex_init(void) {
@@ -87,14 +93,39 @@ static int io_fd(int dir_fd, int file_descriptor) {
   return (dir_fd != -1) ? dir_fd : file_descriptor;
 }
 
+static int deadline_remaining_ms(const struct timespec* deadline) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long ns =
+      (long long)(deadline->tv_sec - now.tv_sec) * 1000000000LL + deadline->tv_nsec - now.tv_nsec;
+  if (ns <= 0)
+    return 0;
+  long long ms = (ns + 999999) / 1000000;
+  return ms > INT_MAX ? INT_MAX : (int)ms;
+}
+
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   int fd = io_fd(io_write_fd, file_descriptor);
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += SEND_TIMEOUT_SEC;
+  short wait_events = POLLOUT;
   ssize_t total_bytes_send = 0;
   while ((size_t)total_bytes_send < data_size) {
     size_t chunk = data_size - total_bytes_send;
     if (io_bwlimit > 0 && chunk > 65536)
       chunk = 65536;
+    struct pollfd pfd = {.fd = fd, .events = wait_events};
+    int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+    if (poll_result == 0 || (poll_result < 0 && errno != EINTR)) {
+      log_message(LOG_LEVEL_ERROR, "Send timeout or poll failure");
+      return false;
+    }
+    if (poll_result < 0)
+      continue;
+    if (pfd.revents & (POLLERR | POLLNVAL))
+      return false;
     ssize_t bytes_send;
     if (io_ssl)
       bytes_send = SSL_write(io_ssl, (const char*)data + total_bytes_send, chunk);
@@ -103,8 +134,10 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
     if (bytes_send <= 0) {
       if (io_ssl) {
         int ssl_err = SSL_get_error(io_ssl, (int)bytes_send);
-        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ)
+        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
+          wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
           continue;
+        }
       }
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
@@ -125,14 +158,22 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
   deadline.tv_sec += RECEIVE_TIMEOUT_SEC;
 
   size_t total_bytes_received = 0;
+  short wait_events = POLLIN;
   while (total_bytes_received < data_size) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (now.tv_sec > deadline.tv_sec ||
-        (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec)) {
+    struct pollfd pfd = {.fd = fd, .events = wait_events};
+    int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+    if (poll_result == 0) {
       log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
       return false;
     }
+    if (poll_result < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    /* POLLHUP may accompany the final readable bytes on pipes/sockets. */
+    if (pfd.revents & (POLLERR | POLLNVAL))
+      return false;
 
     ssize_t bytes_received;
     if (io_ssl)
@@ -144,8 +185,10 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
     if (bytes_received <= 0) {
       if (io_ssl) {
         int ssl_err = SSL_get_error(io_ssl, (int)bytes_received);
-        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ)
+        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
+          wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
           continue;
+        }
       }
       if (bytes_received == 0)
         log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
@@ -204,7 +247,8 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_STRING_SIZE) {
+  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
+      size + 1 > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
@@ -217,6 +261,7 @@ char* receive_str(int file_descriptor) {
     return NULL;
   }
   data[size] = '\0';
+  total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
   return data;
 }
@@ -240,22 +285,28 @@ Data* receive_data(int file_descriptor) {
                 (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
   }
-  if (total_allocated_bytes + size > MAX_CONNECTION_MEMORY) {
+  size_t allocation_size = size == 0 ? 1 : (size_t)size;
+  if (allocation_size > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
     log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
                 (unsigned long long)total_allocated_bytes, size,
                 (unsigned long long)MAX_CONNECTION_MEMORY);
     return NULL;
   }
-  void* data = malloc((size_t)size);
+  void* data = malloc(allocation_size);
   if (data == NULL)
     return NULL;
   if (!receive_n_data(file_descriptor, data, (size_t)size)) {
     free(data);
     return NULL;
   }
-  total_allocated_bytes += size;
+  total_allocated_bytes += allocation_size;
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
-  return data_create(data, (size_t)size);
+  Data* result = data_create(data, (size_t)size);
+  if (!result) {
+    free(data);
+    total_allocated_bytes -= allocation_size;
+  }
+  return result;
 }
 
 bool send_int(int file_descriptor, int data) {

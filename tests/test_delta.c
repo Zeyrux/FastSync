@@ -35,6 +35,10 @@ static void test_xxhash32_different_data() {
   EXPECT_TRUE(ha != hb);
 }
 
+static void test_xxhash64_different_data() {
+  EXPECT_TRUE(delta_xxhash64("AAAA", 4) != delta_xxhash64("BBBB", 4));
+}
+
 static void test_signature_roundtrip() {
   char old_data[4096];
   for (int i = 0; i < 4096; i++)
@@ -344,6 +348,7 @@ void test_delta() {
   test_adler32_different_data();
   test_xxhash32_basic();
   test_xxhash32_different_data();
+  test_xxhash64_different_data();
   test_signature_roundtrip();
   test_delta_identical_files();
   test_delta_small_edit();

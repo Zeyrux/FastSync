@@ -72,5 +72,6 @@ bool delta_is_worthwhile(const Delta* delta, uint64_t new_file_size);
 
 uint32_t delta_adler32(const void* data, uint32_t len);
 uint32_t delta_xxhash32(const void* data, uint32_t len);
+uint64_t delta_xxhash64(const void* data, size_t len);
 
 #endif

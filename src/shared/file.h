@@ -26,6 +26,7 @@ typedef struct {
 File* file_create(const char* path);
 void file_destroy(void* item);
 bool file_load_data(File* file);
+bool file_checksum(File* file, uint64_t* checksum);
 File* file_receive(const Config* config, int file_descriptor);
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path);
@@ -36,7 +37,8 @@ FileMetadata* file_metadata_create(const struct stat* stats);
 void file_metadata_destroy(void* metadata);
 bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
              bool sparse);
-bool file_save_to_disk(const char* root_directory, File* file, const Config* config);
+bool file_save_to_disk(const char* root_directory, const File* file, const Config* config);
+void file_set_authorized_root(int fd, const char* canonical_path);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 int receive_manifest(int fd, const Config* config, int* next_status);
 

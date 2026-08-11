@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 jobs:
@@ -72,6 +72,13 @@ jobs:
 
       - name: Build fuzz targets
         run: cmake --build build-fuzz -j$(nproc)
+
+      - name: Smoke fuzz targets
+        run: |
+          for target in build-fuzz/fuzz_*; do
+            [ -x "$target" ] || continue
+            timeout 10s "$target" -runs=100 -max_total_time=5
+          done
 
   coverage:
     runs-on: ubuntu-latest

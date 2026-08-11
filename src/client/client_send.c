@@ -28,6 +28,20 @@
 /* Forward declaration for progress-reporting thread used in multithreaded send. */
 static int progress_thread_fn(void* arg);
 
+static void pipeline_cancel(PipelineContextSender* context) {
+  mtx_lock(&context->mutex_scanner);
+  mtx_lock(&context->mutex_loader);
+  atomic_store(&context->cancelled, true);
+  context->scanner_done = true;
+  context->loader_done = true;
+  cnd_broadcast(&context->condition_not_full_scanner);
+  cnd_broadcast(&context->condition_not_empty_scanner);
+  cnd_broadcast(&context->condition_not_full_loader);
+  cnd_broadcast(&context->condition_not_empty_loader);
+  mtx_unlock(&context->mutex_loader);
+  mtx_unlock(&context->mutex_scanner);
+}
+
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
 static int send_dry_run_manifest(Config* config) {
   DirectoryScanner* scanner = directory_scanner_create(
@@ -67,7 +81,8 @@ static int send_delete_manifest(int fd, ArrayList* manifest) {
   return 0;
 }
 
-static int incremental_check(Client* client, File* file, DeltaSignature** out_sig) {
+static int incremental_check(Client* client, File* file, const Config* config,
+                             DeltaSignature** out_sig) {
   *out_sig = NULL;
   if (!send_status(client->file_descriptor, STATUS_CHECK))
     return -1;
@@ -79,6 +94,12 @@ static int incremental_check(Client* client, File* file, DeltaSignature** out_si
     return -1;
   if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime)))
     return -1;
+  if (config->checksum) {
+    uint64_t checksum;
+    if (!file_checksum(file, &checksum) ||
+        !send_n_data(client->file_descriptor, &checksum, sizeof(checksum)))
+      return -1;
+  }
   Status s;
   if (!receive_status(client->file_descriptor, &s))
     return -1;
@@ -176,7 +197,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   // Incremental path: use sendfile for the actual data if enabled and no compression
   if (use_sendfile) {
     DeltaSignature* sig = NULL;
-    int rc = incremental_check(client, file, &sig);
+    int rc = incremental_check(client, file, config, &sig);
     if (rc == 1) {
       delta_signature_destroy(sig);
       return 1;
@@ -202,7 +223,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   // Incremental path with single_calls (supports compression and delta)
   file_send_fn send_fn = (file_send_fn)file_send_single_calls;
   DeltaSignature* sig = NULL;
-  int rc = incremental_check(client, file, &sig);
+  int rc = incremental_check(client, file, config, &sig);
   if (rc < 0) {
     delta_signature_destroy(sig);
     return -1;
@@ -337,6 +358,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       return ok ? thrd_success : thrd_error;
 
     send_fail:
+      pipeline_cancel(context);
       client_disconnect(client);
       client_delete(client);
       mtx_lock(&context->mutex_progress);
@@ -347,6 +369,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     if (send_chunk(client, current_chunk, context->config) != 0) {
       fprintf(stderr, "Error: unexpected error while sending chunk\n");
       chunk_destroy(current_chunk);
+      pipeline_cancel(context);
       client_disconnect(client);
       client_delete(client);
       mtx_lock(&context->mutex_progress);
@@ -379,6 +402,11 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->checksum);
 
   Chunk* current_chunk;
+  if (scanner == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to create parallel scanner");
+    pipeline_cancel(context);
+    return thrd_error;
+  }
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
     if (context->config->use_delete) {
       mtx_lock(&context->mutex_scanner);
@@ -390,13 +418,18 @@ static int scan_directory_multithreaded(void* pipeline_context) {
         if (!manifest_entry) {
           log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
           mtx_unlock(&context->mutex_scanner);
-          context->cancelled = true;
-          cnd_broadcast(&context->condition_not_full_scanner);
-          cnd_broadcast(&context->condition_not_empty_scanner);
+          pipeline_cancel(context);
           parallel_scanner_destroy(scanner);
           return thrd_error;
         }
-        array_list_add(context->manifest, manifest_entry);
+        if (!array_list_add(context->manifest, manifest_entry)) {
+          free(manifest_entry);
+          mtx_unlock(&context->mutex_scanner);
+          pipeline_cancel(context);
+          chunk_destroy(current_chunk);
+          parallel_scanner_destroy(scanner);
+          return thrd_error;
+        }
       }
       mtx_unlock(&context->mutex_scanner);
     }
@@ -405,12 +438,20 @@ static int scan_directory_multithreaded(void* pipeline_context) {
             &context->condition_not_empty_scanner, &context->condition_not_full_scanner,
             &context->cancelled)) {
       chunk_destroy(current_chunk);
-      context->cancelled = true;
-      cnd_broadcast(&context->condition_not_full_scanner);
-      cnd_broadcast(&context->condition_not_empty_scanner);
+      pipeline_cancel(context);
       parallel_scanner_destroy(scanner);
       return thrd_error;
     }
+  }
+  if (parallel_scanner_failed(scanner)) {
+    parallel_scanner_destroy(scanner);
+    mtx_lock(&context->mutex_scanner);
+    context->scanner_done = true;
+    cnd_broadcast(&context->condition_not_empty_scanner);
+    cnd_broadcast(&context->condition_not_full_scanner);
+    mtx_unlock(&context->mutex_scanner);
+    pipeline_cancel(context);
+    return thrd_error;
   }
   mtx_lock(&context->mutex_scanner);
   context->scanner_done = true;
@@ -451,7 +492,7 @@ static int load_files_multithreaded(void* pipeline_context) {
                                             &context->condition_not_full_loader,
                                             &context->cancelled)) {
       chunk_destroy(chunk);
-      context->cancelled = true;
+      atomic_store(&context->cancelled, true);
       cnd_broadcast(&context->condition_not_full_loader);
       cnd_broadcast(&context->condition_not_empty_loader);
       return thrd_error;
@@ -547,6 +588,15 @@ int send_files(Config* config) {
   time_t last_progress = 0;
   time_t start = time(NULL);
   ArrayList* manifest = config->use_delete ? array_list_create(free) : NULL;
+  if (!scanner || (config->use_delete && !manifest)) {
+    if (scanner)
+      directory_scanner_destroy(scanner);
+    if (manifest)
+      array_list_delete(manifest);
+    client_disconnect(client);
+    client_delete(client);
+    return 1;
+  }
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
     unsigned long long chunk_bytes = 0;
     for (int i = 0; i < current_chunk->element_count; i++) {
@@ -566,7 +616,15 @@ int send_files(Config* config) {
           client_delete(client);
           return 1;
         }
-        array_list_add(manifest, manifest_entry);
+        if (!array_list_add(manifest, manifest_entry)) {
+          free(manifest_entry);
+          chunk_destroy(current_chunk);
+          array_list_delete(manifest);
+          directory_scanner_destroy(scanner);
+          client_disconnect(client);
+          client_delete(client);
+          return 1;
+        }
       }
     }
     if (!config->use_sendfile) {
@@ -583,6 +641,9 @@ int send_files(Config* config) {
     if (send_chunk(client, current_chunk, config) != 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
       chunk_destroy(current_chunk);
+      if (manifest)
+        array_list_delete(manifest);
+      manifest = NULL;
       break;
     }
     if (config->show_progress) {
@@ -598,12 +659,15 @@ int send_files(Config* config) {
     }
     chunk_destroy(current_chunk);
   }
+  if (directory_scanner_failed(scanner) || (config->use_delete && manifest == NULL))
+    goto send_fail;
   if (config->use_delete) {
     if (send_delete_manifest(client->file_descriptor, manifest) != 0) {
       array_list_delete(manifest);
       goto send_fail;
     }
     array_list_delete(manifest);
+    manifest = NULL;
   }
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     goto send_fail;
@@ -625,6 +689,8 @@ int send_files(Config* config) {
   return ok ? 0 : 1;
 
 send_fail:
+  if (manifest)
+    array_list_delete(manifest);
   directory_scanner_destroy(scanner);
   client_disconnect(client);
   client_delete(client);
@@ -678,14 +744,10 @@ int send_files_multithreaded(Config* config) {
 
   if (!scanner_created || !loader_created || !sender_created) {
     perror("Error creating threads.\n");
-    context->cancelled = true;
-    context->scanner_done = true;
-    context->loader_done = true;
+    pipeline_cancel(context);
+    mtx_lock(&context->mutex_progress);
     context->sender_done = true;
-    cnd_broadcast(&context->condition_not_full_scanner);
-    cnd_broadcast(&context->condition_not_empty_scanner);
-    cnd_broadcast(&context->condition_not_full_loader);
-    cnd_broadcast(&context->condition_not_empty_loader);
+    mtx_unlock(&context->mutex_progress);
     if (sender_created)
       thrd_join(sender, NULL);
     if (loader_created)

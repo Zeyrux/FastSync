@@ -105,9 +105,14 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  if (!present) {
+  if (present == 0) {
     if (ok)
       *ok = 1;
+    return NULL;
+  }
+  if (present != 1) {
+    if (ok)
+      *ok = 0;
     return NULL;
   }
   FileMetadata* m = malloc(sizeof(FileMetadata));
@@ -156,18 +161,24 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
     return NULL;
   }
   m->mtime_nsec = (long)mtime_nsec;
+  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
   if (ok)
     *ok = 1;
   return m;
 }
 
-void file_restore_metadata(const char* path, FileMetadata* metadata) {
+void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   if (metadata == NULL)
     return;
   if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
-  if (chown(path, metadata->uid, metadata->gid) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to chown %s: %s", path, strerror(errno));
+  /* Never apply client-supplied ownership.  The descriptor API below is the
+     receiver write path; retain this legacy API only for compatibility. */
   struct timespec times[2];
   times[0].tv_sec = 0;
   times[0].tv_nsec = UTIME_OMIT;
@@ -175,4 +186,18 @@ void file_restore_metadata(const char* path, FileMetadata* metadata) {
   times[1].tv_nsec = metadata->mtime_nsec;
   if (utimensat(AT_FDCWD, path, times, 0) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
+}
+
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {
+  if (fd < 0 || metadata == NULL)
+    return metadata == NULL;
+  bool ok = true;
+  if (fchmod(fd, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
+    ok = false;
+  /* Client uid/gid values are deliberately not authoritative. */
+  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                              {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
+  if (futimens(fd, times) != 0)
+    ok = false;
+  return ok;
 }
