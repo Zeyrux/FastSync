@@ -55,7 +55,7 @@ static bool parse_positive_int(const char* s, int* out_val) {
 
 /* Duplicate a string argument into *dest, freeing the old value. Returns true on success, false on
  * failure. */
-static bool set_string_option(char** dest, const char* value, const char* option_name) {
+static int set_string_option(char** dest, const char* value, const char* option_name) {
   char* dup = str_dup(value);
   if (!dup) {
     fprintf(stderr, "Error: memory allocation failed for %s\n", option_name);
@@ -67,7 +67,7 @@ static bool set_string_option(char** dest, const char* value, const char* option
 }
 
 /* Parse a string as a positive integer into *dest. Returns true on success, false on error. */
-static bool set_positive_int_option(int* dest, const char* value, const char* option_name) {
+static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
     fprintf(stderr, "Error: %s must be a positive integer\n", option_name);
     return -1;
@@ -76,7 +76,7 @@ static bool set_positive_int_option(int* dest, const char* value, const char* op
 }
 
 /* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
-static bool set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
+static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
     fprintf(stderr, "Error: %s must be a non-negative integer\n", option_name);
     return -1;
