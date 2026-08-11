@@ -40,12 +40,10 @@ A high-performance file synchronization system with SSH and TCP transport, TLS e
 - Optional progress display with throughput
 - Bandwidth limiting via token-bucket algorithm
 - Configurable I/O and connection timeouts (`--timeout`, `--contimeout`)
-- Quiet mode (`-q`/`--quiet`) suppresses all non-error output
 - Backup overwritten files (`--backup`) with optional directory (`--backup-dir`)
 - Transfer statistics summary (`--stats`)
 - Maximum directory depth control (`--max-depth`)
 - Log file output (`--log-file`)
-- Configurable multithreaded queue size (`--queue-size`)
 - Exclude patterns from file (`--exclude-from`)
 
 ### Server
@@ -116,8 +114,6 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 | `-n, --dry-run` | Scan and print what would be transferred |
 | `-p <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
-| `-q, --quiet` | Suppress all non-error output |
-| `--silent` | Alias for `--quiet` |
 | `--progress` | Show real-time transfer speed |
 | `--delete` | Delete files on receiver not present in source |
 | `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
@@ -135,7 +131,6 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 | `--stats` | Print transfer statistics at end (bytes, files, timing) |
 | `--max-depth <n>` | Maximum directory depth to recurse (0 = unlimited, default: 0) |
 | `--log-file <path>` | Write log messages to file instead of stderr |
-| `--queue-size <n>` | Queue capacity for multithreaded mode (default: 100) |
 | `--source-dir <path>` | Source directory (overrides `FASTSYNC_SOURCE_DIR`) |
 | `--dest-dir <path>` | Server destination directory (overrides `FASTSYNC_DEST_DIR`) |
 | `--save-to-disk` | Write received files to disk |
@@ -296,17 +291,14 @@ Place the `fastsync-server` binary in the remote `$PATH`. The client runs `ssh u
 # Bandwidth limit to 1 MB/s
 ./build/client --bwlimit 1024 /src user@host:/dst
 
-# With timeouts, quiet mode, and stats
-./build/client --timeout 60 --contimeout 15 --quiet --stats /src user@host:/dst
+# With timeouts and stats
+./build/client --timeout 60 --contimeout 15 --stats /src user@host:/dst
 
 # Backup overwritten files to a directory
 ./build/client --backup --backup-dir /backups /src user@host:/dst
 
 # Exclude patterns from file, limit depth
 ./build/client --exclude-from ignore.txt --max-depth 3 /src user@host:/dst
-
-# Custom queue size for multithreading
-./build/client -m --queue-size 200 /src user@host:/dst
 
 # Log to file
 ./build/client --log-file /tmp/fastsync.log /src user@host:/dst
@@ -334,7 +326,7 @@ The benchmark prints throughput metrics, best configuration, and speedup vs rsyn
 1. Chunk size (~10 MB default) balances memory and transfer efficiency
 2. Compression level trades CPU for bandwidth
 3. `sendfile()` bypasses userspace — ~2× faster on localhost for large files
-4. Multithreading scales with core count; `--queue-size` controls pipeline buffering
+4. Multithreading scales with core count and uses memory-based pipeline sizing
 5. Metadata transfer adds negligible overhead (~24 bytes per file when enabled)
 6. SSH socketpair buffer set to 1 MB for improved pipe throughput
 7. SSH ControlMaster reuses connections across repeated invocations

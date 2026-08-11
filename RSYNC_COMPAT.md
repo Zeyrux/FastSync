@@ -6,10 +6,10 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 39 | Feature works end-to-end |
-| 🔀 Alt Arg | 5 | Functionality exists but under different flag/semantics |
-| ⚠️ Partial | 30 | Flag parsed/stored but behavior incomplete |
-| ❌ Not Implemented | 62 | Flag not recognized or no behavior |
+| ✅ Implemented | 34 | Feature works end-to-end |
+| 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
+| ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
+| ❌ Not Implemented | 98 | Flag not recognized or no behavior |
 | **Total** | **136** | |
 
 ---
@@ -20,31 +20,31 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `-a`, `--archive` | Archive mode is -rlptgoD | 🔀 Alt Arg | Maps to -c -m -M (compression + multithread + metadata) |
 | `-v`, `--verbose` | Increase verbosity | ✅ Implemented | Sets `log_level=DEBUG` |
-| `-q`, `--quiet` | Suppress non-error messages | ✅ Implemented | `quiet` config field |
-| `-h`, `--help` | Show help | ✅ Implemented | Prints usage and exits |
-| `-V`, `--version` | Print version | ❌ Not Implemented | |
-| `--info=FLAGS` | Fine-grained info verbosity | ⚠️ Partial | `info_level` stored, not wired |
-| `--debug=FLAGS` | Fine-grained debug verbosity | ⚠️ Partial | `debug_level` stored, not wired |
+| `-q`, `--quiet` | Suppress non-error messages | ❌ Not Implemented | Removed because it had no effect |
+| `--help` | Show help | ✅ Implemented | Prints usage and exits; `-h` is not accepted |
+| `-V`, `--version` | Print version | ✅ Implemented | |
+| `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
+| `--debug=FLAGS` | Fine-grained debug verbosity | ❌ Not Implemented | Removed because it had no effect |
 | `--stderr=MODE` | Change stderr output mode | ❌ Not Implemented | |
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |
 | `--exclude=PATTERN` | Exclude files matching pattern | ✅ Implemented | Glob matching in scanner |
 | `--include=PATTERN` | Include files matching pattern | ✅ Implemented | Glob matching in scanner |
-| `-C`, `--cvs-exclude` | Auto-ignore CVS files | ⚠️ Partial | `cvs_exclude` stored, not wired |
+| `-C`, `--cvs-exclude` | Auto-ignore CVS files | ❌ Not Implemented | Removed because it had no effect |
 
 ## 2. Modifying Output
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `--stats` | Give transfer stats | ✅ Implemented | Prints file/byte counts |
-| `-h`, `--human-readable` | Human-readable numbers | ⚠️ Partial | `human_readable` stored, not wired |
-| `-i`, `--itemize-changes` | Per-file change summary | ⚠️ Partial | `itemize_changes` stored, not wired |
+| `-h`, `--human-readable` | Human-readable numbers | ❌ Not Implemented | Removed because it had no effect |
+| `-i`, `--itemize-changes` | Per-file change summary | ❌ Not Implemented | Removed because it had no effect |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
 | `-P` | Same as --partial --progress | ❌ Not Implemented | |
-| `--out-format=FORMAT` | Custom output format | ⚠️ Partial | `out_format` stored, not wired |
+| `--out-format=FORMAT` | Custom output format | ❌ Not Implemented | Removed because it had no effect |
 | `--log-file=FILE` | Log to file | ✅ Implemented | `log_file` config field |
 | `--log-file-format=FMT` | Log format | ❌ Not Implemented | |
 | `--8-bit-output` | Leave high-bit chars unescaped | ❌ Not Implemented | |
-| `--list-only` | List files instead of copying | ⚠️ Partial | `list_only` stored, not wired |
+| `--list-only` | List files instead of copying | ❌ Not Implemented | Removed because it had no effect |
 
 ## 3. File Selection
 
@@ -52,8 +52,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `--exclude-from=FILE` | Read exclude patterns from file | ✅ Implemented | Reads patterns from file |
 | `--include-from=FILE` | Read include patterns from file | ✅ Implemented | Reads patterns from file |
-| `--filter=RULE` | Add file-filtering rule | ⚠️ Partial | `filters` ArrayList stored, not wired |
-| `--files-from=FILE` | Read source file list from file | ⚠️ Partial | `files_from` stored, not wired |
+| `--filter=RULE` | Add file-filtering rule | ❌ Not Implemented | Removed because it had no effect |
+| `--files-from=FILE` | Read source file list from file | ❌ Not Implemented | Removed because it had no effect |
 | `-0`, `--from0` | Delimit *-from files with NULs | ❌ Not Implemented | |
 | `--max-size=SIZE` | Skip files larger than SIZE | ✅ Implemented | `max_size` in scanner |
 | `--min-size=SIZE` | Skip files smaller than SIZE | ✅ Implemented | `min_size` in scanner |
@@ -69,7 +69,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `-r`, `--recursive` | Recurse into directories | ✅ Implemented | Default behavior |
-| `-R`, `--relative` | Use relative path names | ⚠️ Partial | `relative` stored, not wired |
+| `-R`, `--relative` | Use relative path names | ❌ Not Implemented | Removed because it had no effect |
 | `--no-implied-dirs` | Don't send implied dirs with -R | ❌ Not Implemented | |
 | `-d`, `--dirs` | Transfer dirs without recursing | ❌ Not Implemented | |
 | `--mkpath` | Create missing path components | ❌ Not Implemented | |
@@ -78,10 +78,10 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-u`, `--update` | Skip files newer on receiver | ⚠️ Partial | `update` stored, not wired |
+| `-u`, `--update` | Skip files newer on receiver | ❌ Not Implemented | Removed because it had no effect |
 | `--inplace` | Update files in-place | ✅ Implemented | Direct write mode |
-| `--append` | Append data to shorter files | ⚠️ Partial | `append` stored, not wired |
-| `--append-verify` | Append with old-data checksum | ⚠️ Partial | `append_verify` stored, not wired |
+| `--append` | Append data to shorter files | ❌ Not Implemented | Removed because it had no effect |
+| `--append-verify` | Append with old-data checksum | ❌ Not Implemented | Removed because it had no effect |
 | `-W`, `--whole-file` | Copy whole file (no delta) | ❌ Not Implemented | |
 | `--block-size=SIZE` | Force checksum block-size | ⚠️ Partial | Parsed as `--delta-block`; controls delta transfer block size |
 
@@ -100,15 +100,15 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `--delete` | Delete extraneous files from dest | ✅ Implemented | `use_delete` config field |
-| `--delete-before` | Delete before transfer | ⚠️ Partial | `delete_before` stored, not wired |
+| `--delete-before` | Delete before transfer | ❌ Not Implemented | Removed because it had no effect |
 | `--delete-during` | Delete during transfer | ❌ Not Implemented | |
 | `--delete-delay` | Find deletions during, delete after | ❌ Not Implemented | |
-| `--delete-after` | Delete after transfer | ⚠️ Partial | `delete_after` stored, not wired |
-| `--delete-excluded` | Also delete excluded files | ⚠️ Partial | `delete_excluded` stored, not wired |
-| `--max-delete=NUM` | Max files to delete | ⚠️ Partial | `max_delete` stored, not wired |
+| `--delete-after` | Delete after transfer | ❌ Not Implemented | Removed because it had no effect |
+| `--delete-excluded` | Also delete excluded files | ❌ Not Implemented | Removed because it had no effect |
+| `--max-delete=NUM` | Max files to delete | ❌ Not Implemented | Removed because it had no effect |
 | `--ignore-errors` | Delete even with I/O errors | ❌ Not Implemented | |
 | `--force` | Force deletion of non-empty dirs | ❌ Not Implemented | |
-| `--prune-empty-dirs` | Prune empty dir chains | ⚠️ Partial | `prune_empty_dirs` stored, not wired |
+| `--prune-empty-dirs` | Prune empty dir chains | ❌ Not Implemented | Removed because it had no effect |
 
 ## 8. Metadata Preservation
 
@@ -121,11 +121,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-t`, `--times` | Preserve modification times | ✅ Implemented | Part of -M |
 | `-E`, `--executability` | Preserve executability | ❌ Not Implemented | |
 | `--chmod=CHMOD` | Affect file permissions | ❌ Not Implemented | |
-| `-A`, `--acls` | Preserve ACLs | ⚠️ Partial | `preserve_acls` stored, not wired |
-| `-X`, `--xattrs` | Preserve extended attributes | ⚠️ Partial | `preserve_xattrs` stored, not wired |
-| `-H`, `--hard-links` | Preserve hard links | ⚠️ Partial | `preserve_hard_links` stored, not wired |
-| `-D` | Same as --devices --specials | 🔀 Alt Arg | Maps to --devices only (no --specials) |
-| `--devices` | Preserve device files | ⚠️ Partial | `preserve_devices` stored, not wired |
+| `-A`, `--acls` | Preserve ACLs | ❌ Not Implemented | Removed because it had no effect |
+| `-X`, `--xattrs` | Preserve extended attributes | ❌ Not Implemented | Removed because it had no effect |
+| `-H`, `--hard-links` | Preserve hard links | ❌ Not Implemented | Removed because it had no effect |
+| `-D` | Same as --devices --specials | ❌ Not Implemented | Removed because device-file handling is not implemented |
+| `--devices` | Preserve device files | ❌ Not Implemented | Removed because it had no effect |
 | `--specials` | Preserve special files | ❌ Not Implemented | |
 | `--copy-devices` | Copy device contents as file | ❌ Not Implemented | |
 | `--write-devices` | Write to devices as files | ❌ Not Implemented | |
@@ -159,11 +159,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-c`, `--checksum` | Skip based on checksum | 🔀 Alt Arg | `-c` means compression; `--checksum` stored and forwarded to scanner |
+| `--checksum` | Skip based on checksum | ❌ Not Implemented | Removed because it had no effect; `-c` means compression |
 | `--checksum-choice=STR` | Choose checksum algorithm | ❌ Not Implemented | xxHash used internally |
-| `--compare-dest=DIR` | Compare dest files relative to DIR | ⚠️ Partial | `compare_dest` stored, not wired |
-| `--copy-dest=DIR` | Include copies of unchanged files | ⚠️ Partial | `copy_dest` stored, not wired |
-| `--link-dest=DIR` | Hardlink to files when unchanged | ⚠️ Partial | `link_dest` stored, not wired |
+| `--compare-dest=DIR` | Compare dest files relative to DIR | ❌ Not Implemented | Removed because it had no effect |
+| `--copy-dest=DIR` | Include copies of unchanged files | ❌ Not Implemented | Removed because it had no effect |
+| `--link-dest=DIR` | Hardlink to files when unchanged | ❌ Not Implemented | Removed because it had no effect |
 | `--fuzzy`, `--no-fuzzy` | Find similar file for basis | ❌ Not Implemented | |
 
 ## 12. Compression
@@ -171,7 +171,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `-z`, `--compress` | Compress file data | 🔀 Alt Arg | Always uses zstd (rsync supports multiple algorithms) |
-| `--compress-choice=STR` | Choose compression algorithm | ⚠️ Partial | `compress_choice` stored, always zstd |
+| `--compress-choice=STR` | Choose compression algorithm | ❌ Not Implemented | Removed because it had no effect; FastSync always uses zstd |
 | `--compress-level=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
 | `--skip-compress=LIST` | Skip compress for suffixes | ❌ Not Implemented | Internal skip for hardcoded types; not user-configurable |
@@ -180,22 +180,22 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-e`, `--rsh=COMMAND` | Remote shell to use | ✅ Implemented | SSH transport support |
-| `--rsync-path=PROGRAM` | rsync binary on remote | ✅ Implemented | `rsync_path` config field |
+| `-e`, `--rsh=COMMAND` | Remote shell to use | ❌ Not Implemented | Removed; SSH invokes `ssh` directly |
+| `--rsync-path=PROGRAM` | rsync binary on remote | ❌ Not Implemented | Removed; use `--fastsync-server-path` |
 | `--port=PORT` | Alternate daemon port | ✅ Implemented | `server_port` config field |
 | `--sockopts=OPTIONS` | Custom TCP options | ❌ Not Implemented | |
 | `--blocking-io` | Use blocking I/O for remote shell | ❌ Not Implemented | |
 | `--outbuf=N\|L\|B` | Set output buffering | ❌ Not Implemented | |
-| `--address=ADDRESS` | Bind address for outgoing socket | ✅ Implemented | `address` config field |
-| `-4`, `--ipv4` | Prefer IPv4 | ✅ Implemented | `ipv4` config field |
-| `-6`, `--ipv6` | Prefer IPv6 | ✅ Implemented | `ipv6` config field |
+| `--address=ADDRESS` | Bind address for outgoing socket | ❌ Not Implemented | Removed because it had no effect |
+| `-4`, `--ipv4` | Prefer IPv4 | ❌ Not Implemented | Removed because it had no effect |
+| `-6`, `--ipv6` | Prefer IPv6 | ❌ Not Implemented | Removed because it had no effect |
 
 ## 14. Daemon Mode
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `--daemon` | Run as rsync daemon | ⚠️ Partial | `daemon` stored, not wired |
-| `--config=FILE` | Alternate rsyncd.conf file | ⚠️ Partial | `daemon_config` stored, not wired |
+| `--daemon` | Run as rsync daemon | ❌ Not Implemented | Removed because it had no effect |
+| `--config=FILE` | Alternate rsyncd.conf file | ❌ Not Implemented | Removed because it had no effect |
 | `--dparam=OVERRIDE` | Override global daemon config | ❌ Not Implemented | |
 | `--no-detach` | Don't detach from parent | ❌ Not Implemented | |
 | `--password-file=FILE` | Read daemon password from file | ❌ Not Implemented | |
@@ -266,7 +266,6 @@ Ranked by user demand, implementation complexity, and interoperability impact:
 | `-f` / `--sendfile` | Zero-copy sendfile() syscall (TCP only) |
 | `-c [level]` | zstd compression level (1-22) |
 | `--chunk-size` | Configurable chunk size |
-| `--queue-size` | Pipeline queue capacity |
 | `--tls` | TLS encryption (mutual auth) |
 | `--fastsync-server-path` | Path to fastsync-server binary |
 | `--server-host` / `--server-port` | Direct TCP connection |
