@@ -27,6 +27,10 @@ uint32_t delta_xxhash32(const void* data, uint32_t len) {
   return XXH32(data, len, 0);
 }
 
+uint64_t delta_xxhash64(const void* data, size_t len) {
+  return XXH64(data, len, 0);
+}
+
 DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_file_size,
                                        uint32_t block_size) {
   if (old_file_data == NULL || old_file_size == 0 || block_size == 0)

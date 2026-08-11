@@ -11,7 +11,7 @@ A high-performance file synchronization system with SSH and TCP transport, TLS e
 5. **Multithreading**: producer-consumer pipeline with thread-safe queues (scanner → loader → sender)
 6. **Incremental sync**: skip files unchanged since last transfer (compares size + mtime)
 7. **Batch incremental**: send incremental checks in batched groups for reduced round-trips
-8. **Metadata preservation**: `mode`, `uid`, `gid`, `mtime` restored on disk when enabled
+8. **Metadata preservation**: file mode and mtime are restored when enabled; ownership and atime are intentionally not restored
 9. **`sendfile()` zero-copy** on TCP (~2× faster on loopback)
 10. **SSH ControlMaster** for connection reuse across repeated invocations
 11. **Bandwidth limiting**: token-bucket throttling (`--bwlimit`)
@@ -71,7 +71,7 @@ A high-performance file synchronization system with SSH and TCP transport, TLS e
 | `STATUS_NEXT` | Ready for next file (per-file mode) |
 | `STATUS_CHUNK` | Following data is a serialized chunk |
 | `STATUS_MANIFEST` | Following data is a file manifest (for `--delete`) |
-| `STATUS_CHECK` | Incremental check: client sends file path + size + mtime, server responds with OK (skip) or NEXT (send) |
+| `STATUS_CHECK` | Incremental check: client sends file path + size + mtime and, when negotiated, checksum; server responds with OK (skip) or NEXT (send) |
 | `STATUS_CHECK_BATCH` | Batch incremental check: multiple file checks sent in one message |
 | `STATUS_KEEPALIVE` | Keep-alive heartbeat to detect stalled connections |
 | `STATUS_ABORT` | Abort signal: client interrupts, server cleans up and exits |
@@ -93,7 +93,9 @@ Abort (`STATUS_ABORT`) may be sent at any point. On receipt the server cleans up
 
 ### Protocol Version
 
-`1.3.0` — server and client must match. Mismatch results in `STATUS_ERROR`.
+`2.2.0` — server and client must match. This version adds a 64-bit XXH64 checksum to checksum-enabled `STATUS_CHECK` messages and validates the negotiated compression choice (`zstd` or `none`). Older clients and servers must not be mixed with this version; mismatch results in `STATUS_ERROR`.
+
+Config negotiation is sender-driven: the client serializes transfer options and the server applies them while receiving and writing files. `--checksum` compares size and content checksum instead of timestamps. `--compress-choice zstd` enables zstd; `none` disables it. Unsupported choices are rejected during config exchange.
 
 ## Command-Line Arguments
 
@@ -108,7 +110,7 @@ Abort (`STATUS_ABORT`) may be sent at any point. On receipt the server cleans up
 | `-m` | Multithreading mode |
 | `-s` | Chunk serialization (batch all files per chunk) |
 | `-f, --sendfile` | Sendfile zero-copy. Incompatible with `-c` / `-s`. TCP only. |
-| `-M, --preserve` | Preserve file metadata (mode, uid, gid, mtime) |
+| `-M, --preserve` | Preserve supported file metadata (mode and mtime; ownership and atime are unsupported) |
 | `-n, --dry-run` | Scan and print what would be transferred |
 | `-p <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
@@ -171,8 +173,8 @@ Abort (`STATUS_ABORT`) may be sent at any point. On receipt the server cleans up
 ### Data Structures
 1. **Chunk** — collection of files (~10 MB total by default)
 2. **File** — path, content (`Data`), optional `FileMetadata` pointer
-3. **FileMetadata** — `mode`, `uid`, `gid`, `mtime_sec`, `mtime_nsec`
-4. **Config** — runtime parameters (transported over wire, TLS settings excluded). Includes `timeout`, `contimeout`, `backup`, `backup_dir`, `stats`, and `max_depth`.
+3. **FileMetadata** — `mode`, `uid`, `gid`, `mtime_sec`, `mtime_nsec`; uid/gid are advisory wire fields and are never applied by the receiver; atime is unsupported
+4. **Config** — runtime parameters (transported over wire, TLS settings excluded). Includes `timeout`, `contimeout`, `quiet`, `backup`, `backup_dir`, `stats`, `max_depth`, `log_file`, `queue_size`.
 5. **Queue** — thread-safe bounded queue with condition variables
 6. **DirectoryScanner** — recursive BFS traversal with exclude and include pattern support, max-depth enforcement
 
@@ -181,7 +183,7 @@ Abort (`STATUS_ABORT`) may be sent at any point. On receipt the server cleans up
 2. **Chunking** — files accumulated until `chunk_size` threshold, then flushed
 3. **Compression** — streaming zstd via `ZSTD_compressStream2` / `ZSTD_decompressStream`
 4. **Network protocol** — status-code-driven exchange with metadata packing, keep-alive, and abort support
-5. **Incremental check** — client sends `STATUS_CHECK` + path + size + mtime; server compares against destination. Can be batched via `STATUS_CHECK_BATCH` for reduced round-trips.
+5. **Incremental check** — client sends `STATUS_CHECK` + path + size + mtime and, with `--checksum`, XXH64 content checksum; server compares against destination. Can be batched via `STATUS_CHECK_BATCH` for reduced round-trips.
 6. **Bandwidth limiting** — token-bucket algorithm with `nanosleep` throttling on 64 KB write chunks
 7. **Metadata restoration** — `chmod()`, `chown()`, `utimensat()` on the receiving side
 8. **`--delete`** — sender tracks all sent paths; receiver walks destination tree and removes unlisted files/directories

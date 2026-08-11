@@ -256,9 +256,8 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--ipv4",
                                         "--daemon",
                                         "--config",
-                                        "--server",
-                                        "--checksum",
-                                        "--compress-choice"};
+                                         "--server",
+                                         "--compress-choice"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();

@@ -25,6 +25,7 @@
 #include "test_transport_tls.h"
 #include "test_utils.h"
 #include <stdio.h>
+#include <signal.h>
 
 // Define global test state variables
 int tests_run = 0;
@@ -32,6 +33,7 @@ int tests_failed = 0;
 bool current_test_failed = false;
 
 int main() {
+  signal(SIGPIPE, SIG_IGN);
   printf("\033[1;36m=== RUNNING UNIT TESTS ===\033[0m\n\n");
 
   RUN_TEST(test_queue);

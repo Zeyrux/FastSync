@@ -171,10 +171,26 @@ static void test_receive_files_abort() {
   }
 }
 
+static void test_receive_manifest_rejects_traversal() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "../outside"));
+  EXPECT_EQ_INT(receive_manifest(p[0], cfg, NULL), -1);
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
 void test_server() {
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
     test_receive_files_single_file();
     test_receive_files_abort();
+    test_receive_manifest_rejects_traversal();
   }
 }

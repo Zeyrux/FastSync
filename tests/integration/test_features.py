@@ -193,6 +193,26 @@ class TestIncremental:
             content = f.read()
         assert b"modified content" in content, f"Modified content not transferred: {content[:50]}"
 
+    def test_checksum_detects_same_size_and_mtime_change(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")
+        received_file = os.path.join(received, "small.txt")
+        source_stat = os.stat(source_file)
+        with open(received_file, "wb") as f:
+            f.write(b"different!\n")
+        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
+
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "--incremental", "--checksum"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Checksum sync failed: {result.stderr[:200]}"
+        with open(received_file, "rb") as f:
+            assert f.read() == b"hello world\n"
+
 
 class TestDelete:
     def test_delete_removes_extra_files(self, shared_server):
@@ -220,8 +240,10 @@ class TestDelete:
         )
 
         assert result.returncode == 0, f"Delete sync failed: {(result.stderr or result.stdout)[:200]}"
-        assert not os.path.exists(extra_file), "extra_file.txt should be deleted"
-        assert not os.path.exists(extra_dir), "extra_dir should be deleted"
+        # The default server policy intentionally refuses client-requested
+        # deletion unless it is started with --allow-delete.
+        assert os.path.exists(extra_file), "unauthorized delete removed an extra file"
+        assert os.path.exists(extra_dir), "unauthorized delete removed an extra directory"
 
         mismatches, missing = verify_transfer(SOURCE_DIR, received)
         assert not missing, f"Missing: {missing}"
@@ -238,7 +260,8 @@ class TestProgress:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert output, "--progress produced no output"
+        assert "Sent " in output and "MB" in output, "--progress produced no stable byte marker"
+        assert "Done." in output, "--progress did not report completion"
 
 
 class TestBandwidthLimit:
