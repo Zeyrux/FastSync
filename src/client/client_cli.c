@@ -55,7 +55,7 @@ static bool parse_positive_int(const char* s, int* out_val) {
 
 /* Duplicate a string argument into *dest, freeing the old value. Returns true on success, false on
  * failure. */
-static bool set_string_option(char** dest, const char* value, const char* option_name) {
+static int set_string_option(char** dest, const char* value, const char* option_name) {
   char* dup = str_dup(value);
   if (!dup) {
     fprintf(stderr, "Error: memory allocation failed for %s\n", option_name);
@@ -67,7 +67,7 @@ static bool set_string_option(char** dest, const char* value, const char* option
 }
 
 /* Parse a string as a positive integer into *dest. Returns true on success, false on error. */
-static bool set_positive_int_option(int* dest, const char* value, const char* option_name) {
+static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
     fprintf(stderr, "Error: %s must be a positive integer\n", option_name);
     return -1;
@@ -76,7 +76,7 @@ static bool set_positive_int_option(int* dest, const char* value, const char* op
 }
 
 /* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
-static bool set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
+static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
     fprintf(stderr, "Error: %s must be a non-negative integer\n", option_name);
     return -1;
@@ -104,7 +104,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
       config->dry_run = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      if (!set_positive_int_option(&config->ssh_port, argv[++i], "-p"))
+      if (set_positive_int_option(&config->ssh_port, argv[++i], "-p") != 0)
         return -1;
       if (config->ssh_port > 65535) {
         log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535\n");
@@ -139,8 +139,14 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       config->include_patterns[config->include_count++] = dup;
     } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
-      if (!set_nonneg_int_option(&config->max_size, argv[++i], "Max Size"))
+      char* end;
+      errno = 0;
+      unsigned long long val = strtoull(argv[++i], &end, 10);
+      if (errno != 0 || *end != '\0') {
+        fprintf(stderr, "Error: --max-size must be a non-negative integer\n");
         return -1;
+      }
+      config->max_size = val;
     } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
       char* end;
       errno = 0;
@@ -268,9 +274,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strcmp(argv[i], "--contimeout") == 0 && i + 1 < argc) {
       if (set_positive_int_option(&config->contimeout, argv[++i], "--contimeout") != 0)
         return -1;
-    } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0 ||
-               strcmp(argv[i], "--silent") == 0) {
-      config->quiet = true;
     } else if (strcmp(argv[i], "--backup") == 0) {
       config->backup = true;
     } else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc) {
@@ -294,9 +297,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       config->log_file = lf;
       log_set_file(lf);
-    } else if (strcmp(argv[i], "--queue-size") == 0 && i + 1 < argc) {
-      if (set_positive_int_option(&config->queue_size, argv[++i], "--queue-size") != 0)
-        return -1;
     } else if (strcmp(argv[i], "--exclude-from") == 0 && i + 1 < argc) {
       if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
           0)
@@ -321,117 +321,18 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       config->safe_links = true;
     } else if (strcmp(argv[i], "--copy-unsafe-links") == 0) {
       config->copy_unsafe_links = true;
-    } else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--hard-links") == 0) {
-      config->preserve_hard_links = true;
-    } else if (strcmp(argv[i], "-A") == 0 || strcmp(argv[i], "--acls") == 0) {
-      config->preserve_acls = true;
-    } else if (strcmp(argv[i], "-X") == 0 || strcmp(argv[i], "--xattrs") == 0) {
-      config->preserve_xattrs = true;
-    } else if (strcmp(argv[i], "-D") == 0 || strcmp(argv[i], "--devices") == 0) {
-      config->preserve_devices = true;
     } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--sparse") == 0) {
       config->preserve_sparse = true;
-    } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--itemize-changes") == 0) {
-      config->itemize_changes = true;
-    } else if (strcmp(argv[i], "--out-format") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->out_format, argv[++i], "--out-format") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--info") == 0 && i + 1 < argc) {
-      if (set_nonneg_int_option(&config->info_level, argv[++i], "--info") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
-      if (set_nonneg_int_option(&config->debug_level, argv[++i], "--debug") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--list-only") == 0) {
-      config->list_only = true;
-    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--human-readable") == 0) {
-      config->human_readable = true;
-    } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--update") == 0) {
-      config->update = true;
     } else if (strcmp(argv[i], "--inplace") == 0) {
       config->inplace = true;
-    } else if (strcmp(argv[i], "--append") == 0) {
-      config->append = true;
-    } else if (strcmp(argv[i], "--append-verify") == 0) {
-      config->append_verify = true;
-    } else if (strcmp(argv[i], "--delete-excluded") == 0) {
-      config->delete_excluded = true;
-    } else if (strcmp(argv[i], "--delete-after") == 0) {
-      config->delete_after = true;
-    } else if (strcmp(argv[i], "--max-delete") == 0 && i + 1 < argc) {
-      if (set_nonneg_int_option(&config->max_delete, argv[++i], "--max-delete") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
-      if (!config->filters)
-        config->filters = array_list_create(free);
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
-        return -1;
-      array_list_add(config->filters, dup);
-    } else if (strcmp(argv[i], "--files-from") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->files_from, argv[++i], "--files-from") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--cvs-exclude") == 0) {
-      config->cvs_exclude = true;
-    } else if (strcmp(argv[i], "--prune-empty-dirs") == 0) {
-      config->prune_empty_dirs = true;
-    } else if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--relative") == 0) {
-      config->relative = true;
-    } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--rsh") == 0) {
-      if (i + 1 < argc) {
-        if (set_string_option(&config->rsh_command, argv[++i], "-e/--rsh") != 0)
-          return -1;
-      } else {
-        fprintf(stderr, "Error: -e/--rsh requires a command argument\n");
-        return -1;
-      }
-    } else if (strcmp(argv[i], "--rsync-path") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->rsync_path, argv[++i], "--rsync-path") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--temp-dir") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->temp_dir, argv[++i], "--temp-dir") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--compare-dest") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->compare_dest, argv[++i], "--compare-dest") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--copy-dest") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->copy_dest, argv[++i], "--copy-dest") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--link-dest") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->link_dest, argv[++i], "--link-dest") != 0)
-        return -1;
     } else if (strcmp(argv[i], "--partial-dir") == 0 && i + 1 < argc) {
       if (set_string_option(&config->partial_dir, argv[++i], "--partial-dir") != 0)
         return -1;
     } else if (strcmp(argv[i], "--suffix") == 0 && i + 1 < argc) {
       if (set_string_option(&config->suffix, argv[++i], "--suffix") != 0)
         return -1;
-    } else if (strcmp(argv[i], "--delete-before") == 0) {
-      config->delete_before = true;
     } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--address") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->address, argv[++i], "--address") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->bind_address, argv[++i], "--bind-address") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--ipv6") == 0) {
-      config->ipv6 = true;
-    } else if (strcmp(argv[i], "--ipv4") == 0) {
-      config->ipv4 = true;
-    } else if (strcmp(argv[i], "--daemon") == 0) {
-      config->daemon = true;
-    } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->daemon_config, argv[++i], "--config") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--server") == 0) {
-      config->server_mode = true;
-    } else if (strcmp(argv[i], "--checksum") == 0) {
-      config->checksum = true;
-    } else if (strcmp(argv[i], "--compress-choice") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->compress_choice, argv[++i], "--compress-choice") != 0)
         return -1;
     } else if (strcmp(argv[i], "--compress-level") == 0 && i + 1 < argc) {
       if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)

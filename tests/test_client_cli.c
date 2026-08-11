@@ -207,6 +207,70 @@ static void test_parse_args_unknown_option() {
   config_delete(cfg);
 }
 
+/* Parsed-but-unimplemented options must fail instead of being silently accepted. */
+static void test_parse_args_rejects_unimplemented_options() {
+  static const char* const options[] = {"-q",
+                                        "--quiet",
+                                        "--silent",
+                                        "--queue-size",
+                                        "-H",
+                                        "--hard-links",
+                                        "-A",
+                                        "--acls",
+                                        "-X",
+                                        "--xattrs",
+                                        "-D",
+                                        "--devices",
+                                        "-i",
+                                        "--itemize-changes",
+                                        "--out-format",
+                                        "--info",
+                                        "--debug",
+                                        "--list-only",
+                                        "-h",
+                                        "--human-readable",
+                                        "-u",
+                                        "--update",
+                                        "--append",
+                                        "--append-verify",
+                                        "--delete-excluded",
+                                        "--delete-after",
+                                        "--max-delete",
+                                        "--filter",
+                                        "--files-from",
+                                        "--cvs-exclude",
+                                        "--prune-empty-dirs",
+                                        "-R",
+                                        "--relative",
+                                        "-e",
+                                        "--rsh",
+                                        "--rsync-path",
+                                        "--temp-dir",
+                                        "--compare-dest",
+                                        "--copy-dest",
+                                        "--link-dest",
+                                        "--delete-before",
+                                        "--address",
+                                        "--bind-address",
+                                        "--ipv6",
+                                        "--ipv4",
+                                        "--daemon",
+                                        "--config",
+                                        "--server",
+                                        "--checksum",
+                                        "--compress-choice"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "dummy", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 /* Test parse_args with --archive flag */
 static void test_parse_args_archive() {
   Config* cfg = config_create();
@@ -238,5 +302,6 @@ void test_client_cli() {
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
   test_parse_args_unknown_option();
+  test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
 }

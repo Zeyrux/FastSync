@@ -42,8 +42,11 @@ void log_message(LogLevel log_level, const char* format, ...) {
   va_list args;
   va_start(args, format);
   write_message(dest_io, log_level, t, format, args);
+  va_end(args);
 
   if (log_fp) {
+    va_start(args, format);
     write_message(log_fp, log_level, t, format, args);
+    va_end(args);
   }
 }

@@ -45,59 +45,20 @@ static void config_set_defaults(Config* config) {
   config->server_port = 8080;
   config->timeout = 30;
   config->contimeout = 10;
-  config->quiet = false;
   config->backup = false;
   config->backup_dir = NULL;
   config->stats = false;
   config->max_depth = 0;
   config->log_file = NULL;
-  config->queue_size = 100;
   config->follow_symlinks = false;
   config->partial = false;
   config->copy_links = false;
   config->safe_links = false;
   config->copy_unsafe_links = false;
-  config->preserve_hard_links = false;
-  config->preserve_acls = false;
-  config->preserve_xattrs = false;
-  config->preserve_devices = false;
   config->preserve_sparse = false;
-  config->itemize_changes = false;
-  config->out_format = NULL;
-  config->info_level = 0;
-  config->debug_level = 0;
-  config->list_only = false;
-  config->human_readable = false;
-  config->update = false;
   config->inplace = false;
-  config->append = false;
-  config->append_verify = false;
-  config->delete_excluded = false;
-  config->delete_after = false;
-  config->max_delete = 0;
-  config->filters = NULL;
-  config->files_from = NULL;
-  config->cvs_exclude = false;
-  config->prune_empty_dirs = false;
-  config->relative = false;
-  config->rsh_command = NULL;
-  config->rsync_path = NULL;
-  config->temp_dir = NULL;
-  config->compare_dest = NULL;
-  config->copy_dest = NULL;
-  config->link_dest = NULL;
   config->partial_dir = NULL;
   config->suffix = NULL;
-  config->delete_before = false;
-  config->address = NULL;
-  config->bind_address = NULL;
-  config->ipv6 = false;
-  config->ipv4 = false;
-  config->daemon = false;
-  config->daemon_config = NULL;
-  config->server_mode = false;
-  config->checksum = false;
-  config->compress_choice = NULL;
 }
 
 Config* config_create(void) {
@@ -153,23 +114,8 @@ void config_delete(Config* config) {
   free(config->tls_ca);
   free(config->backup_dir);
   free(config->server_host);
-  free(config->out_format);
-  free(config->files_from);
-  free(config->rsh_command);
-  free(config->rsync_path);
-  free(config->temp_dir);
-  free(config->compare_dest);
-  free(config->copy_dest);
-  free(config->link_dest);
   free(config->partial_dir);
   free(config->suffix);
-  free(config->address);
-  free(config->bind_address);
-  free(config->daemon_config);
-  free(config->compress_choice);
-  if (config->filters) {
-    array_list_delete(config->filters);
-  }
   free(config);
 }
 
@@ -178,10 +124,11 @@ void config_delete(Config* config) {
  * use_chunk_serialization, use_compression, use_metadata, compression_level, chunk_size,
  * use_sendfile, use_delete, use_incremental, use_delta, delta_block_size, delta_max_file_size,
  * backup, backup_dir, follow_symlinks, copy_links, safe_links, copy_unsafe_links,
- * preserve_hard_links, preserve_acls, preserve_xattrs, preserve_devices, preserve_sparse,
- * update, inplace, append, append_verify, delete_excluded, delete_after, max_delete, relative,
- * prune_empty_dirs, temp_dir, partial, partial_dir, suffix, delete_before, checksum,
- * compress_choice, status
+ * obsolete metadata flags, preserve_sparse, obsolete transfer flags, inplace, obsolete delete
+ * flags, obsolete path options, partial, partial_dir, suffix, obsolete checksum options, status
+ *
+ * Obsolete fields remain as zero/empty compatibility slots. They must be consumed in this order
+ * until the protocol version is intentionally changed.
  */
 bool config_send(int file_descriptor, const Config* config) {
   if (!send_str(file_descriptor, config->version))
@@ -228,35 +175,36 @@ bool config_send(int file_descriptor, const Config* config) {
     return false;
   if (!send_int(file_descriptor, config->copy_unsafe_links))
     return false;
-  if (!send_int(file_descriptor, config->preserve_hard_links))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->preserve_acls))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->preserve_xattrs))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->preserve_devices))
+  if (!send_int(file_descriptor, 0))
     return false;
   if (!send_int(file_descriptor, config->preserve_sparse))
     return false;
-  if (!send_int(file_descriptor, config->update))
+  if (!send_int(file_descriptor, 0))
     return false;
   if (!send_int(file_descriptor, config->inplace))
     return false;
-  if (!send_int(file_descriptor, config->append))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->append_verify))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->delete_excluded))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->delete_after))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
+  int obsolete_int = 0;
+  if (!send_n_data(file_descriptor, &obsolete_int, sizeof(obsolete_int)))
     return false;
-  if (!send_int(file_descriptor, config->relative))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->prune_empty_dirs))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_str(file_descriptor, config->temp_dir ? config->temp_dir : ""))
+  if (!send_str(file_descriptor, ""))
     return false;
   if (!send_int(file_descriptor, config->partial))
     return false;
@@ -264,11 +212,11 @@ bool config_send(int file_descriptor, const Config* config) {
     return false;
   if (!send_str(file_descriptor, config->suffix ? config->suffix : ""))
     return false;
-  if (!send_int(file_descriptor, config->delete_before))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_int(file_descriptor, config->checksum))
+  if (!send_int(file_descriptor, 0))
     return false;
-  if (!send_str(file_descriptor, config->compress_choice ? config->compress_choice : ""))
+  if (!send_str(file_descriptor, ""))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -374,48 +322,39 @@ Config* config_receive(int file_descriptor) {
   config->copy_unsafe_links = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->preserve_hard_links = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->preserve_acls = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->preserve_xattrs = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->preserve_devices = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->preserve_sparse = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->update = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->inplace = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->append = tmp;
   if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->append_verify = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_excluded = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_after = tmp;
-  if (!receive_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
     goto error;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->relative = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->prune_empty_dirs = tmp;
-  config->temp_dir = receive_str(file_descriptor);
-  if (config->temp_dir == NULL)
+  int obsolete_int = 0;
+  if (!receive_n_data(file_descriptor, &obsolete_int, sizeof(obsolete_int)))
     goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  char* obsolete_string = receive_str(file_descriptor);
+  if (obsolete_string == NULL)
+    goto error;
+  free(obsolete_string);
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->partial = tmp;
@@ -427,13 +366,12 @@ Config* config_receive(int file_descriptor) {
     goto error;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->delete_before = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
-  config->checksum = tmp;
-  config->compress_choice = receive_str(file_descriptor);
-  if (config->compress_choice == NULL)
+  obsolete_string = receive_str(file_descriptor);
+  if (obsolete_string == NULL)
     goto error;
+  free(obsolete_string);
   if (!send_status(file_descriptor, STATUS_OK))
     goto error;
   return config;
@@ -444,10 +382,8 @@ error:
   free(config->receive_root_directory);
   free(config->server_host);
   free(config->backup_dir);
-  free(config->temp_dir);
   free(config->partial_dir);
   free(config->suffix);
-  free(config->compress_choice);
   free(config);
   return NULL;
 }
