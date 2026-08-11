@@ -34,7 +34,7 @@ static int send_dry_run_manifest(Config* config) {
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
       config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links, config->checksum);
+      config->safe_links, config->copy_unsafe_links);
   if (!scanner)
     return -1;
   Chunk* chunk;
@@ -375,8 +375,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       context->config->exclude_patterns, context->config->exclude_count,
       context->config->include_patterns, context->config->include_count, context->config->max_size,
       context->config->min_size, context->config->max_depth, 4, context->config->follow_symlinks,
-      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links,
-      context->config->checksum);
+      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links);
 
   Chunk* current_chunk;
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -540,7 +539,7 @@ int send_files(Config* config) {
       config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
       config->exclude_count, config->include_patterns, config->include_count, config->max_size,
       config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links, config->checksum);
+      config->safe_links, config->copy_unsafe_links);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   int total_files = 0;
