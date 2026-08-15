@@ -534,7 +534,6 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
         void** items = array_list_to_array(batch);
         if (!items) {
           ps->failed = true;
-          batch->item_destroyer = file_destroy;
           array_list_delete(batch);
           batch = NULL;
           break;
@@ -543,11 +542,13 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
         free(items);
         if (!c) {
           ps->failed = true;
-          batch->item_destroyer = file_destroy;
           array_list_delete(batch);
           batch = NULL;
           break;
         }
+        int batch_start = i - batch->size + 1;
+        for (int j = batch_start; j <= i; j++)
+          root_files->items[j] = NULL;
         batch->item_destroyer = NULL;
         array_list_delete(batch);
         batch = NULL;
@@ -574,7 +575,6 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
       array_list_delete(batch);
     }
     ps->initial_chunk = first;
-    root_files->item_destroyer = NULL;
   }
   array_list_delete(root_files);
 
