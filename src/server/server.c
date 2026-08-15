@@ -20,6 +20,16 @@ static char* authorized_root;
 static int authorized_root_fd = -1;
 static bool allow_delete;
 
+static void release_authorization(void) {
+  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root_fd(-1);
+  if (authorized_root_fd >= 0)
+    close(authorized_root_fd);
+  authorized_root_fd = -1;
+  free(authorized_root);
+  authorized_root = NULL;
+}
+
 static bool path_is_within(const char* root, const char* path) {
   size_t n = strlen(root);
   return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
@@ -233,33 +243,35 @@ int main(int argc, char* argv[]) {
   if (stdio_mode) {
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
     handler(STDIN_FILENO);
-    file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root_fd(-1);
-    close(authorized_root_fd);
-    free(authorized_root);
+    release_authorization();
     return 0;
   }
   g_server = server_create(port);
   if (!g_server) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
+    release_authorization();
     return 1;
   }
   if (use_tls) {
     if (!tls_cert || !tls_key) {
       fprintf(stderr, "Error: --tls requires --cert and --key\n");
       server_delete(&g_server);
+      release_authorization();
       return 1;
     }
     tls_global_init();
     if (!server_create_tls(g_server, tls_cert, tls_key, tls_ca)) {
       log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
       server_delete(&g_server);
+      release_authorization();
       return 1;
     }
     server_listen_tls(g_server, handler);
   } else {
     server_listen(g_server, handler);
   }
+  server_delete(&g_server);
+  release_authorization();
   return 0;
 }
 #endif

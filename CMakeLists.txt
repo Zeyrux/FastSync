@@ -58,7 +58,7 @@ endif()
 find_package(OpenSSL REQUIRED)
 
 file(GLOB SHARED_SRCS "src/shared/*.c")
-set(FILE_STORE_SRCS src/shared/file_store.c)
+set(FILE_STORE_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/file_store.c")
 list(REMOVE_ITEM SHARED_SRCS ${FILE_STORE_SRCS})
 file(GLOB SERVER_SRCS "src/server/*.c")
 set(SERVER_RECEIVER_SRCS src/server/receiver.c)

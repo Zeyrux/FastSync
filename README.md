@@ -105,6 +105,7 @@ working directory, so use a destination below that directory unless the
 remote server is otherwise configured with a matching authorized root.
 
 ```bash
+ssh user@host 'mkdir -p destination'
 ./build/client /path/to/source user@host:destination
 ```
 
