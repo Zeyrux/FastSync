@@ -102,7 +102,7 @@ class TestTLSBasic:
         with ServerManager() as server:
             server.start(extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
-                "--ca", certs["ca"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
@@ -126,7 +126,7 @@ class TestTLSBasic:
         with ServerManager() as server:
             server.start(extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
-                "--ca", certs["ca"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
@@ -151,7 +151,7 @@ class TestTLSBasic:
         with ServerManager() as server:
             server.start(extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
-                "--ca", certs["ca"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,

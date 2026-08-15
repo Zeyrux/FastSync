@@ -13,7 +13,6 @@
 
 #define RECEIVE_TIMEOUT_SEC 60 /* 60 second per-message timeout */
 #define SEND_TIMEOUT_SEC 60
-#define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
@@ -25,15 +24,12 @@ static struct timespec bw_last_refill = {0, 0};
 static mtx_t bw_mutex;
 static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
-static __thread unsigned long long total_allocated_bytes = 0;
-
 void io_set_fds(int read_fd, int write_fd) {
   io_read_fd = read_fd;
   io_write_fd = write_fd;
   /* A descriptor switch starts a new transport; never reuse a TLS object
      belonging to a previous connection or test pipe. */
   io_ssl = NULL;
-  total_allocated_bytes = 0;
 }
 
 static void bw_mutex_init(void) {
@@ -247,8 +243,7 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
-      size + 1 > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
+  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
@@ -266,7 +261,6 @@ char* receive_str(int file_descriptor) {
     return NULL;
   }
   data[size] = '\0';
-  total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
   return data;
 }
@@ -291,12 +285,6 @@ Data* receive_data(int file_descriptor) {
     return NULL;
   }
   size_t allocation_size = size == 0 ? 1 : (size_t)size;
-  if (allocation_size > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
-    log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
-                (unsigned long long)total_allocated_bytes, size,
-                (unsigned long long)MAX_CONNECTION_MEMORY);
-    return NULL;
-  }
   void* data = malloc(allocation_size);
   if (data == NULL)
     return NULL;
@@ -304,12 +292,10 @@ Data* receive_data(int file_descriptor) {
     free(data);
     return NULL;
   }
-  total_allocated_bytes += allocation_size;
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     free(data);
-    total_allocated_bytes -= allocation_size;
   }
   return result;
 }

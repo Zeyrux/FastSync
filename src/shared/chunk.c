@@ -215,13 +215,14 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       return NULL;
     }
     memcpy(file_data, data_pointer, file_data_size);
-    data_destroy(file->data);
-    file->data = data_create(file_data, file_data_size);
-    if (file->data == NULL) {
+    Data* replacement = data_create(file_data, file_data_size);
+    if (replacement == NULL) {
       file_destroy(file);
       array_list_delete(files);
       return NULL;
     }
+    data_destroy(file->data);
+    file->data = replacement;
     data_pointer += file_data_size;
     remaining_size -= file_data_size;
 

@@ -19,11 +19,28 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <openssl/x509.h>
 
 static char* authorized_root;
 static int authorized_root_fd = -1;
 static bool allow_delete;
 static bool allow_unauthenticated;
+static const char* required_client_cn;
+
+static bool tls_client_identity_allowed(SSL* ssl) {
+  if (!ssl || !required_client_cn)
+    return false;
+  X509* certificate = SSL_get1_peer_certificate(ssl);
+  if (!certificate)
+    return false;
+  char common_name[256];
+  int length = X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName,
+                                         common_name, sizeof(common_name));
+  bool allowed = length >= 0 && (size_t)length < sizeof(common_name) &&
+                 strcmp(common_name, required_client_cn) == 0;
+  X509_free(certificate);
+  return allowed;
+}
 
 static bool path_is_within(const char* root, const char* path) {
   size_t n = strlen(root);
@@ -33,15 +50,6 @@ static bool path_is_within(const char* root, const char* path) {
 static bool valid_batch_path(const char* path) {
   return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path) &&
          strchr(path, '\0') == path + strlen(path);
-}
-
-static bool batch_path_exists_secure(const char* path, const char* root) {
-  char* full_path = path_cat(root, path);
-  if (!full_path)
-    return false;
-  bool exists = file_path_exists_secure(full_path);
-  free(full_path);
-  return exists;
 }
 
 static bool __attribute__((unused)) configure_authorization(const char* root) {
@@ -128,11 +136,10 @@ int receive_files(Config* config, int fd) {
           send_status(fd, STATUS_ERROR);
           return -1;
         }
-        char* full_path = path_cat(config->receive_root_directory, check_path);
         struct stat st;
-        bool has_old = full_path && lstat(full_path, &st) == 0;
-        bool secure_exists = batch_path_exists_secure(check_path, config->receive_root_directory);
-        bool match = has_old && secure_exists && (unsigned long long)st.st_size == check_size &&
+        char* full_path = path_cat(config->receive_root_directory, check_path);
+        bool has_old = full_path && file_stat_secure(full_path, &st);
+        bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
         bool sent = send_status(fd, match ? STATUS_OK : STATUS_NEXT);
         free(full_path);
@@ -192,6 +199,12 @@ void handler(int file_descriptor) {
   }
   if (!allow_unauthenticated && ssl == NULL) {
     log_message(LOG_LEVEL_ERROR, "Rejected unauthenticated plaintext connection");
+    config_delete(config);
+    close(file_descriptor);
+    return;
+  }
+  if (ssl && !tls_client_identity_allowed(ssl)) {
+    log_message(LOG_LEVEL_ERROR, "Rejected TLS client with unauthorized identity");
     config_delete(config);
     close(file_descriptor);
     return;
@@ -298,6 +311,7 @@ static void print_server_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
+  printf("  --client-cn <name>  Required TLS client certificate CN\n");
   printf("  --destination-root <path>  Authorized destination root (default: .)\n");
   printf("  --allow-delete      Permit manifest deletion\n");
   printf("  --allow-unauthenticated  Allow plaintext/anonymous network clients\n");
@@ -331,6 +345,8 @@ int main(int argc, char* argv[]) {
       tls_key = argv[++i];
     } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
       tls_ca = argv[++i];
+    } else if (strcmp(argv[i], "--client-cn") == 0 && i + 1 < argc) {
+      required_client_cn = argv[++i];
     } else if (strcmp(argv[i], "--destination-root") == 0 && i + 1 < argc) {
       destination_root = argv[++i];
     } else if (strcmp(argv[i], "--allow-delete") == 0) {
@@ -379,8 +395,8 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   if (use_tls) {
-    if (!tls_cert || !tls_key || !tls_ca) {
-      fprintf(stderr, "Error: --tls requires --cert, --key, and --ca\n");
+    if (!tls_cert || !tls_key || !tls_ca || !required_client_cn) {
+      fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
       server_delete(&g_server);
       return 1;
     }

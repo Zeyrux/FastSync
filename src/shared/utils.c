@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -17,6 +18,10 @@ void utils_set_authorized_root(int fd, const char* canonical_path) {
   authorized_root_fd = fd;
   free(authorized_root_path);
   authorized_root_path = canonical_path ? str_dup(canonical_path) : NULL;
+}
+
+void utils_set_authorized_root_fd(int fd) {
+  utils_set_authorized_root(fd, NULL);
 }
 
 static bool path_is_within_root(const char* root, const char* path) {
@@ -192,7 +197,8 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   return false;
 }
 
-static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest) {
+static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest,
+                             size_t max_delete, size_t* deleted_count) {
   int scanfd = dup(dirfd);
   if (scanfd < 0)
     return false;
@@ -222,7 +228,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       bool child_removed = false;
       if (childfd >= 0) {
-        child_removed = delete_extras_fd(childfd, child_rel, manifest);
+        child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count);
         close(childfd);
       }
       if (child_removed && !is_dir_in_manifest(child_rel, manifest) &&
@@ -241,8 +247,15 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
         }
       }
       if (!found) {
+        if (*deleted_count >= max_delete) {
+          operation_ok = false;
+          free(child_rel);
+          continue;
+        }
         if (unlinkat(dirfd, entry->d_name, 0) != 0 && errno != ENOENT)
           operation_ok = false;
+        else
+          (*deleted_count)++;
         fprintf(stderr, "  Deleted: %s\n", child_rel);
       } else {
         all_removed = false;
@@ -255,16 +268,21 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
   return operation_ok;
 }
 
-bool delete_extras(const char* dest_root, ArrayList* manifest) {
+bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete) {
   int rootfd = authorized_root_fd >= 0
                    ? open_authorized_destination(dest_root)
                    : open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (rootfd < 0)
     return false;
-  bool ok = delete_extras_fd(rootfd, "", manifest);
+  size_t deleted_count = 0;
+  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count);
   if (close(rootfd) != 0)
     ok = false;
   return ok;
+}
+
+bool delete_extras(const char* dest_root, ArrayList* manifest) {
+  return delete_extras_limited(dest_root, manifest, SIZE_MAX);
 }
 
 bool has_path_traversal(const char* path) {

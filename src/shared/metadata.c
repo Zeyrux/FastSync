@@ -76,6 +76,11 @@ FileMetadata* metadata_from_buf(char** buf) {
   memcpy(&mtime_nsec, *buf, sizeof(mtime_nsec));
   *buf += sizeof(mtime_nsec);
   m->mtime_nsec = (long)mtime_nsec;
+  if (present != 1 || mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 ||
+      gid < 0) {
+    free(m);
+    return NULL;
+  }
   return m;
 }
 
@@ -175,7 +180,7 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
 void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   if (metadata == NULL)
     return;
-  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  mode_t safe_mode = metadata->mode & 07777 & ~(S_ISUID | S_ISGID);
   if (chmod(path, safe_mode) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
   /* Never apply client-supplied ownership.  The descriptor API below is the
@@ -193,7 +198,7 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;
-  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  mode_t safe_mode = metadata->mode & 07777 & ~(S_ISUID | S_ISGID);
   if (fchmod(fd, safe_mode) != 0)
     ok = false;
   /* Client uid/gid values are deliberately not authoritative. */

@@ -140,6 +140,7 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 | `--cert <path>` | TLS certificate file (PEM) |
 | `--key <path>` | TLS private key file (PEM) |
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
+| `--client-cn <name>` | Required TLS client certificate common name |
 
 ### Server
 
@@ -151,6 +152,9 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 | `--cert <path>` | TLS certificate file (PEM) |
 | `--key <path>` | TLS private key file (PEM) |
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
+| `--destination-root <path>` | Authorized destination root (default: `.`) |
+| `--allow-delete` | Permit manifest deletion |
+| `--allow-unauthenticated` | Permit plaintext TCP clients |
 | `-v, --verbose` | Enable debug logging |
 | `--help` | Show help |
 
@@ -244,12 +248,12 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 
 ### Server (TCP mode)
 ```bash
-./build/server
+./build/server --allow-unauthenticated
 ```
 
 ### Server with TLS
 ```bash
-./build/server --tls --cert server.pem --key server-key.pem --ca ca.pem
+./build/server --tls --cert server.pem --key server-key.pem --ca ca.pem --client-cn fastsync-client
 ```
 
 ### Server via SSH
@@ -264,6 +268,9 @@ Place the `fastsync-server` binary in the remote `$PATH`. The client runs `ssh u
 ```bash
 ./build/client --source-dir /path/to/send --dest-dir /path/to/receive --save-to-disk
 ```
+
+Plain TCP requires the explicit `--allow-unauthenticated` server option. Use TLS for
+authenticated network connections.
 
 ### Client — TCP with TLS
 ```bash

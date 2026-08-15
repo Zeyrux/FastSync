@@ -23,6 +23,8 @@
 #include "protocol.h"
 #include "utils.h"
 
+#define MAX_SERVER_DELETE_COUNT 100000U
+
 bool file_checksum(File* file, uint64_t* checksum) {
   if (!file || !checksum || !file->data)
     return false;
@@ -158,15 +160,19 @@ static bool to_disk_secure(const char* path, const void* data, unsigned long lon
 static int open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
 
 bool file_path_exists_secure(const char* path) {
-  if (!path)
+  struct stat st;
+  return file_stat_secure(path, &st);
+}
+
+bool file_stat_secure(const char* path, struct stat* st) {
+  if (!path || !st)
     return false;
   char* leaf = NULL;
   int parent_fd = open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)
     return false;
-  struct stat st;
   int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  bool exists = fd >= 0 && fstat(fd, &st) == 0;
+  bool exists = fd >= 0 && fstat(fd, st) == 0;
   if (fd >= 0)
     close(fd);
   close(parent_fd);
@@ -457,8 +463,16 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       }
     }
 
+    Data* replacement = data_create(new_data, (size_t)new_size);
+    if (replacement == NULL) {
+      file_destroy(file);
+      free(old_data);
+      delta_signature_destroy(sig);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
     data_destroy(file->data);
-    file->data = data_create(new_data, (size_t)new_size);
+    file->data = replacement;
 
     free(old_data);
     delta_signature_destroy(sig);
@@ -510,6 +524,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
 
   delta_signature_destroy(sig);
   free(old_data);
+  send_status(fd, STATUS_ERROR);
   return NULL;
 }
 
@@ -1085,7 +1100,8 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
     return *status_out == STATUS_FINISHED ? 0 : -1;
   }
   fprintf(stderr, "Deleting files not in manifest...\n");
-  bool deletion_ok = delete_extras(config->receive_root_directory, manifest);
+  bool deletion_ok =
+      delete_extras_limited(config->receive_root_directory, manifest, MAX_SERVER_DELETE_COUNT);
   array_list_delete(manifest);
   return deletion_ok ? 0 : -1;
 }
