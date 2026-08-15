@@ -1,10 +1,12 @@
 #include "client_send.h"
+#include "client_validation.h"
 #include "config.h"
 #include "delta.h"
 #include "log.h"
 #include "protocol.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
+#include "usage.h"
 #include "utils.h"
 #include <errno.h>
 #include <limits.h>
@@ -12,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "usage.c"
 
 #ifndef FASTSYNC_TEST_BUILD
 /* Parse environment variables for source/destination directories and save-to-disk flag. */
@@ -359,55 +360,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   }
   return 0;
 }
-
-#ifndef FASTSYNC_TEST_BUILD
-/* Validate config after parsing. Returns true if valid. */
-static bool validate_config(const Config* config) {
-  if (!config->send_directory || !config->receive_root_directory) {
-    fprintf(stderr, "Error: source and destination directories are required\n");
-    print_usage();
-    return false;
-  }
-  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
-    fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk "
-                    "serialization)\n");
-    return false;
-  }
-  if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
-    fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
-    return false;
-  }
-  if (config->use_incremental && config->use_chunk_serialization) {
-    fprintf(stderr, "Error: --incremental is not supported with -s (chunk serialization)\n");
-    return false;
-  }
-  if (config->use_delta && !config->use_incremental) {
-    fprintf(stderr, "Error: --delta requires --incremental\n");
-    return false;
-  }
-  if (config->use_delta && config->use_chunk_serialization) {
-    fprintf(stderr, "Error: --delta cannot be combined with -s (chunk serialization)\n");
-    return false;
-  }
-  if (config->use_delta && config->use_sendfile) {
-    fprintf(stderr, "Error: --delta cannot be combined with -f (sendfile)\n");
-    return false;
-  }
-  if (config->append || config->append_verify) {
-    fprintf(
-        stderr,
-        "Error: --append and --append-verify are not supported yet; refusing to ignore option\n");
-    return false;
-  }
-  if (config->use_tls) {
-    if (!config->tls_cert || !config->tls_key) {
-      fprintf(stderr, "Error: --tls requires --cert and --key\n");
-      return false;
-    }
-  }
-  return true;
-}
-#endif /* FASTSYNC_TEST_BUILD */
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
   FILE* fp = fopen(filepath, "r");

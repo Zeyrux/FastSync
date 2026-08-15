@@ -19,6 +19,7 @@
 #include "config.h"
 #include "data.h"
 #include "file.h"
+#include "file_store.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
@@ -153,17 +154,8 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
   return true;
 }
 
-static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                           bool inplace, bool sparse, const FileMetadata* metadata);
-static int open_secure_parent(const char* path, char** leaf_out);
-static bool rename_secure(const char* old_path, const char* new_path);
-static int authorized_root_fd = -1;
-static char* authorized_root_path;
-
 void file_set_authorized_root(int fd, const char* canonical_path) {
-  authorized_root_fd = fd;
-  free(authorized_root_path);
-  authorized_root_path = canonical_path ? str_dup(canonical_path) : NULL;
+  file_store_set_authorized_root(fd, canonical_path);
 }
 
 static bool path_is_within_root(const char* root, const char* path) {
@@ -280,7 +272,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
           mkdir_r(bdir);
           free(backup_dir_path);
         }
-        if (!rename_secure(disk_path, backup_path)) {
+        if (!file_store_rename_secure(disk_path, backup_path)) {
           free(backup_path);
           free(resolved_root);
           free(confined_backup);
@@ -335,8 +327,8 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   free(resolved_dir);
   free(resolved_root);
 
-  bool ok = to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
-                           file->metadata);
+  bool ok = file_store_write_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
+                                    file->metadata);
   free(confined_backup);
   free(confined_partial);
   free(disk_path);
@@ -532,7 +524,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   int old_fd = -1;
   if (full_path) {
     char* leaf = NULL;
-    int parent_fd = open_secure_parent(full_path, &leaf);
+    int parent_fd = file_store_open_secure_parent(full_path, &leaf);
     if (parent_fd >= 0) {
       old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
       free(leaf);
@@ -651,243 +643,11 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   return file;
 }
 
-static int open_secure_parent(const char* path, char** leaf_out) {
-  char* copy = str_dup(path);
-  if (!copy)
-    return -1;
-  char* parent = dirname(copy);
-  const char* slash = strrchr(path, '/');
-  char* leaf = str_dup(slash ? slash + 1 : path);
-  if (!leaf) {
-    free(copy);
-    return -1;
-  }
-  int fd;
-  if (authorized_root_fd >= 0 && authorized_root_path && path[0] == '/' &&
-      path_is_within_root(authorized_root_path, path)) {
-    fd = dup(authorized_root_fd);
-    size_t root_len = strlen(authorized_root_path);
-    char* relative = str_dup(path + root_len);
-    if (!relative) {
-      free(copy);
-      free(leaf);
-      close(fd);
-      return -1;
-    }
-    free(copy);
-    copy = relative;
-    parent = dirname(copy);
-  } else {
-    fd = (parent[0] == '/') ? open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-                            : open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  }
-  if (fd < 0) {
-    free(copy);
-    free(leaf);
-    return -1;
-  }
-  char* save = NULL;
-  char* component = strtok_r(parent, "/", &save);
-  while (component) {
-    if (strcmp(component, ".") != 0 && strcmp(component, "..") != 0) {
-      int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (next < 0 && errno == ENOENT && mkdirat(fd, component, 0755) == 0)
-        next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (next < 0) {
-        close(fd);
-        free(copy);
-        free(leaf);
-        return -1;
-      }
-      close(fd);
-      fd = next;
-    }
-    component = strtok_r(NULL, "/", &save);
-  }
-  free(copy);
-  *leaf_out = leaf;
-  return fd;
-}
-
-static bool rename_secure(const char* old_path, const char* new_path) {
-  char *old_leaf = NULL, *new_leaf = NULL;
-  int old_parent = open_secure_parent(old_path, &old_leaf);
-  int new_parent = open_secure_parent(new_path, &new_leaf);
-  bool ok = old_parent >= 0 && new_parent >= 0 &&
-            renameat(old_parent, old_leaf, new_parent, new_leaf) == 0;
-  if (old_parent >= 0)
-    close(old_parent);
-  if (new_parent >= 0)
-    close(new_parent);
-  free(old_leaf);
-  free(new_leaf);
-  return ok;
-}
-
-static bool write_all(int fd, const void* data, unsigned long long size) {
-  const unsigned char* p = data;
-  unsigned long long done = 0;
-  while (done < size) {
-    ssize_t n = write(fd, p + done, (size_t)(size - done));
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
-      return false;
-    done += (unsigned long long)n;
-  }
-  return true;
-}
-
-static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                           bool inplace, bool sparse, const FileMetadata* metadata) {
-  char* leaf = NULL;
-  int dirfd = open_secure_parent(path, &leaf);
-  if (dirfd < 0)
-    return false;
-  int fd = -1;
-  bool ok = false;
-  if (inplace) {
-    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
-    if (fd >= 0) {
-      if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
-        ok = write_all(fd, data, data_size);
-      if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
-    }
-  } else {
-    char tmp[NAME_MAX];
-    for (unsigned int i = 0; i < 100 && !ok; ++i) {
-      snprintf(tmp, sizeof(tmp), ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
-      fd = openat(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-      if (fd < 0)
-        continue;
-      if (sparse && data_size > 0)
-        ok = ftruncate(fd, (off_t)data_size) == 0;
-      if (ok || (!sparse || data_size == 0))
-        ok = write_all(fd, data, data_size);
-      if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
-      if (close(fd) != 0)
-        ok = false;
-      fd = -1;
-      if (ok && renameat(dirfd, tmp, dirfd, leaf) != 0)
-        ok = false;
-      if (!ok)
-        unlinkat(dirfd, tmp, 0);
-    }
-  }
-  if (fd >= 0)
-    close(fd);
-  close(dirfd);
-  free(leaf);
-  return ok;
-}
-
 bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
              bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return to_disk_secure(path, data, data_size, inplace, sparse, NULL);
-  /* Kept below only as historical context; all writes use descriptor-relative operations. */
-  char* tmp_path = NULL;
-  char* directory = NULL;
-
-  char* path_dup = str_dup(path);
-  if (!path_dup)
-    return false;
-  const char* dir_result = dirname(path_dup);
-  directory = str_dup(dir_result);
-  free(path_dup);
-  if (!directory)
-    return false;
-
-  bool ok = true;
-  if (!mkdir_r(directory))
-    goto done;
-
-  if (inplace) {
-    FILE* file_pointer = fopen(path, "wb");
-    if (file_pointer == NULL) {
-      perror("Could not open file for inplace write");
-      ok = false;
-      goto done;
-    }
-    if (sparse && data_size > 0) {
-      if (fseek(file_pointer, data_size - 1, SEEK_SET) != 0) {
-        perror("Failed to seek for sparse file");
-        fclose(file_pointer);
-        ok = false;
-        goto done;
-      }
-      if (fwrite("", 1, 1, file_pointer) != 1) {
-        perror("Failed to write sparse file");
-        fclose(file_pointer);
-        ok = false;
-        goto done;
-      }
-      rewind(file_pointer);
-    }
-    if (data_size > 0 && fwrite(data, 1, data_size, file_pointer) != data_size) {
-      perror("Failed to write all data to file");
-      fclose(file_pointer);
-      ok = false;
-      goto done;
-    }
-    fclose(file_pointer);
-    free(directory);
-    return true;
-  }
-
-  size_t path_len = strlen(path);
-  tmp_path = malloc(path_len + 5);
-  if (!tmp_path) {
-    ok = false;
-    goto done;
-  }
-  memcpy(tmp_path, path, path_len);
-  memcpy(tmp_path + path_len, ".tmp", 5);
-
-  FILE* file_pointer = fopen(tmp_path, "wb");
-  if (file_pointer == NULL) {
-    perror("Could not open temporary file");
-    ok = false;
-    goto done;
-  }
-  if (sparse && data_size > 0) {
-    if (fseek(file_pointer, data_size - 1, SEEK_SET) != 0) {
-      perror("Failed to seek for sparse file");
-      fclose(file_pointer);
-      ok = false;
-      goto done;
-    }
-    if (fwrite("", 1, 1, file_pointer) != 1) {
-      perror("Failed to write sparse file");
-      fclose(file_pointer);
-      ok = false;
-      goto done;
-    }
-    rewind(file_pointer);
-  }
-  if (fwrite(data, 1, data_size, file_pointer) != data_size) {
-    perror("Failed to write all data to temporary file");
-    fclose(file_pointer);
-    unlink(tmp_path);
-    ok = false;
-    goto done;
-  }
-  fclose(file_pointer);
-
-  if (rename(tmp_path, path) != 0) {
-    perror("Failed to atomically rename temporary file");
-    unlink(tmp_path);
-    ok = false;
-    goto done;
-  }
-
-done:
-  free(tmp_path);
-  free(directory);
-  return ok;
+  return file_store_write_secure(path, data, data_size, inplace, sparse, NULL);
 }
 
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,

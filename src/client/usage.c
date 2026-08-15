@@ -1,8 +1,9 @@
-#include "stdio.h"
+#include "usage.h"
+#include <stdio.h>
 #include <delta.h>
 #include <chunk.h>
 
-static __attribute__((unused)) void print_usage() {
+void print_usage(void) {
   printf("Usage:\n");
   printf("  fastsync [options] <source> <destination>\n");
   printf("  fastsync [options] --source-dir <src> --dest-dir <dst>\n");

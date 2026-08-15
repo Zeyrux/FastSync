@@ -1,4 +1,5 @@
 #include "test_client_cli.h"
+#include "client_validation.h"
 #include "config.h"
 #include "test_utils.h"
 #include "utils.h"
@@ -8,6 +9,56 @@
 
 /* Declaration of parse_args from client_cli.c */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args, int* positional_count);
+
+static Config* valid_client_config() {
+  Config* cfg = config_create();
+  if (!cfg)
+    return NULL;
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  return cfg;
+}
+
+static void test_validate_config_required_paths() {
+  Config* cfg = config_create();
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->send_directory = str_dup("/src");
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_incompatible_options() {
+  Config* cfg = valid_client_config();
+  cfg->use_sendfile = true;
+  cfg->use_compression = true;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->use_compression = false;
+  cfg->use_incremental = true;
+  cfg->use_chunk_serialization = true;
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_tls_requirements() {
+  Config* cfg = valid_client_config();
+  cfg->use_tls = true;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->tls_cert = str_dup("cert.pem");
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->tls_key = str_dup("key.pem");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_delta_sendfile_constraints() {
+  Config* cfg = valid_client_config();
+  cfg->use_delta = true;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->use_incremental = true;
+  cfg->use_sendfile = true;
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
 
 /* Test main() with --help flag (early return path, no server connection needed) */
 static void test_cli_help() {
@@ -287,6 +338,10 @@ static void test_parse_args_archive() {
 }
 
 void test_client_cli() {
+  test_validate_config_required_paths();
+  test_validate_config_incompatible_options();
+  test_validate_config_tls_requirements();
+  test_validate_config_delta_sendfile_constraints();
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();

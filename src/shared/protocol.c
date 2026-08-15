@@ -18,6 +18,7 @@
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
 static __thread SSL* io_ssl;
+static __thread ProtocolSession* bound_session;
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
@@ -28,12 +29,36 @@ static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 static __thread unsigned long long total_allocated_bytes = 0;
 
 void io_set_fds(int read_fd, int write_fd) {
+  bound_session = NULL;
   io_read_fd = read_fd;
   io_write_fd = write_fd;
   /* A descriptor switch starts a new transport; never reuse a TLS object
      belonging to a previous connection or test pipe. */
   io_ssl = NULL;
   total_allocated_bytes = 0;
+}
+
+void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) {
+  if (!session)
+    return;
+  memset(session, 0, sizeof(*session));
+  session->read_fd = read_fd;
+  session->write_fd = write_fd;
+  if (io_bwlimit)
+    protocol_session_set_bwlimit(session, io_bwlimit);
+}
+
+void protocol_session_bind(ProtocolSession* session) {
+  bound_session = session;
+}
+
+void protocol_session_unbind(void) {
+  bound_session = NULL;
+}
+
+void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl) {
+  if (session)
+    session->ssl = ssl;
 }
 
 static void bw_mutex_init(void) {
@@ -49,39 +74,51 @@ void io_set_bwlimit(unsigned long long bytes_per_sec) {
   mtx_unlock(&bw_mutex);
 }
 
-static void bw_throttle(size_t bytes_written) {
-  if (io_bwlimit == 0)
+void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec) {
+  if (!session)
     return;
-  call_once(&bw_mutex_once, bw_mutex_init);
-  mtx_lock(&bw_mutex);
+  session->bwlimit = bytes_per_sec;
+  session->bw_tokens = (long long)bytes_per_sec;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  session->bw_last_refill_sec = now.tv_sec;
+  session->bw_last_refill_nsec = now.tv_nsec;
+}
+
+static void bw_throttle_session(ProtocolSession* session, size_t bytes_written) {
+  if (session->bwlimit == 0)
+    return;
 
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
 
-  long long elapsed_ns =
-      (now.tv_sec - bw_last_refill.tv_sec) * 1000000000LL + (now.tv_nsec - bw_last_refill.tv_nsec);
-  bw_last_refill = now;
+  long long elapsed_ns = (now.tv_sec - session->bw_last_refill_sec) * 1000000000LL +
+                         (now.tv_nsec - session->bw_last_refill_nsec);
+  session->bw_last_refill_sec = now.tv_sec;
+  session->bw_last_refill_nsec = now.tv_nsec;
 
-  long long tokens_to_add = (long long)((double)io_bwlimit * elapsed_ns / 1000000000.0);
-  bw_tokens += tokens_to_add;
-  if (bw_tokens > (long long)io_bwlimit)
-    bw_tokens = (long long)io_bwlimit;
+  long long tokens_to_add = (long long)((double)session->bwlimit * elapsed_ns / 1000000000.0);
+  session->bw_tokens += tokens_to_add;
+  if (session->bw_tokens > (long long)session->bwlimit)
+    session->bw_tokens = (long long)session->bwlimit;
 
-  bw_tokens -= (long long)bytes_written;
+  session->bw_tokens -= bytes_written;
 
-  if (bw_tokens < 0) {
-    long long deficit_us = (long long)((double)(-bw_tokens) / io_bwlimit * 1000000.0);
+  if (session->bw_tokens < 0) {
+    long long deficit_us =
+        (long long)((double)(-session->bw_tokens) / session->bwlimit * 1000000.0);
     if (deficit_us >= 1000)
       poll(NULL, 0, (int)(deficit_us / 1000));
     else
       usleep((useconds_t)deficit_us);
-    bw_tokens = 0;
-    clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
+    session->bw_tokens = 0;
+    session->bw_last_refill_sec = now.tv_sec;
+    session->bw_last_refill_nsec = now.tv_nsec;
   }
-  mtx_unlock(&bw_mutex);
 }
 
 void io_set_ssl(SSL* ssl) {
+  bound_session = NULL;
   io_ssl = ssl;
 }
 
@@ -89,8 +126,32 @@ SSL* io_get_ssl(void) {
   return io_ssl;
 }
 
-static int io_fd(int dir_fd, int file_descriptor) {
-  return (dir_fd != -1) ? dir_fd : file_descriptor;
+static ProtocolSession* legacy_session(void) {
+  static __thread ProtocolSession session;
+  if (bound_session)
+    return bound_session;
+  session.read_fd = io_read_fd;
+  session.write_fd = io_write_fd;
+  session.ssl = io_ssl;
+  session.bwlimit = io_bwlimit;
+  session.bw_tokens = (unsigned long long)(bw_tokens < 0 ? 0 : bw_tokens);
+  session.bw_last_refill_sec = bw_last_refill.tv_sec;
+  session.bw_last_refill_nsec = bw_last_refill.tv_nsec;
+  return &session;
+}
+
+bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
+  ProtocolSession* session = legacy_session();
+  if (session->write_fd == -1)
+    session->write_fd = file_descriptor;
+  return protocol_send_n_data(session, data, data_size);
+}
+
+bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
+  ProtocolSession* session = legacy_session();
+  if (session->read_fd == -1)
+    session->read_fd = file_descriptor;
+  return protocol_receive_n_data(session, data, data_size);
 }
 
 static int deadline_remaining_ms(const struct timespec* deadline) {
@@ -104,9 +165,11 @@ static int deadline_remaining_ms(const struct timespec* deadline) {
   return ms > INT_MAX ? INT_MAX : (int)ms;
 }
 
-bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
+bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
-  int fd = io_fd(io_write_fd, file_descriptor);
+  if (!session)
+    return false;
+  int fd = session->write_fd;
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
   deadline.tv_sec += SEND_TIMEOUT_SEC;
@@ -114,7 +177,7 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   ssize_t total_bytes_send = 0;
   while ((size_t)total_bytes_send < data_size) {
     size_t chunk = data_size - total_bytes_send;
-    if (io_bwlimit > 0 && chunk > 65536)
+    if (session->bwlimit > 0 && chunk > 65536)
       chunk = 65536;
     struct pollfd pfd = {.fd = fd, .events = wait_events};
     int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
@@ -127,13 +190,13 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
     if (pfd.revents & (POLLERR | POLLNVAL))
       return false;
     ssize_t bytes_send;
-    if (io_ssl)
-      bytes_send = SSL_write(io_ssl, (const char*)data + total_bytes_send, chunk);
+    if (session->ssl)
+      bytes_send = SSL_write(session->ssl, (const char*)data + total_bytes_send, chunk);
     else
       bytes_send = write(fd, (const char*)data + total_bytes_send, chunk);
     if (bytes_send <= 0) {
-      if (io_ssl) {
-        int ssl_err = SSL_get_error(io_ssl, (int)bytes_send);
+      if (session->ssl) {
+        int ssl_err = SSL_get_error(session->ssl, (int)bytes_send);
         if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
           wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
           continue;
@@ -142,16 +205,18 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
     }
-    bw_throttle((size_t)bytes_send);
+    bw_throttle_session(session, (size_t)bytes_send);
     total_bytes_send += bytes_send;
   }
   log_message(LOG_LEVEL_DEBUG, "    Send n Data: %zu", total_bytes_send);
   return true;
 }
 
-bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
+bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size) {
   log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %zu", data_size);
-  int fd = io_fd(io_read_fd, file_descriptor);
+  if (!session)
+    return false;
+  int fd = session->read_fd;
 
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -176,15 +241,15 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
       return false;
 
     ssize_t bytes_received;
-    if (io_ssl)
-      bytes_received =
-          SSL_read(io_ssl, (char*)data + total_bytes_received, data_size - total_bytes_received);
+    if (session->ssl)
+      bytes_received = SSL_read(session->ssl, (char*)data + total_bytes_received,
+                                data_size - total_bytes_received);
     else
       bytes_received =
           read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
     if (bytes_received <= 0) {
-      if (io_ssl) {
-        int ssl_err = SSL_get_error(io_ssl, (int)bytes_received);
+      if (session->ssl) {
+        int ssl_err = SSL_get_error(session->ssl, (int)bytes_received);
         if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
           wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
           continue;
@@ -231,24 +296,24 @@ static const char* status_to_string(Status status) {
   }
 }
 
-bool send_str(int file_descriptor, const char* data) {
+bool protocol_send_str(ProtocolSession* session, const char* data) {
   if (data == NULL)
     return false;
   size_t size = strlen(data);
-  if (!send_n_data(file_descriptor, &size, sizeof(size_t)))
+  if (!protocol_send_n_data(session, &size, sizeof(size_t)))
     return false;
-  if (!send_n_data(file_descriptor, data, size))
+  if (!protocol_send_n_data(session, data, size))
     return false;
   log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
   return true;
 }
 
-char* receive_str(int file_descriptor) {
+char* protocol_receive_str(ProtocolSession* session) {
   size_t size;
-  if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
+  if (!protocol_receive_n_data(session, &size, sizeof(size_t)))
     return NULL;
   if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
-      size + 1 > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
+      size + 1 > MAX_CONNECTION_MEMORY - session->total_allocated_bytes) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
@@ -256,29 +321,29 @@ char* receive_str(int file_descriptor) {
   char* data = (char*)malloc(size + 1);
   if (data == NULL)
     return NULL;
-  if (!receive_n_data(file_descriptor, data, size)) {
+  if (!protocol_receive_n_data(session, data, size)) {
     free(data);
     return NULL;
   }
   data[size] = '\0';
-  total_allocated_bytes += size + 1;
+  session->total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
   return data;
 }
 
-bool send_data(int file_descriptor, const Data* data) {
+bool protocol_send_data(ProtocolSession* session, const Data* data) {
   unsigned long long data_size = data->size;
-  if (!send_n_data(file_descriptor, &data_size, sizeof(unsigned long long)))
+  if (!protocol_send_n_data(session, &data_size, sizeof(unsigned long long)))
     return false;
-  if (!send_n_data(file_descriptor, data->data, data_size))
+  if (!protocol_send_n_data(session, data->data, data_size))
     return false;
   log_message(LOG_LEVEL_DEBUG, "Send %lld data", data_size);
   return true;
 }
 
-Data* receive_data(int file_descriptor) {
+Data* protocol_receive_data(ProtocolSession* session) {
   unsigned long long size = 0;
-  if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
+  if (!protocol_receive_n_data(session, &size, sizeof(unsigned long long)))
     return NULL;
   if (size > MAX_DATA_PAYLOAD_SIZE) {
     log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
@@ -286,53 +351,86 @@ Data* receive_data(int file_descriptor) {
     return NULL;
   }
   size_t allocation_size = size == 0 ? 1 : (size_t)size;
-  if (allocation_size > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
+  if (allocation_size > MAX_CONNECTION_MEMORY - session->total_allocated_bytes) {
     log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
-                (unsigned long long)total_allocated_bytes, size,
+                (unsigned long long)session->total_allocated_bytes, size,
                 (unsigned long long)MAX_CONNECTION_MEMORY);
     return NULL;
   }
   void* data = malloc(allocation_size);
   if (data == NULL)
     return NULL;
-  if (!receive_n_data(file_descriptor, data, (size_t)size)) {
+  if (!protocol_receive_n_data(session, data, (size_t)size)) {
     free(data);
     return NULL;
   }
-  total_allocated_bytes += allocation_size;
+  session->total_allocated_bytes += allocation_size;
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     free(data);
-    total_allocated_bytes -= allocation_size;
+    session->total_allocated_bytes -= allocation_size;
   }
   return result;
 }
 
-bool send_int(int file_descriptor, int data) {
-  if (!send_n_data(file_descriptor, &data, sizeof(int)))
+bool protocol_send_int(ProtocolSession* session, int data) {
+  if (!protocol_send_n_data(session, &data, sizeof(int)))
     return false;
   log_message(LOG_LEVEL_DEBUG, "Send Int: %d", data);
   return true;
 }
 
-bool receive_int(int file_descriptor, int* data) {
-  if (!receive_n_data(file_descriptor, data, sizeof(int)))
+bool protocol_receive_int(ProtocolSession* session, int* data) {
+  if (!protocol_receive_n_data(session, data, sizeof(int)))
     return false;
   log_message(LOG_LEVEL_DEBUG, "Received Int: %d", *data);
   return true;
 }
 
-bool send_status(int file_descriptor, Status status) {
-  if (!send_n_data(file_descriptor, &status, sizeof(Status)))
+bool protocol_send_status(ProtocolSession* session, Status status) {
+  if (!protocol_send_n_data(session, &status, sizeof(Status)))
     return false;
   log_message(LOG_LEVEL_DEBUG, "Send Status: %s", status_to_string(status));
   return true;
 }
 
-bool receive_status(int file_descriptor, Status* status) {
-  if (!receive_n_data(file_descriptor, status, sizeof(Status)))
+bool protocol_receive_status(ProtocolSession* session, Status* status) {
+  if (!protocol_receive_n_data(session, status, sizeof(Status)))
     return false;
   log_message(LOG_LEVEL_DEBUG, "Received Status: %s", status_to_string(*status));
   return true;
+}
+
+bool send_str(int fd, const char* data) {
+  (void)fd;
+  return protocol_send_str(legacy_session(), data);
+}
+char* receive_str(int fd) {
+  (void)fd;
+  return protocol_receive_str(legacy_session());
+}
+bool send_data(int fd, const Data* data) {
+  (void)fd;
+  return protocol_send_data(legacy_session(), data);
+}
+Data* receive_data(int fd) {
+  (void)fd;
+  return protocol_receive_data(legacy_session());
+}
+bool send_int(int fd, int data) {
+  (void)fd;
+  return protocol_send_int(legacy_session(), data);
+}
+bool receive_int(int fd, int* data) {
+  (void)fd;
+  return protocol_receive_int(legacy_session(), data);
+}
+bool send_status(int fd, Status status) {
+  (void)fd;
+  return protocol_send_status(legacy_session(), status);
+}
+bool receive_status(int fd, Status* status) {
+  (void)fd;
+  return protocol_receive_status(legacy_session(), status);
 }

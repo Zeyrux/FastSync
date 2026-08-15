@@ -224,6 +224,26 @@ static void test_config_send_receive_version_mismatch() {
   }
 }
 
+static void test_config_receive_truncated() {
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[0]);
+  io_set_bwlimit(0);
+
+  /* A valid prefix exercises cleanup after allocated wire strings and a
+   * partially received scalar field. */
+  EXPECT_TRUE(send_str(p[1], PROTOCOL_VERSION));
+  EXPECT_TRUE(send_str(p[1], "/src"));
+  EXPECT_TRUE(send_str(p[1], "/dst"));
+  EXPECT_TRUE(send_int(p[1], 1));
+  shutdown(p[1], SHUT_WR);
+
+  Config* cfg = config_receive(p[0]);
+  EXPECT_NULL(cfg);
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(is_remote_dest("user@host:/path"));
@@ -256,6 +276,7 @@ void test_config() {
   if (!is_running_under_valgrind()) {
     test_config_send_receive();
     test_config_send_receive_version_mismatch();
+    test_config_receive_truncated();
   }
   test_is_remote_dest();
 }

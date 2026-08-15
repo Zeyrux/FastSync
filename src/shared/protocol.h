@@ -19,6 +19,23 @@
 
 typedef struct ssl_st SSL;
 
+/*
+ * Explicit owner of protocol I/O.  A session does not own the descriptors or
+ * SSL object; it only describes the transport used by a transfer.  This makes
+ * it safe to pass the transport to a worker without relying on inherited
+ * thread-local state.
+ */
+typedef struct ProtocolSession {
+  int read_fd;
+  int write_fd;
+  SSL* ssl;
+  unsigned long long bwlimit;
+  long long bw_tokens;
+  long long bw_last_refill_sec;
+  long bw_last_refill_nsec;
+  unsigned long long total_allocated_bytes;
+} ProtocolSession;
+
 typedef int Status;
 enum NET_STATUS {
   STATUS_OK,
@@ -39,6 +56,23 @@ void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
+
+void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
+/* Transitional bridge for helpers whose signatures still carry only an fd. */
+void protocol_session_bind(ProtocolSession* session);
+void protocol_session_unbind(void);
+void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
+void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
+bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size);
+bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size);
+bool protocol_send_str(ProtocolSession* session, const char* data);
+char* protocol_receive_str(ProtocolSession* session);
+bool protocol_send_data(ProtocolSession* session, const Data* data);
+Data* protocol_receive_data(ProtocolSession* session);
+bool protocol_send_int(ProtocolSession* session, int data);
+bool protocol_receive_int(ProtocolSession* session, int* data);
+bool protocol_send_status(ProtocolSession* session, Status status);
+bool protocol_receive_status(ProtocolSession* session, Status* status);
 bool send_n_data(int file_descriptor, const void* data, size_t data_size);
 bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 
