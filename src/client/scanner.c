@@ -252,7 +252,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         break;
     }
 
-    struct dirent* entry = readdir(scanner->current_dir);
+    const struct dirent* entry = readdir(scanner->current_dir);
     if (entry == NULL) {
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
@@ -454,7 +454,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     parallel_scanner_destroy(ps);
     return NULL;
   }
-  struct dirent* entry;
+  const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
@@ -637,7 +637,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   return ps;
 }
 
-ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata,
+ParallelScanner* parallel_scanner_create(const char* root_directory, bool use_metadata,
                                          unsigned long long chunk_size, char** exclude_patterns,
                                          int exclude_count, char** include_patterns,
                                          int include_count, unsigned long long max_size,

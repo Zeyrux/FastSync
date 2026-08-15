@@ -124,7 +124,7 @@ static void pipeline_cancel(PipelineContextSender* context) {
 }
 
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
-static int send_dry_run_manifest(Config* config) {
+static int send_dry_run_manifest(const Config* config) {
   ScannerOptions options = scanner_options_from_config(config, 0);
   DirectoryScanner* scanner =
       directory_scanner_create_with_options(config->send_directory, &options);

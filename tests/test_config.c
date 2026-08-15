@@ -238,7 +238,7 @@ static void test_config_receive_truncated() {
   EXPECT_TRUE(send_int(p[1], 1));
   shutdown(p[1], SHUT_WR);
 
-  Config* cfg = config_receive(p[0]);
+  const Config* cfg = config_receive(p[0]);
   EXPECT_NULL(cfg);
   close(p[0]);
   close(p[1]);
