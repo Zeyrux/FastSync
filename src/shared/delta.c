@@ -36,6 +36,9 @@ DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_f
   if (old_file_data == NULL || old_file_size == 0 || block_size == 0)
     return NULL;
 
+  if (old_file_size > DELTA_MAX_FILE_SIZE || old_file_size > UINT32_MAX * (uint64_t)block_size)
+    return NULL;
+
   uint32_t block_count = (uint32_t)((old_file_size + block_size - 1) / block_size);
 
   DeltaSignature* sig = malloc(sizeof(DeltaSignature));
@@ -463,7 +466,8 @@ Delta* delta_deserialize(const Data* data) {
 void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
                   uint32_t block_size) {
   if (!old_data || !delta || (delta->new_file_size > 0 && delta->instructions == NULL) ||
-      (delta->instruction_count > 0 && block_size == 0))
+      (delta->instruction_count > 0 && block_size == 0) ||
+      delta->new_file_size > DELTA_MAX_FILE_SIZE || delta->new_file_size > SIZE_MAX)
     return NULL;
 
   void* output = malloc((size_t)delta->new_file_size);

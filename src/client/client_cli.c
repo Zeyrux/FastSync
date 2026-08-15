@@ -400,8 +400,8 @@ static bool validate_config(const Config* config) {
     return false;
   }
   if (config->use_tls) {
-    if (!config->tls_cert || !config->tls_key) {
-      fprintf(stderr, "Error: --tls requires --cert and --key\n");
+    if (!config->tls_cert || !config->tls_key || !config->tls_ca) {
+      fprintf(stderr, "Error: --tls requires --cert, --key, and --ca\n");
       return false;
     }
   }

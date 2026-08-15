@@ -14,6 +14,7 @@
 
 /* Maximum individual file data size within a chunk (64 MB) */
 #define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
+#define MAX_FILES_PER_CHUNK 65536U
 
 Chunk* chunk_create(File** items, int element_count) {
   Chunk* chunk = (Chunk*)malloc(sizeof(Chunk));
@@ -88,10 +89,17 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
 
 Chunk* chunk_deserialize(Data* data, bool use_metadata) {
   ArrayList* files = array_list_create(file_destroy);
+  if (files == NULL)
+    return NULL;
   char* data_pointer = data->data;
   size_t remaining_size = data->size;
 
   while (remaining_size > 0) {
+    if ((unsigned int)files->size >= MAX_FILES_PER_CHUNK) {
+      log_message(LOG_LEVEL_ERROR, "Chunk contains too many files");
+      array_list_delete(files);
+      return NULL;
+    }
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path length");
       array_list_delete(files);
@@ -109,6 +117,10 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       return NULL;
     }
 
+    if (path_len == SIZE_MAX) {
+      array_list_delete(files);
+      return NULL;
+    }
     char* path = malloc(path_len + 1);
     if (path == NULL) {
       perror("Could not allocate memory for file path");
@@ -117,6 +129,11 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     memcpy(path, data_pointer, path_len);
     path[path_len] = '\0';
+    if (memchr(path, '\0', path_len) != NULL) {
+      free(path);
+      array_list_delete(files);
+      return NULL;
+    }
     data_pointer += path_len;
     remaining_size -= path_len;
 
@@ -180,7 +197,11 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     data_pointer += file_data_size;
     remaining_size -= file_data_size;
 
-    array_list_add(files, file);
+    if (!array_list_add(files, file)) {
+      file_destroy(file);
+      array_list_delete(files);
+      return NULL;
+    }
   }
 
   File** file_array = (File**)array_list_to_array(files);

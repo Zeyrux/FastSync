@@ -40,6 +40,7 @@ bool to_disk(const char* path, const void* data, unsigned long long data_size, b
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config);
 void file_set_authorized_root(int fd, const char* canonical_path);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
+bool file_path_exists_secure(const char* path);
 int receive_manifest(int fd, const Config* config, int* next_status);
 
 #endif

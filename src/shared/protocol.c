@@ -260,6 +260,11 @@ char* receive_str(int file_descriptor) {
     free(data);
     return NULL;
   }
+  if (memchr(data, '\0', size) != NULL) {
+    free(data);
+    log_message(LOG_LEVEL_ERROR, "Received string contains an embedded NUL");
+    return NULL;
+  }
   data[size] = '\0';
   total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);

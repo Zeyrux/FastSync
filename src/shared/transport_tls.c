@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -43,8 +44,19 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
   }
 
   SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  if (SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES") != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
 
   if (cert && key) {
+    struct stat key_stat;
+    if (stat(key, &key_stat) != 0 || !S_ISREG(key_stat.st_mode) || key_stat.st_uid != geteuid() ||
+        (key_stat.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH))) {
+      log_message(LOG_LEVEL_ERROR, "TLS private key must be owned by the current user and private");
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
     if (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s", cert);
       log_ssl_errors();

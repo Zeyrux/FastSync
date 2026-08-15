@@ -100,6 +100,33 @@ static void config_set_defaults(Config* config) {
   config->compress_choice = NULL;
 }
 
+static bool valid_wire_bool(int value) {
+  return value == 0 || value == 1;
+}
+
+static bool validate_received_config(const Config* config) {
+  return valid_wire_bool(config->save_to_disk) && valid_wire_bool(config->use_multithreading) &&
+         valid_wire_bool(config->use_chunk_serialization) &&
+         valid_wire_bool(config->use_compression) && valid_wire_bool(config->use_metadata) &&
+         valid_wire_bool(config->use_sendfile) && valid_wire_bool(config->use_delete) &&
+         valid_wire_bool(config->use_incremental) && valid_wire_bool(config->use_delta) &&
+         valid_wire_bool(config->backup) && valid_wire_bool(config->follow_symlinks) &&
+         valid_wire_bool(config->copy_links) && valid_wire_bool(config->safe_links) &&
+         valid_wire_bool(config->copy_unsafe_links) &&
+         valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
+         valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
+         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->update) &&
+         valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
+         valid_wire_bool(config->append_verify) && valid_wire_bool(config->delete_excluded) &&
+         valid_wire_bool(config->delete_after) && valid_wire_bool(config->relative) &&
+         valid_wire_bool(config->prune_empty_dirs) && valid_wire_bool(config->partial) &&
+         config->compression_level >= 1 && config->compression_level <= 22 &&
+         config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
+         config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
+         config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
+         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->max_delete >= 0;
+}
+
 Config* config_create(void) {
   Config* config = malloc(sizeof(Config));
   if (!config)
@@ -320,8 +347,12 @@ Config* config_receive(int file_descriptor) {
   int tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
+  if (!valid_wire_bool(tmp))
+    goto error;
   config->save_to_disk = tmp;
   if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  if (!valid_wire_bool(tmp))
     goto error;
   config->use_multithreading = tmp;
   if (!receive_int(file_descriptor, &tmp))
@@ -329,8 +360,12 @@ Config* config_receive(int file_descriptor) {
   config->use_chunk_serialization = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
+  if (!valid_wire_bool(tmp))
+    goto error;
   config->use_compression = tmp;
   if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  if (!valid_wire_bool(tmp))
     goto error;
   config->use_metadata = tmp;
   if (!receive_int(file_descriptor, &tmp))
@@ -340,14 +375,22 @@ Config* config_receive(int file_descriptor) {
     goto error;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
+  if (!valid_wire_bool(tmp))
+    goto error;
   config->use_sendfile = tmp;
   if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  if (!valid_wire_bool(tmp))
     goto error;
   config->use_delete = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
+  if (!valid_wire_bool(tmp))
+    goto error;
   config->use_incremental = tmp;
   if (!receive_int(file_descriptor, &tmp))
+    goto error;
+  if (!valid_wire_bool(tmp))
     goto error;
   config->use_delta = tmp;
   if (!receive_n_data(file_descriptor, &config->delta_block_size, sizeof(config->delta_block_size)))
@@ -437,6 +480,11 @@ Config* config_receive(int file_descriptor) {
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
     fprintf(stderr, "Unsupported compression choice: %s\n", config->compress_choice);
+    send_status(file_descriptor, STATUS_ERROR);
+    goto error;
+  }
+  if (!validate_received_config(config)) {
+    fprintf(stderr, "Invalid configuration received from client\n");
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }

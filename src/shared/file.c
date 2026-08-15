@@ -155,7 +155,24 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
 
 static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                            bool inplace, bool sparse, const FileMetadata* metadata);
-static int open_secure_parent(const char* path, char** leaf_out);
+static int open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
+
+bool file_path_exists_secure(const char* path) {
+  if (!path)
+    return false;
+  char* leaf = NULL;
+  int parent_fd = open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return false;
+  struct stat st;
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  bool exists = fd >= 0 && fstat(fd, &st) == 0;
+  if (fd >= 0)
+    close(fd);
+  close(parent_fd);
+  free(leaf);
+  return exists;
+}
 static bool rename_secure(const char* old_path, const char* new_path);
 static int authorized_root_fd = -1;
 static char* authorized_root_path;
@@ -532,7 +549,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   int old_fd = -1;
   if (full_path) {
     char* leaf = NULL;
-    int parent_fd = open_secure_parent(full_path, &leaf);
+    int parent_fd = open_secure_parent(full_path, &leaf, false);
     if (parent_fd >= 0) {
       old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
       free(leaf);
@@ -542,7 +559,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
   void* old_data = NULL;
-  if (has_old_file && old_size > 0) {
+  if (has_old_file && old_size > 0 && old_size <= DELTA_MAX_FILE_SIZE && old_size <= SIZE_MAX) {
     old_data = malloc((size_t)old_size);
     if (old_data) {
       size_t got = 0;
@@ -651,7 +668,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   return file;
 }
 
-static int open_secure_parent(const char* path, char** leaf_out) {
+static int open_secure_parent(const char* path, char** leaf_out, bool create_dirs) {
   char* copy = str_dup(path);
   if (!copy)
     return -1;
@@ -691,7 +708,7 @@ static int open_secure_parent(const char* path, char** leaf_out) {
   while (component) {
     if (strcmp(component, ".") != 0 && strcmp(component, "..") != 0) {
       int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (next < 0 && errno == ENOENT && mkdirat(fd, component, 0755) == 0)
+      if (create_dirs && next < 0 && errno == ENOENT && mkdirat(fd, component, 0755) == 0)
         next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (next < 0) {
         close(fd);
@@ -711,8 +728,8 @@ static int open_secure_parent(const char* path, char** leaf_out) {
 
 static bool rename_secure(const char* old_path, const char* new_path) {
   char *old_leaf = NULL, *new_leaf = NULL;
-  int old_parent = open_secure_parent(old_path, &old_leaf);
-  int new_parent = open_secure_parent(new_path, &new_leaf);
+  int old_parent = open_secure_parent(old_path, &old_leaf, true);
+  int new_parent = open_secure_parent(new_path, &new_leaf, true);
   bool ok = old_parent >= 0 && new_parent >= 0 &&
             renameat(old_parent, old_leaf, new_parent, new_leaf) == 0;
   if (old_parent >= 0)
@@ -741,7 +758,7 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
 static bool to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                            bool inplace, bool sparse, const FileMetadata* metadata) {
   char* leaf = NULL;
-  int dirfd = open_secure_parent(path, &leaf);
+  int dirfd = open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
     return false;
   int fd = -1;
