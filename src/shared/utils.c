@@ -11,9 +11,58 @@
 #include <unistd.h>
 
 static int authorized_root_fd = -1;
+static char* authorized_root_path;
 
-void utils_set_authorized_root_fd(int fd) {
+void utils_set_authorized_root(int fd, const char* canonical_path) {
   authorized_root_fd = fd;
+  free(authorized_root_path);
+  authorized_root_path = canonical_path ? str_dup(canonical_path) : NULL;
+}
+
+static bool path_is_within_root(const char* root, const char* path) {
+  size_t root_len = strlen(root);
+  return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
+}
+
+static int open_authorized_destination(const char* dest_root) {
+  if (authorized_root_fd < 0 || !authorized_root_path || !dest_root ||
+      !path_is_within_root(authorized_root_path, dest_root))
+    return -1;
+
+  int dirfd = dup(authorized_root_fd);
+  if (dirfd < 0)
+    return -1;
+
+  const char* relative_path = dest_root + strlen(authorized_root_path);
+  while (*relative_path == '/')
+    relative_path++;
+  char* relative = str_dup(*relative_path ? relative_path : ".");
+  if (!relative) {
+    close(dirfd);
+    return -1;
+  }
+
+  char* saveptr = NULL;
+  char* component = strtok_r(relative, "/", &saveptr);
+  while (component) {
+    if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+      free(relative);
+      close(dirfd);
+      return -1;
+    }
+    int next = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (next < 0) {
+      free(relative);
+      close(dirfd);
+      return -1;
+    }
+    close(dirfd);
+    dirfd = next;
+    component = strtok_r(NULL, "/", &saveptr);
+  }
+
+  free(relative);
+  return dirfd;
 }
 
 bool mkdir_r(const char* path) {
@@ -208,7 +257,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
 
 bool delete_extras(const char* dest_root, ArrayList* manifest) {
   int rootfd = authorized_root_fd >= 0
-                   ? dup(authorized_root_fd)
+                   ? open_authorized_destination(dest_root)
                    : open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (rootfd < 0)
     return false;

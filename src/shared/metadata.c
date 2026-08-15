@@ -175,7 +175,8 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
 void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   if (metadata == NULL)
     return;
-  if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
+  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  if (chmod(path, safe_mode) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
   /* Never apply client-supplied ownership.  The descriptor API below is the
      receiver write path; retain this legacy API only for compatibility. */
@@ -192,7 +193,8 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;
-  if (fchmod(fd, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
+  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  if (fchmod(fd, safe_mode) != 0)
     ok = false;
   /* Client uid/gid values are deliberately not authoritative. */
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},

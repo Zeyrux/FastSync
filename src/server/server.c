@@ -58,7 +58,7 @@ static bool __attribute__((unused)) configure_authorization(const char* root) {
     return false;
   }
   file_set_authorized_root(authorized_root_fd, authorized_root);
-  utils_set_authorized_root_fd(authorized_root_fd);
+  utils_set_authorized_root(authorized_root_fd, authorized_root);
   return true;
 }
 
@@ -363,10 +363,12 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   if (stdio_mode) {
+    /* SSH authenticates the stdio transport outside of FastSync. */
+    allow_unauthenticated = true;
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
     handler(STDIN_FILENO);
     file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root_fd(-1);
+    utils_set_authorized_root(-1, NULL);
     close(authorized_root_fd);
     free(authorized_root);
     return 0;

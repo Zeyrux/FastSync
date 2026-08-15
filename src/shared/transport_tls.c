@@ -35,6 +35,10 @@ static void log_ssl_errors(void) {
 
 static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key,
                                const char* ca_path) {
+  if (!is_server && !ca_path) {
+    log_message(LOG_LEVEL_ERROR, "TLS clients require a CA certificate path");
+    return NULL;
+  }
   const SSL_METHOD* method = is_server ? TLS_server_method() : TLS_client_method();
   SSL_CTX* ctx = SSL_CTX_new(method);
   if (!ctx) {
@@ -43,7 +47,10 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     return NULL;
   }
 
-  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
   if (SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES") != 1) {
     SSL_CTX_free(ctx);
     return NULL;
@@ -103,7 +110,10 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
   // Enable hostname verification for client connections when a hostname is provided.
   // Must be done before SSL_connect to take effect during the handshake.
   if (!is_server && hostname) {
-    SSL_set1_host(ssl, hostname);
+    if (SSL_set1_host(ssl, hostname) != 1) {
+      SSL_free(ssl);
+      return NULL;
+    }
   }
 
   // Retry SSL_accept/SSL_connect on WANT_READ/WANT_WRITE (non-blocking handshake)

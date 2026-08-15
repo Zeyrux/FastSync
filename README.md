@@ -188,7 +188,7 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 7. **Metadata restoration** — `chmod()`, `chown()`, `utimensat()` on the receiving side
 8. **`--delete`** — sender tracks all sent paths; receiver walks destination tree and removes unlisted files/directories
 9. **SSH transport** — `socketpair()` + `fork()` + `execvp("ssh", ...)` with `ControlMaster` and port support
-10. **TLS transport** — OpenSSL `SSL_CTX` with TLS 1.2 minimum, optional CA verification, transparent `SSL_read`/`SSL_write` via `io_set_ssl()`
+10. **TLS transport** — OpenSSL `SSL_CTX` with TLS 1.2 minimum, mutual CA verification, transparent `SSL_read`/`SSL_write` via `io_set_ssl()`
 11. **Path traversal protection** — `has_path_traversal()` rejects any file path containing `..` components, preventing directory escape attacks
 12. **Connection limiting** — server tracks active connections and rejects new ones beyond `max_connections` (default 100)
 13. **Keep-alive** — idle connections receive periodic `STATUS_KEEPALIVE` to detect half-open TCP connections
@@ -202,7 +202,7 @@ Config negotiation is sender-driven: the client serializes transfer options and 
 All received file paths are validated by `has_path_traversal()` before any disk operation. Any path containing `..` components is rejected with `STATUS_ERROR`, preventing directory escape attacks.
 
 ### TLS Certificate Verification
-When `--ca` is provided, the server performs mutual TLS verification (`SSL_VERIFY_PEER` with depth 4). Without `--ca`, TLS is still encrypted but peer certificates are not verified.
+TLS requires `--ca` and performs mutual TLS verification (`SSL_VERIFY_PEER` with depth 4). Connections without certificate verification are rejected.
 
 ### Connection Limits
 The server enforces a maximum of 100 concurrent connections (configurable via `max_connections` in `Server`). When the limit is reached, new connections are immediately rejected and closed.
@@ -249,7 +249,7 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 
 ### Server with TLS
 ```bash
-./build/server --tls --cert server.pem --key server-key.pem
+./build/server --tls --cert server.pem --key server-key.pem --ca ca.pem
 ```
 
 ### Server via SSH
