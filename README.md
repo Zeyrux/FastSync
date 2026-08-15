@@ -109,7 +109,7 @@ The remote host must have `fastsync-server` available in `PATH`, or use
 Start the FastSync server:
 
 ```bash
-./build/server -p 8080
+./build/server --destination-root /path/to -p 8080
 ```
 
 Then run the client:
@@ -123,7 +123,7 @@ Then run the client:
 ### TLS transfer
 
 ```bash
-./build/server --tls --cert server.pem --key server-key.pem -p 8443
+./build/server --destination-root /path/to --tls --cert server.pem --key server-key.pem -p 8443
 ./build/client --tls --cert client.pem --key client-key.pem --ca ca.pem \
   --server-host example.com --server-port 8443 \
   --source-dir /path/to/source --dest-dir /path/to/destination \
@@ -269,6 +269,7 @@ before FastSync can claim full rsync CLI compatibility.
 | `--cert <path>` | TLS certificate file. |
 | `--key <path>` | TLS private key file. |
 | `--ca <path>` | CA file for peer verification. |
+| `--destination-root <path>` | Confine received files to this server-side root; defaults to the current directory. |
 | `--allow-delete` | Permit client delete manifests. Deletion is refused by default. |
 | `-v`, `--verbose` | Enable debug logging. |
 | `--help` | Print server usage. |
