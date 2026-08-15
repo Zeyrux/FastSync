@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 bool tls_global_init(void) {
@@ -92,6 +93,7 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
   }
 
   // Retry SSL_accept/SSL_connect on WANT_READ/WANT_WRITE (non-blocking handshake)
+  time_t deadline = time(NULL) + (is_server ? tcp_get_timeout_sec() : tcp_get_contimeout_sec());
   int ret;
   do {
     if (is_server)
@@ -101,7 +103,8 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
 
     if (ret <= 0) {
       int ssl_err = SSL_get_error(ssl, ret);
-      if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+      if ((ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) &&
+          time(NULL) < deadline)
         continue;
       log_message(LOG_LEVEL_ERROR, "SSL %s failed", is_server ? "accept" : "connect");
       log_ssl_errors();

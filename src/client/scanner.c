@@ -400,6 +400,18 @@ static int parallel_worker_thread(void* arg) {
   return thrd_success;
 }
 
+static void parallel_scanner_creation_failed(ParallelScanner* ps) {
+  mtx_lock(&ps->result_mutex);
+  ps->failed = true;
+  atomic_store(&ps->cancelled, true);
+  ps->expected_threads = ps->created_threads;
+  if (ps->completed >= ps->expected_threads)
+    ps->done = true;
+  cnd_broadcast(&ps->result_not_empty);
+  cnd_broadcast(&ps->result_not_full);
+  mtx_unlock(&ps->result_mutex);
+}
+
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
                                                       const ScannerOptions* options) {
   if (!root_directory || !options)
@@ -589,16 +601,14 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
         break;
       ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
       if (!wa) {
-        ps->failed = true;
-        ps->expected_threads = ps->created_threads;
+        parallel_scanner_creation_failed(ps);
         break;
       }
       wa->ps = ps;
       wa->dirs = calloc(count, sizeof(char*));
       if (!wa->dirs) {
         free(wa);
-        ps->failed = true;
-        ps->expected_threads = ps->created_threads;
+        parallel_scanner_creation_failed(ps);
         break;
       }
       bool dup_ok = true;
@@ -612,8 +622,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
           free(wa->dirs[j]);
         free(wa->dirs);
         free(wa);
-        ps->failed = true;
-        ps->expected_threads = ps->created_threads;
+        parallel_scanner_creation_failed(ps);
         break;
       }
       wa->dir_count = count;
@@ -625,13 +634,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
           free(wa->dirs[j]);
         free(wa->dirs);
         free(wa);
-        ps->failed = true;
-        atomic_store(&ps->cancelled, true);
-        ps->expected_threads = ps->created_threads;
-        mtx_lock(&ps->result_mutex);
-        cnd_broadcast(&ps->result_not_empty);
-        cnd_broadcast(&ps->result_not_full);
-        mtx_unlock(&ps->result_mutex);
+        parallel_scanner_creation_failed(ps);
         break;
       }
       ps->num_threads++;

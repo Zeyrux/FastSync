@@ -151,6 +151,10 @@ int tcp_get_contimeout_sec(void) {
   return g_contimeout_sec;
 }
 
+int tcp_get_timeout_sec(void) {
+  return g_timeout_sec;
+}
+
 static void tcp_apply_socket_timeout(int fd) {
   struct timeval tv;
   tv.tv_sec = g_timeout_sec;

@@ -35,5 +35,6 @@ void client_disconnect(Client* client);
 void client_delete(Client* client);
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec);
 int tcp_get_contimeout_sec(void);
+int tcp_get_timeout_sec(void);
 
 #endif

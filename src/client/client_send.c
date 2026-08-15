@@ -378,6 +378,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     if (context->config->transport == TRANSPORT_TCP)
       fprintf(stderr, "Error: could not connect to server%s\n",
               context->config->use_tls ? " via TLS" : "");
+    pipeline_cancel(context);
     mark_sender_done(context);
     return thrd_error;
   }
@@ -386,6 +387,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   protocol_session_set_ssl(&session, (SSL*)client->ssl);
   protocol_session_bind(&session);
   if (!config_send(client->file_descriptor, context->config)) {
+    pipeline_cancel(context);
     disconnect_transfer_client(client);
     mark_sender_done(context);
     protocol_session_unbind();
@@ -713,6 +715,10 @@ int send_files_multithreaded(Config* config) {
   }
   if (config->use_delete)
     context->manifest = create_transfer_manifest(config);
+  if (config->use_delete && !context->manifest) {
+    pipeline_context_sender_destroy(context);
+    return 1;
+  }
 
   thrd_t scanner, loader, sender;
   bool scanner_created = false;
