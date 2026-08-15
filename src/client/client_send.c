@@ -208,8 +208,11 @@ static int incremental_check(Client* client, File* file, const Config* config,
 
 static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* config) {
   Delta* delta = delta_compute(file->data->data, file->data->size, sig, config->delta_block_size);
-  if (!delta)
+  if (!delta) {
+    if (!send_status(client->file_descriptor, STATUS_NEXT))
+      return -1;
     return 1;
+  }
 
   if (!delta_is_worthwhile(delta, file->data->size)) {
     delta_destroy(delta);
@@ -506,9 +509,10 @@ static int load_files_multithreaded(void* pipeline_context) {
         if (f->data->size > STREAM_THRESHOLD)
           continue;
         if (!file_load_data(f)) {
-          log_message(LOG_LEVEL_ERROR, "Failed to load file data, skipping");
-          file_destroy(f);
-          chunk->items[i] = NULL;
+          log_message(LOG_LEVEL_ERROR, "Failed to load file data");
+          chunk_destroy(chunk);
+          pipeline_cancel(context);
+          return thrd_error;
         }
       }
     }
@@ -615,7 +619,8 @@ int send_files(Config* config) {
           continue;
         if (!file_load_data(f)) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
-          continue;
+          chunk_destroy(current_chunk);
+          goto send_fail;
         }
       }
     }

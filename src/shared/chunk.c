@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,7 @@
 
 /* Maximum individual file data size within a chunk (64 MB) */
 #define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
+#define MAX_CHUNK_FILES (1024 * 1024)
 
 Chunk* chunk_create(File** items, int element_count) {
   Chunk* chunk = (Chunk*)malloc(sizeof(Chunk));
@@ -92,6 +94,11 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
   size_t remaining_size = data->size;
 
   while (remaining_size > 0) {
+    if (files->size >= MAX_CHUNK_FILES) {
+      log_message(LOG_LEVEL_ERROR, "Chunk contains too many files");
+      array_list_delete(files);
+      return NULL;
+    }
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path length");
       array_list_delete(files);
@@ -103,7 +110,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     data_pointer += sizeof(size_t);
     remaining_size -= sizeof(size_t);
 
-    if (remaining_size < path_len) {
+    if (path_len > SIZE_MAX - 1 || remaining_size < path_len) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path");
       array_list_delete(files);
       return NULL;
@@ -122,10 +129,15 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 
     File* file = file_create(path);
     free(path);
+    if (file == NULL) {
+      array_list_delete(files);
+      return NULL;
+    }
 
     if (use_metadata) {
       if (remaining_size < sizeof(int)) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for metadata");
+        file_destroy(file);
         array_list_delete(files);
         return NULL;
       }
@@ -134,6 +146,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       memcpy(&present_flag, data_pointer, sizeof(int));
       if (present_flag && remaining_size < sizeof(int) + FILE_METADATA_WIRE_SIZE) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for metadata body");
+        file_destroy(file);
         array_list_delete(files);
         return NULL;
       }
@@ -141,10 +154,16 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       remaining_size -= sizeof(int);
       if (file->metadata)
         remaining_size -= FILE_METADATA_WIRE_SIZE;
+      else if (present_flag) {
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
     }
 
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for data size");
+      file_destroy(file);
       array_list_delete(files);
       return NULL;
     }
@@ -156,6 +175,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 
     if (remaining_size < file_data_size) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for file content");
+      file_destroy(file);
       array_list_delete(files);
       return NULL;
     }
@@ -164,29 +184,48 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     if (file_data_size > MAX_FILE_DATA_SIZE) {
       log_message(LOG_LEVEL_ERROR, "File data size %zu exceeds maximum %llu", file_data_size,
                   (unsigned long long)MAX_FILE_DATA_SIZE);
+      file_destroy(file);
       array_list_delete(files);
       return NULL;
     }
 
-    void* file_data = malloc(file_data_size);
+    void* file_data = malloc(file_data_size > 0 ? file_data_size : 1);
     if (file_data == NULL) {
       perror("Could not allocate memory for file data");
+      file_destroy(file);
       array_list_delete(files);
       return NULL;
     }
     memcpy(file_data, data_pointer, file_data_size);
     data_destroy(file->data);
     file->data = data_create(file_data, file_data_size);
+    if (file->data == NULL) {
+      file_destroy(file);
+      array_list_delete(files);
+      return NULL;
+    }
     data_pointer += file_data_size;
     remaining_size -= file_data_size;
 
-    array_list_add(files, file);
+    if (!array_list_add(files, file)) {
+      file_destroy(file);
+      array_list_delete(files);
+      return NULL;
+    }
   }
 
   File** file_array = (File**)array_list_to_array(files);
+  if (file_array == NULL) {
+    array_list_delete(files);
+    return NULL;
+  }
   Chunk* chunk = chunk_create(file_array, files->size);
 
   free(file_array);
+  if (chunk == NULL) {
+    array_list_delete(files);
+    return NULL;
+  }
   files->item_destroyer = NULL;
   array_list_delete(files);
 

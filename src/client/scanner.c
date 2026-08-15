@@ -363,6 +363,8 @@ static int parallel_worker_thread(void* arg) {
       cnd_broadcast(&wa->ps->result_not_empty);
       cnd_broadcast(&wa->ps->result_not_full);
       mtx_unlock(&wa->ps->result_mutex);
+      for (int j = i; j < wa->dir_count; j++)
+        free(wa->dirs[j]);
       break;
     }
     Chunk* chunk;
@@ -588,6 +590,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
       ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
       if (!wa) {
         ps->failed = true;
+        ps->expected_threads = ps->created_threads;
         break;
       }
       wa->ps = ps;
@@ -595,6 +598,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
       if (!wa->dirs) {
         free(wa);
         ps->failed = true;
+        ps->expected_threads = ps->created_threads;
         break;
       }
       bool dup_ok = true;
@@ -609,6 +613,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
         free(wa->dirs);
         free(wa);
         ps->failed = true;
+        ps->expected_threads = ps->created_threads;
         break;
       }
       wa->dir_count = count;

@@ -19,14 +19,13 @@ static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
 static __thread SSL* io_ssl;
 static __thread ProtocolSession* bound_session;
+static __thread ProtocolSession legacy_io_session = {.read_fd = -1, .write_fd = -1};
 
 static unsigned long long io_bwlimit = 0;
 static long long bw_tokens = 0;
 static struct timespec bw_last_refill = {0, 0};
 static mtx_t bw_mutex;
 static once_flag bw_mutex_once = ONCE_FLAG_INIT;
-
-static __thread unsigned long long total_allocated_bytes = 0;
 
 void io_set_fds(int read_fd, int write_fd) {
   bound_session = NULL;
@@ -35,7 +34,11 @@ void io_set_fds(int read_fd, int write_fd) {
   /* A descriptor switch starts a new transport; never reuse a TLS object
      belonging to a previous connection or test pipe. */
   io_ssl = NULL;
-  total_allocated_bytes = 0;
+  legacy_io_session.read_fd = read_fd;
+  legacy_io_session.write_fd = write_fd;
+  legacy_io_session.ssl = NULL;
+  legacy_io_session.total_allocated_bytes = 0;
+  protocol_session_set_bwlimit(&legacy_io_session, io_bwlimit);
 }
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) {
@@ -126,32 +129,30 @@ SSL* io_get_ssl(void) {
   return io_ssl;
 }
 
-static ProtocolSession* legacy_session(void) {
-  static __thread ProtocolSession session;
+static ProtocolSession* legacy_session(int read_fd, int write_fd) {
   if (bound_session)
     return bound_session;
-  session.read_fd = io_read_fd;
-  session.write_fd = io_write_fd;
-  session.ssl = io_ssl;
-  session.bwlimit = io_bwlimit;
-  session.bw_tokens = (unsigned long long)(bw_tokens < 0 ? 0 : bw_tokens);
-  session.bw_last_refill_sec = bw_last_refill.tv_sec;
-  session.bw_last_refill_nsec = bw_last_refill.tv_nsec;
-  return &session;
+  int target_read_fd = io_read_fd != -1 ? io_read_fd : read_fd;
+  int target_write_fd = io_write_fd != -1 ? io_write_fd : write_fd;
+  if (legacy_io_session.read_fd != target_read_fd ||
+      legacy_io_session.write_fd != target_write_fd) {
+    legacy_io_session.read_fd = target_read_fd;
+    legacy_io_session.write_fd = target_write_fd;
+    legacy_io_session.total_allocated_bytes = 0;
+    protocol_session_set_bwlimit(&legacy_io_session, io_bwlimit);
+  } else if (legacy_io_session.bwlimit != io_bwlimit) {
+    protocol_session_set_bwlimit(&legacy_io_session, io_bwlimit);
+  }
+  legacy_io_session.ssl = io_ssl;
+  return &legacy_io_session;
 }
 
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
-  ProtocolSession* session = legacy_session();
-  if (session->write_fd == -1)
-    session->write_fd = file_descriptor;
-  return protocol_send_n_data(session, data, data_size);
+  return protocol_send_n_data(legacy_session(-1, file_descriptor), data, data_size);
 }
 
 bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
-  ProtocolSession* session = legacy_session();
-  if (session->read_fd == -1)
-    session->read_fd = file_descriptor;
-  return protocol_receive_n_data(session, data, data_size);
+  return protocol_receive_n_data(legacy_session(file_descriptor, -1), data, data_size);
 }
 
 static int deadline_remaining_ms(const struct timespec* deadline) {
@@ -403,34 +404,26 @@ bool protocol_receive_status(ProtocolSession* session, Status* status) {
 }
 
 bool send_str(int fd, const char* data) {
-  (void)fd;
-  return protocol_send_str(legacy_session(), data);
+  return protocol_send_str(legacy_session(-1, fd), data);
 }
 char* receive_str(int fd) {
-  (void)fd;
-  return protocol_receive_str(legacy_session());
+  return protocol_receive_str(legacy_session(fd, -1));
 }
 bool send_data(int fd, const Data* data) {
-  (void)fd;
-  return protocol_send_data(legacy_session(), data);
+  return protocol_send_data(legacy_session(-1, fd), data);
 }
 Data* receive_data(int fd) {
-  (void)fd;
-  return protocol_receive_data(legacy_session());
+  return protocol_receive_data(legacy_session(fd, -1));
 }
 bool send_int(int fd, int data) {
-  (void)fd;
-  return protocol_send_int(legacy_session(), data);
+  return protocol_send_int(legacy_session(-1, fd), data);
 }
 bool receive_int(int fd, int* data) {
-  (void)fd;
-  return protocol_receive_int(legacy_session(), data);
+  return protocol_receive_int(legacy_session(fd, -1), data);
 }
 bool send_status(int fd, Status status) {
-  (void)fd;
-  return protocol_send_status(legacy_session(), status);
+  return protocol_send_status(legacy_session(-1, fd), status);
 }
 bool receive_status(int fd, Status* status) {
-  (void)fd;
-  return protocol_receive_status(legacy_session(), status);
+  return protocol_receive_status(legacy_session(fd, -1), status);
 }

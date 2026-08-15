@@ -130,9 +130,20 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
         ok = file_restore_metadata_fd(fd, metadata);
     }
   } else {
-    char tmp[NAME_MAX];
+    int tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%u", leaf, (long)getpid(), 99U);
+    if (tmp_size < 0) {
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
+    char* tmp = malloc((size_t)tmp_size + 1);
+    if (!tmp) {
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
     for (unsigned int i = 0; i < 100 && !ok; ++i) {
-      snprintf(tmp, sizeof(tmp), ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
+      snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
       fd = openat(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
       if (fd < 0)
         continue;
@@ -150,6 +161,7 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
       if (!ok)
         unlinkat(dirfd, tmp, 0);
     }
+    free(tmp);
   }
   if (fd >= 0)
     close(fd);
