@@ -24,6 +24,7 @@
 #include "utils.h"
 
 #define MAX_SERVER_DELETE_COUNT 100000U
+#define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
 
 bool file_checksum(File* file, uint64_t* checksum) {
   if (!file || !checksum || !file->data)
@@ -171,8 +172,8 @@ bool file_stat_secure(const char* path, struct stat* st) {
   int parent_fd = open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)
     return false;
-  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  bool exists = fd >= 0 && fstat(fd, st) == 0;
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+  bool exists = fd >= 0 && fstat(fd, st) == 0 && S_ISREG(st->st_mode);
   if (fd >= 0)
     close(fd);
   close(parent_fd);
@@ -514,6 +515,12 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         send_status(fd, STATUS_ERROR);
         return NULL;
       }
+      if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+        data_destroy(uncompressed);
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
+        return NULL;
+      }
       file_data = uncompressed;
     }
 
@@ -671,6 +678,12 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     Data* uncompressed = data_decompress(file_data);
     data_destroy(file_data);
     if (uncompressed == NULL) {
+      file_destroy(file);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
+    if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+      data_destroy(uncompressed);
       file_destroy(file);
       send_status(fd, STATUS_ERROR);
       return NULL;
@@ -1040,6 +1053,11 @@ File* file_receive(const Config* config, int file_descriptor) {
     Data* file_data_uncompressed = data_decompress(file_data);
     data_destroy(file_data);
     if (file_data_uncompressed == NULL) {
+      file_destroy(file);
+      return NULL;
+    }
+    if (file_data_uncompressed->size > MAX_FILE_DATA_SIZE) {
+      data_destroy(file_data_uncompressed);
       file_destroy(file);
       return NULL;
     }

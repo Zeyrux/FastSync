@@ -203,7 +203,7 @@ void handler(int file_descriptor) {
     close(file_descriptor);
     return;
   }
-  if (ssl && !tls_client_identity_allowed(ssl)) {
+  if (ssl && required_client_cn && !tls_client_identity_allowed(ssl)) {
     log_message(LOG_LEVEL_ERROR, "Rejected TLS client with unauthorized identity");
     config_delete(config);
     close(file_descriptor);

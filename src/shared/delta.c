@@ -121,6 +121,13 @@ DeltaSignature* delta_signature_deserialize(const Data* data) {
     return NULL;
   }
 
+  if (sig->block_size == 0 || sig->block_size > DELTA_BLOCK_SIZE_MAX ||
+      sig->file_size > DELTA_MAX_FILE_SIZE || sig->file_size == 0 ||
+      (sig->file_size + sig->block_size - 1) / sig->block_size != sig->block_count) {
+    free(sig);
+    return NULL;
+  }
+
   uint64_t expected = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t) +
                       (uint64_t)sig->block_count * (sizeof(uint32_t) + sizeof(uint32_t));
   if (data->size < expected) {

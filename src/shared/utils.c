@@ -231,9 +231,14 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
         child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count);
         close(childfd);
       }
-      if (child_removed && !is_dir_in_manifest(child_rel, manifest) &&
-          unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
-        operation_ok = false;
+      if (child_removed && !is_dir_in_manifest(child_rel, manifest)) {
+        if (*deleted_count >= max_delete) {
+          operation_ok = false;
+        } else if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
+          operation_ok = false;
+        } else {
+          (*deleted_count)++;
+        }
       } else if (!child_removed) {
         all_removed = false;
       }
@@ -269,9 +274,13 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
 }
 
 bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete) {
-  int rootfd = authorized_root_fd >= 0
-                   ? open_authorized_destination(dest_root)
-                   : open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int rootfd;
+  if (authorized_root_fd >= 0) {
+    rootfd =
+        authorized_root_path ? open_authorized_destination(dest_root) : dup(authorized_root_fd);
+  } else {
+    rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  }
   if (rootfd < 0)
     return false;
   size_t deleted_count = 0;

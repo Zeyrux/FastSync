@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,15 +63,31 @@ void chunk_destroy(void* item) {
 }
 
 static unsigned long long per_file_serialize_size(File* file, bool use_metadata) {
-  return sizeof(size_t) + strlen(file->path) +
-         (use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0) +
-         sizeof(size_t) + file->data->size;
+  unsigned long long size = sizeof(size_t);
+  size_t path_len = strlen(file->path);
+  unsigned long long metadata_size =
+      use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0;
+  if ((unsigned long long)path_len > ULLONG_MAX - size)
+    return 0;
+  size += path_len;
+  if (metadata_size > ULLONG_MAX - size)
+    return 0;
+  size += metadata_size;
+  if (sizeof(size_t) > ULLONG_MAX - size)
+    return 0;
+  size += sizeof(size_t);
+  if ((unsigned long long)file->data->size > ULLONG_MAX - size)
+    return 0;
+  return size + file->data->size;
 }
 
 Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
   unsigned long long data_size = 0;
   for (int i = 0; i < chunk->element_count; i++) {
-    data_size += per_file_serialize_size(chunk->items[i], use_metadata);
+    unsigned long long file_size = per_file_serialize_size(chunk->items[i], use_metadata);
+    if (file_size == 0 || file_size > ULLONG_MAX - data_size || data_size + file_size > SIZE_MAX)
+      return NULL;
+    data_size += file_size;
   }
   Data* data = data_create_empty(data_size);
   if (data == NULL) {
@@ -174,8 +191,14 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       }
       file->metadata = metadata_from_buf(&data_pointer);
       remaining_size -= sizeof(int);
-      if (file->metadata)
+      if (present_flag == 1) {
+        if (file->metadata == NULL) {
+          file_destroy(file);
+          array_list_delete(files);
+          return NULL;
+        }
         remaining_size -= FILE_METADATA_WIRE_SIZE;
+      }
     }
 
     if (remaining_size < sizeof(size_t)) {
