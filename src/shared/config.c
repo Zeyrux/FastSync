@@ -120,6 +120,7 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->append_verify) && valid_wire_bool(config->delete_excluded) &&
          valid_wire_bool(config->delete_after) && valid_wire_bool(config->relative) &&
          valid_wire_bool(config->prune_empty_dirs) && valid_wire_bool(config->partial) &&
+         valid_wire_bool(config->delete_before) && valid_wire_bool(config->checksum) &&
          config->compression_level >= 1 && config->compression_level <= 22 &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
