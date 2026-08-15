@@ -45,7 +45,7 @@ replacement for every rsync feature or protocol mode.
 
 - Recursive directory scanning.
 - Rsync-style source and destination arguments.
-- SSH transport using `user@host:/path` destinations.
+- SSH transport using `user@host:destination` paths below the remote authorized root.
 - TCP client/server transfers.
 - Dry runs, excludes, includes, size filters, backups, statistics, and
   bandwidth limiting.
@@ -79,8 +79,10 @@ partial, alternate, and planned behavior.
 
 ### Build
 
-Requirements: C11 compiler, CMake 3.22 or newer, zstd, OpenSSL, pthreads,
-and an SSH client for SSH transport.
+Requirements: C11 compiler, CMake 3.22 or newer, xxHash, zstd, OpenSSL,
+pthreads, and an SSH client for SSH transport. The first CMake configure fetches
+xxHash from GitHub, so network access is required unless the dependency is
+already cached.
 
 ```bash
 cmake -B build -S .
@@ -98,10 +100,12 @@ cmake --build build -j$(nproc)
 ### SSH transfer
 
 The remote host must have `fastsync-server` available in `PATH`, or use
-`--fastsync-server-path`.
+`--fastsync-server-path`. SSH starts `fastsync-server --stdio` in its remote
+working directory, so use a destination below that directory unless the
+remote server is otherwise configured with a matching authorized root.
 
 ```bash
-./build/client /path/to/source user@host:/path/to/destination
+./build/client /path/to/source user@host:destination
 ```
 
 ### TCP transfer
@@ -140,30 +144,30 @@ FastSync-native are optional performance or transport extensions.
 ./build/client /source/ /destination/
 
 # Archive-style synchronization (current FastSync archive behavior)
-./build/client -a /source/ user@host:/destination/
+./build/client -a /source/ user@host:destination/
 
 # Preview a transfer without changing the destination
 ./build/client -n /source/ /destination/
 
 # Exclude temporary and object files
 ./build/client --exclude '*.tmp' --exclude '*.o' \
-  /source/ user@host:/destination/
+  /source/ user@host:destination/
 
 # Remove destination entries not present in the source
-./build/client --delete /source/ user@host:/destination/
+./build/client --delete /source/ user@host:destination/
 
 # Skip unchanged files using size and modification time
-./build/client --incremental /source/ user@host:/destination/
+./build/client --incremental /source/ user@host:destination/
 
 # Verify content when size and time are not sufficient
-./build/client --incremental --checksum /source/ user@host:/destination/
+./build/client --incremental --checksum /source/ user@host:destination/
 
 # Preserve supported mode and timestamp metadata
-./build/client -M /source/ user@host:/destination/
+./build/client -M /source/ user@host:destination/
 
 # Keep backups of overwritten destination files
-./build/client --backup --backup-dir /backups \
-  /source/ user@host:/destination/
+./build/client --backup --backup-dir backups \
+  /source/ user@host:destination/
 ```
 
 ## FastSync Extensions
@@ -217,8 +221,8 @@ before FastSync can claim full rsync CLI compatibility.
 | `--backup` | Back up overwritten files. |
 | `--backup-dir <dir>` | Store backups under a separate directory. |
 | `--suffix <suffix>` | Set the backup filename suffix. |
-| `--partial` | Keep received data under the configured partial location. Full resume semantics are planned. |
-| `--partial-dir <dir>` | Set the partial transfer directory. |
+| `--partial` | Select partial-transfer handling. With `--partial-dir`, completed files are written there; resumable transfers are not implemented. |
+| `--partial-dir <dir>` | Set a relative partial-transfer directory below the server destination root; use with `--partial`. |
 | `--inplace` | Write directly to the destination instead of using a temporary file. |
 
 ### Metadata and links
