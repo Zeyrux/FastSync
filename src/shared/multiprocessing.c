@@ -183,6 +183,15 @@ int write_thread(void* pipeline_context) {
   bool save_to_disk = context->config->save_to_disk;
   char* root_directory = str_dup(context->config->receive_root_directory);
   mtx_unlock(&context->mutex);
+  if (save_to_disk && !root_directory) {
+    mtx_lock(&context->mutex);
+    atomic_store(&context->cancelled, true);
+    context->receiver_done = true;
+    cnd_broadcast(&context->condition_not_full);
+    cnd_broadcast(&context->condition_not_empty);
+    mtx_unlock(&context->mutex);
+    return thrd_error;
+  }
 
   while (true) {
     File* file =

@@ -60,6 +60,7 @@ static Client* connect_transfer_client(const Config* config) {
     connected = client_connect(client, config->server_host, config->server_port);
   }
   if (!connected) {
+    client_disconnect(client);
     client_delete(client);
     return NULL;
   }
@@ -399,6 +400,13 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         context->queue_loader, &context->mutex_loader, &context->condition_not_empty_loader,
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
+      if (atomic_load(&context->cancelled)) {
+        pipeline_cancel(context);
+        disconnect_transfer_client(client);
+        mark_sender_done(context);
+        protocol_session_unbind();
+        return thrd_error;
+      }
       if (context->config->use_delete) {
         if (send_delete_manifest(client->file_descriptor, context->manifest) != 0)
           goto send_fail;
@@ -523,9 +531,7 @@ static int load_files_multithreaded(void* pipeline_context) {
                                             &context->condition_not_full_loader,
                                             &context->cancelled)) {
       chunk_destroy(chunk);
-      atomic_store(&context->cancelled, true);
-      cnd_broadcast(&context->condition_not_full_loader);
-      cnd_broadcast(&context->condition_not_empty_loader);
+      pipeline_cancel(context);
       return thrd_error;
     }
   }
