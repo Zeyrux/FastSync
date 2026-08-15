@@ -38,7 +38,13 @@ static bool __attribute__((unused)) configure_authorization(const char* root) {
     authorized_root = NULL;
     return false;
   }
-  file_set_authorized_root(authorized_root_fd, authorized_root);
+  if (!file_set_authorized_root(authorized_root_fd, authorized_root)) {
+    close(authorized_root_fd);
+    authorized_root_fd = -1;
+    free(authorized_root);
+    authorized_root = NULL;
+    return false;
+  }
   utils_set_authorized_root_fd(authorized_root_fd);
   return true;
 }

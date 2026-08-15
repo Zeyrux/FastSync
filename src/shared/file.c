@@ -154,8 +154,8 @@ bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
   return true;
 }
 
-void file_set_authorized_root(int fd, const char* canonical_path) {
-  file_store_set_authorized_root(fd, canonical_path);
+bool file_set_authorized_root(int fd, const char* canonical_path) {
+  return file_store_set_authorized_root(fd, canonical_path);
 }
 
 static bool path_is_within_root(const char* root, const char* path) {

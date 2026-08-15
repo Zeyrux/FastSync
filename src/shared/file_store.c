@@ -20,10 +20,14 @@ static bool path_is_within_root(const char* root, const char* path) {
          (path[root_length] == '\0' || path[root_length] == '/');
 }
 
-void file_store_set_authorized_root(int fd, const char* canonical_path) {
-  authorized_root_fd = fd;
+bool file_store_set_authorized_root(int fd, const char* canonical_path) {
+  char* new_path = canonical_path ? str_dup(canonical_path) : NULL;
+  if (canonical_path && !new_path)
+    return false;
   free(authorized_root_path);
-  authorized_root_path = canonical_path ? str_dup(canonical_path) : NULL;
+  authorized_root_path = new_path;
+  authorized_root_fd = fd;
+  return true;
 }
 
 int file_store_open_secure_parent(const char* path, char** leaf_out) {
