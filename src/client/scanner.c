@@ -667,6 +667,11 @@ Chunk* parallel_scanner_next(ParallelScanner* ps) {
   }
   if (ps->num_threads == 0) {
     mtx_lock(&ps->result_mutex);
+    if (!queue_is_empty(ps->result_queue)) {
+      Chunk* chunk = queue_dequeue(ps->result_queue);
+      mtx_unlock(&ps->result_mutex);
+      return chunk;
+    }
     ps->done = true;
     mtx_unlock(&ps->result_mutex);
     return NULL;

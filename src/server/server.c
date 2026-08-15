@@ -106,6 +106,7 @@ void handler(int file_descriptor) {
       protocol_session_unbind();
       return;
     }
+    context->session.total_allocated_bytes = session.total_allocated_bytes;
     thrd_t receiver, writer;
     bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
     bool writer_created = false;

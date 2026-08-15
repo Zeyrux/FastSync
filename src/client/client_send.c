@@ -658,6 +658,7 @@ int send_files(Config* config) {
   if (config->use_delete) {
     if (send_delete_manifest(client->file_descriptor, manifest) != 0) {
       array_list_delete(manifest);
+      manifest = NULL;
       goto send_fail;
     }
     array_list_delete(manifest);
