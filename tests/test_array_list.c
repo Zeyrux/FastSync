@@ -12,8 +12,6 @@ static void test_destroyer(void* item) {
 void test_array_list() {
   ArrayList* list = array_list_create(free);
   EXPECT_NOT_NULL(list);
-  if (!list)
-    return;
   EXPECT_EQ_INT(list->size, 0);
   EXPECT_EQ_INT(list->capacity, 100);
 

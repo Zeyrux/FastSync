@@ -119,8 +119,6 @@ static void test_queue_destroyer() {
   destroyer_calls = 0;
   Queue* q = queue_create(5, my_destroyer);
   EXPECT_NOT_NULL(q);
-  if (!q)
-    return;
 
   for (int i = 0; i < 3; i++) {
     int* val = malloc(sizeof(int));

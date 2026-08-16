@@ -195,8 +195,6 @@ static void test_queue_rapid_create_destroy() {
   for (int i = 0; i < 100; i++) {
     Queue* q = queue_create(4, free);
     EXPECT_NOT_NULL(q);
-    if (!q)
-      return;
 
     for (int j = 0; j < 3; j++) {
       int* val = malloc(sizeof(int));

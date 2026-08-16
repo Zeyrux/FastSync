@@ -25,16 +25,10 @@ static void test_property_compress_roundtrip() {
   for (int iter = 0; iter < 10; iter++) {
     Data* original = random_data(1, 10000);
     EXPECT_NOT_NULL(original);
-    if (!original)
-      return;
 
     size_t orig_size = original->size;
     void* orig_copy = malloc(orig_size);
     EXPECT_NOT_NULL(orig_copy);
-    if (!orig_copy) {
-      data_destroy(original);
-      return;
-    }
     memcpy(orig_copy, original->data, orig_size);
 
     Data* compressed = data_compress(original, 3);
