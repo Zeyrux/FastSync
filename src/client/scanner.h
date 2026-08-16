@@ -9,6 +9,24 @@
 #include <stdatomic.h>
 
 typedef struct {
+  bool use_metadata;
+  unsigned long long chunk_size;
+  char** exclude_patterns;
+  int exclude_count;
+  char** include_patterns;
+  int include_count;
+  unsigned long long max_size;
+  unsigned long long min_size;
+  int max_depth;
+  int num_threads;
+  bool follow_symlinks;
+  bool copy_links;
+  bool safe_links;
+  bool copy_unsafe_links;
+  bool checksum;
+} ScannerOptions;
+
+typedef struct {
   Queue* directories;
   DIR* current_dir;
   char* current_path;
@@ -53,17 +71,21 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            unsigned long long min_size, int max_depth,
                                            bool follow_symlinks, bool copy_links, bool safe_links,
                                            bool copy_unsafe_links, bool checksum);
+DirectoryScanner* directory_scanner_create_with_options(const char* root_directory,
+                                                        const ScannerOptions* options);
 Chunk* directory_scanner_next(DirectoryScanner* scanner);
 bool directory_scanner_failed(const DirectoryScanner* scanner);
 void directory_scanner_destroy(DirectoryScanner* scanner);
 
-ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata,
+ParallelScanner* parallel_scanner_create(const char* root_directory, bool use_metadata,
                                          unsigned long long chunk_size, char** exclude_patterns,
                                          int exclude_count, char** include_patterns,
                                          int include_count, unsigned long long max_size,
                                          unsigned long long min_size, int max_depth,
                                          int num_threads, bool follow_symlinks, bool copy_links,
                                          bool safe_links, bool copy_unsafe_links, bool checksum);
+ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
+                                                      const ScannerOptions* options);
 Chunk* parallel_scanner_next(ParallelScanner* scanner);
 bool parallel_scanner_failed(const ParallelScanner* scanner);
 void parallel_scanner_destroy(ParallelScanner* scanner);

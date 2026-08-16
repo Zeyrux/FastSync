@@ -35,6 +35,7 @@ typedef struct PipelineContextReceiver {
   Config* config;
   int file_descriptor;
   SSL* ssl;
+  ProtocolSession session;
   mtx_t mutex;
   cnd_t condition_not_full;
   cnd_t condition_not_empty;

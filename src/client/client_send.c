@@ -28,6 +28,88 @@
 /* Forward declaration for progress-reporting thread used in multithreaded send. */
 static int progress_thread_fn(void* arg);
 
+static ScannerOptions scanner_options_from_config(const Config* config, int num_threads) {
+  ScannerOptions options = {
+      config->use_metadata,  config->chunk_size,        config->exclude_patterns,
+      config->exclude_count, config->include_patterns,  config->include_count,
+      config->max_size,      config->min_size,          config->max_depth,
+      num_threads,           config->follow_symlinks,   config->copy_links,
+      config->safe_links,    config->copy_unsafe_links, config->checksum};
+  return options;
+}
+
+/* Select the configured transport for both transfer execution paths. */
+static Client* connect_transfer_client(const Config* config) {
+  if (config->transport == TRANSPORT_SSH) {
+    if (config->use_sendfile) {
+      fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
+      return NULL;
+    }
+    return client_connect_ssh(config->ssh_destination, config->ssh_port,
+                              config->fastsync_server_path);
+  }
+
+  Client* client = client_create();
+  if (!client)
+    return NULL;
+  bool connected;
+  if (config->use_tls) {
+    connected = client_connect_tls(client, config->server_host, config->server_port,
+                                   config->tls_cert, config->tls_key, config->tls_ca);
+  } else {
+    connected = client_connect(client, config->server_host, config->server_port);
+  }
+  if (!connected) {
+    client_disconnect(client);
+    client_delete(client);
+    return NULL;
+  }
+  return client;
+}
+
+static void disconnect_transfer_client(Client* client) {
+  if (!client)
+    return;
+  client_disconnect(client);
+  client_delete(client);
+}
+
+static ArrayList* create_transfer_manifest(const Config* config) {
+  return config->use_delete ? array_list_create(free) : NULL;
+}
+
+static bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
+  if (!manifest)
+    return true;
+  for (int i = 0; i < chunk->element_count; i++) {
+    const char* path = chunk->items[i]->path;
+    if (*path == '/')
+      path++;
+    char* entry = str_dup(path);
+    if (!entry) {
+      log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
+      return false;
+    }
+    if (!array_list_add(manifest, entry)) {
+      free(entry);
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool finalize_transfer(Client* client) {
+  Status status;
+  return send_status(client->file_descriptor, STATUS_FINISHED) &&
+         receive_status(client->file_descriptor, &status) && status == STATUS_OK;
+}
+
+static void mark_sender_done(PipelineContextSender* context) {
+  mtx_lock(&context->mutex_progress);
+  context->sender_done = true;
+  mtx_unlock(&context->mutex_progress);
+}
+
 static void pipeline_cancel(PipelineContextSender* context) {
   mtx_lock(&context->mutex_scanner);
   mtx_lock(&context->mutex_loader);
@@ -43,12 +125,10 @@ static void pipeline_cancel(PipelineContextSender* context) {
 }
 
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
-static int send_dry_run_manifest(Config* config) {
-  DirectoryScanner* scanner = directory_scanner_create(
-      config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
-      config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-      config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links, config->checksum);
+static int send_dry_run_manifest(const Config* config) {
+  ScannerOptions options = scanner_options_from_config(config, 0);
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &options);
   if (!scanner)
     return -1;
   Chunk* chunk;
@@ -129,8 +209,11 @@ static int incremental_check(Client* client, File* file, const Config* config,
 
 static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* config) {
   Delta* delta = delta_compute(file->data->data, file->data->size, sig, config->delta_block_size);
-  if (!delta)
+  if (!delta) {
+    if (!send_status(client->file_descriptor, STATUS_NEXT))
+      return -1;
     return 1;
+  }
 
   if (!delta_is_worthwhile(delta, file->data->size)) {
     delta_destroy(delta);
@@ -291,49 +374,24 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
 
 static int send_chunks_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
-  Client* client;
-  if (context->config->transport == TRANSPORT_SSH) {
-    if (context->config->use_sendfile) {
-      fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
-      mtx_lock(&context->mutex_progress);
-      context->sender_done = true;
-      mtx_unlock(&context->mutex_progress);
-      return 1;
-    }
-    client = client_connect_ssh(context->config->ssh_destination, context->config->ssh_port,
-                                context->config->fastsync_server_path);
-  } else if (context->config->use_tls) {
-    client = client_create();
-    if (!client || !client_connect_tls(client, context->config->server_host,
-                                       context->config->server_port, context->config->tls_cert,
-                                       context->config->tls_key, context->config->tls_ca)) {
-      if (client)
-        client_delete(client);
-      fprintf(stderr, "Error: could not connect to server via TLS\n");
-      mtx_lock(&context->mutex_progress);
-      context->sender_done = true;
-      mtx_unlock(&context->mutex_progress);
-      return thrd_error;
-    }
-  } else {
-    client = client_create();
-    if (!client ||
-        !client_connect(client, context->config->server_host, context->config->server_port)) {
-      if (client)
-        client_delete(client);
-      fprintf(stderr, "Error: could not connect to server\n");
-      mtx_lock(&context->mutex_progress);
-      context->sender_done = true;
-      mtx_unlock(&context->mutex_progress);
-      return thrd_error;
-    }
+  Client* client = connect_transfer_client(context->config);
+  if (!client) {
+    if (context->config->transport == TRANSPORT_TCP)
+      fprintf(stderr, "Error: could not connect to server%s\n",
+              context->config->use_tls ? " via TLS" : "");
+    pipeline_cancel(context);
+    mark_sender_done(context);
+    return thrd_error;
   }
+  ProtocolSession session;
+  protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
+  protocol_session_set_ssl(&session, (SSL*)client->ssl);
+  protocol_session_bind(&session);
   if (!config_send(client->file_descriptor, context->config)) {
-    client_disconnect(client);
-    client_delete(client);
-    mtx_lock(&context->mutex_progress);
-    context->sender_done = true;
-    mtx_unlock(&context->mutex_progress);
+    pipeline_cancel(context);
+    disconnect_transfer_client(client);
+    mark_sender_done(context);
+    protocol_session_unbind();
     return thrd_error;
   }
 
@@ -342,39 +400,37 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         context->queue_loader, &context->mutex_loader, &context->condition_not_empty_loader,
         &context->condition_not_full_loader, &context->loader_done);
     if (current_chunk == NULL) {
+      if (atomic_load(&context->cancelled)) {
+        pipeline_cancel(context);
+        disconnect_transfer_client(client);
+        mark_sender_done(context);
+        protocol_session_unbind();
+        return thrd_error;
+      }
       if (context->config->use_delete) {
         if (send_delete_manifest(client->file_descriptor, context->manifest) != 0)
           goto send_fail;
       }
-      if (!send_status(client->file_descriptor, STATUS_FINISHED))
-        goto send_fail;
-      Status s;
-      int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
-      client_disconnect(client);
-      client_delete(client);
-      mtx_lock(&context->mutex_progress);
-      context->sender_done = true;
-      mtx_unlock(&context->mutex_progress);
+      bool ok = finalize_transfer(client);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
       return ok ? thrd_success : thrd_error;
 
     send_fail:
       pipeline_cancel(context);
-      client_disconnect(client);
-      client_delete(client);
-      mtx_lock(&context->mutex_progress);
-      context->sender_done = true;
-      mtx_unlock(&context->mutex_progress);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
       return thrd_error;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
       fprintf(stderr, "Error: unexpected error while sending chunk\n");
       chunk_destroy(current_chunk);
       pipeline_cancel(context);
-      client_disconnect(client);
-      client_delete(client);
-      mtx_lock(&context->mutex_progress);
-      context->sender_done = true;
-      mtx_unlock(&context->mutex_progress);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
       return thrd_error;
     }
     if (context->config->show_progress) {
@@ -393,13 +449,9 @@ static int send_chunks_multithreaded(void* pipeline_context) {
 
 static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
-  ParallelScanner* scanner = parallel_scanner_create(
-      context->config->send_directory, context->config->use_metadata, context->config->chunk_size,
-      context->config->exclude_patterns, context->config->exclude_count,
-      context->config->include_patterns, context->config->include_count, context->config->max_size,
-      context->config->min_size, context->config->max_depth, 4, context->config->follow_symlinks,
-      context->config->copy_links, context->config->safe_links, context->config->copy_unsafe_links,
-      context->config->checksum);
+  ScannerOptions options = scanner_options_from_config(context->config, 4);
+  ParallelScanner* scanner =
+      parallel_scanner_create_with_options(context->config->send_directory, &options);
 
   Chunk* current_chunk;
   if (scanner == NULL) {
@@ -410,28 +462,14 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
     if (context->config->use_delete) {
       mtx_lock(&context->mutex_scanner);
-      for (int i = 0; i < current_chunk->element_count; i++) {
-        const char* p = current_chunk->items[i]->path;
-        if (*p == '/')
-          p++;
-        char* manifest_entry = str_dup(p);
-        if (!manifest_entry) {
-          log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
-          mtx_unlock(&context->mutex_scanner);
-          pipeline_cancel(context);
-          parallel_scanner_destroy(scanner);
-          return thrd_error;
-        }
-        if (!array_list_add(context->manifest, manifest_entry)) {
-          free(manifest_entry);
-          mtx_unlock(&context->mutex_scanner);
-          pipeline_cancel(context);
-          chunk_destroy(current_chunk);
-          parallel_scanner_destroy(scanner);
-          return thrd_error;
-        }
-      }
+      bool manifest_ok = add_chunk_to_manifest(context->manifest, current_chunk);
       mtx_unlock(&context->mutex_scanner);
+      if (!manifest_ok) {
+        pipeline_cancel(context);
+        chunk_destroy(current_chunk);
+        parallel_scanner_destroy(scanner);
+        return thrd_error;
+      }
     }
     if (!queue_enqueue_multithreaded_cancel(
             context->queue_scanner, current_chunk, &context->mutex_scanner,
@@ -481,9 +519,10 @@ static int load_files_multithreaded(void* pipeline_context) {
         if (f->data->size > STREAM_THRESHOLD)
           continue;
         if (!file_load_data(f)) {
-          log_message(LOG_LEVEL_ERROR, "Failed to load file data, skipping");
-          file_destroy(f);
-          chunk->items[i] = NULL;
+          log_message(LOG_LEVEL_ERROR, "Failed to load file data");
+          chunk_destroy(chunk);
+          pipeline_cancel(context);
+          return thrd_error;
         }
       }
     }
@@ -492,9 +531,7 @@ static int load_files_multithreaded(void* pipeline_context) {
                                             &context->condition_not_full_loader,
                                             &context->cancelled)) {
       chunk_destroy(chunk);
-      atomic_store(&context->cancelled, true);
-      cnd_broadcast(&context->condition_not_full_loader);
-      cnd_broadcast(&context->condition_not_empty_loader);
+      pipeline_cancel(context);
       return thrd_error;
     }
   }
@@ -540,61 +577,37 @@ int send_files(Config* config) {
   if (config->dry_run)
     return send_dry_run_manifest(config);
 
-  Client* client;
-  if (config->transport == TRANSPORT_SSH) {
-    if (config->use_sendfile) {
-      fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
-      return 1;
-    }
-    client =
-        client_connect_ssh(config->ssh_destination, config->ssh_port, config->fastsync_server_path);
-    if (!client)
-      return 1;
-  } else if (config->use_tls) {
-    client = client_create();
-    if (!client || !client_connect_tls(client, config->server_host, config->server_port,
-                                       config->tls_cert, config->tls_key, config->tls_ca)) {
-      if (client) {
-        client_disconnect(client);
-        client_delete(client);
-      }
-      fprintf(stderr, "Error: could not connect to server via TLS\n");
-      return 1;
-    }
-  } else {
-    client = client_create();
-    if (!client || !client_connect(client, config->server_host, config->server_port)) {
-      if (client) {
-        client_disconnect(client);
-        client_delete(client);
-      }
-      fprintf(stderr, "Error: could not connect to server\n");
-      return 1;
-    }
-  }
-  if (!config_send(client->file_descriptor, config)) {
-    client_disconnect(client);
-    client_delete(client);
+  Client* client = connect_transfer_client(config);
+  if (!client) {
+    if (config->transport == TRANSPORT_TCP)
+      fprintf(stderr, "Error: could not connect to server%s\n", config->use_tls ? " via TLS" : "");
     return 1;
   }
-  DirectoryScanner* scanner = directory_scanner_create(
-      config->send_directory, config->use_metadata, config->chunk_size, config->exclude_patterns,
-      config->exclude_count, config->include_patterns, config->include_count, config->max_size,
-      config->min_size, config->max_depth, config->follow_symlinks, config->copy_links,
-      config->safe_links, config->copy_unsafe_links, config->checksum);
+  ProtocolSession session;
+  protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
+  protocol_session_set_ssl(&session, (SSL*)client->ssl);
+  protocol_session_bind(&session);
+  if (!config_send(client->file_descriptor, config)) {
+    disconnect_transfer_client(client);
+    protocol_session_unbind();
+    return 1;
+  }
+  ScannerOptions scanner_options = scanner_options_from_config(config, 0);
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &scanner_options);
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   int total_files = 0;
   time_t last_progress = 0;
   time_t start = time(NULL);
-  ArrayList* manifest = config->use_delete ? array_list_create(free) : NULL;
+  ArrayList* manifest = create_transfer_manifest(config);
   if (!scanner || (config->use_delete && !manifest)) {
     if (scanner)
       directory_scanner_destroy(scanner);
     if (manifest)
       array_list_delete(manifest);
-    client_disconnect(client);
-    client_delete(client);
+    disconnect_transfer_client(client);
+    protocol_session_unbind();
     return 1;
   }
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
@@ -602,30 +615,10 @@ int send_files(Config* config) {
     for (int i = 0; i < current_chunk->element_count; i++) {
       chunk_bytes += current_chunk->items[i]->data->size;
       total_files++;
-      if (manifest) {
-        const char* p = current_chunk->items[i]->path;
-        if (*p == '/')
-          p++;
-        char* manifest_entry = str_dup(p);
-        if (!manifest_entry) {
-          log_message(LOG_LEVEL_ERROR, "Failed to allocate manifest entry");
-          chunk_destroy(current_chunk);
-          array_list_delete(manifest);
-          directory_scanner_destroy(scanner);
-          client_disconnect(client);
-          client_delete(client);
-          return 1;
-        }
-        if (!array_list_add(manifest, manifest_entry)) {
-          free(manifest_entry);
-          chunk_destroy(current_chunk);
-          array_list_delete(manifest);
-          directory_scanner_destroy(scanner);
-          client_disconnect(client);
-          client_delete(client);
-          return 1;
-        }
-      }
+    }
+    if (!add_chunk_to_manifest(manifest, current_chunk)) {
+      chunk_destroy(current_chunk);
+      goto send_fail;
     }
     if (!config->use_sendfile) {
       for (int i = 0; i < current_chunk->element_count; i++) {
@@ -634,7 +627,8 @@ int send_files(Config* config) {
           continue;
         if (!file_load_data(f)) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
-          continue;
+          chunk_destroy(current_chunk);
+          goto send_fail;
         }
       }
     }
@@ -664,15 +658,13 @@ int send_files(Config* config) {
   if (config->use_delete) {
     if (send_delete_manifest(client->file_descriptor, manifest) != 0) {
       array_list_delete(manifest);
+      manifest = NULL;
       goto send_fail;
     }
     array_list_delete(manifest);
     manifest = NULL;
   }
-  if (!send_status(client->file_descriptor, STATUS_FINISHED))
-    goto send_fail;
-  Status s;
-  int ok = receive_status(client->file_descriptor, &s) && s == STATUS_OK;
+  bool ok = finalize_transfer(client);
   double elapsed_total = difftime(time(NULL), start);
   if (config->show_progress) {
     double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
@@ -684,16 +676,16 @@ int send_files(Config* config) {
             rate);
   }
   directory_scanner_destroy(scanner);
-  client_disconnect(client);
-  client_delete(client);
+  disconnect_transfer_client(client);
+  protocol_session_unbind();
   return ok ? 0 : 1;
 
 send_fail:
   if (manifest)
     array_list_delete(manifest);
   directory_scanner_destroy(scanner);
-  client_disconnect(client);
-  client_delete(client);
+  disconnect_transfer_client(client);
+  protocol_session_unbind();
   return 1;
 }
 
@@ -729,7 +721,11 @@ int send_files_multithreaded(Config* config) {
     return 1;
   }
   if (config->use_delete)
-    context->manifest = array_list_create(free);
+    context->manifest = create_transfer_manifest(config);
+  if (config->use_delete && !context->manifest) {
+    pipeline_context_sender_destroy(context);
+    return 1;
+  }
 
   thrd_t scanner, loader, sender;
   bool scanner_created = false;

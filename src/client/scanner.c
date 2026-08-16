@@ -52,13 +52,84 @@ static bool safe_relative_link(const char* source_root, const char* containing_d
   return safe;
 }
 
-DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,
-                                           unsigned long long chunk_size, char** exclude_patterns,
-                                           int exclude_count, char** include_patterns,
-                                           int include_count, unsigned long long max_size,
-                                           unsigned long long min_size, int max_depth,
-                                           bool follow_symlinks, bool copy_links, bool safe_links,
-                                           bool copy_unsafe_links, bool checksum) {
+typedef struct {
+  char* path;
+  struct stat stats;
+  bool is_directory;
+} ScannerEntry;
+
+/* Inspect symlinks, resolve the entry type, and apply file filters once for both scanners. */
+static int scanner_inspect_entry(const ScannerOptions* options, const char* source_root,
+                                 const char* containing_dir, const char* name,
+                                 ScannerEntry* entry) {
+  entry->path = path_cat(containing_dir, name);
+  if (!entry->path)
+    return -1;
+
+  struct stat link_stats;
+  if (lstat(entry->path, &link_stats) != 0) {
+    free(entry->path);
+    return 0;
+  }
+  bool is_symlink = S_ISLNK(link_stats.st_mode);
+  if (is_symlink && !options->follow_symlinks && !options->copy_links && !options->safe_links &&
+      !options->copy_unsafe_links)
+    goto skip;
+
+  if (is_symlink && options->safe_links) {
+    char link_target[4096];
+    ssize_t length = readlink(entry->path, link_target, sizeof(link_target) - 1);
+    if (length < 0)
+      goto skip;
+    link_target[length] = '\0';
+    if (link_target[0] == '/' || !safe_relative_link(source_root, containing_dir, link_target))
+      goto skip;
+  }
+
+  if (is_symlink && options->copy_unsafe_links && !options->copy_links) {
+    char link_target[4096];
+    ssize_t length = readlink(entry->path, link_target, sizeof(link_target) - 1);
+    if (length < 0)
+      goto skip;
+    link_target[length] = '\0';
+    if (link_target[0] != '/')
+      goto skip;
+  }
+
+  if (is_symlink && options->follow_symlinks && !options->copy_links)
+    entry->stats = link_stats;
+  else if (stat(entry->path, &entry->stats) != 0)
+    goto skip;
+
+  entry->is_directory = S_ISDIR(entry->stats.st_mode);
+  if (entry->is_directory)
+    return 1;
+  for (int i = 0; i < options->exclude_count; i++)
+    if (glob_match(options->exclude_patterns[i], name))
+      goto skip;
+  if (options->include_count > 0) {
+    bool included = false;
+    for (int i = 0; i < options->include_count; i++)
+      if (glob_match(options->include_patterns[i], name))
+        included = true;
+    if (!included)
+      goto skip;
+  }
+  if ((options->max_size > 0 && (unsigned long long)entry->stats.st_size > options->max_size) ||
+      (options->min_size > 0 && (unsigned long long)entry->stats.st_size < options->min_size))
+    goto skip;
+  return 1;
+
+skip:
+  free(entry->path);
+  entry->path = NULL;
+  return 0;
+}
+
+DirectoryScanner* directory_scanner_create_with_options(const char* root_directory,
+                                                        const ScannerOptions* options) {
+  if (!root_directory || !options)
+    return NULL;
   DirectoryScanner* scanner = calloc(1, sizeof(DirectoryScanner));
   if (scanner == NULL)
     return NULL;
@@ -69,21 +140,21 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
   }
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
-  scanner->use_metadata = use_metadata;
-  scanner->chunk_size = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
-  scanner->exclude_patterns = exclude_patterns;
-  scanner->exclude_count = exclude_count;
-  scanner->include_patterns = include_patterns;
-  scanner->include_count = include_count;
-  scanner->max_size = max_size;
-  scanner->min_size = min_size;
-  scanner->max_depth = max_depth;
+  scanner->use_metadata = options->use_metadata;
+  scanner->chunk_size = options->chunk_size > 0 ? options->chunk_size : DESIRED_CHUNK_SIZE;
+  scanner->exclude_patterns = options->exclude_patterns;
+  scanner->exclude_count = options->exclude_count;
+  scanner->include_patterns = options->include_patterns;
+  scanner->include_count = options->include_count;
+  scanner->max_size = options->max_size;
+  scanner->min_size = options->min_size;
+  scanner->max_depth = options->max_depth;
   scanner->current_depth = 0;
-  scanner->follow_symlinks = follow_symlinks;
-  scanner->copy_links = copy_links;
-  scanner->safe_links = safe_links;
-  scanner->copy_unsafe_links = copy_unsafe_links;
-  scanner->checksum = checksum;
+  scanner->follow_symlinks = options->follow_symlinks;
+  scanner->copy_links = options->copy_links;
+  scanner->safe_links = options->safe_links;
+  scanner->copy_unsafe_links = options->copy_unsafe_links;
+  scanner->checksum = options->checksum;
   scanner->failed = false;
   DirEntry* root = dir_entry_create(root_directory, 0);
   if (!root) {
@@ -98,6 +169,20 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
     return NULL;
   }
   return scanner;
+}
+
+DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,
+                                           unsigned long long chunk_size, char** exclude_patterns,
+                                           int exclude_count, char** include_patterns,
+                                           int include_count, unsigned long long max_size,
+                                           unsigned long long min_size, int max_depth,
+                                           bool follow_symlinks, bool copy_links, bool safe_links,
+                                           bool copy_unsafe_links, bool checksum) {
+  ScannerOptions options = {
+      use_metadata,    chunk_size, exclude_patterns, exclude_count,     include_patterns,
+      include_count,   max_size,   min_size,         max_depth,         0,
+      follow_symlinks, copy_links, safe_links,       copy_unsafe_links, checksum};
+  return directory_scanner_create_with_options(root_directory, &options);
 }
 
 void directory_scanner_destroy(DirectoryScanner* scanner) {
@@ -167,7 +252,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         break;
     }
 
-    struct dirent* entry = readdir(scanner->current_dir);
+    const struct dirent* entry = readdir(scanner->current_dir);
     if (entry == NULL) {
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
@@ -179,67 +264,27 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
 
-    char* cur_path = path_cat(scanner->current_path, entry->d_name);
-    if (!cur_path) {
+    ScannerOptions options = {scanner->use_metadata,     scanner->chunk_size,
+                              scanner->exclude_patterns, scanner->exclude_count,
+                              scanner->include_patterns, scanner->include_count,
+                              scanner->max_size,         scanner->min_size,
+                              scanner->max_depth,        0,
+                              scanner->follow_symlinks,  scanner->copy_links,
+                              scanner->safe_links,       scanner->copy_unsafe_links,
+                              scanner->checksum};
+    ScannerEntry inspected;
+    int inspection = scanner_inspect_entry(&options, scanner->current_path, scanner->current_path,
+                                           entry->d_name, &inspected);
+    if (inspection < 0) {
       scanner->failed = true;
       break;
     }
-    struct stat stats;
-    struct stat lstats;
-    bool is_symlink = false;
-    if (lstat(cur_path, &lstats) != 0) {
-      free(cur_path);
+    if (inspection == 0)
       continue;
-    }
-    is_symlink = S_ISLNK(lstats.st_mode);
+    char* cur_path = inspected.path;
+    struct stat stats = inspected.stats;
 
-    if (is_symlink && !scanner->follow_symlinks && !scanner->copy_links && !scanner->safe_links &&
-        !scanner->copy_unsafe_links) {
-      free(cur_path);
-      continue;
-    }
-
-    if (is_symlink && scanner->safe_links) {
-      char link_target[4096];
-      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
-      if (len < 0) {
-        free(cur_path);
-        continue;
-      }
-      link_target[len] = '\0';
-      if (link_target[0] == '/' ||
-          !safe_relative_link(scanner->current_path, scanner->current_path, link_target)) {
-        free(cur_path);
-        continue;
-      }
-    }
-
-    if (is_symlink && scanner->copy_unsafe_links && !scanner->copy_links) {
-      char link_target[4096];
-      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
-      if (len < 0) {
-        free(cur_path);
-        continue;
-      }
-      link_target[len] = '\0';
-      bool unsafe = (link_target[0] == '/');
-      if (!unsafe) {
-        free(cur_path);
-        continue;
-      }
-    }
-
-    bool use_lstat = is_symlink && scanner->follow_symlinks && !scanner->copy_links;
-    if (use_lstat) {
-      stats = lstats;
-    } else {
-      if (stat(cur_path, &stats) != 0) {
-        free(cur_path);
-        continue;
-      }
-    }
-
-    if (S_ISDIR(stats.st_mode)) {
+    if (inspected.is_directory) {
       int next_depth = scanner->current_depth + 1;
       if (scanner->max_depth <= 0 || next_depth < scanner->max_depth) {
         DirEntry* de = dir_entry_create(cur_path, next_depth);
@@ -254,38 +299,6 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         free(cur_path);
         continue;
       }
-      bool excluded = false;
-      for (int i = 0; i < scanner->exclude_count; i++) {
-        if (glob_match(scanner->exclude_patterns[i], entry->d_name)) {
-          excluded = true;
-          break;
-        }
-      }
-      if (excluded) {
-        free(cur_path);
-        continue;
-      }
-
-      if (scanner->include_count > 0) {
-        bool included = false;
-        for (int i = 0; i < scanner->include_count; i++) {
-          if (glob_match(scanner->include_patterns[i], entry->d_name)) {
-            included = true;
-            break;
-          }
-        }
-        if (!included) {
-          free(cur_path);
-          continue;
-        }
-      }
-
-      if ((scanner->max_size > 0 && (unsigned long long)stats.st_size > scanner->max_size) ||
-          (scanner->min_size > 0 && (unsigned long long)stats.st_size < scanner->min_size)) {
-        free(cur_path);
-        continue;
-      }
-
       File* file = file_create(cur_path);
       if (file == NULL) {
         free(cur_path);
@@ -336,29 +349,13 @@ typedef struct {
   ParallelScanner* ps;
   char** dirs;
   int dir_count;
-  bool use_metadata;
-  unsigned long long chunk_size;
-  char** exclude_patterns;
-  int exclude_count;
-  char** include_patterns;
-  int include_count;
-  unsigned long long max_size;
-  unsigned long long min_size;
-  int max_depth;
-  bool follow_symlinks;
-  bool copy_links;
-  bool safe_links;
-  bool copy_unsafe_links;
-  bool checksum;
+  ScannerOptions options;
 } ParallelWorkerArg;
 
 static int parallel_worker_thread(void* arg) {
   ParallelWorkerArg* wa = (ParallelWorkerArg*)arg;
   for (int i = 0; i < wa->dir_count; i++) {
-    DirectoryScanner* ds = directory_scanner_create(
-        wa->dirs[i], wa->use_metadata, wa->chunk_size, wa->exclude_patterns, wa->exclude_count,
-        wa->include_patterns, wa->include_count, wa->max_size, wa->min_size, wa->max_depth,
-        wa->follow_symlinks, wa->copy_links, wa->safe_links, wa->copy_unsafe_links, wa->checksum);
+    DirectoryScanner* ds = directory_scanner_create_with_options(wa->dirs[i], &wa->options);
     if (!ds) {
       mtx_lock(&wa->ps->result_mutex);
       wa->ps->failed = true;
@@ -366,6 +363,8 @@ static int parallel_worker_thread(void* arg) {
       cnd_broadcast(&wa->ps->result_not_empty);
       cnd_broadcast(&wa->ps->result_not_full);
       mtx_unlock(&wa->ps->result_mutex);
+      for (int j = i; j < wa->dir_count; j++)
+        free(wa->dirs[j]);
       break;
     }
     Chunk* chunk;
@@ -401,13 +400,22 @@ static int parallel_worker_thread(void* arg) {
   return thrd_success;
 }
 
-ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata,
-                                         unsigned long long chunk_size, char** exclude_patterns,
-                                         int exclude_count, char** include_patterns,
-                                         int include_count, unsigned long long max_size,
-                                         unsigned long long min_size, int max_depth,
-                                         int num_threads, bool follow_symlinks, bool copy_links,
-                                         bool safe_links, bool copy_unsafe_links, bool checksum) {
+static void parallel_scanner_creation_failed(ParallelScanner* ps) {
+  mtx_lock(&ps->result_mutex);
+  ps->failed = true;
+  atomic_store(&ps->cancelled, true);
+  ps->expected_threads = ps->created_threads;
+  if (ps->completed >= ps->expected_threads)
+    ps->done = true;
+  cnd_broadcast(&ps->result_not_empty);
+  cnd_broadcast(&ps->result_not_full);
+  mtx_unlock(&ps->result_mutex);
+}
+
+ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
+                                                      const ScannerOptions* options) {
+  if (!root_directory || !options)
+    return NULL;
   ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
   if (!ps)
     return NULL;
@@ -460,105 +468,27 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     parallel_scanner_destroy(ps);
     return NULL;
   }
-  struct dirent* entry;
+  const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    char* cur_path = path_cat(root_directory, entry->d_name);
-    if (!cur_path)
-      continue;
-    struct stat lstats;
-    if (lstat(cur_path, &lstats) != 0) {
-      free(cur_path);
-      continue;
-    }
-    bool is_symlink = S_ISLNK(lstats.st_mode);
-
-    // Skip symlinks unless the user explicitly enabled following/copying them.
-    if (is_symlink && !follow_symlinks && !copy_links && !safe_links && !copy_unsafe_links) {
-      free(cur_path);
+    ScannerEntry inspected;
+    int inspection =
+        scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);
+    if (inspection < 0) {
+      ps->failed = true;
       continue;
     }
-
-    // --safe-links: reject symlinks pointing outside the source tree.
-    if (is_symlink && safe_links) {
-      char link_target[4096];
-      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
-      if (len < 0) {
-        free(cur_path);
-        continue;
-      }
-      link_target[len] = 0;
-      if (link_target[0] == '/' ||
-          !safe_relative_link(root_directory, root_directory, link_target)) {
-        free(cur_path);
-        continue;
-      }
-    }
-
-    // --copy-unsafe-links (without --copy-links): only copy absolute symlinks.
-    if (is_symlink && copy_unsafe_links && !copy_links) {
-      char link_target[4096];
-      ssize_t len = readlink(cur_path, link_target, sizeof(link_target) - 1);
-      if (len < 0) {
-        free(cur_path);
-        continue;
-      }
-      link_target[len] = 0;
-      bool unsafe = (link_target[0] == '/');
-      if (!unsafe) {
-        free(cur_path);
-        continue;
-      }
-    }
-
-    // Determine whether to use lstat or stat results for the entry.
-    struct stat st;
-    bool use_lstat_res = is_symlink && follow_symlinks && !copy_links;
-    if (use_lstat_res) {
-      st = lstats;
-    } else {
-      if (stat(cur_path, &st) != 0) {
-        free(cur_path);
-        continue;
-      }
-    }
-
-    if (S_ISDIR(st.st_mode)) {
+    if (inspection == 0)
+      continue;
+    char* cur_path = inspected.path;
+    struct stat st = inspected.stats;
+    if (inspected.is_directory) {
       if (!array_list_add(subdirs, cur_path)) {
         free(cur_path);
         ps->failed = true;
       }
     } else {
-      bool excluded = false;
-      for (int i = 0; i < exclude_count; i++) {
-        if (glob_match(exclude_patterns[i], entry->d_name)) {
-          excluded = true;
-          break;
-        }
-      }
-      if (excluded) {
-        free(cur_path);
-        continue;
-      }
-      if (include_count > 0) {
-        bool included = false;
-        for (int i = 0; i < include_count; i++) {
-          if (glob_match(include_patterns[i], entry->d_name)) {
-            included = true;
-            break;
-          }
-        }
-        if (!included) {
-          free(cur_path);
-          continue;
-        }
-      }
-      if ((max_size > 0 && (unsigned long long)st.st_size > max_size) ||
-          (min_size > 0 && (unsigned long long)st.st_size < min_size)) {
-        free(cur_path);
-        continue;
-      }
       File* file = file_create(cur_path);
       free(cur_path);
       if (!file) {
@@ -566,9 +496,9 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         continue;
       }
       file->data->size = st.st_size;
-      if (use_metadata)
+      if (options->use_metadata)
         file->metadata = file_metadata_create(&st);
-      if (use_metadata && !file->metadata) {
+      if (options->use_metadata && !file->metadata) {
         file_destroy(file);
         ps->failed = true;
         continue;
@@ -581,7 +511,7 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
   }
   closedir(dir);
 
-  unsigned long long cs = chunk_size > 0 ? chunk_size : DESIRED_CHUNK_SIZE;
+  unsigned long long cs = options->chunk_size > 0 ? options->chunk_size : DESIRED_CHUNK_SIZE;
   if (root_files->size > 0) {
     ArrayList* batch = array_list_create(NULL);
     if (!batch) {
@@ -604,7 +534,6 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         void** items = array_list_to_array(batch);
         if (!items) {
           ps->failed = true;
-          batch->item_destroyer = file_destroy;
           array_list_delete(batch);
           batch = NULL;
           break;
@@ -613,11 +542,13 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         free(items);
         if (!c) {
           ps->failed = true;
-          batch->item_destroyer = file_destroy;
           array_list_delete(batch);
           batch = NULL;
           break;
         }
+        int batch_start = i - batch->size + 1;
+        for (int j = batch_start; j <= i; j++)
+          root_files->items[j] = NULL;
         batch->item_destroyer = NULL;
         array_list_delete(batch);
         batch = NULL;
@@ -644,11 +575,10 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
       array_list_delete(batch);
     }
     ps->initial_chunk = first;
-    root_files->item_destroyer = NULL;
   }
   array_list_delete(root_files);
 
-  int n = num_threads > 0 ? num_threads : 4;
+  int n = options->num_threads > 0 ? options->num_threads : 4;
   if (n > subdirs->size)
     n = subdirs->size > 0 ? subdirs->size : 1;
 
@@ -671,14 +601,14 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
         break;
       ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
       if (!wa) {
-        ps->failed = true;
+        parallel_scanner_creation_failed(ps);
         break;
       }
       wa->ps = ps;
       wa->dirs = calloc(count, sizeof(char*));
       if (!wa->dirs) {
         free(wa);
-        ps->failed = true;
+        parallel_scanner_creation_failed(ps);
         break;
       }
       bool dup_ok = true;
@@ -692,37 +622,19 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
           free(wa->dirs[j]);
         free(wa->dirs);
         free(wa);
-        ps->failed = true;
+        parallel_scanner_creation_failed(ps);
         break;
       }
       wa->dir_count = count;
-      wa->use_metadata = use_metadata;
-      wa->chunk_size = cs;
-      wa->exclude_patterns = exclude_patterns;
-      wa->exclude_count = exclude_count;
-      wa->include_patterns = include_patterns;
-      wa->include_count = include_count;
-      wa->max_size = max_size;
-      wa->min_size = min_size;
-      wa->max_depth = max_depth;
-      wa->follow_symlinks = follow_symlinks;
-      wa->copy_links = copy_links;
-      wa->safe_links = safe_links;
-      wa->copy_unsafe_links = copy_unsafe_links;
-      wa->checksum = checksum;
+      wa->options = *options;
+      wa->options.chunk_size = cs;
       start += count;
       if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
         for (int j = 0; j < count; j++)
           free(wa->dirs[j]);
         free(wa->dirs);
         free(wa);
-        ps->failed = true;
-        atomic_store(&ps->cancelled, true);
-        ps->expected_threads = ps->created_threads;
-        mtx_lock(&ps->result_mutex);
-        cnd_broadcast(&ps->result_not_empty);
-        cnd_broadcast(&ps->result_not_full);
-        mtx_unlock(&ps->result_mutex);
+        parallel_scanner_creation_failed(ps);
         break;
       }
       ps->num_threads++;
@@ -733,6 +645,20 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
   return ps;
 }
 
+ParallelScanner* parallel_scanner_create(const char* root_directory, bool use_metadata,
+                                         unsigned long long chunk_size, char** exclude_patterns,
+                                         int exclude_count, char** include_patterns,
+                                         int include_count, unsigned long long max_size,
+                                         unsigned long long min_size, int max_depth,
+                                         int num_threads, bool follow_symlinks, bool copy_links,
+                                         bool safe_links, bool copy_unsafe_links, bool checksum) {
+  ScannerOptions options = {use_metadata,     chunk_size,        exclude_patterns, exclude_count,
+                            include_patterns, include_count,     max_size,         min_size,
+                            max_depth,        num_threads,       follow_symlinks,  copy_links,
+                            safe_links,       copy_unsafe_links, checksum};
+  return parallel_scanner_create_with_options(root_directory, &options);
+}
+
 Chunk* parallel_scanner_next(ParallelScanner* ps) {
   if (ps->initial_chunk) {
     Chunk* c = ps->initial_chunk;
@@ -741,6 +667,11 @@ Chunk* parallel_scanner_next(ParallelScanner* ps) {
   }
   if (ps->num_threads == 0) {
     mtx_lock(&ps->result_mutex);
+    if (!queue_is_empty(ps->result_queue)) {
+      Chunk* chunk = queue_dequeue(ps->result_queue);
+      mtx_unlock(&ps->result_mutex);
+      return chunk;
+    }
     ps->done = true;
     mtx_unlock(&ps->result_mutex);
     return NULL;

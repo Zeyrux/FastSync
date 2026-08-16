@@ -237,6 +237,10 @@ bool has_path_traversal(const char* path) {
   return false;
 }
 
+bool utils_valid_batch_path(const char* path) {
+  return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path);
+}
+
 char* path_cat(const char* path1, const char* path2) {
   if (path1 == NULL || *path1 == '\0')
     return str_dup(path2);
