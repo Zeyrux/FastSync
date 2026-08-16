@@ -148,7 +148,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     data_pointer += sizeof(size_t);
     remaining_size -= sizeof(size_t);
 
-    if (remaining_size < path_len) {
+    if (path_len > SIZE_MAX - 1 || remaining_size < path_len) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path");
       array_list_delete(files);
       return NULL;
@@ -279,8 +279,11 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
   Chunk* chunk = chunk_create(file_array, files->size);
 
   free(file_array);
-  if (chunk != NULL)
-    files->item_destroyer = NULL;
+  if (chunk == NULL) {
+    array_list_delete(files);
+    return NULL;
+  }
+  files->item_destroyer = NULL;
   array_list_delete(files);
 
   return chunk;

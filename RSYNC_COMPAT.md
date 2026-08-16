@@ -152,14 +152,14 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-S`, `--sparse` | Sparse block handling | ✅ Implemented | `preserve_sparse` config field |
+| `-S`, `--sparse` | Sparse block handling | ⚠️ Partial | Flag is accepted, but full hole preservation is not implemented |
 | `--preallocate` | Allocate dest files before writing | ❌ Not Implemented | |
 
 ## 11. Checksum & Comparison
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `--checksum` | Skip based on checksum | ❌ Not Implemented | Removed because it had no effect; `-c` means compression |
+| `--checksum` | Skip based on checksum | ✅ Implemented | With `--incremental`, compares xxHash64 content checksums; `-c` remains compression |
 | `--checksum-choice=STR` | Choose checksum algorithm | ❌ Not Implemented | xxHash used internally |
 | `--compare-dest=DIR` | Compare dest files relative to DIR | ❌ Not Implemented | Removed because it had no effect |
 | `--copy-dest=DIR` | Include copies of unchanged files | ❌ Not Implemented | Removed because it had no effect |

@@ -151,6 +151,10 @@ int tcp_get_contimeout_sec(void) {
   return g_contimeout_sec;
 }
 
+int tcp_get_timeout_sec(void) {
+  return g_timeout_sec;
+}
+
 static void tcp_apply_socket_timeout(int fd) {
   struct timeval tv;
   tv.tv_sec = g_timeout_sec;
@@ -173,7 +177,7 @@ Client* client_create() {
   return client;
 }
 
-bool client_connect(Client* client, char* host, int port) {
+bool tcp_connect_socket(Client* client, char* host, int port) {
   struct addrinfo hints;
   struct addrinfo* result;
   memset(&hints, 0, sizeof(hints));
@@ -222,6 +226,12 @@ bool client_connect(Client* client, char* host, int port) {
     return false;
   }
 
+  return true;
+}
+
+bool client_connect(Client* client, char* host, int port) {
+  if (!tcp_connect_socket(client, host, port))
+    return false;
   tcp_apply_socket_timeout(client->file_descriptor);
   return true;
 }

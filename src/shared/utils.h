@@ -16,5 +16,6 @@ bool utils_set_authorized_root(int fd, const char* canonical_path);
  * callers should use utils_set_authorized_root with the canonical identity. */
 void utils_set_authorized_root_fd(int fd);
 bool has_path_traversal(const char* path);
+bool utils_valid_batch_path(const char* path);
 
 #endif

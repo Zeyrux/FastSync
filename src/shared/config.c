@@ -214,102 +214,130 @@ void config_delete(Config* config) {
   free(config);
 }
 
-/* Wire format order (must match config_receive and be updated when PROTOCOL_VERSION bumps):
- * version, send_directory, receive_root_directory, save_to_disk, use_multithreading,
- * use_chunk_serialization, use_compression, use_metadata, compression_level, chunk_size,
- * use_sendfile, use_delete, use_incremental, use_delta, delta_block_size, delta_max_file_size,
- * backup, backup_dir, follow_symlinks, copy_links, safe_links, copy_unsafe_links,
- * preserve_hard_links, preserve_acls, preserve_xattrs, preserve_devices, preserve_sparse,
- * update, inplace, append, append_verify, delete_excluded, delete_after, max_delete, relative,
- * prune_empty_dirs, temp_dir, partial, partial_dir, suffix, delete_before, checksum,
- * compress_choice, status
- */
+/* Each helper is deliberately ordered to match the wire format. Keep the
+ * helper call order in config_send and config_receive unchanged when adding
+ * fields. */
+static bool send_core_fields(int fd, const Config* c) {
+  return send_str(fd, c->version) && send_str(fd, c->send_directory) &&
+         send_str(fd, c->receive_root_directory) && send_int(fd, c->save_to_disk) &&
+         send_int(fd, c->use_multithreading) && send_int(fd, c->use_chunk_serialization) &&
+         send_int(fd, c->use_compression) && send_int(fd, c->use_metadata) &&
+         send_int(fd, c->compression_level) &&
+         send_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)) && send_int(fd, c->use_sendfile);
+}
+
+static bool send_delta_fields(int fd, const Config* c) {
+  return send_int(fd, c->use_delete) && send_int(fd, c->use_incremental) &&
+         send_int(fd, c->use_delta) &&
+         send_n_data(fd, &c->delta_block_size, sizeof(c->delta_block_size)) &&
+         send_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
+}
+
+static bool send_file_options(int fd, const Config* c) {
+  return send_int(fd, c->backup) && send_str(fd, c->backup_dir ? c->backup_dir : "") &&
+         send_int(fd, c->follow_symlinks) && send_int(fd, c->copy_links) &&
+         send_int(fd, c->safe_links) && send_int(fd, c->copy_unsafe_links) &&
+         send_int(fd, c->preserve_hard_links) && send_int(fd, c->preserve_acls) &&
+         send_int(fd, c->preserve_xattrs) && send_int(fd, c->preserve_devices) &&
+         send_int(fd, c->preserve_sparse);
+}
+
+static bool send_selection_options(int fd, const Config* c) {
+  return send_int(fd, c->update) && send_int(fd, c->inplace) && send_int(fd, c->append) &&
+         send_int(fd, c->append_verify) && send_int(fd, c->delete_excluded) &&
+         send_int(fd, c->delete_after) && send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) &&
+         send_int(fd, c->relative) && send_int(fd, c->prune_empty_dirs);
+}
+
+static bool send_resume_options(int fd, const Config* c) {
+  return send_str(fd, c->temp_dir ? c->temp_dir : "") && send_int(fd, c->partial) &&
+         send_str(fd, c->partial_dir ? c->partial_dir : "") &&
+         send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
+         send_int(fd, c->checksum) && send_str(fd, c->compress_choice ? c->compress_choice : "");
+}
+
+static bool receive_core_fields(int fd, Config* c) {
+  int value;
+  c->send_directory = receive_str(fd);
+  c->receive_root_directory = receive_str(fd);
+  if (!c->send_directory || !c->receive_root_directory)
+    return false;
+  if (!receive_wire_bool(fd, &c->save_to_disk) || !receive_wire_bool(fd, &c->use_multithreading) ||
+      !receive_wire_bool(fd, &c->use_chunk_serialization) ||
+      !receive_wire_bool(fd, &c->use_compression) || !receive_wire_bool(fd, &c->use_metadata))
+    return false;
+  if (!receive_int(fd, &value))
+    return false;
+  c->compression_level = value;
+  if (!receive_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)))
+    return false;
+  if (!receive_wire_bool(fd, &c->use_sendfile))
+    return false;
+  return true;
+}
+
+static bool receive_delta_fields(int fd, Config* c) {
+  if (!receive_wire_bool(fd, &c->use_delete))
+    return false;
+  if (!receive_wire_bool(fd, &c->use_incremental))
+    return false;
+  if (!receive_wire_bool(fd, &c->use_delta))
+    return false;
+  return receive_n_data(fd, &c->delta_block_size, sizeof(c->delta_block_size)) &&
+         receive_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
+}
+
+static bool receive_file_options(int fd, Config* c) {
+  if (!receive_wire_bool(fd, &c->backup))
+    return false;
+  c->backup_dir = receive_str(fd);
+  if (!c->backup_dir)
+    return false;
+  bool* flags[] = {&c->follow_symlinks,   &c->copy_links,          &c->safe_links,
+                   &c->copy_unsafe_links, &c->preserve_hard_links, &c->preserve_acls,
+                   &c->preserve_xattrs,   &c->preserve_devices,    &c->preserve_sparse};
+  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+    if (!receive_wire_bool(fd, flags[i]))
+      return false;
+  }
+  return true;
+}
+
+static bool receive_selection_options(int fd, Config* c) {
+  bool* flags[] = {&c->update,        &c->inplace,         &c->append,
+                   &c->append_verify, &c->delete_excluded, &c->delete_after};
+  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+    if (!receive_wire_bool(fd, flags[i]))
+      return false;
+  }
+  if (!receive_n_data(fd, &c->max_delete, sizeof(c->max_delete)))
+    return false;
+  if (!receive_wire_bool(fd, &c->relative))
+    return false;
+  if (!receive_wire_bool(fd, &c->prune_empty_dirs))
+    return false;
+  return true;
+}
+
+static bool receive_resume_options(int fd, Config* c) {
+  c->temp_dir = receive_str(fd);
+  if (!c->temp_dir || !receive_wire_bool(fd, &c->partial))
+    return false;
+  c->partial_dir = receive_str(fd);
+  c->suffix = c->partial_dir ? receive_str(fd) : NULL;
+  if (!c->partial_dir || !c->suffix || !receive_wire_bool(fd, &c->delete_before))
+    return false;
+  if (!receive_wire_bool(fd, &c->checksum))
+    return false;
+  c->compress_choice = receive_str(fd);
+  return c->compress_choice != NULL;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
-  if (!send_str(file_descriptor, config->version))
-    return false;
-  if (!send_str(file_descriptor, config->send_directory))
-    return false;
-  if (!send_str(file_descriptor, config->receive_root_directory))
-    return false;
-  if (!send_int(file_descriptor, config->save_to_disk))
-    return false;
-  if (!send_int(file_descriptor, config->use_multithreading))
-    return false;
-  if (!send_int(file_descriptor, config->use_chunk_serialization))
-    return false;
-  if (!send_int(file_descriptor, config->use_compression))
-    return false;
-  if (!send_int(file_descriptor, config->use_metadata))
-    return false;
-  if (!send_int(file_descriptor, config->compression_level))
-    return false;
-  if (!send_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
-    return false;
-  if (!send_int(file_descriptor, config->use_sendfile))
-    return false;
-  if (!send_int(file_descriptor, config->use_delete))
-    return false;
-  if (!send_int(file_descriptor, config->use_incremental))
-    return false;
-  if (!send_int(file_descriptor, config->use_delta))
-    return false;
-  if (!send_n_data(file_descriptor, &config->delta_block_size, sizeof(config->delta_block_size)))
-    return false;
-  if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
-    return false;
-  if (!send_int(file_descriptor, config->backup))
-    return false;
-  if (!send_str(file_descriptor, config->backup_dir ? config->backup_dir : ""))
-    return false;
-  if (!send_int(file_descriptor, config->follow_symlinks))
-    return false;
-  if (!send_int(file_descriptor, config->copy_links))
-    return false;
-  if (!send_int(file_descriptor, config->safe_links))
-    return false;
-  if (!send_int(file_descriptor, config->copy_unsafe_links))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_hard_links))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_acls))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_xattrs))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_devices))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_sparse))
-    return false;
-  if (!send_int(file_descriptor, config->update))
-    return false;
-  if (!send_int(file_descriptor, config->inplace))
-    return false;
-  if (!send_int(file_descriptor, config->append))
-    return false;
-  if (!send_int(file_descriptor, config->append_verify))
-    return false;
-  if (!send_int(file_descriptor, config->delete_excluded))
-    return false;
-  if (!send_int(file_descriptor, config->delete_after))
-    return false;
-  if (!send_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
-    return false;
-  if (!send_int(file_descriptor, config->relative))
-    return false;
-  if (!send_int(file_descriptor, config->prune_empty_dirs))
-    return false;
-  if (!send_str(file_descriptor, config->temp_dir ? config->temp_dir : ""))
-    return false;
-  if (!send_int(file_descriptor, config->partial))
-    return false;
-  if (!send_str(file_descriptor, config->partial_dir ? config->partial_dir : ""))
-    return false;
-  if (!send_str(file_descriptor, config->suffix ? config->suffix : ""))
-    return false;
-  if (!send_int(file_descriptor, config->delete_before))
-    return false;
-  if (!send_int(file_descriptor, config->checksum))
-    return false;
-  if (!send_str(file_descriptor, config->compress_choice ? config->compress_choice : ""))
+  if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
+      !send_file_options(file_descriptor, config) ||
+      !send_selection_options(file_descriptor, config) ||
+      !send_resume_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -321,106 +349,25 @@ bool config_send(int file_descriptor, const Config* config) {
   return true;
 }
 
-/* Wire format order: see the comment above config_send. */
 Config* config_receive(int file_descriptor) {
-  Config* config = (Config*)malloc(sizeof(Config));
-  if (config == NULL)
+  Config* config = config_create();
+  if (!config)
     return NULL;
-  config_set_defaults(config);
   free(config->version);
   config->version = receive_str(file_descriptor);
-  if (!config->version) {
-    free(config->server_host);
-    free(config);
-    return NULL;
-  }
+  if (!config->version)
+    goto error;
   if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
     fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n", config->version,
             PROTOCOL_VERSION);
-    free(config->version);
-    free(config->server_host);
-    free(config);
     send_status(file_descriptor, STATUS_ERROR);
-    return NULL;
+    goto error;
   }
-  config->send_directory = receive_str(file_descriptor);
-  if (!config->send_directory) {
-    free(config->version);
-    free(config->server_host);
-    free(config);
-    return NULL;
-  }
-  config->receive_root_directory = receive_str(file_descriptor);
-  if (!config->receive_root_directory) {
-    free(config->version);
-    free(config->send_directory);
-    free(config->server_host);
-    free(config);
-    return NULL;
-  }
-  int tmp;
-  if (!receive_wire_bool(file_descriptor, &config->save_to_disk) ||
-      !receive_wire_bool(file_descriptor, &config->use_multithreading) ||
-      !receive_wire_bool(file_descriptor, &config->use_chunk_serialization) ||
-      !receive_wire_bool(file_descriptor, &config->use_compression) ||
-      !receive_wire_bool(file_descriptor, &config->use_metadata))
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->compression_level = tmp;
-  if (!receive_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
-    goto error;
-  if (!receive_wire_bool(file_descriptor, &config->use_sendfile) ||
-      !receive_wire_bool(file_descriptor, &config->use_delete) ||
-      !receive_wire_bool(file_descriptor, &config->use_incremental) ||
-      !receive_wire_bool(file_descriptor, &config->use_delta))
-    goto error;
-  if (!receive_n_data(file_descriptor, &config->delta_block_size, sizeof(config->delta_block_size)))
-    goto error;
-  if (!receive_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
-    goto error;
-  if (!receive_wire_bool(file_descriptor, &config->backup))
-    goto error;
-  config->backup_dir = receive_str(file_descriptor);
-  if (config->backup_dir == NULL)
-    goto error;
-  if (!receive_wire_bool(file_descriptor, &config->follow_symlinks) ||
-      !receive_wire_bool(file_descriptor, &config->copy_links) ||
-      !receive_wire_bool(file_descriptor, &config->safe_links) ||
-      !receive_wire_bool(file_descriptor, &config->copy_unsafe_links) ||
-      !receive_wire_bool(file_descriptor, &config->preserve_hard_links) ||
-      !receive_wire_bool(file_descriptor, &config->preserve_acls) ||
-      !receive_wire_bool(file_descriptor, &config->preserve_xattrs) ||
-      !receive_wire_bool(file_descriptor, &config->preserve_devices) ||
-      !receive_wire_bool(file_descriptor, &config->preserve_sparse) ||
-      !receive_wire_bool(file_descriptor, &config->update) ||
-      !receive_wire_bool(file_descriptor, &config->inplace) ||
-      !receive_wire_bool(file_descriptor, &config->append) ||
-      !receive_wire_bool(file_descriptor, &config->append_verify) ||
-      !receive_wire_bool(file_descriptor, &config->delete_excluded) ||
-      !receive_wire_bool(file_descriptor, &config->delete_after))
-    goto error;
-  if (!receive_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
-    goto error;
-  if (!receive_wire_bool(file_descriptor, &config->relative) ||
-      !receive_wire_bool(file_descriptor, &config->prune_empty_dirs))
-    goto error;
-  config->temp_dir = receive_str(file_descriptor);
-  if (config->temp_dir == NULL)
-    goto error;
-  if (!receive_wire_bool(file_descriptor, &config->partial))
-    goto error;
-  config->partial_dir = receive_str(file_descriptor);
-  if (config->partial_dir == NULL)
-    goto error;
-  config->suffix = receive_str(file_descriptor);
-  if (config->suffix == NULL)
-    goto error;
-  if (!receive_wire_bool(file_descriptor, &config->delete_before) ||
-      !receive_wire_bool(file_descriptor, &config->checksum))
-    goto error;
-  config->compress_choice = receive_str(file_descriptor);
-  if (config->compress_choice == NULL)
+  if (!receive_core_fields(file_descriptor, config) ||
+      !receive_delta_fields(file_descriptor, config) ||
+      !receive_file_options(file_descriptor, config) ||
+      !receive_selection_options(file_descriptor, config) ||
+      !receive_resume_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
@@ -438,15 +385,6 @@ Config* config_receive(int file_descriptor) {
   return config;
 
 error:
-  free(config->version);
-  free(config->send_directory);
-  free(config->receive_root_directory);
-  free(config->server_host);
-  free(config->backup_dir);
-  free(config->temp_dir);
-  free(config->partial_dir);
-  free(config->suffix);
-  free(config->compress_choice);
-  free(config);
+  config_delete(config);
   return NULL;
 }

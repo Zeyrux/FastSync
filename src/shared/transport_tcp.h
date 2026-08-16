@@ -30,9 +30,11 @@ void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
 void server_delete(Server** server);
 Client* client_create();
 bool client_connect(Client* client, char* host, int port);
+bool tcp_connect_socket(Client* client, char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec);
 int tcp_get_contimeout_sec(void);
+int tcp_get_timeout_sec(void);
 
 #endif

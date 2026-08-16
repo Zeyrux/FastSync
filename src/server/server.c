@@ -1,22 +1,20 @@
-#include "array_list.h"
-#include "chunk.h"
 #include "config.h"
-#include "data.h"
+#include "chunk.h"
 #include "file.h"
 #include "log.h"
 #include "multiprocessing.h"
-#include "protocol.h"
 #include "queue.h"
+#include "receiver.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
 #include "unistd.h"
 #include "utils.h"
+#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <openssl/x509.h>
@@ -44,14 +42,19 @@ static bool tls_client_identity_allowed(SSL* ssl) {
   return allowed;
 }
 
+static void release_authorization(void) {
+  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root_fd(-1);
+  if (authorized_root_fd >= 0)
+    close(authorized_root_fd);
+  authorized_root_fd = -1;
+  free(authorized_root);
+  authorized_root = NULL;
+}
+
 static bool path_is_within(const char* root, const char* path) {
   size_t n = strlen(root);
   return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
-}
-
-static bool valid_batch_path(const char* path) {
-  return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path) &&
-         strchr(path, '\0') == path + strlen(path);
 }
 
 static bool __attribute__((unused)) configure_authorization(const char* root) {
@@ -158,7 +161,7 @@ int receive_files(Config* config, int fd) {
           free(check_path);
           return -1;
         }
-        if (!valid_batch_path(check_path)) {
+        if (!utils_valid_batch_path(check_path)) {
           free(check_path);
           send_status(fd, STATUS_ERROR);
           return -1;
@@ -218,22 +221,29 @@ int receive_files(Config* config, int fd) {
 
 void handler(int file_descriptor) {
   SSL* ssl = io_get_ssl();
+  ProtocolSession session;
+  protocol_session_init(&session, file_descriptor, file_descriptor);
+  protocol_session_set_ssl(&session, ssl);
+  protocol_session_bind(&session);
   Config* config = config_receive(file_descriptor);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
     close(file_descriptor);
+    protocol_session_unbind();
     return;
   }
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
     config_delete(config);
     close(file_descriptor);
+    protocol_session_unbind();
     return;
   }
   if (!allow_unauthenticated && ssl == NULL) {
     log_message(LOG_LEVEL_ERROR, "Rejected unauthenticated plaintext connection");
     config_delete(config);
     close(file_descriptor);
+    protocol_session_unbind();
     return;
   }
   if (ssl && required_client_cn && !tls_client_identity_allowed(ssl)) {
@@ -263,6 +273,7 @@ void handler(int file_descriptor) {
   if (!config->receive_root_directory) {
     config_delete(config);
     close(file_descriptor);
+    protocol_session_unbind();
     return;
   }
   config->use_delete = config->use_delete && allow_delete;
@@ -271,6 +282,7 @@ void handler(int file_descriptor) {
     if (q == NULL) {
       config_delete(config);
       close(file_descriptor);
+      protocol_session_unbind();
       return;
     }
     PipelineContextReceiver* context =
@@ -279,14 +291,15 @@ void handler(int file_descriptor) {
       queue_destroy(q);
       config_delete(config);
       close(file_descriptor);
+      protocol_session_unbind();
       return;
     }
+    context->session.total_allocated_bytes = session.total_allocated_bytes;
     thrd_t receiver, writer;
-    bool receiver_created = false;
+    bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
     bool writer_created = false;
-    receiver_created = (thrd_create(&receiver, receive_thread, context) == thrd_success);
     if (receiver_created)
-      writer_created = (thrd_create(&writer, write_thread, context) == thrd_success);
+      writer_created = thrd_create(&writer, write_thread, context) == thrd_success;
     if (!receiver_created || !writer_created) {
       perror("Error creating Threads");
       if (receiver_created) {
@@ -303,22 +316,23 @@ void handler(int file_descriptor) {
       if (writer_created)
         thrd_join(writer, NULL);
       pipeline_context_receiver_destroy(context);
+      protocol_session_unbind();
       return;
     }
     int receiver_result;
     int writer_result;
     thrd_join(receiver, &receiver_result);
     thrd_join(writer, &writer_result);
-    if (receiver_result == thrd_success && writer_result == thrd_success)
-      send_status(file_descriptor, STATUS_OK);
-    else
-      send_status(file_descriptor, STATUS_ERROR);
+    send_status(file_descriptor, receiver_result == thrd_success && writer_result == thrd_success
+                                     ? STATUS_OK
+                                     : STATUS_ERROR);
     pipeline_context_receiver_destroy(context);
   } else {
-    if (receive_files(config, file_descriptor) != 0)
+    if (receiver_receive_files(config, file_descriptor) != 0)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
     config_delete(config);
   }
+  protocol_session_unbind();
   close(file_descriptor);
 }
 
@@ -327,16 +341,14 @@ static Server* g_server = NULL;
 
 static void cleanup(int sig) {
   (void)sig;
-  if (g_server) {
+  if (g_server)
     server_delete(&g_server);
-  }
   _exit(0);
 }
 
 static void print_server_usage(void) {
   printf("FastSync Server\n");
-  printf("Usage: fastsync-server [options]\n");
-  printf("\n");
+  printf("Usage: fastsync-server [options]\n\n");
   printf("Options:\n");
   printf("  --stdio             Run in stdio mode (SSH transport)\n");
   printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
@@ -354,9 +366,7 @@ static void print_server_usage(void) {
 
 int main(int argc, char* argv[]) {
   bool use_tls = false;
-  char* tls_cert = NULL;
-  char* tls_key = NULL;
-  char* tls_ca = NULL;
+  char *tls_cert = NULL, *tls_key = NULL, *tls_ca = NULL;
   int port = 8080;
   const char* destination_root = ".";
   bool stdio_mode = false;
@@ -400,11 +410,8 @@ int main(int argc, char* argv[]) {
       return 1;
     }
   }
-
-  if (tls_ca && !use_tls) {
+  if (tls_ca && !use_tls)
     log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
-  }
-
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
   if (!configure_authorization(destination_root)) {
@@ -416,33 +423,35 @@ int main(int argc, char* argv[]) {
     allow_unauthenticated = true;
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
     handler(STDIN_FILENO);
-    file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root(-1, NULL);
-    close(authorized_root_fd);
-    free(authorized_root);
+    release_authorization();
     return 0;
   }
   g_server = server_create(port);
-  if (g_server == NULL) {
+  if (!g_server) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
+    release_authorization();
     return 1;
   }
   if (use_tls) {
     if (!tls_cert || !tls_key || !tls_ca || !required_client_cn) {
       fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
       server_delete(&g_server);
+      release_authorization();
       return 1;
     }
     tls_global_init();
     if (!server_create_tls(g_server, tls_cert, tls_key, tls_ca)) {
       log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
       server_delete(&g_server);
+      release_authorization();
       return 1;
     }
     server_listen_tls(g_server, handler);
   } else {
     server_listen(g_server, handler);
   }
+  server_delete(&g_server);
+  release_authorization();
   return 0;
 }
-#endif /* !FASTSYNC_SERVER_AS_LIB */
+#endif

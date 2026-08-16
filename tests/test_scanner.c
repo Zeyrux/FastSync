@@ -385,6 +385,34 @@ static void test_scanner_no_patterns() {
   rmdir(dir);
 }
 
+static void test_parallel_scanner_root_chunks_without_workers() {
+  const char* dir = "test_parallel_scan_root";
+  const char* file1 = "test_parallel_scan_root/a.txt";
+  const char* file2 = "test_parallel_scan_root/b.txt";
+
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
+  create_test_file(file1, "a");
+  create_test_file(file2, "b");
+
+  ParallelScanner* scanner = parallel_scanner_create(dir, false, 1, NULL, 0, NULL, 0, 0, 0, 0, 0,
+                                                     false, false, false, false, false);
+  EXPECT_NOT_NULL(scanner);
+
+  int total_files = 0;
+  Chunk* chunk;
+  while ((chunk = parallel_scanner_next(scanner)) != NULL) {
+    total_files += chunk->element_count;
+    chunk_destroy(chunk);
+  }
+  EXPECT_EQ_INT(total_files, 2);
+  EXPECT_FALSE(parallel_scanner_failed(scanner));
+
+  parallel_scanner_destroy(scanner);
+  unlink(file1);
+  unlink(file2);
+  rmdir(dir);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -399,4 +427,5 @@ void test_scanner() {
   test_scanner_size_range();
   test_scanner_mixed_patterns();
   test_scanner_no_patterns();
+  test_parallel_scanner_root_chunks_without_workers();
 }

@@ -11,11 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* Include server.c but rename main to avoid conflict with test runner's main */
-#define main server_main_
-#define FASTSYNC_SERVER_AS_LIB
-#include "server.c"
-#undef main
+#include "receiver.h"
 
 /* Test receive_files with immediate FINISHED status */
 static void test_receive_files_finished() {
@@ -36,7 +32,7 @@ static void test_receive_files_finished() {
     /* Child: use p[0] for both read and write */
     close(p[1]);
     io_set_fds(p[0], p[0]);
-    int ret = receive_files(cfg, p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     _exit(ret == 0 ? 0 : 1);
@@ -88,7 +84,7 @@ static void test_receive_files_single_file() {
     /* Child: use p[0] for both read and write */
     close(p[1]);
     io_set_fds(p[0], p[0]);
-    int ret = receive_files(cfg, p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     _exit(ret == 0 ? 0 : 1);
@@ -149,7 +145,7 @@ static void test_receive_files_abort() {
   if (pid == 0) {
     close(p[1]);
     io_set_fds(p[0], p[0]);
-    int ret = receive_files(cfg, p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     /* Should return -1 on abort */

@@ -38,6 +38,23 @@ static void test_send_receive_n_data_zero() {
   close(p[1]);
 }
 
+static void test_explicit_session_context() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+  protocol_session_set_bwlimit(&session, 0);
+
+  const char payload[] = "explicit context";
+  char received[sizeof(payload)] = {0};
+  EXPECT_TRUE(protocol_send_n_data(&session, payload, sizeof(payload)));
+  EXPECT_TRUE(protocol_receive_n_data(&session, received, sizeof(received)));
+  EXPECT_EQ_INT(memcmp(payload, received, sizeof(payload)), 0);
+
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_send_receive_str() {
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -173,6 +190,7 @@ static void test_receive_str_truncated() {
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
+  test_explicit_session_context();
   test_send_receive_str();
   test_send_receive_str_normal();
   test_send_receive_data();

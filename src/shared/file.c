@@ -19,6 +19,7 @@
 #include "config.h"
 #include "data.h"
 #include "file.h"
+#include "file_store.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
@@ -305,13 +306,14 @@ fail:
 }
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
-                                void* old_data, unsigned long long old_size) {
+                                void* old_data, unsigned long long old_size, bool* failed) {
   if (!old_data)
     return NULL;
 
   DeltaSignature* sig = delta_signature_create(old_data, old_size, config->delta_block_size);
   if (!sig) {
     free(old_data);
+    *failed = true;
     return NULL;
   }
 
@@ -319,6 +321,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   if (!sig_data) {
     delta_signature_destroy(sig);
     free(old_data);
+    *failed = true;
     return NULL;
   }
 
@@ -328,6 +331,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   if (!sig_sent) {
     delta_signature_destroy(sig);
     free(old_data);
+    *failed = true;
     return NULL;
   }
 
@@ -335,6 +339,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   if (!receive_status(fd, &resp)) {
     delta_signature_destroy(sig);
     free(old_data);
+    *failed = true;
     return NULL;
   }
 
@@ -343,7 +348,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     if (!delta_data) {
       delta_signature_destroy(sig);
       free(old_data);
-      send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
 
@@ -354,7 +359,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       if (!raw_delta) {
         free(old_data);
         delta_signature_destroy(sig);
-        send_status(fd, STATUS_ERROR);
+        *failed = true;
         return NULL;
       }
     }
@@ -364,7 +369,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     if (!delta) {
       free(old_data);
       delta_signature_destroy(sig);
-      send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
 
@@ -382,7 +387,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     if (!new_data) {
       free(old_data);
       delta_signature_destroy(sig);
-      send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
 
@@ -391,7 +396,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       free(new_data);
       free(old_data);
       delta_signature_destroy(sig);
-      send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
 
@@ -403,7 +408,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         free(new_data);
         free(old_data);
         delta_signature_destroy(sig);
-        send_status(fd, STATUS_ERROR);
+        *failed = true;
         return NULL;
       }
     }
@@ -430,7 +435,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
 
     File* file = file_create(check_path);
     if (!file) {
-      send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
 
@@ -439,7 +444,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       file->metadata = metadata_receive(fd, &meta_ok);
       if (!meta_ok) {
         file_destroy(file);
-        send_status(fd, STATUS_ERROR);
+        *failed = true;
         return NULL;
       }
     }
@@ -447,7 +452,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     Data* file_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
     if (file_data == NULL) {
       file_destroy(file);
-      send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
 
@@ -456,7 +461,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       data_destroy(file_data);
       if (uncompressed == NULL) {
         file_destroy(file);
-        send_status(fd, STATUS_ERROR);
+        *failed = true;
         return NULL;
       }
       if (uncompressed->size > MAX_FILE_DATA_SIZE) {
@@ -476,6 +481,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   delta_signature_destroy(sig);
   free(old_data);
   send_status(fd, STATUS_ERROR);
+  *failed = true;
   return NULL;
 }
 
@@ -487,7 +493,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   *skipped = false;
   char* check_path = receive_str(fd);
   if (check_path == NULL) {
-    send_status(fd, STATUS_ERROR);
     return NULL;
   }
 
@@ -497,12 +502,10 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
       !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
     free(check_path);
-    send_status(fd, STATUS_ERROR);
     return NULL;
   }
   if (config->checksum && !receive_n_data(fd, &check_checksum, sizeof(check_checksum))) {
     free(check_path);
-    send_status(fd, STATUS_ERROR);
     return NULL;
   }
 
@@ -515,7 +518,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (has_path_traversal(check_path)) {
     log_message(LOG_LEVEL_ERROR, "Path traversal detected: %s", check_path);
     free(check_path);
-    send_status(fd, STATUS_ERROR);
     return NULL;
   }
 
@@ -586,12 +588,19 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
                    delta_should_attempt(old_size, check_size, config->delta_max_file_size);
 
   if (try_delta) {
-    File* delta_file = receive_delta_file(fd, config, check_path, old_data, old_size);
+    bool delta_failed = false;
+    File* delta_file =
+        receive_delta_file(fd, config, check_path, old_data, old_size, &delta_failed);
     old_data = NULL; /* receive_delta_file consumes the snapshot on every path */
     if (delta_file) {
       free(full_path);
       free(check_path);
       return delta_file;
+    }
+    if (delta_failed) {
+      free(full_path);
+      free(check_path);
+      return NULL;
     }
     free(old_data);
     old_data = NULL;
@@ -610,7 +619,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   free(check_path);
   free(full_path);
   if (file == NULL) {
-    send_status(fd, STATUS_ERROR);
     return NULL;
   }
 
@@ -619,7 +627,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     file->metadata = metadata_receive(fd, &meta_ok);
     if (!meta_ok) {
       file_destroy(file);
-      send_status(fd, STATUS_ERROR);
       return NULL;
     }
   }
@@ -627,7 +634,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   Data* file_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
   if (file_data == NULL) {
     file_destroy(file);
-    send_status(fd, STATUS_ERROR);
     return NULL;
   }
 
@@ -636,7 +642,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     data_destroy(file_data);
     if (uncompressed == NULL) {
       file_destroy(file);
-      send_status(fd, STATUS_ERROR);
       return NULL;
     }
     if (uncompressed->size > MAX_FILE_DATA_SIZE) {
