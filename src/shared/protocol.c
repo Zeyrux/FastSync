@@ -27,6 +27,13 @@ static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
 static __thread unsigned long long total_allocated_bytes;
 
+void protocol_release_memory(size_t charge) {
+  if ((unsigned long long)charge >= total_allocated_bytes)
+    total_allocated_bytes = 0;
+  else
+    total_allocated_bytes -= charge;
+}
+
 void io_set_fds(int read_fd, int write_fd) {
   io_read_fd = read_fd;
   io_write_fd = write_fd;
@@ -43,17 +50,20 @@ static void bw_mutex_init(void) {
 void io_set_bwlimit(unsigned long long bytes_per_sec) {
   call_once(&bw_mutex_once, bw_mutex_init);
   mtx_lock(&bw_mutex);
-  io_bwlimit = bytes_per_sec;
+  io_bwlimit =
+      bytes_per_sec > (unsigned long long)LLONG_MAX ? (unsigned long long)LLONG_MAX : bytes_per_sec;
   bw_tokens = (long long)io_bwlimit;
   clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
   mtx_unlock(&bw_mutex);
 }
 
 static void bw_throttle(size_t bytes_written) {
-  if (io_bwlimit == 0)
-    return;
   call_once(&bw_mutex_once, bw_mutex_init);
   mtx_lock(&bw_mutex);
+  if (io_bwlimit == 0) {
+    mtx_unlock(&bw_mutex);
+    return;
+  }
 
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -81,6 +91,15 @@ static void bw_throttle(size_t bytes_written) {
   mtx_unlock(&bw_mutex);
 }
 
+static bool bw_enabled(void) {
+  bool enabled;
+  call_once(&bw_mutex_once, bw_mutex_init);
+  mtx_lock(&bw_mutex);
+  enabled = io_bwlimit != 0;
+  mtx_unlock(&bw_mutex);
+  return enabled;
+}
+
 void io_set_ssl(SSL* ssl) {
   io_ssl = ssl;
 }
@@ -105,6 +124,8 @@ static int deadline_remaining_ms(const struct timespec* deadline) {
 }
 
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
+  if (!data && data_size != 0)
+    return false;
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   int fd = io_fd(io_write_fd, file_descriptor);
   struct timespec deadline;
@@ -114,7 +135,7 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   ssize_t total_bytes_send = 0;
   while ((size_t)total_bytes_send < data_size) {
     size_t chunk = data_size - total_bytes_send;
-    if (io_bwlimit > 0 && chunk > 65536)
+    if (bw_enabled() && chunk > 65536)
       chunk = 65536;
     struct pollfd pfd = {.fd = fd, .events = wait_events};
     int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
@@ -144,6 +165,8 @@ bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
     }
     bw_throttle((size_t)bytes_send);
     total_bytes_send += bytes_send;
+    if (io_ssl)
+      wait_events = POLLOUT;
   }
   log_message(LOG_LEVEL_DEBUG, "    Send n Data: %zu", total_bytes_send);
   return true;
@@ -160,20 +183,22 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
   size_t total_bytes_received = 0;
   short wait_events = POLLIN;
   while (total_bytes_received < data_size) {
-    struct pollfd pfd = {.fd = fd, .events = wait_events};
-    int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
-    if (poll_result == 0) {
-      log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
-      return false;
+    if (!io_ssl || SSL_pending(io_ssl) == 0) {
+      struct pollfd pfd = {.fd = fd, .events = wait_events};
+      int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+      if (poll_result == 0) {
+        log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
+        return false;
+      }
+      if (poll_result < 0) {
+        if (errno == EINTR)
+          continue;
+        return false;
+      }
+      /* POLLHUP may accompany the final readable bytes on pipes/sockets. */
+      if (pfd.revents & (POLLERR | POLLNVAL))
+        return false;
     }
-    if (poll_result < 0) {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    /* POLLHUP may accompany the final readable bytes on pipes/sockets. */
-    if (pfd.revents & (POLLERR | POLLNVAL))
-      return false;
 
     ssize_t bytes_received;
     if (io_ssl)
@@ -196,7 +221,9 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size) {
         log_message(LOG_LEVEL_ERROR, "Could not receive bytes");
       return false;
     }
-    total_bytes_received += bytes_received;
+    total_bytes_received += (size_t)bytes_received;
+    if (io_ssl)
+      wait_events = POLLIN;
   }
   log_message(LOG_LEVEL_DEBUG, "    Received n Data: %zu", total_bytes_received);
   return true;
@@ -247,8 +274,7 @@ char* receive_str(int file_descriptor) {
   size_t size;
   if (!receive_n_data(file_descriptor, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
-      size + 1 > MAX_CONNECTION_MEMORY - total_allocated_bytes) {
+  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
@@ -266,12 +292,13 @@ char* receive_str(int file_descriptor) {
     return NULL;
   }
   data[size] = '\0';
-  total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
   return data;
 }
 
 bool send_data(int file_descriptor, const Data* data) {
+  if (!data || (!data->data && data->size != 0))
+    return false;
   unsigned long long data_size = data->size;
   if (!send_n_data(file_descriptor, &data_size, sizeof(unsigned long long)))
     return false;
@@ -281,11 +308,11 @@ bool send_data(int file_descriptor, const Data* data) {
   return true;
 }
 
-Data* receive_data(int file_descriptor) {
+Data* receive_data_limited(int file_descriptor, unsigned long long maximum_size) {
   unsigned long long size = 0;
   if (!receive_n_data(file_descriptor, &size, sizeof(unsigned long long)))
     return NULL;
-  if (size > MAX_DATA_PAYLOAD_SIZE) {
+  if (size > MAX_DATA_PAYLOAD_SIZE || size > maximum_size) {
     log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
                 (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
@@ -302,14 +329,19 @@ Data* receive_data(int file_descriptor) {
     free(data);
     return NULL;
   }
-  total_allocated_bytes += allocation_size;
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     free(data);
-    total_allocated_bytes -= allocation_size;
+    return NULL;
   }
+  total_allocated_bytes += allocation_size;
+  result->protocol_charge = allocation_size;
   return result;
+}
+
+Data* receive_data(int file_descriptor) {
+  return receive_data_limited(file_descriptor, MAX_DATA_PAYLOAD_SIZE);
 }
 
 bool send_int(int file_descriptor, int data) {

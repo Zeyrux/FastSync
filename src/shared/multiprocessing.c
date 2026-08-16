@@ -233,6 +233,12 @@ int receive_thread(void* pipeline_context) {
           RECEIVE_THREAD_FAIL();
         }
         char* full_path = path_cat(config->receive_root_directory, check_path);
+        if (!full_path) {
+          free(check_path);
+          if (!send_status(file_descriptor, STATUS_ERROR))
+            RECEIVE_THREAD_FAIL();
+          RECEIVE_THREAD_FAIL();
+        }
         struct stat st;
         bool has_old = full_path && file_stat_secure(full_path, &st);
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
@@ -263,8 +269,9 @@ int receive_thread(void* pipeline_context) {
       RECEIVE_THREAD_FAIL();
   }
   if (status == STATUS_MANIFEST) {
-    if (receive_manifest(file_descriptor, config, &status) != 0)
+    if (receive_manifest(file_descriptor, config, &status) != 0) {
       RECEIVE_THREAD_FAIL();
+    }
   }
   if (status != STATUS_FINISHED)
     RECEIVE_THREAD_FAIL();

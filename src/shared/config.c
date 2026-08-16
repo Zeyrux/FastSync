@@ -104,6 +104,14 @@ static bool valid_wire_bool(int value) {
   return value == 0 || value == 1;
 }
 
+static bool receive_wire_bool(int fd, bool* value) {
+  int wire_value;
+  if (!receive_int(fd, &wire_value) || !valid_wire_bool(wire_value))
+    return false;
+  *value = wire_value != 0;
+  return true;
+}
+
 static bool validate_received_config(const Config* config) {
   return valid_wire_bool(config->save_to_disk) && valid_wire_bool(config->use_multithreading) &&
          valid_wire_bool(config->use_chunk_serialization) &&
@@ -166,6 +174,10 @@ void config_parse_ssh_dest(Config* config) {
 void config_delete(Config* config) {
   if (config == NULL)
     return;
+  if (config->log_file) {
+    fclose(config->log_file);
+    config->log_file = NULL;
+  }
   free(config->version);
   free(config->send_directory);
   free(config->receive_root_directory);
@@ -347,135 +359,66 @@ Config* config_receive(int file_descriptor) {
     return NULL;
   }
   int tmp;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->save_to_disk) ||
+      !receive_wire_bool(file_descriptor, &config->use_multithreading) ||
+      !receive_wire_bool(file_descriptor, &config->use_chunk_serialization) ||
+      !receive_wire_bool(file_descriptor, &config->use_compression) ||
+      !receive_wire_bool(file_descriptor, &config->use_metadata))
     goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->save_to_disk = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_multithreading = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_chunk_serialization = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_compression = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_metadata = tmp;
   if (!receive_int(file_descriptor, &tmp))
     goto error;
   config->compression_level = tmp;
   if (!receive_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
     goto error;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->use_sendfile) ||
+      !receive_wire_bool(file_descriptor, &config->use_delete) ||
+      !receive_wire_bool(file_descriptor, &config->use_incremental) ||
+      !receive_wire_bool(file_descriptor, &config->use_delta))
     goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_sendfile = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_delete = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_incremental = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  if (!valid_wire_bool(tmp))
-    goto error;
-  config->use_delta = tmp;
   if (!receive_n_data(file_descriptor, &config->delta_block_size, sizeof(config->delta_block_size)))
     goto error;
   if (!receive_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
     goto error;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->backup))
     goto error;
-  config->backup = tmp;
   config->backup_dir = receive_str(file_descriptor);
   if (config->backup_dir == NULL)
     goto error;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->follow_symlinks) ||
+      !receive_wire_bool(file_descriptor, &config->copy_links) ||
+      !receive_wire_bool(file_descriptor, &config->safe_links) ||
+      !receive_wire_bool(file_descriptor, &config->copy_unsafe_links) ||
+      !receive_wire_bool(file_descriptor, &config->preserve_hard_links) ||
+      !receive_wire_bool(file_descriptor, &config->preserve_acls) ||
+      !receive_wire_bool(file_descriptor, &config->preserve_xattrs) ||
+      !receive_wire_bool(file_descriptor, &config->preserve_devices) ||
+      !receive_wire_bool(file_descriptor, &config->preserve_sparse) ||
+      !receive_wire_bool(file_descriptor, &config->update) ||
+      !receive_wire_bool(file_descriptor, &config->inplace) ||
+      !receive_wire_bool(file_descriptor, &config->append) ||
+      !receive_wire_bool(file_descriptor, &config->append_verify) ||
+      !receive_wire_bool(file_descriptor, &config->delete_excluded) ||
+      !receive_wire_bool(file_descriptor, &config->delete_after))
     goto error;
-  config->follow_symlinks = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->copy_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->safe_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->copy_unsafe_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_hard_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_acls = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_xattrs = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_devices = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_sparse = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->update = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->inplace = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->append = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->append_verify = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_excluded = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_after = tmp;
   if (!receive_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
     goto error;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->relative) ||
+      !receive_wire_bool(file_descriptor, &config->prune_empty_dirs))
     goto error;
-  config->relative = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->prune_empty_dirs = tmp;
   config->temp_dir = receive_str(file_descriptor);
   if (config->temp_dir == NULL)
     goto error;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->partial))
     goto error;
-  config->partial = tmp;
   config->partial_dir = receive_str(file_descriptor);
   if (config->partial_dir == NULL)
     goto error;
   config->suffix = receive_str(file_descriptor);
   if (config->suffix == NULL)
     goto error;
-  if (!receive_int(file_descriptor, &tmp))
+  if (!receive_wire_bool(file_descriptor, &config->delete_before) ||
+      !receive_wire_bool(file_descriptor, &config->checksum))
     goto error;
-  config->delete_before = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->checksum = tmp;
   config->compress_choice = receive_str(file_descriptor);
   if (config->compress_choice == NULL)
     goto error;

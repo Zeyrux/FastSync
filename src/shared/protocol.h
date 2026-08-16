@@ -10,6 +10,8 @@
 
 /* Maximum allowed data payload size for receive_data (100 MB) */
 #define MAX_DATA_PAYLOAD_SIZE (100ULL * 1024 * 1024)
+/* Maximum uncompressed file payload accepted by the receiver. */
+#define MAX_RECEIVE_FILE_SIZE (64ULL * 1024 * 1024)
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
@@ -46,6 +48,7 @@ bool send_str(int file_descriptor, const char* data);
 char* receive_str(int file_descriptor);
 bool send_data(int file_descriptor, const Data* data);
 Data* receive_data(int file_descriptor);
+Data* receive_data_limited(int file_descriptor, unsigned long long maximum_size);
 bool send_int(int file_descriptor, int data);
 bool receive_int(int file_descriptor, int* data);
 bool send_status(int file_descriptor, Status status);

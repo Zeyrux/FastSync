@@ -119,9 +119,13 @@ static void test_queue_destroyer() {
   destroyer_calls = 0;
   Queue* q = queue_create(5, my_destroyer);
   EXPECT_NOT_NULL(q);
+  if (!q)
+    return;
 
   for (int i = 0; i < 3; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      break;
     *val = i;
     queue_enqueue(q, val);
   }
@@ -181,6 +185,8 @@ static void test_queue_multithreaded() {
 
   for (int i = 1; i <= 100; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      break;
     *val = i;
     queue_enqueue_multithreaded(q, val, &mutex, &cnd_empty, &cnd_full);
   }

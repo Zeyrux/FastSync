@@ -36,8 +36,10 @@ static bool tls_client_identity_allowed(SSL* ssl) {
   char common_name[256];
   int length = X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName,
                                          common_name, sizeof(common_name));
-  bool allowed = length >= 0 && (size_t)length < sizeof(common_name) &&
-                 strcmp(common_name, required_client_cn) == 0;
+  size_t required_length = strlen(required_client_cn);
+  bool allowed = length >= 0 && (size_t)length == required_length &&
+                 required_length < sizeof(common_name) &&
+                 memcmp(common_name, required_client_cn, required_length) == 0;
   X509_free(certificate);
   return allowed;
 }
@@ -54,19 +56,44 @@ static bool valid_batch_path(const char* path) {
 
 static bool __attribute__((unused)) configure_authorization(const char* root) {
   char resolved[PATH_MAX];
-  if (!root || !realpath(root, resolved))
+  if (!root) {
+    file_set_authorized_root(-1, NULL);
+    utils_set_authorized_root(-1, NULL);
     return false;
+  }
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (root_fd < 0) {
+    file_set_authorized_root(-1, NULL);
+    utils_set_authorized_root(-1, NULL);
+    return false;
+  }
+  char fd_path[64];
+  int fd_path_length = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", root_fd);
+  if (fd_path_length < 0 || (size_t)fd_path_length >= sizeof(fd_path) ||
+      !realpath(fd_path, resolved)) {
+    close(root_fd);
+    file_set_authorized_root(-1, NULL);
+    utils_set_authorized_root(-1, NULL);
+    return false;
+  }
   authorized_root = str_dup(resolved);
-  if (!authorized_root)
+  if (!authorized_root) {
+    close(root_fd);
+    file_set_authorized_root(-1, NULL);
+    utils_set_authorized_root(-1, NULL);
     return false;
-  authorized_root_fd = open(resolved, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (authorized_root_fd < 0) {
+  }
+  authorized_root_fd = root_fd;
+  if (!file_set_authorized_root(authorized_root_fd, authorized_root) ||
+      !utils_set_authorized_root(authorized_root_fd, authorized_root)) {
+    file_set_authorized_root(-1, NULL);
+    utils_set_authorized_root(-1, NULL);
+    close(authorized_root_fd);
+    authorized_root_fd = -1;
     free(authorized_root);
     authorized_root = NULL;
     return false;
   }
-  file_set_authorized_root(authorized_root_fd, authorized_root);
-  utils_set_authorized_root(authorized_root_fd, authorized_root);
   return true;
 }
 
@@ -138,6 +165,11 @@ int receive_files(Config* config, int fd) {
         }
         struct stat st;
         char* full_path = path_cat(config->receive_root_directory, check_path);
+        if (!full_path) {
+          free(check_path);
+          send_status(fd, STATUS_ERROR);
+          return -1;
+        }
         bool has_old = full_path && file_stat_secure(full_path, &st);
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      (long long)st.st_mtime == check_mtime;
@@ -171,8 +203,9 @@ int receive_files(Config* config, int fd) {
   }
 
   if (status == STATUS_MANIFEST) {
-    if (receive_manifest(fd, config, &status) != 0)
+    if (receive_manifest(fd, config, &status) != 0) {
       return -1;
+    }
   }
   if (status != STATUS_FINISHED) {
     log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
@@ -209,24 +242,24 @@ void handler(int file_descriptor) {
     close(file_descriptor);
     return;
   }
-  char resolved_destination[PATH_MAX];
-  char* canonical_destination = realpath(config->receive_root_directory, NULL);
-  const char* destination =
-      canonical_destination ? canonical_destination : config->receive_root_directory;
-  if (has_path_traversal(destination) || !path_is_within(authorized_root, destination)) {
+  char* destination = config->receive_root_directory;
+  char* joined_destination = NULL;
+  if (destination && destination[0] != '/')
+    joined_destination = path_cat(authorized_root, destination);
+  if (joined_destination)
+    destination = joined_destination;
+  if (!destination || has_path_traversal(destination) ||
+      !path_is_within(authorized_root, destination)) {
     log_message(LOG_LEVEL_ERROR, "Rejected destination outside authorized root");
-    free(canonical_destination);
+    free(joined_destination);
     config_delete(config);
     close(file_descriptor);
     return;
   }
-  if (canonical_destination)
-    snprintf(resolved_destination, sizeof(resolved_destination), "%s", canonical_destination);
-  else
-    snprintf(resolved_destination, sizeof(resolved_destination), "%s", destination);
-  free(canonical_destination);
-  free(config->receive_root_directory);
-  config->receive_root_directory = str_dup(resolved_destination);
+  if (joined_destination) {
+    free(config->receive_root_directory);
+    config->receive_root_directory = joined_destination;
+  }
   if (!config->receive_root_directory) {
     config_delete(config);
     close(file_descriptor);

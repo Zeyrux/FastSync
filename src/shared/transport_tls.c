@@ -105,7 +105,10 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
     log_message(LOG_LEVEL_ERROR, "Failed to create SSL object");
     return NULL;
   }
-  SSL_set_fd(ssl, fd);
+  if (SSL_set_fd(ssl, fd) != 1) {
+    SSL_free(ssl);
+    return NULL;
+  }
 
   // Enable hostname verification for client connections when a hostname is provided.
   // Must be done before SSL_connect to take effect during the handshake.
@@ -154,8 +157,10 @@ struct tls_child_ctx {
 static void tls_child_fn(int fd, void* arg) {
   struct tls_child_ctx* ctx = (struct tls_child_ctx*)arg;
   SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true, NULL);
-  if (!ssl)
+  if (!ssl) {
+    io_set_ssl(NULL);
     return;
+  }
   io_set_ssl(ssl);
   ctx->handler(fd);
   SSL_shutdown(ssl);
@@ -184,6 +189,10 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
   int err = getaddrinfo(host, port_str, &hints, &result);
   if (err != 0 || result == NULL) {
     fprintf(stderr, "Could not resolve host: %s (%s)\n", host, gai_strerror(err));
+    if (client->file_descriptor >= 0) {
+      close(client->file_descriptor);
+      client->file_descriptor = -1;
+    }
     return false;
   }
 
@@ -216,12 +225,18 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
 
   if (!connected) {
     perror("Could not connect to Server!");
+    if (client->file_descriptor >= 0)
+      close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
   }
 
   SSL_CTX* ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
-  if (!ctx)
+  if (!ctx) {
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
+  }
   client->ssl_ctx = ctx;
 
   // Pass the server hostname for TLS hostname verification (SSL_set1_host
@@ -231,6 +246,8 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
   if (!ssl) {
     SSL_CTX_free(ctx);
     client->ssl_ctx = NULL;
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
   }
 

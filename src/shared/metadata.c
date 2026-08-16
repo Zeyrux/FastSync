@@ -51,6 +51,8 @@ FileMetadata* metadata_from_buf(char** buf) {
   int32_t present;
   memcpy(&present, *buf, sizeof(present));
   *buf += sizeof(present);
+  if (present != 0 && present != 1)
+    return NULL;
   if (!present)
     return NULL;
   FileMetadata* m = malloc(sizeof(FileMetadata));
@@ -84,7 +86,7 @@ FileMetadata* metadata_from_buf(char** buf) {
   return m;
 }
 
-bool metadata_send(int file_descriptor, FileMetadata* m) {
+bool metadata_send(int file_descriptor, const FileMetadata* m) {
   if (m == NULL) {
     int32_t zero = 0;
     return send_n_data(file_descriptor, &zero, sizeof(zero));

@@ -12,11 +12,15 @@ static void test_destroyer(void* item) {
 void test_array_list() {
   ArrayList* list = array_list_create(free);
   EXPECT_NOT_NULL(list);
+  if (!list)
+    return;
   EXPECT_EQ_INT(list->size, 0);
   EXPECT_EQ_INT(list->capacity, 100);
 
   // Test adding
   int* val1 = malloc(sizeof(int));
+  if (!val1)
+    return;
   *val1 = 42;
   array_list_add(list, val1);
   EXPECT_EQ_INT(list->size, 1);
@@ -26,6 +30,8 @@ void test_array_list() {
   // Initial capacity is 100. Let's add 105 elements.
   for (int i = 0; i < 105; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      return;
     *val = i;
     array_list_add(list, val);
   }

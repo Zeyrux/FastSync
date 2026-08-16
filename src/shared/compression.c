@@ -2,6 +2,8 @@
 #include "data.h"
 #include "log.h"
 #include <stdlib.h>
+#include <limits.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <zstd.h>
@@ -69,7 +71,10 @@ Data* data_compress(Data* data_to_compress, int compression_level) {
   return compressed_data;
 }
 
-Data* data_decompress(Data* compressed_data) {
+Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
+  if (!compressed_data || (!compressed_data->data && compressed_data->size != 0) ||
+      maximum_size == 0)
+    return NULL;
   log_message(LOG_LEVEL_DEBUG, "Start to decompress data");
   unsigned long long dst_size =
       ZSTD_getFrameContentSize(compressed_data->data, compressed_data->size);
@@ -82,15 +87,16 @@ Data* data_decompress(Data* compressed_data) {
   // ZSTD_CONTENTSIZE_UNKNOWN (~2^64) can cause massive allocation;
   // fall back to a conservative estimate (3x compressed size) when unknown.
   if (dst_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+    if (compressed_data->size > ULLONG_MAX / 3)
+      return NULL;
     dst_size = compressed_data->size * 3;
     if (dst_size < INITIAL_DECOMPRESS_BUF_SIZE)
       dst_size = INITIAL_DECOMPRESS_BUF_SIZE;
-    if (dst_size > MAX_DECOMPRESSED_SIZE)
-      dst_size = MAX_DECOMPRESSED_SIZE;
   }
-  if (dst_size > MAX_DECOMPRESSED_SIZE) {
-    log_message(LOG_LEVEL_ERROR, "Declared decompressed size exceeds %llu bytes",
-                (unsigned long long)MAX_DECOMPRESSED_SIZE);
+  unsigned long long hard_limit =
+      maximum_size < MAX_DECOMPRESSED_SIZE ? maximum_size : MAX_DECOMPRESSED_SIZE;
+  if (dst_size > hard_limit) {
+    log_message(LOG_LEVEL_ERROR, "Declared decompressed size exceeds %llu bytes", hard_limit);
     return NULL;
   }
 
@@ -101,6 +107,8 @@ Data* data_decompress(Data* compressed_data) {
   }
 
   size_t buf_size = (dst_size > 0) ? (size_t)dst_size : INITIAL_DECOMPRESS_BUF_SIZE;
+  if (buf_size > maximum_size)
+    buf_size = maximum_size;
   Data* uncompressed_data = data_create_empty(buf_size);
   if (!uncompressed_data) {
     log_message(LOG_LEVEL_ERROR, "Failed to allocate decompression buffer");
@@ -121,7 +129,7 @@ Data* data_decompress(Data* compressed_data) {
       return NULL;
     }
     if (ret > 0 && output.pos == output.size) {
-      if (buf_size >= MAX_DECOMPRESSED_SIZE) {
+      if (buf_size >= hard_limit || buf_size > SIZE_MAX / 2) {
         log_message(LOG_LEVEL_ERROR, "Decompressed data exceeds %llu bytes",
                     (unsigned long long)MAX_DECOMPRESSED_SIZE);
         ZSTD_freeDCtx(dctx);
@@ -129,8 +137,8 @@ Data* data_decompress(Data* compressed_data) {
         return NULL;
       }
       buf_size *= 2;
-      if (buf_size > MAX_DECOMPRESSED_SIZE)
-        buf_size = MAX_DECOMPRESSED_SIZE;
+      if (buf_size > hard_limit)
+        buf_size = (size_t)hard_limit;
       void* new_data = realloc(uncompressed_data->data, buf_size);
       if (!new_data) {
         log_message(LOG_LEVEL_ERROR, "Failed to grow decompression buffer");
@@ -149,4 +157,8 @@ Data* data_decompress(Data* compressed_data) {
 
   log_message(LOG_LEVEL_DEBUG, "Decompressed data successfully");
   return uncompressed_data;
+}
+
+Data* data_decompress(Data* compressed_data) {
+  return data_decompress_limited(compressed_data, MAX_DECOMPRESSED_SIZE);
 }

@@ -13,6 +13,7 @@
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
+#include "utils.h"
 
 /* Maximum individual file data size within a chunk (64 MB) */
 #define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
@@ -82,8 +83,14 @@ static unsigned long long per_file_serialize_size(File* file, bool use_metadata)
 }
 
 Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
+  if (!chunk || chunk->element_count < 0 || (chunk->element_count > 0 && chunk->items == NULL))
+    return NULL;
   unsigned long long data_size = 0;
   for (int i = 0; i < chunk->element_count; i++) {
+    if (!chunk->items[i] || !chunk->items[i]->path || !chunk->items[i]->data ||
+        (chunk->items[i]->data->size > 0 && !chunk->items[i]->data->data) ||
+        chunk->items[i]->path[0] == '\0' || has_path_traversal(chunk->items[i]->path))
+      return NULL;
     unsigned long long file_size = per_file_serialize_size(chunk->items[i], use_metadata);
     if (file_size == 0 || file_size > ULLONG_MAX - data_size || data_size + file_size > SIZE_MAX)
       return NULL;
@@ -116,6 +123,8 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
 }
 
 Chunk* chunk_deserialize(Data* data, bool use_metadata) {
+  if (!data || (!data->data && data->size != 0))
+    return NULL;
   ArrayList* files = array_list_create(file_destroy);
   if (files == NULL)
     return NULL;
@@ -164,6 +173,12 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     data_pointer += path_len;
     remaining_size -= path_len;
+
+    if (path_len == 0 || has_path_traversal(path)) {
+      free(path);
+      array_list_delete(files);
+      return NULL;
+    }
 
     File* file = file_create(path);
     free(path);
@@ -285,14 +300,14 @@ Data* chunk_compress(Chunk* chunk, int compression_level, bool use_metadata) {
 }
 
 Chunk* receive_chunk_data(int fd, const Config* config) {
-  Data* chunk_data = receive_data(fd);
+  Data* chunk_data = receive_data_limited(fd, MAX_CHUNK_SIZE);
   if (chunk_data == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive chunk data");
     return NULL;
   }
   Data* data_to_process = chunk_data;
   if (config->use_compression) {
-    data_to_process = data_decompress(chunk_data);
+    data_to_process = data_decompress_limited(chunk_data, MAX_CHUNK_SIZE);
     data_destroy(chunk_data);
     if (data_to_process == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");

@@ -32,6 +32,8 @@ static int mpmc_producer_func(void* arg) {
   ProducerCtx* ctx = (ProducerCtx*)arg;
   for (int i = 1; i <= ITEMS_PER_PRODUCER; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      return thrd_error;
     *val = ctx->producer_id * ITEMS_PER_PRODUCER + i;
     queue_enqueue_multithreaded(ctx->q, val, ctx->mutex, ctx->cnd_empty, ctx->cnd_full);
   }
@@ -121,6 +123,8 @@ static int bp_producer_func(void* arg) {
   BackpressureCtx* ctx = (BackpressureCtx*)arg;
   for (int i = 0; i < 5; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      return thrd_error;
     *val = i + 1;
     queue_enqueue_multithreaded(ctx->q, val, ctx->mutex, ctx->cnd_empty, ctx->cnd_full);
     ctx->items_sent++;
@@ -191,9 +195,13 @@ static void test_queue_rapid_create_destroy() {
   for (int i = 0; i < 100; i++) {
     Queue* q = queue_create(4, free);
     EXPECT_NOT_NULL(q);
+    if (!q)
+      return;
 
     for (int j = 0; j < 3; j++) {
       int* val = malloc(sizeof(int));
+      if (!val)
+        break;
       *val = j;
       queue_enqueue(q, val);
     }

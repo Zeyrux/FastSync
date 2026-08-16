@@ -14,6 +14,8 @@
 static Data* random_data(int min_size, int max_size) {
   int size = min_size + rand() % (max_size - min_size + 1);
   char* buf = malloc(size);
+  if (!buf)
+    return NULL;
   for (int i = 0; i < size; i++)
     buf[i] = (char)(rand() % 256);
   return data_create(buf, size);
@@ -23,10 +25,16 @@ static void test_property_compress_roundtrip() {
   for (int iter = 0; iter < 10; iter++) {
     Data* original = random_data(1, 10000);
     EXPECT_NOT_NULL(original);
+    if (!original)
+      return;
 
     size_t orig_size = original->size;
     void* orig_copy = malloc(orig_size);
     EXPECT_NOT_NULL(orig_copy);
+    if (!orig_copy) {
+      data_destroy(original);
+      return;
+    }
     memcpy(orig_copy, original->data, orig_size);
 
     Data* compressed = data_compress(original, 3);
@@ -81,6 +89,8 @@ static void test_property_chunk_roundtrip() {
 
     int content_len = 1 + rand() % 4096;
     char* content = malloc(content_len);
+    if (!content)
+      return;
     for (int i = 0; i < content_len; i++)
       content[i] = (char)(rand() % 256);
 

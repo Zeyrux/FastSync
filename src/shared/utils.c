@@ -14,14 +14,22 @@
 static int authorized_root_fd = -1;
 static char* authorized_root_path;
 
-void utils_set_authorized_root(int fd, const char* canonical_path) {
+bool utils_set_authorized_root(int fd, const char* canonical_path) {
+  char* path_copy = canonical_path ? str_dup(canonical_path) : NULL;
+  if (canonical_path && !path_copy) {
+    authorized_root_fd = -1;
+    free(authorized_root_path);
+    authorized_root_path = NULL;
+    return false;
+  }
   authorized_root_fd = fd;
   free(authorized_root_path);
-  authorized_root_path = canonical_path ? str_dup(canonical_path) : NULL;
+  authorized_root_path = path_copy;
+  return true;
 }
 
 void utils_set_authorized_root_fd(int fd) {
-  utils_set_authorized_root(fd, NULL);
+  (void)utils_set_authorized_root(fd, NULL);
 }
 
 static bool path_is_within_root(const char* root, const char* path) {
@@ -50,10 +58,14 @@ static int open_authorized_destination(const char* dest_root) {
   char* saveptr = NULL;
   char* component = strtok_r(relative, "/", &saveptr);
   while (component) {
-    if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+    if (strcmp(component, "..") == 0) {
       free(relative);
       close(dirfd);
       return -1;
+    }
+    if (strcmp(component, ".") == 0) {
+      component = strtok_r(NULL, "/", &saveptr);
+      continue;
     }
     int next = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (next < 0) {
@@ -71,52 +83,41 @@ static int open_authorized_destination(const char* dest_root) {
 }
 
 bool mkdir_r(const char* path) {
-  size_t path_len = strlen(path);
-  char* path_duplicate = malloc(path_len + 1);
-  if (!path_duplicate)
+  if (!path || *path == '\0')
     return false;
-  memcpy(path_duplicate, path, path_len + 1);
-  size_t capacity = path_len + 2;
-  char* path_current = (char*)malloc(capacity * sizeof(char));
-  if (!path_current) {
-    free(path_duplicate);
+  char* duplicate = str_dup(path);
+  if (!duplicate)
+    return false;
+  int dirfd = open(path[0] == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (dirfd < 0) {
+    free(duplicate);
     return false;
   }
-  char* path_current_position = path_current;
-  if (path[0] == '/') {
-    path_current[0] = '/';
-    path_current[1] = '\0';
-    path_current_position += 1;
-  } else {
-    path_current[0] = '\0';
-  }
-  const char* delimiter = "/";
-  char* saveptr;
-  const char* part = strtok_r(path_duplicate, delimiter, &saveptr);
   bool ok = true;
-  while (part != NULL) {
-    size_t part_len = strlen(part);
-    if ((size_t)(path_current_position - path_current) + part_len + 2 > capacity) {
+  char* saveptr = NULL;
+  char* component = strtok_r(duplicate, "/", &saveptr);
+  while (component) {
+    if (strcmp(component, "..") == 0) {
       ok = false;
       break;
     }
-    memcpy(path_current_position, part, part_len);
-    path_current_position += part_len;
-    path_current_position[0] = '/';
-    path_current_position[1] = '\0';
-    path_current_position++;
-    struct stat st;
-    if (stat(path_current, &st) != 0) {
-      if (mkdir(path_current, 0755) != 0) {
-        perror("Could not create directory");
+    if (strcmp(component, ".") != 0) {
+      int next = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (next < 0 && errno == ENOENT) {
+        if (mkdirat(dirfd, component, 0755) == 0 || errno == EEXIST)
+          next = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      }
+      if (next < 0) {
         ok = false;
         break;
       }
+      close(dirfd);
+      dirfd = next;
     }
-    part = strtok_r(NULL, delimiter, &saveptr);
+    component = strtok_r(NULL, "/", &saveptr);
   }
-  free(path_duplicate);
-  free(path_current);
+  close(dirfd);
+  free(duplicate);
   return ok;
 }
 
@@ -207,15 +208,20 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
     close(scanfd);
     return false;
   }
-  bool all_removed = true;
   bool operation_ok = true;
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
     char* child_rel = path_cat((char*)rel_path, entry->d_name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
     struct stat st;
     if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno != ENOENT)
+        operation_ok = false;
       free(child_rel);
       continue;
     }
@@ -229,18 +235,23 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       bool child_removed = false;
       if (childfd >= 0) {
         child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count);
+        if (!child_removed)
+          operation_ok = false;
         close(childfd);
+      } else if (errno != ENOENT) {
+        operation_ok = false;
       }
       if (child_removed && !is_dir_in_manifest(child_rel, manifest)) {
         if (*deleted_count >= max_delete) {
           operation_ok = false;
-        } else if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
-          operation_ok = false;
         } else {
-          (*deleted_count)++;
+          if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0) {
+            if (errno != ENOENT)
+              operation_ok = false;
+          } else {
+            (*deleted_count)++;
+          }
         }
-      } else if (!child_removed) {
-        all_removed = false;
       }
     } else {
       // Check if relative path is in manifest
@@ -257,27 +268,32 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
           free(child_rel);
           continue;
         }
-        if (unlinkat(dirfd, entry->d_name, 0) != 0 && errno != ENOENT)
-          operation_ok = false;
-        else
+        if (unlinkat(dirfd, entry->d_name, 0) != 0) {
+          if (errno != ENOENT)
+            operation_ok = false;
+        } else {
           (*deleted_count)++;
+        }
         fprintf(stderr, "  Deleted: %s\n", child_rel);
-      } else {
-        all_removed = false;
       }
     }
     free(child_rel);
   }
   closedir(dir);
-  (void)all_removed;
   return operation_ok;
 }
 
 bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete) {
+  if (!manifest)
+    return false;
   int rootfd;
   if (authorized_root_fd >= 0) {
-    rootfd =
-        authorized_root_path ? open_authorized_destination(dest_root) : dup(authorized_root_fd);
+    if (authorized_root_path)
+      rootfd = open_authorized_destination(dest_root);
+    else if (dest_root == NULL)
+      rootfd = dup(authorized_root_fd);
+    else
+      rootfd = -1;
   } else {
     rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   }
@@ -296,10 +312,10 @@ bool delete_extras(const char* dest_root, ArrayList* manifest) {
 
 bool has_path_traversal(const char* path) {
   if (!path)
-    return false;
+    return true;
   char* dup = str_dup(path);
   if (!dup)
-    return false;
+    return true;
   char* saveptr;
   const char* part = strtok_r(dup, "/", &saveptr);
   while (part) {
@@ -327,6 +343,8 @@ char* path_cat(const char* path1, const char* path2) {
     offset = 1;
     path2_len -= 1;
   }
+  if (path1_len > SIZE_MAX - path2_len - 2)
+    return NULL;
   char* new_path = malloc(path1_len + path2_len + 2);
   if (new_path == NULL)
     return NULL;

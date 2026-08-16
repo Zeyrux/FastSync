@@ -38,7 +38,8 @@ void file_metadata_destroy(void* metadata);
 bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
              bool sparse);
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config);
-void file_set_authorized_root(int fd, const char* canonical_path);
+/* A configured fd without a canonical identity deliberately rejects paths. */
+bool file_set_authorized_root(int fd, const char* canonical_path);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 bool file_path_exists_secure(const char* path);
 bool file_stat_secure(const char* path, struct stat* st);

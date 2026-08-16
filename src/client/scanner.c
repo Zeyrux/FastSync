@@ -465,8 +465,10 @@ ParallelScanner* parallel_scanner_create(char* root_directory, bool use_metadata
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
     char* cur_path = path_cat(root_directory, entry->d_name);
-    if (!cur_path)
+    if (!cur_path) {
+      ps->failed = true;
       continue;
+    }
     struct stat lstats;
     if (lstat(cur_path, &lstats) != 0) {
       free(cur_path);
