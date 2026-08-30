@@ -34,7 +34,8 @@ static void test_file_destroy_normal() {
 
 static void test_file_load_data() {
   const char* content = "Hello Load Test";
-  EXPECT_TRUE(file_write_to_disk("test_file_load_data.txt", content, strlen(content), false, false));
+  EXPECT_TRUE(
+      file_write_to_disk("test_file_load_data.txt", content, strlen(content), false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_file_load_data.txt", &st), 0);
@@ -89,7 +90,8 @@ static void test_file_save_to_disk() {
 
 static void test_file_write_to_disk_basic() {
   const char* content = "Basic file_write_to_disk test";
-  EXPECT_TRUE(file_write_to_disk("test_file_write_to_disk_basic.txt", content, strlen(content), false, false));
+  EXPECT_TRUE(file_write_to_disk("test_file_write_to_disk_basic.txt", content, strlen(content),
+                                 false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_file_write_to_disk_basic.txt", &st), 0);
@@ -108,7 +110,8 @@ static void test_file_write_to_disk_basic() {
 
 static void test_file_write_to_disk_creates_dirs() {
   const char* content = "Nested dir test";
-  EXPECT_TRUE(file_write_to_disk("test_nested_tmp/nested/file.txt", content, strlen(content), false, false));
+  EXPECT_TRUE(file_write_to_disk("test_nested_tmp/nested/file.txt", content, strlen(content), false,
+                                 false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_nested_tmp/nested/file.txt", &st), 0);

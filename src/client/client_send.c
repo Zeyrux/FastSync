@@ -378,7 +378,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   if (!client) {
     if (context->config->transport == TRANSPORT_TCP)
       log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
-              context->config->use_tls ? " via TLS" : "");
+                  context->config->use_tls ? " via TLS" : "");
     pipeline_cancel(context);
     mark_sender_done(context);
     return thrd_error;
@@ -585,7 +585,8 @@ int send_files(Config* config) {
   Client* client = connect_transfer_client(config);
   if (!client) {
     if (config->transport == TRANSPORT_TCP)
-      log_message(LOG_LEVEL_ERROR, "could not connect to server%s", config->use_tls ? " via TLS" : "");
+      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
+                  config->use_tls ? " via TLS" : "");
     return 1;
   }
   ProtocolSession session;

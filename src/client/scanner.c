@@ -518,8 +518,8 @@ static Chunk* batch_files(ArrayList* files, unsigned long long chunk_size, Queue
 
 /* Scan one root-directory entry into either the subdirs or files list. */
 static void scan_root_entry(const ScannerOptions* options, const char* root_directory,
-                            const struct dirent* entry, ArrayList* root_files,
-                            ArrayList* subdirs, ParallelScanner* ps) {
+                            const struct dirent* entry, ArrayList* root_files, ArrayList* subdirs,
+                            ParallelScanner* ps) {
   ScannerEntry inspected;
   int inspection =
       scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);

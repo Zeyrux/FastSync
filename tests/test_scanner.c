@@ -394,7 +394,8 @@ static void test_parallel_scanner_root_chunks_without_workers() {
   create_test_file(file1, "a");
   create_test_file(file2, "b");
 
-  ScannerOptions options = {false, 1, NULL, 0, NULL, 0, 0, 0, 0, 0, false, false, false, false, false};
+  ScannerOptions options = {false, 1, NULL,  0,     NULL,  0,     0,    0,
+                            0,     0, false, false, false, false, false};
   ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options);
   EXPECT_NOT_NULL(scanner);
 
