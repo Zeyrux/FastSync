@@ -1,3 +1,4 @@
+#include "log.h"
 #include "scanner.h"
 #include "array_list.h"
 #include "chunk.h"
@@ -226,7 +227,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
   free(de);
   scanner->current_dir = opendir(scanner->current_path);
   if (scanner->current_dir == NULL) {
-    perror("Could not open directory");
+    log_perror("Could not open directory");
     free(scanner->current_path);
     scanner->current_path = NULL;
     scanner->failed = true;
@@ -564,7 +565,7 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
                                 ArrayList* subdirs) {
   DIR* dir = opendir(root_directory);
   if (!dir) {
-    perror("Could not open root directory for parallel scan");
+    log_perror("Could not open root directory for parallel scan");
     return false;
   }
   const struct dirent* entry;

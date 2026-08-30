@@ -29,7 +29,7 @@ File* file_create(const char* path) {
     return NULL;
   File* file = (File*)malloc(sizeof(File));
   if (file == NULL) {
-    perror("ERROR: Could not allocate memory for file struct");
+    log_perror("ERROR: Could not allocate memory for file struct");
     return NULL;
   }
 
@@ -69,7 +69,7 @@ void file_destroy(void* item) {
 FileMetadata* file_metadata_create(const struct stat* stats) {
   FileMetadata* m = malloc(sizeof(FileMetadata));
   if (m == NULL) {
-    perror("ERROR: Could not allocate memory for file metadata");
+    log_perror("ERROR: Could not allocate memory for file metadata");
     return NULL;
   }
   m->mode = stats->st_mode;
@@ -96,7 +96,7 @@ bool file_load_data(File* file) {
       return true;
     file->data->data = malloc(file->data->size);
     if (file->data->data == NULL) {
-      perror("Could not allocate memory for file data");
+      log_perror("Could not allocate memory for file data");
       return false;
     }
   }
@@ -125,13 +125,13 @@ bool file_write_to_disk(const char* path, const void* data, unsigned long long d
 size_t file_content_to_buffer(File* file) {
   FILE* file_pointer = fopen(file->path, "rb");
   if (file_pointer == NULL) {
-    perror("Could not open the file!");
+    log_perror("Could not open the file!");
     return 0;
   }
   size_t bytes_read = fread(file->data->data, 1, file->data->size, file_pointer);
   if (bytes_read != (size_t)file->data->size) {
     fclose(file_pointer);
-    perror("Read unexpected number of bytes from File!");
+    log_perror("Read unexpected number of bytes from File!");
     return 0;
   }
   fclose(file_pointer);

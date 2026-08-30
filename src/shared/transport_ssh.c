@@ -1,3 +1,4 @@
+#include "log.h"
 #include "transport_ssh.h"
 #include "utils.h"
 #include <fcntl.h>
@@ -76,7 +77,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
 
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
-    perror("socketpair failed");
+    log_perror("socketpair failed");
     remote_dest_destroy(&r);
     return NULL;
   }
@@ -89,7 +90,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
 
   int exec_pipe[2];
   if (pipe(exec_pipe) < 0) {
-    perror("pipe failed");
+    log_perror("pipe failed");
     close(sv[0]);
     close(sv[1]);
     remote_dest_destroy(&r);
@@ -98,7 +99,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
 
   pid_t pid = fork();
   if (pid < 0) {
-    perror("fork failed");
+    log_perror("fork failed");
     close(sv[0]);
     close(sv[1]);
     close(exec_pipe[0]);
@@ -151,7 +152,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     ssh_argv[ac++] = "--stdio";
     ssh_argv[ac] = NULL;
     execvp("ssh", ssh_argv);
-    perror("exec of ssh failed");
+    log_perror("exec of ssh failed");
     ssize_t wret = write(exec_pipe[1], "x", 1);
     (void)wret;
     _exit(1);

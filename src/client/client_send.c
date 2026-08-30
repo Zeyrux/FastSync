@@ -42,7 +42,7 @@ static ScannerOptions scanner_options_from_config(const Config* config, int num_
 static Client* connect_transfer_client(const Config* config) {
   if (config->transport == TRANSPORT_SSH) {
     if (config->use_sendfile) {
-      fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
+      log_message(LOG_LEVEL_ERROR, "-f/--sendfile is not supported with SSH transport");
       return NULL;
     }
     return client_connect_ssh(config->ssh_destination, config->ssh_port,
@@ -377,7 +377,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   Client* client = connect_transfer_client(context->config);
   if (!client) {
     if (context->config->transport == TRANSPORT_TCP)
-      fprintf(stderr, "Error: could not connect to server%s\n",
+      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
               context->config->use_tls ? " via TLS" : "");
     pipeline_cancel(context);
     mark_sender_done(context);
@@ -425,7 +425,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       return thrd_error;
     }
     if (send_chunk(client, current_chunk, context->config) != 0) {
-      fprintf(stderr, "Error: unexpected error while sending chunk\n");
+      log_message(LOG_LEVEL_ERROR, "unexpected error while sending chunk");
       chunk_destroy(current_chunk);
       pipeline_cancel(context);
       disconnect_transfer_client(client);
@@ -585,7 +585,7 @@ int send_files(Config* config) {
   Client* client = connect_transfer_client(config);
   if (!client) {
     if (config->transport == TRANSPORT_TCP)
-      fprintf(stderr, "Error: could not connect to server%s\n", config->use_tls ? " via TLS" : "");
+      log_message(LOG_LEVEL_ERROR, "could not connect to server%s", config->use_tls ? " via TLS" : "");
     return 1;
   }
   ProtocolSession session;
@@ -736,7 +736,7 @@ int send_files_multithreaded(Config* config) {
     sender_created = (thrd_create(&sender, send_chunks_multithreaded, context) == thrd_success);
 
   if (!scanner_created || !loader_created || !sender_created) {
-    perror("Error creating threads");
+    log_perror("Error creating threads");
     pipeline_cancel(context);
     mtx_lock(&context->mutex_progress);
     context->sender_done = true;
@@ -756,7 +756,7 @@ int send_files_multithreaded(Config* config) {
   if (config->show_progress) {
     progress_created = (thrd_create(&progress, progress_thread_fn, context) == thrd_success);
     if (!progress_created) {
-      perror("Error creating progress thread");
+      log_perror("Error creating progress thread");
       /* Non-fatal; continue without progress reporting */
     }
   }

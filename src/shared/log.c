@@ -1,6 +1,8 @@
 #include "log.h"
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
@@ -49,4 +51,8 @@ void log_message(LogLevel log_level, const char* format, ...) {
     write_message(log_fp, log_level, t, format, args);
     va_end(args);
   }
+}
+
+void log_perror(const char* context) {
+  log_message(LOG_LEVEL_ERROR, "%s: %s", context, strerror(errno));
 }

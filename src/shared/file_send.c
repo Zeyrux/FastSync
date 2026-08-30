@@ -62,7 +62,7 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
 
   int fd = open(file->path, O_RDONLY);
   if (fd == -1) {
-    perror("Could not open file for sendfile");
+    log_perror("Could not open file for sendfile");
     return false;
   }
 
@@ -121,7 +121,7 @@ bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int 
     if (sent == -1) {
       if (errno == EAGAIN || errno == EINTR)
         continue;
-      perror("sendfile failed");
+      log_perror("sendfile failed");
       close(fd);
       return false;
     }

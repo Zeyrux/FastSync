@@ -60,7 +60,7 @@ static bool parse_positive_int(const char* s, int* out_val) {
 static int set_string_option(char** dest, const char* value, const char* option_name) {
   char* dup = str_dup(value);
   if (!dup) {
-    fprintf(stderr, "Error: memory allocation failed for %s\n", option_name);
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", option_name);
     return -1;
   }
   free(*dest);
@@ -71,7 +71,7 @@ static int set_string_option(char** dest, const char* value, const char* option_
 /* Parse a string as a positive integer into *dest. Returns true on success, false on error. */
 static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
-    fprintf(stderr, "Error: %s must be a positive integer\n", option_name);
+    log_message(LOG_LEVEL_ERROR, "%s must be a positive integer", option_name);
     return -1;
   }
   return 0;
@@ -80,7 +80,7 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
 /* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
 static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
-    fprintf(stderr, "Error: %s must be a non-negative integer\n", option_name);
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", option_name);
     return -1;
   }
   return 0;
@@ -94,7 +94,7 @@ static int parse_ull_arg(const char* val, unsigned long long* out, const char* o
   errno = 0;
   unsigned long long v = strtoull(val, &end, 10);
   if (errno != 0 || *end != '\0') {
-    fprintf(stderr, "Error: %s must be a non-negative integer\n", optname);
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", optname);
     return -1;
   }
   *out = v;
@@ -106,13 +106,13 @@ static int config_add_pattern(char*** patterns, int* count, const char* value,
                               const char* optname) {
   char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
   if (!tmp) {
-    fprintf(stderr, "Error: memory allocation failed for %s\n", optname);
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
     return -1;
   }
   *patterns = tmp;
   char* dup = str_dup(value);
   if (!dup) {
-    fprintf(stderr, "Error: memory allocation failed for %s\n", optname);
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
     return -1;
   }
   (*patterns)[(*count)++] = dup;
@@ -215,7 +215,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     if (entry) {
       if (entry->kind != OPT_FLAG) {
         if (i + 1 >= argc) {
-          fprintf(stderr, "Error: missing argument for %s\n", entry->name);
+          log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
           return -1;
         }
         if (apply_table_option(config, entry, argv[++i]) != 0)
@@ -241,7 +241,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (set_positive_int_option(&config->ssh_port, argv[++i], "-p") != 0)
         return -1;
       if (config->ssh_port > 65535) {
-        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535\n");
+        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
         return -1;
       }
     } else if (opt_is(argv[i], "--exclude", NULL) && i + 1 < argc) {
@@ -259,7 +259,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
         config->delta_block_size = (uint32_t)val;
       else
-        fprintf(stderr, "Warning: --delta-block value %llu out of range, using default\n", val);
+        log_message(LOG_LEVEL_WARNING, "--delta-block value %llu out of range, using default", val);
     } else if (opt_is(argv[i], "--delta-max", NULL) && i + 1 < argc) {
       unsigned long long val;
       if (parse_ull_arg(argv[++i], &val, "--delta-max") != 0)
@@ -267,7 +267,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (val >= DELTA_MIN_FILE_SIZE)
         config->delta_max_file_size = val;
       else
-        fprintf(stderr, "Warning: --delta-max value %llu too small, using default\n", val);
+        log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
     } else if (opt_is(argv[i], "-c", "-z")) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
@@ -276,7 +276,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         long level = strtol(argv[i + 1], &end_ptr, 10);
         if (*end_ptr == '\0') {
           if (level < 1 || level > 22) {
-            fprintf(stderr, "Error: compression level must be 1-22\n");
+            log_message(LOG_LEVEL_ERROR, "compression level must be 1-22");
             return -1;
           }
           config->compression_level = (int)level;
@@ -298,11 +298,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
     } else if (opt_is(argv[i], "--server-port", NULL) && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->server_port)) {
-        fprintf(stderr, "Error: invalid --server-port value: %s\n", argv[i]);
+        log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s", argv[i]);
         return -1;
       }
       if (config->server_port > 65535) {
-        fprintf(stderr, "Error: server port must be 1-65535\n");
+        log_message(LOG_LEVEL_ERROR, "server port must be 1-65535");
         return -1;
       }
     } else if (opt_is(argv[i], "--bwlimit", NULL) && i + 1 < argc) {
@@ -310,11 +310,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (parse_ull_arg(argv[++i], &kbps, "--bwlimit") != 0)
         return -1;
       if (kbps == 0) {
-        fprintf(stderr, "Error: --bwlimit must be a positive integer\n");
+        log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
         return -1;
       }
       if (kbps > ULLONG_MAX / 1024) {
-        fprintf(stderr, "Error: --bwlimit value too large\n");
+        log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
         return -1;
       }
       io_set_bwlimit(kbps * 1024);
@@ -324,7 +324,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (parse_ull_arg(argv[++i], &val, "--chunk-size") != 0)
         return -1;
       if (val == 0) {
-        fprintf(stderr, "Error: --chunk-size must be a positive integer\n");
+        log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
         return -1;
       }
       config->chunk_size = val;
@@ -336,7 +336,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       FILE* lf = fopen(argv[++i], "a");
       if (!lf) {
-        fprintf(stderr, "Error: could not open log file '%s': %s\n", argv[i], strerror(errno));
+        log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s", argv[i], strerror(errno));
         return -1;
       }
       config->log_file = lf;
@@ -358,7 +358,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)
         return -1;
       if (config->compression_level < 1 || config->compression_level > 22) {
-        fprintf(stderr, "Error: --compress-level must be between 1 and 22\n");
+        log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
         return -1;
       }
     } else if (argv[i][0] == '-') {
@@ -381,7 +381,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
   FILE* fp = fopen(filepath, "r");
   if (!fp) {
-    fprintf(stderr, "Error: could not open pattern file '%s': %s\n", filepath, strerror(errno));
+    log_message(LOG_LEVEL_ERROR, "could not open pattern file '%s': %s", filepath, strerror(errno));
     return -1;
   }
   char* line = NULL;
@@ -420,7 +420,7 @@ int main(int argc, char* argv[]) {
   bool config_owned_by_pipeline = false;
   Config* config = config_create();
   if (!config) {
-    fprintf(stderr, "Error: failed to allocate config\n");
+    log_message(LOG_LEVEL_ERROR, "failed to allocate config");
     return 1;
   }
   config->save_to_disk = save_to_disk;
@@ -441,20 +441,20 @@ int main(int argc, char* argv[]) {
     free(config->receive_root_directory);
     config->send_directory = str_dup(argv[positional_args[0]]);
     if (!config->send_directory) {
-      fprintf(stderr, "Error: memory allocation failed\n");
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed");
       exit_code = 1;
       goto cleanup;
     }
     config->receive_root_directory = str_dup(argv[positional_args[1]]);
     if (!config->receive_root_directory) {
-      fprintf(stderr, "Error: memory allocation failed\n");
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed");
       exit_code = 1;
       goto cleanup;
     }
     config->save_to_disk = true;
     config_parse_ssh_dest(config);
   } else if (positional_count == 1) {
-    fprintf(stderr, "Error: missing destination argument\n");
+    log_message(LOG_LEVEL_ERROR, "missing destination argument");
     print_usage();
     exit_code = 1;
     goto cleanup;
@@ -462,7 +462,7 @@ int main(int argc, char* argv[]) {
     if (!config->send_directory && env_source) {
       config->send_directory = str_dup(env_source);
       if (!config->send_directory) {
-        fprintf(stderr, "Error: memory allocation failed\n");
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
         exit_code = 1;
         goto cleanup;
       }
@@ -470,7 +470,7 @@ int main(int argc, char* argv[]) {
     if (!config->receive_root_directory && env_dest) {
       config->receive_root_directory = str_dup(env_dest);
       if (!config->receive_root_directory) {
-        fprintf(stderr, "Error: memory allocation failed\n");
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
         exit_code = 1;
         goto cleanup;
       }
