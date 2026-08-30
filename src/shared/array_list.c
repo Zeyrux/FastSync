@@ -34,7 +34,7 @@ void array_list_delete(ArrayList* array_list) {
   free(array_list);
 }
 
-bool array_list_extend(ArrayList* array_list) {
+static bool array_list_extend(ArrayList* array_list) {
   if (array_list == NULL)
     return false;
   int new_capacity = array_list->capacity * 2;

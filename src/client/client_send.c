@@ -739,7 +739,7 @@ int send_files_multithreaded(Config* config) {
     sender_created = (thrd_create(&sender, send_chunks_multithreaded, context) == thrd_success);
 
   if (!scanner_created || !loader_created || !sender_created) {
-    perror("Error creating threads.\n");
+    perror("Error creating threads");
     pipeline_cancel(context);
     mtx_lock(&context->mutex_progress);
     context->sender_done = true;
@@ -759,7 +759,7 @@ int send_files_multithreaded(Config* config) {
   if (config->show_progress) {
     progress_created = (thrd_create(&progress, progress_thread_fn, context) == thrd_success);
     if (!progress_created) {
-      perror("Error creating progress thread.\n");
+      perror("Error creating progress thread");
       /* Non-fatal; continue without progress reporting */
     }
   }

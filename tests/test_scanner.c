@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 static void create_test_file(const char* path, const char* content) {
-  (void)to_disk(path, content, strlen(content), false, false);
+  (void)file_write_to_disk(path, content, strlen(content), false, false);
 }
 
 static void test_scanner_single_file() {
@@ -394,8 +394,8 @@ static void test_parallel_scanner_root_chunks_without_workers() {
   create_test_file(file1, "a");
   create_test_file(file2, "b");
 
-  ParallelScanner* scanner = parallel_scanner_create(dir, false, 1, NULL, 0, NULL, 0, 0, 0, 0, 0,
-                                                     false, false, false, false, false);
+  ScannerOptions options = {false, 1, NULL, 0, NULL, 0, 0, 0, 0, 0, false, false, false, false, false};
+  ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options);
   EXPECT_NOT_NULL(scanner);
 
   int total_files = 0;

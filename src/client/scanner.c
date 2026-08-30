@@ -645,20 +645,6 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   return ps;
 }
 
-ParallelScanner* parallel_scanner_create(const char* root_directory, bool use_metadata,
-                                         unsigned long long chunk_size, char** exclude_patterns,
-                                         int exclude_count, char** include_patterns,
-                                         int include_count, unsigned long long max_size,
-                                         unsigned long long min_size, int max_depth,
-                                         int num_threads, bool follow_symlinks, bool copy_links,
-                                         bool safe_links, bool copy_unsafe_links, bool checksum) {
-  ScannerOptions options = {use_metadata,     chunk_size,        exclude_patterns, exclude_count,
-                            include_patterns, include_count,     max_size,         min_size,
-                            max_depth,        num_threads,       follow_symlinks,  copy_links,
-                            safe_links,       copy_unsafe_links, checksum};
-  return parallel_scanner_create_with_options(root_directory, &options);
-}
-
 Chunk* parallel_scanner_next(ParallelScanner* ps) {
   if (ps->initial_chunk) {
     Chunk* c = ps->initial_chunk;

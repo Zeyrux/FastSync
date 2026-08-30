@@ -11,7 +11,7 @@ static void test_file_operations() {
   char* test_content = "Hello, Chunk System!";
   unsigned long long test_len = strlen(test_content);
 
-  to_disk(test_path, test_content, test_len, false, false);
+  file_write_to_disk(test_path, test_content, test_len, false, false);
 
   File* f = file_create(test_path);
   EXPECT_NOT_NULL(f);
@@ -43,8 +43,8 @@ static void test_chunk_operations() {
   char* content2 = "chunk item number 2";
   unsigned long long len2 = strlen(content2);
 
-  to_disk(path1, content1, len1, false, false);
-  to_disk(path2, content2, len2, false, false);
+  file_write_to_disk(path1, content1, len1, false, false);
+  file_write_to_disk(path2, content2, len2, false, false);
 
   struct stat st1, st2;
   stat(path1, &st1);

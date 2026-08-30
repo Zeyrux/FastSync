@@ -244,26 +244,26 @@ static void test_config_receive_truncated() {
   close(p[1]);
 }
 
-static void test_is_remote_dest() {
+static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
-  EXPECT_TRUE(is_remote_dest("user@host:/path"));
-  EXPECT_TRUE(is_remote_dest("host:/path"));
-  EXPECT_TRUE(is_remote_dest("user@192.168.1.1:/remote/path"));
+  EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
+  EXPECT_TRUE(config_is_remote_dest("host:/path"));
+  EXPECT_TRUE(config_is_remote_dest("user@192.168.1.1:/remote/path"));
 
   /* Invalid destinations */
-  EXPECT_FALSE(is_remote_dest(NULL));
-  EXPECT_FALSE(is_remote_dest(""));
-  EXPECT_FALSE(is_remote_dest(":"));
-  EXPECT_FALSE(is_remote_dest("/local/path"));
-  EXPECT_FALSE(is_remote_dest("relative/path"));
+  EXPECT_FALSE(config_is_remote_dest(NULL));
+  EXPECT_FALSE(config_is_remote_dest(""));
+  EXPECT_FALSE(config_is_remote_dest(":"));
+  EXPECT_FALSE(config_is_remote_dest("/local/path"));
+  EXPECT_FALSE(config_is_remote_dest("relative/path"));
   /* C:/windows/path is treated as remote (colon with no preceding slash) */
-  EXPECT_TRUE(is_remote_dest("C:/windows/path"));
+  EXPECT_TRUE(config_is_remote_dest("C:/windows/path"));
 
   /* Edge cases */
-  EXPECT_FALSE(is_remote_dest("noslash"));
-  EXPECT_FALSE(is_remote_dest("/"));
-  EXPECT_TRUE(is_remote_dest("host:"));
-  EXPECT_TRUE(is_remote_dest("user@host:"));
+  EXPECT_FALSE(config_is_remote_dest("noslash"));
+  EXPECT_FALSE(config_is_remote_dest("/"));
+  EXPECT_TRUE(config_is_remote_dest("host:"));
+  EXPECT_TRUE(config_is_remote_dest("user@host:"));
 }
 
 void test_config() {
@@ -278,5 +278,5 @@ void test_config() {
     test_config_send_receive_version_mismatch();
     test_config_receive_truncated();
   }
-  test_is_remote_dest();
+  test_config_is_remote_dest();
 }

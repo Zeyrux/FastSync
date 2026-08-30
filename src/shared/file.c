@@ -647,7 +647,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   return file;
 }
 
-bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
+bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
              bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
