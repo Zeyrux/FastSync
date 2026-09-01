@@ -42,6 +42,11 @@ typedef struct PipelineContextReceiver {
   atomic_bool cancelled;
 } PipelineContextReceiver;
 
+typedef bool (*ReceivedFileHandler)(File* file, void* context);
+
+int receive_files_common(const Config* config, int file_descriptor, ReceivedFileHandler handler,
+                         void* context, bool send_completion_status);
+
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
                                                       Queue* queue_loader);
 void pipeline_context_sender_destroy(PipelineContextSender* context);

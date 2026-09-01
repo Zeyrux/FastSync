@@ -13,9 +13,105 @@
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
+#include <sys/stat.h>
 
 static bool valid_batch_path(const char* path) {
   return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path);
+}
+
+static bool handle_batch_checks(int file_descriptor, const Config* config) {
+  int count;
+  if (config->checksum || !receive_int(file_descriptor, &count) || count < 0 ||
+      count > MAX_MANIFEST_ENTRIES)
+    return false;
+  for (int i = 0; i < count; i++) {
+    char* check_path = receive_str(file_descriptor);
+    if (!check_path)
+      return false;
+    unsigned long long check_size;
+    long long check_mtime;
+    bool received = receive_n_data(file_descriptor, &check_size, sizeof(check_size)) &&
+                    receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime));
+    if (!received || !valid_batch_path(check_path)) {
+      free(check_path);
+      if (received)
+        send_status(file_descriptor, STATUS_ERROR);
+      return false;
+    }
+    char* full_path = path_cat(config->receive_root_directory, check_path);
+    struct stat st;
+    bool has_old = full_path && lstat(full_path, &st) == 0;
+    bool match = has_old && (unsigned long long)st.st_size == check_size &&
+                 (long long)st.st_mtime == check_mtime;
+    bool sent = send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT);
+    free(full_path);
+    free(check_path);
+    if (!sent)
+      return false;
+  }
+  return true;
+}
+
+int receive_files_common(const Config* config, int file_descriptor, ReceivedFileHandler handler,
+                         void* context, bool send_completion_status) {
+  Status status;
+  if (!receive_status(file_descriptor, &status))
+    return -1;
+  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
+    if (status == STATUS_KEEPALIVE) {
+      if (!send_status(file_descriptor, STATUS_KEEPALIVE))
+        return -1;
+    } else if (status == STATUS_ABORT) {
+      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
+      return -1;
+    } else if (status == STATUS_CHECK_BATCH) {
+      if (!handle_batch_checks(file_descriptor, config))
+        return -1;
+    } else {
+      if (status == STATUS_CHUNK) {
+        Chunk* chunk = receive_chunk_data(file_descriptor, config);
+        if (!chunk)
+          return -1;
+        for (int i = 0; i < chunk->element_count; i++) {
+          File* file = chunk->items[i];
+          chunk->items[i] = NULL;
+          if (!handler(file, context)) {
+            file_destroy(file);
+            chunk_destroy(chunk);
+            return -1;
+          }
+        }
+        chunk_destroy(chunk);
+      } else {
+        bool skipped = false;
+        File* file = status == STATUS_CHECK
+                         ? receive_incremental_check(file_descriptor, config, &skipped)
+                         : file_receive(config, file_descriptor);
+        if (!skipped) {
+          if (!file || !handler(file, context)) {
+            file_destroy(file);
+            if (status == STATUS_NEXT)
+              log_message(LOG_LEVEL_ERROR, "Failed to receive file");
+            return -1;
+          }
+        }
+      }
+    }
+    if (!receive_status(file_descriptor, &status))
+      return -1;
+  }
+  if (status == STATUS_MANIFEST && receive_manifest(file_descriptor, config, &status) != 0)
+    return -1;
+  if (status != STATUS_FINISHED) {
+    log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
+    if (send_completion_status)
+      send_status(file_descriptor, STATUS_ERROR);
+    return -1;
+  }
+  if (send_completion_status && !send_status(file_descriptor, STATUS_OK))
+    return -1;
+  return 0;
 }
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
@@ -137,41 +233,14 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   free(context);
 }
 
-static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
-  Chunk* chunk = receive_chunk_data(file_descriptor, context->config);
-  if (chunk == NULL)
-    return false;
-
-  for (int i = 0; i < chunk->element_count; i++) {
-    File* file = chunk->items[i];
-    chunk->items[i] = NULL;
-    if (!queue_enqueue_multithreaded_cancel(context->queue, file, &context->mutex,
-                                            &context->condition_not_empty,
-                                            &context->condition_not_full, &context->cancelled)) {
-      file_destroy(file);
-      chunk_destroy(chunk);
-      return false;
-    }
-  }
-  chunk_destroy(chunk);
-  return true;
-}
-
-static void receiver_thread_fail(PipelineContextReceiver* context) {
-  mtx_lock(&context->mutex);
-  atomic_store(&context->cancelled, true);
-  context->receiver_done = true;
-  cnd_broadcast(&context->condition_not_empty);
-  cnd_broadcast(&context->condition_not_full);
-  mtx_unlock(&context->mutex);
+static bool enqueue_received_file(File* file, void* context) {
+  PipelineContextReceiver* receiver = context;
+  return queue_enqueue_multithreaded_cancel(receiver->queue, file, &receiver->mutex,
+                                            &receiver->condition_not_empty,
+                                            &receiver->condition_not_full, &receiver->cancelled);
 }
 
 int receive_thread(void* pipeline_context) {
-#define RECEIVE_THREAD_FAIL()                                                                      \
-  do {                                                                                             \
-    receiver_thread_fail(context);                                                                 \
-    return thrd_error;                                                                             \
-  } while (0)
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
   if (context->ssl)
     io_set_ssl(context->ssl);
@@ -180,100 +249,15 @@ int receive_thread(void* pipeline_context) {
   const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
-  Status status;
-  if (!receive_status(file_descriptor, &status))
-    RECEIVE_THREAD_FAIL();
-  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
-         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
-    if (status == STATUS_KEEPALIVE) {
-      if (!send_status(file_descriptor, STATUS_KEEPALIVE))
-        RECEIVE_THREAD_FAIL();
-      goto next;
-    }
-    if (status == STATUS_ABORT) {
-      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
-      RECEIVE_THREAD_FAIL();
-    }
-    if (status == STATUS_CHECK) {
-      bool skipped;
-      File* file = receive_incremental_check(file_descriptor, config, &skipped);
-      if (!skipped) {
-        if (file == NULL)
-          RECEIVE_THREAD_FAIL();
-        if (!queue_enqueue_multithreaded_cancel(
-                context->queue, file, &context->mutex, &context->condition_not_empty,
-                &context->condition_not_full, &context->cancelled)) {
-          file_destroy(file);
-          RECEIVE_THREAD_FAIL();
-        }
-      }
-    } else if (status == STATUS_CHUNK) {
-      if (!receive_chunk_enqueue(file_descriptor, context))
-        RECEIVE_THREAD_FAIL();
-    } else if (status == STATUS_CHECK_BATCH) {
-      int count;
-      if (config->checksum || !receive_int(file_descriptor, &count) || count < 0 ||
-          count > MAX_MANIFEST_ENTRIES)
-        RECEIVE_THREAD_FAIL();
-      for (int i = 0; i < count; i++) {
-        char* check_path = receive_str(file_descriptor);
-        if (!check_path)
-          RECEIVE_THREAD_FAIL();
-        unsigned long long check_size;
-        long long check_mtime;
-        if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
-            !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
-          free(check_path);
-          RECEIVE_THREAD_FAIL();
-        }
-        if (!valid_batch_path(check_path)) {
-          free(check_path);
-          if (!send_status(file_descriptor, STATUS_ERROR))
-            RECEIVE_THREAD_FAIL();
-          RECEIVE_THREAD_FAIL();
-        }
-        char* full_path = path_cat(config->receive_root_directory, check_path);
-        struct stat st;
-        bool has_old = full_path && lstat(full_path, &st) == 0;
-        bool match = has_old && (unsigned long long)st.st_size == check_size &&
-                     (long long)st.st_mtime == check_mtime;
-        if (!send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT))
-          RECEIVE_THREAD_FAIL();
-        free(full_path);
-        free(check_path);
-      }
-      goto next;
-    } else {
-      File* file = file_receive(config, file_descriptor);
-      if (file) {
-        if (!queue_enqueue_multithreaded_cancel(
-                context->queue, file, &context->mutex, &context->condition_not_empty,
-                &context->condition_not_full, &context->cancelled)) {
-          file_destroy(file);
-          receiver_thread_fail(context);
-          return thrd_error;
-        }
-      } else {
-        log_message(LOG_LEVEL_ERROR, "Failed to receive file");
-        RECEIVE_THREAD_FAIL();
-      }
-    }
-  next:
-    if (!receive_status(file_descriptor, &status))
-      RECEIVE_THREAD_FAIL();
-  }
-  if (status == STATUS_MANIFEST) {
-    if (receive_manifest(file_descriptor, config, &status) != 0)
-      RECEIVE_THREAD_FAIL();
-  }
-  if (status != STATUS_FINISHED)
-    RECEIVE_THREAD_FAIL();
+  int result = receive_files_common(config, file_descriptor, enqueue_received_file, context, false);
   mtx_lock(&context->mutex);
+  if (result != 0)
+    atomic_store(&context->cancelled, true);
   context->receiver_done = true;
   cnd_signal(&context->condition_not_empty);
+  cnd_broadcast(&context->condition_not_full);
   mtx_unlock(&context->mutex);
-#undef RECEIVE_THREAD_FAIL
-  return thrd_success;
+  return result == 0 ? thrd_success : thrd_error;
 }
 
 int write_thread(void* pipeline_context) {

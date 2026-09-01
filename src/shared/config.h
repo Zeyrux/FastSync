@@ -128,6 +128,53 @@ typedef struct Config {
   char* compress_choice;
 } Config;
 
+/* Keep the on-wire field order in one place. The first three strings require
+ * values when sent; optional strings are encoded as empty strings when NULL. */
+#define CONFIG_WIRE_FIELDS(VERSION, STRING, OPTIONAL_STRING, INTEGER, DATA)                        \
+  VERSION(version)                                                                                 \
+  STRING(send_directory)                                                                           \
+  STRING(receive_root_directory)                                                                   \
+  INTEGER(save_to_disk)                                                                            \
+  INTEGER(use_multithreading)                                                                      \
+  INTEGER(use_chunk_serialization)                                                                 \
+  INTEGER(use_compression)                                                                         \
+  INTEGER(use_metadata)                                                                            \
+  INTEGER(compression_level)                                                                       \
+  DATA(chunk_size)                                                                                 \
+  INTEGER(use_sendfile)                                                                            \
+  INTEGER(use_delete)                                                                              \
+  INTEGER(use_incremental)                                                                         \
+  INTEGER(use_delta)                                                                               \
+  DATA(delta_block_size)                                                                           \
+  DATA(delta_max_file_size)                                                                        \
+  INTEGER(backup)                                                                                  \
+  OPTIONAL_STRING(backup_dir)                                                                      \
+  INTEGER(follow_symlinks)                                                                         \
+  INTEGER(copy_links)                                                                              \
+  INTEGER(safe_links)                                                                              \
+  INTEGER(copy_unsafe_links)                                                                       \
+  INTEGER(preserve_hard_links)                                                                     \
+  INTEGER(preserve_acls)                                                                           \
+  INTEGER(preserve_xattrs)                                                                         \
+  INTEGER(preserve_devices)                                                                        \
+  INTEGER(preserve_sparse)                                                                         \
+  INTEGER(update)                                                                                  \
+  INTEGER(inplace)                                                                                 \
+  INTEGER(append)                                                                                  \
+  INTEGER(append_verify)                                                                           \
+  INTEGER(delete_excluded)                                                                         \
+  INTEGER(delete_after)                                                                            \
+  DATA(max_delete)                                                                                 \
+  INTEGER(relative)                                                                                \
+  INTEGER(prune_empty_dirs)                                                                        \
+  OPTIONAL_STRING(temp_dir)                                                                        \
+  INTEGER(partial)                                                                                 \
+  OPTIONAL_STRING(partial_dir)                                                                     \
+  OPTIONAL_STRING(suffix)                                                                          \
+  INTEGER(delete_before)                                                                           \
+  INTEGER(checksum)                                                                                \
+  OPTIONAL_STRING(compress_choice)
+
 #define PROTOCOL_VERSION "2.2.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 

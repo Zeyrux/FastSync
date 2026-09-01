@@ -29,6 +29,7 @@ void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
                         const char* log_fmt);
 void server_delete(Server** server);
 Client* client_create();
+bool tcp_connect_socket(Client* client, const char* host, int port);
 bool client_connect(Client* client, char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);

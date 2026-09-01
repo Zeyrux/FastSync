@@ -1,7 +1,4 @@
-#include "array_list.h"
-#include "chunk.h"
 #include "config.h"
-#include "data.h"
 #include "file.h"
 #include "log.h"
 #include "multiprocessing.h"
@@ -29,9 +26,12 @@ static bool path_is_within(const char* root, const char* path) {
   return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
-static bool valid_batch_path(const char* path) {
-  return path && path[0] != '\0' && path[0] != '/' && !has_path_traversal(path) &&
-         strchr(path, '\0') == path + strlen(path);
+static bool save_received_file(File* file, void* context) {
+  Config* config = context;
+  if (config->save_to_disk && !file_save_to_disk(config->receive_root_directory, file, config))
+    return false;
+  file_destroy(file);
+  return true;
 }
 
 static bool __attribute__((unused)) configure_authorization(const char* root) {
@@ -53,116 +53,7 @@ static bool __attribute__((unused)) configure_authorization(const char* root) {
 }
 
 int receive_files(Config* config, int fd) {
-  Status status;
-  if (!receive_status(fd, &status))
-    return -1;
-
-  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
-         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
-    if (status == STATUS_KEEPALIVE) {
-      send_status(fd, STATUS_KEEPALIVE);
-      goto next;
-    }
-    if (status == STATUS_ABORT) {
-      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
-      return -1;
-    }
-    if (status == STATUS_CHECK) {
-      bool skipped;
-      File* file = receive_incremental_check(fd, config, &skipped);
-      if (skipped)
-        goto next;
-      if (file == NULL && !skipped)
-        return -1;
-      if (config->save_to_disk &&
-          !file_save_to_disk(config->receive_root_directory, file, config)) {
-        file_destroy(file);
-        send_status(fd, STATUS_ERROR);
-        return -1;
-      }
-      file_destroy(file);
-    } else if (status == STATUS_CHUNK) {
-      Chunk* chunk = receive_chunk_data(fd, config);
-      if (chunk == NULL) {
-        send_status(fd, STATUS_ERROR);
-        return -1;
-      }
-      for (int i = 0; i < chunk->element_count; i++) {
-        if (config->save_to_disk &&
-            !file_save_to_disk(config->receive_root_directory, chunk->items[i], config)) {
-          chunk_destroy(chunk);
-          send_status(fd, STATUS_ERROR);
-          return -1;
-        }
-      }
-      chunk_destroy(chunk);
-    } else if (status == STATUS_CHECK_BATCH) {
-      int count;
-      /* Batch framing has no checksum field yet; never silently downgrade a
-         checksum-enabled transfer into mtime-only matching. */
-      if (config->checksum || !receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
-        return -1;
-      for (int i = 0; i < count; i++) {
-        char* check_path = receive_str(fd);
-        if (!check_path)
-          return -1;
-        unsigned long long check_size;
-        long long check_mtime;
-        if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
-            !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
-          free(check_path);
-          return -1;
-        }
-        if (!valid_batch_path(check_path)) {
-          free(check_path);
-          send_status(fd, STATUS_ERROR);
-          return -1;
-        }
-        char* full_path = path_cat(config->receive_root_directory, check_path);
-        struct stat st;
-        bool has_old = full_path && lstat(full_path, &st) == 0;
-        bool match = has_old && (unsigned long long)st.st_size == check_size &&
-                     (long long)st.st_mtime == check_mtime;
-        bool sent = send_status(fd, match ? STATUS_OK : STATUS_NEXT);
-        free(full_path);
-        free(check_path);
-        if (!sent)
-          return -1;
-      }
-      goto next;
-    } else {
-      File* file = file_receive(config, fd);
-      if (file == NULL) {
-        log_message(LOG_LEVEL_ERROR, "Failed to receive file");
-        send_status(fd, STATUS_ERROR);
-        return -1;
-      }
-      if (config->save_to_disk &&
-          !file_save_to_disk(config->receive_root_directory, file, config)) {
-        file_destroy(file);
-        send_status(fd, STATUS_ERROR);
-        return -1;
-      }
-      file_destroy(file);
-    }
-  next:
-    if (!receive_status(fd, &status)) {
-      send_status(fd, STATUS_ERROR);
-      return -1;
-    }
-  }
-
-  if (status == STATUS_MANIFEST) {
-    if (receive_manifest(fd, config, &status) != 0)
-      return -1;
-  }
-  if (status != STATUS_FINISHED) {
-    log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
-    send_status(fd, STATUS_ERROR);
-    return -1;
-  }
-  send_status(fd, STATUS_OK);
-  return 0;
+  return receive_files_common(config, fd, save_received_file, config, true);
 }
 
 void handler(int file_descriptor) {

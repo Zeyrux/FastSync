@@ -173,103 +173,39 @@ void config_delete(Config* config) {
   free(config);
 }
 
-/* Wire format order (must match config_receive and be updated when PROTOCOL_VERSION bumps):
- * version, send_directory, receive_root_directory, save_to_disk, use_multithreading,
- * use_chunk_serialization, use_compression, use_metadata, compression_level, chunk_size,
- * use_sendfile, use_delete, use_incremental, use_delta, delta_block_size, delta_max_file_size,
- * backup, backup_dir, follow_symlinks, copy_links, safe_links, copy_unsafe_links,
- * preserve_hard_links, preserve_acls, preserve_xattrs, preserve_devices, preserve_sparse,
- * update, inplace, append, append_verify, delete_excluded, delete_after, max_delete, relative,
- * prune_empty_dirs, temp_dir, partial, partial_dir, suffix, delete_before, checksum,
- * compress_choice, status
- */
+static bool config_send_string(int file_descriptor, const char* value, bool optional) {
+  return send_str(file_descriptor, value ? value : (optional ? "" : NULL));
+}
+
+#define CONFIG_SEND_VERSION(field)                                                                 \
+  do {                                                                                             \
+    if (!config_send_string(file_descriptor, config->field, false))                                \
+      return false;                                                                                \
+  } while (0);
+#define CONFIG_SEND_STRING(field)                                                                  \
+  do {                                                                                             \
+    if (!config_send_string(file_descriptor, config->field, false))                                \
+      return false;                                                                                \
+  } while (0);
+#define CONFIG_SEND_OPTIONAL_STRING(field)                                                         \
+  do {                                                                                             \
+    if (!config_send_string(file_descriptor, config->field, true))                                 \
+      return false;                                                                                \
+  } while (0);
+#define CONFIG_SEND_INTEGER(field)                                                                 \
+  do {                                                                                             \
+    if (!send_int(file_descriptor, config->field))                                                 \
+      return false;                                                                                \
+  } while (0);
+#define CONFIG_SEND_DATA(field)                                                                    \
+  do {                                                                                             \
+    if (!send_n_data(file_descriptor, &config->field, sizeof(config->field)))                      \
+      return false;                                                                                \
+  } while (0);
+
 bool config_send(int file_descriptor, const Config* config) {
-  if (!send_str(file_descriptor, config->version))
-    return false;
-  if (!send_str(file_descriptor, config->send_directory))
-    return false;
-  if (!send_str(file_descriptor, config->receive_root_directory))
-    return false;
-  if (!send_int(file_descriptor, config->save_to_disk))
-    return false;
-  if (!send_int(file_descriptor, config->use_multithreading))
-    return false;
-  if (!send_int(file_descriptor, config->use_chunk_serialization))
-    return false;
-  if (!send_int(file_descriptor, config->use_compression))
-    return false;
-  if (!send_int(file_descriptor, config->use_metadata))
-    return false;
-  if (!send_int(file_descriptor, config->compression_level))
-    return false;
-  if (!send_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
-    return false;
-  if (!send_int(file_descriptor, config->use_sendfile))
-    return false;
-  if (!send_int(file_descriptor, config->use_delete))
-    return false;
-  if (!send_int(file_descriptor, config->use_incremental))
-    return false;
-  if (!send_int(file_descriptor, config->use_delta))
-    return false;
-  if (!send_n_data(file_descriptor, &config->delta_block_size, sizeof(config->delta_block_size)))
-    return false;
-  if (!send_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
-    return false;
-  if (!send_int(file_descriptor, config->backup))
-    return false;
-  if (!send_str(file_descriptor, config->backup_dir ? config->backup_dir : ""))
-    return false;
-  if (!send_int(file_descriptor, config->follow_symlinks))
-    return false;
-  if (!send_int(file_descriptor, config->copy_links))
-    return false;
-  if (!send_int(file_descriptor, config->safe_links))
-    return false;
-  if (!send_int(file_descriptor, config->copy_unsafe_links))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_hard_links))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_acls))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_xattrs))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_devices))
-    return false;
-  if (!send_int(file_descriptor, config->preserve_sparse))
-    return false;
-  if (!send_int(file_descriptor, config->update))
-    return false;
-  if (!send_int(file_descriptor, config->inplace))
-    return false;
-  if (!send_int(file_descriptor, config->append))
-    return false;
-  if (!send_int(file_descriptor, config->append_verify))
-    return false;
-  if (!send_int(file_descriptor, config->delete_excluded))
-    return false;
-  if (!send_int(file_descriptor, config->delete_after))
-    return false;
-  if (!send_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
-    return false;
-  if (!send_int(file_descriptor, config->relative))
-    return false;
-  if (!send_int(file_descriptor, config->prune_empty_dirs))
-    return false;
-  if (!send_str(file_descriptor, config->temp_dir ? config->temp_dir : ""))
-    return false;
-  if (!send_int(file_descriptor, config->partial))
-    return false;
-  if (!send_str(file_descriptor, config->partial_dir ? config->partial_dir : ""))
-    return false;
-  if (!send_str(file_descriptor, config->suffix ? config->suffix : ""))
-    return false;
-  if (!send_int(file_descriptor, config->delete_before))
-    return false;
-  if (!send_int(file_descriptor, config->checksum))
-    return false;
-  if (!send_str(file_descriptor, config->compress_choice ? config->compress_choice : ""))
-    return false;
+  CONFIG_WIRE_FIELDS(CONFIG_SEND_VERSION, CONFIG_SEND_STRING, CONFIG_SEND_OPTIONAL_STRING,
+                     CONFIG_SEND_INTEGER, CONFIG_SEND_DATA)
   Status status;
   if (!receive_status(file_descriptor, &status))
     return false;
@@ -280,160 +216,60 @@ bool config_send(int file_descriptor, const Config* config) {
   return true;
 }
 
-/* Wire format order: see the comment above config_send. */
+#undef CONFIG_SEND_VERSION
+#undef CONFIG_SEND_STRING
+#undef CONFIG_SEND_OPTIONAL_STRING
+#undef CONFIG_SEND_INTEGER
+#undef CONFIG_SEND_DATA
+
+static bool config_receive_string(int file_descriptor, char** destination) {
+  char* value = receive_str(file_descriptor);
+  if (!value)
+    return false;
+  *destination = value;
+  return true;
+}
+
+#define CONFIG_RECEIVE_VERSION(field)                                                              \
+  do {                                                                                             \
+    free(config->field);                                                                           \
+    config->field = receive_str(file_descriptor);                                                  \
+    if (!config->field)                                                                            \
+      goto error;                                                                                  \
+    if (strcmp(config->field, PROTOCOL_VERSION) != 0) {                                            \
+      fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n", config->field,          \
+              PROTOCOL_VERSION);                                                                   \
+      config_delete(config);                                                                       \
+      send_status(file_descriptor, STATUS_ERROR);                                                  \
+      return NULL;                                                                                 \
+    }                                                                                              \
+  } while (0);
+#define CONFIG_RECEIVE_STRING(field)                                                               \
+  do {                                                                                             \
+    if (!config_receive_string(file_descriptor, &config->field))                                   \
+      goto error;                                                                                  \
+  } while (0);
+#define CONFIG_RECEIVE_OPTIONAL_STRING(field) CONFIG_RECEIVE_STRING(field)
+#define CONFIG_RECEIVE_INTEGER(field)                                                              \
+  do {                                                                                             \
+    if (!receive_int(file_descriptor, &tmp))                                                       \
+      goto error;                                                                                  \
+    config->field = tmp;                                                                           \
+  } while (0);
+#define CONFIG_RECEIVE_DATA(field)                                                                 \
+  do {                                                                                             \
+    if (!receive_n_data(file_descriptor, &config->field, sizeof(config->field)))                   \
+      goto error;                                                                                  \
+  } while (0);
+
 Config* config_receive(int file_descriptor) {
   Config* config = (Config*)malloc(sizeof(Config));
   if (config == NULL)
     return NULL;
   config_set_defaults(config);
-  free(config->version);
-  config->version = receive_str(file_descriptor);
-  if (!config->version) {
-    free(config->server_host);
-    free(config);
-    return NULL;
-  }
-  if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
-    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n", config->version,
-            PROTOCOL_VERSION);
-    free(config->version);
-    free(config->server_host);
-    free(config);
-    send_status(file_descriptor, STATUS_ERROR);
-    return NULL;
-  }
-  config->send_directory = receive_str(file_descriptor);
-  if (!config->send_directory) {
-    free(config->version);
-    free(config->server_host);
-    free(config);
-    return NULL;
-  }
-  config->receive_root_directory = receive_str(file_descriptor);
-  if (!config->receive_root_directory) {
-    free(config->version);
-    free(config->send_directory);
-    free(config->server_host);
-    free(config);
-    return NULL;
-  }
   int tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->save_to_disk = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_multithreading = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_chunk_serialization = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_compression = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_metadata = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->compression_level = tmp;
-  if (!receive_n_data(file_descriptor, &config->chunk_size, sizeof(config->chunk_size)))
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_sendfile = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_delete = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_incremental = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->use_delta = tmp;
-  if (!receive_n_data(file_descriptor, &config->delta_block_size, sizeof(config->delta_block_size)))
-    goto error;
-  if (!receive_n_data(file_descriptor, &config->delta_max_file_size, sizeof(unsigned long long)))
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->backup = tmp;
-  config->backup_dir = receive_str(file_descriptor);
-  if (config->backup_dir == NULL)
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->follow_symlinks = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->copy_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->safe_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->copy_unsafe_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_hard_links = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_acls = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_xattrs = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_devices = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->preserve_sparse = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->update = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->inplace = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->append = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->append_verify = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_excluded = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_after = tmp;
-  if (!receive_n_data(file_descriptor, &config->max_delete, sizeof(config->max_delete)))
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->relative = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->prune_empty_dirs = tmp;
-  config->temp_dir = receive_str(file_descriptor);
-  if (config->temp_dir == NULL)
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->partial = tmp;
-  config->partial_dir = receive_str(file_descriptor);
-  if (config->partial_dir == NULL)
-    goto error;
-  config->suffix = receive_str(file_descriptor);
-  if (config->suffix == NULL)
-    goto error;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->delete_before = tmp;
-  if (!receive_int(file_descriptor, &tmp))
-    goto error;
-  config->checksum = tmp;
-  config->compress_choice = receive_str(file_descriptor);
-  if (config->compress_choice == NULL)
-    goto error;
+  CONFIG_WIRE_FIELDS(CONFIG_RECEIVE_VERSION, CONFIG_RECEIVE_STRING, CONFIG_RECEIVE_OPTIONAL_STRING,
+                     CONFIG_RECEIVE_INTEGER, CONFIG_RECEIVE_DATA)
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
     fprintf(stderr, "Unsupported compression choice: %s\n", config->compress_choice);
@@ -445,15 +281,12 @@ Config* config_receive(int file_descriptor) {
   return config;
 
 error:
-  free(config->version);
-  free(config->send_directory);
-  free(config->receive_root_directory);
-  free(config->server_host);
-  free(config->backup_dir);
-  free(config->temp_dir);
-  free(config->partial_dir);
-  free(config->suffix);
-  free(config->compress_choice);
-  free(config);
+  config_delete(config);
   return NULL;
 }
+
+#undef CONFIG_RECEIVE_VERSION
+#undef CONFIG_RECEIVE_STRING
+#undef CONFIG_RECEIVE_OPTIONAL_STRING
+#undef CONFIG_RECEIVE_INTEGER
+#undef CONFIG_RECEIVE_DATA

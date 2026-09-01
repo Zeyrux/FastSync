@@ -173,7 +173,7 @@ Client* client_create() {
   return client;
 }
 
-bool client_connect(Client* client, char* host, int port) {
+bool tcp_connect_socket(Client* client, const char* host, int port) {
   struct addrinfo hints;
   struct addrinfo* result;
   memset(&hints, 0, sizeof(hints));
@@ -224,6 +224,10 @@ bool client_connect(Client* client, char* host, int port) {
 
   tcp_apply_socket_timeout(client->file_descriptor);
   return true;
+}
+
+bool client_connect(Client* client, char* host, int port) {
+  return tcp_connect_socket(client, host, port);
 }
 
 void client_disconnect(Client* client) {
