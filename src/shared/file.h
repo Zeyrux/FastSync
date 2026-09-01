@@ -6,8 +6,10 @@
 #include "file_types.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
-/* File/FileMetadata lifecycle and local disk helpers. */
+/* File/FileMetadata lifecycle, local disk helpers, and secure filesystem
+   primitives shared by the send/receive pipelines. */
 
 File* file_create(const char* path);
 void file_destroy(void* item);
@@ -18,6 +20,17 @@ FileMetadata* file_metadata_create(const struct stat* stats);
 void file_metadata_destroy(void* metadata);
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
                         bool inplace, bool sparse);
+
+/* A configured fd without a canonical identity deliberately rejects paths. */
 bool file_set_authorized_root(int fd, const char* canonical_path);
+
+/* Secure path/filesystem primitives (symlink-safe, O_NOFOLLOW, root-confined). */
+bool file_path_exists_secure(const char* path);
+bool file_stat_secure(const char* path, struct stat* st);
+int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
+bool file_ensure_directory_secure(const char* path);
+bool file_rename_secure(const char* old_path, const char* new_path);
+bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
+                         bool inplace, bool sparse, const FileMetadata* metadata);
 
 #endif

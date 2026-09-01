@@ -417,7 +417,6 @@ int main(int argc, char* argv[]) {
   parse_environment(&env_source, &env_dest, &save_to_disk);
 
   int exit_code = 0;
-  bool config_owned_by_pipeline = false;
   Config* config = config_create();
   if (!config) {
     log_message(LOG_LEVEL_ERROR, "failed to allocate config");
@@ -500,18 +499,14 @@ int main(int argc, char* argv[]) {
 
   /* Execute transfer */
   if (config->use_multithreading) {
-    config_owned_by_pipeline = true;
-    exit_code = send_files_multithreaded(config);
+    exit_code = send_files_multithreaded(&config);
   } else {
     exit_code = send_files(config);
   }
 
 cleanup:
   if (config) {
-    if (config->log_file)
-      fclose(config->log_file);
-    if (!config_owned_by_pipeline)
-      config_delete(config);
+    config_delete(config);
   }
   return exit_code;
 }

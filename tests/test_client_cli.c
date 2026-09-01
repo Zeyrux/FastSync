@@ -46,6 +46,8 @@ static void test_validate_config_tls_requirements() {
   cfg->tls_cert = str_dup("cert.pem");
   EXPECT_FALSE(validate_config(cfg));
   cfg->tls_key = str_dup("key.pem");
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->tls_ca = str_dup("ca.pem");
   EXPECT_TRUE(validate_config(cfg));
   config_delete(cfg);
 }

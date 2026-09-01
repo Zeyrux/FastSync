@@ -19,7 +19,7 @@
 
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
-  if (!file || !file->path || !file->data)
+  if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data))
     return false;
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;

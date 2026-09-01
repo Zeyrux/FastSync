@@ -10,6 +10,8 @@
 
 /* Maximum allowed data payload size for receive_data (100 MB) */
 #define MAX_DATA_PAYLOAD_SIZE (100ULL * 1024 * 1024)
+/* Maximum uncompressed file payload accepted by the receiver. */
+#define MAX_RECEIVE_FILE_SIZE (64ULL * 1024 * 1024)
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
@@ -69,6 +71,7 @@ bool protocol_send_str(ProtocolSession* session, const char* data);
 char* protocol_receive_str(ProtocolSession* session);
 bool protocol_send_data(ProtocolSession* session, const Data* data);
 Data* protocol_receive_data(ProtocolSession* session);
+Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long maximum_size);
 bool protocol_send_int(ProtocolSession* session, int data);
 bool protocol_receive_int(ProtocolSession* session, int* data);
 bool protocol_send_status(ProtocolSession* session, Status status);
@@ -80,6 +83,7 @@ bool send_str(int file_descriptor, const char* data);
 char* receive_str(int file_descriptor);
 bool send_data(int file_descriptor, const Data* data);
 Data* receive_data(int file_descriptor);
+Data* receive_data_limited(int file_descriptor, unsigned long long maximum_size);
 bool send_int(int file_descriptor, int data);
 bool receive_int(int file_descriptor, int* data);
 bool send_status(int file_descriptor, Status status);

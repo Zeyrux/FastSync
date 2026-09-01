@@ -13,6 +13,8 @@ static void test_data_compress_decompress_roundtrip() {
   size_t len = strlen(original);
 
   char* buf = malloc(len);
+  if (!buf)
+    return;
   memcpy(buf, original, len);
   Data* original_data = data_create(buf, len);
   EXPECT_NOT_NULL(original_data);

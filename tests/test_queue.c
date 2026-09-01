@@ -122,6 +122,8 @@ static void test_queue_destroyer() {
 
   for (int i = 0; i < 3; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      break;
     *val = i;
     queue_enqueue(q, val);
   }
@@ -181,6 +183,8 @@ static void test_queue_multithreaded() {
 
   for (int i = 1; i <= 100; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      break;
     *val = i;
     queue_enqueue_multithreaded(q, val, &mutex, &cnd_empty, &cnd_full);
   }

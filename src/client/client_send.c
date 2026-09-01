@@ -150,6 +150,8 @@ static int send_dry_run_manifest(const Config* config) {
 
 /* Send the delete manifest (list of files) to the server. Returns 0 on success, -1 on failure. */
 static int send_delete_manifest(int fd, ArrayList* manifest) {
+  if (!manifest)
+    return -1;
   if (!send_status(fd, STATUS_MANIFEST))
     return -1;
   if (!send_int(fd, manifest->size))
@@ -191,17 +193,22 @@ static int incremental_check(Client* client, File* file, const Config* config,
     return 1;
   if (s == STATUS_DELTA_SIGNATURE) {
     Data* sig_data = receive_data(client->file_descriptor);
-    if (!sig_data)
+    if (!sig_data) {
+      send_status(client->file_descriptor, STATUS_ERROR);
       return -1;
+    }
     DeltaSignature* sig = delta_signature_deserialize(sig_data);
     data_destroy(sig_data);
-    if (!sig)
+    if (!sig) {
+      send_status(client->file_descriptor, STATUS_ERROR);
       return -1;
+    }
     *out_sig = sig;
     return 2;
   }
   if (s != STATUS_NEXT) {
     log_message(LOG_LEVEL_ERROR, "Unexpected server status");
+    send_status(client->file_descriptor, STATUS_ERROR);
     return -1;
   }
   return 0;
@@ -209,11 +216,10 @@ static int incremental_check(Client* client, File* file, const Config* config,
 
 static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* config) {
   Delta* delta = delta_compute(file->data->data, file->data->size, sig, config->delta_block_size);
-  if (!delta) {
-    if (!send_status(client->file_descriptor, STATUS_NEXT))
-      return -1;
-    return 1;
-  }
+  /* The receiver is blocked after sending the signature.  Every local
+     fallback therefore needs the explicit NEXT response before full data. */
+  if (!delta)
+    return send_status(client->file_descriptor, STATUS_NEXT) ? 1 : -1;
 
   if (!delta_is_worthwhile(delta, file->data->size)) {
     delta_destroy(delta);
@@ -225,14 +231,14 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
   Data* delta_data = delta_serialize(delta);
   delta_destroy(delta);
   if (!delta_data)
-    return -1;
+    return send_status(client->file_descriptor, STATUS_NEXT) ? 1 : -1;
 
   Data* to_send = delta_data;
   if (config->use_compression) {
     to_send = data_compress(delta_data, config->compression_level);
     data_destroy(delta_data);
     if (!to_send)
-      return -1;
+      return send_status(client->file_descriptor, STATUS_NEXT) ? 1 : -1;
   }
 
   bool ok = send_status(client->file_descriptor, STATUS_DELTA_DATA) &&
@@ -362,7 +368,8 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
     if (f == NULL)
       continue;
     bool stream = f->data->data == NULL && f->data->size > 0;
-    bool use_sendfile = (config->use_sendfile && !config->use_compression) || stream;
+    bool use_sendfile =
+        (config->use_sendfile && !config->use_compression) || (stream && !config->use_compression);
     int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
     if (rc == 1)
       continue;
@@ -516,7 +523,7 @@ static int load_files_multithreaded(void* pipeline_context) {
     if (!context->config->use_sendfile) {
       for (int i = 0; i < chunk->element_count; i++) {
         File* f = chunk->items[i];
-        if (f->data->size > STREAM_THRESHOLD)
+        if (f->data->size > STREAM_THRESHOLD && !context->config->use_compression)
           continue;
         if (!file_load_data(f)) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
@@ -622,7 +629,7 @@ int send_files(Config* config) {
       bool load_ok = true;
       for (int i = 0; i < current_chunk->element_count; i++) {
         File* f = current_chunk->items[i];
-        if (f->data->size > STREAM_THRESHOLD)
+        if (f->data->size > STREAM_THRESHOLD && !config->use_compression)
           continue;
         if (!file_load_data(f)) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
@@ -687,7 +694,10 @@ send_fail:
   return ret;
 }
 
-int send_files_multithreaded(Config* config) {
+int send_files_multithreaded(Config** config_ptr) {
+  if (!config_ptr || !*config_ptr)
+    return 1;
+  Config* config = *config_ptr;
   if (config->dry_run)
     return send_dry_run_manifest(config);
 
@@ -718,8 +728,9 @@ int send_files_multithreaded(Config* config) {
     queue_destroy(q2);
     return 1;
   }
+  *config_ptr = NULL; /* context now owns config through all remaining paths */
   if (config->use_delete)
-    context->manifest = create_transfer_manifest(config);
+    context->manifest = array_list_create(free);
   if (config->use_delete && !context->manifest) {
     pipeline_context_sender_destroy(context);
     return 1;

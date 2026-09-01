@@ -13,7 +13,7 @@
 
 #define RECEIVE_TIMEOUT_SEC 60 /* 60 second per-message timeout */
 #define SEND_TIMEOUT_SEC 60
-#define MAX_CONNECTION_MEMORY (1024ULL * 1024 * 1024) /* 1 GB total per connection */
+#define MAX_CONNECTION_MEMORY (256ULL * 1024 * 1024) /* bounded cumulative receive budget */
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
@@ -22,11 +22,18 @@ static __thread ProtocolSession* bound_session;
 static __thread ProtocolSession legacy_io_session = {.read_fd = -1, .write_fd = -1};
 
 static unsigned long long io_bwlimit = 0;
-static long long bw_tokens = 0;
-static struct timespec bw_last_refill = {0, 0};
 static mtx_t bw_mutex;
 static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
+static unsigned long long global_bwlimit(void);
+
+void protocol_release_memory(size_t charge) {
+  ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
+  if ((unsigned long long)charge >= session->total_allocated_bytes)
+    session->total_allocated_bytes = 0;
+  else
+    session->total_allocated_bytes -= charge;
+}
 void io_set_fds(int read_fd, int write_fd) {
   bound_session = NULL;
   io_read_fd = read_fd;
@@ -38,7 +45,7 @@ void io_set_fds(int read_fd, int write_fd) {
   legacy_io_session.write_fd = write_fd;
   legacy_io_session.ssl = NULL;
   legacy_io_session.total_allocated_bytes = 0;
-  protocol_session_set_bwlimit(&legacy_io_session, io_bwlimit);
+  protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
 }
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) {
@@ -47,8 +54,7 @@ void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) 
   memset(session, 0, sizeof(*session));
   session->read_fd = read_fd;
   session->write_fd = write_fd;
-  if (io_bwlimit)
-    protocol_session_set_bwlimit(session, io_bwlimit);
+  protocol_session_set_bwlimit(session, global_bwlimit());
 }
 
 void protocol_session_bind(ProtocolSession* session) {
@@ -68,20 +74,29 @@ static void bw_mutex_init(void) {
   mtx_init(&bw_mutex, mtx_plain);
 }
 
+static unsigned long long global_bwlimit(void) {
+  unsigned long long limit;
+  call_once(&bw_mutex_once, bw_mutex_init);
+  mtx_lock(&bw_mutex);
+  limit = io_bwlimit;
+  mtx_unlock(&bw_mutex);
+  return limit;
+}
+
 void io_set_bwlimit(unsigned long long bytes_per_sec) {
   call_once(&bw_mutex_once, bw_mutex_init);
   mtx_lock(&bw_mutex);
-  io_bwlimit = bytes_per_sec;
-  bw_tokens = (long long)io_bwlimit;
-  clock_gettime(CLOCK_MONOTONIC, &bw_last_refill);
+  io_bwlimit =
+      bytes_per_sec > (unsigned long long)LLONG_MAX ? (unsigned long long)LLONG_MAX : bytes_per_sec;
   mtx_unlock(&bw_mutex);
 }
 
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec) {
   if (!session)
     return;
-  session->bwlimit = bytes_per_sec;
-  session->bw_tokens = (long long)bytes_per_sec;
+  session->bwlimit =
+      bytes_per_sec > (unsigned long long)LLONG_MAX ? (unsigned long long)LLONG_MAX : bytes_per_sec;
+  session->bw_tokens = (long long)session->bwlimit;
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   session->bw_last_refill_sec = now.tv_sec;
@@ -139,9 +154,9 @@ static ProtocolSession* legacy_session(int read_fd, int write_fd) {
     legacy_io_session.read_fd = target_read_fd;
     legacy_io_session.write_fd = target_write_fd;
     legacy_io_session.total_allocated_bytes = 0;
-    protocol_session_set_bwlimit(&legacy_io_session, io_bwlimit);
-  } else if (legacy_io_session.bwlimit != io_bwlimit) {
-    protocol_session_set_bwlimit(&legacy_io_session, io_bwlimit);
+    protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
+  } else if (legacy_io_session.bwlimit != global_bwlimit()) {
+    protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
   }
   legacy_io_session.ssl = io_ssl;
   return &legacy_io_session;
@@ -167,6 +182,8 @@ static int deadline_remaining_ms(const struct timespec* deadline) {
 }
 
 bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size) {
+  if (!data && data_size != 0)
+    return false;
   log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
   if (!session)
     return false;
@@ -208,6 +225,8 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
     }
     bw_throttle_session(session, (size_t)bytes_send);
     total_bytes_send += bytes_send;
+    if (session->ssl)
+      wait_events = POLLOUT;
   }
   log_message(LOG_LEVEL_DEBUG, "    Send n Data: %zu", total_bytes_send);
   return true;
@@ -226,20 +245,22 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
   size_t total_bytes_received = 0;
   short wait_events = POLLIN;
   while (total_bytes_received < data_size) {
-    struct pollfd pfd = {.fd = fd, .events = wait_events};
-    int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
-    if (poll_result == 0) {
-      log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
-      return false;
+    if (!session->ssl || SSL_pending(session->ssl) == 0) {
+      struct pollfd pfd = {.fd = fd, .events = wait_events};
+      int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+      if (poll_result == 0) {
+        log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
+        return false;
+      }
+      if (poll_result < 0) {
+        if (errno == EINTR)
+          continue;
+        return false;
+      }
+      /* POLLHUP may accompany the final readable bytes on pipes/sockets. */
+      if (pfd.revents & (POLLERR | POLLNVAL))
+        return false;
     }
-    if (poll_result < 0) {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    /* POLLHUP may accompany the final readable bytes on pipes/sockets. */
-    if (pfd.revents & (POLLERR | POLLNVAL))
-      return false;
 
     ssize_t bytes_received;
     if (session->ssl)
@@ -262,7 +283,9 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
         log_message(LOG_LEVEL_ERROR, "Could not receive bytes");
       return false;
     }
-    total_bytes_received += bytes_received;
+    total_bytes_received += (size_t)bytes_received;
+    if (session->ssl)
+      wait_events = POLLIN;
   }
   log_message(LOG_LEVEL_DEBUG, "    Received n Data: %zu", total_bytes_received);
   return true;
@@ -326,6 +349,11 @@ char* protocol_receive_str(ProtocolSession* session) {
     free(data);
     return NULL;
   }
+  if (memchr(data, '\0', size) != NULL) {
+    free(data);
+    log_message(LOG_LEVEL_ERROR, "Received string contains an embedded NUL");
+    return NULL;
+  }
   data[size] = '\0';
   session->total_allocated_bytes += size + 1;
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
@@ -333,6 +361,10 @@ char* protocol_receive_str(ProtocolSession* session) {
 }
 
 bool protocol_send_data(ProtocolSession* session, const Data* data) {
+  if (!data || (!data->data && data->size != 0))
+    return false;
+  if (!session)
+    return false;
   unsigned long long data_size = data->size;
   if (!protocol_send_n_data(session, &data_size, sizeof(unsigned long long)))
     return false;
@@ -342,11 +374,13 @@ bool protocol_send_data(ProtocolSession* session, const Data* data) {
   return true;
 }
 
-Data* protocol_receive_data(ProtocolSession* session) {
+Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long maximum_size) {
+  if (!session)
+    return NULL;
   unsigned long long size = 0;
   if (!protocol_receive_n_data(session, &size, sizeof(unsigned long long)))
     return NULL;
-  if (size > MAX_DATA_PAYLOAD_SIZE) {
+  if (size > MAX_DATA_PAYLOAD_SIZE || size > maximum_size) {
     log_message(LOG_LEVEL_ERROR, "Data size %llu exceeds maximum %llu", size,
                 (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
@@ -369,10 +403,15 @@ Data* protocol_receive_data(ProtocolSession* session) {
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
-    free(data);
     session->total_allocated_bytes -= allocation_size;
+    return NULL;
   }
+  result->protocol_charge = allocation_size;
   return result;
+}
+
+Data* protocol_receive_data(ProtocolSession* session) {
+  return protocol_receive_data_limited(session, MAX_DATA_PAYLOAD_SIZE);
 }
 
 bool protocol_send_int(ProtocolSession* session, int data) {
@@ -413,7 +452,10 @@ bool send_data(int fd, const Data* data) {
   return protocol_send_data(legacy_session(-1, fd), data);
 }
 Data* receive_data(int fd) {
-  return protocol_receive_data(legacy_session(fd, -1));
+  return protocol_receive_data_limited(legacy_session(fd, -1), MAX_DATA_PAYLOAD_SIZE);
+}
+Data* receive_data_limited(int fd, unsigned long long maximum_size) {
+  return protocol_receive_data_limited(legacy_session(fd, -1), maximum_size);
 }
 bool send_int(int fd, int data) {
   return protocol_send_int(legacy_session(-1, fd), data);

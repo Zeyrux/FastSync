@@ -22,8 +22,12 @@ static bool path_is_within_root(const char* root, const char* path) {
 
 bool file_store_set_authorized_root(int fd, const char* canonical_path) {
   char* new_path = canonical_path ? str_dup(canonical_path) : NULL;
-  if (canonical_path && !new_path)
+  if (canonical_path && !new_path) {
+    authorized_root_fd = -1;
+    free(authorized_root_path);
+    authorized_root_path = NULL;
     return false;
+  }
   free(authorized_root_path);
   authorized_root_path = new_path;
   authorized_root_fd = fd;
@@ -42,9 +46,19 @@ int file_store_open_secure_parent(const char* path, char** leaf_out) {
     return -1;
   }
   int fd;
-  if (authorized_root_fd >= 0 && authorized_root_path && path[0] == '/' &&
-      path_is_within_root(authorized_root_path, path)) {
+  if (authorized_root_fd >= 0) {
+    if (!authorized_root_path || path[0] != '/' ||
+        !path_is_within_root(authorized_root_path, path)) {
+      free(copy);
+      free(leaf);
+      return -1;
+    }
     fd = dup(authorized_root_fd);
+    if (fd < 0) {
+      free(copy);
+      free(leaf);
+      return -1;
+    }
     size_t root_length = strlen(authorized_root_path);
     char* relative = str_dup(path + root_length);
     if (!relative) {
@@ -68,10 +82,18 @@ int file_store_open_secure_parent(const char* path, char** leaf_out) {
   char* save = NULL;
   char* component = strtok_r(parent, "/", &save);
   while (component) {
-    if (strcmp(component, ".") != 0 && strcmp(component, "..") != 0) {
+    if (strcmp(component, "..") == 0) {
+      close(fd);
+      free(copy);
+      free(leaf);
+      return -1;
+    }
+    if (strcmp(component, ".") != 0) {
       int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (next < 0 && errno == ENOENT && mkdirat(fd, component, 0755) == 0)
-        next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (next < 0 && errno == ENOENT) {
+        if (mkdirat(fd, component, 0755) == 0 || errno == EEXIST)
+          next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      }
       if (next < 0) {
         close(fd);
         free(copy);

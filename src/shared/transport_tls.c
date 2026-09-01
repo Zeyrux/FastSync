@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -32,6 +35,10 @@ static void log_ssl_errors(void) {
 
 static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key,
                                const char* ca_path) {
+  if (!is_server && !ca_path) {
+    log_message(LOG_LEVEL_ERROR, "TLS clients require a CA certificate path");
+    return NULL;
+  }
   const SSL_METHOD* method = is_server ? TLS_server_method() : TLS_client_method();
   SSL_CTX* ctx = SSL_CTX_new(method);
   if (!ctx) {
@@ -40,9 +47,23 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     return NULL;
   }
 
-  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
+  if (SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES") != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
 
   if (cert && key) {
+    struct stat key_stat;
+    if (stat(key, &key_stat) != 0 || !S_ISREG(key_stat.st_mode) || key_stat.st_uid != geteuid() ||
+        (key_stat.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH))) {
+      log_message(LOG_LEVEL_ERROR, "TLS private key must be owned by the current user and private");
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
     if (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s", cert);
       log_ssl_errors();
@@ -84,12 +105,18 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
     log_message(LOG_LEVEL_ERROR, "Failed to create SSL object");
     return NULL;
   }
-  SSL_set_fd(ssl, fd);
+  if (SSL_set_fd(ssl, fd) != 1) {
+    SSL_free(ssl);
+    return NULL;
+  }
 
   // Enable hostname verification for client connections when a hostname is provided.
   // Must be done before SSL_connect to take effect during the handshake.
   if (!is_server && hostname) {
-    SSL_set1_host(ssl, hostname);
+    if (SSL_set1_host(ssl, hostname) != 1) {
+      SSL_free(ssl);
+      return NULL;
+    }
   }
 
   // Retry SSL_accept/SSL_connect on WANT_READ/WANT_WRITE (non-blocking handshake)
@@ -132,8 +159,10 @@ struct tls_child_ctx {
 static void tls_child_fn(int fd, void* arg) {
   struct tls_child_ctx* ctx = (struct tls_child_ctx*)arg;
   SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true, NULL);
-  if (!ssl)
+  if (!ssl) {
+    io_set_ssl(NULL);
     return;
+  }
   io_set_ssl(ssl);
   ctx->handler(fd);
   SSL_shutdown(ssl);
@@ -149,12 +178,19 @@ bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {
 
 bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
                         const char* key_path, const char* ca_path) {
-  if (!tcp_connect_socket(client, host, port))
+  if (!tcp_connect_socket(client, host, port)) {
+    if (client->file_descriptor >= 0)
+      close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
+  }
 
   SSL_CTX* ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
-  if (!ctx)
+  if (!ctx) {
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
+  }
   client->ssl_ctx = ctx;
 
   // Pass the server hostname for TLS hostname verification (SSL_set1_host
@@ -164,6 +200,8 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
   if (!ssl) {
     SSL_CTX_free(ctx);
     client->ssl_ctx = NULL;
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
   }
 

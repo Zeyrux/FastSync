@@ -7,6 +7,7 @@
 
 int send_chunk(Client* client, Chunk* chunk, Config* config);
 int send_files(Config* config);
-int send_files_multithreaded(Config* config);
+/* Takes ownership only when *config is set to NULL on return. */
+int send_files_multithreaded(Config** config);
 
 #endif

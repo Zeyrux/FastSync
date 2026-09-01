@@ -25,7 +25,9 @@ class ServerManager:
     def start(self, extra_args=None):
         self.stop()
         self._port = _find_free_port()
-        cmd = SERVER_CMD + ["-p", str(self._port)]
+        # Plain TCP is intentionally explicit in the server; integration tests
+        # exercise that opt-in mode rather than relying on the secure default.
+        cmd = SERVER_CMD + ["-p", str(self._port), "--allow-unauthenticated"]
         if extra_args:
             cmd += extra_args
         self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

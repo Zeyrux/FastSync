@@ -51,6 +51,8 @@ FileMetadata* metadata_from_buf(char** buf) {
   int32_t present;
   memcpy(&present, *buf, sizeof(present));
   *buf += sizeof(present);
+  if (present != 0 && present != 1)
+    return NULL;
   if (!present)
     return NULL;
   FileMetadata* m = malloc(sizeof(FileMetadata));
@@ -76,10 +78,15 @@ FileMetadata* metadata_from_buf(char** buf) {
   memcpy(&mtime_nsec, *buf, sizeof(mtime_nsec));
   *buf += sizeof(mtime_nsec);
   m->mtime_nsec = (long)mtime_nsec;
+  if (present != 1 || mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 ||
+      gid < 0) {
+    free(m);
+    return NULL;
+  }
   return m;
 }
 
-bool metadata_send(int file_descriptor, FileMetadata* m) {
+bool metadata_send(int file_descriptor, const FileMetadata* m) {
   if (m == NULL) {
     int32_t zero = 0;
     return send_n_data(file_descriptor, &zero, sizeof(zero));
@@ -175,7 +182,8 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
 void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   if (metadata == NULL)
     return;
-  if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
+  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  if (chmod(path, safe_mode) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
   /* Never apply client-supplied ownership.  The descriptor API below is the
      receiver write path; retain this legacy API only for compatibility. */
@@ -192,7 +200,8 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;
-  if (fchmod(fd, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
+  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  if (fchmod(fd, safe_mode) != 0)
     ok = false;
   /* Client uid/gid values are deliberately not authoritative. */
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},

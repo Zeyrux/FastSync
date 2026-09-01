@@ -42,8 +42,8 @@ bool validate_config(const Config* config) {
     return false;
   }
   if (config->use_tls) {
-    if (!config->tls_cert || !config->tls_key) {
-      log_message(LOG_LEVEL_ERROR, "--tls requires --cert and --key");
+    if (!config->tls_cert || !config->tls_key || !config->tls_ca) {
+      log_message(LOG_LEVEL_ERROR, "--tls requires --cert, --key, and --ca");
       return false;
     }
   }

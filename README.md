@@ -1,4 +1,4 @@
-# FastSync
+#FastSync
 
 FastSync is a high-performance file synchronization tool designed to become a
 drop-in replacement for common `rsync` workflows. It keeps the familiar
@@ -79,10 +79,166 @@ partial, alternate, and planned behavior.
 
 ### Build
 
-Requirements: C11 compiler, CMake 3.22 or newer, xxHash, zstd, OpenSSL,
-pthreads, and an SSH client for SSH transport. The first CMake configure fetches
-xxHash from GitHub, so network access is required unless the dependency is
-already cached.
+### Client
+
+| Argument | Description |
+|----------|-------------|
+| Positional | `<source> <dest>` — automatic SSH detection if dest contains `:` |
+| `-c [level]` | Compression with optional level (1–22, default 5) |
+| `-z [level]` | Alias for `-c` |
+| `-a, --archive` | Archive mode: enables `-c -m -M` (no `-s`) |
+| `-m` | Multithreading mode |
+| `-s` | Chunk serialization (batch all files per chunk) |
+| `-f, --sendfile` | Sendfile zero-copy. Incompatible with `-c` / `-s`. TCP only. |
+| `-M, --preserve` | Preserve supported file metadata (mode and mtime; ownership and atime are unsupported) |
+| `-n, --dry-run` | Scan and print what would be transferred |
+| `-p <port>` | SSH port (default: 22) |
+| `-v, --verbose` | Enable debug logging |
+| `--progress` | Show real-time transfer speed |
+| `--delete` | Delete files on receiver not present in source |
+| `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
+| `--exclude-from <file>` | Read exclude patterns from a file (one per line) |
+| `--include <pattern>` | Only transfer files matching glob pattern (repeatable, whitelist) |
+| `--max-size <n>` | Skip files larger than n bytes |
+| `--min-size <n>` | Skip files smaller than n bytes |
+| `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `-s`. |
+| `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
+| `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
+| `--timeout <sec>` | I/O timeout in seconds (default: 30) |
+| `--contimeout <sec>` | Connection timeout in seconds (default: 10) |
+| `--backup` | Backup existing destination files before overwriting |
+| `--backup-dir <dir>` | Target directory for backups (requires `--backup`) |
+| `--stats` | Print transfer statistics at end (bytes, files, timing) |
+| `--max-depth <n>` | Maximum directory depth to recurse (0 = unlimited, default: 0) |
+| `--log-file <path>` | Write log messages to file instead of stderr |
+| `--source-dir <path>` | Source directory (overrides `FASTSYNC_SOURCE_DIR`) |
+| `--dest-dir <path>` | Server destination directory (overrides `FASTSYNC_DEST_DIR`) |
+| `--save-to-disk` | Write received files to disk |
+| `--server-host <ip>` | Server IP address (default: `127.0.0.1`) |
+| `--server-port <n>` | Server port (default: `8080`) |
+| `--tls` | Enable TLS encryption |
+| `--cert <path>` | TLS certificate file (PEM) |
+| `--key <path>` | TLS private key file (PEM) |
+| `--ca <path>` | TLS CA certificate file for verification (PEM) |
+| `--client-cn <name>` | Required TLS client certificate common name |
+
+### Server
+
+| Argument | Description |
+|----------|-------------|
+| `--stdio` | Run in stdio mode (for SSH transport; single connection then exits) |
+| `-p <port>` | TCP listen port (default: 8080, range: 1–65535) |
+| `--tls` | Enable TLS encryption |
+| `--cert <path>` | TLS certificate file (PEM) |
+| `--key <path>` | TLS private key file (PEM) |
+| `--ca <path>` | TLS CA certificate file for verification (PEM) |
+| `--destination-root <path>` | Authorized destination root (default: `.`) |
+| `--allow-delete` | Permit manifest deletion |
+| `--allow-unauthenticated` | Permit plaintext TCP clients |
+| `-v, --verbose` | Enable debug logging |
+| `--help` | Show help |
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FASTSYNC_SOURCE_DIR` | — | Source directory fallback |
+| `FASTSYNC_DEST_DIR` | — | Destination directory fallback |
+| `FASTSYNC_SAVE_TO_DISK` | `false` | Disk persistence fallback |
+| `FASTSYNC_SSH_PORT` | `22` | Default SSH port |
+| `FASTSYNC_SERVER_HOST` | `127.0.0.1` | Default server host |
+| `FASTSYNC_SERVER_PORT` | `8080` | Default server port |
+| `FASTSYNC_TLS_CERT` | — | Default TLS certificate path |
+| `FASTSYNC_TLS_KEY` | — | Default TLS private key path |
+| `FASTSYNC_TLS_CA` | — | Default TLS CA certificate path |
+
+## Implementation Details
+
+### Data Structures
+1. **Chunk** — collection of files (~10 MB total by default)
+2. **File** — path, content (`Data`), optional `FileMetadata` pointer
+3. **FileMetadata** — `mode`, `uid`, `gid`, `mtime_sec`, `mtime_nsec`;
+uid / gid are advisory wire fields and are never applied by the receiver;
+atime is unsupported
+4. **Config** — runtime parameters (transported over wire, TLS settings excluded). Includes `timeout`, `contimeout`, `quiet`, `backup`, `backup_dir`, `stats`, `max_depth`, `log_file`, `queue_size`.
+5. **Queue** — thread-safe bounded queue with condition variables
+6. **DirectoryScanner** — recursive BFS traversal with exclude and include pattern support, max-depth enforcement
+
+### Key Algorithms
+1. **File scanning** — BFS directory traversal;
+entries matched against exclude and include patterns,
+    max - depth enforced 2. * *Chunking ** — files accumulated until `chunk_size` threshold,
+    then flushed 3. *
+            *Compression ** — streaming zstd
+                via `ZSTD_compressStream2` / `ZSTD_decompressStream` 4. *
+            *Network protocol ** — status -
+        code - driven exchange with metadata packing,
+    keep - alive,
+    and abort support 5. * *Incremental check ** — client sends `STATUS_CHECK` + path + size +
+        mtime and,
+    with `--checksum`, XXH64 content checksum; server compares against destination. Can be batched via `STATUS_CHECK_BATCH` for reduced round-trips.
+6. **Bandwidth limiting** — token-bucket algorithm with `nanosleep` throttling on 64 KB write chunks
+7. **Metadata restoration** — `chmod()`, `chown()`, `utimensat()` on the receiving side
+8. **`--delete`** — sender tracks all sent paths;
+receiver walks destination tree and removes unlisted files / directories 9. *
+        *SSH transport *
+            * — `socketpair()` + `fork()` + `execvp("ssh",
+                                                    ...)` with `ControlMaster` and port support
+                                                10. *
+                                                *TLS transport ** — OpenSSL `SSL_CTX` with TLS
+                                                1.2 minimum,
+    mutual CA verification,
+    transparent `SSL_read`/`SSL_write` via `io_set_ssl()` 11. *
+        *Path traversal protection ** — `has_path_traversal()` rejects any file path
+         containing `..` components,
+    preventing directory escape attacks 12. *
+            *Connection limiting ** — server tracks active connections and rejects
+            new ones beyond `max_connections` (default 100)13. *
+            *Keep
+        - alive ** — idle connections receive periodic `STATUS_KEEPALIVE` to detect half
+        - open TCP connections 14. * *Abort handling ** — `SIGINT` sets an abort flag; the next protocol operation sends `STATUS_ABORT` for clean server cleanup
+15. **Atomic writes** — files are written to a `.tmp` suffix then atomically renamed via `rename()`, preventing partial files
+16. **Backup** — before overwriting, existing files are moved to `--backup-dir` (or same directory with `~` suffix) preserving the original
+
+## Security Features
+
+### Path Traversal Protection
+All received file paths are validated by `has_path_traversal()` before any disk operation. Any path containing `..` components is rejected with `STATUS_ERROR`, preventing directory escape attacks.
+
+### TLS Certificate Verification
+TLS requires `--ca` and performs mutual TLS verification (`SSL_VERIFY_PEER` with depth 4). Connections without certificate verification are rejected.
+
+### Connection Limits
+The server enforces a maximum of 100 concurrent connections (configurable via `max_connections` in `Server`). When the limit is reached, new connections are immediately rejected and closed.
+
+### Abort Handling
+If the client receives `SIGINT` (Ctrl+C) during a transfer, it sends `STATUS_ABORT` to the server. The server then cleans up temporary files and exits the child process, preventing incomplete files from remaining on disk.
+
+### Atomic Writes
+Received files are written to a temporary path (suffixed with `.tmp`) and then atomically renamed to the final filename via `rename()`. This prevents partial or corrupted files from appearing at the destination if the transfer is interrupted.
+
+## Build Requirements
+
+- C11 compiler
+- CMake >= 3.22
+- zstd library
+- OpenSSL (development headers and libraries)
+- pthreads
+- SSH client (for SSH transport mode only)
+
+### Installing Dependencies
+
+**Ubuntu/Debian:**
+```bash
+sudo apt install cmake build-essential libzstd-dev libssl-dev openssh-client
+```
+
+**Nix:**
+```bash
+nix-shell  # provides zstd, openssl, cmake, gcc
+```
+
+## Building
 
 ```bash
 cmake -B build -S .
@@ -125,8 +281,10 @@ Then run the client:
   --save-to-disk
 ```
 
-### TLS transfer
+Plain TCP requires the explicit `--allow-unauthenticated` server option. Use TLS for
+authenticated network connections.
 
+### TLS transfer
 ```bash
 ./build/server --destination-root /path/to --tls --cert server.pem --key server-key.pem -p 8443
 ./build/client --tls --cert client.pem --key client-key.pem --ca ca.pem \
@@ -141,32 +299,32 @@ These examples show the intended rsync-style workflow. Options marked as
 FastSync-native are optional performance or transport extensions.
 
 ```bash
-# Basic synchronization
+#Basic synchronization
 ./build/client /source/ /destination/
 
-# Archive-style synchronization (current FastSync archive behavior)
+#Archive - style synchronization(current FastSync archive behavior)
 ./build/client -a /source/ user@host:destination/
 
-# Preview a transfer without changing the destination
+#Preview a transfer without changing the destination
 ./build/client -n /source/ /destination/
 
-# Exclude temporary and object files
+#Exclude temporary and object files
 ./build/client --exclude '*.tmp' --exclude '*.o' \
   /source/ user@host:destination/
 
-# Remove destination entries not present in the source
+#Remove destination entries not present in the source
 ./build/client --delete /source/ user@host:destination/
 
-# Skip unchanged files using size and modification time
+#Skip unchanged files using size and modification time
 ./build/client --incremental /source/ user@host:destination/
 
-# Verify content when size and time are not sufficient
+#Verify content when size and time are not sufficient
 ./build/client --incremental --checksum /source/ user@host:destination/
 
-# Preserve supported mode and timestamp metadata
+#Preserve supported mode and timestamp metadata
 ./build/client -M /source/ user@host:destination/
 
-# Keep backups of overwritten destination files
+#Keep backups of overwritten destination files
 ./build/client --backup --backup-dir backups \
   /source/ user@host:destination/
 ```
@@ -216,14 +374,16 @@ before FastSync can claim full rsync CLI compatibility.
 | `--include-from <file>` | Read include patterns from a file. |
 | `--max-size <bytes>` | Skip files larger than the limit. |
 | `--min-size <bytes>` | Skip files smaller than the limit. |
-| `--max-depth <n>` | Limit recursive scanning depth; zero means unlimited. |
-| `--incremental` | Skip files matching destination size and mtime. |
-| `--checksum` | Include xxHash64 content checks in incremental comparisons. |
-| `--backup` | Back up overwritten files. |
-| `--backup-dir <dir>` | Store backups under a separate directory. |
-| `--suffix <suffix>` | Set the backup filename suffix. |
-| `--partial` | Select partial-transfer handling. With `--partial-dir`, completed files are written there; resumable transfers are not implemented. |
-| `--partial-dir <dir>` | Set a relative partial-transfer directory below the server destination root; use with `--partial`. |
+| `--max-depth <n>` | Limit recursive scanning depth;
+zero means unlimited.| | `--incremental` | Skip files matching destination size and mtime.|
+    | `--checksum` | Include xxHash64 content checks in incremental comparisons.| | `--backup` |
+    Back up overwritten files.| | `--backup - dir<dir>` | Store backups under a separate directory.|
+    | `--suffix<suffix>` | Set the backup filename suffix.| | `--partial` |
+    Select partial - transfer handling.With `--partial - dir`,
+    completed files are written there;
+resumable transfers are not implemented.| | `--partial - dir<dir>` |
+    Set a relative partial - transfer directory below the server destination root;
+use with `--partial`. |
 | `--inplace` | Write directly to the destination instead of using a temporary file. |
 
 ### Metadata and links
@@ -231,7 +391,8 @@ before FastSync can claim full rsync CLI compatibility.
 | Option | Description |
 |---|---|
 | `-M`, `--preserve` | Preserve supported file metadata, currently mode and modification time. |
-| `-l`, `--links` | Request symlink preservation; link-target transfer remains incomplete. |
+| `-l`, `--links` | Request symlink preservation;
+link-target transfer remains incomplete. |
 | `--copy-links` | Copy symlink referents. |
 | `--safe-links` | Skip symlinks that point outside the transfer tree. |
 | `--copy-unsafe-links` | Copy unsafe symlink referents. |
@@ -274,7 +435,8 @@ before FastSync can claim full rsync CLI compatibility.
 | `--cert <path>` | TLS certificate file. |
 | `--key <path>` | TLS private key file. |
 | `--ca <path>` | CA file for peer verification. |
-| `--destination-root <path>` | Confine received files to this server-side root; defaults to the current directory. |
+| `--destination-root <path>` | Confine received files to this server-side root;
+defaults to the current directory. |
 | `--allow-delete` | Permit client delete manifests. Deletion is refused by default. |
 | `-v`, `--verbose` | Enable debug logging. |
 | `--help` | Print server usage. |

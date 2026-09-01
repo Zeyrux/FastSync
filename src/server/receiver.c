@@ -8,8 +8,14 @@
 #include <sys/stat.h>
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
+  if (!chunk || !sink || !sink->store_file)
+    return false;
   for (int i = 0; i < chunk->element_count; i++) {
     File* file = chunk->items[i];
+    if (!file) {
+      chunk_destroy(chunk);
+      return false;
+    }
     chunk->items[i] = NULL;
     if (!sink->store_file(file, sink->context)) {
       chunk_destroy(chunk);
@@ -41,9 +47,19 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
       send_status(file_descriptor, STATUS_ERROR);
       return false;
     }
+    if (check_size > MAX_RECEIVE_FILE_SIZE) {
+      free(check_path);
+      send_status(file_descriptor, STATUS_ERROR);
+      return false;
+    }
     char* full_path = path_cat(config->receive_root_directory, check_path);
+    if (!full_path) {
+      free(check_path);
+      send_status(file_descriptor, STATUS_ERROR);
+      return false;
+    }
     struct stat st;
-    bool has_old = full_path && lstat(full_path, &st) == 0;
+    bool has_old = file_stat_secure(full_path, &st);
     bool match = has_old && (unsigned long long)st.st_size == check_size &&
                  (long long)st.st_mtime == check_mtime;
     bool sent = send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT);

@@ -13,16 +13,13 @@
 #include "data.h"
 #include "delta.h"
 #include "file.h"
-#include "file_store.h"
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
 
-static bool path_is_within_root(const char* root, const char* path) {
-  size_t n = strlen(root);
-  return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
-}
+#define MAX_SERVER_DELETE_COUNT 100000U
+#define MAX_FILE_DATA_SIZE MAX_RECEIVE_FILE_SIZE
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
   bool backup_enabled = config && config->backup;
@@ -31,9 +28,11 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
-  char *confined_backup = NULL, *confined_partial = NULL;
+  char *confined_backup = NULL, *confined_partial = NULL, *disk_path = NULL;
+  char *backup_path = NULL, *parent_copy = NULL;
 
-  if (!file || !file->path || !file->data || has_path_traversal(file->path) ||
+  if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data) ||
+      has_path_traversal(file->path) ||
       (backup_enabled &&
        (!backup_suffix || backup_suffix[0] == '\0' || strchr(backup_suffix, '/') != NULL ||
         strcmp(backup_suffix, ".") == 0 || strcmp(backup_suffix, "..") == 0))) {
@@ -53,45 +52,20 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     return false;
   }
 
-  char* resolved_root = NULL;
   const char* actual_root =
       (partial_dir && config && config->partial) ? confined_partial : root_directory;
-  resolved_root = realpath(actual_root, NULL);
-  if (resolved_root == NULL) {
-    if (mkdir_r(actual_root)) {
-      resolved_root = realpath(actual_root, NULL);
-    }
-  }
-  if (resolved_root == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to resolve destination root: %s", actual_root);
-    free(confined_backup);
-    free(confined_partial);
-    return false;
-  }
-  char* resolved_base = realpath(root_directory, NULL);
-  if (resolved_base == NULL || !path_is_within_root(resolved_base, resolved_root)) {
-    free(resolved_base);
-    free(confined_backup);
-    free(confined_partial);
-    free(resolved_root);
-    return false;
-  }
-  free(resolved_base);
-
-  char* disk_path = path_cat(resolved_root, file->path);
+  disk_path = path_cat(actual_root, file->path);
   if (disk_path == NULL) {
     free(confined_backup);
     free(confined_partial);
-    free(resolved_root);
     return false;
   }
 
   /* --update is receiver-side policy: never replace a newer destination. */
   if (config && config->update) {
     struct stat destination_stat;
-    if (stat(disk_path, &destination_stat) == 0 && file->metadata &&
+    if (file_stat_secure(disk_path, &destination_stat) && file->metadata &&
         destination_stat.st_mtime > file->metadata->mtime_sec) {
-      free(resolved_root);
       free(confined_backup);
       free(confined_partial);
       free(disk_path);
@@ -101,99 +75,50 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
 
   if (backup_enabled) {
     struct stat backup_stat;
-    if (stat(disk_path, &backup_stat) == 0) {
-      char* backup_path = NULL;
+    if (file_stat_secure(disk_path, &backup_stat)) {
       if (backup_dir) {
-        char* resolved_backup_dir = realpath(confined_backup, NULL);
-        if (!resolved_backup_dir) {
-          mkdir_r(confined_backup);
-          resolved_backup_dir = realpath(confined_backup, NULL);
-        }
-        if (resolved_backup_dir) {
-          char* backup_base = realpath(root_directory, NULL);
-          if (backup_base && path_is_within_root(backup_base, resolved_backup_dir))
-            backup_path = path_cat(resolved_backup_dir, file->path);
-          free(backup_base);
-          free(resolved_backup_dir);
-        }
-      }
-      if (!backup_path) {
+        backup_path = path_cat(confined_backup, file->path);
+      } else {
         size_t path_len = strlen(disk_path);
         size_t suffix_len = strlen(backup_suffix);
+        if (path_len > SIZE_MAX - suffix_len - 1)
+          goto fail;
         backup_path = malloc(path_len + suffix_len + 1);
         if (backup_path) {
           memcpy(backup_path, disk_path, path_len);
           memcpy(backup_path + path_len, backup_suffix, suffix_len + 1);
         }
       }
-      if (backup_path) {
-        char* backup_dir_path = str_dup(backup_path);
-        if (backup_dir_path) {
-          const char* bdir = dirname(backup_dir_path);
-          mkdir_r(bdir);
-          free(backup_dir_path);
-        }
-        if (!file_store_rename_secure(disk_path, backup_path)) {
-          free(backup_path);
-          free(resolved_root);
-          free(confined_backup);
-          free(confined_partial);
-          free(disk_path);
-          return false;
-        }
-        free(backup_path);
-      }
+      if (!backup_path)
+        goto fail;
+      parent_copy = str_dup(backup_path);
+      if (!parent_copy || !file_ensure_directory_secure(dirname(parent_copy)))
+        goto fail;
+      free(parent_copy);
+      parent_copy = NULL;
+      if (!file_rename_secure(disk_path, backup_path))
+        goto fail;
+      free(backup_path);
+      backup_path = NULL;
     }
   }
 
-  char* dir_dup = str_dup(disk_path);
-  if (!dir_dup) {
-    free(confined_backup);
-    free(confined_partial);
-    free(resolved_root);
-    free(disk_path);
-    return false;
-  }
-  char* dir_str = dirname(dir_dup);
-  if (!mkdir_r(dir_str)) {
-    free(dir_dup);
-    free(confined_backup);
-    free(confined_partial);
-    free(resolved_root);
-    free(disk_path);
-    return false;
-  }
-  char* resolved_dir = realpath(dir_str, NULL);
-  free(dir_dup);
-  if (resolved_dir == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to resolve directory for: %s", disk_path);
-    free(confined_backup);
-    free(confined_partial);
-    free(resolved_root);
-    free(disk_path);
-    return false;
-  }
-
-  size_t root_len = strlen(resolved_root);
-  if (strncmp(resolved_dir, resolved_root, root_len) != 0 ||
-      (resolved_dir[root_len] != '\0' && resolved_dir[root_len] != '/')) {
-    log_message(LOG_LEVEL_ERROR, "Path escape detected: %s is outside %s", disk_path, actual_root);
-    free(resolved_dir);
-    free(confined_backup);
-    free(confined_partial);
-    free(resolved_root);
-    free(disk_path);
-    return false;
-  }
-  free(resolved_dir);
-  free(resolved_root);
-
-  bool ok = file_store_write_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
-                                    file->metadata);
+  bool ok = file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
+                                file->metadata);
+  free(parent_copy);
+  free(backup_path);
   free(confined_backup);
   free(confined_partial);
   free(disk_path);
   return ok;
+
+fail:
+  free(parent_copy);
+  free(backup_path);
+  free(confined_backup);
+  free(confined_partial);
+  free(disk_path);
+  return false;
 }
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
@@ -235,7 +160,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   }
 
   if (resp == STATUS_DELTA_DATA) {
-    Data* delta_data = receive_data(fd);
+    Data* delta_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
     if (!delta_data) {
       delta_signature_destroy(sig);
       free(old_data);
@@ -245,7 +170,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
 
     Data* raw_delta = delta_data;
     if (config->use_compression) {
-      raw_delta = data_decompress(delta_data);
+      raw_delta = data_decompress_limited(delta_data, MAX_RECEIVE_FILE_SIZE);
       data_destroy(delta_data);
       if (!raw_delta) {
         free(old_data);
@@ -264,8 +189,15 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       return NULL;
     }
 
-    void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
     uint64_t new_size = delta->new_file_size;
+    if (new_size > MAX_RECEIVE_FILE_SIZE || new_size > SIZE_MAX) {
+      delta_destroy(delta);
+      free(old_data);
+      delta_signature_destroy(sig);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
+    void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
     delta_destroy(delta);
 
     if (!new_data) {
@@ -297,8 +229,16 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       }
     }
 
+    Data* replacement = data_create(new_data, (size_t)new_size);
+    if (replacement == NULL) {
+      file_destroy(file);
+      free(old_data);
+      delta_signature_destroy(sig);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
     data_destroy(file->data);
-    file->data = data_create(new_data, (size_t)new_size);
+    file->data = replacement;
 
     free(old_data);
     delta_signature_destroy(sig);
@@ -325,7 +265,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       }
     }
 
-    Data* file_data = receive_data(fd);
+    Data* file_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
     if (file_data == NULL) {
       file_destroy(file);
       *failed = true;
@@ -333,11 +273,17 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     }
 
     if (config->use_compression) {
-      Data* uncompressed = data_decompress(file_data);
+      Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
       data_destroy(file_data);
       if (uncompressed == NULL) {
         file_destroy(file);
         *failed = true;
+        return NULL;
+      }
+      if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+        data_destroy(uncompressed);
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
         return NULL;
       }
       file_data = uncompressed;
@@ -350,11 +296,16 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
 
   delta_signature_destroy(sig);
   free(old_data);
+  send_status(fd, STATUS_ERROR);
   *failed = true;
   return NULL;
 }
 
 File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
+  if (!config || !skipped) {
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
   *skipped = false;
   char* check_path = receive_str(fd);
   if (check_path == NULL) {
@@ -374,6 +325,12 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
+  if (check_size > MAX_RECEIVE_FILE_SIZE) {
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+
   if (has_path_traversal(check_path)) {
     log_message(LOG_LEVEL_ERROR, "Path traversal detected: %s", check_path);
     free(check_path);
@@ -381,22 +338,25 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
 
   char* full_path = path_cat(config->receive_root_directory, check_path);
+  if (!full_path) {
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
   struct stat st;
   bool has_old_file = false;
   int old_fd = -1;
-  if (full_path) {
-    char* leaf = NULL;
-    int parent_fd = file_store_open_secure_parent(full_path, &leaf);
-    if (parent_fd >= 0) {
-      old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-      free(leaf);
-      close(parent_fd);
-      has_old_file = old_fd >= 0 && fstat(old_fd, &st) == 0 && S_ISREG(st.st_mode);
-    }
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(full_path, &leaf, false);
+  if (parent_fd >= 0) {
+    old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    free(leaf);
+    close(parent_fd);
+    has_old_file = old_fd >= 0 && fstat(old_fd, &st) == 0 && S_ISREG(st.st_mode);
   }
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
   void* old_data = NULL;
-  if (has_old_file && old_size > 0) {
+  if (has_old_file && old_size > 0 && old_size <= MAX_RECEIVE_FILE_SIZE && old_size <= SIZE_MAX) {
     old_data = malloc((size_t)old_size);
     if (old_data) {
       size_t got = 0;
@@ -440,7 +400,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
-  bool try_delta = config->use_delta && has_old_file &&
+  bool try_delta = config->use_delta && has_old_file && old_data != NULL &&
                    delta_should_attempt(old_size, check_size, config->delta_max_file_size);
 
   if (try_delta) {
@@ -487,17 +447,23 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     }
   }
 
-  Data* file_data = receive_data(fd);
+  Data* file_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
   if (file_data == NULL) {
     file_destroy(file);
     return NULL;
   }
 
   if (config->use_compression) {
-    Data* uncompressed = data_decompress(file_data);
+    Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
     data_destroy(file_data);
     if (uncompressed == NULL) {
       file_destroy(file);
+      return NULL;
+    }
+    if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+      data_destroy(uncompressed);
+      file_destroy(file);
+      send_status(fd, STATUS_ERROR);
       return NULL;
     }
     file_data = uncompressed;
@@ -529,15 +495,20 @@ File* file_receive(const Config* config, int file_descriptor) {
       return NULL;
     }
   }
-  Data* file_data = receive_data(file_descriptor);
+  Data* file_data = receive_data_limited(file_descriptor, MAX_RECEIVE_FILE_SIZE);
   if (file_data == NULL) {
     file_destroy(file);
     return NULL;
   }
-  if (config->use_compression) {
-    Data* file_data_uncompressed = data_decompress(file_data);
+  if (config->use_compression && !compression_should_skip(file->path)) {
+    Data* file_data_uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
     data_destroy(file_data);
     if (file_data_uncompressed == NULL) {
+      file_destroy(file);
+      return NULL;
+    }
+    if (file_data_uncompressed->size > MAX_FILE_DATA_SIZE) {
+      data_destroy(file_data_uncompressed);
       file_destroy(file);
       return NULL;
     }
@@ -549,16 +520,26 @@ File* file_receive(const Config* config, int file_descriptor) {
 }
 
 int receive_manifest(int fd, const Config* config, int* next_status) {
+  if (!config) {
+    send_status(fd, STATUS_ERROR);
+    return -1;
+  }
   int received_status = STATUS_ERROR;
   int* status_out = next_status ? next_status : &received_status;
   int count;
-  if (!receive_int(fd, &count))
+  if (!receive_int(fd, &count)) {
+    send_status(fd, STATUS_ERROR);
     return -1;
-  if (count < 0 || count > MAX_MANIFEST_ENTRIES)
+  }
+  if (count < 0 || count > MAX_MANIFEST_ENTRIES) {
+    send_status(fd, STATUS_ERROR);
     return -1;
+  }
   ArrayList* manifest = array_list_create(free);
-  if (!manifest)
+  if (!manifest) {
+    send_status(fd, STATUS_ERROR);
     return -1;
+  }
   size_t manifest_bytes = 0;
   for (int i = 0; i < count; i++) {
     char* s = receive_str(fd);
@@ -568,21 +549,28 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
         (manifest_bytes += entry_size) > MAX_MANIFEST_BYTES || !array_list_add(manifest, s)) {
       free(s);
       array_list_delete(manifest);
+      send_status(fd, STATUS_ERROR);
       return -1;
     }
   }
   if (!receive_status(fd, status_out)) {
     array_list_delete(manifest);
+    send_status(fd, STATUS_ERROR);
     return -1;
   }
   /* Deletion is a commit operation: never perform it until the sender has
      completed the manifest frame successfully. */
   if (*status_out != STATUS_FINISHED || !config->use_delete) {
     array_list_delete(manifest);
+    if (*status_out != STATUS_FINISHED)
+      send_status(fd, STATUS_ERROR);
     return *status_out == STATUS_FINISHED ? 0 : -1;
   }
   fprintf(stderr, "Deleting files not in manifest...\n");
-  bool deletion_ok = delete_extras(config->receive_root_directory, manifest);
+  bool deletion_ok =
+      delete_extras_limited(config->receive_root_directory, manifest, MAX_SERVER_DELETE_COUNT);
   array_list_delete(manifest);
+  if (!deletion_ok)
+    send_status(fd, STATUS_ERROR);
   return deletion_ok ? 0 : -1;
 }
