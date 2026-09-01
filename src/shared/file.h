@@ -1,48 +1,36 @@
 #ifndef FILE_H
 #define FILE_H
 
-#include "config.h"
-#include "data.h"
+#include "file_send.h"
+#include "file_receive.h"
+#include "file_types.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/stat.h>
 
-typedef enum { FILE_TYPE_REGULAR, FILE_TYPE_SYMLINK, FILE_TYPE_DIR } FileType;
-
-typedef struct {
-  mode_t mode;
-  uid_t uid;
-  gid_t gid;
-  time_t mtime_sec;
-  long mtime_nsec;
-} FileMetadata;
-
-typedef struct {
-  char* path;
-  Data* data;
-  FileMetadata* metadata;
-  bool skip;
-} File;
+/* File/FileMetadata lifecycle, local disk helpers, and secure filesystem
+   primitives shared by the send/receive pipelines. */
 
 File* file_create(const char* path);
 void file_destroy(void* item);
 bool file_load_data(File* file);
 bool file_checksum(File* file, uint64_t* checksum);
-File* file_receive(const Config* config, int file_descriptor);
-bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
-                            int compression_level, bool send_path);
-bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
-                        bool send_path);
 size_t file_content_to_buffer(File* file);
 FileMetadata* file_metadata_create(const struct stat* stats);
 void file_metadata_destroy(void* metadata);
-bool to_disk(const char* path, const void* data, unsigned long long data_size, bool inplace,
-             bool sparse);
-bool file_save_to_disk(const char* root_directory, const File* file, const Config* config);
+bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
+                        bool inplace, bool sparse);
+
 /* A configured fd without a canonical identity deliberately rejects paths. */
 bool file_set_authorized_root(int fd, const char* canonical_path);
-File* receive_incremental_check(int fd, const Config* config, bool* skipped);
+
+/* Secure path/filesystem primitives (symlink-safe, O_NOFOLLOW, root-confined). */
 bool file_path_exists_secure(const char* path);
 bool file_stat_secure(const char* path, struct stat* st);
-int receive_manifest(int fd, const Config* config, int* next_status);
+int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
+bool file_ensure_directory_secure(const char* path);
+bool file_rename_secure(const char* old_path, const char* new_path);
+bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
+                         bool inplace, bool sparse, const FileMetadata* metadata);
 
 #endif

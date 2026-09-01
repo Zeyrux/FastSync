@@ -301,7 +301,7 @@ void handler(int file_descriptor) {
     if (receiver_created)
       writer_created = thrd_create(&writer, write_thread, context) == thrd_success;
     if (!receiver_created || !writer_created) {
-      perror("Error creating Threads");
+      log_perror("Error creating Threads");
       if (receiver_created) {
         mtx_lock(&context->mutex);
         atomic_store(&context->cancelled, true);

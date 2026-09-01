@@ -15,7 +15,7 @@
 static void test_sendfile_basic() {
   const char* content = "Hello from sendfile test!";
   size_t len = strlen(content);
-  EXPECT_TRUE(to_disk("test_sendfile_basic.txt", content, len, false, false));
+  EXPECT_TRUE(file_write_to_disk("test_sendfile_basic.txt", content, len, false, false));
 
   File* file = file_create("test_sendfile_basic.txt");
   EXPECT_NOT_NULL(file);
@@ -77,7 +77,7 @@ static void test_sendfile_basic() {
 static void test_sendfile_empty_file() {
   const char* content = "";
   size_t len = 0;
-  EXPECT_TRUE(to_disk("test_sendfile_empty.txt", content, len, false, false));
+  EXPECT_TRUE(file_write_to_disk("test_sendfile_empty.txt", content, len, false, false));
 
   File* file = file_create("test_sendfile_empty.txt");
   EXPECT_NOT_NULL(file);
@@ -156,7 +156,7 @@ static void test_sendfile_missing_file() {
 static void test_sendfile_compression_fallback() {
   const char* content = "Compression fallback content";
   size_t len = strlen(content);
-  EXPECT_TRUE(to_disk("test_sendfile_comp.txt", content, len, false, false));
+  EXPECT_TRUE(file_write_to_disk("test_sendfile_comp.txt", content, len, false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_sendfile_comp.txt", &st), 0);
@@ -222,7 +222,7 @@ static void test_sendfile_compression_fallback() {
 static void test_sendfile_no_path() {
   const char* content = "No path sendfile test";
   size_t len = strlen(content);
-  EXPECT_TRUE(to_disk("test_sendfile_nopath.txt", content, len, false, false));
+  EXPECT_TRUE(file_write_to_disk("test_sendfile_nopath.txt", content, len, false, false));
 
   File* file = file_create("test_sendfile_nopath.txt");
   EXPECT_NOT_NULL(file);

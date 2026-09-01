@@ -1,3 +1,4 @@
+#include "log.h"
 #include <stdbool.h>
 #include <limits.h>
 #include <stdio.h>
@@ -13,7 +14,7 @@ Queue* queue_create(int capacity, void (*destroyer)(void* item)) {
 
   Queue* queue = (Queue*)malloc(sizeof(Queue));
   if (queue == NULL) {
-    perror("ERROR: Could not allocate memory for queue structure");
+    log_perror("ERROR: Could not allocate memory for queue structure");
     return NULL;
   }
 
@@ -72,7 +73,7 @@ static bool queue_double_capacity(Queue* queue) {
     new_capacity = 100;
   void** new_items = malloc(new_capacity * sizeof(void*));
   if (new_items == NULL) {
-    perror("ERROR: Could not allocate memory for doubling capacity of queue.");
+    log_perror("ERROR: Could not allocate memory for doubling capacity of queue.");
     return false;
   }
   for (int i = 0; i < queue->size; i++)
@@ -127,7 +128,7 @@ bool queue_enqueue_multithreaded_cancel(Queue* queue, void* item, mtx_t* mutex,
 
 void* queue_dequeue(Queue* queue) {
   if (queue == NULL || queue_is_empty(queue)) {
-    perror("ERROR: Could not dequeue from null or empty queue.");
+    log_perror("ERROR: Could not dequeue from null or empty queue.");
     return NULL;
   }
 

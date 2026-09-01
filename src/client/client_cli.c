@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +60,7 @@ static bool parse_positive_int(const char* s, int* out_val) {
 static int set_string_option(char** dest, const char* value, const char* option_name) {
   char* dup = str_dup(value);
   if (!dup) {
-    fprintf(stderr, "Error: memory allocation failed for %s\n", option_name);
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", option_name);
     return -1;
   }
   free(*dest);
@@ -70,7 +71,7 @@ static int set_string_option(char** dest, const char* value, const char* option_
 /* Parse a string as a positive integer into *dest. Returns true on success, false on error. */
 static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
-    fprintf(stderr, "Error: %s must be a positive integer\n", option_name);
+    log_message(LOG_LEVEL_ERROR, "%s must be a positive integer", option_name);
     return -1;
   }
   return 0;
@@ -79,7 +80,7 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
 /* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
 static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
-    fprintf(stderr, "Error: %s must be a non-negative integer\n", option_name);
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", option_name);
     return -1;
   }
   return 0;
@@ -87,105 +88,187 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
+/* Parse a string as an unsigned long long. Returns 0 on success, -1 on error. */
+static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname) {
+  char* end;
+  errno = 0;
+  unsigned long long v = strtoull(val, &end, 10);
+  if (errno != 0 || *end != '\0') {
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", optname);
+    return -1;
+  }
+  *out = v;
+  return 0;
+}
+
+/* Append a duplicated pattern to a growable pattern array. Returns 0 on success, -1 on error. */
+static int config_add_pattern(char*** patterns, int* count, const char* value,
+                              const char* optname) {
+  char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
+  if (!tmp) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
+    return -1;
+  }
+  *patterns = tmp;
+  char* dup = str_dup(value);
+  if (!dup) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
+    return -1;
+  }
+  (*patterns)[(*count)++] = dup;
+  return 0;
+}
+
+typedef enum {
+  OPT_FLAG,
+  OPT_STRING,
+  OPT_POS_INT,
+  OPT_NONNEG_INT,
+  OPT_ULL,
+} OptKind;
+
+typedef struct {
+  const char* name;
+  const char* alias;
+  OptKind kind;
+  size_t offset; /* offsetof of the target field in Config */
+} OptionEntry;
+
+/* Options that map directly onto a Config field with no side effects. */
+static const OptionEntry OPTION_TABLE[] = {
+    {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
+    {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
+    {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
+    {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
+    {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
+    {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
+    {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},
+    {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
+    {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
+    {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
+    {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
+    {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
+    {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
+    {"--copy-unsafe-links", NULL, OPT_FLAG, offsetof(Config, copy_unsafe_links)},
+    {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
+    {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
+    {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
+
+    {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
+    {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
+    {"--server-host", NULL, OPT_STRING, offsetof(Config, server_host)},
+    {"--cert", NULL, OPT_STRING, offsetof(Config, tls_cert)},
+    {"--key", NULL, OPT_STRING, offsetof(Config, tls_key)},
+    {"--ca", NULL, OPT_STRING, offsetof(Config, tls_ca)},
+    {"--backup-dir", NULL, OPT_STRING, offsetof(Config, backup_dir)},
+    {"--fastsync-server-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
+    {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
+    {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
+
+    {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
+    {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
+    {"--max-depth", NULL, OPT_NONNEG_INT, offsetof(Config, max_depth)},
+
+    {"--max-size", NULL, OPT_ULL, offsetof(Config, max_size)},
+    {"--min-size", NULL, OPT_ULL, offsetof(Config, min_size)},
+};
+
+static bool opt_is(const char* arg, const char* name, const char* alias) {
+  return strcmp(arg, name) == 0 || (alias && strcmp(arg, alias) == 0);
+}
+
+static const OptionEntry* find_table_option(const char* arg) {
+  for (size_t i = 0; i < sizeof(OPTION_TABLE) / sizeof(OPTION_TABLE[0]); i++)
+    if (opt_is(arg, OPTION_TABLE[i].name, OPTION_TABLE[i].alias))
+      return &OPTION_TABLE[i];
+  return NULL;
+}
+
+static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
+  void* field = (char*)config + entry->offset;
+  switch (entry->kind) {
+  case OPT_FLAG:
+    *(bool*)field = true;
+    return 0;
+  case OPT_STRING:
+    return set_string_option((char**)field, value, entry->name);
+  case OPT_POS_INT:
+    return set_positive_int_option((int*)field, value, entry->name);
+  case OPT_NONNEG_INT:
+    return set_nonneg_int_option((int*)field, value, entry->name);
+  case OPT_ULL: {
+    unsigned long long v;
+    if (parse_ull_arg(value, &v, entry->name) != 0)
+      return -1;
+    *(unsigned long long*)field = v;
+    return 0;
+  }
+  }
+  return -1;
+}
+
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0) {
+    const OptionEntry* entry = find_table_option(argv[i]);
+    if (entry) {
+      if (entry->kind != OPT_FLAG) {
+        if (i + 1 >= argc) {
+          log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
+          return -1;
+        }
+        if (apply_table_option(config, entry, argv[++i]) != 0)
+          return -1;
+      } else if (apply_table_option(config, entry, NULL) != 0) {
+        return -1;
+      }
+      continue;
+    }
+
+    if (opt_is(argv[i], "--help", NULL)) {
       print_usage();
       return 1;
-    } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+    } else if (opt_is(argv[i], "-V", "--version")) {
       printf("fastsync version %s\n", PROTOCOL_VERSION);
       return 1;
-    } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
+    } else if (opt_is(argv[i], "-a", "--archive")) {
       config->use_compression = true;
       config->use_multithreading = true;
       config->use_metadata = true;
       log_message(LOG_LEVEL_INFO, "Enabled archive mode (-c -m -M)");
-    } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
-      config->dry_run = true;
-    } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "-p", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->ssh_port, argv[++i], "-p") != 0)
         return -1;
       if (config->ssh_port > 65535) {
-        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535\n");
+        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
         return -1;
       }
-    } else if (strcmp(argv[i], "--delete") == 0) {
-      config->use_delete = true;
-    } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
-      char** tmp = realloc(config->exclude_patterns, (config->exclude_count + 1) * sizeof(char*));
-      if (!tmp) {
-        fprintf(stderr, "Error: memory allocation failed for --exclude\n");
+    } else if (opt_is(argv[i], "--exclude", NULL) && i + 1 < argc) {
+      if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, argv[++i],
+                             "--exclude") != 0)
         return -1;
-      }
-      config->exclude_patterns = tmp;
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --exclude\n");
+    } else if (opt_is(argv[i], "--include", NULL) && i + 1 < argc) {
+      if (config_add_pattern(&config->include_patterns, &config->include_count, argv[++i],
+                             "--include") != 0)
         return -1;
-      }
-      config->exclude_patterns[config->exclude_count++] = dup;
-    } else if (strcmp(argv[i], "--include") == 0 && i + 1 < argc) {
-      char** tmp = realloc(config->include_patterns, (config->include_count + 1) * sizeof(char*));
-      if (!tmp) {
-        fprintf(stderr, "Error: memory allocation failed for --include\n");
+    } else if (opt_is(argv[i], "--delta-block", NULL) && i + 1 < argc) {
+      unsigned long long val;
+      if (parse_ull_arg(argv[++i], &val, "--delta-block") != 0)
         return -1;
-      }
-      config->include_patterns = tmp;
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --include\n");
-        return -1;
-      }
-      config->include_patterns[config->include_count++] = dup;
-    } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long val = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0') {
-        fprintf(stderr, "Error: --max-size must be a non-negative integer\n");
-        return -1;
-      }
-      config->max_size = val;
-    } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long val = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0') {
-        fprintf(stderr, "Error: --min-size must be a non-negative integer\n");
-        return -1;
-      }
-      config->min_size = val;
-    } else if (strcmp(argv[i], "--incremental") == 0) {
-      config->use_incremental = true;
-    } else if (strcmp(argv[i], "--delta") == 0) {
-      config->use_delta = true;
-    } else if (strcmp(argv[i], "--delta-block") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long val = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0') {
-        fprintf(stderr, "Error: --delta-block must be a positive integer\n");
-        return -1;
-      }
       if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
         config->delta_block_size = (uint32_t)val;
       else
-        fprintf(stderr, "Warning: --delta-block value %llu out of range, using default\n", val);
-    } else if (strcmp(argv[i], "--delta-max") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long val = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0') {
-        fprintf(stderr, "Error: --delta-max must be a positive integer\n");
+        log_message(LOG_LEVEL_WARNING, "--delta-block value %llu out of range, using default", val);
+    } else if (opt_is(argv[i], "--delta-max", NULL) && i + 1 < argc) {
+      unsigned long long val;
+      if (parse_ull_arg(argv[++i], &val, "--delta-max") != 0)
         return -1;
-      }
       if (val >= DELTA_MIN_FILE_SIZE)
         config->delta_max_file_size = val;
       else
-        fprintf(stderr, "Warning: --delta-max value %llu too small, using default\n", val);
-    } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
+        log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
+    } else if (opt_is(argv[i], "-c", "-z")) {
       config->use_compression = true;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
       if (i + 1 < argc) {
@@ -193,7 +276,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         long level = strtol(argv[i + 1], &end_ptr, 10);
         if (*end_ptr == '\0') {
           if (level < 1 || level > 22) {
-            fprintf(stderr, "Error: compression level must be 1-22\n");
+            log_message(LOG_LEVEL_ERROR, "compression level must be 1-22");
             return -1;
           }
           config->compression_level = (int)level;
@@ -201,91 +284,51 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
           i++;
         }
       }
-    } else if (strcmp(argv[i], "--source-dir") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->send_directory, argv[++i], "--source-dir") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--dest-dir") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->receive_root_directory, argv[++i], "--dest-dir") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--save-to-disk") == 0) {
-      config->save_to_disk = true;
-    } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--preserve") == 0) {
+    } else if (opt_is(argv[i], "-M", "--preserve")) {
       config->use_metadata = true;
       log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
-    } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--sendfile") == 0) {
+    } else if (opt_is(argv[i], "-f", "--sendfile")) {
       config->use_sendfile = true;
       log_message(LOG_LEVEL_INFO, "Enabled sendfile");
-    } else if (strcmp(argv[i], "-m") == 0) {
+    } else if (opt_is(argv[i], "-m", NULL)) {
       config->use_multithreading = true;
       log_message(LOG_LEVEL_INFO, "Enabled Multithreading");
-    } else if (strcmp(argv[i], "-s") == 0) {
+    } else if (opt_is(argv[i], "-s", NULL)) {
       config->use_chunk_serialization = true;
       log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
-    } else if (strcmp(argv[i], "--server-host") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->server_host, argv[++i], "--server-host") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--server-port", NULL) && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->server_port)) {
-        fprintf(stderr, "Error: invalid --server-port value: %s\n", argv[i]);
+        log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s", argv[i]);
         return -1;
       }
       if (config->server_port > 65535) {
-        fprintf(stderr, "Error: server port must be 1-65535\n");
+        log_message(LOG_LEVEL_ERROR, "server port must be 1-65535");
         return -1;
       }
-    } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long kbps = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0' || kbps == 0) {
-        fprintf(stderr, "Error: --bwlimit must be a positive integer\n");
+    } else if (opt_is(argv[i], "--bwlimit", NULL) && i + 1 < argc) {
+      unsigned long long kbps;
+      if (parse_ull_arg(argv[++i], &kbps, "--bwlimit") != 0)
+        return -1;
+      if (kbps == 0) {
+        log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
         return -1;
       }
       if (kbps > ULLONG_MAX / 1024) {
-        fprintf(stderr, "Error: --bwlimit value too large\n");
+        log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
         return -1;
       }
       io_set_bwlimit(kbps * 1024);
       log_message(LOG_LEVEL_INFO, "Set bandwidth limit to %llu KB/s", kbps);
-    } else if (strcmp(argv[i], "--progress") == 0) {
-      config->show_progress = true;
-    } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long val = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0' || val == 0) {
-        fprintf(stderr, "Error: --chunk-size must be a positive integer\n");
+    } else if (opt_is(argv[i], "--chunk-size", NULL) && i + 1 < argc) {
+      unsigned long long val;
+      if (parse_ull_arg(argv[++i], &val, "--chunk-size") != 0)
+        return -1;
+      if (val == 0) {
+        log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
         return -1;
       }
       config->chunk_size = val;
-    } else if (strcmp(argv[i], "--tls") == 0) {
-      config->use_tls = true;
-    } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->tls_cert, argv[++i], "--cert") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->tls_key, argv[++i], "--key") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->tls_ca, argv[++i], "--ca") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
-      if (set_positive_int_option(&config->timeout, argv[++i], "--timeout") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--contimeout") == 0 && i + 1 < argc) {
-      if (set_positive_int_option(&config->contimeout, argv[++i], "--contimeout") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--backup") == 0) {
-      config->backup = true;
-    } else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->backup_dir, argv[++i], "--backup-dir") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--stats") == 0) {
-      config->stats = true;
-    } else if (strcmp(argv[i], "--max-depth") == 0 && i + 1 < argc) {
-      if (set_nonneg_int_option(&config->max_depth, argv[++i], "--max-depth") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--log-file", NULL) && i + 1 < argc) {
       if (config->log_file) {
         fclose(config->log_file);
         config->log_file = NULL;
@@ -293,55 +336,29 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       FILE* lf = fopen(argv[++i], "a");
       if (!lf) {
-        fprintf(stderr, "Error: could not open log file '%s': %s\n", argv[i], strerror(errno));
+        log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s", argv[i], strerror(errno));
         return -1;
       }
       config->log_file = lf;
       log_set_file(lf);
-    } else if (strcmp(argv[i], "--exclude-from") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--exclude-from", NULL) && i + 1 < argc) {
       if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
           0)
         return -1;
-    } else if (strcmp(argv[i], "--include-from") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--include-from", NULL) && i + 1 < argc) {
       if (read_patterns_from_file(argv[++i], &config->include_patterns, &config->include_count) !=
           0)
         return -1;
-    } else if (strcmp(argv[i], "--partial") == 0) {
-      config->partial = true;
-    } else if (strcmp(argv[i], "--fastsync-server-path") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->fastsync_server_path, argv[++i], "--fastsync-server-path") !=
-          0)
-        return -1;
-    } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+    } else if (opt_is(argv[i], "-v", "--verbose")) {
       set_log_level(LOG_LEVEL_DEBUG);
-    } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--links") == 0) {
-      config->follow_symlinks = true;
-    } else if (strcmp(argv[i], "--copy-links") == 0) {
-      config->copy_links = true;
-    } else if (strcmp(argv[i], "--safe-links") == 0) {
-      config->safe_links = true;
-    } else if (strcmp(argv[i], "--copy-unsafe-links") == 0) {
-      config->copy_unsafe_links = true;
-    } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--sparse") == 0) {
-      config->preserve_sparse = true;
-    } else if (strcmp(argv[i], "--inplace") == 0) {
-      config->inplace = true;
-    } else if (strcmp(argv[i], "--partial-dir") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->partial_dir, argv[++i], "--partial-dir") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "--suffix") == 0 && i + 1 < argc) {
-      if (set_string_option(&config->suffix, argv[++i], "--suffix") != 0)
-        return -1;
-    } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
-    } else if (strcmp(argv[i], "--checksum") == 0) {
-      config->checksum = true;
-    } else if (strcmp(argv[i], "--compress-level") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--compress-level", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)
         return -1;
       if (config->compression_level < 1 || config->compression_level > 22) {
-        fprintf(stderr, "Error: --compress-level must be between 1 and 22\n");
+        log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
         return -1;
       }
     } else if (argv[i][0] == '-') {
@@ -364,7 +381,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
   FILE* fp = fopen(filepath, "r");
   if (!fp) {
-    fprintf(stderr, "Error: could not open pattern file '%s': %s\n", filepath, strerror(errno));
+    log_message(LOG_LEVEL_ERROR, "could not open pattern file '%s': %s", filepath, strerror(errno));
     return -1;
   }
   char* line = NULL;
@@ -381,22 +398,11 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
       p[--len] = '\0';
     if (len == 0)
       continue;
-    char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
-    if (!tmp) {
-      fprintf(stderr, "Error: memory allocation failed for pattern file\n");
+    if (config_add_pattern(patterns, count, p, "pattern file") != 0) {
       free(line);
       fclose(fp);
       return -1;
     }
-    *patterns = tmp;
-    char* dup = str_dup(p);
-    if (!dup) {
-      fprintf(stderr, "Error: memory allocation failed for pattern file\n");
-      free(line);
-      fclose(fp);
-      return -1;
-    }
-    (*patterns)[(*count)++] = dup;
   }
   free(line);
   fclose(fp);
@@ -413,7 +419,7 @@ int main(int argc, char* argv[]) {
   int exit_code = 0;
   Config* config = config_create();
   if (!config) {
-    fprintf(stderr, "Error: failed to allocate config\n");
+    log_message(LOG_LEVEL_ERROR, "failed to allocate config");
     return 1;
   }
   config->save_to_disk = save_to_disk;
@@ -434,20 +440,20 @@ int main(int argc, char* argv[]) {
     free(config->receive_root_directory);
     config->send_directory = str_dup(argv[positional_args[0]]);
     if (!config->send_directory) {
-      fprintf(stderr, "Error: memory allocation failed\n");
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed");
       exit_code = 1;
       goto cleanup;
     }
     config->receive_root_directory = str_dup(argv[positional_args[1]]);
     if (!config->receive_root_directory) {
-      fprintf(stderr, "Error: memory allocation failed\n");
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed");
       exit_code = 1;
       goto cleanup;
     }
     config->save_to_disk = true;
     config_parse_ssh_dest(config);
   } else if (positional_count == 1) {
-    fprintf(stderr, "Error: missing destination argument\n");
+    log_message(LOG_LEVEL_ERROR, "missing destination argument");
     print_usage();
     exit_code = 1;
     goto cleanup;
@@ -455,7 +461,7 @@ int main(int argc, char* argv[]) {
     if (!config->send_directory && env_source) {
       config->send_directory = str_dup(env_source);
       if (!config->send_directory) {
-        fprintf(stderr, "Error: memory allocation failed\n");
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
         exit_code = 1;
         goto cleanup;
       }
@@ -463,7 +469,7 @@ int main(int argc, char* argv[]) {
     if (!config->receive_root_directory && env_dest) {
       config->receive_root_directory = str_dup(env_dest);
       if (!config->receive_root_directory) {
-        fprintf(stderr, "Error: memory allocation failed\n");
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
         exit_code = 1;
         goto cleanup;
       }

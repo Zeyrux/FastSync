@@ -24,7 +24,7 @@ Chunk* chunk_create(File** items, int element_count) {
     return NULL;
   Chunk* chunk = (Chunk*)malloc(sizeof(Chunk));
   if (chunk == NULL) {
-    perror("ERROR: Could not allocate memory for chunk structure");
+    log_perror("ERROR: Could not allocate memory for chunk structure");
     return NULL;
   }
 
@@ -160,7 +160,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     char* path = malloc(path_len + 1);
     if (path == NULL) {
-      perror("Could not allocate memory for file path");
+      log_perror("Could not allocate memory for file path");
       array_list_delete(files);
       return NULL;
     }
@@ -247,7 +247,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     size_t allocation_size = file_data_size > 0 ? file_data_size : 1;
     void* file_data = malloc(allocation_size);
     if (file_data == NULL) {
-      perror("Could not allocate memory for file data");
+      log_perror("Could not allocate memory for file data");
       file_destroy(file);
       array_list_delete(files);
       return NULL;

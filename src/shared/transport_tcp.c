@@ -30,20 +30,20 @@ static void sigchld_handler(int sig) {
 Server* server_create(int port) {
   Server* server = (Server*)malloc(sizeof(Server));
   if (server == NULL) {
-    perror("Could not allocate space for Server");
+    log_perror("Could not allocate space for Server");
     return NULL;
   }
 
   int file_descriptor = socket(AF_INET, SOCK_STREAM, 0);
   if (file_descriptor < 0) {
-    perror("Could not create Socket!");
+    log_perror("Could not create Socket!");
     free(server);
     return NULL;
   }
   server->file_descriptor = file_descriptor;
   int opt = 1;
   if (setsockopt(server->file_descriptor, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-    perror("Error setting a socket option!");
+    log_perror("Error setting a socket option!");
     close(server->file_descriptor);
     free(server);
     return NULL;
@@ -59,7 +59,7 @@ Server* server_create(int port) {
 
   if (bind(server->file_descriptor, (struct sockaddr*)&server->address, server->address_length) <
       0) {
-    perror("Could not bind server");
+    log_perror("Could not bind server");
     close(server->file_descriptor);
     free(server);
     return NULL;
@@ -83,7 +83,7 @@ void server_delete(Server** server) {
 static void accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
                         const char* log_fmt) {
   if (listen(server->file_descriptor, SOMAXCONN) < 0) {
-    perror("Could not listen on port!");
+    log_perror("Could not listen on port!");
     return;
   }
   signal(SIGCHLD, sigchld_handler);
@@ -92,7 +92,7 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     socklen_t client_len = sizeof(client_addr);
     int fd = accept(server->file_descriptor, (struct sockaddr*)&client_addr, &client_len);
     if (fd < 0) {
-      perror("Could not accept the connection");
+      log_perror("Could not accept the connection");
       continue;
     }
     tcp_apply_socket_timeout(fd);
@@ -222,7 +222,7 @@ bool tcp_connect_socket(Client* client, char* host, int port) {
   freeaddrinfo(result);
 
   if (!connected) {
-    perror("Could not connect to Server!");
+    log_perror("Could not connect to Server!");
     return false;
   }
 

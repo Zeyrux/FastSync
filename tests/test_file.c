@@ -34,7 +34,8 @@ static void test_file_destroy_normal() {
 
 static void test_file_load_data() {
   const char* content = "Hello Load Test";
-  EXPECT_TRUE(to_disk("test_file_load_data.txt", content, strlen(content), false, false));
+  EXPECT_TRUE(
+      file_write_to_disk("test_file_load_data.txt", content, strlen(content), false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_file_load_data.txt", &st), 0);
@@ -87,15 +88,16 @@ static void test_file_save_to_disk() {
   rmdir("test_save_tmp");
 }
 
-static void test_to_disk_basic() {
-  const char* content = "Basic to_disk test";
-  EXPECT_TRUE(to_disk("test_to_disk_basic.txt", content, strlen(content), false, false));
+static void test_file_write_to_disk_basic() {
+  const char* content = "Basic file_write_to_disk test";
+  EXPECT_TRUE(file_write_to_disk("test_file_write_to_disk_basic.txt", content, strlen(content),
+                                 false, false));
 
   struct stat st;
-  EXPECT_EQ_INT(stat("test_to_disk_basic.txt", &st), 0);
+  EXPECT_EQ_INT(stat("test_file_write_to_disk_basic.txt", &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
 
-  FILE* fp = fopen("test_to_disk_basic.txt", "rb");
+  FILE* fp = fopen("test_file_write_to_disk_basic.txt", "rb");
   EXPECT_NOT_NULL(fp);
   char buf[100];
   size_t nread = fread(buf, 1, sizeof(buf), fp);
@@ -103,12 +105,13 @@ static void test_to_disk_basic() {
   EXPECT_EQ_INT((int)nread, (int)strlen(content));
   EXPECT_EQ_INT(memcmp(buf, content, strlen(content)), 0);
 
-  unlink("test_to_disk_basic.txt");
+  unlink("test_file_write_to_disk_basic.txt");
 }
 
-static void test_to_disk_creates_dirs() {
+static void test_file_write_to_disk_creates_dirs() {
   const char* content = "Nested dir test";
-  EXPECT_TRUE(to_disk("test_nested_tmp/nested/file.txt", content, strlen(content), false, false));
+  EXPECT_TRUE(file_write_to_disk("test_nested_tmp/nested/file.txt", content, strlen(content), false,
+                                 false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_nested_tmp/nested/file.txt", &st), 0);
@@ -126,15 +129,15 @@ static void test_to_disk_creates_dirs() {
   rmdir("test_nested_tmp");
 }
 
-static void test_to_disk_does_not_follow_symlink() {
-  const char* outside = "test_to_disk_outside.txt";
-  const char* link = "test_to_disk_link.txt";
+static void test_file_write_to_disk_does_not_follow_symlink() {
+  const char* outside = "test_file_write_to_disk_outside.txt";
+  const char* link = "test_file_write_to_disk_link.txt";
   const char* content = "confined";
   unlink(outside);
   unlink(link);
-  EXPECT_TRUE(to_disk(outside, "outside", 7, false, false));
+  EXPECT_TRUE(file_write_to_disk(outside, "outside", 7, false, false));
   EXPECT_EQ_INT(symlink(outside, link), 0);
-  EXPECT_TRUE(to_disk(link, content, strlen(content), false, false));
+  EXPECT_TRUE(file_write_to_disk(link, content, strlen(content), false, false));
   FILE* fp = fopen(outside, "rb");
   char buf[16] = {0};
   EXPECT_NOT_NULL(fp);
@@ -151,7 +154,7 @@ static void test_to_disk_does_not_follow_symlink() {
 
 static void test_file_content_to_buffer() {
   const char* content = "Buffer content test";
-  EXPECT_TRUE(to_disk("test_buffer_file.txt", content, strlen(content), false, false));
+  EXPECT_TRUE(file_write_to_disk("test_buffer_file.txt", content, strlen(content), false, false));
 
   File* f = file_create("test_buffer_file.txt");
   EXPECT_NOT_NULL(f);
@@ -273,7 +276,7 @@ static void test_file_send_no_path() {
 }
 
 static void test_file_metadata_create() {
-  EXPECT_TRUE(to_disk("test_meta_file.txt", "metadata test", 13, false, false));
+  EXPECT_TRUE(file_write_to_disk("test_meta_file.txt", "metadata test", 13, false, false));
   struct stat st;
   EXPECT_EQ_INT(stat("test_meta_file.txt", &st), 0);
 
@@ -382,7 +385,7 @@ static void test_file_send_single_calls_metadata_and_path() {
   /* Create a real file on disk so we can have metadata */
   const char* content = "File with metadata";
   size_t len = strlen(content);
-  EXPECT_TRUE(to_disk("test_meta_send.txt", content, len, false, false));
+  EXPECT_TRUE(file_write_to_disk("test_meta_send.txt", content, len, false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("test_meta_send.txt", &st), 0);
@@ -455,9 +458,9 @@ void test_file() {
   test_file_load_data();
   test_file_load_data_missing_file();
   test_file_save_to_disk();
-  test_to_disk_basic();
-  test_to_disk_creates_dirs();
-  test_to_disk_does_not_follow_symlink();
+  test_file_write_to_disk_basic();
+  test_file_write_to_disk_creates_dirs();
+  test_file_write_to_disk_does_not_follow_symlink();
   test_file_content_to_buffer();
   test_file_save_to_disk_path_traversal();
   test_file_save_to_disk_deep_traversal();

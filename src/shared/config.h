@@ -135,7 +135,7 @@ Config* config_create(void);
 void config_delete(Config* config);
 bool config_send(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
-bool is_remote_dest(const char* s);
+bool config_is_remote_dest(const char* s);
 void config_parse_ssh_dest(Config* config);
 
 #endif
