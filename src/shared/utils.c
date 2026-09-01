@@ -1,3 +1,4 @@
+#include "log.h"
 #include "utils.h"
 #include "array_list.h"
 #include "libgen.h"
@@ -54,7 +55,7 @@ bool mkdir_r(const char* path) {
     struct stat st;
     if (stat(path_current, &st) != 0) {
       if (mkdir(path_current, 0755) != 0) {
-        perror("Could not create directory");
+        log_perror("Could not create directory");
         ok = false;
         break;
       }

@@ -108,7 +108,7 @@ Config* config_create(void) {
   return config;
 }
 
-bool is_remote_dest(const char* s) {
+bool config_is_remote_dest(const char* s) {
   if (s == NULL)
     return false;
   const char* colon = strchr(s, ':');
@@ -124,7 +124,7 @@ bool is_remote_dest(const char* s) {
 }
 
 void config_parse_ssh_dest(Config* config) {
-  if (!is_remote_dest(config->receive_root_directory))
+  if (!config_is_remote_dest(config->receive_root_directory))
     return;
   config->transport = TRANSPORT_SSH;
   config->ssh_destination = str_dup(config->receive_root_directory);

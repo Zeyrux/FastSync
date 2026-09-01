@@ -101,7 +101,7 @@ static void test_fuzz_delta_deserialize() {
 /* Smoke test for metadata_from_buf fuzz target */
 static void test_fuzz_metadata_from_buf() {
   /* Create a real file to get metadata from */
-  EXPECT_TRUE(to_disk("fuzz_meta_test.txt", "metadata test", 13, false, false));
+  EXPECT_TRUE(file_write_to_disk("fuzz_meta_test.txt", "metadata test", 13, false, false));
 
   struct stat st;
   EXPECT_EQ_INT(stat("fuzz_meta_test.txt", &st), 0);

@@ -1,3 +1,4 @@
+#include "log.h"
 #include "scanner.h"
 #include "array_list.h"
 #include "chunk.h"
@@ -226,7 +227,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
   free(de);
   scanner->current_dir = opendir(scanner->current_path);
   if (scanner->current_dir == NULL) {
-    perror("Could not open directory");
+    log_perror("Could not open directory");
     free(scanner->current_path);
     scanner->current_path = NULL;
     scanner->failed = true;
@@ -412,18 +413,11 @@ static void parallel_scanner_creation_failed(ParallelScanner* ps) {
   mtx_unlock(&ps->result_mutex);
 }
 
-ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
-                                                      const ScannerOptions* options) {
-  if (!root_directory || !options)
-    return NULL;
-  ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
-  if (!ps)
-    return NULL;
+/* Initialize result queue and synchronization primitives. Returns true on success. */
+static bool parallel_scanner_init(ParallelScanner* ps) {
   ps->result_queue = queue_create(100, chunk_destroy);
-  if (!ps->result_queue) {
-    free(ps);
-    return NULL;
-  }
+  if (!ps->result_queue)
+    return false;
   atomic_init(&ps->cancelled, false);
   int init = 0;
   bool ok = true;
@@ -448,14 +442,220 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     if (init >= 1)
       mtx_destroy(&ps->result_mutex);
     queue_destroy(ps->result_queue);
-    free(ps);
+    ps->result_queue = NULL;
+    return false;
+  }
+  return true;
+}
+
+/* Split files into chunks of roughly chunk_size bytes. Returns the first chunk (also stored
+ * chunks beyond the first are enqueued on `queue`). Nulls out consumed entries in `files`.
+ * Sets *failed on allocation/enqueue errors. */
+static Chunk* batch_files(ArrayList* files, unsigned long long chunk_size, Queue* queue,
+                          bool* failed) {
+  Chunk* first = NULL;
+  if (files->size <= 0)
+    return NULL;
+  ArrayList* batch = array_list_create(NULL);
+  if (!batch) {
+    *failed = true;
     return NULL;
   }
+  unsigned long long batch_size = 0;
+  for (int i = 0; i < files->size; i++) {
+    File* f = (File*)files->items[i];
+    if (!array_list_add(batch, f)) {
+      *failed = true;
+      break;
+    }
+    batch_size += f->data->size;
+    if (batch_size >= chunk_size || i == files->size - 1) {
+      void** items = array_list_to_array(batch);
+      if (!items) {
+        *failed = true;
+        array_list_delete(batch);
+        batch = NULL;
+        break;
+      }
+      Chunk* c = chunk_create((File**)items, batch->size);
+      free(items);
+      if (!c) {
+        *failed = true;
+        array_list_delete(batch);
+        batch = NULL;
+        break;
+      }
+      int batch_start = i - batch->size + 1;
+      for (int j = batch_start; j <= i; j++)
+        files->items[j] = NULL;
+      batch->item_destroyer = NULL;
+      array_list_delete(batch);
+      batch = NULL;
+      if (!first) {
+        first = c;
+      } else {
+        if (!queue_enqueue(queue, c)) {
+          chunk_destroy(c);
+          *failed = true;
+        }
+      }
+      if (i < files->size - 1) {
+        batch = array_list_create(NULL);
+        if (!batch) {
+          *failed = true;
+          break;
+        }
+        batch_size = 0;
+      }
+    }
+  }
+  if (batch) {
+    batch->item_destroyer = NULL;
+    array_list_delete(batch);
+  }
+  return first;
+}
 
+/* Scan one root-directory entry into either the subdirs or files list. */
+static void scan_root_entry(const ScannerOptions* options, const char* root_directory,
+                            const struct dirent* entry, ArrayList* root_files, ArrayList* subdirs,
+                            ParallelScanner* ps) {
+  ScannerEntry inspected;
+  int inspection =
+      scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);
+  if (inspection < 0) {
+    ps->failed = true;
+    return;
+  }
+  if (inspection == 0)
+    return;
+  char* cur_path = inspected.path;
+  struct stat st = inspected.stats;
+  if (inspected.is_directory) {
+    if (!array_list_add(subdirs, cur_path)) {
+      free(cur_path);
+      ps->failed = true;
+    }
+    return;
+  }
+  File* file = file_create(cur_path);
+  free(cur_path);
+  if (!file) {
+    ps->failed = true;
+    return;
+  }
+  file->data->size = st.st_size;
+  if (options->use_metadata)
+    file->metadata = file_metadata_create(&st);
+  if (options->use_metadata && !file->metadata) {
+    file_destroy(file);
+    ps->failed = true;
+    return;
+  }
+  if (!array_list_add(root_files, file)) {
+    file_destroy(file);
+    ps->failed = true;
+  }
+}
+
+/* Scan the root directory itself, collecting root files and subdirectories.
+ * Returns false if the root directory could not be opened. */
+static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
+                                const ScannerOptions* options, ArrayList* root_files,
+                                ArrayList* subdirs) {
   DIR* dir = opendir(root_directory);
   if (!dir) {
-    perror("Could not open root directory for parallel scan");
-    parallel_scanner_destroy(ps);
+    log_perror("Could not open root directory for parallel scan");
+    return false;
+  }
+  const struct dirent* entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    scan_root_entry(options, root_directory, entry, root_files, subdirs, ps);
+  }
+  closedir(dir);
+  return true;
+}
+
+/* Spawn worker threads, one per group of subdirectories. */
+static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
+                                   const ScannerOptions* options, unsigned long long cs) {
+  if (subdirs->size <= 0)
+    return;
+  int n = options->num_threads > 0 ? options->num_threads : 4;
+  if (n > subdirs->size)
+    n = subdirs->size;
+
+  ps->num_threads = n;
+  ps->expected_threads = n;
+  ps->threads = calloc(n, sizeof(thrd_t));
+  if (!ps->threads) {
+    ps->num_threads = 0;
+    ps->expected_threads = 0;
+    ps->failed = true;
+    return;
+  }
+  int dirs_per_thread = subdirs->size / n;
+  int remainder = subdirs->size % n;
+  int start = 0;
+  ps->num_threads = 0;
+  for (int t = 0; t < n; t++) {
+    int count = dirs_per_thread + (t < remainder ? 1 : 0);
+    if (count == 0)
+      break;
+    ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
+    if (!wa) {
+      parallel_scanner_creation_failed(ps);
+      break;
+    }
+    wa->ps = ps;
+    wa->dirs = calloc(count, sizeof(char*));
+    if (!wa->dirs) {
+      free(wa);
+      parallel_scanner_creation_failed(ps);
+      break;
+    }
+    bool dup_ok = true;
+    for (int j = 0; j < count; j++) {
+      wa->dirs[j] = str_dup((char*)subdirs->items[start + j]);
+      if (!wa->dirs[j])
+        dup_ok = false;
+    }
+    if (!dup_ok) {
+      for (int j = 0; j < count; j++)
+        free(wa->dirs[j]);
+      free(wa->dirs);
+      free(wa);
+      parallel_scanner_creation_failed(ps);
+      break;
+    }
+    wa->dir_count = count;
+    wa->options = *options;
+    wa->options.chunk_size = cs;
+    start += count;
+    if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
+      for (int j = 0; j < count; j++)
+        free(wa->dirs[j]);
+      free(wa->dirs);
+      free(wa);
+      parallel_scanner_creation_failed(ps);
+      break;
+    }
+    ps->num_threads++;
+    ps->created_threads++;
+  }
+}
+
+ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
+                                                      const ScannerOptions* options) {
+  if (!root_directory || !options)
+    return NULL;
+  ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
+  if (!ps)
+    return NULL;
+  if (!parallel_scanner_init(ps)) {
+    free(ps);
     return NULL;
   }
 
@@ -464,199 +664,24 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   if (!root_files || !subdirs) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
-    closedir(dir);
     parallel_scanner_destroy(ps);
     return NULL;
   }
-  const struct dirent* entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
-    ScannerEntry inspected;
-    int inspection =
-        scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);
-    if (inspection < 0) {
-      ps->failed = true;
-      continue;
-    }
-    if (inspection == 0)
-      continue;
-    char* cur_path = inspected.path;
-    struct stat st = inspected.stats;
-    if (inspected.is_directory) {
-      if (!array_list_add(subdirs, cur_path)) {
-        free(cur_path);
-        ps->failed = true;
-      }
-    } else {
-      File* file = file_create(cur_path);
-      free(cur_path);
-      if (!file) {
-        ps->failed = true;
-        continue;
-      }
-      file->data->size = st.st_size;
-      if (options->use_metadata)
-        file->metadata = file_metadata_create(&st);
-      if (options->use_metadata && !file->metadata) {
-        file_destroy(file);
-        ps->failed = true;
-        continue;
-      }
-      if (!array_list_add(root_files, file)) {
-        file_destroy(file);
-        ps->failed = true;
-      }
-    }
+
+  if (!scan_root_directory(ps, root_directory, options, root_files, subdirs)) {
+    array_list_delete(root_files);
+    array_list_delete(subdirs);
+    parallel_scanner_destroy(ps);
+    return NULL;
   }
-  closedir(dir);
 
   unsigned long long cs = options->chunk_size > 0 ? options->chunk_size : DESIRED_CHUNK_SIZE;
-  if (root_files->size > 0) {
-    ArrayList* batch = array_list_create(NULL);
-    if (!batch) {
-      ps->failed = true;
-      array_list_delete(root_files);
-      array_list_delete(subdirs);
-      parallel_scanner_destroy(ps);
-      return NULL;
-    }
-    unsigned long long batch_size = 0;
-    Chunk* first = NULL;
-    for (int i = 0; i < root_files->size; i++) {
-      File* f = (File*)root_files->items[i];
-      if (!array_list_add(batch, f)) {
-        ps->failed = true;
-        break;
-      }
-      batch_size += f->data->size;
-      if (batch_size >= cs || i == root_files->size - 1) {
-        void** items = array_list_to_array(batch);
-        if (!items) {
-          ps->failed = true;
-          array_list_delete(batch);
-          batch = NULL;
-          break;
-        }
-        Chunk* c = chunk_create((File**)items, batch->size);
-        free(items);
-        if (!c) {
-          ps->failed = true;
-          array_list_delete(batch);
-          batch = NULL;
-          break;
-        }
-        int batch_start = i - batch->size + 1;
-        for (int j = batch_start; j <= i; j++)
-          root_files->items[j] = NULL;
-        batch->item_destroyer = NULL;
-        array_list_delete(batch);
-        batch = NULL;
-        if (!first) {
-          first = c;
-        } else {
-          if (!queue_enqueue(ps->result_queue, c)) {
-            chunk_destroy(c);
-            ps->failed = true;
-          }
-        }
-        if (i < root_files->size - 1) {
-          batch = array_list_create(NULL);
-          if (!batch) {
-            ps->failed = true;
-            break;
-          }
-          batch_size = 0;
-        }
-      }
-    }
-    if (batch) {
-      batch->item_destroyer = NULL;
-      array_list_delete(batch);
-    }
-    ps->initial_chunk = first;
-  }
+  ps->initial_chunk = batch_files(root_files, cs, ps->result_queue, &ps->failed);
   array_list_delete(root_files);
 
-  int n = options->num_threads > 0 ? options->num_threads : 4;
-  if (n > subdirs->size)
-    n = subdirs->size > 0 ? subdirs->size : 1;
-
-  if (subdirs->size > 0) {
-    ps->num_threads = n;
-    ps->expected_threads = n;
-    ps->threads = calloc(n, sizeof(thrd_t));
-    if (!ps->threads) {
-      array_list_delete(subdirs);
-      parallel_scanner_destroy(ps);
-      return NULL;
-    }
-    int dirs_per_thread = subdirs->size / n;
-    int remainder = subdirs->size % n;
-    int start = 0;
-    ps->num_threads = 0;
-    for (int t = 0; t < n; t++) {
-      int count = dirs_per_thread + (t < remainder ? 1 : 0);
-      if (count == 0)
-        break;
-      ParallelWorkerArg* wa = calloc(1, sizeof(ParallelWorkerArg));
-      if (!wa) {
-        parallel_scanner_creation_failed(ps);
-        break;
-      }
-      wa->ps = ps;
-      wa->dirs = calloc(count, sizeof(char*));
-      if (!wa->dirs) {
-        free(wa);
-        parallel_scanner_creation_failed(ps);
-        break;
-      }
-      bool dup_ok = true;
-      for (int j = 0; j < count; j++) {
-        wa->dirs[j] = str_dup((char*)subdirs->items[start + j]);
-        if (!wa->dirs[j])
-          dup_ok = false;
-      }
-      if (!dup_ok) {
-        for (int j = 0; j < count; j++)
-          free(wa->dirs[j]);
-        free(wa->dirs);
-        free(wa);
-        parallel_scanner_creation_failed(ps);
-        break;
-      }
-      wa->dir_count = count;
-      wa->options = *options;
-      wa->options.chunk_size = cs;
-      start += count;
-      if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
-        for (int j = 0; j < count; j++)
-          free(wa->dirs[j]);
-        free(wa->dirs);
-        free(wa);
-        parallel_scanner_creation_failed(ps);
-        break;
-      }
-      ps->num_threads++;
-      ps->created_threads++;
-    }
-  }
+  spawn_parallel_workers(ps, subdirs, options, cs);
   array_list_delete(subdirs);
   return ps;
-}
-
-ParallelScanner* parallel_scanner_create(const char* root_directory, bool use_metadata,
-                                         unsigned long long chunk_size, char** exclude_patterns,
-                                         int exclude_count, char** include_patterns,
-                                         int include_count, unsigned long long max_size,
-                                         unsigned long long min_size, int max_depth,
-                                         int num_threads, bool follow_symlinks, bool copy_links,
-                                         bool safe_links, bool copy_unsafe_links, bool checksum) {
-  ScannerOptions options = {use_metadata,     chunk_size,        exclude_patterns, exclude_count,
-                            include_patterns, include_count,     max_size,         min_size,
-                            max_depth,        num_threads,       follow_symlinks,  copy_links,
-                            safe_links,       copy_unsafe_links, checksum};
-  return parallel_scanner_create_with_options(root_directory, &options);
 }
 
 Chunk* parallel_scanner_next(ParallelScanner* ps) {

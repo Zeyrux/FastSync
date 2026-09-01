@@ -55,7 +55,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   return context;
 
 fail:
-  perror("Error initializing synchronization objects");
+  log_perror("Error initializing synchronization objects");
   if (init >= 6)
     cnd_destroy(&context->condition_not_empty_loader);
   if (init >= 5)
@@ -116,7 +116,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   return context;
 
 fail:
-  perror("Error initializing synchronization objects");
+  log_perror("Error initializing synchronization objects");
   if (init >= 3)
     cnd_destroy(&context->condition_not_empty);
   if (init >= 2)

@@ -84,7 +84,7 @@ static void test_property_chunk_roundtrip() {
     for (int i = 0; i < content_len; i++)
       content[i] = (char)(rand() % 256);
 
-    to_disk(path, content, content_len, false, false);
+    file_write_to_disk(path, content, content_len, false, false);
 
     struct stat st;
     stat(path, &st);
