@@ -211,6 +211,13 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   for (int i = 1; i < argc; i++) {
+    const char* threads_prefix = "--compress-threads=";
+    if (strncmp(argv[i], threads_prefix, strlen(threads_prefix)) == 0) {
+      if (set_positive_int_option(&config->compression_threads, argv[i] + strlen(threads_prefix),
+                                  "--compress-threads") != 0)
+        return -1;
+      continue;
+    }
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
       if (entry->kind != OPT_FLAG) {
@@ -361,6 +368,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
         return -1;
       }
+    } else if (opt_is(argv[i], "--compress-threads", NULL) && i + 1 < argc) {
+      if (set_positive_int_option(&config->compression_threads, argv[++i], "--compress-threads") !=
+          0)
+        return -1;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();

@@ -71,6 +71,11 @@ class TestTCPFlags:
         r = _run_tcp_test("Compression (-c)", shared_server.port, ["-c"])
         assert r["status"] == "Success", r["error"]
 
+    def test_compression_threads(self, shared_server):
+        r = _run_tcp_test("Compression threads (-c --compress-threads=2)", shared_server.port,
+                          ["-c", "--compress-threads=2"])
+        assert r["status"] == "Success", r["error"]
+
     def test_chunk_serialization(self, shared_server):
         r = _run_tcp_test("Chunk Serialization (-s)", shared_server.port, ["-s"])
         assert r["status"] == "Success", r["error"]

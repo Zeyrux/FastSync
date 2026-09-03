@@ -8,6 +8,9 @@
 
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path);
+bool file_send_single_calls_with_threads(File* file, int file_descriptor, bool use_metadata,
+                                         int compression_level, int compression_threads,
+                                         bool send_path);
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path);
 

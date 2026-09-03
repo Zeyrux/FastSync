@@ -36,6 +36,12 @@ static void test_validate_config_incompatible_options() {
   cfg->use_incremental = true;
   cfg->use_chunk_serialization = true;
   EXPECT_FALSE(validate_config(cfg));
+  cfg->use_incremental = false;
+  cfg->compression_threads = 2;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->use_compression = true;
+  cfg->use_sendfile = false;
+  EXPECT_TRUE(validate_config(cfg));
   config_delete(cfg);
 }
 
@@ -247,6 +253,30 @@ static void test_parse_args_valid_compression_level() {
   config_delete(cfg);
 }
 
+static void test_parse_args_compression_threads() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--compress-threads", "4", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_threads, 4);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* equals_argv[] = {"fastsync", "--compress-threads=3", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, equals_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_threads, 3);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* invalid_argv[] = {"fastsync", "--compress-threads=0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, invalid_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
 /* Test parse_args unknown option returns error */
 static void test_parse_args_unknown_option() {
   Config* cfg = config_create();
@@ -357,6 +387,7 @@ void test_client_cli() {
   test_parse_args_invalid_server_port();
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
+  test_parse_args_compression_threads();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();

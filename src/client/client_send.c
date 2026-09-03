@@ -235,7 +235,8 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
 
   Data* to_send = delta_data;
   if (config->use_compression) {
-    to_send = data_compress(delta_data, config->compression_level);
+    to_send = data_compress_with_threads(delta_data, config->compression_level,
+                                         config->compression_threads);
     data_destroy(delta_data);
     if (!to_send)
       return send_status(client->file_descriptor, STATUS_NEXT) ? 1 : -1;
@@ -251,13 +252,15 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
   return ok ? 0 : -1;
 }
 
-typedef bool (*file_send_fn)(File*, int, bool, int, bool);
+typedef bool (*file_send_fn)(File*, int, bool, int, int, bool);
 
 // Send a single file directly (non-incremental path).
-static bool send_file_direct(File* file, int fd, bool use_metadata, int compression_level) {
+static bool send_file_direct(File* file, int fd, bool use_metadata, int compression_level,
+                             int compression_threads) {
   if (!send_status(fd, STATUS_NEXT))
     return false;
-  return file_send_single_calls(file, fd, use_metadata, compression_level, true);
+  return file_send_single_calls_with_threads(file, fd, use_metadata, compression_level,
+                                             compression_threads, true);
 }
 
 // Send a single file directly via sendfile (non-incremental path).
@@ -278,7 +281,8 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
       return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata) ? 0
                                                                                             : -1;
     }
-    return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level)
+    return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level,
+                            config->compression_threads)
                ? 0
                : -1;
   }
@@ -310,7 +314,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   }
 
   // Incremental path with single_calls (supports compression and delta)
-  file_send_fn send_fn = (file_send_fn)file_send_single_calls;
+  file_send_fn send_fn = (file_send_fn)file_send_single_calls_with_threads;
   DeltaSignature* sig = NULL;
   int rc = incremental_check(client, file, config, &sig);
   if (rc < 0) {
@@ -338,7 +342,8 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
         return -1;
     }
   }
-  if (!send_fn(file, client->file_descriptor, config->use_metadata, compression_level, false))
+  if (!send_fn(file, client->file_descriptor, config->use_metadata, compression_level,
+               config->compression_threads, false))
     return -1;
   return 0;
 }
@@ -349,7 +354,8 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
       return -1;
     Data* data;
     if (config->use_compression) {
-      data = chunk_compress(chunk, config->compression_level, config->use_metadata);
+      data = chunk_compress_with_threads(chunk, config->compression_level, config->use_metadata,
+                                         config->compression_threads);
     } else {
       data = chunk_serialize(chunk, config->use_metadata);
     }

@@ -19,12 +19,20 @@
 
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
+  return file_send_single_calls_with_threads(file, file_descriptor, use_metadata, compression_level,
+                                             0, send_path);
+}
+
+bool file_send_single_calls_with_threads(File* file, int file_descriptor, bool use_metadata,
+                                         int compression_level, int compression_threads,
+                                         bool send_path) {
   if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data))
     return false;
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
   if (compression_level > 0 && !compression_should_skip(file->path)) {
-    compressed_data = data_compress(file->data, compression_level);
+    compressed_data =
+        data_compress_with_threads(file->data, compression_level, compression_threads);
     if (compressed_data == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
       return false;

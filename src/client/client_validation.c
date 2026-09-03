@@ -15,6 +15,10 @@ bool validate_config(const Config* config) {
                                  "(chunk serialization)");
     return false;
   }
+  if (config->compression_threads > 0 && !config->use_compression) {
+    log_message(LOG_LEVEL_ERROR, "--compress-threads requires compression (-c or -z)");
+    return false;
+  }
   if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
     log_message(LOG_LEVEL_ERROR, "-f/--sendfile is not supported with SSH transport");
     return false;

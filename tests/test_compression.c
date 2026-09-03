@@ -55,6 +55,22 @@ static void test_data_compress_decompress_large() {
   data_destroy(decompressed);
 }
 
+static void test_data_compress_with_threads_roundtrip() {
+  const char original[] = "Threaded zstd compression test data";
+  Data* input = data_create_empty(sizeof(original) - 1);
+  EXPECT_NOT_NULL(input);
+  memcpy(input->data, original, sizeof(original) - 1);
+  Data* compressed = data_compress_with_threads(input, 3, 2);
+  EXPECT_NOT_NULL(compressed);
+  Data* decompressed = data_decompress(compressed);
+  EXPECT_NOT_NULL(decompressed);
+  EXPECT_EQ_INT((int)decompressed->size, (int)(sizeof(original) - 1));
+  EXPECT_EQ_INT(memcmp(decompressed->data, original, sizeof(original) - 1), 0);
+  data_destroy(input);
+  data_destroy(compressed);
+  data_destroy(decompressed);
+}
+
 static void test_chunk_compress_decompress_roundtrip() {
   char* path1 = "temp_comp_test_1.txt";
   char* content1 = "chunk compression test file 1";
@@ -115,5 +131,6 @@ static void test_chunk_compress_decompress_roundtrip() {
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
+  test_data_compress_with_threads_roundtrip();
   test_chunk_compress_decompress_roundtrip();
 }

@@ -22,6 +22,7 @@ typedef struct Config {
   bool dry_run;
   bool use_delete;
   int compression_level;
+  int compression_threads;
   unsigned long long chunk_size;
   int ssh_port;
   TransportType transport;

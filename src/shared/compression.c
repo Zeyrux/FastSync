@@ -28,6 +28,14 @@ bool compression_should_skip(const char* path) {
 }
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
+  return data_compress_with_threads(data_to_compress, compression_level, 0);
+}
+
+Data* data_compress_with_threads(Data* data_to_compress, int compression_level,
+                                 int compression_threads) {
+  if (!data_to_compress || (!data_to_compress->data && data_to_compress->size != 0) ||
+      compression_threads < 0)
+    return NULL;
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data* compressed_data = data_create_empty(dst_size);
@@ -47,6 +55,26 @@ Data* data_compress(Data* data_to_compress, int compression_level) {
     ZSTD_freeCCtx(cctx);
     data_destroy(compressed_data);
     return NULL;
+  }
+
+  if (compression_threads > 0) {
+    zret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, compression_threads);
+    if (ZSTD_isError(zret)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set compression threads: %s",
+                  ZSTD_getErrorName(zret));
+      ZSTD_freeCCtx(cctx);
+      data_destroy(compressed_data);
+      return NULL;
+    }
+    /* Streaming compression needs the source size before threaded mode can end a frame. */
+    zret = ZSTD_CCtx_setPledgedSrcSize(cctx, data_to_compress->size);
+    if (ZSTD_isError(zret)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set compression source size: %s",
+                  ZSTD_getErrorName(zret));
+      ZSTD_freeCCtx(cctx);
+      data_destroy(compressed_data);
+      return NULL;
+    }
   }
 
   ZSTD_inBuffer input = {data_to_compress->data, data_to_compress->size, 0};
