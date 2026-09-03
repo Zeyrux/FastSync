@@ -52,6 +52,28 @@ class TestArchiveMode:
         assert not mismatches, f"Mismatch: {mismatches}"
 
 
+class TestCompressionChoice:
+    def test_zstd_choice_compresses(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--zc", "zstd"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"zstd sync failed: {(result.stderr or result.stdout)[:200]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    def test_none_choice_disables_compression(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-z", "--compress-choice", "none"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"none sync failed: {(result.stderr or result.stdout)[:200]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+
 class TestExclude:
     def test_exclude_single(self, shared_server):
         clean_dir(DEST_DIR)

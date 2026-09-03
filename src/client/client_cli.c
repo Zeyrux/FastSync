@@ -77,6 +77,18 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
   return 0;
 }
 
+/* Set and validate the compression algorithm selected by the client. */
+static int set_compression_choice(Config* config, const char* value) {
+  if (strcmp(value, "zstd") != 0 && strcmp(value, "none") != 0) {
+    log_message(LOG_LEVEL_ERROR, "--compress-choice must be zstd or none");
+    return -1;
+  }
+  if (set_string_option(&config->compress_choice, value, "--compress-choice") != 0)
+    return -1;
+  config->use_compression = strcmp(value, "zstd") == 0;
+  return 0;
+}
+
 /* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
 static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
@@ -165,6 +177,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
     {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
     {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},
+    {"--compress-level", "--zl", OPT_POS_INT, offsetof(Config, compression_level)},
 
     {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
     {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
@@ -182,6 +195,26 @@ static const OptionEntry* find_table_option(const char* arg) {
   for (size_t i = 0; i < sizeof(OPTION_TABLE) / sizeof(OPTION_TABLE[0]); i++)
     if (opt_is(arg, OPTION_TABLE[i].name, OPTION_TABLE[i].alias))
       return &OPTION_TABLE[i];
+  return NULL;
+}
+
+static const OptionEntry* find_table_option_with_equals(const char* arg, const char** value) {
+  const char* equals = strchr(arg, '=');
+  if (!equals || equals == arg)
+    return NULL;
+  size_t name_len = (size_t)(equals - arg);
+  for (size_t i = 0; i < sizeof(OPTION_TABLE) / sizeof(OPTION_TABLE[0]); i++) {
+    const OptionEntry* entry = &OPTION_TABLE[i];
+    if ((strlen(entry->name) == name_len && strncmp(arg, entry->name, name_len) == 0) ||
+        (entry->alias && strlen(entry->alias) == name_len &&
+         strncmp(arg, entry->alias, name_len) == 0)) {
+      if (strcmp(entry->name, "--compress-choice") == 0 ||
+          strcmp(entry->name, "--compress-level") == 0) {
+        *value = equals + 1;
+        return entry;
+      }
+    }
+  }
   return NULL;
 }
 
@@ -213,14 +246,30 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   for (int i = 1; i < argc; i++) {
     const OptionEntry* entry = find_table_option(argv[i]);
+    const char* inline_value = NULL;
+    if (!entry)
+      entry = find_table_option_with_equals(argv[i], &inline_value);
     if (entry) {
       if (entry->kind != OPT_FLAG) {
-        if (i + 1 >= argc) {
+        const char* value = inline_value;
+        if (!value && i + 1 < argc)
+          value = argv[++i];
+        if (!value) {
           log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
           return -1;
         }
-        if (apply_table_option(config, entry, argv[++i]) != 0)
-          return -1;
+        if (strcmp(entry->name, "--compress-choice") == 0) {
+          if (set_compression_choice(config, value) != 0)
+            return -1;
+        } else {
+          if (apply_table_option(config, entry, value) != 0)
+            return -1;
+          if (strcmp(entry->name, "--compress-level") == 0 &&
+              (config->compression_level < 1 || config->compression_level > 22)) {
+            log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
+            return -1;
+          }
+        }
       } else if (apply_table_option(config, entry, NULL) != 0) {
         return -1;
       }
@@ -234,7 +283,8 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       printf("fastsync version %s\n", PROTOCOL_VERSION);
       return 1;
     } else if (opt_is(argv[i], "-a", "--archive")) {
-      config->use_compression = true;
+      config->use_compression =
+          !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
       config->use_multithreading = true;
       config->use_metadata = true;
       log_message(LOG_LEVEL_INFO, "Enabled archive mode (-c -m -M)");
@@ -270,7 +320,8 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       else
         log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
     } else if (opt_is(argv[i], "-c", "-z")) {
-      config->use_compression = true;
+      config->use_compression =
+          !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
       log_message(LOG_LEVEL_INFO, "Enabled Compression");
       if (i + 1 < argc) {
         char* end_ptr;
@@ -355,13 +406,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--compress-level", "--zl") && i + 1 < argc) {
-      if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)
-        return -1;
-      if (config->compression_level < 1 || config->compression_level > 22) {
-        log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
-        return -1;
-      }
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
@@ -376,6 +420,8 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
     }
   }
+  if (config->compress_choice)
+    config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
   return 0;
 }
 

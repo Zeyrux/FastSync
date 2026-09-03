@@ -350,8 +350,33 @@ static void test_parse_args_compression_aliases() {
   EXPECT_EQ_INT(ret, 0);
   EXPECT_EQ_STR(cfg->compress_choice, "zstd");
   EXPECT_EQ_INT(cfg->compression_level, 10);
+  EXPECT_TRUE(cfg->use_compression);
   EXPECT_EQ_INT(positional_count, 2);
 
+  config_delete(cfg);
+}
+
+static void test_parse_args_compression_equals_and_none() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-z", "--zc=none", "--zl=7", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 6, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_STR(cfg->compress_choice, "none");
+  EXPECT_EQ_INT(cfg->compression_level, 7);
+  EXPECT_FALSE(cfg->use_compression);
+  config_delete(cfg);
+}
+
+static void test_parse_args_rejects_invalid_compression_choice() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--compress-choice=bogus", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 }
 
@@ -377,4 +402,6 @@ void test_client_cli() {
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
   test_parse_args_compression_aliases();
+  test_parse_args_compression_equals_and_none();
+  test_parse_args_rejects_invalid_compression_choice();
 }
