@@ -36,6 +36,7 @@ typedef struct ProtocolSession {
   long long bw_last_refill_sec;
   long bw_last_refill_nsec;
   unsigned long long total_allocated_bytes;
+  bool eight_bit_output;
 } ProtocolSession;
 
 typedef int Status;
@@ -65,6 +66,8 @@ void protocol_session_bind(ProtocolSession* session);
 void protocol_session_unbind(void);
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
+void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled);
+void protocol_set_8_bit_output(bool enabled);
 bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size);
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size);
 bool protocol_send_str(ProtocolSession* session, const char* data);

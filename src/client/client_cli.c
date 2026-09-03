@@ -211,7 +211,7 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
-  log_set_8_bit_output(config->eight_bit_output);
+  protocol_set_8_bit_output(config->eight_bit_output);
   for (int i = 1; i < argc; i++) {
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
@@ -226,7 +226,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
       if (entry->offset == offsetof(Config, eight_bit_output))
-        log_set_8_bit_output(true);
+        protocol_set_8_bit_output(true);
       continue;
     }
 
@@ -302,7 +302,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
     } else if (opt_is(argv[i], "--server-port", NULL) && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->server_port)) {
-        log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s", argv[i]);
+        char* escaped = output_escape(argv[i], false);
+        log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s",
+                    escaped ? escaped : "<allocation failed>");
+        free(escaped);
         return -1;
       }
       if (config->server_port > 65535) {
@@ -340,7 +343,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       FILE* lf = fopen(argv[++i], "a");
       if (!lf) {
-        log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s", argv[i], strerror(errno));
+        char* escaped = output_escape(argv[i], false);
+        log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
+                    escaped ? escaped : "<allocation failed>", strerror(errno));
+        free(escaped);
         return -1;
       }
       config->log_file = lf;
@@ -366,14 +372,18 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
     } else if (argv[i][0] == '-') {
-      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      char* escaped = output_escape(argv[i], false);
+      fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
+      free(escaped);
       print_usage();
       return -1;
     } else {
       if (*positional_count < 2)
         positional_args[(*positional_count)++] = i;
       else {
-        fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+        char* escaped = output_escape(argv[i], false);
+        fprintf(stderr, "Unexpected argument: %s\n", escaped ? escaped : "<allocation failed>");
+        free(escaped);
         print_usage();
         return -1;
       }
@@ -385,7 +395,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
   FILE* fp = fopen(filepath, "r");
   if (!fp) {
-    log_message(LOG_LEVEL_ERROR, "could not open pattern file '%s': %s", filepath, strerror(errno));
+    char* escaped = output_escape(filepath, false);
+    log_message(LOG_LEVEL_ERROR, "could not open pattern file '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(errno));
+    free(escaped);
     return -1;
   }
   char* line = NULL;

@@ -232,7 +232,7 @@ void handler(int file_descriptor) {
     protocol_session_unbind();
     return;
   }
-  log_set_8_bit_output(config->eight_bit_output);
+  protocol_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
     config_delete(config);
@@ -401,12 +401,17 @@ int main(int argc, char* argv[]) {
       char* end;
       long p = strtol(argv[++i], &end, 10);
       if (*end || p <= 0 || p > 65535) {
-        fprintf(stderr, "Error: invalid port '%s' (must be 1-65535)\n", argv[i]);
+        char* escaped = output_escape(argv[i], false);
+        fprintf(stderr, "Error: invalid port '%s' (must be 1-65535)\n",
+                escaped ? escaped : "<allocation failed>");
+        free(escaped);
         return 1;
       }
       port = (int)p;
     } else if (argv[i][0] == '-') {
-      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      char* escaped = output_escape(argv[i], false);
+      fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
+      free(escaped);
       print_server_usage();
       return 1;
     }
@@ -416,7 +421,10 @@ int main(int argc, char* argv[]) {
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
   if (!configure_authorization(destination_root)) {
-    fprintf(stderr, "Error: invalid destination root '%s'\n", destination_root);
+    char* escaped = output_escape(destination_root, false);
+    fprintf(stderr, "Error: invalid destination root '%s'\n",
+            escaped ? escaped : "<allocation failed>");
+    free(escaped);
     return 1;
   }
   if (stdio_mode) {

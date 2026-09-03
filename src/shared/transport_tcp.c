@@ -1,6 +1,7 @@
 #include "transport_tcp.h"
 #include "log.h"
 #include "protocol.h"
+#include "utils.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -190,7 +191,10 @@ bool tcp_connect_socket(Client* client, char* host, int port) {
 
   int err = getaddrinfo(host, port_str, &hints, &result);
   if (err != 0 || result == NULL) {
-    fprintf(stderr, "Could not resolve host: %s (%s)\n", host, gai_strerror(err));
+    char* escaped_host = output_escape(host, false);
+    fprintf(stderr, "Could not resolve host: %s (%s)\n",
+            escaped_host ? escaped_host : "<allocation failed>", gai_strerror(err));
+    free(escaped_host);
     return false;
   }
 

@@ -8,7 +8,7 @@
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
 static FILE* log_fp = NULL;
-static bool eight_bit_output = false;
+static _Thread_local bool eight_bit_output;
 
 void set_log_level(LogLevel level) {
   current_log_level = level;

@@ -71,7 +71,9 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
 Client* client_connect_ssh(const char* destination, int port, const char* server_path) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
-    fprintf(stderr, "Invalid remote destination: %s\n", destination);
+    char* escaped = output_escape(destination, false);
+    fprintf(stderr, "Invalid remote destination: %s\n", escaped ? escaped : "<allocation failed>");
+    free(escaped);
     return NULL;
   }
 
@@ -169,8 +171,11 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     close(sv[0]);
     waitpid(pid, NULL, 0);
     remote_dest_destroy(&r);
+    const char* path = server_path ? server_path : "fastsync-server";
+    char* escaped = output_escape(path, false);
     fprintf(stderr, "Error: could not launch '%s --stdio' on remote\n",
-            server_path ? server_path : "fastsync-server");
+            escaped ? escaped : "<allocation failed>");
+    free(escaped);
     return NULL;
   }
 
