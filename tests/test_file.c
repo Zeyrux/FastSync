@@ -108,6 +108,17 @@ static void test_file_write_to_disk_basic() {
   unlink("test_file_write_to_disk_basic.txt");
 }
 
+static void test_file_write_to_disk_with_fsync() {
+  const char* path = "test_file_write_to_disk_fsync.txt";
+  const char* content = "fsync file content";
+  EXPECT_TRUE(
+      file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, NULL, true));
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
+  unlink(path);
+}
+
 static void test_file_write_to_disk_creates_dirs() {
   const char* content = "Nested dir test";
   EXPECT_TRUE(file_write_to_disk("test_nested_tmp/nested/file.txt", content, strlen(content), false,
@@ -459,6 +470,7 @@ void test_file() {
   test_file_load_data_missing_file();
   test_file_save_to_disk();
   test_file_write_to_disk_basic();
+  test_file_write_to_disk_with_fsync();
   test_file_write_to_disk_creates_dirs();
   test_file_write_to_disk_does_not_follow_symlink();
   test_file_content_to_buffer();

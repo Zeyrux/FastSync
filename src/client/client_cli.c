@@ -152,6 +152,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--copy-unsafe-links", NULL, OPT_FLAG, offsetof(Config, copy_unsafe_links)},
     {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
     {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
+    {"--fsync", NULL, OPT_FLAG, offsetof(Config, use_fsync)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},

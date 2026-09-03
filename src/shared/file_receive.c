@@ -103,8 +103,8 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     }
   }
 
-  bool ok = file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
-                                file->metadata);
+  bool ok = file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size, inplace,
+                                           sparse, file->metadata, config && config->use_fsync);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

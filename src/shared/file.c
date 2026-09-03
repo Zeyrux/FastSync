@@ -302,8 +302,9 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
   return ok;
 }
 
-bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                         bool inplace, bool sparse, const FileMetadata* metadata) {
+bool file_to_disk_secure_with_fsync(const char* path, const void* data,
+                                    unsigned long long data_size, bool inplace, bool sparse,
+                                    const FileMetadata* metadata, bool use_fsync) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -317,6 +318,8 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
         ok = file_restore_metadata_fd(fd, metadata);
+      if (ok && use_fsync)
+        ok = fsync(fd) == 0;
     }
   } else {
     char tmp[NAME_MAX];
@@ -331,6 +334,8 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
         ok = file_restore_metadata_fd(fd, metadata);
+      if (ok && use_fsync)
+        ok = fsync(fd) == 0;
       if (close(fd) != 0)
         ok = false;
       fd = -1;
@@ -345,6 +350,11 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
   close(dirfd);
   free(leaf);
   return ok;
+}
+
+bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
+                         bool inplace, bool sparse, const FileMetadata* metadata) {
+  return file_to_disk_secure_with_fsync(path, data, data_size, inplace, sparse, metadata, false);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

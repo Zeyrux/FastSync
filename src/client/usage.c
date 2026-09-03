@@ -68,6 +68,7 @@ void print_usage(void) {
   printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
+  printf("  --fsync             Fsync every written file before publication\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");

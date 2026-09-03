@@ -78,6 +78,7 @@ typedef struct Config {
   // Issue #127: Transfer modes
   bool update;
   bool inplace;
+  bool use_fsync;
   bool append;
   bool append_verify;
 
@@ -128,7 +129,7 @@ typedef struct Config {
   char* compress_choice;
 } Config;
 
-#define PROTOCOL_VERSION "2.2.0"
+#define PROTOCOL_VERSION "2.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

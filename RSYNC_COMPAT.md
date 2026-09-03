@@ -229,7 +229,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `--stop-after=MINS` | Stop after N minutes | ❌ Not Implemented | |
 | `--stop-at=TIME` | Stop at specified time | ❌ Not Implemented | |
-| `--fsync` | Fsync every written file | ❌ Not Implemented | |
+| `--fsync` | Fsync every written file before publication | ✅ Implemented | |
 | `--protocol=NUM` | Force older protocol version | ❌ Not Implemented | |
 | `--iconv=CONVERT_SPEC` | Charset conversion | ❌ Not Implemented | |
 | `--checksum-seed=NUM` | Set checksum seed | ❌ Not Implemented | |
