@@ -339,6 +339,7 @@ features without changing the meaning of ordinary compatibility options.
 | `-m` | Enable the multithreaded scanner/loader/sender pipeline. |
 | `-c [level]`, `-z [level]` | Enable streaming zstd compression, levels 1-22. |
 | `--compress-level <n>` | Set the zstd compression level. |
+| `--skip-compress <list>` | Skip compression for comma-separated suffixes; incompatible with `-s`. |
 | `--chunk-size <bytes>` | Set the transfer chunk size. |
 | `-s` | Enable FastSync chunk serialization. |
 | `-f`, `--sendfile` | Use TCP `sendfile()` zero-copy transfer. Incompatible with compression and chunk serialization. |

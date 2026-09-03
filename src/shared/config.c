@@ -213,9 +213,11 @@ void config_delete(Config* config) {
   free(config->bind_address);
   free(config->daemon_config);
   free(config->compress_choice);
-  for (int i = 0; i < config->skip_compress_count; i++)
-    free(config->skip_compress_suffixes[i]);
-  free(config->skip_compress_suffixes);
+  if (config->skip_compress_suffixes) {
+    for (int i = 0; i < config->skip_compress_count; i++)
+      free(config->skip_compress_suffixes[i]);
+    free(config->skip_compress_suffixes);
+  }
   if (config->filters) {
     array_list_delete(config->filters);
   }
