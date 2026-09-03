@@ -18,6 +18,7 @@ void print_usage(void) {
   printf("  -z [level]          Alias for -c\n");
   printf("  -a, --archive       Archive mode (-c -m -M)\n");
   printf("  -n, --dry-run       Show what would be transferred\n");
+  printf("  --remove-source-files  Remove regular source files after successful transfer\n");
   printf("  -p <port>           SSH port (default: 22)\n");
   printf("  --progress          Show transfer progress\n");
   printf("  --delete            Delete files on receiver not in source\n");

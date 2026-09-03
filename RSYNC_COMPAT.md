@@ -62,7 +62,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-@`, `--modify-window=NUM` | Mod-time comparison accuracy | ❌ Not Implemented | |
 | `--existing` | Skip creating new files on receiver | ❌ Not Implemented | |
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
-| `--remove-source-files` | Sender removes synced files | ❌ Not Implemented | |
+| `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |
 
 ## 4. Directory Options
 

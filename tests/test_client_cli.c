@@ -107,6 +107,27 @@ static void test_cli_dry_run() {
   config_delete(cfg);
 }
 
+static void test_cli_remove_source_files() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_FALSE(cfg->remove_source_files);
+  cfg->remove_source_files = true;
+  EXPECT_TRUE(cfg->remove_source_files);
+  config_delete(cfg);
+}
+
+static void test_parse_args_remove_source_files() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--remove-source-files", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_TRUE(cfg->remove_source_files);
+  config_delete(cfg);
+}
+
 /* Test that --delete sets use_delete */
 static void test_cli_delete_flag() {
   Config* cfg = config_create();
@@ -347,6 +368,8 @@ void test_client_cli() {
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();
+  test_cli_remove_source_files();
+  test_parse_args_remove_source_files();
   test_cli_delete_flag();
   test_cli_exclude_patterns();
   test_parse_args_help();

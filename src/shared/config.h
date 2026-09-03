@@ -20,6 +20,7 @@ typedef struct Config {
   bool use_metadata;
   bool show_progress;
   bool dry_run;
+  bool remove_source_files;
   bool use_delete;
   int compression_level;
   unsigned long long chunk_size;
