@@ -9,8 +9,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 | ✅ Implemented | 34 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
-| ❌ Not Implemented | 98 | Flag not recognized or no behavior |
-| **Total** | **136** | |
+| ❌ Not Implemented | 99 | Flag not recognized or no behavior |
+| **Total** | **137** | |
 
 ---
 
@@ -101,7 +101,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `--delete` | Delete extraneous files from dest | ✅ Implemented | `use_delete` config field |
 | `--delete-before` | Delete before transfer | ❌ Not Implemented | Removed because it had no effect |
-| `--delete-during` | Delete during transfer | ❌ Not Implemented | |
+| `--del`, `--delete-during` | Delete during transfer | ❌ Not Implemented | Both flags are recognized but rejected; delete timing is not implemented |
 | `--delete-delay` | Find deletions during, delete after | ❌ Not Implemented | |
 | `--delete-after` | Delete after transfer | ❌ Not Implemented | Removed because it had no effect |
 | `--delete-excluded` | Also delete excluded files | ❌ Not Implemented | Removed because it had no effect |
