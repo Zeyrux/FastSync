@@ -465,7 +465,7 @@ defaults to the current directory. |
 
 ## Protocol and Security
 
-FastSync protocol version `2.2.0` is shared by the client and server. The
+FastSync protocol version `2.3.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 incremental checks, checksums, manifests, keep-alives, abort handling, and
 FastSync-native delta messages. Client and server versions must currently

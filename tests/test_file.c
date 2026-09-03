@@ -1,6 +1,7 @@
 #include "test_file.h"
 #include "file.h"
 #include "data.h"
+#include "config.h"
 #include "utils.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -86,6 +87,30 @@ static void test_file_save_to_disk() {
   file_destroy(f);
   unlink("test_save_tmp/saved_file.txt");
   rmdir("test_save_tmp");
+}
+
+static void test_file_save_to_disk_with_fsync_config() {
+  File* f = file_create("saved_file_fsync.txt");
+  EXPECT_NOT_NULL(f);
+  const char* content = "Save to disk with fsync";
+  f->data->data = malloc(strlen(content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, content, strlen(content));
+  f->data->size = strlen(content);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->use_fsync = true;
+  EXPECT_TRUE(file_save_to_disk("test_save_fsync_tmp", f, config));
+
+  struct stat st;
+  EXPECT_EQ_INT(stat("test_save_fsync_tmp/saved_file_fsync.txt", &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
+
+  file_destroy(f);
+  config_delete(config);
+  unlink("test_save_fsync_tmp/saved_file_fsync.txt");
+  rmdir("test_save_fsync_tmp");
 }
 
 static void test_file_write_to_disk_basic() {
@@ -469,6 +494,7 @@ void test_file() {
   test_file_load_data();
   test_file_load_data_missing_file();
   test_file_save_to_disk();
+  test_file_save_to_disk_with_fsync_config();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_with_fsync();
   test_file_write_to_disk_creates_dirs();
