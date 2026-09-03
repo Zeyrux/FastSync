@@ -351,10 +351,14 @@ typedef struct {
   char** dirs;
   int dir_count;
   ScannerOptions options;
+  ProtocolSession* allocation_session;
 } ParallelWorkerArg;
 
 static int parallel_worker_thread(void* arg) {
   ParallelWorkerArg* wa = (ParallelWorkerArg*)arg;
+  ProtocolSession* allocation_session = wa->allocation_session;
+  if (allocation_session)
+    protocol_session_bind(allocation_session);
   for (int i = 0; i < wa->dir_count; i++) {
     DirectoryScanner* ds = directory_scanner_create_with_options(wa->dirs[i], &wa->options);
     if (!ds) {
@@ -398,6 +402,8 @@ static int parallel_worker_thread(void* arg) {
     cnd_signal(&ps->result_not_empty);
   }
   mtx_unlock(&ps->result_mutex);
+  if (allocation_session)
+    protocol_session_unbind();
   return thrd_success;
 }
 
@@ -633,6 +639,7 @@ static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
     wa->dir_count = count;
     wa->options = *options;
     wa->options.chunk_size = cs;
+    wa->allocation_session = ps->allocation_session;
     start += count;
     if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
       for (int j = 0; j < count; j++)
@@ -648,7 +655,8 @@ static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
 }
 
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
-                                                      const ScannerOptions* options) {
+                                                      const ScannerOptions* options,
+                                                      ProtocolSession* allocation_session) {
   if (!root_directory || !options)
     return NULL;
   ParallelScanner* ps = calloc(1, sizeof(ParallelScanner));
@@ -658,6 +666,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     free(ps);
     return NULL;
   }
+  ps->allocation_session = allocation_session;
 
   ArrayList* root_files = array_list_create(file_destroy);
   ArrayList* subdirs = array_list_create(free);

@@ -295,7 +295,8 @@ void handler(int file_descriptor) {
       return;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
-    context->session.total_allocated_bytes = session.total_allocated_bytes;
+    atomic_store(&context->session.total_allocated_bytes,
+                 atomic_load(&session.total_allocated_bytes));
     thrd_t receiver, writer;
     bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
     bool writer_created = false;

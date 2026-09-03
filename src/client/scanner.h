@@ -2,6 +2,7 @@
 #define SCANNER_H
 
 #include "chunk.h"
+#include "protocol.h"
 #include "queue.h"
 #include <dirent.h>
 #include <stdbool.h>
@@ -62,6 +63,7 @@ typedef struct {
   atomic_bool cancelled;
   int completed;
   Chunk* initial_chunk;
+  ProtocolSession* allocation_session;
 } ParallelScanner;
 
 DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,
@@ -78,7 +80,8 @@ bool directory_scanner_failed(const DirectoryScanner* scanner);
 void directory_scanner_destroy(DirectoryScanner* scanner);
 
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
-                                                      const ScannerOptions* options);
+                                                      const ScannerOptions* options,
+                                                      ProtocolSession* allocation_session);
 Chunk* parallel_scanner_next(ParallelScanner* scanner);
 bool parallel_scanner_failed(const ParallelScanner* scanner);
 void parallel_scanner_destroy(ParallelScanner* scanner);

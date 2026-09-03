@@ -181,6 +181,7 @@ int receive_thread(void* pipeline_context) {
 
 int write_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
+  protocol_session_bind(&context->session);
   mtx_lock(&context->mutex);
   bool save_to_disk = context->config->save_to_disk;
   char* root_directory = str_dup(context->config->receive_root_directory);
@@ -192,6 +193,7 @@ int write_thread(void* pipeline_context) {
     cnd_broadcast(&context->condition_not_full);
     cnd_broadcast(&context->condition_not_empty);
     mtx_unlock(&context->mutex);
+    protocol_session_unbind();
     return thrd_error;
   }
 
@@ -201,6 +203,7 @@ int write_thread(void* pipeline_context) {
                                     &context->condition_not_full, &context->receiver_done);
     if (file == NULL) {
       free(root_directory);
+      protocol_session_unbind();
       return thrd_success;
     }
     if (save_to_disk && !file_save_to_disk(root_directory, file, context->config)) {
@@ -212,6 +215,7 @@ int write_thread(void* pipeline_context) {
       cnd_broadcast(&context->condition_not_empty);
       mtx_unlock(&context->mutex);
       free(root_directory);
+      protocol_session_unbind();
       return thrd_error;
     }
     file_destroy(file);

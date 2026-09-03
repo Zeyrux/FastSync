@@ -458,8 +458,8 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
   protocol_session_bind(&context->allocation_session);
   ScannerOptions options = scanner_options_from_config(context->config, 4);
-  ParallelScanner* scanner =
-      parallel_scanner_create_with_options(context->config->send_directory, &options);
+  ParallelScanner* scanner = parallel_scanner_create_with_options(
+      context->config->send_directory, &options, &context->allocation_session);
 
   Chunk* current_chunk;
   if (scanner == NULL) {

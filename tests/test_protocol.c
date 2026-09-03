@@ -3,6 +3,40 @@
 #include <limits.h>
 #include <string.h>
 #include <unistd.h>
+#include <threads.h>
+
+typedef struct {
+  ProtocolSession* session;
+  bool allocation_allowed;
+} AllocationWorkerArg;
+
+static int allocation_worker(void* arg) {
+  AllocationWorkerArg* worker = arg;
+  protocol_session_bind(worker->session);
+  void* allocation = protocol_alloc(8);
+  worker->allocation_allowed = allocation != NULL;
+  free(allocation);
+  protocol_session_unbind();
+  return thrd_success;
+}
+
+typedef struct {
+  ProtocolSession* session;
+  int read_fd;
+  bool released;
+} AccountingWorkerArg;
+
+static int accounting_worker(void* arg) {
+  AccountingWorkerArg* worker = arg;
+  protocol_session_bind(worker->session);
+  Data* data = protocol_receive_data_limited(worker->session, 8);
+  if (data) {
+    data_destroy(data);
+    worker->released = atomic_load(&worker->session->total_allocated_bytes) == 0;
+  }
+  protocol_session_unbind();
+  return data ? thrd_success : thrd_error;
+}
 
 static void test_send_receive_n_data() {
   int p[2];
@@ -215,6 +249,53 @@ static void test_max_alloc_allows_configured_buffer() {
   protocol_session_unbind();
 }
 
+static void test_max_alloc_is_bound_in_worker_threads() {
+  enum { WORKER_COUNT = 4 };
+  ProtocolSession sessions[WORKER_COUNT];
+  AllocationWorkerArg args[WORKER_COUNT] = {0};
+  thrd_t threads[WORKER_COUNT];
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    protocol_session_init(&sessions[i], -1, -1);
+    protocol_session_set_max_alloc(&sessions[i], 4);
+    args[i].session = &sessions[i];
+    EXPECT_EQ_INT(thrd_create(&threads[i], allocation_worker, &args[i]), thrd_success);
+  }
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    int result;
+    EXPECT_EQ_INT(thrd_join(threads[i], &result), thrd_success);
+    EXPECT_EQ_INT(result, thrd_success);
+    EXPECT_FALSE(args[i].allocation_allowed);
+  }
+}
+
+static void test_protocol_accounting_is_released_in_worker_threads() {
+  enum { WORKER_COUNT = 4 };
+  ProtocolSession sessions[WORKER_COUNT];
+  AccountingWorkerArg args[WORKER_COUNT] = {0};
+  thrd_t threads[WORKER_COUNT];
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    int p[2];
+    EXPECT_EQ_INT(pipe(p), 0);
+    protocol_session_init(&sessions[i], p[0], p[1]);
+    protocol_session_set_max_alloc(&sessions[i], 64);
+    unsigned long long size = 8;
+    EXPECT_EQ_INT((int)write(p[1], &size, sizeof(size)), (int)sizeof(size));
+    EXPECT_EQ_INT((int)write(p[1], "12345678", 8), 8);
+    close(p[1]);
+    args[i].session = &sessions[i];
+    args[i].read_fd = p[0];
+    EXPECT_EQ_INT(thrd_create(&threads[i], accounting_worker, &args[i]), thrd_success);
+  }
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    int result;
+    EXPECT_EQ_INT(thrd_join(threads[i], &result), thrd_success);
+    EXPECT_EQ_INT(result, thrd_success);
+    EXPECT_TRUE(args[i].released);
+    EXPECT_EQ_INT((int)atomic_load(&sessions[i].total_allocated_bytes), 0);
+    close(args[i].read_fd);
+  }
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -228,4 +309,6 @@ void test_protocol() {
   test_receive_str_truncated();
   test_max_alloc_rejects_single_buffer();
   test_max_alloc_allows_configured_buffer();
+  test_max_alloc_is_bound_in_worker_threads();
+  test_protocol_accounting_is_released_in_worker_threads();
 }

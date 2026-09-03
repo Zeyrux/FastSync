@@ -4,6 +4,7 @@
 #include "data.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 /* Maximum allowed string size for receive_str (64 KB) */
 #define MAX_STRING_SIZE (64 * 1024)
@@ -38,7 +39,7 @@ typedef struct ProtocolSession {
   long long bw_tokens;
   long long bw_last_refill_sec;
   long bw_last_refill_nsec;
-  unsigned long long total_allocated_bytes;
+  atomic_ullong total_allocated_bytes;
   unsigned long long max_alloc;
 } ProtocolSession;
 

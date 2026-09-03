@@ -396,7 +396,7 @@ static void test_parallel_scanner_root_chunks_without_workers() {
 
   ScannerOptions options = {false, 1, NULL,  0,     NULL,  0,     0,    0,
                             0,     0, false, false, false, false, false};
-  ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options);
+  ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options, NULL);
   EXPECT_NOT_NULL(scanner);
 
   int total_files = 0;
