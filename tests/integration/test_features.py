@@ -57,6 +57,20 @@ class TestRemoveSourceFiles:
         assert os.path.isdir(os.path.join(source, "directory"))
         assert os.path.islink(os.path.join(source, "link.txt"))
 
+    def test_single_threaded_removes_transferred_file(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_single_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_single_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"single threaded")
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files"],
+                               port=shared_server.port)
+        assert result.returncode == 0
+        assert not os.path.exists(source_file)
+
     def test_dry_run_preserves_source_files(self):
         source = os.path.join(TEST_DATA_DIR, "remove_dry_source")
         dest = os.path.join(TEST_DATA_DIR, "remove_dry_dest")
@@ -81,6 +95,23 @@ class TestRemoveSourceFiles:
 
         result, _ = run_client(source, dest, flags=["--remove-source-files"], port=1)
         assert result.returncode != 0
+        assert os.path.isfile(source_file)
+
+    def test_incremental_skip_preserves_source_file(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_skipped_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_skipped_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"keep after skip")
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0
+        result, _ = run_client(source, dest,
+                               flags=["--remove-source-files", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0
         assert os.path.isfile(source_file)
 
 
