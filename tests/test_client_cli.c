@@ -339,6 +339,17 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+static void test_parse_args_old_args() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--old-args", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->old_args);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -360,4 +371,5 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
+  test_parse_args_old_args();
 }

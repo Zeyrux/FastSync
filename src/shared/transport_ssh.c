@@ -3,6 +3,7 @@
 #include "utils.h"
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -68,7 +69,52 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
   return 0;
 }
 
-Client* client_connect_ssh(const char* destination, int port, const char* server_path) {
+char* ssh_build_remote_command(const char* server_path, bool old_args) {
+  const char* path = server_path ? server_path : "fastsync-server";
+  const char* suffix = " --stdio";
+  size_t path_len = strlen(path);
+  size_t suffix_len = strlen(suffix);
+
+  if (old_args) {
+    if (path_len > SIZE_MAX - suffix_len - 1)
+      return NULL;
+    char* command = malloc(path_len + suffix_len + 1);
+    if (!command)
+      return NULL;
+    memcpy(command, path, path_len);
+    memcpy(command + path_len, suffix, suffix_len + 1);
+    return command;
+  }
+
+  /* Quote the executable as one remote-shell word. This is the default safety boundary. */
+  size_t quote_count = 0;
+  for (const char* p = path; *p; p++)
+    if (*p == '\'')
+      quote_count++;
+  if (path_len > SIZE_MAX - suffix_len - 4 ||
+      quote_count > (SIZE_MAX - path_len - suffix_len - 4) / 4)
+    return NULL;
+  size_t command_len = path_len + quote_count * 4 + suffix_len + 4;
+  char* command = malloc(command_len + 1);
+  if (!command)
+    return NULL;
+  char* out = command;
+  *out++ = '\'';
+  for (const char* p = path; *p; p++) {
+    if (*p == '\'') {
+      memcpy(out, "'\\''", 4);
+      out += 4;
+    } else {
+      *out++ = *p;
+    }
+  }
+  *out++ = '\'';
+  memcpy(out, suffix, suffix_len + 1);
+  return command;
+}
+
+Client* client_connect_ssh(const char* destination, int port, const char* server_path,
+                           bool old_args) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     fprintf(stderr, "Invalid remote destination: %s\n", destination);
@@ -135,6 +181,9 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     char* ssh_argv[16];
     int ac = 0;
     char port_str[16];
+    char* remote_command = ssh_build_remote_command(server_path, old_args);
+    if (!remote_command)
+      _exit(1);
     ssh_argv[ac++] = "ssh";
     ssh_argv[ac++] = "-o";
     ssh_argv[ac++] = "Compression=no";
@@ -148,8 +197,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
       ssh_argv[ac++] = port_str;
     }
     ssh_argv[ac++] = ssh_user;
-    ssh_argv[ac++] = (char*)(server_path ? server_path : "fastsync-server");
-    ssh_argv[ac++] = "--stdio";
+    ssh_argv[ac++] = remote_command;
     ssh_argv[ac] = NULL;
     execvp("ssh", ssh_argv);
     log_perror("exec of ssh failed");

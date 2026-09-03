@@ -46,7 +46,7 @@ static Client* connect_transfer_client(const Config* config) {
       return NULL;
     }
     return client_connect_ssh(config->ssh_destination, config->ssh_port,
-                              config->fastsync_server_path);
+                              config->fastsync_server_path, config->old_args);
   }
 
   Client* client = client_create();

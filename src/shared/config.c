@@ -82,6 +82,7 @@ static void config_set_defaults(Config* config) {
   config->relative = false;
   config->rsh_command = NULL;
   config->rsync_path = NULL;
+  config->old_args = false;
   config->temp_dir = NULL;
   config->compare_dest = NULL;
   config->copy_dest = NULL;

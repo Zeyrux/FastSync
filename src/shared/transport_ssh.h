@@ -3,6 +3,8 @@
 
 #include "transport_tcp.h"
 
-Client* client_connect_ssh(const char* destination, int port, const char* server_path);
+Client* client_connect_ssh(const char* destination, int port, const char* server_path,
+                           bool old_args);
+char* ssh_build_remote_command(const char* server_path, bool old_args);
 
 #endif
