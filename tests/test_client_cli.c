@@ -339,6 +339,36 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+/* Checksum-choice spellings are recognized and rejected until algorithms are implemented. */
+static void test_parse_args_checksum_choice_aliases() {
+  static const char* const options[] = {"--checksum-choice", "--cc"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "xxh64", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
+/* Both checksum-choice spellings require a value. */
+static void test_parse_args_checksum_choice_requires_value() {
+  static const char* const options[] = {"--checksum-choice", "--cc"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i]};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -360,4 +390,6 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
+  test_parse_args_checksum_choice_aliases();
+  test_parse_args_checksum_choice_requires_value();
 }

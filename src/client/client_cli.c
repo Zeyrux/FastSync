@@ -361,6 +361,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
         return -1;
       }
+    } else if (opt_is(argv[i], "--checksum-choice", "--cc")) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      log_message(LOG_LEVEL_ERROR, "%s is not supported yet (xxHash64 is used)", argv[i]);
+      return -1;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
