@@ -164,6 +164,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--fastsync-server-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
     {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
     {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
+    {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},
 
     {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
     {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
@@ -354,7 +355,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--compress-level", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--compress-level", "--zl") && i + 1 < argc) {
       if (set_positive_int_option(&config->compression_level, argv[++i], "--compress-level") != 0)
         return -1;
       if (config->compression_level < 1 || config->compression_level > 22) {

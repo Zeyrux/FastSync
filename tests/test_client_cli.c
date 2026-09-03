@@ -310,7 +310,7 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--daemon",
                                         "--config",
                                         "--server",
-                                        "--compress-choice"};
+                                        "--checksum-choice"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
@@ -339,6 +339,22 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+/* Test rsync-compatible compression-choice and compression-level aliases. */
+static void test_parse_args_compression_aliases() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--zc", "zstd", "--zl", "10", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 7, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_STR(cfg->compress_choice, "zstd");
+  EXPECT_EQ_INT(cfg->compression_level, 10);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -360,4 +376,5 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
+  test_parse_args_compression_aliases();
 }

@@ -36,6 +36,8 @@ void print_usage(void) {
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
+  printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
+  printf("  --zc <alg>          Alias for --compress-choice\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -M, --preserve      Preserve file metadata\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
@@ -69,6 +71,7 @@ void print_usage(void) {
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
+  printf("  --zl <n>             Alias for --compress-level\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");
 }
