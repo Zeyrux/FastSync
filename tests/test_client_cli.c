@@ -1,6 +1,7 @@
 #include "test_client_cli.h"
 #include "client_validation.h"
 #include "config.h"
+#include "log.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <stdlib.h>
@@ -277,7 +278,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "-i",
                                         "--itemize-changes",
                                         "--out-format",
-                                        "--info",
                                         "--debug",
                                         "--list-only",
                                         "-h",
@@ -323,6 +323,28 @@ static void test_parse_args_rejects_unimplemented_options() {
   }
 }
 
+static void test_parse_args_info_flags() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=copy,skip", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_COPY | LOG_INFO_SKIP);
+  EXPECT_EQ_INT(get_log_info_flags(), LOG_INFO_COPY | LOG_INFO_SKIP);
+  config_delete(cfg);
+}
+
+static void test_parse_args_rejects_invalid_info_flag() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=copy,unknown", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
 /* Test parse_args with --archive flag */
 static void test_parse_args_archive() {
   Config* cfg = config_create();
@@ -359,5 +381,7 @@ void test_client_cli() {
   test_parse_args_valid_compression_level();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
+  test_parse_args_info_flags();
+  test_parse_args_rejects_invalid_info_flag();
   test_parse_args_archive();
 }

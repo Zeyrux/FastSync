@@ -88,6 +88,69 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
+static int parse_info_flags(const char* value, Config* config) {
+  if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
+      strstr(value, ",,")) {
+    log_message(LOG_LEVEL_ERROR, "--info requires at least one flag");
+    return -1;
+  }
+  char* flags = str_dup(value);
+  if (!flags) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --info");
+    return -1;
+  }
+
+  uint32_t parsed = (uint32_t)config->info_level;
+  char* saveptr = NULL;
+  for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
+       token = strtok_r(NULL, ",", &saveptr)) {
+    uint32_t flag = 0;
+    if (strcmp(token, "all") == 0) {
+      parsed = LOG_INFO_ALL;
+      continue;
+    }
+    if (strcmp(token, "none") == 0) {
+      parsed = 0;
+      continue;
+    }
+    if (strcmp(token, "copy") == 0)
+      flag = LOG_INFO_COPY;
+    else if (strcmp(token, "del") == 0)
+      flag = LOG_INFO_DEL;
+    else if (strcmp(token, "flist") == 0)
+      flag = LOG_INFO_FLIST;
+    else if (strcmp(token, "misc") == 0)
+      flag = LOG_INFO_MISC;
+    else if (strcmp(token, "mount") == 0)
+      flag = LOG_INFO_MOUNT;
+    else if (strcmp(token, "name") == 0)
+      flag = LOG_INFO_NAME;
+    else if (strcmp(token, "nonreg") == 0)
+      flag = LOG_INFO_NONREG;
+    else if (strcmp(token, "progress") == 0)
+      flag = LOG_INFO_PROGRESS;
+    else if (strcmp(token, "skip") == 0)
+      flag = LOG_INFO_SKIP;
+    else if (strcmp(token, "stats") == 0)
+      flag = LOG_INFO_STATS;
+    else if (strcmp(token, "symsafe") == 0)
+      flag = LOG_INFO_SYMSAFE;
+    else if (strcmp(token, "backup") == 0)
+      flag = LOG_INFO_BACKUP;
+    else {
+      log_message(LOG_LEVEL_ERROR, "unknown --info flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    parsed |= flag;
+  }
+  free(flags);
+  config->info_level = (int)parsed;
+  set_log_info_flags(parsed);
+  set_log_level(LOG_LEVEL_INFO);
+  return 0;
+}
+
 /* Parse a string as an unsigned long long. Returns 0 on success, -1 on error. */
 static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname) {
   char* end;
@@ -236,7 +299,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       config->use_compression = true;
       config->use_multithreading = true;
       config->use_metadata = true;
-      log_message(LOG_LEVEL_INFO, "Enabled archive mode (-c -m -M)");
+      log_info_message(LOG_INFO_MISC, "Enabled archive mode (-c -m -M)");
     } else if (opt_is(argv[i], "-p", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->ssh_port, argv[++i], "-p") != 0)
         return -1;
@@ -270,7 +333,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
     } else if (opt_is(argv[i], "-c", "-z")) {
       config->use_compression = true;
-      log_message(LOG_LEVEL_INFO, "Enabled Compression");
+      log_info_message(LOG_INFO_MISC, "Enabled Compression");
       if (i + 1 < argc) {
         char* end_ptr;
         long level = strtol(argv[i + 1], &end_ptr, 10);
@@ -280,22 +343,22 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
             return -1;
           }
           config->compression_level = (int)level;
-          log_message(LOG_LEVEL_INFO, "Set Compression level to %ld", level);
+          log_info_message(LOG_INFO_MISC, "Set Compression level to %ld", level);
           i++;
         }
       }
     } else if (opt_is(argv[i], "-M", "--preserve")) {
       config->use_metadata = true;
-      log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
+      log_info_message(LOG_INFO_MISC, "Enabled metadata preservation");
     } else if (opt_is(argv[i], "-f", "--sendfile")) {
       config->use_sendfile = true;
-      log_message(LOG_LEVEL_INFO, "Enabled sendfile");
+      log_info_message(LOG_INFO_MISC, "Enabled sendfile");
     } else if (opt_is(argv[i], "-m", NULL)) {
       config->use_multithreading = true;
-      log_message(LOG_LEVEL_INFO, "Enabled Multithreading");
+      log_info_message(LOG_INFO_MISC, "Enabled Multithreading");
     } else if (opt_is(argv[i], "-s", NULL)) {
       config->use_chunk_serialization = true;
-      log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
+      log_info_message(LOG_INFO_MISC, "Enabled Chunk Serialization");
     } else if (opt_is(argv[i], "--server-port", NULL) && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->server_port)) {
         log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s", argv[i]);
@@ -318,7 +381,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
       io_set_bwlimit(kbps * 1024);
-      log_message(LOG_LEVEL_INFO, "Set bandwidth limit to %llu KB/s", kbps);
+      log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
     } else if (opt_is(argv[i], "--chunk-size", NULL) && i + 1 < argc) {
       unsigned long long val;
       if (parse_ull_arg(argv[++i], &val, "--chunk-size") != 0)
@@ -351,6 +414,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
     } else if (opt_is(argv[i], "-v", "--verbose")) {
       set_log_level(LOG_LEVEL_DEBUG);
+    } else if (strncmp(argv[i], "--info=", 7) == 0) {
+      if (parse_info_flags(argv[i] + 7, config) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--info", NULL)) {
+      if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
+        return -1;
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
@@ -483,11 +552,11 @@ int main(int argc, char* argv[]) {
 
   /* Enable implicit flags */
   if (config->use_incremental && !config->use_metadata) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
+    log_info_message(LOG_INFO_MISC, "Enabling metadata preservation for --incremental");
     config->use_metadata = true;
   }
   if (config->use_delta && !config->use_metadata) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --delta");
+    log_info_message(LOG_INFO_MISC, "Enabling metadata preservation for --delta");
     config->use_metadata = true;
   }
 

@@ -272,6 +272,7 @@ static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata) {
 static int send_single_file(Client* client, File* file, Config* config, bool use_incremental,
                             bool use_sendfile) {
   int compression_level = config->use_compression ? config->compression_level : 0;
+  log_info_message(LOG_INFO_COPY, "Transferring %s", file->path);
 
   if (!use_incremental) {
     if (use_sendfile) {
@@ -288,6 +289,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     DeltaSignature* sig = NULL;
     int rc = incremental_check(client, file, config, &sig);
     if (rc == 1) {
+      log_info_message(LOG_INFO_SKIP, "Skipping unchanged %s", file->path);
       delta_signature_destroy(sig);
       return 1;
     }
@@ -318,6 +320,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     return -1;
   }
   if (rc == 1) {
+    log_info_message(LOG_INFO_SKIP, "Skipping unchanged %s", file->path);
     delta_signature_destroy(sig);
     return 1;
   }
@@ -680,6 +683,8 @@ int send_files(Config* config) {
     fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files, total_bytes / 1048576.0,
             rate);
   }
+  log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
+                   total_bytes / 1048576.0);
   ret = ok ? 0 : 1;
 
 send_fail:

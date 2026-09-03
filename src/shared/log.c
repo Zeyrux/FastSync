@@ -7,10 +7,19 @@
 
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
+static uint32_t info_flags = 0;
 static FILE* log_fp = NULL;
 
 void set_log_level(LogLevel level) {
   current_log_level = level;
+}
+
+void set_log_info_flags(uint32_t flags) {
+  info_flags = flags;
+}
+
+uint32_t get_log_info_flags(void) {
+  return info_flags;
 }
 
 void log_set_file(FILE* fp) {
@@ -49,6 +58,27 @@ void log_message(LogLevel log_level, const char* format, ...) {
   if (log_fp) {
     va_start(args, format);
     write_message(log_fp, log_level, t, format, args);
+    va_end(args);
+  }
+}
+
+void log_info_message(LogInfoFlag flag, const char* format, ...) {
+  if ((info_flags & flag) == 0 && current_log_level > LOG_LEVEL_DEBUG)
+    return;
+
+  time_t now = time(NULL);
+  struct tm t;
+  if (!localtime_r(&now, &t))
+    return;
+
+  va_list args;
+  va_start(args, format);
+  write_message(stdout, LOG_LEVEL_INFO, t, format, args);
+  va_end(args);
+
+  if (log_fp) {
+    va_start(args, format);
+    write_message(log_fp, LOG_LEVEL_INFO, t, format, args);
     va_end(args);
   }
 }
