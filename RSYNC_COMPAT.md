@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 34 | Feature works end-to-end |
-| 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
-| ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
-| ❌ Not Implemented | 98 | Flag not recognized or no behavior |
-| **Total** | **136** | |
+| ✅ Implemented | 35 | Feature works end-to-end |
+| 🔀 Alt Arg | 4 | Functionality exists but under different flag/semantics |
+| ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
+| ❌ Not Implemented | 97 | Flag not recognized or no behavior |
+| **Total** | **141** | |
 
 ---
 
@@ -25,7 +25,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-V`, `--version` | Print version | ✅ Implemented | |
 | `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
 | `--debug=FLAGS` | Fine-grained debug verbosity | ❌ Not Implemented | Removed because it had no effect |
-| `--stderr=MODE` | Change stderr output mode | ⚠️ Partial | `errors` (default), `all`, and `client` are accepted; `client` preserves local client routing because FastSync has no rsync message channel |
+| `--stderr=MODE` | Change stderr output mode | ⚠️ Partial | `errors` (default) and `all` are supported; `client` is rejected because FastSync has no rsync message channel |
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |
 | `--exclude=PATTERN` | Exclude files matching pattern | ✅ Implemented | Glob matching in scanner |
 | `--include=PATTERN` | Include files matching pattern | ✅ Implemented | Glob matching in scanner |

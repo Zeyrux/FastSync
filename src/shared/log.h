@@ -4,7 +4,7 @@
 #include <stdio.h>
 
 typedef enum { LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARNING, LOG_LEVEL_ERROR } LogLevel;
-typedef enum { LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_CLIENT } LogStderrMode;
+typedef enum { LOG_STDERR_ERRORS, LOG_STDERR_ALL } LogStderrMode;
 
 void log_message(LogLevel log_level, const char* message, ...);
 void log_perror(const char* context);

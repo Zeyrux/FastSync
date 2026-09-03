@@ -341,9 +341,9 @@ static void test_parse_args_archive() {
 }
 
 static void test_parse_args_stderr_modes() {
-  static const char* const modes[] = {"errors", "all", "client", "e", "a", "c"};
-  static const LogStderrMode expected[] = {LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_CLIENT,
-                                           LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_CLIENT};
+  static const char* const modes[] = {"errors", "all", "e", "a"};
+  static const LogStderrMode expected[] = {LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_ERRORS,
+                                           LOG_STDERR_ALL};
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
     Config* cfg = config_create();
     char option[32];
@@ -358,13 +358,18 @@ static void test_parse_args_stderr_modes() {
   log_set_stderr_mode(LOG_STDERR_ERRORS);
 }
 
-static void test_parse_args_rejects_invalid_stderr_mode() {
-  Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--stderr=invalid", "/src", "/dst"};
-  int positional_args[2];
-  int positional_count = 0;
-  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-  config_delete(cfg);
+static void test_parse_args_rejects_unsupported_stderr_modes() {
+  static const char* const modes[] = {"client", "c", "invalid"};
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+    Config* cfg = config_create();
+    char option[32];
+    snprintf(option, sizeof(option), "--stderr=%s", modes[i]);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
   log_set_stderr_mode(LOG_STDERR_ERRORS);
 }
 
@@ -390,5 +395,5 @@ void test_client_cli() {
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
   test_parse_args_stderr_modes();
-  test_parse_args_rejects_invalid_stderr_mode();
+  test_parse_args_rejects_unsupported_stderr_modes();
 }

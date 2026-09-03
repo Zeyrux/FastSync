@@ -91,10 +91,12 @@ static int set_stderr_mode(const char* value) {
     log_set_stderr_mode(LOG_STDERR_ERRORS);
   else if (strcmp(value, "all") == 0 || strcmp(value, "a") == 0)
     log_set_stderr_mode(LOG_STDERR_ALL);
-  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0)
-    log_set_stderr_mode(LOG_STDERR_CLIENT);
-  else {
-    log_message(LOG_LEVEL_ERROR, "--stderr must be errors, all, or client");
+  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--stderr=client is not supported: FastSync has no client message channel");
+    return -1;
+  } else {
+    log_message(LOG_LEVEL_ERROR, "--stderr must be errors or all");
     return -1;
   }
   return 0;
