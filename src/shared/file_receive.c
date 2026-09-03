@@ -357,7 +357,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
   void* old_data = NULL;
   if (has_old_file && old_size > 0 && old_size <= MAX_RECEIVE_FILE_SIZE && old_size <= SIZE_MAX) {
-    old_data = malloc((size_t)old_size);
+    old_data = protocol_alloc((size_t)old_size);
     if (old_data) {
       size_t got = 0;
       while (got < (size_t)old_size) {

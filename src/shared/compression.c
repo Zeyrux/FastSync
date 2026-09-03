@@ -1,6 +1,7 @@
 #include "compression.h"
 #include "data.h"
 #include "log.h"
+#include "protocol.h"
 #include <stdlib.h>
 #include <limits.h>
 #include <stdint.h>
@@ -139,7 +140,7 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
       buf_size *= 2;
       if (buf_size > hard_limit)
         buf_size = (size_t)hard_limit;
-      void* new_data = realloc(uncompressed_data->data, buf_size);
+      void* new_data = protocol_realloc(uncompressed_data->data, buf_size);
       if (!new_data) {
         log_message(LOG_LEVEL_ERROR, "Failed to grow decompression buffer");
         ZSTD_freeDCtx(dctx);

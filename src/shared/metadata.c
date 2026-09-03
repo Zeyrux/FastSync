@@ -55,7 +55,7 @@ FileMetadata* metadata_from_buf(char** buf) {
     return NULL;
   if (!present)
     return NULL;
-  FileMetadata* m = malloc(sizeof(FileMetadata));
+  FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL)
     return NULL;
   int32_t mode;
@@ -122,7 +122,7 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  FileMetadata* m = malloc(sizeof(FileMetadata));
+  FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL) {
     if (ok)
       *ok = 0;

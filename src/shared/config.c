@@ -33,6 +33,7 @@ static void config_set_defaults(Config* config) {
   config->include_count = 0;
   config->max_size = 0;
   config->min_size = 0;
+  config->max_alloc = DEFAULT_MAX_ALLOC;
   config->use_incremental = false;
   config->use_delta = false;
   config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
@@ -134,7 +135,8 @@ static bool validate_received_config(const Config* config) {
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
-         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->max_delete >= 0;
+         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->max_delete >= 0 &&
+         config->max_alloc > 0;
 }
 
 Config* config_create(void) {
@@ -218,11 +220,11 @@ void config_delete(Config* config) {
  * helper call order in config_send and config_receive unchanged when adding
  * fields. */
 static bool send_core_fields(int fd, const Config* c) {
-  return send_str(fd, c->version) && send_str(fd, c->send_directory) &&
-         send_str(fd, c->receive_root_directory) && send_int(fd, c->save_to_disk) &&
-         send_int(fd, c->use_multithreading) && send_int(fd, c->use_chunk_serialization) &&
-         send_int(fd, c->use_compression) && send_int(fd, c->use_metadata) &&
-         send_int(fd, c->compression_level) &&
+  return send_str(fd, c->version) && send_n_data(fd, &c->max_alloc, sizeof(c->max_alloc)) &&
+         send_str(fd, c->send_directory) && send_str(fd, c->receive_root_directory) &&
+         send_int(fd, c->save_to_disk) && send_int(fd, c->use_multithreading) &&
+         send_int(fd, c->use_chunk_serialization) && send_int(fd, c->use_compression) &&
+         send_int(fd, c->use_metadata) && send_int(fd, c->compression_level) &&
          send_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)) && send_int(fd, c->use_sendfile);
 }
 
@@ -258,6 +260,9 @@ static bool send_resume_options(int fd, const Config* c) {
 
 static bool receive_core_fields(int fd, Config* c) {
   int value;
+  if (!receive_n_data(fd, &c->max_alloc, sizeof(c->max_alloc)) || c->max_alloc == 0)
+    return false;
+  protocol_session_set_max_alloc(NULL, c->max_alloc);
   c->send_directory = receive_str(fd);
   c->receive_root_directory = receive_str(fd);
   if (!c->send_directory || !c->receive_root_directory)
@@ -334,6 +339,7 @@ static bool receive_resume_options(int fd, Config* c) {
 }
 
 bool config_send(int file_descriptor, const Config* config) {
+  protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
       !send_file_options(file_descriptor, config) ||
       !send_selection_options(file_descriptor, config) ||

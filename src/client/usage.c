@@ -27,6 +27,7 @@ void print_usage(void) {
   printf("  --include-from <file> Read include patterns from file\n");
   printf("  --max-size <n>      Skip files larger than n bytes\n");
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
+  printf("  --max-alloc <SIZE>  Maximum single allocation (default: 1G)\n");
   printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
   printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",

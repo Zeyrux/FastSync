@@ -18,6 +18,7 @@
 #define MAX_MANIFEST_ENTRIES (1024 * 1024)
 /* Aggregate bytes retained by one received deletion manifest. */
 #define MAX_MANIFEST_BYTES (16ULL * 1024 * 1024)
+#define DEFAULT_MAX_ALLOC (1ULL * 1024 * 1024 * 1024)
 
 typedef struct ssl_st SSL;
 
@@ -36,6 +37,7 @@ typedef struct ProtocolSession {
   long long bw_last_refill_sec;
   long bw_last_refill_nsec;
   unsigned long long total_allocated_bytes;
+  unsigned long long max_alloc;
 } ProtocolSession;
 
 typedef int Status;
@@ -65,6 +67,9 @@ void protocol_session_bind(ProtocolSession* session);
 void protocol_session_unbind(void);
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
+void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc);
+void* protocol_alloc(size_t size);
+void* protocol_realloc(void* ptr, size_t size);
 bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size);
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size);
 bool protocol_send_str(ProtocolSession* session, const char* data);

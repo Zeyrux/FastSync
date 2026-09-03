@@ -187,6 +187,21 @@ static void test_receive_str_truncated() {
   close(p[0]);
 }
 
+static void test_max_alloc_rejects_single_buffer() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+  protocol_session_set_max_alloc(&session, 4);
+  protocol_session_bind(&session);
+  char payload[8] = {0};
+  EXPECT_TRUE(write(p[1], &(size_t){sizeof(payload)}, sizeof(size_t)) == sizeof(size_t));
+  EXPECT_NULL(protocol_receive_str(&session));
+  protocol_session_unbind();
+  close(p[0]);
+  close(p[1]);
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -198,4 +213,5 @@ void test_protocol() {
   test_send_receive_status();
   test_receive_n_data_truncated();
   test_receive_str_truncated();
+  test_max_alloc_rejects_single_buffer();
 }

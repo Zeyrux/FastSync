@@ -101,6 +101,7 @@ partial, alternate, and planned behavior.
 | `--include <pattern>` | Only transfer files matching glob pattern (repeatable, whitelist) |
 | `--max-size <n>` | Skip files larger than n bytes |
 | `--min-size <n>` | Skip files smaller than n bytes |
+| `--max-alloc <SIZE>` | Maximum single allocation (binary units: B, K, M, G, T, P, E; default 1G) |
 | `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `-s`. |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
