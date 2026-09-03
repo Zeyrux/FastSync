@@ -295,6 +295,19 @@ class TestInfo:
         assert result.returncode != 0
         assert "unsupported --info flag" in result.stderr
 
+    @pytest.mark.parametrize("flags", [
+        ["--info=none", "--verbose"],
+        ["--verbose", "--info=none"],
+    ])
+    def test_info_none_suppresses_verbose_info(self, shared_server, flags):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"Info sync failed: {(result.stderr or result.stdout)[:200]}"
+        output = result.stdout + result.stderr
+        assert "[INFO]" not in output
+        assert "Transferring" not in output
+        assert "Transfer summary:" not in output
+
 
 class TestBandwidthLimit:
     def test_bwlimit_runs(self, shared_server):

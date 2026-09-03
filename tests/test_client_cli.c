@@ -336,13 +336,22 @@ static void test_parse_args_info_flags() {
 }
 
 static void test_parse_args_info_verbose_order() {
-  Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--info=copy", "--verbose", "/src", "/dst"};
+  char* argv_info_first[] = {"fastsync", "--info=none", "--verbose", "/src", "/dst"};
+  char* argv_verbose_first[] = {"fastsync", "--verbose", "--info=none", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
-  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(get_log_info_flags(), LOG_INFO_COPY);
+  Config* cfg = config_create();
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_info_first, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, 0);
+  EXPECT_EQ_INT(get_log_info_flags(), 0);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_verbose_first, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, 0);
+  EXPECT_EQ_INT(get_log_info_flags(), 0);
   config_delete(cfg);
 }
 

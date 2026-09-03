@@ -1,5 +1,6 @@
 #include "log.h"
 #include <errno.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,6 +9,7 @@
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
 static uint32_t info_flags = 0;
+static bool info_flags_explicit = false;
 static FILE* log_fp = NULL;
 
 void set_log_level(LogLevel level) {
@@ -16,6 +18,7 @@ void set_log_level(LogLevel level) {
 
 void set_log_info_flags(uint32_t flags) {
   info_flags = flags;
+  info_flags_explicit = true;
 }
 
 uint32_t get_log_info_flags(void) {
@@ -63,7 +66,8 @@ void log_message(LogLevel log_level, const char* format, ...) {
 }
 
 void log_info_message(LogInfoFlag flag, const char* format, ...) {
-  if ((info_flags & flag) == 0 && current_log_level > LOG_LEVEL_DEBUG)
+  if ((info_flags_explicit && (info_flags & flag) == 0) ||
+      (!info_flags_explicit && current_log_level > LOG_LEVEL_DEBUG))
     return;
 
   time_t now = time(NULL);
