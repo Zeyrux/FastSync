@@ -262,9 +262,7 @@ static void test_parse_args_unknown_option() {
 
 /* Parsed-but-unimplemented options must fail instead of being silently accepted. */
 static void test_parse_args_rejects_unimplemented_options() {
-  static const char* const options[] = {"-q",
-                                        "--quiet",
-                                        "--silent",
+  static const char* const options[] = {"--silent",
                                         "--queue-size",
                                         "-H",
                                         "--hard-links",
@@ -323,6 +321,21 @@ static void test_parse_args_rejects_unimplemented_options() {
   }
 }
 
+/* Test both rsync-compatible quiet spellings. */
+static void test_parse_args_quiet() {
+  static const char* const options[] = {"-q", "--quiet"};
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->quiet);
+    config_delete(cfg);
+  }
+}
+
 /* Test parse_args with --archive flag */
 static void test_parse_args_archive() {
   Config* cfg = config_create();
@@ -359,5 +372,6 @@ void test_client_cli() {
   test_parse_args_valid_compression_level();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
+  test_parse_args_quiet();
   test_parse_args_archive();
 }

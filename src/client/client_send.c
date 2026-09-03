@@ -134,17 +134,20 @@ static int send_dry_run_manifest(const Config* config) {
   Chunk* chunk;
   int file_count = 0;
   unsigned long long total_bytes = 0;
-  printf("Dry run: files to be transferred\n");
+  if (!config->quiet)
+    printf("Dry run: files to be transferred\n");
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
-      printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+      if (!config->quiet)
+        printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
       total_bytes += chunk->items[i]->data->size;
       file_count++;
     }
     chunk_destroy(chunk);
   }
   directory_scanner_destroy(scanner);
-  printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
+  if (!config->quiet)
+    printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
   return 0;
 }
 
@@ -650,7 +653,7 @@ int send_files(Config* config) {
       manifest = NULL;
       break;
     }
-    if (config->show_progress) {
+    if (config->show_progress && !config->quiet) {
       total_bytes += chunk_bytes;
       time_t now = time(NULL);
       if (now - last_progress >= 1) {
@@ -672,9 +675,9 @@ int send_files(Config* config) {
     manifest = NULL;
   }
   bool ok = finalize_transfer(client);
-  if (config->show_progress)
+  if (config->show_progress && !config->quiet)
     print_transfer_progress(total_bytes, start, "Done.\n");
-  if (config->stats) {
+  if (config->stats && !config->quiet) {
     double elapsed_total = difftime(time(NULL), start);
     double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
     fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files, total_bytes / 1048576.0,
@@ -765,7 +768,7 @@ int send_files_multithreaded(Config** config_ptr) {
 
   thrd_t progress;
   bool progress_created = false;
-  if (config->show_progress) {
+  if (config->show_progress && !config->quiet) {
     progress_created = (thrd_create(&progress, progress_thread_fn, context) == thrd_success);
     if (!progress_created) {
       log_perror("Error creating progress thread");

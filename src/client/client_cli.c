@@ -351,6 +351,9 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
     } else if (opt_is(argv[i], "-v", "--verbose")) {
       set_log_level(LOG_LEVEL_DEBUG);
+    } else if (opt_is(argv[i], "-q", "--quiet")) {
+      config->quiet = true;
+      set_log_level(LOG_LEVEL_ERROR);
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;

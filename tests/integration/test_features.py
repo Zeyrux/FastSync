@@ -35,6 +35,23 @@ class TestDryRun:
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         assert "Dry run:" in result.stdout, f"No dry run output: {result.stdout[:200]}"
 
+    def test_quiet_suppresses_dry_run_output(self):
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["-q", "-n", "--progress", "--stats"],
+        )
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
+        assert result.stdout == ""
+        assert result.stderr == ""
+
+    def test_quiet_preserves_errors(self):
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--quiet", "--server-port", "1"],
+        )
+        assert result.returncode != 0
+        assert result.stderr != ""
+
 
 class TestArchiveMode:
     def test_archive_mode(self, shared_server):
