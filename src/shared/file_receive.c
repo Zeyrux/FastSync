@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "array_list.h"
+#include "chmod.h"
 #include "compression.h"
 #include "config.h"
 #include "data.h"
@@ -103,8 +104,16 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     }
   }
 
-  bool ok = file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
-                                file->metadata);
+  FileMetadata adjusted_metadata;
+  const FileMetadata* metadata = file->metadata;
+  if (metadata && config && config->chmod_spec && *config->chmod_spec) {
+    adjusted_metadata = *metadata;
+    if (!chmod_apply(adjusted_metadata.mode, config->chmod_spec, &adjusted_metadata.mode))
+      goto fail;
+    metadata = &adjusted_metadata;
+  }
+  bool ok =
+      file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse, metadata);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

@@ -38,6 +38,7 @@ void print_usage(void) {
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -M, --preserve      Preserve file metadata\n");
+  printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");

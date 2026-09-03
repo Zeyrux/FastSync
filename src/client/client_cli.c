@@ -1,5 +1,6 @@
 #include "client_send.h"
 #include "client_validation.h"
+#include "chmod.h"
 #include "config.h"
 #include "delta.h"
 #include "log.h"
@@ -153,6 +154,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
     {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
+    {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -220,9 +222,29 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         }
         if (apply_table_option(config, entry, argv[++i]) != 0)
           return -1;
+        if (entry->offset == offsetof(Config, chmod_spec)) {
+          mode_t ignored;
+          if (!chmod_apply(0, config->chmod_spec, &ignored)) {
+            log_message(LOG_LEVEL_ERROR, "--chmod has invalid permission changes");
+            return -1;
+          }
+          config->use_metadata = true;
+        }
       } else if (apply_table_option(config, entry, NULL) != 0) {
         return -1;
       }
+      continue;
+    }
+
+    if (strncmp(argv[i], "--chmod=", 8) == 0) {
+      if (set_string_option(&config->chmod_spec, argv[i] + 8, "--chmod") != 0)
+        return -1;
+      mode_t ignored;
+      if (!chmod_apply(0, config->chmod_spec, &ignored)) {
+        log_message(LOG_LEVEL_ERROR, "--chmod has invalid permission changes");
+        return -1;
+      }
+      config->use_metadata = true;
       continue;
     }
 

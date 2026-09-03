@@ -52,6 +52,22 @@ class TestArchiveMode:
         assert not mismatches, f"Mismatch: {mismatches}"
 
 
+class TestChmod:
+    def test_chmod_applies_to_transferred_files(self, shared_server):
+        clean_dir(DEST_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")
+        os.chmod(source_file, 0o777)
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--chmod=u=rw,go=r"],
+            port=shared_server.port,
+        )
+        if result.returncode != 0:
+            pytest.fail(f"Exit {result.returncode}: {(result.stderr or result.stdout)[:200]}")
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert (os.stat(os.path.join(received, "small.txt")).st_mode & 0o777) == 0o644
+
+
 class TestExclude:
     def test_exclude_single(self, shared_server):
         clean_dir(DEST_DIR)

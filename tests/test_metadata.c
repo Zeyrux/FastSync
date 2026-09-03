@@ -1,4 +1,5 @@
 #include "test_metadata.h"
+#include "chmod.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -144,6 +145,18 @@ static void test_file_restore_metadata() {
   unlink(path);
 }
 
+static void test_chmod_changes() {
+  mode_t result;
+  EXPECT_TRUE(chmod_apply(0777, "u=rw,go=r", &result));
+  EXPECT_EQ_INT(result, 0644);
+  EXPECT_TRUE(chmod_apply(0644, "a+x", &result));
+  EXPECT_EQ_INT(result, 0755);
+  EXPECT_TRUE(chmod_apply(0777, "755", &result));
+  EXPECT_EQ_INT(result, 0755);
+  EXPECT_FALSE(chmod_apply(0777, "a+X", &result));
+  EXPECT_FALSE(chmod_apply(0777, "a+r,", &result));
+}
+
 void test_metadata() {
   test_metadata_to_from_buf_roundtrip();
   test_metadata_to_buf_null();
@@ -152,4 +165,5 @@ void test_metadata() {
   test_metadata_send_null();
   test_metadata_rejects_invalid_values();
   test_file_restore_metadata();
+  test_chmod_changes();
 }
