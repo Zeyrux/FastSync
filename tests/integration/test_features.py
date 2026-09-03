@@ -213,6 +213,27 @@ class TestIncremental:
         with open(received_file, "rb") as f:
             assert f.read() == b"hello world\n"
 
+    def test_modify_window_allows_subsecond_mtime_difference(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")
+        received_file = os.path.join(received, "small.txt")
+        source_stat = os.stat(source_file)
+        with open(received_file, "wb") as f:
+            f.write(b"modified!!!\n")
+        os.utime(received_file, ns=(source_stat.st_atime_ns,
+                                    source_stat.st_mtime_ns - 1500000000))
+
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "--incremental", "--modify-window=2"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Modify-window sync failed: {result.stderr[:200]}"
+        with open(received_file, "rb") as f:
+            assert f.read() == b"modified!!!\n"
+
 
 class TestDelete:
     def test_delete_removes_extra_files(self, shared_server):

@@ -35,6 +35,7 @@ typedef struct Config {
   unsigned long long min_size;
   bool use_incremental;
   bool use_delta;
+  int modify_window;
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;
   bool use_tls;
@@ -128,7 +129,7 @@ typedef struct Config {
   char* compress_choice;
 } Config;
 
-#define PROTOCOL_VERSION "2.2.0"
+#define PROTOCOL_VERSION "2.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

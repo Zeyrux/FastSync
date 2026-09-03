@@ -24,6 +24,23 @@ typedef char static_assert_mode_t_fits[(sizeof(mode_t) <= sizeof(int32_t)) ? 1 :
 typedef char static_assert_uid_t_fits[(sizeof(uid_t) <= sizeof(int32_t)) ? 1 : -1];
 typedef char static_assert_gid_t_fits[(sizeof(gid_t) <= sizeof(int32_t)) ? 1 : -1];
 
+bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, long right_nsec,
+                            int modify_window) {
+  int64_t left = (int64_t)left_sec;
+  int64_t right = (int64_t)right_sec;
+  int64_t seconds;
+  int64_t nanoseconds;
+
+  if (left > right || (left == right && left_nsec >= right_nsec)) {
+    seconds = left - right;
+    nanoseconds = (int64_t)left_nsec - (int64_t)right_nsec;
+  } else {
+    seconds = right - left;
+    nanoseconds = (int64_t)right_nsec - (int64_t)left_nsec;
+  }
+  return seconds < modify_window || (seconds == modify_window && nanoseconds == 0);
+}
+
 void metadata_to_buf(char** buf, const FileMetadata* m) {
   int32_t present = (m != NULL) ? 1 : 0;
   memcpy(*buf, &present, sizeof(present));

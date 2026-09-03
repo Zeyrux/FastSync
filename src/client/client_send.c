@@ -172,9 +172,12 @@ static int incremental_check(Client* client, File* file, const Config* config,
     return -1;
   unsigned long long fsize = file->data->size;
   long long mtime = file->metadata ? file->metadata->mtime_sec : 0;
+  long long mtime_nsec = file->metadata ? file->metadata->mtime_nsec : 0;
   if (!send_n_data(client->file_descriptor, &fsize, sizeof(fsize)))
     return -1;
   if (!send_n_data(client->file_descriptor, &mtime, sizeof(mtime)))
+    return -1;
+  if (!send_n_data(client->file_descriptor, &mtime_nsec, sizeof(mtime_nsec)))
     return -1;
   if (config->checksum) {
     uint64_t checksum;

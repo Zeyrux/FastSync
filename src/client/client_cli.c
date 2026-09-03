@@ -139,6 +139,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
     {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
     {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
+    {"--modify-window", "-@", OPT_NONNEG_INT, offsetof(Config, modify_window)},
     {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
     {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
@@ -211,6 +212,18 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   for (int i = 1; i < argc; i++) {
+    const char* modify_window_prefix = "--modify-window=";
+    if (strncmp(argv[i], modify_window_prefix, strlen(modify_window_prefix)) == 0) {
+      if (set_nonneg_int_option(&config->modify_window, argv[i] + strlen(modify_window_prefix),
+                                "--modify-window") != 0)
+        return -1;
+      continue;
+    }
+    if (strncmp(argv[i], "-@", 2) == 0 && argv[i][2] != '\0') {
+      if (set_nonneg_int_option(&config->modify_window, argv[i] + 2, "-@") != 0)
+        return -1;
+      continue;
+    }
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
       if (entry->kind != OPT_FLAG) {

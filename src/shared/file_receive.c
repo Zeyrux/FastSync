@@ -314,10 +314,17 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 
   unsigned long long check_size;
   long long check_mtime;
+  long long check_mtime_nsec;
   uint64_t check_checksum = 0;
   if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
       !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
     free(check_path);
+    return NULL;
+  }
+  if (!receive_n_data(fd, &check_mtime_nsec, sizeof(check_mtime_nsec)) || check_mtime_nsec < 0 ||
+      check_mtime_nsec >= 1000000000LL) {
+    free(check_path);
+    send_status(fd, STATUS_ERROR);
     return NULL;
   }
   if (config->checksum && !receive_n_data(fd, &check_checksum, sizeof(check_checksum))) {
@@ -384,7 +391,12 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     free(old_data);
     old_data = NULL;
   } else if (match) {
-    match = (long long)st.st_mtime == check_mtime;
+    long long old_mtime_nsec = 0;
+#ifdef __linux__
+    old_mtime_nsec = st.st_mtim.tv_nsec;
+#endif
+    match = metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
+                                   (long)check_mtime_nsec, config->modify_window);
   }
 
   if (match) {

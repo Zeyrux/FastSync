@@ -122,6 +122,14 @@ static void test_metadata_rejects_invalid_values() {
   close(p[1]);
 }
 
+static void test_metadata_mtime_window() {
+  EXPECT_TRUE(metadata_mtime_matches(100, 100000000, 101, 600000000, 2));
+  EXPECT_FALSE(metadata_mtime_matches(100, 100000000, 102, 600000000, 2));
+  EXPECT_TRUE(metadata_mtime_matches(100, 100000000, 102, 100000000, 2));
+  EXPECT_FALSE(metadata_mtime_matches(100, 100000000, 100, 100000001, 0));
+  EXPECT_TRUE(metadata_mtime_matches(100, 100000000, 100, 100000000, 0));
+}
+
 static void test_file_restore_metadata() {
   const char* path = "temp_meta_restore_test.txt";
   const char* content = "test content";
@@ -151,5 +159,6 @@ void test_metadata() {
   test_metadata_send_receive_roundtrip();
   test_metadata_send_null();
   test_metadata_rejects_invalid_values();
+  test_metadata_mtime_window();
   test_file_restore_metadata();
 }

@@ -2,6 +2,7 @@
 #include "chunk.h"
 #include "file.h"
 #include "log.h"
+#include "metadata.h"
 #include "multiprocessing.h"
 #include "queue.h"
 #include "receiver.h"
@@ -161,6 +162,13 @@ int receive_files(Config* config, int fd) {
           free(check_path);
           return -1;
         }
+        long long check_mtime_nsec;
+        if (!receive_n_data(fd, &check_mtime_nsec, sizeof(check_mtime_nsec)) ||
+            check_mtime_nsec < 0 || check_mtime_nsec >= 1000000000LL) {
+          free(check_path);
+          send_status(fd, STATUS_ERROR);
+          return -1;
+        }
         if (!utils_valid_batch_path(check_path)) {
           free(check_path);
           send_status(fd, STATUS_ERROR);
@@ -174,8 +182,13 @@ int receive_files(Config* config, int fd) {
           return -1;
         }
         bool has_old = full_path && file_stat_secure(full_path, &st);
+        long long old_mtime_nsec = 0;
+#ifdef __linux__
+        old_mtime_nsec = st.st_mtim.tv_nsec;
+#endif
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
-                     (long long)st.st_mtime == check_mtime;
+                     metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
+                                            (long)check_mtime_nsec, config->modify_window);
         bool sent = send_status(fd, match ? STATUS_OK : STATUS_NEXT);
         free(full_path);
         free(check_path);
