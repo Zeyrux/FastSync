@@ -25,7 +25,9 @@ typedef struct {
   bool loader_done;
   ArrayList* manifest;
   mtx_t mutex_progress;
+  int total_files;
   unsigned long long progress_bytes;
+  unsigned long long total_bytes;
   bool sender_done;
   atomic_bool cancelled;
 } PipelineContextSender;

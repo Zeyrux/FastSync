@@ -23,7 +23,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-q`, `--quiet` | Suppress non-error messages | ❌ Not Implemented | Removed because it had no effect |
 | `--help` | Show help | ✅ Implemented | Prints usage and exits; `-h` is not accepted |
 | `-V`, `--version` | Print version | ✅ Implemented | |
-| `--info=FLAGS` | Fine-grained info verbosity | ✅ Implemented | Supports comma-separated rsync info names and `all`/`none` |
+| `--info=FLAGS` | Fine-grained info verbosity | ✅ Implemented | Supports `copy`, `misc`, `skip`, `stats`, and `none`; unsupported names are rejected |
 | `--debug=FLAGS` | Fine-grained debug verbosity | ❌ Not Implemented | Removed because it had no effect |
 | `--stderr=MODE` | Change stderr output mode | ❌ Not Implemented | |
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |

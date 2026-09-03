@@ -335,6 +335,17 @@ static void test_parse_args_info_flags() {
   config_delete(cfg);
 }
 
+static void test_parse_args_info_verbose_order() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=copy", "--verbose", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(get_log_info_flags(), LOG_INFO_COPY);
+  config_delete(cfg);
+}
+
 static void test_parse_args_rejects_invalid_info_flag() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--info=copy,unknown", "/src", "/dst"};
@@ -382,6 +393,7 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_info_flags();
+  test_parse_args_info_verbose_order();
   test_parse_args_rejects_invalid_info_flag();
   test_parse_args_archive();
 }

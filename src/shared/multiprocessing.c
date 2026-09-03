@@ -26,7 +26,9 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scanner_done = false;
   context->loader_done = false;
   context->manifest = NULL;
+  context->total_files = 0;
   context->progress_bytes = 0;
+  context->total_bytes = 0;
   context->sender_done = false;
   atomic_init(&context->cancelled, false);
   int init = 0;

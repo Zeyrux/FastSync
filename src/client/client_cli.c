@@ -115,30 +115,14 @@ static int parse_info_flags(const char* value, Config* config) {
     }
     if (strcmp(token, "copy") == 0)
       flag = LOG_INFO_COPY;
-    else if (strcmp(token, "del") == 0)
-      flag = LOG_INFO_DEL;
-    else if (strcmp(token, "flist") == 0)
-      flag = LOG_INFO_FLIST;
     else if (strcmp(token, "misc") == 0)
       flag = LOG_INFO_MISC;
-    else if (strcmp(token, "mount") == 0)
-      flag = LOG_INFO_MOUNT;
-    else if (strcmp(token, "name") == 0)
-      flag = LOG_INFO_NAME;
-    else if (strcmp(token, "nonreg") == 0)
-      flag = LOG_INFO_NONREG;
-    else if (strcmp(token, "progress") == 0)
-      flag = LOG_INFO_PROGRESS;
     else if (strcmp(token, "skip") == 0)
       flag = LOG_INFO_SKIP;
     else if (strcmp(token, "stats") == 0)
       flag = LOG_INFO_STATS;
-    else if (strcmp(token, "symsafe") == 0)
-      flag = LOG_INFO_SYMSAFE;
-    else if (strcmp(token, "backup") == 0)
-      flag = LOG_INFO_BACKUP;
     else {
-      log_message(LOG_LEVEL_ERROR, "unknown --info flag: %s", token);
+      log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
       free(flags);
       return -1;
     }
@@ -147,7 +131,6 @@ static int parse_info_flags(const char* value, Config* config) {
   free(flags);
   config->info_level = (int)parsed;
   set_log_info_flags(parsed);
-  set_log_level(LOG_LEVEL_INFO);
   return 0;
 }
 
@@ -273,6 +256,19 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
+  /* Apply output controls before processing other options so their order is irrelevant. */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+      set_log_level(LOG_LEVEL_DEBUG);
+    } else if (strncmp(argv[i], "--info=", 7) == 0) {
+      if (parse_info_flags(argv[i] + 7, config) != 0)
+        return -1;
+    } else if (strcmp(argv[i], "--info") == 0) {
+      if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
+        return -1;
+    }
+  }
+
   for (int i = 1; i < argc; i++) {
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
