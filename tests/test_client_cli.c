@@ -260,6 +260,22 @@ static void test_parse_args_unknown_option() {
   config_delete(cfg);
 }
 
+/* --del is recognized as the rsync alias, but its timing mode is not implemented. */
+static void test_parse_args_delete_during_alias_unimplemented() {
+  static const char* const options[] = {"--del", "--delete-during"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    EXPECT_FALSE(cfg->use_delete);
+    config_delete(cfg);
+  }
+}
+
 /* Parsed-but-unimplemented options must fail instead of being silently accepted. */
 static void test_parse_args_rejects_unimplemented_options() {
   static const char* const options[] = {"-q",
@@ -358,6 +374,7 @@ void test_client_cli() {
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
   test_parse_args_unknown_option();
+  test_parse_args_delete_during_alias_unimplemented();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
 }

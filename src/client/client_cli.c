@@ -361,6 +361,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
         return -1;
       }
+    } else if (opt_is(argv[i], "--del", NULL)) {
+      fprintf(stderr, "--del is an alias for --delete-during, which is not implemented\n");
+      return -1;
+    } else if (opt_is(argv[i], "--delete-during", NULL)) {
+      fprintf(stderr, "--delete-during is not implemented\n");
+      return -1;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       print_usage();
