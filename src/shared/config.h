@@ -35,6 +35,7 @@ typedef struct Config {
   unsigned long long min_size;
   bool use_incremental;
   bool use_delta;
+  bool whole_file;
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;
   bool use_tls;

@@ -29,6 +29,7 @@ void print_usage(void) {
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
+  printf("  -W, --whole-file    Transfer changed files without delta processing\n");
   printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
          DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",

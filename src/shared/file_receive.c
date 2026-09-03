@@ -400,7 +400,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
-  bool try_delta = config->use_delta && has_old_file && old_data != NULL &&
+  bool try_delta = config->use_delta && !config->whole_file && has_old_file && old_data != NULL &&
                    delta_should_attempt(old_size, check_size, config->delta_max_file_size);
 
   if (try_delta) {

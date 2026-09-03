@@ -339,6 +339,26 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+/* Test both whole-file spellings and its precedence over delta selection. */
+static void test_parse_args_whole_file() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delta", "--incremental", "-W", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->whole_file);
+  EXPECT_TRUE(cfg->use_delta);
+
+  config_delete(cfg);
+  cfg = config_create();
+  char* long_argv[] = {"fastsync", "--whole-file", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, long_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->whole_file);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -360,4 +380,5 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
+  test_parse_args_whole_file();
 }
