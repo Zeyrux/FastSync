@@ -425,6 +425,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
 
   if (!try_delta) {
+    free(old_data);
+    old_data = NULL;
     if (!send_status(fd, STATUS_NEXT)) {
       free(full_path);
       free(check_path);
