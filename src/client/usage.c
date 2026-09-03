@@ -35,6 +35,7 @@ void print_usage(void) {
          DELTA_MAX_FILE_SIZE);
   printf("  -m                  Enable multithreading\n");
   printf("  -s                  Enable chunk serialization\n");
+  printf("  --secluded-args    Send transfer arguments through the protocol (SSH)\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -M, --preserve      Preserve file metadata\n");

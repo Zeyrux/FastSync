@@ -146,6 +146,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
     {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
+    {"--secluded-args", NULL, OPT_FLAG, offsetof(Config, use_secluded_args)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
     {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
     {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},

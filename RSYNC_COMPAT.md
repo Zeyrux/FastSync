@@ -233,7 +233,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--protocol=NUM` | Force older protocol version | ❌ Not Implemented | |
 | `--iconv=CONVERT_SPEC` | Charset conversion | ❌ Not Implemented | |
 | `--checksum-seed=NUM` | Set checksum seed | ❌ Not Implemented | |
-| `-s`, `--secluded-args` | Use protocol to send args | ❌ Not Implemented | |
+| `--secluded-args` | Use protocol to send args | ✅ Implemented | SSH already sends transfer configuration through FastSync's protocol; `-s` remains chunk serialization because of the existing FastSync short-option meaning. |
 | `--no-OPTION` | Turn off implied option | ❌ Not Implemented | |
 
 ---

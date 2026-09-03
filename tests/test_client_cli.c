@@ -339,6 +339,31 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+/* --secluded-args is the rsync-compatible long form; -s keeps its FastSync meaning. */
+static void test_parse_args_secluded_args() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--secluded-args", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_secluded_args);
+  EXPECT_FALSE(cfg->use_chunk_serialization);
+  config_delete(cfg);
+}
+
+static void test_parse_args_short_s_remains_chunk_serialization() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-s", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_chunk_serialization);
+  EXPECT_FALSE(cfg->use_secluded_args);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -360,4 +385,6 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
+  test_parse_args_secluded_args();
+  test_parse_args_short_s_remains_chunk_serialization();
 }
