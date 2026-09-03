@@ -214,6 +214,40 @@ class TestIncremental:
             assert f.read() == b"hello world\n"
 
 
+class TestUpdate:
+    def test_update_skips_older_destination_and_allows_equal_or_newer_source(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")
+        received_file = os.path.join(received, "small.txt")
+        source_stat = os.stat(source_file)
+
+        with open(received_file, "wb") as f:
+            f.write(b"newer destination\n")
+        os.utime(received_file, (source_stat.st_mtime + 10, source_stat.st_mtime + 10))
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
+        assert result.returncode == 0
+        with open(received_file, "rb") as f:
+            assert f.read() == b"newer destination\n"
+
+        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
+        assert result.returncode == 0
+        with open(received_file, "rb") as f:
+            assert f.read() == b"hello world\n"
+
+        with open(received_file, "wb") as f:
+            f.write(b"older destination\n")
+        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime - 10))
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
+        assert result.returncode == 0
+        with open(received_file, "rb") as f:
+            assert f.read() == b"hello world\n"
+
+
 class TestDelete:
     def test_delete_removes_extra_files(self, shared_server):
         clean_dir(DEST_DIR)
