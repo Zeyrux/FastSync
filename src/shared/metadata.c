@@ -38,6 +38,10 @@ bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, l
     seconds = right - left;
     nanoseconds = (int64_t)right_nsec - (int64_t)left_nsec;
   }
+  if (nanoseconds < 0) {
+    seconds--;
+    nanoseconds += 1000000000LL;
+  }
   return seconds < modify_window || (seconds == modify_window && nanoseconds == 0);
 }
 

@@ -182,11 +182,40 @@ static void test_receive_manifest_rejects_traversal() {
   config_delete(cfg);
 }
 
+static void test_receive_incremental_check_rejects_invalid_nanoseconds() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  EXPECT_TRUE(send_str(p[1], "file.txt"));
+  unsigned long long size = 0;
+  long long mtime = 100;
+  long long mtime_nsec = 1000000000LL;
+  EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+  EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+  EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+
+  bool skipped = false;
+  EXPECT_NULL(receive_incremental_check(p[0], cfg, &skipped));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
+  EXPECT_FALSE(skipped);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
 void test_server() {
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
     test_receive_files_single_file();
     test_receive_files_abort();
     test_receive_manifest_rejects_traversal();
+    test_receive_incremental_check_rejects_invalid_nanoseconds();
   }
 }

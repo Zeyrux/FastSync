@@ -183,9 +183,11 @@ int receive_files(Config* config, int fd) {
         }
         bool has_old = full_path && file_stat_secure(full_path, &st);
         long long old_mtime_nsec = 0;
+        if (has_old) {
 #ifdef __linux__
-        old_mtime_nsec = st.st_mtim.tv_nsec;
+          old_mtime_nsec = st.st_mtim.tv_nsec;
 #endif
+        }
         bool match = has_old && (unsigned long long)st.st_size == check_size &&
                      metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
                                             (long)check_mtime_nsec, config->modify_window);
