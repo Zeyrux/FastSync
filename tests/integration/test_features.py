@@ -227,21 +227,42 @@ class TestUpdate:
 
         with open(received_file, "wb") as f:
             f.write(b"newer destination\n")
-        os.utime(received_file, (source_stat.st_mtime + 10, source_stat.st_mtime + 10))
+        os.utime(received_file, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 10_000_000_000))
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
         assert result.returncode == 0
         with open(received_file, "rb") as f:
             assert f.read() == b"newer destination\n"
 
-        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
+        os.utime(received_file, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
         assert result.returncode == 0
         with open(received_file, "rb") as f:
             assert f.read() == b"hello world\n"
 
+    def test_update_skips_unreadable_newer_destination(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received_file = os.path.join(get_dest_received_dir(DEST_DIR, SOURCE_DIR), "small.txt")
+        source_stat = os.stat(os.path.join(SOURCE_DIR, "small.txt"))
+        with open(received_file, "wb") as f:
+            f.write(b"protected destination\n")
+        os.utime(received_file, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns + 10_000_000_000))
+        original_mode = os.stat(received_file).st_mode
+        try:
+            os.chmod(received_file, 0)
+            result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
+            assert result.returncode == 0
+            os.chmod(received_file, original_mode)
+            with open(received_file, "rb") as f:
+                assert f.read() == b"protected destination\n"
+        finally:
+            os.chmod(received_file, original_mode)
+
         with open(received_file, "wb") as f:
             f.write(b"older destination\n")
-        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime - 10))
+        os.utime(received_file, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns - 10_000_000_000))
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
         assert result.returncode == 0
         with open(received_file, "rb") as f:

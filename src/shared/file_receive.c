@@ -21,17 +21,6 @@
 #define MAX_SERVER_DELETE_COUNT 100000U
 #define MAX_FILE_DATA_SIZE MAX_RECEIVE_FILE_SIZE
 
-static bool destination_is_newer(const char* path, const FileMetadata* source_metadata) {
-  struct stat destination_stat;
-  if (!source_metadata || !file_stat_secure(path, &destination_stat))
-    return false;
-  time_t destination_sec = destination_stat.st_mtim.tv_sec;
-  long destination_nsec = destination_stat.st_mtim.tv_nsec;
-  return destination_sec > source_metadata->mtime_sec ||
-         (destination_sec == source_metadata->mtime_sec &&
-          destination_nsec > source_metadata->mtime_nsec);
-}
-
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
   bool backup_enabled = config && config->backup;
   bool inplace = config && config->inplace;
@@ -72,8 +61,9 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     return false;
   }
 
-  /* --update is receiver-side policy: never replace a newer destination. */
-  if (config && config->update && destination_is_newer(disk_path, file->metadata)) {
+  /* --update is receiver-side policy: never replace a newer destination.
+     The secure stat does not require read permission on the destination. */
+  if (config && config->update && file_destination_is_newer_secure(disk_path, file->metadata)) {
     free(confined_backup);
     free(confined_partial);
     free(disk_path);
@@ -110,8 +100,11 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     }
   }
 
-  bool ok = file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
-                                file->metadata);
+  bool ok = config && config->update
+                ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
+                                             sparse, file->metadata)
+                : file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace,
+                                      sparse, file->metadata);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);
