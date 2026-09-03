@@ -234,7 +234,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--iconv=CONVERT_SPEC` | Charset conversion | ❌ Not Implemented | |
 | `--checksum-seed=NUM` | Set checksum seed | ❌ Not Implemented | |
 | `-s`, `--secluded-args` | Use protocol to send args | ❌ Not Implemented | |
-| `--no-OPTION` | Turn off implied option | ❌ Not Implemented | |
+| `--no-OPTION` | Turn off implied option | ✅ Supported | Supported boolean FastSync options and archive-implied options; unsafe or value-taking options are rejected. |
 
 ---
 
