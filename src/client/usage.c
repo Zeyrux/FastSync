@@ -69,6 +69,7 @@ void print_usage(void) {
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
+  printf("  --skip-compress=LIST    Skip compression for comma-separated suffixes\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");
 }

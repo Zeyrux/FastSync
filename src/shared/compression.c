@@ -11,17 +11,27 @@
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
 #define MAX_DECOMPRESSED_SIZE (100ULL * 1024 * 1024) /* 100 MB hard ceiling */
 
-static const char* SKIP_COMPRESSION_EXTENSIONS[] = {".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mkv",
-                                                    ".zip", ".gz",   ".xz",  ".zst", NULL};
+static char* SKIP_COMPRESSION_EXTENSIONS[] = {".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mkv",
+                                              ".zip", ".gz",   ".xz",  ".zst", NULL};
 
 bool compression_should_skip(const char* path) {
+  return compression_should_skip_with_suffixes(path, NULL, -1);
+}
+
+bool compression_should_skip_with_suffixes(const char* path, char* const* suffixes, int count) {
   if (!path)
     return false;
   const char* dot = strrchr(path, '.');
   if (!dot)
     return false;
-  for (int i = 0; SKIP_COMPRESSION_EXTENSIONS[i]; i++) {
-    if (strcasecmp(dot, SKIP_COMPRESSION_EXTENSIONS[i]) == 0)
+  if (count < 0) {
+    suffixes = SKIP_COMPRESSION_EXTENSIONS;
+    count = 0;
+    while (SKIP_COMPRESSION_EXTENSIONS[count])
+      count++;
+  }
+  for (int i = 0; i < count; i++) {
+    if (strcasecmp(dot, suffixes[i]) == 0)
       return true;
   }
   return false;

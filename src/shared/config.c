@@ -98,6 +98,9 @@ static void config_set_defaults(Config* config) {
   config->server_mode = false;
   config->checksum = false;
   config->compress_choice = NULL;
+  config->skip_compress_suffixes = NULL;
+  config->skip_compress_count = 0;
+  config->skip_compress_set = false;
 }
 
 static bool valid_wire_bool(int value) {
@@ -134,7 +137,8 @@ static bool validate_received_config(const Config* config) {
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
-         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->max_delete >= 0;
+         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->max_delete >= 0 &&
+         config->skip_compress_count >= 0 && config->skip_compress_count <= 10000;
 }
 
 Config* config_create(void) {
@@ -208,6 +212,9 @@ void config_delete(Config* config) {
   free(config->bind_address);
   free(config->daemon_config);
   free(config->compress_choice);
+  for (int i = 0; i < config->skip_compress_count; i++)
+    free(config->skip_compress_suffixes[i]);
+  free(config->skip_compress_suffixes);
   if (config->filters) {
     array_list_delete(config->filters);
   }
@@ -249,11 +256,22 @@ static bool send_selection_options(int fd, const Config* c) {
          send_int(fd, c->relative) && send_int(fd, c->prune_empty_dirs);
 }
 
+static bool send_skip_compress_options(int fd, const Config* c) {
+  if (!send_int(fd, c->skip_compress_set) || !send_int(fd, c->skip_compress_count))
+    return false;
+  for (int i = 0; i < c->skip_compress_count; i++) {
+    if (!send_str(fd, c->skip_compress_suffixes[i]))
+      return false;
+  }
+  return true;
+}
+
 static bool send_resume_options(int fd, const Config* c) {
   return send_str(fd, c->temp_dir ? c->temp_dir : "") && send_int(fd, c->partial) &&
          send_str(fd, c->partial_dir ? c->partial_dir : "") &&
          send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
-         send_int(fd, c->checksum) && send_str(fd, c->compress_choice ? c->compress_choice : "");
+         send_int(fd, c->checksum) && send_str(fd, c->compress_choice ? c->compress_choice : "") &&
+         send_skip_compress_options(fd, c);
 }
 
 static bool receive_core_fields(int fd, Config* c) {
@@ -330,7 +348,21 @@ static bool receive_resume_options(int fd, Config* c) {
   if (!receive_wire_bool(fd, &c->checksum))
     return false;
   c->compress_choice = receive_str(fd);
-  return c->compress_choice != NULL;
+  if (!c->compress_choice || !receive_wire_bool(fd, &c->skip_compress_set) ||
+      !receive_int(fd, &c->skip_compress_count) || c->skip_compress_count < 0 ||
+      c->skip_compress_count > 10000)
+    return false;
+  if (c->skip_compress_count > 0) {
+    c->skip_compress_suffixes = calloc((size_t)c->skip_compress_count, sizeof(char*));
+    if (!c->skip_compress_suffixes)
+      return false;
+    for (int i = 0; i < c->skip_compress_count; i++) {
+      c->skip_compress_suffixes[i] = receive_str(fd);
+      if (!c->skip_compress_suffixes[i])
+        return false;
+    }
+  }
+  return true;
 }
 
 bool config_send(int file_descriptor, const Config* config) {

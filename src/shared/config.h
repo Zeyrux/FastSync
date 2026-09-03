@@ -126,6 +126,10 @@ typedef struct Config {
 
   // PR #184: Compression algorithm negotiation
   char* compress_choice;
+
+  char** skip_compress_suffixes;
+  int skip_compress_count;
+  bool skip_compress_set;
 } Config;
 
 #define PROTOCOL_VERSION "2.2.0"

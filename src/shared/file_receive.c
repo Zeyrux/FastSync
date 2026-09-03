@@ -169,7 +169,10 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     }
 
     Data* raw_delta = delta_data;
-    if (config->use_compression) {
+    if (config->use_compression &&
+        !compression_should_skip_with_suffixes(
+            check_path, config->skip_compress_suffixes,
+            config->skip_compress_set ? config->skip_compress_count : -1)) {
       raw_delta = data_decompress_limited(delta_data, MAX_RECEIVE_FILE_SIZE);
       data_destroy(delta_data);
       if (!raw_delta) {
@@ -272,7 +275,10 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       return NULL;
     }
 
-    if (config->use_compression) {
+    if (config->use_compression &&
+        !compression_should_skip_with_suffixes(
+            file->path, config->skip_compress_suffixes,
+            config->skip_compress_set ? config->skip_compress_count : -1)) {
       Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
       data_destroy(file_data);
       if (uncompressed == NULL) {
@@ -500,7 +506,10 @@ File* file_receive(const Config* config, int file_descriptor) {
     file_destroy(file);
     return NULL;
   }
-  if (config->use_compression && !compression_should_skip(file->path)) {
+  if (config->use_compression &&
+      !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
+                                             config->skip_compress_set ? config->skip_compress_count
+                                                                       : -1)) {
     Data* file_data_uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
     data_destroy(file_data);
     if (file_data_uncompressed == NULL) {

@@ -247,6 +247,32 @@ static void test_parse_args_valid_compression_level() {
   config_delete(cfg);
 }
 
+static void test_parse_args_skip_compress() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--skip-compress=.ZIP, .GZ", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->skip_compress_set);
+  EXPECT_EQ_INT(cfg->skip_compress_count, 2);
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[0], ".ZIP");
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[1], ".GZ");
+  config_delete(cfg);
+}
+
+static void test_parse_args_empty_skip_compress() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--skip-compress=", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->skip_compress_set);
+  EXPECT_EQ_INT(cfg->skip_compress_count, 0);
+  config_delete(cfg);
+}
+
 /* Test parse_args unknown option returns error */
 static void test_parse_args_unknown_option() {
   Config* cfg = config_create();
@@ -357,6 +383,8 @@ void test_client_cli() {
   test_parse_args_invalid_server_port();
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
+  test_parse_args_skip_compress();
+  test_parse_args_empty_skip_compress();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();

@@ -174,7 +174,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--compress-choice=STR` | Choose compression algorithm | ❌ Not Implemented | Removed because it had no effect; FastSync always uses zstd |
 | `--compress-level=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
-| `--skip-compress=LIST` | Skip compress for suffixes | ❌ Not Implemented | Internal skip for hardcoded types; not user-configurable |
+| `--skip-compress=LIST` | Skip compress for suffixes | ✅ Implemented | Comma-separated, case-insensitive suffix list; empty list skips none |
 
 ## 13. Connectivity
 

@@ -234,7 +234,9 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
     return send_status(client->file_descriptor, STATUS_NEXT) ? 1 : -1;
 
   Data* to_send = delta_data;
-  if (config->use_compression) {
+  int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+  if (config->use_compression && !compression_should_skip_with_suffixes(
+                                     file->path, config->skip_compress_suffixes, skip_count)) {
     to_send = data_compress(delta_data, config->compression_level);
     data_destroy(delta_data);
     if (!to_send)
@@ -251,20 +253,23 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
   return ok ? 0 : -1;
 }
 
-typedef bool (*file_send_fn)(File*, int, bool, int, bool);
-
 // Send a single file directly (non-incremental path).
-static bool send_file_direct(File* file, int fd, bool use_metadata, int compression_level) {
+static bool send_file_direct(File* file, int fd, bool use_metadata, int compression_level,
+                             const Config* config) {
   if (!send_status(fd, STATUS_NEXT))
     return false;
-  return file_send_single_calls(file, fd, use_metadata, compression_level, true);
+  int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+  return file_send_single_calls_with_skip(file, fd, use_metadata, compression_level, true,
+                                          config->skip_compress_suffixes, skip_count);
 }
 
 // Send a single file directly via sendfile (non-incremental path).
-static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata) {
+static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata, const Config* config) {
   if (!send_status(fd, STATUS_NEXT))
     return false;
-  return file_send_sendfile(file, fd, use_metadata, 0, true);
+  int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+  return file_send_sendfile_with_skip(file, fd, use_metadata, 0, true,
+                                      config->skip_compress_suffixes, skip_count);
 }
 
 // Process one file in a chunk: either via incremental check or direct send.
@@ -275,10 +280,12 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
 
   if (!use_incremental) {
     if (use_sendfile) {
-      return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata) ? 0
-                                                                                            : -1;
+      return send_file_direct_sendfile(file, client->file_descriptor, config->use_metadata, config)
+                 ? 0
+                 : -1;
     }
-    return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level)
+    return send_file_direct(file, client->file_descriptor, config->use_metadata, compression_level,
+                            config)
                ? 0
                : -1;
   }
@@ -304,13 +311,14 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
         return -1;
     }
     // Fall through: send full file via sendfile (pass 0 for compression_level)
-    if (!file_send_sendfile(file, client->file_descriptor, config->use_metadata, 0, false))
+    int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+    if (!file_send_sendfile_with_skip(file, client->file_descriptor, config->use_metadata, 0, false,
+                                      config->skip_compress_suffixes, skip_count))
       return -1;
     return 0;
   }
 
   // Incremental path with single_calls (supports compression and delta)
-  file_send_fn send_fn = (file_send_fn)file_send_single_calls;
   DeltaSignature* sig = NULL;
   int rc = incremental_check(client, file, config, &sig);
   if (rc < 0) {
@@ -338,7 +346,10 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
         return -1;
     }
   }
-  if (!send_fn(file, client->file_descriptor, config->use_metadata, compression_level, false))
+  int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+  if (!file_send_single_calls_with_skip(file, client->file_descriptor, config->use_metadata,
+                                        compression_level, false, config->skip_compress_suffixes,
+                                        skip_count))
     return -1;
   return 0;
 }
