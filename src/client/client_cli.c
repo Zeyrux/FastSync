@@ -86,6 +86,20 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
   return 0;
 }
 
+static int set_stderr_mode(const char* value) {
+  if (strcmp(value, "errors") == 0 || strcmp(value, "e") == 0)
+    log_set_stderr_mode(LOG_STDERR_ERRORS);
+  else if (strcmp(value, "all") == 0 || strcmp(value, "a") == 0)
+    log_set_stderr_mode(LOG_STDERR_ALL);
+  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0)
+    log_set_stderr_mode(LOG_STDERR_CLIENT);
+  else {
+    log_message(LOG_LEVEL_ERROR, "--stderr must be errors, all, or client");
+    return -1;
+  }
+  return 0;
+}
+
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
 /* Parse a string as an unsigned long long. Returns 0 on success, -1 on error. */
@@ -341,6 +355,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       config->log_file = lf;
       log_set_file(lf);
+    } else if (strncmp(argv[i], "--stderr=", 9) == 0) {
+      if (set_stderr_mode(argv[i] + 9) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--stderr", NULL)) {
+      if (i + 1 >= argc || set_stderr_mode(argv[++i]) != 0)
+        return -1;
     } else if (opt_is(argv[i], "--exclude-from", NULL) && i + 1 < argc) {
       if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
           0)

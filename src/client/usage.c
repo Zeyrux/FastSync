@@ -58,6 +58,7 @@ void print_usage(void) {
   printf("  --stats             Print transfer statistics at end\n");
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  --log-file <path>   Write log messages to file\n");
+  printf("  --stderr=MODE       Route logging to stderr: errors, all, or client\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --partial-dir <dir> Directory for partial files\n");
   printf("  --fastsync-server-path <path>\n");

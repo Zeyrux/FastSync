@@ -8,6 +8,7 @@
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
 static FILE* log_fp = NULL;
+static LogStderrMode stderr_mode = LOG_STDERR_ERRORS;
 
 void set_log_level(LogLevel level) {
   current_log_level = level;
@@ -15,6 +16,14 @@ void set_log_level(LogLevel level) {
 
 void log_set_file(FILE* fp) {
   log_fp = fp;
+}
+
+void log_set_stderr_mode(LogStderrMode mode) {
+  stderr_mode = mode;
+}
+
+LogStderrMode log_get_stderr_mode(void) {
+  return stderr_mode;
 }
 
 static inline void write_message(FILE* dest_io, LogLevel log_level, struct tm t, const char* format,
@@ -37,7 +46,7 @@ void log_message(LogLevel log_level, const char* format, ...) {
     return;
 
   FILE* dest_io = stdout;
-  if (log_level == LOG_LEVEL_ERROR) {
+  if (stderr_mode == LOG_STDERR_ALL || log_level == LOG_LEVEL_ERROR) {
     dest_io = stderr;
   }
 

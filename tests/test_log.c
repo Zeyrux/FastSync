@@ -1,6 +1,8 @@
 #include "test_log.h"
 #include "log.h"
 #include "test_utils.h"
+#include <string.h>
+#include <unistd.h>
 
 /* Test default log level: WARNING and ERROR should print, DEBUG and INFO should not.
  * We can't easily capture stderr in unit tests, so we verify the functions don't crash
@@ -90,6 +92,29 @@ static void test_log_filtering() {
   EXPECT_TRUE(true);
 }
 
+static void test_log_stderr_mode_all() {
+  int pipe_fds[2];
+  EXPECT_EQ_INT(pipe(pipe_fds), 0);
+  int saved_stderr = dup(STDERR_FILENO);
+  EXPECT_TRUE(saved_stderr >= 0);
+  EXPECT_TRUE(dup2(pipe_fds[1], STDERR_FILENO) >= 0);
+  close(pipe_fds[1]);
+
+  set_log_level(LOG_LEVEL_WARNING);
+  log_set_stderr_mode(LOG_STDERR_ALL);
+  log_message(LOG_LEVEL_WARNING, "warning routed to stderr");
+  fflush(stderr);
+
+  EXPECT_TRUE(dup2(saved_stderr, STDERR_FILENO) >= 0);
+  close(saved_stderr);
+  char output[128] = {0};
+  ssize_t length = read(pipe_fds[0], output, sizeof(output) - 1);
+  close(pipe_fds[0]);
+  EXPECT_TRUE(length > 0);
+  EXPECT_TRUE(strstr(output, "warning routed to stderr") != NULL);
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+}
+
 /* Test that log_message handles various format strings */
 static void test_log_message_formats() {
   set_log_level(LOG_LEVEL_DEBUG);
@@ -112,5 +137,6 @@ void test_log() {
   test_log_set_level_info();
   test_log_set_level_error();
   test_log_filtering();
+  test_log_stderr_mode_all();
   test_log_message_formats();
 }

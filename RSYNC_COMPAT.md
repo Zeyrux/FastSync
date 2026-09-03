@@ -25,7 +25,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-V`, `--version` | Print version | ✅ Implemented | |
 | `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
 | `--debug=FLAGS` | Fine-grained debug verbosity | ❌ Not Implemented | Removed because it had no effect |
-| `--stderr=MODE` | Change stderr output mode | ❌ Not Implemented | |
+| `--stderr=MODE` | Change stderr output mode | ⚠️ Partial | `errors` (default), `all`, and `client` are accepted; `client` preserves local client routing because FastSync has no rsync message channel |
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |
 | `--exclude=PATTERN` | Exclude files matching pattern | ✅ Implemented | Glob matching in scanner |
 | `--include=PATTERN` | Include files matching pattern | ✅ Implemented | Glob matching in scanner |
