@@ -380,6 +380,7 @@ int main(int argc, char* argv[]) {
       stdio_mode = true;
     } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
+      set_log_debug_flags(LOG_DEBUG_ALL);
     } else if (strcmp(argv[i], "--tls") == 0) {
       use_tls = true;
     } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {

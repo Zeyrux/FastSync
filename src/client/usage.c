@@ -37,6 +37,7 @@ void print_usage(void) {
   printf("  -s                  Enable chunk serialization\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
   printf("  -v, --verbose       Enable debug logging\n");
+  printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
   printf("  -M, --preserve      Preserve file metadata\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
@@ -71,4 +72,11 @@ void print_usage(void) {
   printf("  --compress-level <n>    Compression level (default: 5)\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");
+}
+
+void print_debug_usage(void) {
+  printf("Debug flags: ACL,BACKUP,BIND,CHKSUM,CONNECT,CMD,DEL,DIGEST,DFLT,FLIST,\n");
+  printf("             FUZZER,GENR,HASH,HLINK,ICONV,IO,NSTR,OWN,PACK,PROC,PROTO,\n");
+  printf("             RECV,SEND,TIME,TLS,UTIL,ALL,NONE\n");
+  printf("Flags may be comma-separated, for example: --debug=io,proto\n");
 }

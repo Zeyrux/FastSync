@@ -88,6 +88,99 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
+static int parse_debug_flags(const char* value, Config* config) {
+  if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
+      strstr(value, ",,")) {
+    log_message(LOG_LEVEL_ERROR, "--debug requires at least one flag");
+    return -1;
+  }
+
+  char* flags = str_dup(value);
+  if (!flags) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --debug");
+    return -1;
+  }
+  uint32_t parsed = (uint32_t)config->debug_level;
+  char* saveptr = NULL;
+  for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
+       token = strtok_r(NULL, ",", &saveptr)) {
+    uint32_t flag = 0;
+    if (strcmp(token, "help") == 0) {
+      print_debug_usage();
+      free(flags);
+      return 1;
+    } else if (strcmp(token, "all") == 0) {
+      parsed = LOG_DEBUG_ALL;
+      continue;
+    } else if (strcmp(token, "none") == 0) {
+      parsed = 0;
+      continue;
+    } else if (strcmp(token, "io") == 0) {
+      flag = LOG_DEBUG_IO;
+    } else if (strcmp(token, "proto") == 0) {
+      flag = LOG_DEBUG_PROTO;
+    } else if (strcmp(token, "pack") == 0) {
+      flag = LOG_DEBUG_PACK;
+    } else if (strcmp(token, "util") == 0) {
+      flag = LOG_DEBUG_UTIL;
+    } else if (strcmp(token, "acl") == 0) {
+      flag = LOG_DEBUG_ACL;
+    } else if (strcmp(token, "backup") == 0) {
+      flag = LOG_DEBUG_BACKUP;
+    } else if (strcmp(token, "bind") == 0) {
+      flag = LOG_DEBUG_BIND;
+    } else if (strcmp(token, "chksum") == 0) {
+      flag = LOG_DEBUG_CHKSUM;
+    } else if (strcmp(token, "connect") == 0) {
+      flag = LOG_DEBUG_CONNECT;
+    } else if (strcmp(token, "cmd") == 0) {
+      flag = LOG_DEBUG_CMD;
+    } else if (strcmp(token, "del") == 0) {
+      flag = LOG_DEBUG_DEL;
+    } else if (strcmp(token, "digest") == 0) {
+      flag = LOG_DEBUG_DIGEST;
+    } else if (strcmp(token, "dflt") == 0) {
+      flag = LOG_DEBUG_DFLT;
+    } else if (strcmp(token, "flist") == 0) {
+      flag = LOG_DEBUG_FLIST;
+    } else if (strcmp(token, "fuzzer") == 0) {
+      flag = LOG_DEBUG_FUZZER;
+    } else if (strcmp(token, "genr") == 0) {
+      flag = LOG_DEBUG_GENR;
+    } else if (strcmp(token, "hash") == 0) {
+      flag = LOG_DEBUG_HASH;
+    } else if (strcmp(token, "hlink") == 0) {
+      flag = LOG_DEBUG_HLINK;
+    } else if (strcmp(token, "iconv") == 0) {
+      flag = LOG_DEBUG_ICONV;
+    } else if (strcmp(token, "nstr") == 0) {
+      flag = LOG_DEBUG_NSTR;
+    } else if (strcmp(token, "own") == 0) {
+      flag = LOG_DEBUG_OWN;
+    } else if (strcmp(token, "proc") == 0) {
+      flag = LOG_DEBUG_PROC;
+    } else if (strcmp(token, "recv") == 0) {
+      flag = LOG_DEBUG_RECV;
+    } else if (strcmp(token, "send") == 0) {
+      flag = LOG_DEBUG_SEND;
+    } else if (strcmp(token, "time") == 0) {
+      flag = LOG_DEBUG_TIME;
+    } else if (strcmp(token, "tls") == 0) {
+      flag = LOG_DEBUG_TLS;
+    } else {
+      log_message(LOG_LEVEL_ERROR, "unknown --debug flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    parsed |= flag;
+  }
+  free(flags);
+  config->debug_level = (int)parsed;
+  set_log_debug_flags(parsed);
+  set_log_level(LOG_LEVEL_DEBUG);
+  return 0;
+}
+
 /* Parse a string as an unsigned long long. Returns 0 on success, -1 on error. */
 static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname) {
   char* end;
@@ -350,7 +443,19 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
           0)
         return -1;
     } else if (opt_is(argv[i], "-v", "--verbose")) {
+      config->debug_level = LOG_DEBUG_ALL;
       set_log_level(LOG_LEVEL_DEBUG);
+      set_log_debug_flags(LOG_DEBUG_ALL);
+    } else if (strncmp(argv[i], "--debug=", 8) == 0) {
+      int debug_ret = parse_debug_flags(argv[i] + 8, config);
+      if (debug_ret != 0)
+        return debug_ret;
+    } else if (opt_is(argv[i], "--debug", NULL)) {
+      if (i + 1 >= argc)
+        return parse_debug_flags(NULL, config);
+      int debug_ret = parse_debug_flags(argv[++i], config);
+      if (debug_ret != 0)
+        return debug_ret;
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;

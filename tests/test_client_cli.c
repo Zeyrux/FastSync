@@ -1,6 +1,7 @@
 #include "test_client_cli.h"
 #include "client_validation.h"
 #include "config.h"
+#include "log.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <stdlib.h>
@@ -247,6 +248,33 @@ static void test_parse_args_valid_compression_level() {
   config_delete(cfg);
 }
 
+static void test_parse_args_debug_flags() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--debug=io,proto", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_IO | LOG_DEBUG_PROTO);
+  EXPECT_EQ_INT(get_log_debug_flags(), LOG_DEBUG_IO | LOG_DEBUG_PROTO);
+  config_delete(cfg);
+}
+
+static void test_parse_args_debug_flags_validation() {
+  static const char* const values[] = {"", "io,", ",io", "io,,proto", "unknown"};
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    Config* cfg = config_create();
+    char option[64];
+    snprintf(option, sizeof(option), "--debug=%s", values[i]);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 /* Test parse_args unknown option returns error */
 static void test_parse_args_unknown_option() {
   Config* cfg = config_create();
@@ -357,6 +385,8 @@ void test_client_cli() {
   test_parse_args_invalid_server_port();
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
+  test_parse_args_debug_flags();
+  test_parse_args_debug_flags_validation();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();

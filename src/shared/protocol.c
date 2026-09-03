@@ -184,7 +184,7 @@ static int deadline_remaining_ms(const struct timespec* deadline) {
 bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size) {
   if (!data && data_size != 0)
     return false;
-  log_message(LOG_LEVEL_DEBUG, "    Sending n Data: %zu", data_size);
+  log_debug_message(LOG_DEBUG_IO, "    Sending n Data: %zu", data_size);
   if (!session)
     return false;
   int fd = session->write_fd;
@@ -228,12 +228,12 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
     if (session->ssl)
       wait_events = POLLOUT;
   }
-  log_message(LOG_LEVEL_DEBUG, "    Send n Data: %zu", total_bytes_send);
+  log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zu", total_bytes_send);
   return true;
 }
 
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size) {
-  log_message(LOG_LEVEL_DEBUG, "    Receiving n Data: %zu", data_size);
+  log_debug_message(LOG_DEBUG_IO, "    Receiving n Data: %zu", data_size);
   if (!session)
     return false;
   int fd = session->read_fd;
@@ -287,7 +287,7 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
     if (session->ssl)
       wait_events = POLLIN;
   }
-  log_message(LOG_LEVEL_DEBUG, "    Received n Data: %zu", total_bytes_received);
+  log_debug_message(LOG_DEBUG_IO, "    Received n Data: %zu", total_bytes_received);
   return true;
 }
 
@@ -328,7 +328,7 @@ bool protocol_send_str(ProtocolSession* session, const char* data) {
     return false;
   if (!protocol_send_n_data(session, data, size))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
+  log_debug_message(LOG_DEBUG_PROTO, "Send String: %s", data);
   return true;
 }
 
@@ -356,7 +356,7 @@ char* protocol_receive_str(ProtocolSession* session) {
   }
   data[size] = '\0';
   session->total_allocated_bytes += size + 1;
-  log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
+  log_debug_message(LOG_DEBUG_PROTO, "Received String: %s", data);
   return data;
 }
 
@@ -370,7 +370,7 @@ bool protocol_send_data(ProtocolSession* session, const Data* data) {
     return false;
   if (!protocol_send_n_data(session, data->data, data_size))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send %lld data", data_size);
+  log_debug_message(LOG_DEBUG_PROTO, "Send %lld data", data_size);
   return true;
 }
 
@@ -400,7 +400,7 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
     return NULL;
   }
   session->total_allocated_bytes += allocation_size;
-  log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
+  log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     session->total_allocated_bytes -= allocation_size;
@@ -417,28 +417,28 @@ Data* protocol_receive_data(ProtocolSession* session) {
 bool protocol_send_int(ProtocolSession* session, int data) {
   if (!protocol_send_n_data(session, &data, sizeof(int)))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send Int: %d", data);
+  log_debug_message(LOG_DEBUG_PROTO, "Send Int: %d", data);
   return true;
 }
 
 bool protocol_receive_int(ProtocolSession* session, int* data) {
   if (!protocol_receive_n_data(session, data, sizeof(int)))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Received Int: %d", *data);
+  log_debug_message(LOG_DEBUG_PROTO, "Received Int: %d", *data);
   return true;
 }
 
 bool protocol_send_status(ProtocolSession* session, Status status) {
   if (!protocol_send_n_data(session, &status, sizeof(Status)))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send Status: %s", status_to_string(status));
+  log_debug_message(LOG_DEBUG_PROTO, "Send Status: %s", status_to_string(status));
   return true;
 }
 
 bool protocol_receive_status(ProtocolSession* session, Status* status) {
   if (!protocol_receive_n_data(session, status, sizeof(Status)))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Received Status: %s", status_to_string(*status));
+  log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
   return true;
 }
 
