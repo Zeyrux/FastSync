@@ -139,6 +139,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
     {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
     {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
+    {"--size-only", NULL, OPT_FLAG, offsetof(Config, size_only)},
     {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
     {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},

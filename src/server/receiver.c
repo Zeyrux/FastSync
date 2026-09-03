@@ -61,7 +61,7 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
     struct stat st;
     bool has_old = file_stat_secure(full_path, &st);
     bool match = has_old && (unsigned long long)st.st_size == check_size &&
-                 (long long)st.st_mtime == check_mtime;
+                 (config->size_only || (long long)st.st_mtime == check_mtime);
     bool sent = send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT);
     free(full_path);
     free(check_path);

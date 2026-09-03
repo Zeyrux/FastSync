@@ -383,7 +383,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     match = (old_size == 0 || old_data) && old_checksum == check_checksum;
     free(old_data);
     old_data = NULL;
-  } else if (match) {
+  } else if (match && !config->size_only) {
     match = (long long)st.st_mtime == check_mtime;
   }
 
