@@ -187,7 +187,8 @@ static const OptionEntry* find_table_option(const char* arg) {
   return NULL;
 }
 
-static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
+static int apply_table_option(Config* config, const OptionEntry* entry, const char* option_name,
+                              const char* value) {
   void* field = (char*)config + entry->offset;
   switch (entry->kind) {
   case OPT_FLAG:
@@ -208,8 +209,8 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   }
   case OPT_UNSUPPORTED:
     log_message(LOG_LEVEL_ERROR,
-                "%s requires --dirs, which is not implemented; refusing to ignore option",
-                entry->name);
+                "%s: directory-only transfer is not implemented; refusing to ignore option",
+                option_name);
     return -1;
   }
   return -1;
@@ -221,14 +222,17 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   for (int i = 1; i < argc; i++) {
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
+      const char* option_name = argv[i];
+      const char* value = NULL;
       if (entry->kind != OPT_FLAG) {
-        if (i + 1 >= argc) {
+        if (entry->kind != OPT_UNSUPPORTED && i + 1 >= argc) {
           log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
           return -1;
         }
-        if (apply_table_option(config, entry, argv[++i]) != 0)
-          return -1;
-      } else if (apply_table_option(config, entry, NULL) != 0) {
+        if (entry->kind != OPT_UNSUPPORTED)
+          value = argv[++i];
+      }
+      if (apply_table_option(config, entry, option_name, value) != 0) {
         return -1;
       }
       continue;

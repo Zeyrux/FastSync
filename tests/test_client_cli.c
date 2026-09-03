@@ -1,8 +1,10 @@
 #include "test_client_cli.h"
 #include "client_validation.h"
 #include "config.h"
+#include "log.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -260,7 +262,7 @@ static void test_parse_args_unknown_option() {
   config_delete(cfg);
 }
 
-/* Directory aliases require the not-yet-implemented --dirs behavior. */
+/* Directory aliases must report the unsupported directory-only behavior clearly. */
 static void test_parse_args_rejects_dirs_aliases() {
   static const char* const options[] = {"--dirs", "--old-dirs", "--old-d"};
 
@@ -269,8 +271,21 @@ static void test_parse_args_rejects_dirs_aliases() {
     char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
+    FILE* log_file = tmpfile();
+    char log_buffer[256] = {0};
+
+    EXPECT_NOT_NULL(log_file);
+    log_set_file(log_file);
 
     EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    fflush(log_file);
+    rewind(log_file);
+    EXPECT_TRUE(fread(log_buffer, 1, sizeof(log_buffer) - 1, log_file) > 0);
+    EXPECT_TRUE(strstr(log_buffer, options[i]) != NULL);
+    EXPECT_TRUE(strstr(log_buffer, "directory-only transfer is not implemented") != NULL);
+    EXPECT_TRUE(strstr(log_buffer, "requires --dirs") == NULL);
+    log_set_file(NULL);
+    fclose(log_file);
     config_delete(cfg);
   }
 }
