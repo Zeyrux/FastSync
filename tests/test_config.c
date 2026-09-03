@@ -95,6 +95,7 @@ static void test_pipeline_sender_lifecycle() {
   EXPECT_EQ_INT(pcs->queue_loader->capacity, 15);
   EXPECT_FALSE(pcs->scanner_done);
   EXPECT_FALSE(pcs->loader_done);
+  EXPECT_EQ_INT((int)pcs->allocation_session.max_alloc, (int)cfg->max_alloc);
 
   pipeline_context_sender_destroy(pcs);
 }
@@ -126,7 +127,7 @@ static void test_config_send_receive() {
   send_cfg->use_metadata = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
-  send_cfg->max_alloc = 8ULL * 1024 * 1024;
+  send_cfg->max_alloc = MAX_SERVER_ALLOC + 1;
 
   /* Use socketpair for bidirectional communication */
   int p[2];
@@ -161,7 +162,7 @@ static void test_config_send_receive() {
         ok = false;
       if (recv_cfg->chunk_size != 1024)
         ok = false;
-      if (recv_cfg->max_alloc != 8ULL * 1024 * 1024)
+      if (recv_cfg->max_alloc != MAX_SERVER_ALLOC)
         ok = false;
     }
     config_delete(recv_cfg);
@@ -192,7 +193,7 @@ static void test_config_send_receive_version_mismatch() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
-  cfg->version = str_dup("0.0");
+  cfg->version = str_dup("2.2.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 

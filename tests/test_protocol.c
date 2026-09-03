@@ -202,6 +202,19 @@ static void test_max_alloc_rejects_single_buffer() {
   close(p[1]);
 }
 
+static void test_max_alloc_allows_configured_buffer() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_set_max_alloc(&session, 4);
+  protocol_session_bind(&session);
+  void* allowed = protocol_alloc(4);
+  const void* rejected = protocol_alloc(5);
+  EXPECT_NOT_NULL(allowed);
+  EXPECT_NULL(rejected);
+  free(allowed);
+  protocol_session_unbind();
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -214,4 +227,5 @@ void test_protocol() {
   test_receive_n_data_truncated();
   test_receive_str_truncated();
   test_max_alloc_rejects_single_buffer();
+  test_max_alloc_allows_configured_buffer();
 }

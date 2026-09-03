@@ -29,6 +29,8 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->progress_bytes = 0;
   context->sender_done = false;
   atomic_init(&context->cancelled, false);
+  protocol_session_init(&context->allocation_session, -1, -1);
+  protocol_session_set_max_alloc(&context->allocation_session, config->max_alloc);
   int init = 0;
   if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success)
     goto fail;

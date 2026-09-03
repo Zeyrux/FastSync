@@ -28,6 +28,7 @@ typedef struct {
   unsigned long long progress_bytes;
   bool sender_done;
   atomic_bool cancelled;
+  ProtocolSession allocation_session;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {

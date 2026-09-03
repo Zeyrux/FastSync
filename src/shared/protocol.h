@@ -19,6 +19,8 @@
 /* Aggregate bytes retained by one received deletion manifest. */
 #define MAX_MANIFEST_BYTES (16ULL * 1024 * 1024)
 #define DEFAULT_MAX_ALLOC (1ULL * 1024 * 1024 * 1024)
+/* Server policy ceiling for a client-provided allocation limit. */
+#define MAX_SERVER_ALLOC (256ULL * 1024 * 1024)
 
 typedef struct ssl_st SSL;
 

@@ -262,6 +262,8 @@ static bool receive_core_fields(int fd, Config* c) {
   int value;
   if (!receive_n_data(fd, &c->max_alloc, sizeof(c->max_alloc)) || c->max_alloc == 0)
     return false;
+  if (c->max_alloc > MAX_SERVER_ALLOC)
+    c->max_alloc = MAX_SERVER_ALLOC;
   protocol_session_set_max_alloc(NULL, c->max_alloc);
   c->send_directory = receive_str(fd);
   c->receive_root_directory = receive_str(fd);
