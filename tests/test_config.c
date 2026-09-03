@@ -124,6 +124,7 @@ static void test_config_send_receive() {
   send_cfg->use_chunk_serialization = true;
   send_cfg->use_compression = true;
   send_cfg->use_metadata = true;
+  send_cfg->use_executability = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
 
@@ -159,6 +160,8 @@ static void test_config_send_receive() {
       if (recv_cfg->compression_level != 5)
         ok = false;
       if (recv_cfg->chunk_size != 1024)
+        ok = false;
+      if (!recv_cfg->use_executability)
         ok = false;
     }
     config_delete(recv_cfg);

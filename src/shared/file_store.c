@@ -140,7 +140,8 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
 }
 
 bool file_store_write_secure(const char* path, const void* data, unsigned long long data_size,
-                             bool inplace, bool sparse, const FileMetadata* metadata) {
+                             bool inplace, bool sparse, const FileMetadata* metadata,
+                             bool preserve_executability) {
   char* leaf = NULL;
   int dirfd = file_store_open_secure_parent(path, &leaf);
   if (dirfd < 0)
@@ -153,7 +154,7 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
       if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
     }
   } else {
     int tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%u", leaf, (long)getpid(), 99U);
@@ -178,7 +179,7 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
       if (ok || (!sparse || data_size == 0))
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
       if (close(fd) != 0)
         ok = false;
       fd = -1;

@@ -119,7 +119,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-o`, `--owner` | Preserve owner | ✅ Implemented | Part of -M |
 | `-g`, `--group` | Preserve group | ✅ Implemented | Part of -M |
 | `-t`, `--times` | Preserve modification times | ✅ Implemented | Part of -M |
-| `-E`, `--executability` | Preserve executability | ❌ Not Implemented | |
+| `-E`, `--executability` | Preserve executability | ✅ Implemented | Preserves executable permission bits (implies metadata preservation) |
 | `--chmod=CHMOD` | Affect file permissions | ❌ Not Implemented | |
 | `-A`, `--acls` | Preserve ACLs | ❌ Not Implemented | Removed because it had no effect |
 | `-X`, `--xattrs` | Preserve extended attributes | ❌ Not Implemented | Removed because it had no effect |

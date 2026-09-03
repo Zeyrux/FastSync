@@ -179,10 +179,21 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
   return m;
 }
 
-void file_restore_metadata(const char* path, const FileMetadata* metadata) {
+static mode_t metadata_mode(const FileMetadata* metadata, mode_t current_mode,
+                            bool preserve_executability) {
+  const mode_t execute_bits = S_IXUSR | S_IXGRP | S_IXOTH;
+  if (preserve_executability)
+    return (current_mode & 0777 & ~execute_bits) | (metadata->mode & execute_bits);
+  return metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+}
+
+void file_restore_metadata(const char* path, const FileMetadata* metadata,
+                           bool preserve_executability) {
   if (metadata == NULL)
     return;
-  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  struct stat current;
+  mode_t current_mode = stat(path, &current) == 0 ? current.st_mode : 0;
+  mode_t safe_mode = metadata_mode(metadata, current_mode, preserve_executability);
   if (chmod(path, safe_mode) != 0)
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
   /* Never apply client-supplied ownership.  The descriptor API below is the
@@ -196,11 +207,14 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata) {
     log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
 }
 
-bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;
-  mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  struct stat current;
+  if (fstat(fd, &current) != 0)
+    return false;
+  mode_t safe_mode = metadata_mode(metadata, current.st_mode, preserve_executability);
   if (fchmod(fd, safe_mode) != 0)
     ok = false;
   /* Client uid/gid values are deliberately not authoritative. */

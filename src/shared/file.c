@@ -303,7 +303,8 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
 }
 
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                         bool inplace, bool sparse, const FileMetadata* metadata) {
+                         bool inplace, bool sparse, const FileMetadata* metadata,
+                         bool preserve_executability) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -316,7 +317,7 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
       if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
     }
   } else {
     char tmp[NAME_MAX];
@@ -330,7 +331,7 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
       if (ok || (!sparse || data_size == 0))
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
       if (close(fd) != 0)
         ok = false;
       fd = -1;
@@ -351,5 +352,5 @@ bool file_write_to_disk(const char* path, const void* data, unsigned long long d
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return file_to_disk_secure(path, data, data_size, inplace, sparse, NULL);
+  return file_to_disk_secure(path, data, data_size, inplace, sparse, NULL, false);
 }

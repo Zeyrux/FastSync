@@ -25,6 +25,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   bool backup_enabled = config && config->backup;
   bool inplace = config && config->inplace;
   bool sparse = config && config->preserve_sparse;
+  bool preserve_executability = config && config->use_executability;
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
@@ -104,7 +105,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   }
 
   bool ok = file_to_disk_secure(disk_path, file->data->data, file->data->size, inplace, sparse,
-                                file->metadata);
+                                file->metadata, preserve_executability);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

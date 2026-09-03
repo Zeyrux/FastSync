@@ -18,6 +18,7 @@ typedef struct Config {
   bool use_compression;
   bool use_sendfile;
   bool use_metadata;
+  bool use_executability;
   bool show_progress;
   bool dry_run;
   bool use_delete;
@@ -128,7 +129,7 @@ typedef struct Config {
   char* compress_choice;
 } Config;
 
-#define PROTOCOL_VERSION "2.2.0"
+#define PROTOCOL_VERSION "2.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);
