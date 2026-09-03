@@ -102,6 +102,7 @@ partial, alternate, and planned behavior.
 | `--max-size <n>` | Skip files larger than n bytes |
 | `--min-size <n>` | Skip files smaller than n bytes |
 | `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `-s`. |
+| `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
 | `--timeout <sec>` | I/O timeout in seconds (default: 30) |
@@ -465,7 +466,7 @@ defaults to the current directory. |
 
 ## Protocol and Security
 
-FastSync protocol version `2.2.0` is shared by the client and server. The
+FastSync protocol version `2.3.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 incremental checks, checksums, manifests, keep-alives, abort handling, and
 FastSync-native delta messages. Client and server versions must currently

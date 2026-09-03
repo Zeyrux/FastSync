@@ -76,6 +76,7 @@ typedef struct Config {
   bool human_readable;
 
   // Issue #127: Transfer modes
+  bool existing;
   bool update;
   bool inplace;
   bool append;
@@ -128,7 +129,7 @@ typedef struct Config {
   char* compress_choice;
 } Config;
 
-#define PROTOCOL_VERSION "2.2.0"
+#define PROTOCOL_VERSION "2.3.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);
