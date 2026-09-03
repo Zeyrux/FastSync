@@ -211,6 +211,12 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-P") == 0) {
+      config->partial = true;
+      config->show_progress = true;
+      continue;
+    }
+
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
       if (entry->kind != OPT_FLAG) {

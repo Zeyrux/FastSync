@@ -95,6 +95,7 @@ partial, alternate, and planned behavior.
 | `-p <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
 | `--progress` | Show real-time transfer speed |
+| `-P` | Alias for `--partial --progress` |
 | `--delete` | Delete files on receiver not present in source |
 | `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
 | `--exclude-from <file>` | Read exclude patterns from a file (one per line) |

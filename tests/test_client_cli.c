@@ -339,6 +339,22 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+/* Test rsync-compatible -P enables both partial files and progress output. */
+static void test_parse_args_partial_progress() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-P", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_TRUE(cfg->partial);
+  EXPECT_TRUE(cfg->show_progress);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -360,4 +376,5 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
+  test_parse_args_partial_progress();
 }
