@@ -4,6 +4,8 @@
 #include "data.h"
 #include <stdbool.h>
 
+#define COMPRESSION_MAX_THREADS 64
+
 Data* data_compress(Data* data_to_compress, int compression_level);
 Data* data_compress_with_threads(Data* data_to_compress, int compression_level,
                                  int compression_threads);

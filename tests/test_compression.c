@@ -56,16 +56,17 @@ static void test_data_compress_decompress_large() {
 }
 
 static void test_data_compress_with_threads_roundtrip() {
-  const char original[] = "Threaded zstd compression test data";
-  Data* input = data_create_empty(sizeof(original) - 1);
+  const size_t size = 8 * 1024 * 1024;
+  Data* input = data_create_empty(size);
   EXPECT_NOT_NULL(input);
-  memcpy(input->data, original, sizeof(original) - 1);
+  for (size_t i = 0; i < size; i++)
+    ((char*)input->data)[i] = (char)((i / 4096) % 7);
   Data* compressed = data_compress_with_threads(input, 3, 2);
   EXPECT_NOT_NULL(compressed);
   Data* decompressed = data_decompress(compressed);
   EXPECT_NOT_NULL(decompressed);
-  EXPECT_EQ_INT((int)decompressed->size, (int)(sizeof(original) - 1));
-  EXPECT_EQ_INT(memcmp(decompressed->data, original, sizeof(original) - 1), 0);
+  EXPECT_EQ_INT((int)decompressed->size, (int)size);
+  EXPECT_EQ_INT(memcmp(decompressed->data, input->data, size), 0);
   data_destroy(input);
   data_destroy(compressed);
   data_destroy(decompressed);

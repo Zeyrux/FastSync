@@ -275,6 +275,12 @@ static void test_parse_args_compression_threads() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, invalid_argv, positional_args, &positional_count), -1);
   config_delete(cfg);
+
+  cfg = config_create();
+  char* excessive_argv[] = {"fastsync", "--compress-threads=65", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, excessive_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
 }
 
 /* Test parse_args unknown option returns error */

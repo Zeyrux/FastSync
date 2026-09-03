@@ -1,5 +1,6 @@
 #include "client_send.h"
 #include "client_validation.h"
+#include "compression.h"
 #include "config.h"
 #include "delta.h"
 #include "log.h"
@@ -72,6 +73,17 @@ static int set_string_option(char** dest, const char* value, const char* option_
 static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
     log_message(LOG_LEVEL_ERROR, "%s must be a positive integer", option_name);
+    return -1;
+  }
+  return 0;
+}
+
+static int set_compression_threads_option(int* dest, const char* value) {
+  if (set_positive_int_option(dest, value, "--compress-threads") != 0)
+    return -1;
+  if (*dest > COMPRESSION_MAX_THREADS) {
+    log_message(LOG_LEVEL_ERROR, "--compress-threads must be between 1 and %d",
+                COMPRESSION_MAX_THREADS);
     return -1;
   }
   return 0;
@@ -213,8 +225,8 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   for (int i = 1; i < argc; i++) {
     const char* threads_prefix = "--compress-threads=";
     if (strncmp(argv[i], threads_prefix, strlen(threads_prefix)) == 0) {
-      if (set_positive_int_option(&config->compression_threads, argv[i] + strlen(threads_prefix),
-                                  "--compress-threads") != 0)
+      if (set_compression_threads_option(&config->compression_threads,
+                                         argv[i] + strlen(threads_prefix)) != 0)
         return -1;
       continue;
     }
@@ -369,8 +381,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
     } else if (opt_is(argv[i], "--compress-threads", NULL) && i + 1 < argc) {
-      if (set_positive_int_option(&config->compression_threads, argv[++i], "--compress-threads") !=
-          0)
+      if (set_compression_threads_option(&config->compression_threads, argv[++i]) != 0)
         return -1;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);

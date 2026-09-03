@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 #include <zstd.h>
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
@@ -34,7 +35,7 @@ Data* data_compress(Data* data_to_compress, int compression_level) {
 Data* data_compress_with_threads(Data* data_to_compress, int compression_level,
                                  int compression_threads) {
   if (!data_to_compress || (!data_to_compress->data && data_to_compress->size != 0) ||
-      compression_threads < 0)
+      compression_threads < 0 || compression_threads > COMPRESSION_MAX_THREADS)
     return NULL;
   log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
@@ -58,7 +59,11 @@ Data* data_compress_with_threads(Data* data_to_compress, int compression_level,
   }
 
   if (compression_threads > 0) {
-    zret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, compression_threads);
+    long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int available_threads = online_cpus > 0 && online_cpus < compression_threads
+                                ? (int)online_cpus
+                                : compression_threads;
+    zret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, available_threads);
     if (ZSTD_isError(zret)) {
       log_message(LOG_LEVEL_ERROR, "Failed to set compression threads: %s",
                   ZSTD_getErrorName(zret));
