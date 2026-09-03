@@ -20,6 +20,7 @@ void print_usage(void) {
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  -p <port>           SSH port (default: 22)\n");
   printf("  --progress          Show transfer progress\n");
+  printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");

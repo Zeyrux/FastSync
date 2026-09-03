@@ -137,7 +137,14 @@ static int send_dry_run_manifest(const Config* config) {
   printf("Dry run: files to be transferred\n");
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
-      printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+      char* escaped_path = output_escape(chunk->items[i]->path, config->eight_bit_output);
+      if (!escaped_path) {
+        chunk_destroy(chunk);
+        directory_scanner_destroy(scanner);
+        return -1;
+      }
+      printf("  %s (%zu bytes)\n", escaped_path, chunk->items[i]->data->size);
+      free(escaped_path);
       total_bytes += chunk->items[i]->data->size;
       file_count++;
     }

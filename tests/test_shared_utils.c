@@ -5,6 +5,14 @@
 #include <string.h>
 
 void test_shared_utils() {
+  char high_bit[] = {'a', (char)0xc3, (char)0xa9, '\n', '\0'};
+  char* escaped = output_escape(high_bit, false);
+  EXPECT_EQ_STR(escaped, "a\\#303\\#251\\#012");
+  free(escaped);
+  escaped = output_escape(high_bit, true);
+  EXPECT_EQ_STR(escaped, "a\xc3\xa9\\#012");
+  free(escaped);
+
   // Test str_dup
   const char* dup_null = str_dup(NULL);
   EXPECT_NULL(dup_null);

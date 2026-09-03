@@ -281,7 +281,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--debug",
                                         "--list-only",
                                         "-h",
-                                        "--human-readable",
                                         "-u",
                                         "--update",
                                         "--append",

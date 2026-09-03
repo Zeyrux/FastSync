@@ -8,6 +8,7 @@
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
 static FILE* log_fp = NULL;
+static bool eight_bit_output = false;
 
 void set_log_level(LogLevel level) {
   current_log_level = level;
@@ -15,6 +16,14 @@ void set_log_level(LogLevel level) {
 
 void log_set_file(FILE* fp) {
   log_fp = fp;
+}
+
+void log_set_8_bit_output(bool enabled) {
+  eight_bit_output = enabled;
+}
+
+bool log_get_8_bit_output(void) {
+  return eight_bit_output;
 }
 
 static inline void write_message(FILE* dest_io, LogLevel log_level, struct tm t, const char* format,

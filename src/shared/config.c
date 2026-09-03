@@ -68,6 +68,7 @@ static void config_set_defaults(Config* config) {
   config->debug_level = 0;
   config->list_only = false;
   config->human_readable = false;
+  config->eight_bit_output = false;
   config->update = false;
   config->inplace = false;
   config->append = false;

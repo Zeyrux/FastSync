@@ -1,6 +1,7 @@
 #include "utils.h"
 #include "array_list.h"
 #include "libgen.h"
+#include "log.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -130,6 +131,32 @@ char* str_dup(const char* string) {
     return NULL;
   memcpy(new_string, string, str_len + 1);
   return new_string;
+}
+
+char* output_escape(const char* string, bool eight_bit_output) {
+  if (!string)
+    return NULL;
+  size_t length = strlen(string);
+  if (length > (SIZE_MAX - 1) / 5)
+    return NULL;
+  char* escaped = malloc(length * 5 + 1);
+  if (!escaped)
+    return NULL;
+  size_t out = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char byte = (unsigned char)string[i];
+    if ((byte >= 32 && byte <= 126) || (eight_bit_output && byte >= 128)) {
+      escaped[out++] = (char)byte;
+    } else {
+      escaped[out++] = '\\';
+      escaped[out++] = '#';
+      escaped[out++] = (char)('0' + ((byte >> 6) & 7));
+      escaped[out++] = (char)('0' + ((byte >> 3) & 7));
+      escaped[out++] = (char)('0' + (byte & 7));
+    }
+  }
+  escaped[out] = '\0';
+  return escaped;
 }
 
 /* Match a glob pattern against a string. Supported wildcards:
@@ -274,7 +301,9 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
         } else {
           (*deleted_count)++;
         }
-        fprintf(stderr, "  Deleted: %s\n", child_rel);
+        char* escaped_path = output_escape(child_rel, log_get_8_bit_output());
+        fprintf(stderr, "  Deleted: %s\n", escaped_path ? escaped_path : "<allocation failed>");
+        free(escaped_path);
       }
     }
     free(child_rel);

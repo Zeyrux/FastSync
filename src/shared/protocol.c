@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include "log.h"
+#include "utils.h"
 #include <errno.h>
 #include <limits.h>
 #include <openssl/ssl.h>
@@ -328,7 +329,9 @@ bool protocol_send_str(ProtocolSession* session, const char* data) {
     return false;
   if (!protocol_send_n_data(session, data, size))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
+  char* escaped = output_escape(data, log_get_8_bit_output());
+  log_message(LOG_LEVEL_DEBUG, "Send String: %s", escaped ? escaped : "<allocation failed>");
+  free(escaped);
   return true;
 }
 
@@ -356,7 +359,9 @@ char* protocol_receive_str(ProtocolSession* session) {
   }
   data[size] = '\0';
   session->total_allocated_bytes += size + 1;
-  log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
+  char* escaped = output_escape(data, log_get_8_bit_output());
+  log_message(LOG_LEVEL_DEBUG, "Received String: %s", escaped ? escaped : "<allocation failed>");
+  free(escaped);
   return data;
 }
 

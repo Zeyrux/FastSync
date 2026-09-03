@@ -153,6 +153,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
     {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
+    {"--8-bit-output", "-8", OPT_FLAG, offsetof(Config, eight_bit_output)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -210,6 +211,7 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
+  log_set_8_bit_output(config->eight_bit_output);
   for (int i = 1; i < argc; i++) {
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
@@ -223,6 +225,8 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       } else if (apply_table_option(config, entry, NULL) != 0) {
         return -1;
       }
+      if (entry->offset == offsetof(Config, eight_bit_output))
+        log_set_8_bit_output(true);
       continue;
     }
 
