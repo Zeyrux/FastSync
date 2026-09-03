@@ -151,8 +151,17 @@ static void test_chmod_changes() {
   EXPECT_EQ_INT(result, 0644);
   EXPECT_TRUE(chmod_apply(0644, "a+x", &result));
   EXPECT_EQ_INT(result, 0755);
+  result = 0777;
+  EXPECT_TRUE(chmod_apply(0777, "0000", &result));
+  EXPECT_EQ_INT(result, 0000);
+  result = 0777;
+  EXPECT_TRUE(chmod_apply(0777, "7777", &result));
+  EXPECT_EQ_INT(result, 07777);
+  result = 0777;
   EXPECT_TRUE(chmod_apply(0777, "755", &result));
   EXPECT_EQ_INT(result, 0755);
+  EXPECT_FALSE(chmod_apply(0777, "888", &result));
+  EXPECT_FALSE(chmod_apply(0777, "10000", &result));
   EXPECT_FALSE(chmod_apply(0777, "a+X", &result));
   EXPECT_FALSE(chmod_apply(0777, "a+r,", &result));
 }

@@ -62,12 +62,12 @@ bool chmod_apply(mode_t mode, const char* spec, mode_t* result) {
   for (size_t i = 0; i < length && numeric; i++)
     numeric = spec[i] >= '0' && spec[i] <= '7';
   if (numeric) {
-    if (length < 3 || (length == 4 && spec[0] != '0'))
+    if (length == 0 || length > 4)
       return false;
     mode_t parsed = 0;
     for (size_t i = 0; i < length; i++)
       parsed = (mode_t)((parsed << 3) | (spec[i] - '0'));
-    *result = (*result & ~07777) | parsed;
+    *result = parsed;
     return true;
   }
 
