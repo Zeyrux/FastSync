@@ -14,18 +14,23 @@ static void test_ssh_connect_invalid_dest_empty() {
   EXPECT_NULL(client);
 }
 
-/* Test client_connect_ssh with malformed destination (just a colon).
- * parse_remote_dest succeeds, ssh is exec'd and fails, but the function
- * creates a Client that must be cleaned up. */
+/* A child that cannot exec ssh must not be returned as a successful client. */
 static void test_ssh_connect_malformed() {
+  const char* old_path = getenv("PATH");
+  char* saved_path = old_path ? strdup(old_path) : NULL;
+  setenv("PATH", "", 1);
+
+  /* cppcheck-suppress constVariablePointer */
   Client* client = client_connect_ssh(":", 22, NULL, false);
-  /* ssh binary exists, so exec succeeds; the function returns a Client.
-   * We just verify it doesn't crash and clean up properly. */
-  if (client != NULL) {
-    client_disconnect(client);
-    client_delete(client);
+
+  if (saved_path) {
+    setenv("PATH", saved_path, 1);
+    free(saved_path);
+  } else {
+    unsetenv("PATH");
   }
-  EXPECT_TRUE(true);
+
+  EXPECT_NULL(client);
 }
 
 /* Test client_connect_ssh with valid format but unreachable host.
