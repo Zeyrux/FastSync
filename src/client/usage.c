@@ -75,8 +75,7 @@ void print_usage(void) {
 }
 
 void print_debug_usage(void) {
-  printf("Debug flags: ACL,BACKUP,BIND,CHKSUM,CONNECT,CMD,DEL,DIGEST,DFLT,FLIST,\n");
-  printf("             FUZZER,GENR,HASH,HLINK,ICONV,IO,NSTR,OWN,PACK,PROC,PROTO,\n");
-  printf("             RECV,SEND,TIME,TLS,UTIL,ALL,NONE\n");
+  printf("Supported debug flags: IO,PROTO,PACK,UTIL,ALL,NONE\n");
   printf("Flags may be comma-separated, for example: --debug=io,proto\n");
+  printf("Other rsync debug flags are unsupported and rejected.\n");
 }

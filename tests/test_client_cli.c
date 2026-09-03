@@ -250,18 +250,28 @@ static void test_parse_args_valid_compression_level() {
 
 static void test_parse_args_debug_flags() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--debug=io,proto", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--debug=io,proto,pack,util", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_IO | LOG_DEBUG_PROTO);
-  EXPECT_EQ_INT(get_log_debug_flags(), LOG_DEBUG_IO | LOG_DEBUG_PROTO);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL);
+  EXPECT_EQ_INT(get_log_debug_flags(), LOG_DEBUG_ALL);
+  config_delete(cfg);
+}
+
+static void test_parse_args_debug_help() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--debug=help"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), 1);
   config_delete(cfg);
 }
 
 static void test_parse_args_debug_flags_validation() {
-  static const char* const values[] = {"", "io,", ",io", "io,,proto", "unknown"};
+  static const char* const values[] = {"", "io,", ",io", "io,,proto", "acl", "tls", "unknown"};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     Config* cfg = config_create();
     char option[64];
@@ -306,7 +316,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--itemize-changes",
                                         "--out-format",
                                         "--info",
-                                        "--debug",
                                         "--list-only",
                                         "-h",
                                         "--human-readable",
@@ -386,6 +395,7 @@ void test_client_cli() {
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
   test_parse_args_debug_flags();
+  test_parse_args_debug_help();
   test_parse_args_debug_flags_validation();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();

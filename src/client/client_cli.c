@@ -123,52 +123,8 @@ static int parse_debug_flags(const char* value, Config* config) {
       flag = LOG_DEBUG_PACK;
     } else if (strcmp(token, "util") == 0) {
       flag = LOG_DEBUG_UTIL;
-    } else if (strcmp(token, "acl") == 0) {
-      flag = LOG_DEBUG_ACL;
-    } else if (strcmp(token, "backup") == 0) {
-      flag = LOG_DEBUG_BACKUP;
-    } else if (strcmp(token, "bind") == 0) {
-      flag = LOG_DEBUG_BIND;
-    } else if (strcmp(token, "chksum") == 0) {
-      flag = LOG_DEBUG_CHKSUM;
-    } else if (strcmp(token, "connect") == 0) {
-      flag = LOG_DEBUG_CONNECT;
-    } else if (strcmp(token, "cmd") == 0) {
-      flag = LOG_DEBUG_CMD;
-    } else if (strcmp(token, "del") == 0) {
-      flag = LOG_DEBUG_DEL;
-    } else if (strcmp(token, "digest") == 0) {
-      flag = LOG_DEBUG_DIGEST;
-    } else if (strcmp(token, "dflt") == 0) {
-      flag = LOG_DEBUG_DFLT;
-    } else if (strcmp(token, "flist") == 0) {
-      flag = LOG_DEBUG_FLIST;
-    } else if (strcmp(token, "fuzzer") == 0) {
-      flag = LOG_DEBUG_FUZZER;
-    } else if (strcmp(token, "genr") == 0) {
-      flag = LOG_DEBUG_GENR;
-    } else if (strcmp(token, "hash") == 0) {
-      flag = LOG_DEBUG_HASH;
-    } else if (strcmp(token, "hlink") == 0) {
-      flag = LOG_DEBUG_HLINK;
-    } else if (strcmp(token, "iconv") == 0) {
-      flag = LOG_DEBUG_ICONV;
-    } else if (strcmp(token, "nstr") == 0) {
-      flag = LOG_DEBUG_NSTR;
-    } else if (strcmp(token, "own") == 0) {
-      flag = LOG_DEBUG_OWN;
-    } else if (strcmp(token, "proc") == 0) {
-      flag = LOG_DEBUG_PROC;
-    } else if (strcmp(token, "recv") == 0) {
-      flag = LOG_DEBUG_RECV;
-    } else if (strcmp(token, "send") == 0) {
-      flag = LOG_DEBUG_SEND;
-    } else if (strcmp(token, "time") == 0) {
-      flag = LOG_DEBUG_TIME;
-    } else if (strcmp(token, "tls") == 0) {
-      flag = LOG_DEBUG_TLS;
     } else {
-      log_message(LOG_LEVEL_ERROR, "unknown --debug flag: %s", token);
+      log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
       free(flags);
       return -1;
     }
