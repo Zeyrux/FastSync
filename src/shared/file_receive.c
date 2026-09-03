@@ -61,6 +61,21 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     return false;
   }
 
+  /* --ignore-existing checks the final destination before partial files or
+     overwrite policies can modify it. */
+  if (config && config->ignore_existing) {
+    struct stat destination_stat;
+    char* final_path = path_cat(root_directory, file->path);
+    bool exists = final_path && file_stat_secure(final_path, &destination_stat);
+    free(final_path);
+    if (exists) {
+      free(confined_backup);
+      free(confined_partial);
+      free(disk_path);
+      return true;
+    }
+  }
+
   /* --update is receiver-side policy: never replace a newer destination. */
   if (config && config->update) {
     struct stat destination_stat;

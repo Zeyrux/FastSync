@@ -68,6 +68,7 @@ static void config_set_defaults(Config* config) {
   config->debug_level = 0;
   config->list_only = false;
   config->human_readable = false;
+  config->ignore_existing = false;
   config->update = false;
   config->inplace = false;
   config->append = false;
@@ -123,12 +124,13 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
-         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->update) &&
-         valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
-         valid_wire_bool(config->append_verify) && valid_wire_bool(config->delete_excluded) &&
-         valid_wire_bool(config->delete_after) && valid_wire_bool(config->relative) &&
-         valid_wire_bool(config->prune_empty_dirs) && valid_wire_bool(config->partial) &&
-         valid_wire_bool(config->delete_before) && valid_wire_bool(config->checksum) &&
+         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->ignore_existing) &&
+         valid_wire_bool(config->update) && valid_wire_bool(config->inplace) &&
+         valid_wire_bool(config->append) && valid_wire_bool(config->append_verify) &&
+         valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
+         valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
+         valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
+         valid_wire_bool(config->checksum) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -243,10 +245,11 @@ static bool send_file_options(int fd, const Config* c) {
 }
 
 static bool send_selection_options(int fd, const Config* c) {
-  return send_int(fd, c->update) && send_int(fd, c->inplace) && send_int(fd, c->append) &&
-         send_int(fd, c->append_verify) && send_int(fd, c->delete_excluded) &&
-         send_int(fd, c->delete_after) && send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) &&
-         send_int(fd, c->relative) && send_int(fd, c->prune_empty_dirs);
+  return send_int(fd, c->ignore_existing) && send_int(fd, c->update) && send_int(fd, c->inplace) &&
+         send_int(fd, c->append) && send_int(fd, c->append_verify) &&
+         send_int(fd, c->delete_excluded) && send_int(fd, c->delete_after) &&
+         send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
+         send_int(fd, c->prune_empty_dirs);
 }
 
 static bool send_resume_options(int fd, const Config* c) {
@@ -304,8 +307,8 @@ static bool receive_file_options(int fd, Config* c) {
 }
 
 static bool receive_selection_options(int fd, Config* c) {
-  bool* flags[] = {&c->update,        &c->inplace,         &c->append,
-                   &c->append_verify, &c->delete_excluded, &c->delete_after};
+  bool* flags[] = {&c->ignore_existing, &c->update,          &c->inplace,     &c->append,
+                   &c->append_verify,   &c->delete_excluded, &c->delete_after};
   for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
     if (!receive_wire_bool(fd, flags[i]))
       return false;

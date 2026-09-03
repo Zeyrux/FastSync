@@ -76,6 +76,7 @@ typedef struct Config {
   bool human_readable;
 
   // Issue #127: Transfer modes
+  bool ignore_existing;
   bool update;
   bool inplace;
   bool append;

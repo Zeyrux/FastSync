@@ -181,6 +181,19 @@ static void test_parse_args_valid_port() {
   config_delete(cfg);
 }
 
+static void test_parse_args_ignore_existing() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--ignore-existing", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_TRUE(cfg->ignore_existing);
+
+  config_delete(cfg);
+}
+
 /* Test parse_args rejects port > 65535 */
 static void test_parse_args_invalid_port() {
   Config* cfg = config_create();
@@ -352,6 +365,7 @@ void test_client_cli() {
   test_parse_args_help();
   test_parse_args_version();
   test_parse_args_valid_port();
+  test_parse_args_ignore_existing();
   test_parse_args_invalid_port();
   test_parse_args_non_numeric_port();
   test_parse_args_invalid_server_port();

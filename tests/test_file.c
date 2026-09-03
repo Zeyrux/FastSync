@@ -88,6 +88,38 @@ static void test_file_save_to_disk() {
   rmdir("test_save_tmp");
 }
 
+static void test_file_save_to_disk_ignore_existing() {
+  const char* path = "test_ignore_existing_tmp/existing.txt";
+  EXPECT_TRUE(file_write_to_disk(path, "old", 3, false, false));
+
+  File* file = file_create("existing.txt");
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(3);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, "new", 3);
+  file->data->size = 3;
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->ignore_existing = true;
+  EXPECT_TRUE(file_save_to_disk("test_ignore_existing_tmp", file, config));
+
+  FILE* stream = fopen(path, "rb");
+  char content[4] = {0};
+  EXPECT_NOT_NULL(stream);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (stream) {
+    EXPECT_EQ_INT((int)fread(content, 1, 3, stream), 3);
+    fclose(stream);
+  }
+  EXPECT_EQ_STR(content, "old");
+
+  file_destroy(file);
+  config_delete(config);
+  unlink(path);
+  rmdir("test_ignore_existing_tmp");
+}
+
 static void test_file_write_to_disk_basic() {
   const char* content = "Basic file_write_to_disk test";
   EXPECT_TRUE(file_write_to_disk("test_file_write_to_disk_basic.txt", content, strlen(content),
@@ -458,6 +490,7 @@ void test_file() {
   test_file_load_data();
   test_file_load_data_missing_file();
   test_file_save_to_disk();
+  test_file_save_to_disk_ignore_existing();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_creates_dirs();
   test_file_write_to_disk_does_not_follow_symlink();

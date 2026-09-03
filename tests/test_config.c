@@ -126,6 +126,7 @@ static void test_config_send_receive() {
   send_cfg->use_metadata = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
+  send_cfg->ignore_existing = true;
 
   /* Use socketpair for bidirectional communication */
   int p[2];
@@ -159,6 +160,8 @@ static void test_config_send_receive() {
       if (recv_cfg->compression_level != 5)
         ok = false;
       if (recv_cfg->chunk_size != 1024)
+        ok = false;
+      if (!recv_cfg->ignore_existing)
         ok = false;
     }
     config_delete(recv_cfg);

@@ -153,6 +153,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
     {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
+    {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
