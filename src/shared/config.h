@@ -132,7 +132,7 @@ typedef struct Config {
   bool skip_compress_set;
 } Config;
 
-#define PROTOCOL_VERSION "2.2.0"
+#define PROTOCOL_VERSION "2.2.1"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

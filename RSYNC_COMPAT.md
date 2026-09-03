@@ -174,7 +174,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--compress-choice=STR` | Choose compression algorithm | ❌ Not Implemented | Removed because it had no effect; FastSync always uses zstd |
 | `--compress-level=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
-| `--skip-compress=LIST` | Skip compress for suffixes | ✅ Implemented | Comma-separated, case-insensitive suffix list; empty list skips none |
+| `--skip-compress=LIST` | Skip compress for suffixes | ✅ Implemented | Comma-separated, case-insensitive suffix list; empty list skips none; incompatible with FastSync chunk serialization (`-s`) |
 
 ## 13. Connectivity
 
@@ -253,7 +253,6 @@ Ranked by user demand, implementation complexity, and interoperability impact:
 | 7 | `--delay-updates` | Medium | High — atomic updates |
 | 8 | `--chmod` | Low | Medium — permission flexibility |
 | 9 | `--executability` / `-E` | Low | Low — simple flag |
-| 10 | `--skip-compress` | Low | Medium — performance tuning |
 
 ---
 

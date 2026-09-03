@@ -121,11 +121,15 @@ static void test_config_send_receive() {
   send_cfg->receive_root_directory = str_dup("/send/dst");
   send_cfg->save_to_disk = true;
   send_cfg->use_multithreading = true;
-  send_cfg->use_chunk_serialization = true;
+  send_cfg->use_chunk_serialization = false;
   send_cfg->use_compression = true;
   send_cfg->use_metadata = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
+  send_cfg->skip_compress_set = true;
+  send_cfg->skip_compress_count = 1;
+  send_cfg->skip_compress_suffixes = calloc(1, sizeof(char*));
+  send_cfg->skip_compress_suffixes[0] = str_dup(".zip");
 
   /* Use socketpair for bidirectional communication */
   int p[2];
@@ -154,11 +158,14 @@ static void test_config_send_receive() {
         ok = false;
       if (!recv_cfg->use_multithreading)
         ok = false;
-      if (!recv_cfg->use_chunk_serialization)
+      if (recv_cfg->use_chunk_serialization)
         ok = false;
       if (recv_cfg->compression_level != 5)
         ok = false;
       if (recv_cfg->chunk_size != 1024)
+        ok = false;
+      if (!recv_cfg->skip_compress_set || recv_cfg->skip_compress_count != 1 ||
+          strcmp(recv_cfg->skip_compress_suffixes[0], ".zip") != 0)
         ok = false;
     }
     config_delete(recv_cfg);

@@ -459,7 +459,10 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
-  if (config->use_compression) {
+  if (config->use_compression &&
+      !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
+                                             config->skip_compress_set ? config->skip_compress_count
+                                                                       : -1)) {
     Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
     data_destroy(file_data);
     if (uncompressed == NULL) {

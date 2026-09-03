@@ -36,6 +36,9 @@ static void test_validate_config_incompatible_options() {
   cfg->use_incremental = true;
   cfg->use_chunk_serialization = true;
   EXPECT_FALSE(validate_config(cfg));
+  cfg->use_incremental = false;
+  cfg->skip_compress_set = true;
+  EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
 

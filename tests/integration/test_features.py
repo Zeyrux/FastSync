@@ -80,6 +80,35 @@ class TestSkipCompress:
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
 
+    def test_skip_compress_incremental_full_fallback(self, shared_server):
+        clean_dir(DEST_DIR)
+        path = os.path.join(SOURCE_DIR, "incremental-skip.TXT")
+        with open(path, "wb") as f:
+            f.write(b"original skipped content\n")
+        flags = ["-c", "-M", "--skip-compress=.txt"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"Initial sync failed: {(result.stderr or result.stdout)[:200]}"
+        with open(path, "wb") as f:
+            f.write(b"updated skipped content\n")
+        result, _ = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=flags + ["--incremental"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Incremental sync failed: {(result.stderr or result.stdout)[:200]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        with open(os.path.join(received, "incremental-skip.TXT"), "rb") as f:
+            assert f.read() == b"updated skipped content\n"
+
+    def test_skip_compress_rejects_chunk_serialization(self, shared_server):
+        result, _ = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["-c", "-s", "--skip-compress=.txt"],
+            port=shared_server.port,
+        )
+        assert result.returncode != 0
+        assert "cannot be combined" in (result.stderr or result.stdout)
+
 
 class TestExclude:
     def test_exclude_single(self, shared_server):

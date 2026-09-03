@@ -23,6 +23,11 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "--incremental is not supported with -s (chunk serialization)");
     return false;
   }
+  if (config->skip_compress_set && config->use_chunk_serialization) {
+    log_message(LOG_LEVEL_ERROR,
+                "--skip-compress cannot be combined with -s (chunk serialization)");
+    return false;
+  }
   if (config->use_delta && !config->use_incremental) {
     log_message(LOG_LEVEL_ERROR, "--delta requires --incremental");
     return false;
