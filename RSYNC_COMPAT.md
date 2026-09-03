@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 34 | Feature works end-to-end |
+| ✅ Implemented | 35 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
-| ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
-| ❌ Not Implemented | 98 | Flag not recognized or no behavior |
-| **Total** | **136** | |
+| ⚠️ Partial | 3 | Flag parsed/stored but behavior incomplete |
+| ❌ Not Implemented | 97 | Flag not recognized or no behavior |
+| **Total** | **138** | |
 
 ---
 
@@ -60,7 +60,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-I`, `--ignore-times` | Don't skip files matching size+time | ❌ Not Implemented | |
 | `--size-only` | Skip based on size only | ❌ Not Implemented | |
 | `-@`, `--modify-window=NUM` | Mod-time comparison accuracy | ❌ Not Implemented | |
-| `--existing` | Skip creating new files on receiver | ❌ Not Implemented | |
+| `--existing` | Skip creating new files on receiver | ✅ Implemented | Existing destination files continue through normal update handling |
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
 | `--remove-source-files` | Sender removes synced files | ❌ Not Implemented | |
 
@@ -247,7 +247,7 @@ Ranked by user demand, implementation complexity, and interoperability impact:
 | 1 | `--whole-file` / `-W` | Low | High — users expect opt-out of delta |
 | 2 | `--ignore-times` / `-I` | Low | Medium — useful for forcing re-transfer |
 | 3 | `--size-only` | Low | Medium — common migration scenario |
-| 4 | `--existing` / `--ignore-existing` | Low | Medium — common sync patterns |
+| 4 | `--ignore-existing` | Low | Medium — common sync patterns |
 | 5 | `--remove-source-files` | Low | High — common for moves/backup |
 | 6 | `--delete-during` | Medium | High — performance improvement |
 | 7 | `--delay-updates` | Medium | High — atomic updates |
