@@ -210,6 +210,7 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
+  bool verbose = false;
   for (int i = 1; i < argc; i++) {
     const OptionEntry* entry = find_table_option(argv[i]);
     if (entry) {
@@ -350,10 +351,9 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
           0)
         return -1;
     } else if (opt_is(argv[i], "-v", "--verbose")) {
-      set_log_level(LOG_LEVEL_DEBUG);
+      verbose = true;
     } else if (opt_is(argv[i], "-q", "--quiet")) {
       config->quiet = true;
-      set_log_level(LOG_LEVEL_ERROR);
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
@@ -378,6 +378,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
     }
   }
+  set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   return 0;
 }
 

@@ -321,16 +321,17 @@ static void test_parse_args_rejects_unimplemented_options() {
   }
 }
 
-/* Test both rsync-compatible quiet spellings. */
+/* Test both rsync-compatible quiet spellings and option ordering. */
 static void test_parse_args_quiet() {
-  static const char* const options[] = {"-q", "--quiet"};
+  static const char* const options[][2] = {
+      {"-q", "-v"}, {"-v", "-q"}, {"--quiet", "-v"}, {"-v", "--quiet"}};
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
-    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
+    char* argv[] = {"fastsync", (char*)options[i][0], (char*)options[i][1], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
 
-    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
     EXPECT_TRUE(cfg->quiet);
     config_delete(cfg);
   }

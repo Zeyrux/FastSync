@@ -52,6 +52,22 @@ class TestDryRun:
         assert result.returncode != 0
         assert result.stderr != ""
 
+    @pytest.mark.parametrize("flags", [["-q", "-v"], ["-v", "-q"]])
+    def test_quiet_successful_transfer_and_verbose_order(self, shared_server, flags):
+        clean_dir(DEST_DIR)
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=flags,
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
+        assert result.stdout == ""
+        assert result.stderr == ""
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
 
 class TestArchiveMode:
     def test_archive_mode(self, shared_server):
