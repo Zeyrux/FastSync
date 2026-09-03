@@ -2,6 +2,7 @@
 #include "file.h"
 #include "log.h"
 #include "protocol.h"
+#include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -183,8 +184,12 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   if (metadata == NULL)
     return;
   mode_t safe_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
-  if (chmod(path, safe_mode) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
+  if (chmod(path, safe_mode) != 0) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s",
+                escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+    free(escaped_path);
+  }
   /* Never apply client-supplied ownership.  The descriptor API below is the
      receiver write path; retain this legacy API only for compatibility. */
   struct timespec times[2];
@@ -192,8 +197,12 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata) {
   times[0].tv_nsec = UTIME_OMIT;
   times[1].tv_sec = metadata->mtime_sec;
   times[1].tv_nsec = metadata->mtime_nsec;
-  if (utimensat(AT_FDCWD, path, times, 0) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
+  if (utimensat(AT_FDCWD, path, times, 0) != 0) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s",
+                escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+    free(escaped_path);
+  }
 }
 
 bool file_restore_metadata_fd(int fd, const FileMetadata* metadata) {

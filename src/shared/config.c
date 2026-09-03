@@ -130,6 +130,7 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delete_after) && valid_wire_bool(config->relative) &&
          valid_wire_bool(config->prune_empty_dirs) && valid_wire_bool(config->partial) &&
          valid_wire_bool(config->delete_before) && valid_wire_bool(config->checksum) &&
+         valid_wire_bool(config->eight_bit_output) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -219,11 +220,11 @@ void config_delete(Config* config) {
  * helper call order in config_send and config_receive unchanged when adding
  * fields. */
 static bool send_core_fields(int fd, const Config* c) {
-  return send_str(fd, c->version) && send_str(fd, c->send_directory) &&
-         send_str(fd, c->receive_root_directory) && send_int(fd, c->save_to_disk) &&
-         send_int(fd, c->use_multithreading) && send_int(fd, c->use_chunk_serialization) &&
-         send_int(fd, c->use_compression) && send_int(fd, c->use_metadata) &&
-         send_int(fd, c->compression_level) &&
+  return send_str(fd, c->version) && send_int(fd, c->eight_bit_output) &&
+         send_str(fd, c->send_directory) && send_str(fd, c->receive_root_directory) &&
+         send_int(fd, c->save_to_disk) && send_int(fd, c->use_multithreading) &&
+         send_int(fd, c->use_chunk_serialization) && send_int(fd, c->use_compression) &&
+         send_int(fd, c->use_metadata) && send_int(fd, c->compression_level) &&
          send_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)) && send_int(fd, c->use_sendfile);
 }
 
@@ -259,6 +260,9 @@ static bool send_resume_options(int fd, const Config* c) {
 
 static bool receive_core_fields(int fd, Config* c) {
   int value;
+  if (!receive_wire_bool(fd, &c->eight_bit_output))
+    return false;
+  log_set_8_bit_output(c->eight_bit_output);
   c->send_directory = receive_str(fd);
   c->receive_root_directory = receive_str(fd);
   if (!c->send_directory || !c->receive_root_directory)

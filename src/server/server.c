@@ -232,6 +232,7 @@ void handler(int file_descriptor) {
     protocol_session_unbind();
     return;
   }
+  log_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
     config_delete(config);
