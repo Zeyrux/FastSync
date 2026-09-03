@@ -59,6 +59,13 @@ static void test_validate_config_delta_sendfile_constraints() {
   cfg->use_incremental = true;
   cfg->use_sendfile = true;
   EXPECT_FALSE(validate_config(cfg));
+
+  /* Whole-file makes delta selection inactive, so these combinations are valid. */
+  cfg->whole_file = true;
+  EXPECT_TRUE(validate_config(cfg));
+
+  cfg->use_incremental = false;
+  EXPECT_TRUE(validate_config(cfg));
   config_delete(cfg);
 }
 
