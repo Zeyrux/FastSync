@@ -66,8 +66,9 @@ replacement for every rsync feature or protocol mode.
 - Owner/group, ACL, xattr, hard-link, device, and special-file handling is
   incomplete or unavailable.
 - Sparse-file handling does not yet preserve all holes correctly.
-- `--partial`, `--partial-dir`, `--append`, and `--append-verify` are not yet
-  full rsync-style resumable transfers.
+- `--partial`, `--partial-dir`, `-P`, `--append`, and `--append-verify` are not
+  yet full rsync-style resumable transfers. Interrupted files are not retained
+  for resumption.
 - Several rsync short options currently have FastSync-specific meanings. Do
   not assume every short option is interchangeable yet.
 
@@ -95,7 +96,7 @@ partial, alternate, and planned behavior.
 | `-p <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
 | `--progress` | Show real-time transfer speed |
-| `-P` | Alias for `--partial --progress` |
+| `-P` | Enables partial-transfer mode and progress output (partial retention is incomplete) |
 | `--delete` | Delete files on receiver not present in source |
 | `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
 | `--exclude-from <file>` | Read exclude patterns from a file (one per line) |

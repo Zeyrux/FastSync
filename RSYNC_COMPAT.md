@@ -6,9 +6,9 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 35 | Feature works end-to-end |
+| ✅ Implemented | 34 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
-| ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
+| ⚠️ Partial | 2 | Flag parsed/stored but behavior incomplete |
 | ❌ Not Implemented | 97 | Flag not recognized or no behavior |
 | **Total** | **136** | |
 
@@ -39,7 +39,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-h`, `--human-readable` | Human-readable numbers | ❌ Not Implemented | Removed because it had no effect |
 | `-i`, `--itemize-changes` | Per-file change summary | ❌ Not Implemented | Removed because it had no effect |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
-| `-P` | Same as --partial --progress | ✅ Implemented | Enables both existing `--partial` and `--progress` behavior |
+| `-P` | Same as --partial --progress | ⚠️ Partial | Parses and enables progress, but interrupted files are not retained for resumable transfers |
 | `--out-format=FORMAT` | Custom output format | ❌ Not Implemented | Removed because it had no effect |
 | `--log-file=FILE` | Log to file | ✅ Implemented | `log_file` config field |
 | `--log-file-format=FMT` | Log format | ❌ Not Implemented | |

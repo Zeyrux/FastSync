@@ -20,7 +20,7 @@ void print_usage(void) {
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  -p <port>           SSH port (default: 22)\n");
   printf("  --progress          Show transfer progress\n");
-  printf("  -P                  Alias for --partial --progress\n");
+  printf("  -P                  Partial mode with progress (retention incomplete)\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
@@ -59,8 +59,8 @@ void print_usage(void) {
   printf("  --stats             Print transfer statistics at end\n");
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  --log-file <path>   Write log messages to file\n");
-  printf("  --partial           Keep partial files on interrupted transfer\n");
-  printf("  --partial-dir <dir> Directory for partial files\n");
+  printf("  --partial           Use partial-transfer mode (retention incomplete)\n");
+  printf("  --partial-dir <dir> Use a separate partial-transfer directory\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf("  -l, --links         Copy symlinks as symlinks\n");

@@ -339,7 +339,7 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
-/* Test rsync-compatible -P enables both partial files and progress output. */
+/* Test rsync-compatible -P parsing; resumable partial-file retention is not implied. */
 static void test_parse_args_partial_progress() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "-P", "/src", "/dst"};
