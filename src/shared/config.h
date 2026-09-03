@@ -96,7 +96,6 @@ typedef struct Config {
   // Issue #130: Remote shell/connection options
   char* rsh_command;
   char* rsync_path;
-  bool use_secluded_args;
   char* temp_dir;
   char* compare_dest;
   char* copy_dest;

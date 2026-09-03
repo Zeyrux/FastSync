@@ -6,9 +6,10 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 34 | Feature works end-to-end |
+| ✅ Implemented | 33 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
+| 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
 | ❌ Not Implemented | 98 | Flag not recognized or no behavior |
 | **Total** | **136** | |
 
@@ -233,7 +234,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--protocol=NUM` | Force older protocol version | ❌ Not Implemented | |
 | `--iconv=CONVERT_SPEC` | Charset conversion | ❌ Not Implemented | |
 | `--checksum-seed=NUM` | Set checksum seed | ❌ Not Implemented | |
-| `--secluded-args` | Use protocol to send args | ✅ Implemented | SSH already sends transfer configuration through FastSync's protocol; `-s` remains chunk serialization because of the existing FastSync short-option meaning. |
+| `--secluded-args` | Use protocol to send args | 🔄 Compatibility No-op | Accepted for CLI compatibility; it does not change FastSync transport or protocol behavior. `-s` remains chunk serialization. |
 | `--no-OPTION` | Turn off implied option | ❌ Not Implemented | |
 
 ---

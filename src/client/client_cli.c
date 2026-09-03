@@ -121,6 +121,7 @@ static int config_add_pattern(char*** patterns, int* count, const char* value,
 
 typedef enum {
   OPT_FLAG,
+  OPT_NOOP,
   OPT_STRING,
   OPT_POS_INT,
   OPT_NONNEG_INT,
@@ -131,10 +132,10 @@ typedef struct {
   const char* name;
   const char* alias;
   OptKind kind;
-  size_t offset; /* offsetof of the target field in Config */
+  size_t offset; /* offsetof of the target field in Config, or 0 for OPT_NOOP */
 } OptionEntry;
 
-/* Options that map directly onto a Config field with no side effects. */
+/* Options parsed directly into Config, plus compatibility options with no effect. */
 static const OptionEntry OPTION_TABLE[] = {
     {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
     {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
@@ -146,7 +147,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
     {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
-    {"--secluded-args", NULL, OPT_FLAG, offsetof(Config, use_secluded_args)},
+    {"--secluded-args", NULL, OPT_NOOP, 0},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
     {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
     {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
@@ -186,10 +187,15 @@ static const OptionEntry* find_table_option(const char* arg) {
 }
 
 static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
+  if (entry->kind == OPT_NOOP)
+    return 0;
+
   void* field = (char*)config + entry->offset;
   switch (entry->kind) {
   case OPT_FLAG:
     *(bool*)field = true;
+    return 0;
+  case OPT_NOOP:
     return 0;
   case OPT_STRING:
     return set_string_option((char**)field, value, entry->name);
