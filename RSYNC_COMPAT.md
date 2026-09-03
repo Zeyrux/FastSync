@@ -21,7 +21,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-a`, `--archive` | Archive mode is -rlptgoD | 🔀 Alt Arg | Maps to -c -m -M (compression + multithread + metadata) |
 | `-v`, `--verbose` | Increase verbosity | ✅ Implemented | Sets `log_level=DEBUG` |
 | `-q`, `--quiet` | Suppress non-error messages | ❌ Not Implemented | Removed because it had no effect |
-| `--help` | Show help | ✅ Implemented | Prints usage and exits; `-h` is not accepted |
+| `--help` | Show help | ✅ Implemented | Prints usage and exits |
 | `-V`, `--version` | Print version | ✅ Implemented | |
 | `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
 | `--debug=FLAGS` | Fine-grained debug verbosity | ❌ Not Implemented | Removed because it had no effect |
@@ -36,7 +36,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `--stats` | Give transfer stats | ✅ Implemented | Prints file/byte counts |
-| `-h`, `--human-readable` | Human-readable numbers | ❌ Not Implemented | Removed because it had no effect |
+| `-h`, `--human-readable` | Human-readable numbers | ✅ Implemented | Formats transfer byte sizes using binary units |
 | `-i`, `--itemize-changes` | Per-file change summary | ❌ Not Implemented | Removed because it had no effect |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
 | `-P` | Same as --partial --progress | ❌ Not Implemented | |

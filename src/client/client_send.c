@@ -28,6 +28,14 @@
 /* Forward declaration for progress-reporting thread used in multithreaded send. */
 static int progress_thread_fn(void* arg);
 
+static const char* display_bytes(unsigned long long bytes, bool human_readable, char* buffer,
+                                 size_t buffer_size) {
+  if (human_readable && format_human_bytes(bytes, buffer, buffer_size))
+    return buffer;
+  snprintf(buffer, buffer_size, "%.1f MB", bytes / 1048576.0);
+  return buffer;
+}
+
 static ScannerOptions scanner_options_from_config(const Config* config, int num_threads) {
   ScannerOptions options = {
       config->use_metadata,  config->chunk_size,        config->exclude_patterns,
@@ -134,17 +142,26 @@ static int send_dry_run_manifest(const Config* config) {
   Chunk* chunk;
   int file_count = 0;
   unsigned long long total_bytes = 0;
+  char size_buffer[32];
   printf("Dry run: files to be transferred\n");
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
-      printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+      if (config->human_readable)
+        printf("  %s (%s)\n", chunk->items[i]->path,
+               display_bytes(chunk->items[i]->data->size, true, size_buffer, sizeof(size_buffer)));
+      else
+        printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
       total_bytes += chunk->items[i]->data->size;
       file_count++;
     }
     chunk_destroy(chunk);
   }
   directory_scanner_destroy(scanner);
-  printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
+  if (config->human_readable)
+    printf("Total: %d files, %s\n", file_count,
+           display_bytes(total_bytes, true, size_buffer, sizeof(size_buffer)));
+  else
+    printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
   return 0;
 }
 
@@ -548,10 +565,20 @@ static int load_files_multithreaded(void* pipeline_context) {
    line (e.g. "Done.\n") or is "" for in-place refresh. Shared by the
    single-threaded loop and the multithreaded progress thread. */
 static void print_transfer_progress(unsigned long long total_bytes, time_t start,
-                                    const char* suffix) {
+                                    const char* suffix, bool human_readable) {
   double elapsed = difftime(time(NULL), start);
   double rate = elapsed > 0.0 ? total_bytes / (1048576.0 * elapsed) : 0.0;
-  fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  %s", total_bytes / 1048576.0, rate, suffix);
+  if (human_readable) {
+    char total_buffer[32];
+    char rate_buffer[32];
+    fprintf(stderr, "\rSent %s  (%s/s)  %s",
+            display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
+            display_bytes((unsigned long long)(rate * 1048576.0), true, rate_buffer,
+                          sizeof(rate_buffer)),
+            suffix);
+  } else {
+    fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  %s", total_bytes / 1048576.0, rate, suffix);
+  }
   fflush(stderr);
 }
 
@@ -569,14 +596,14 @@ static int progress_thread_fn(void* arg) {
     mtx_unlock(&context->mutex_progress);
 
     if (done) {
-      print_transfer_progress(total, start, "Done.\n");
+      print_transfer_progress(total, start, "Done.\n", context->config->human_readable);
       break;
     }
 
     time_t now = time(NULL);
     if (now - last_progress >= 1) {
       last_progress = now;
-      print_transfer_progress(total, start, "");
+      print_transfer_progress(total, start, "", context->config->human_readable);
     }
 
     struct timespec ts = {0, 100 * 1000000L}; /* 100 ms */
@@ -650,12 +677,12 @@ int send_files(Config* config) {
       manifest = NULL;
       break;
     }
+    total_bytes += chunk_bytes;
     if (config->show_progress) {
-      total_bytes += chunk_bytes;
       time_t now = time(NULL);
       if (now - last_progress >= 1) {
         last_progress = now;
-        print_transfer_progress(total_bytes, start, "");
+        print_transfer_progress(total_bytes, start, "", config->human_readable);
       }
     }
     chunk_destroy(current_chunk);
@@ -673,12 +700,21 @@ int send_files(Config* config) {
   }
   bool ok = finalize_transfer(client);
   if (config->show_progress)
-    print_transfer_progress(total_bytes, start, "Done.\n");
+    print_transfer_progress(total_bytes, start, "Done.\n", config->human_readable);
   if (config->stats) {
     double elapsed_total = difftime(time(NULL), start);
     double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
-    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files, total_bytes / 1048576.0,
-            rate);
+    if (config->human_readable) {
+      char total_buffer[32];
+      char rate_buffer[32];
+      fprintf(stderr, "Stats: %d files, %s, %s/s\n", total_files,
+              display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
+              display_bytes((unsigned long long)(rate * 1048576.0), true, rate_buffer,
+                            sizeof(rate_buffer)));
+    } else {
+      fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files, total_bytes / 1048576.0,
+              rate);
+    }
   }
   ret = ok ? 0 : 1;
 

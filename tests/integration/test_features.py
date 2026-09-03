@@ -26,6 +26,12 @@ def setup_test_data():
 
 
 class TestDryRun:
+    def test_human_readable_dry_run(self):
+        result, dur = run_client(SOURCE_DIR, DEST_DIR, flags=["-h", "--dry-run"])
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
+        assert "Total:" in result.stdout
+        assert "KB" in result.stdout
+
     def test_dry_run(self):
         clean_dir(DEST_DIR)
         result, dur = run_client(
@@ -262,6 +268,17 @@ class TestProgress:
         output = result.stdout + result.stderr
         assert "Sent " in output and "MB" in output, "--progress produced no stable byte marker"
         assert "Done." in output, "--progress did not report completion"
+
+    def test_human_readable_stats(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["-h", "--stats"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
+        assert "Stats:" in result.stderr
+        assert "KB" in result.stderr
 
 
 class TestBandwidthLimit:

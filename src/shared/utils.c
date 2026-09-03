@@ -187,6 +187,25 @@ bool glob_match(const char* pattern, const char* str) {
   return *str == '\0';
 }
 
+bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_size) {
+  static const char* const units[] = {"B", "KB", "MB", "GB", "TB", "PB", "EB"};
+  double value = (double)bytes;
+  size_t unit = 0;
+  int written;
+
+  if (!buffer || buffer_size == 0)
+    return false;
+  while (value >= 1024.0 && unit < sizeof(units) / sizeof(units[0]) - 1) {
+    value /= 1024.0;
+    unit++;
+  }
+  if (unit == 0)
+    written = snprintf(buffer, buffer_size, "%llu %s", bytes, units[unit]);
+  else
+    written = snprintf(buffer, buffer_size, "%.1f %s", value, units[unit]);
+  return written >= 0 && (size_t)written < buffer_size;
+}
+
 static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   size_t len = strlen(rel_path);
   for (int i = 0; i < manifest->size; i++) {

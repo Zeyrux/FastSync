@@ -145,6 +145,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},
     {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
     {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
+    {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
     {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
