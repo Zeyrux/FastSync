@@ -188,11 +188,11 @@ static void test_config_send_receive() {
 }
 
 static void test_config_send_receive_version_mismatch() {
-  /* Create a config with a different protocol version */
+  /* A peer using the previous wire format must be rejected. */
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
-  cfg->version = str_dup("0.0");
+  cfg->version = str_dup("2.2.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 

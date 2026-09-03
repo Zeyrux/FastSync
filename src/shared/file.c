@@ -172,8 +172,17 @@ bool file_set_authorized_root(int fd, const char* canonical_path) {
 }
 
 bool file_path_exists_secure(const char* path) {
+  if (!path)
+    return false;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return false;
   struct stat st;
-  return file_stat_secure(path, &st);
+  bool exists = fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0;
+  close(parent_fd);
+  free(leaf);
+  return exists;
 }
 
 bool file_stat_secure(const char* path, struct stat* st) {
@@ -302,8 +311,9 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
   return ok;
 }
 
-bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                         bool inplace, bool sparse, const FileMetadata* metadata) {
+static bool file_to_disk_secure_impl(const char* path, const void* data,
+                                     unsigned long long data_size, bool inplace, bool sparse,
+                                     const FileMetadata* metadata, bool no_replace) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -334,8 +344,20 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
       if (close(fd) != 0)
         ok = false;
       fd = -1;
-      if (ok && renameat(dirfd, tmp, dirfd, leaf) != 0)
-        ok = false;
+      if (ok) {
+        if (no_replace) {
+          /* The probe and commit cannot be one operation. A concurrent
+             creator may win; EEXIST is then the requested skip. */
+          if (linkat(dirfd, tmp, dirfd, leaf, 0) == 0 || errno == EEXIST) {
+            if (unlinkat(dirfd, tmp, 0) != 0 && errno != ENOENT)
+              ok = false;
+          } else {
+            ok = false;
+          }
+        } else if (renameat(dirfd, tmp, dirfd, leaf) != 0) {
+          ok = false;
+        }
+      }
       if (!ok)
         unlinkat(dirfd, tmp, 0);
     }
@@ -345,6 +367,17 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
   close(dirfd);
   free(leaf);
   return ok;
+}
+
+bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
+                         bool inplace, bool sparse, const FileMetadata* metadata) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, false);
+}
+
+bool file_to_disk_secure_no_replace(const char* path, const void* data,
+                                    unsigned long long data_size, bool sparse,
+                                    const FileMetadata* metadata) {
+  return file_to_disk_secure_impl(path, data, data_size, false, sparse, metadata, true);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

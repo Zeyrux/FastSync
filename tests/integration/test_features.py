@@ -225,16 +225,20 @@ class TestIgnoreExisting:
         with open(existing_file, "wb") as f:
             f.write(b"destination content\n")
         new_source = os.path.join(SOURCE_DIR, "new.txt")
-        with open(new_source, "wb") as f:
-            f.write(b"new file\n")
+        try:
+            with open(new_source, "wb") as f:
+                f.write(b"new file\n")
 
-        result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["--ignore-existing"], port=shared_server.port)
-        assert result.returncode == 0, f"Sync failed: {(result.stderr or result.stdout)[:200]}"
-        with open(existing_file, "rb") as f:
-            assert f.read() == b"destination content\n"
-        with open(os.path.join(received, "new.txt"), "rb") as f:
-            assert f.read() == b"new file\n"
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=["--ignore-existing"], port=shared_server.port)
+            assert result.returncode == 0, f"Sync failed: {(result.stderr or result.stdout)[:200]}"
+            with open(existing_file, "rb") as f:
+                assert f.read() == b"destination content\n"
+            with open(os.path.join(received, "new.txt"), "rb") as f:
+                assert f.read() == b"new file\n"
+        finally:
+            if os.path.lexists(new_source):
+                os.unlink(new_source)
 
 
 class TestDelete:
