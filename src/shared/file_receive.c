@@ -22,7 +22,9 @@
 #define MAX_FILE_DATA_SIZE MAX_RECEIVE_FILE_SIZE
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
-  bool backup_enabled = config && config->backup;
+  /* Backups are incompatible with ignore-existing: moving the entry first
+     would make a concurrent no-replace commit overwrite its old name. */
+  bool backup_enabled = config && config->backup && !config->ignore_existing;
   bool inplace = config && config->inplace;
   bool sparse = config && config->preserve_sparse;
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
@@ -64,9 +66,8 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   /* --ignore-existing checks the final destination before partial files or
      overwrite policies can modify it. */
   if (config && config->ignore_existing) {
-    struct stat destination_stat;
     char* final_path = path_cat(root_directory, file->path);
-    bool exists = final_path && file_stat_secure(final_path, &destination_stat);
+    bool exists = final_path && file_path_exists_secure(final_path);
     free(final_path);
     if (exists) {
       free(confined_backup);

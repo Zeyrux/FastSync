@@ -120,6 +120,67 @@ static void test_file_save_to_disk_ignore_existing() {
   rmdir("test_ignore_existing_tmp");
 }
 
+static void test_file_save_to_disk_ignore_existing_entry_types() {
+  const char* root = "test_ignore_existing_entries_tmp";
+  const char* directory = "test_ignore_existing_entries_tmp/directory";
+  const char* link = "test_ignore_existing_entries_tmp/link";
+  const char* target = "test_ignore_existing_entries_tmp/target";
+  const char* backup = "test_ignore_existing_entries_tmp/backup.txt~";
+  const char* backup_file = "test_ignore_existing_entries_tmp/backup.txt";
+  Config* config = config_create();
+  File* file = file_create("unused");
+
+  unlink(link);
+  unlink(target);
+  unlink(backup);
+  unlink(backup_file);
+  rmdir(directory);
+  rmdir(root);
+  EXPECT_NOT_NULL(config);
+  EXPECT_NOT_NULL(file);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (!config || !file)
+    return;
+  config->ignore_existing = true;
+  config->backup = true;
+  file->data->data = malloc(3);
+  EXPECT_NOT_NULL(file->data->data);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (!file->data->data) {
+    file_destroy(file);
+    config_delete(config);
+    return;
+  }
+  memcpy(file->data->data, "new", 3);
+  file->data->size = 3;
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(directory, 0755), 0);
+  EXPECT_TRUE(file_write_to_disk(target, "old", 3, false, false));
+  EXPECT_EQ_INT(symlink("target", link), 0);
+  free(file->path);
+  file->path = str_dup("directory");
+  EXPECT_TRUE(file_save_to_disk(root, file, config));
+  free(file->path);
+  file->path = str_dup("link");
+  EXPECT_TRUE(file_save_to_disk(root, file, config));
+
+  free(file->path);
+  file->path = str_dup("backup.txt");
+  EXPECT_TRUE(file_write_to_disk(backup_file, "old", 3, false, false));
+  EXPECT_TRUE(file_save_to_disk(root, file, config));
+  EXPECT_TRUE(file_path_exists_secure(backup_file));
+  EXPECT_FALSE(file_path_exists_secure(backup));
+
+  file_destroy(file);
+  config_delete(config);
+  unlink(link);
+  unlink(target);
+  unlink(backup_file);
+  rmdir(directory);
+  rmdir(root);
+}
+
 static void test_file_write_to_disk_basic() {
   const char* content = "Basic file_write_to_disk test";
   EXPECT_TRUE(file_write_to_disk("test_file_write_to_disk_basic.txt", content, strlen(content),
@@ -491,6 +552,7 @@ void test_file() {
   test_file_load_data_missing_file();
   test_file_save_to_disk();
   test_file_save_to_disk_ignore_existing();
+  test_file_save_to_disk_ignore_existing_entry_types();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_creates_dirs();
   test_file_write_to_disk_does_not_follow_symlink();
