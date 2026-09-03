@@ -4,7 +4,6 @@
 #include "array_list.h"
 #include <stddef.h>
 #include <stdbool.h>
-#include <stddef.h>
 
 bool mkdir_r(const char* path);
 char* str_dup(const char* string);

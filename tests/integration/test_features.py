@@ -280,6 +280,19 @@ class TestProgress:
         assert "Stats:" in result.stderr
         assert "KB" in result.stderr
 
+    def test_human_readable_progress_multithreaded(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["-m", "-h", "--progress"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
+        output = result.stdout + result.stderr
+        assert "Sent " in output
+        assert "KB" in output
+        assert "Done." in output
+
 
 class TestBandwidthLimit:
     def test_bwlimit_runs(self, shared_server):
