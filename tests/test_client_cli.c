@@ -260,6 +260,21 @@ static void test_parse_args_unknown_option() {
   config_delete(cfg);
 }
 
+/* Directory aliases require the not-yet-implemented --dirs behavior. */
+static void test_parse_args_rejects_dirs_aliases() {
+  static const char* const options[] = {"--dirs", "--old-dirs", "--old-d"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 /* Parsed-but-unimplemented options must fail instead of being silently accepted. */
 static void test_parse_args_rejects_unimplemented_options() {
   static const char* const options[] = {"-q",
@@ -358,6 +373,7 @@ void test_client_cli() {
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
   test_parse_args_unknown_option();
+  test_parse_args_rejects_dirs_aliases();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_archive();
 }

@@ -125,6 +125,7 @@ typedef enum {
   OPT_POS_INT,
   OPT_NONNEG_INT,
   OPT_ULL,
+  OPT_UNSUPPORTED,
 } OptKind;
 
 typedef struct {
@@ -153,6 +154,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
     {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
+    {"--dirs", "--old-dirs", OPT_UNSUPPORTED, 0},
+    {"--old-d", NULL, OPT_UNSUPPORTED, 0},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -203,6 +206,11 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     *(unsigned long long*)field = v;
     return 0;
   }
+  case OPT_UNSUPPORTED:
+    log_message(LOG_LEVEL_ERROR,
+                "%s requires --dirs, which is not implemented; refusing to ignore option",
+                entry->name);
+    return -1;
   }
   return -1;
 }

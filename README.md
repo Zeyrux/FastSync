@@ -68,6 +68,9 @@ replacement for every rsync feature or protocol mode.
 - Sparse-file handling does not yet preserve all holes correctly.
 - `--partial`, `--partial-dir`, `--append`, and `--append-verify` are not yet
   full rsync-style resumable transfers.
+- `--dirs` is not implemented. Its compatibility aliases `--old-dirs` and
+  `--old-d` are recognized but rejected explicitly rather than silently using
+  FastSync's recursive directory behavior.
 - Several rsync short options currently have FastSync-specific meanings. Do
   not assume every short option is interchangeable yet.
 

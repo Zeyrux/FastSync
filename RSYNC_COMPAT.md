@@ -71,7 +71,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-r`, `--recursive` | Recurse into directories | ✅ Implemented | Default behavior |
 | `-R`, `--relative` | Use relative path names | ❌ Not Implemented | Removed because it had no effect |
 | `--no-implied-dirs` | Don't send implied dirs with -R | ❌ Not Implemented | |
-| `-d`, `--dirs` | Transfer dirs without recursing | ❌ Not Implemented | |
+| `-d`, `--dirs`, `--old-dirs`, `--old-d` | Transfer dirs without recursing | ❌ Not Implemented | The aliases are recognized and rejected explicitly; they depend on the unimplemented `--dirs` behavior |
 | `--mkpath` | Create missing path components | ❌ Not Implemented | |
 
 ## 5. Transfer Modifications

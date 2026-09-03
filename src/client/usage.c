@@ -21,6 +21,8 @@ void print_usage(void) {
   printf("  -p <port>           SSH port (default: 22)\n");
   printf("  --progress          Show transfer progress\n");
   printf("  --delete            Delete files on receiver not in source\n");
+  printf(
+      "  --dirs, --old-dirs, --old-d  Transfer directories without recursing (not implemented)\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --exclude-from <file> Read exclude patterns from file\n");
