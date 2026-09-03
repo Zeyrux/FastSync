@@ -375,7 +375,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     close(old_fd);
   }
 
-  bool match = has_old_file && (unsigned long long)st.st_size == check_size;
+  bool match =
+      !config->ignore_times && has_old_file && (unsigned long long)st.st_size == check_size;
   if (match && config->checksum) {
     uint64_t old_checksum = old_size == 0 ? delta_xxhash64("", 0) : 0;
     if (old_data)

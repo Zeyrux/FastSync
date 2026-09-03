@@ -223,7 +223,7 @@ class TestIncremental:
         received_file = os.path.join(received, "small.txt")
         source_stat = os.stat(source_file)
         with open(received_file, "wb") as f:
-            f.write(b"stale data\n")
+            f.write(b"stale data!\n")
         os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
 
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
