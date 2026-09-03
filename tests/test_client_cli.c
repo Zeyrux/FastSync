@@ -358,13 +358,35 @@ static void test_parse_args_negations() {
 
 static void test_parse_args_negation_order() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--no-compress", "-c", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--no-z", "-c", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->use_compression);
   config_delete(cfg);
+}
+
+static void test_parse_args_no_preserve_blocks_implicit_metadata() {
+  static const char* const options[][3] = {
+      {"--incremental", "--no-preserve", "/src"},
+      {"--no-preserve", "--incremental", "/src"},
+      {"--delta", "--no-preserve", "/src"},
+      {"--no-preserve", "--delta", "/src"},
+  };
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i][0], (char*)options[i][1], (char*)options[i][2],
+                    "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->use_metadata);
+    EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+    config_delete(cfg);
+  }
 }
 
 static void test_parse_args_rejects_unsafe_negation() {
@@ -403,5 +425,6 @@ void test_client_cli() {
   test_parse_args_archive();
   test_parse_args_negations();
   test_parse_args_negation_order();
+  test_parse_args_no_preserve_blocks_implicit_metadata();
   test_parse_args_rejects_unsafe_negation();
 }

@@ -17,6 +17,7 @@ static void config_set_defaults(Config* config) {
   config->use_chunk_serialization = false;
   config->use_compression = false;
   config->use_metadata = false;
+  config->metadata_explicitly_disabled = false;
   config->show_progress = false;
   config->dry_run = false;
   config->use_delete = false;

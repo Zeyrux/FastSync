@@ -201,6 +201,7 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
 
     /* These options are also implied by --archive or handled outside the table. */
     {"compress", "c", offsetof(Config, use_compression)},
+    {"compress", "z", offsetof(Config, use_compression)},
     {"multithreading", "m", offsetof(Config, use_multithreading)},
     {"preserve", "M", offsetof(Config, use_metadata)},
     {"sendfile", "f", offsetof(Config, use_sendfile)},
@@ -238,6 +239,8 @@ static int apply_negation(Config* config, const char* arg) {
     return -1;
   }
   *(bool*)((char*)config + entry->offset) = false;
+  if (entry->offset == offsetof(Config, use_metadata))
+    config->metadata_explicitly_disabled = true;
   return 0;
 }
 
@@ -437,6 +440,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
     }
   }
+  /* Incremental and delta transfers need metadata unless the user disabled it. */
+  if ((config->use_incremental || config->use_delta) && !config->use_metadata &&
+      !config->metadata_explicitly_disabled) {
+    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for incremental/delta transfer");
+    config->use_metadata = true;
+  }
   return 0;
 }
 
@@ -541,16 +550,6 @@ int main(int argc, char* argv[]) {
   if (!validate_config(config)) {
     exit_code = 1;
     goto cleanup;
-  }
-
-  /* Enable implicit flags */
-  if (config->use_incremental && !config->use_metadata) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
-    config->use_metadata = true;
-  }
-  if (config->use_delta && !config->use_metadata) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --delta");
-    config->use_metadata = true;
   }
 
   /* Initialize TLS if needed */
