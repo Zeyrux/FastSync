@@ -28,7 +28,7 @@ bool compression_should_skip(const char* path) {
 }
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
-  log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
+  log_debug_message(LOG_DEBUG_UTIL, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data* compressed_data = data_create_empty(dst_size);
   if (compressed_data == NULL)
@@ -66,8 +66,8 @@ Data* data_compress(Data* data_to_compress, int compression_level) {
   compressed_data->size = output.pos;
   ZSTD_freeCCtx(cctx);
 
-  log_message(LOG_LEVEL_DEBUG, "Data succesfully compressed from %zu to %zu",
-              data_to_compress->size, compressed_data->size);
+  log_debug_message(LOG_DEBUG_UTIL, "Data succesfully compressed from %zu to %zu",
+                    data_to_compress->size, compressed_data->size);
   return compressed_data;
 }
 
@@ -75,7 +75,7 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
   if (!compressed_data || (!compressed_data->data && compressed_data->size != 0) ||
       maximum_size == 0)
     return NULL;
-  log_message(LOG_LEVEL_DEBUG, "Start to decompress data");
+  log_debug_message(LOG_DEBUG_UTIL, "Start to decompress data");
   unsigned long long dst_size =
       ZSTD_getFrameContentSize(compressed_data->data, compressed_data->size);
   if (ZSTD_isError(dst_size)) {
@@ -155,7 +155,7 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
   uncompressed_data->size = output.pos;
   ZSTD_freeDCtx(dctx);
 
-  log_message(LOG_LEVEL_DEBUG, "Decompressed data successfully");
+  log_debug_message(LOG_DEBUG_UTIL, "Decompressed data successfully");
   return uncompressed_data;
 }
 

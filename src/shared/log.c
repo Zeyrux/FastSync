@@ -7,12 +7,21 @@
 
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
+static uint32_t current_debug_flags = 0;
 static FILE* log_fp = NULL;
 static _Thread_local bool eight_bit_output;
 static LogStderrMode stderr_mode = LOG_STDERR_ERRORS;
 
 void set_log_level(LogLevel level) {
   current_log_level = level;
+}
+
+void set_log_debug_flags(uint32_t flags) {
+  current_debug_flags = flags;
+}
+
+uint32_t get_log_debug_flags(void) {
+  return current_debug_flags;
 }
 
 void log_set_file(FILE* fp) {
@@ -67,6 +76,27 @@ void log_message(LogLevel log_level, const char* format, ...) {
   if (log_fp) {
     va_start(args, format);
     write_message(log_fp, log_level, t, format, args);
+    va_end(args);
+  }
+}
+
+void log_debug_message(LogDebugFlag flag, const char* format, ...) {
+  if (current_log_level > LOG_LEVEL_DEBUG || !(current_debug_flags & flag))
+    return;
+
+  time_t now = time(NULL);
+  struct tm t;
+  if (!localtime_r(&now, &t))
+    return;
+
+  va_list args;
+  va_start(args, format);
+  write_message(stdout, LOG_LEVEL_DEBUG, t, format, args);
+  va_end(args);
+
+  if (log_fp) {
+    va_start(args, format);
+    write_message(log_fp, LOG_LEVEL_DEBUG, t, format, args);
     va_end(args);
   }
 }

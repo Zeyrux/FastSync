@@ -40,6 +40,7 @@ void print_usage(void) {
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -q, --quiet         Suppress non-error output\n");
+  printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
   printf("  -M, --preserve      Preserve file metadata\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
@@ -77,4 +78,10 @@ void print_usage(void) {
   printf("  --compress-level <n>    Compression level (default: 5)\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");
+}
+
+void print_debug_usage(void) {
+  printf("Supported debug flags: IO,PROTO,PACK,UTIL,ALL,NONE\n");
+  printf("Flags may be comma-separated, for example: --debug=io,proto\n");
+  printf("Other rsync debug flags are unsupported and rejected.\n");
 }

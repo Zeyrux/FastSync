@@ -290,7 +290,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 }
 
 Data* chunk_compress(Chunk* chunk, int compression_level, bool use_metadata) {
-  log_message(LOG_LEVEL_DEBUG, "Starting to compress chunk");
+  log_debug_message(LOG_DEBUG_PACK, "Starting to compress chunk");
   Data* serialized = chunk_serialize(chunk, use_metadata);
   if (serialized == NULL)
     return NULL;
@@ -298,7 +298,7 @@ Data* chunk_compress(Chunk* chunk, int compression_level, bool use_metadata) {
   data_destroy(serialized);
   if (compressed == NULL)
     return NULL;
-  log_message(LOG_LEVEL_DEBUG, "Chunk successfully compressed");
+  log_debug_message(LOG_DEBUG_PACK, "Chunk successfully compressed");
   return compressed;
 }
 
