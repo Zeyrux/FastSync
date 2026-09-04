@@ -2,6 +2,7 @@
 
 #include "chunk.h"
 #include "log.h"
+#include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
 #include <stdlib.h>
@@ -37,9 +38,13 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
       return false;
     unsigned long long check_size;
     long long check_mtime;
+    long long check_mtime_nsec;
     if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
-        !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
+        !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime)) ||
+        !receive_n_data(file_descriptor, &check_mtime_nsec, sizeof(check_mtime_nsec)) ||
+        check_mtime_nsec < 0 || check_mtime_nsec >= 1000000000LL) {
       free(check_path);
+      send_status(file_descriptor, STATUS_ERROR);
       return false;
     }
     if (!utils_valid_batch_path(check_path)) {
@@ -60,8 +65,16 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
     }
     struct stat st;
     bool has_old = file_stat_secure(full_path, &st);
-    bool match = !config->ignore_times && has_old && (unsigned long long)st.st_size == check_size &&
-                 (config->size_only || (long long)st.st_mtime == check_mtime);
+    long long old_mtime_nsec = 0;
+    if (has_old) {
+#ifdef __linux__
+      old_mtime_nsec = st.st_mtim.tv_nsec;
+#endif
+    }
+    bool match =
+        !config->ignore_times && has_old && (unsigned long long)st.st_size == check_size &&
+        metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
+                               (long)check_mtime_nsec, config->modify_window);
     bool sent = send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT);
     free(full_path);
     free(check_path);

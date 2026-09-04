@@ -39,6 +39,7 @@ typedef struct Config {
   bool size_only;
   bool use_delta;
   bool whole_file;
+  int modify_window;
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;
   bool use_tls;

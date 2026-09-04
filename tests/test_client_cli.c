@@ -327,6 +327,43 @@ static void test_parse_args_debug_flags_validation() {
   }
 }
 
+static void test_parse_args_modify_window() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--modify-window=3", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->modify_window, 3);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* short_argv[] = {"fastsync", "-@", "7", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, short_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->modify_window, 7);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* attached_argv[] = {"fastsync", "-@11", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, attached_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->modify_window, 11);
+  config_delete(cfg);
+}
+
+static void test_parse_args_rejects_invalid_modify_window() {
+  const char* values[] = {"-1", "not-a-number", ""};
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--modify-window", (char*)values[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 /* Test parse_args unknown option returns error */
 static void test_parse_args_unknown_option() {
   Config* cfg = config_create();
@@ -591,6 +628,8 @@ void test_client_cli() {
   test_parse_args_debug_flags();
   test_parse_args_debug_help();
   test_parse_args_debug_flags_validation();
+  test_parse_args_modify_window();
+  test_parse_args_rejects_invalid_modify_window();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();

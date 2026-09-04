@@ -131,6 +131,7 @@ static void test_config_send_receive() {
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
   send_cfg->eight_bit_output = true;
+  send_cfg->modify_window = 4;
 
   /* Use socketpair for bidirectional communication */
   int p[2];
@@ -174,6 +175,8 @@ static void test_config_send_receive() {
       if (recv_cfg->use_delta)
         ok = false;
       if (!recv_cfg->whole_file)
+        ok = false;
+      if (recv_cfg->modify_window != 4)
         ok = false;
     }
     config_delete(recv_cfg);

@@ -39,6 +39,7 @@ static void config_set_defaults(Config* config) {
   config->size_only = false;
   config->use_delta = false;
   config->whole_file = false;
+  config->modify_window = 0;
   config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
   config->delta_max_file_size = DELTA_MAX_FILE_SIZE;
   config->use_tls = false;
@@ -141,7 +142,8 @@ static bool validate_received_config(const Config* config) {
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
-         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->max_delete >= 0;
+         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
+         config->max_delete >= 0;
 }
 
 Config* config_create(void) {
@@ -264,7 +266,8 @@ static bool send_resume_options(int fd, const Config* c) {
   return send_str(fd, c->temp_dir ? c->temp_dir : "") && send_int(fd, c->partial) &&
          send_str(fd, c->partial_dir ? c->partial_dir : "") &&
          send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
-         send_int(fd, c->checksum) && send_str(fd, c->compress_choice ? c->compress_choice : "");
+         send_int(fd, c->checksum) && send_int(fd, c->modify_window) &&
+         send_str(fd, c->compress_choice ? c->compress_choice : "");
 }
 
 static bool receive_core_fields(int fd, Config* c) {
@@ -346,6 +349,8 @@ static bool receive_resume_options(int fd, Config* c) {
   if (!c->partial_dir || !c->suffix || !receive_wire_bool(fd, &c->delete_before))
     return false;
   if (!receive_wire_bool(fd, &c->checksum))
+    return false;
+  if (!receive_n_data(fd, &c->modify_window, sizeof(c->modify_window)))
     return false;
   c->compress_choice = receive_str(fd);
   return c->compress_choice != NULL;

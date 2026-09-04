@@ -60,7 +60,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--min-size=SIZE` | Skip files smaller than SIZE | ✅ Implemented | `min_size` in scanner |
 | `-I`, `--ignore-times` | Don't skip files matching size+time | ❌ Not Implemented | |
 | `--size-only` | Skip based on size only | ✅ Implemented | With `--incremental`, ignores mtime |
-| `-@`, `--modify-window=NUM` | Mod-time comparison accuracy | ❌ Not Implemented | |
+| `-@`, `--modify-window=NUM` | Mod-time comparison accuracy | ✅ Implemented | Whole-second tolerance with nanosecond-aware comparisons |
 | `--existing` | Skip creating new files on receiver | ❌ Not Implemented | |
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
 | `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |

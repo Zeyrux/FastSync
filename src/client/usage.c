@@ -32,6 +32,7 @@ void print_usage(void) {
   printf("  --incremental       Skip files unchanged since last transfer\n");
   printf("  --size-only         Skip incremental files matching in size, ignoring mtime\n");
   printf("  -I, --ignore-times  Transfer files even when size and mtime match\n");
+  printf("  -@, --modify-window <sec>  Modification time tolerance\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
   printf("  -W, --whole-file    Transfer changed files without delta processing\n");
   printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",

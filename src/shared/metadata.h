@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /*
  * Wire format (introduced in protocol version 2.0.0):
@@ -31,5 +32,9 @@ bool metadata_send(int file_descriptor, const FileMetadata* m);
 FileMetadata* metadata_receive(int file_descriptor, int* ok);
 void file_restore_metadata(const char* path, const FileMetadata* metadata);
 bool file_restore_metadata_fd(int fd, const FileMetadata* metadata);
+
+/* Compare timestamps using rsync's whole-second modification window. */
+bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, long right_nsec,
+                            int modify_window);
 
 #endif
