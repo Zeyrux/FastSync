@@ -331,6 +331,26 @@ class TestIncremental:
         with open(received_file, "rb") as f:
             assert f.read() == b"hello world\n"
 
+    def test_ignore_times_transfers_same_size_and_mtime(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")
+        received_file = os.path.join(received, "small.txt")
+        source_stat = os.stat(source_file)
+        with open(received_file, "wb") as f:
+            f.write(b"stale data!\n")
+        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
+
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "--incremental", "--ignore-times"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Ignore-times sync failed: {result.stderr[:200]}"
+        with open(received_file, "rb") as f:
+            assert f.read() == b"hello world\n"
+
     def test_whole_file_disables_delta_and_keeps_compression(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)

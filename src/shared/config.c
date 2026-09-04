@@ -35,6 +35,7 @@ static void config_set_defaults(Config* config) {
   config->max_size = 0;
   config->min_size = 0;
   config->use_incremental = false;
+  config->ignore_times = false;
   config->use_delta = false;
   config->whole_file = false;
   config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
@@ -122,9 +123,9 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->use_compression) && valid_wire_bool(config->use_metadata) &&
          valid_wire_bool(config->use_sendfile) && valid_wire_bool(config->use_delete) &&
          valid_wire_bool(config->use_incremental) && valid_wire_bool(config->use_delta) &&
-         valid_wire_bool(config->backup) && valid_wire_bool(config->follow_symlinks) &&
-         valid_wire_bool(config->copy_links) && valid_wire_bool(config->safe_links) &&
-         valid_wire_bool(config->copy_unsafe_links) &&
+         valid_wire_bool(config->ignore_times) && valid_wire_bool(config->backup) &&
+         valid_wire_bool(config->follow_symlinks) && valid_wire_bool(config->copy_links) &&
+         valid_wire_bool(config->safe_links) && valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
          valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->update) &&
@@ -235,7 +236,7 @@ static bool send_core_fields(int fd, const Config* c) {
 
 static bool send_delta_fields(int fd, const Config* c) {
   return send_int(fd, c->use_delete) && send_int(fd, c->use_incremental) &&
-         send_int(fd, c->use_delta && !c->whole_file) &&
+         send_int(fd, c->ignore_times) && send_int(fd, c->use_delta && !c->whole_file) &&
          send_n_data(fd, &c->delta_block_size, sizeof(c->delta_block_size)) &&
          send_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
 }
@@ -291,6 +292,8 @@ static bool receive_delta_fields(int fd, Config* c) {
   if (!receive_wire_bool(fd, &c->use_delete))
     return false;
   if (!receive_wire_bool(fd, &c->use_incremental))
+    return false;
+  if (!receive_wire_bool(fd, &c->ignore_times))
     return false;
   if (!receive_wire_bool(fd, &c->use_delta))
     return false;

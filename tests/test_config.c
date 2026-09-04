@@ -127,6 +127,7 @@ static void test_config_send_receive() {
   send_cfg->use_fsync = true;
   send_cfg->use_delta = true;
   send_cfg->whole_file = true;
+  send_cfg->ignore_times = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
   send_cfg->eight_bit_output = true;
@@ -159,6 +160,8 @@ static void test_config_send_receive() {
       if (!recv_cfg->use_multithreading)
         ok = false;
       if (!recv_cfg->use_chunk_serialization)
+        ok = false;
+      if (!recv_cfg->ignore_times)
         ok = false;
       if (recv_cfg->compression_level != 5)
         ok = false;

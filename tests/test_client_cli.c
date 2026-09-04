@@ -441,6 +441,24 @@ static void test_parse_args_fsync() {
   config_delete(cfg);
 }
 
+static void test_parse_args_ignore_times() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-I", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->ignore_times);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* long_argv[] = {"fastsync", "--ignore-times", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, long_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->ignore_times);
+  config_delete(cfg);
+}
+
 /* --secluded-args is accepted for compatibility but has no effect. */
 static void test_parse_args_secluded_args() {
   Config* cfg = config_create();
@@ -564,6 +582,7 @@ void test_client_cli() {
   test_parse_args_human_readable();
   test_parse_args_archive();
   test_parse_args_fsync();
+  test_parse_args_ignore_times();
   test_parse_args_8_bit_output();
   test_parse_args_stderr_modes();
   test_parse_args_rejects_unsupported_stderr_modes();

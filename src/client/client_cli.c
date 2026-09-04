@@ -206,6 +206,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--remove-source-files", NULL, OPT_FLAG, offsetof(Config, remove_source_files)},
     {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
     {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
+    {"--ignore-times", "-I", OPT_FLAG, offsetof(Config, ignore_times)},
     {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
     {"--whole-file", "-W", OPT_FLAG, offsetof(Config, whole_file)},
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
