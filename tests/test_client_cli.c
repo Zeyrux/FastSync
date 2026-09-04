@@ -5,6 +5,7 @@
 #include "log.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -481,7 +482,7 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--daemon",
                                         "--config",
                                         "--server",
-                                        "--compress-choice"};
+                                        "--checksum-choice"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
@@ -688,6 +689,93 @@ static void test_parse_args_whole_file() {
   config_delete(cfg);
 }
 
+/* Test rsync-compatible compression-choice and compression-level aliases. */
+static void test_parse_args_compression_aliases() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--zc", "zstd", "--zl", "10", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 7, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_STR(cfg->compress_choice, "zstd");
+  EXPECT_EQ_INT(cfg->compression_level, 10);
+  EXPECT_TRUE(cfg->use_compression);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
+static void test_parse_args_compression_equals_and_none() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-z", "--zc=none", "--zl=7", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 6, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_STR(cfg->compress_choice, "none");
+  EXPECT_EQ_INT(cfg->compression_level, 7);
+  EXPECT_FALSE(cfg->use_compression);
+  config_delete(cfg);
+}
+
+static void test_parse_args_compression_canonical_equals() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--compress-choice=zstd", "--compress-level=7", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->compress_choice, "zstd");
+  EXPECT_EQ_INT(cfg->compression_level, 7);
+  EXPECT_TRUE(cfg->use_compression);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
+static void test_parse_args_compression_alias_equals() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--zc=zstd", "--zl=7", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->compress_choice, "zstd");
+  EXPECT_EQ_INT(cfg->compression_level, 7);
+  EXPECT_TRUE(cfg->use_compression);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
+static void test_parse_args_rejects_invalid_compression_level_equals() {
+  static const char* const values[] = {"0", "23", "invalid"};
+
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    Config* cfg = config_create();
+    char option[32];
+    snprintf(option, sizeof(option), "--compress-level=%s", values[i]);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
+static void test_parse_args_rejects_invalid_compression_choice() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--compress-choice=bogus", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -734,4 +822,10 @@ void test_client_cli() {
   test_parse_args_secluded_args();
   test_parse_args_short_s_remains_chunk_serialization();
   test_parse_args_whole_file();
+  test_parse_args_compression_aliases();
+  test_parse_args_compression_equals_and_none();
+  test_parse_args_compression_canonical_equals();
+  test_parse_args_compression_alias_equals();
+  test_parse_args_rejects_invalid_compression_level_equals();
+  test_parse_args_rejects_invalid_compression_choice();
 }

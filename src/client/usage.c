@@ -46,6 +46,8 @@ void print_usage(void) {
   printf("  -s                  Enable chunk serialization\n");
   printf("  --secluded-args    Accept rsync compatibility option (no effect)\n");
   printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
+  printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
+  printf("  --zc <alg>          Alias for --compress-choice\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -q, --quiet         Suppress non-error output\n");
   printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
@@ -86,6 +88,7 @@ void print_usage(void) {
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf("  --fsync             Fsync every written file before publication\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
+  printf("  --zl <n>             Alias for --compress-level\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");
 }

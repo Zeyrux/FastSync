@@ -172,8 +172,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `-z`, `--compress` | Compress file data | 🔀 Alt Arg | Always uses zstd (rsync supports multiple algorithms) |
-| `--compress-choice=STR` | Choose compression algorithm | ❌ Not Implemented | Removed because it had no effect; FastSync always uses zstd |
-| `--compress-level=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
+| `--compress-choice=STR`, `--zc=STR` | Choose compression algorithm | ✅ Implemented | FastSync supports `zstd` and `none` |
+| `--compress-level=NUM`, `--zl=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
 | `--skip-compress=LIST` | Skip compress for suffixes | ❌ Not Implemented | Internal skip for hardcoded types; not user-configurable |
 
