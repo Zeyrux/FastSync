@@ -1,6 +1,7 @@
 #include "test_client_cli.h"
 #include "client_validation.h"
 #include "config.h"
+#include "log.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <stdlib.h>
@@ -415,6 +416,39 @@ static void test_parse_args_8_bit_output() {
   config_delete(cfg);
 }
 
+static void test_parse_args_stderr_modes() {
+  static const char* const modes[] = {"errors", "all", "e", "a"};
+  static const LogStderrMode expected[] = {LOG_STDERR_ERRORS, LOG_STDERR_ALL, LOG_STDERR_ERRORS,
+                                           LOG_STDERR_ALL};
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+    Config* cfg = config_create();
+    char option[32];
+    snprintf(option, sizeof(option), "--stderr=%s", modes[i]);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(log_get_stderr_mode(), expected[i]);
+    config_delete(cfg);
+  }
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+}
+
+static void test_parse_args_rejects_unsupported_stderr_modes() {
+  static const char* const modes[] = {"client", "c", "invalid"};
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+    Config* cfg = config_create();
+    char option[32];
+    snprintf(option, sizeof(option), "--stderr=%s", modes[i]);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -442,4 +476,6 @@ void test_client_cli() {
   test_parse_args_archive();
   test_parse_args_fsync();
   test_parse_args_8_bit_output();
+  test_parse_args_stderr_modes();
+  test_parse_args_rejects_unsupported_stderr_modes();
 }

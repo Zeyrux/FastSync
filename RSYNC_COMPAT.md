@@ -7,10 +7,10 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Status | Count | Description |
 |--------|-------|-------------|
 | ✅ Implemented | 35 | Feature works end-to-end |
-| 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
-| ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
-| ❌ Not Implemented | 98 | Flag not recognized or no behavior |
-| **Total** | **137** | |
+| 🔀 Alt Arg | 4 | Functionality exists but under different flag/semantics |
+| ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
+| ❌ Not Implemented | 97 | Flag not recognized or no behavior |
+| **Total** | **141** | |
 
 ---
 
@@ -25,7 +25,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-V`, `--version` | Print version | ✅ Implemented | |
 | `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
 | `--debug=FLAGS` | Fine-grained debug verbosity | ❌ Not Implemented | Removed because it had no effect |
-| `--stderr=MODE` | Change stderr output mode | ❌ Not Implemented | |
+| `--stderr=MODE` | Change stderr output mode | ⚠️ Partial | `errors` (default) and `all` are supported; `client` is rejected because FastSync has no rsync message channel |
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |
 | `--exclude=PATTERN` | Exclude files matching pattern | ✅ Implemented | Glob matching in scanner |
 | `--include=PATTERN` | Include files matching pattern | ✅ Implemented | Glob matching in scanner |
@@ -248,12 +248,11 @@ Ranked by user demand, implementation complexity, and interoperability impact:
 | 2 | `--ignore-times` / `-I` | Low | Medium — useful for forcing re-transfer |
 | 3 | `--size-only` | Low | Medium — common migration scenario |
 | 4 | `--existing` / `--ignore-existing` | Low | Medium — common sync patterns |
-| 5 | `--remove-source-files` | Low | High — common for moves/backup |
-| 6 | `--delete-during` | Medium | High — performance improvement |
-| 7 | `--delay-updates` | Medium | High — atomic updates |
-| 8 | `--chmod` | Low | Medium — permission flexibility |
-| 9 | `--executability` / `-E` | Low | Low — simple flag |
-| 10 | `--skip-compress` | Low | Medium — performance tuning |
+| 5 | `--delete-during` | Medium | High — performance improvement |
+| 6 | `--delay-updates` | Medium | High — atomic updates |
+| 7 | `--chmod` | Low | Medium — permission flexibility |
+| 8 | `--executability` / `-E` | Low | Low — simple flag |
+| 9 | `--skip-compress` | Low | Medium — performance tuning |
 
 ---
 
