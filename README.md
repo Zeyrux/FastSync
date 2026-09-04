@@ -89,6 +89,7 @@ partial, alternate, and planned behavior.
 | `-a, --archive` | Archive mode: enables `-c -m -M` (no `-s`) |
 | `-m` | Multithreading mode |
 | `-s` | Chunk serialization (batch all files per chunk) |
+| `--secluded-args` | Accepted as an rsync compatibility option with no effect; `-s` remains chunk serialization. |
 | `-f, --sendfile` | Sendfile zero-copy. Incompatible with `-c` / `-s`. TCP only. |
 | `-M, --preserve` | Preserve supported file metadata (mode and mtime; ownership and atime are unsupported) |
 | `-n, --dry-run` | Scan and print what would be transferred |
@@ -360,6 +361,11 @@ Current short-option conflicts are tracked as compatibility work. In
 particular, FastSync currently uses `-p` for SSH port, `-s` for chunk
 serialization, and `-S` for sparse handling. These meanings must be reconciled
 before FastSync can claim full rsync CLI compatibility.
+
+`--secluded-args` is accepted as a long-form compatibility no-op. It does not
+change FastSync's transport or protocol behavior. The rsync short form `-s` is
+intentionally not aliased because it remains FastSync's chunk-serialization
+option.
 
 ## Client Options
 

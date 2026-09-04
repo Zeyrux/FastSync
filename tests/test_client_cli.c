@@ -434,6 +434,29 @@ static void test_parse_args_fsync() {
   config_delete(cfg);
 }
 
+/* --secluded-args is accepted for compatibility but has no effect. */
+static void test_parse_args_secluded_args() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--secluded-args", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->use_chunk_serialization);
+  config_delete(cfg);
+}
+
+static void test_parse_args_short_s_remains_chunk_serialization() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-s", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_chunk_serialization);
+  config_delete(cfg);
+}
+
 static void test_parse_args_8_bit_output() {
   Config* cfg = config_create();
   char* long_argv[] = {"fastsync", "--8-bit-output", "/src", "/dst"};
@@ -484,7 +507,6 @@ static void test_parse_args_rejects_unsupported_stderr_modes() {
   }
   log_set_stderr_mode(LOG_STDERR_ERRORS);
 }
-
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -517,4 +539,6 @@ void test_client_cli() {
   test_parse_args_8_bit_output();
   test_parse_args_stderr_modes();
   test_parse_args_rejects_unsupported_stderr_modes();
+  test_parse_args_secluded_args();
+  test_parse_args_short_s_remains_chunk_serialization();
 }
