@@ -176,7 +176,7 @@ int receive_files(Config* config, int fd) {
         bool has_old = full_path && file_stat_secure(full_path, &st);
         bool match = !config->ignore_times && has_old &&
                      (unsigned long long)st.st_size == check_size &&
-                     (long long)st.st_mtime == check_mtime;
+                     (config->size_only || (long long)st.st_mtime == check_mtime);
         bool sent = send_status(fd, match ? STATUS_OK : STATUS_NEXT);
         free(full_path);
         free(check_path);

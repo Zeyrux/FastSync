@@ -124,10 +124,10 @@ static void test_config_send_receive() {
   send_cfg->use_chunk_serialization = true;
   send_cfg->use_compression = true;
   send_cfg->use_metadata = true;
-  send_cfg->use_fsync = true;
   send_cfg->use_delta = true;
   send_cfg->whole_file = true;
   send_cfg->ignore_times = true;
+  send_cfg->size_only = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
   send_cfg->eight_bit_output = true;
@@ -161,13 +161,13 @@ static void test_config_send_receive() {
         ok = false;
       if (!recv_cfg->use_chunk_serialization)
         ok = false;
-      if (!recv_cfg->ignore_times)
-        ok = false;
       if (recv_cfg->compression_level != 5)
         ok = false;
       if (recv_cfg->chunk_size != 1024)
         ok = false;
-      if (!recv_cfg->use_fsync)
+      if (!recv_cfg->size_only)
+        ok = false;
+      if (!recv_cfg->ignore_times)
         ok = false;
       if (!recv_cfg->eight_bit_output)
         ok = false;
@@ -200,11 +200,11 @@ static void test_config_send_receive() {
 }
 
 static void test_config_send_receive_version_mismatch() {
-  /* Create a config with a different protocol version */
+  /* A peer using the previous wire format must be rejected. */
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
-  cfg->version = str_dup("0.0");
+  cfg->version = str_dup("2.2.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 

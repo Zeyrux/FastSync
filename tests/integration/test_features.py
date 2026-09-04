@@ -331,6 +331,26 @@ class TestIncremental:
         with open(received_file, "rb") as f:
             assert f.read() == b"hello world\n"
 
+    def test_size_only_skips_same_size_with_different_mtime(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        received_file = os.path.join(received, "small.txt")
+        with open(received_file, "wb") as f:
+            f.write(b"different!!\n")
+        os.utime(received_file, (time.time() - 3600, time.time() - 3600))
+
+        result, _ = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["-M", "--incremental", "--size-only"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Size-only sync failed: {result.stderr[:200]}"
+        with open(received_file, "rb") as f:
+            assert f.read() == b"different!!\n"
+
     def test_ignore_times_transfers_same_size_and_mtime(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
