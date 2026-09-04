@@ -504,6 +504,17 @@ static void test_parse_args_fsync() {
   config_delete(cfg);
 }
 
+static void test_parse_args_existing() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--existing", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->existing);
+  config_delete(cfg);
+}
+
 static void test_parse_args_ignore_times() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "-I", "/src", "/dst"};
@@ -649,6 +660,7 @@ void test_client_cli() {
   test_parse_args_update();
   test_parse_args_archive();
   test_parse_args_fsync();
+  test_parse_args_existing();
   test_parse_args_ignore_times();
   test_parse_args_8_bit_output();
   test_parse_args_stderr_modes();

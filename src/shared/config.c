@@ -74,6 +74,7 @@ static void config_set_defaults(Config* config) {
   config->list_only = false;
   config->human_readable = false;
   config->eight_bit_output = false;
+  config->existing = false;
   config->update = false;
   config->inplace = false;
   config->use_fsync = false;
@@ -130,9 +131,10 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->safe_links) && valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
-         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->update) &&
-         valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
-         valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
+         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->existing) &&
+         valid_wire_bool(config->update) && valid_wire_bool(config->inplace) &&
+         valid_wire_bool(config->append) && valid_wire_bool(config->use_fsync) &&
+         valid_wire_bool(config->append_verify) &&
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
@@ -255,8 +257,9 @@ static bool send_file_options(int fd, const Config* c) {
 }
 
 static bool send_selection_options(int fd, const Config* c) {
-  return send_int(fd, c->update) && send_int(fd, c->inplace) && send_int(fd, c->append) &&
-         send_int(fd, c->use_fsync) && send_int(fd, c->append_verify) &&
+  return send_int(fd, c->existing) && send_int(fd, c->update) && send_int(fd, c->inplace) &&
+         send_int(fd, c->append) && send_int(fd, c->use_fsync) &&
+         send_int(fd, c->append_verify) &&
          send_int(fd, c->delete_excluded) && send_int(fd, c->delete_after) &&
          send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
          send_int(fd, c->prune_empty_dirs);
@@ -325,7 +328,8 @@ static bool receive_file_options(int fd, Config* c) {
 }
 
 static bool receive_selection_options(int fd, Config* c) {
-  bool* flags[] = {&c->update,        &c->inplace,         &c->append,      &c->use_fsync,
+  bool* flags[] = {&c->existing,      &c->update,          &c->inplace,     &c->append,
+                   &c->use_fsync,
                    &c->append_verify, &c->delete_excluded, &c->delete_after};
   for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
     if (!receive_wire_bool(fd, flags[i]))

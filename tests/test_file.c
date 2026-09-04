@@ -113,6 +113,50 @@ static void test_file_save_to_disk_with_fsync_config() {
   rmdir("test_save_fsync_tmp");
 }
 
+static void test_file_save_to_disk_existing() {
+  const char* root = "test_existing_tmp";
+  const char* existing_path = "test_existing_tmp/existing.txt";
+  const char* missing_path = "test_existing_tmp/missing.txt";
+  EXPECT_TRUE(file_write_to_disk(existing_path, "old", 3, false, false));
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->existing = true;
+
+  File* existing = file_create("existing.txt");
+  EXPECT_NOT_NULL(existing);
+  existing->data->data = malloc(3);
+  EXPECT_NOT_NULL(existing->data->data);
+  memcpy(existing->data->data, "new", 3);
+  existing->data->size = 3;
+  EXPECT_TRUE(file_save_to_disk(root, existing, cfg));
+  file_destroy(existing);
+
+  File* missing = file_create("missing.txt");
+  EXPECT_NOT_NULL(missing);
+  missing->data->data = malloc(7);
+  EXPECT_NOT_NULL(missing->data->data);
+  memcpy(missing->data->data, "skipped", 7);
+  missing->data->size = 7;
+  EXPECT_TRUE(file_save_to_disk(root, missing, cfg));
+  file_destroy(missing);
+
+  FILE* fp = fopen(existing_path, "rb");
+  char content[4] = {0};
+  EXPECT_NOT_NULL(fp);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (fp) {
+    EXPECT_EQ_INT((int)fread(content, 1, 3, fp), 3);
+    fclose(fp);
+  }
+  EXPECT_EQ_STR(content, "new");
+  EXPECT_EQ_INT(access(missing_path, F_OK), -1);
+
+  config_delete(cfg);
+  unlink(existing_path);
+  rmdir(root);
+}
+
 static void test_file_write_to_disk_basic() {
   const char* content = "Basic file_write_to_disk test";
   EXPECT_TRUE(file_write_to_disk("test_file_write_to_disk_basic.txt", content, strlen(content),
@@ -495,6 +539,7 @@ void test_file() {
   test_file_load_data_missing_file();
   test_file_save_to_disk();
   test_file_save_to_disk_with_fsync_config();
+  test_file_save_to_disk_existing();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_with_fsync();
   test_file_write_to_disk_creates_dirs();

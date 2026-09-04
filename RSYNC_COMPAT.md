@@ -10,7 +10,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | 🔀 Alt Arg | 4 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 96 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 95 | Flag not recognized or no behavior |
 | **Total** | **141** | |
 
 ---
@@ -61,7 +61,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-I`, `--ignore-times` | Don't skip files matching size+time | ❌ Not Implemented | |
 | `--size-only` | Skip based on size only | ✅ Implemented | With `--incremental`, ignores mtime |
 | `-@`, `--modify-window=NUM` | Mod-time comparison accuracy | ✅ Implemented | Whole-second tolerance with nanosecond-aware comparisons |
-| `--existing` | Skip creating new files on receiver | ❌ Not Implemented | |
+| `--existing` | Skip creating new files on receiver | ✅ Implemented | Existing destination files continue through normal update handling |
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
 | `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |
 
@@ -248,7 +248,7 @@ Ranked by user demand, implementation complexity, and interoperability impact:
 | 1 | `--whole-file` / `-W` | Low | High — users expect opt-out of delta |
 | 2 | `--ignore-times` / `-I` | Low | Medium — useful for forcing re-transfer |
 | 3 | `--size-only` | Low | Medium — common migration scenario |
-| 4 | `--existing` / `--ignore-existing` | Low | Medium — common sync patterns |
+| 4 | `--ignore-existing` | Low | Medium — common sync patterns |
 | 5 | `--delete-during` | Medium | High — performance improvement |
 | 6 | `--delay-updates` | Medium | High — atomic updates |
 | 7 | `--chmod` | Low | Medium — permission flexibility |

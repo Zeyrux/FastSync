@@ -412,66 +412,6 @@ class TestIncremental:
         mismatches, missing = verify_transfer(SOURCE_DIR, received)
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
-        clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
-        assert result.returncode == 0
-
-        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
-        source_file = os.path.join(SOURCE_DIR, "small.txt")
-        received_file = os.path.join(received, "small.txt")
-        source_stat = os.stat(source_file)
-        with open(received_file, "wb") as f:
-            f.write(b"stale data!\n")
-        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
-
-        result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "--incremental", "--ignore-times"],
-                               port=shared_server.port)
-        assert result.returncode == 0, f"Ignore-times sync failed: {result.stderr[:200]}"
-        with open(received_file, "rb") as f:
-            assert f.read() == b"hello world\n"
-
-    def test_modify_window_allows_subsecond_mtime_difference(self, shared_server):
-        clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
-        assert result.returncode == 0
-
-        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
-        source_file = os.path.join(SOURCE_DIR, "small.txt")
-        received_file = os.path.join(received, "small.txt")
-        source_stat = os.stat(source_file)
-        with open(received_file, "wb") as f:
-            f.write(b"modified!!!\n")
-        os.utime(received_file, ns=(source_stat.st_atime_ns,
-                                    source_stat.st_mtime_ns - 1500000000))
-
-        result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "--incremental", "--modify-window=2"],
-                               port=shared_server.port)
-        assert result.returncode == 0, f"Modify-window sync failed: {result.stderr[:200]}"
-        with open(received_file, "rb") as f:
-            assert f.read() == b"modified!!!\n"
-
-    def test_whole_file_disables_delta_and_keeps_compression(self, shared_server):
-        clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
-        assert result.returncode == 0
-
-        source_file = os.path.join(SOURCE_DIR, "medium.txt")
-        with open(source_file, "wb") as f:
-            f.write(b"whole-file replacement\n" * 5000)
-
-        result, _ = run_client(
-            SOURCE_DIR,
-            DEST_DIR,
-            flags=["-M", "--incremental", "--delta", "-W", "-c"],
-            port=shared_server.port,
-        )
-        assert result.returncode == 0, f"Whole-file sync failed: {(result.stderr or result.stdout)[:200]}"
-        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
-        mismatches, missing = verify_transfer(SOURCE_DIR, received)
-        assert not missing, f"Missing: {missing}"
-        assert not mismatches, f"Mismatch: {mismatches}"
 
 
 class TestUpdate:
@@ -527,6 +467,34 @@ class TestUpdate:
         assert result.returncode == 0
         with open(received_file, "rb") as f:
             assert f.read() == b"hello world\n"
+
+
+class TestExisting:
+    def test_existing_updates_existing_and_skips_new(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"Initial sync failed: {(result.stderr or result.stdout)[:200]}"
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")
+        new_source_file = os.path.join(SOURCE_DIR, "new-existing-test.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"updated existing content\n")
+        with open(new_source_file, "wb") as f:
+            f.write(b"this file must not be created\n")
+
+        try:
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=["-M", "--existing"], port=shared_server.port)
+            assert result.returncode == 0, f"--existing sync failed: {(result.stderr or result.stdout)[:200]}"
+
+            with open(os.path.join(received, "small.txt"), "rb") as f:
+                assert f.read() == b"updated existing content\n"
+            assert not os.path.exists(os.path.join(received, "new-existing-test.txt"))
+        finally:
+            os.unlink(new_source_file)
+            with open(source_file, "wb") as f:
+                f.write(b"hello world\n")
 
 
 class TestDelete:

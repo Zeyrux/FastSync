@@ -29,6 +29,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
   char *confined_backup = NULL, *confined_partial = NULL, *disk_path = NULL;
+  char* destination_path = NULL;
   char *backup_path = NULL, *parent_copy = NULL;
 
   if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data) ||
@@ -54,12 +55,26 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
 
   const char* actual_root =
       (partial_dir && config && config->partial) ? confined_partial : root_directory;
+  destination_path = path_cat(root_directory, file->path);
   disk_path = path_cat(actual_root, file->path);
-  if (disk_path == NULL) {
+  if (destination_path == NULL || disk_path == NULL) {
     free(confined_backup);
     free(confined_partial);
+    free(destination_path);
+    free(disk_path);
     return false;
   }
+
+  /* --existing checks the final destination, not a temporary partial path. */
+  if (config && config->existing && !file_path_exists_secure(destination_path)) {
+    free(confined_backup);
+    free(confined_partial);
+    free(destination_path);
+    free(disk_path);
+    return true;
+  }
+  free(destination_path);
+  destination_path = NULL;
 
   /* --update is receiver-side policy: never replace a newer destination.
      The secure stat does not require read permission on the destination. */
@@ -110,6 +125,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   free(backup_path);
   free(confined_backup);
   free(confined_partial);
+  free(destination_path);
   free(disk_path);
   return ok;
 
@@ -118,6 +134,7 @@ fail:
   free(backup_path);
   free(confined_backup);
   free(confined_partial);
+  free(destination_path);
   free(disk_path);
   return false;
 }

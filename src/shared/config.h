@@ -82,6 +82,7 @@ typedef struct Config {
   bool eight_bit_output;
 
   // Issue #127: Transfer modes
+  bool existing;
   bool update;
   bool inplace;
   bool use_fsync;

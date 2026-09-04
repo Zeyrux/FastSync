@@ -229,6 +229,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--fsync", NULL, OPT_FLAG, offsetof(Config, use_fsync)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
     {"--8-bit-output", "-8", OPT_FLAG, offsetof(Config, eight_bit_output)},
+    {"--existing", NULL, OPT_FLAG, offsetof(Config, existing)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
