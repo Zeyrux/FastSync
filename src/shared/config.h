@@ -18,6 +18,7 @@ typedef struct Config {
   bool use_compression;
   bool use_sendfile;
   bool use_metadata;
+  bool use_executability;
   bool show_progress;
   bool dry_run;
   bool remove_source_files;

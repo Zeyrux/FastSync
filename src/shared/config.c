@@ -17,6 +17,7 @@ static void config_set_defaults(Config* config) {
   config->use_chunk_serialization = false;
   config->use_compression = false;
   config->use_metadata = false;
+  config->use_executability = false;
   config->show_progress = false;
   config->dry_run = false;
   config->remove_source_files = false;
@@ -125,9 +126,10 @@ static bool validate_received_config(const Config* config) {
   return valid_wire_bool(config->save_to_disk) && valid_wire_bool(config->use_multithreading) &&
          valid_wire_bool(config->use_chunk_serialization) &&
          valid_wire_bool(config->use_compression) && valid_wire_bool(config->use_metadata) &&
-         valid_wire_bool(config->use_sendfile) && valid_wire_bool(config->use_delete) &&
-         valid_wire_bool(config->use_incremental) && valid_wire_bool(config->size_only) &&
-         valid_wire_bool(config->ignore_times) && valid_wire_bool(config->use_delta) &&
+         valid_wire_bool(config->use_executability) && valid_wire_bool(config->use_sendfile) &&
+         valid_wire_bool(config->use_delete) && valid_wire_bool(config->use_incremental) &&
+         valid_wire_bool(config->size_only) && valid_wire_bool(config->ignore_times) &&
+         valid_wire_bool(config->use_delta) && valid_wire_bool(config->backup) &&
          valid_wire_bool(config->follow_symlinks) && valid_wire_bool(config->copy_links) &&
          valid_wire_bool(config->safe_links) && valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
@@ -237,7 +239,8 @@ static bool send_core_fields(int fd, const Config* c) {
   return send_str(fd, c->send_directory) && send_str(fd, c->receive_root_directory) &&
          send_int(fd, c->save_to_disk) && send_int(fd, c->use_multithreading) &&
          send_int(fd, c->use_chunk_serialization) && send_int(fd, c->use_compression) &&
-         send_int(fd, c->use_metadata) && send_int(fd, c->compression_level) &&
+         send_int(fd, c->use_metadata) && send_int(fd, c->use_executability) &&
+         send_int(fd, c->compression_level) &&
          send_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)) && send_int(fd, c->use_sendfile);
 }
 
@@ -286,7 +289,8 @@ static bool receive_core_fields(int fd, Config* c) {
     return false;
   if (!receive_wire_bool(fd, &c->save_to_disk) || !receive_wire_bool(fd, &c->use_multithreading) ||
       !receive_wire_bool(fd, &c->use_chunk_serialization) ||
-      !receive_wire_bool(fd, &c->use_compression) || !receive_wire_bool(fd, &c->use_metadata))
+      !receive_wire_bool(fd, &c->use_compression) || !receive_wire_bool(fd, &c->use_metadata) ||
+      !receive_wire_bool(fd, &c->use_executability))
     return false;
   if (!receive_int(fd, &value))
     return false;

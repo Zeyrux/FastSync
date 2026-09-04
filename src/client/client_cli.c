@@ -388,6 +388,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "-M", "--preserve")) {
       config->use_metadata = true;
       log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
+    } else if (opt_is(argv[i], "-E", "--executability")) {
+      config->use_metadata = true;
+      config->use_executability = true;
+      log_message(LOG_LEVEL_INFO, "Enabled executable permission preservation");
     } else if (opt_is(argv[i], "-f", "--sendfile")) {
       config->use_sendfile = true;
       log_message(LOG_LEVEL_INFO, "Enabled sendfile");
@@ -623,7 +627,6 @@ int main(int argc, char* argv[]) {
     log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --delta");
     config->use_metadata = true;
   }
-
   /* Initialize TLS if needed */
   if (config->use_tls)
     tls_global_init();

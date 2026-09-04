@@ -146,7 +146,7 @@ static void test_file_restore_metadata() {
   m.mtime_sec = 1234567890;
   m.mtime_nsec = 0;
 
-  file_restore_metadata(path, &m);
+  file_restore_metadata(path, &m, false);
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -154,6 +154,35 @@ static void test_file_restore_metadata() {
   EXPECT_EQ_INT((int)st.st_mtime, 1234567890);
 
   unlink(path);
+}
+
+static void test_file_restore_executability_only() {
+  const char* path = "temp_exec_restore_test.txt";
+  EXPECT_TRUE(file_write_to_disk(path, "x", 1, false, false));
+  EXPECT_EQ_INT(chmod(path, 0644), 0);
+
+  FileMetadata m = {
+      .mode = 0751, .uid = getuid(), .gid = getgid(), .mtime_sec = 0, .mtime_nsec = 0};
+  file_restore_metadata(path, &m, true);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT(st.st_mode & 0777, 0755);
+  unlink(path);
+}
+
+static void test_directory_restore_executability_only() {
+  const char* path = "temp_exec_restore_test_dir";
+  EXPECT_EQ_INT(mkdir(path, 0700), 0);
+
+  FileMetadata m = {
+      .mode = 0755, .uid = getuid(), .gid = getgid(), .mtime_sec = 0, .mtime_nsec = 0};
+  file_restore_metadata(path, &m, true);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT(st.st_mode & 0777, 0711);
+  rmdir(path);
 }
 
 void test_metadata() {
@@ -165,4 +194,6 @@ void test_metadata() {
   test_metadata_rejects_invalid_values();
   test_metadata_mtime_window();
   test_file_restore_metadata();
+  test_file_restore_executability_only();
+  test_directory_restore_executability_only();
 }

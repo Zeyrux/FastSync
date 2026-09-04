@@ -50,6 +50,7 @@ void print_usage(void) {
   printf("  -q, --quiet         Suppress non-error output\n");
   printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
   printf("  -M, --preserve      Preserve file metadata\n");
+  printf("  -E, --executability Preserve executable permission bits\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");

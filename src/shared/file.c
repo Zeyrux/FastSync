@@ -327,8 +327,8 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
 
 static bool file_to_disk_secure_impl(const char* path, const void* data,
                                      unsigned long long data_size, bool inplace, bool sparse,
-                                     const FileMetadata* metadata, bool update, bool no_replace,
-                                     bool use_fsync) {
+                                     const FileMetadata* metadata, bool preserve_executability,
+                                     bool update, bool no_replace, bool use_fsync) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -350,7 +350,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
         if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
           ok = write_all(fd, data, data_size);
         if (ok && metadata)
-          ok = file_restore_metadata_fd(fd, metadata);
+          ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
         if (ok && use_fsync)
           ok = fsync(fd) == 0;
       }
@@ -378,7 +378,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (ok || (!sparse || data_size == 0))
         ok = write_all(fd, data, data_size);
       if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
+        ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
       if (ok && use_fsync)
         ok = fsync(fd) == 0;
       if (close(fd) != 0)
@@ -410,31 +410,37 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
 }
 
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                         bool inplace, bool sparse, const FileMetadata* metadata) {
-  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, false, false, false);
+                         bool inplace, bool sparse, const FileMetadata* metadata,
+                         bool preserve_executability) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
+                                   preserve_executability, false, false, false);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
-                                bool inplace, bool sparse, const FileMetadata* metadata) {
-  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, true, false, false);
+                                bool inplace, bool sparse, const FileMetadata* metadata,
+                                bool preserve_executability) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
+                                   preserve_executability, true, false, false);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
-                                    const FileMetadata* metadata, bool use_fsync) {
-  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, false, false,
-                                  use_fsync);
+                                    const FileMetadata* metadata, bool preserve_executability,
+                                    bool use_fsync) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
+                                   preserve_executability, false, false, use_fsync);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse,
-                                    const FileMetadata* metadata) {
-  return file_to_disk_secure_impl(path, data, data_size, false, sparse, metadata, false, true, false);
+                                    const FileMetadata* metadata, bool preserve_executability) {
+  return file_to_disk_secure_impl(path, data, data_size, false, sparse, metadata,
+                                   preserve_executability, false, true, false);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return file_to_disk_secure(path, data, data_size, inplace, sparse, NULL);
+  return file_to_disk_secure(path, data, data_size, inplace, sparse, NULL, false);
 }

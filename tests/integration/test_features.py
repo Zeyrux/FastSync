@@ -170,6 +170,26 @@ class TestArchiveMode:
         assert not mismatches, f"Mismatch: {mismatches}"
 
 
+class TestExecutability:
+    def test_preserves_only_executable_bits(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "executability_source")
+        dest = os.path.join(TEST_DATA_DIR, "executability_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "tool.sh")
+        with open(source_file, "w") as f:
+            f.write("#!/bin/sh\necho test\n")
+        os.chmod(source_file, 0o751)
+
+        result, _ = run_client(source, dest, flags=["-E"], port=shared_server.port)
+        assert result.returncode == 0, f"Executability sync failed: {result.stderr[:200]}"
+        received_file = os.path.join(get_dest_received_dir(dest, source), "tool.sh")
+        received_mode = os.stat(received_file).st_mode
+        assert received_mode & 0o111 == 0o111
+        assert received_mode & 0o600 == 0o600
+        assert received_mode & 0o077 == 0o011
+
+
 class TestExclude:
     def test_exclude_single(self, shared_server):
         clean_dir(DEST_DIR)

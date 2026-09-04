@@ -30,8 +30,9 @@ void metadata_to_buf(char** buf, const FileMetadata* m);
 FileMetadata* metadata_from_buf(char** buf);
 bool metadata_send(int file_descriptor, const FileMetadata* m);
 FileMetadata* metadata_receive(int file_descriptor, int* ok);
-void file_restore_metadata(const char* path, const FileMetadata* metadata);
-bool file_restore_metadata_fd(int fd, const FileMetadata* metadata);
+void file_restore_metadata(const char* path, const FileMetadata* metadata,
+                           bool preserve_executability);
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability);
 
 /* Compare timestamps using rsync's whole-second modification window. */
 bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, long right_nsec,
