@@ -1,4 +1,5 @@
 #include "config.h"
+#include "chmod.h"
 #include "delta.h"
 #include "log.h"
 #include "protocol.h"
@@ -108,6 +109,7 @@ static void config_set_defaults(Config* config) {
   config->server_mode = false;
   config->checksum = false;
   config->compress_choice = NULL;
+  config->chmod_spec = NULL;
 }
 
 static bool valid_wire_bool(int value) {
@@ -149,7 +151,9 @@ static bool validate_received_config(const Config* config) {
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
-         config->max_delete >= 0;
+         config->max_delete >= 0 &&
+         (!config->chmod_spec || !*config->chmod_spec ||
+          chmod_apply(0, config->chmod_spec, &(mode_t){0}));
 }
 
 Config* config_create(void) {
@@ -223,6 +227,7 @@ void config_delete(Config* config) {
   free(config->bind_address);
   free(config->daemon_config);
   free(config->compress_choice);
+  free(config->chmod_spec);
   if (config->filters) {
     array_list_delete(config->filters);
   }
@@ -275,7 +280,8 @@ static bool send_resume_options(int fd, const Config* c) {
          send_str(fd, c->partial_dir ? c->partial_dir : "") &&
          send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
          send_int(fd, c->checksum) && send_int(fd, c->modify_window) &&
-         send_str(fd, c->compress_choice ? c->compress_choice : "");
+         send_str(fd, c->compress_choice ? c->compress_choice : "") &&
+         send_str(fd, c->chmod_spec ? c->chmod_spec : "");
 }
 
 static bool receive_core_fields(int fd, Config* c) {
@@ -363,7 +369,10 @@ static bool receive_resume_options(int fd, Config* c) {
   if (!receive_n_data(fd, &c->modify_window, sizeof(c->modify_window)))
     return false;
   c->compress_choice = receive_str(fd);
-  return c->compress_choice != NULL;
+  if (!c->compress_choice)
+    return false;
+  c->chmod_spec = receive_str(fd);
+  return c->chmod_spec != NULL;
 }
 
 bool config_send(int file_descriptor, const Config* config) {

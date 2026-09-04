@@ -1,5 +1,6 @@
 #include "test_client_cli.h"
 #include "client_validation.h"
+#include "chmod.h"
 #include "config.h"
 #include "log.h"
 #include "test_utils.h"
@@ -247,6 +248,40 @@ static void test_parse_args_executability() {
   EXPECT_TRUE(cfg->use_executability);
   EXPECT_TRUE(cfg->use_metadata);
 
+  config_delete(cfg);
+}
+
+static void test_parse_args_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod=u=rw,go=r", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->chmod_spec, "u=rw,go=r");
+  EXPECT_TRUE(cfg->use_metadata);
+  mode_t result;
+  EXPECT_TRUE(chmod_apply(0777, cfg->chmod_spec, &result));
+  EXPECT_EQ_INT(result, 0644);
+  config_delete(cfg);
+}
+
+static void test_parse_args_numeric_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod", "7777", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->chmod_spec, "7777");
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+static void test_parse_args_rejects_invalid_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod=a+X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 }
 
@@ -671,6 +706,9 @@ void test_client_cli() {
   test_parse_args_size_only();
   test_parse_args_ignore_existing();
   test_parse_args_executability();
+  test_parse_args_chmod();
+  test_parse_args_numeric_chmod();
+  test_parse_args_rejects_invalid_chmod();
   test_parse_args_invalid_port();
   test_parse_args_non_numeric_port();
   test_parse_args_invalid_server_port();

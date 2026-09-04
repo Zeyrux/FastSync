@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "array_list.h"
+#include "chmod.h"
 #include "compression.h"
 #include "config.h"
 #include "data.h"
@@ -131,17 +132,25 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     }
   }
 
+  FileMetadata adjusted_metadata;
+  const FileMetadata* metadata = file->metadata;
+  if (metadata && config && config->chmod_spec && *config->chmod_spec) {
+    adjusted_metadata = *metadata;
+    if (!chmod_apply(adjusted_metadata.mode, config->chmod_spec, &adjusted_metadata.mode))
+      goto fail;
+    metadata = &adjusted_metadata;
+  }
   bool ok = config && config->ignore_existing
                 ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size,
-                                                  sparse, file->metadata, preserve_executability)
+                                                   sparse, metadata, preserve_executability)
                 : config && config->update
                       ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size,
-                                                    inplace, sparse, file->metadata,
-                                                    preserve_executability)
+                                                     inplace, sparse, metadata,
+                                                     preserve_executability)
                       : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
-                                                        inplace, sparse, file->metadata,
-                                                        preserve_executability,
-                                                        config && config->use_fsync);
+                                                         inplace, sparse, metadata,
+                                                         preserve_executability,
+                                                         config && config->use_fsync);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

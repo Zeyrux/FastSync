@@ -136,6 +136,7 @@ typedef struct Config {
 
   // PR #184: Compression algorithm negotiation
   char* compress_choice;
+  char* chmod_spec;
 } Config;
 
 #define PROTOCOL_VERSION "2.3.0"

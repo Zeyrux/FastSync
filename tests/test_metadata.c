@@ -1,4 +1,5 @@
 #include "test_metadata.h"
+#include "chmod.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -185,6 +186,27 @@ static void test_directory_restore_executability_only() {
   rmdir(path);
 }
 
+static void test_chmod_changes() {
+  mode_t result;
+  EXPECT_TRUE(chmod_apply(0777, "u=rw,go=r", &result));
+  EXPECT_EQ_INT(result, 0644);
+  EXPECT_TRUE(chmod_apply(0644, "a+x", &result));
+  EXPECT_EQ_INT(result, 0755);
+  result = 0777;
+  EXPECT_TRUE(chmod_apply(0777, "0000", &result));
+  EXPECT_EQ_INT(result, 0000);
+  result = 0777;
+  EXPECT_TRUE(chmod_apply(0777, "7777", &result));
+  EXPECT_EQ_INT(result, 07777);
+  result = 0777;
+  EXPECT_TRUE(chmod_apply(0777, "755", &result));
+  EXPECT_EQ_INT(result, 0755);
+  EXPECT_FALSE(chmod_apply(0777, "888", &result));
+  EXPECT_FALSE(chmod_apply(0777, "10000", &result));
+  EXPECT_FALSE(chmod_apply(0777, "a+X", &result));
+  EXPECT_FALSE(chmod_apply(0777, "a+r,", &result));
+}
+
 void test_metadata() {
   test_metadata_to_from_buf_roundtrip();
   test_metadata_to_buf_null();
@@ -196,4 +218,5 @@ void test_metadata() {
   test_file_restore_metadata();
   test_file_restore_executability_only();
   test_directory_restore_executability_only();
+  test_chmod_changes();
 }
