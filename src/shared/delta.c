@@ -396,7 +396,7 @@ Delta* delta_deserialize(const Data* data) {
   const uint8_t* buf = (const uint8_t*)data->data;
   size_t pos = 0;
 
-  Delta* delta = malloc(sizeof(Delta));
+  Delta* delta = protocol_alloc(sizeof(Delta));
   if (!delta)
     return NULL;
 
