@@ -28,6 +28,18 @@ static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
 static unsigned long long global_bwlimit(void);
 
+static bool protocol_reserve_memory(ProtocolSession* session, size_t charge) {
+  unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
+  while (true) {
+    if (allocated > MAX_CONNECTION_MEMORY ||
+        (unsigned long long)charge > MAX_CONNECTION_MEMORY - allocated)
+      return false;
+    if (atomic_compare_exchange_weak(&session->total_allocated_bytes, &allocated,
+                                     allocated + (unsigned long long)charge))
+      return true;
+  }
+}
+
 void protocol_release_memory(size_t charge) {
   ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
   unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
@@ -366,8 +378,7 @@ char* protocol_receive_str(ProtocolSession* session) {
   size_t size;
   if (!protocol_receive_n_data(session, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
-      size + 1 > MAX_CONNECTION_MEMORY - atomic_load(&session->total_allocated_bytes)) {
+  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
@@ -385,7 +396,6 @@ char* protocol_receive_str(ProtocolSession* session) {
     return NULL;
   }
   data[size] = '\0';
-  atomic_fetch_add(&session->total_allocated_bytes, size + 1);
   log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
   return data;
 }
@@ -418,20 +428,22 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
   if (size > SIZE_MAX)
     return NULL;
   size_t allocation_size = size == 0 ? 1 : (size_t)size;
-  if (allocation_size > MAX_CONNECTION_MEMORY - atomic_load(&session->total_allocated_bytes)) {
+  if (!protocol_reserve_memory(session, allocation_size)) {
     log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
                 (unsigned long long)atomic_load(&session->total_allocated_bytes), size,
                 (unsigned long long)MAX_CONNECTION_MEMORY);
     return NULL;
   }
   void* data = protocol_alloc(allocation_size);
-  if (data == NULL)
-    return NULL;
-  if (!protocol_receive_n_data(session, data, (size_t)size)) {
-    free(data);
+  if (data == NULL) {
+    protocol_release_memory(allocation_size);
     return NULL;
   }
-  atomic_fetch_add(&session->total_allocated_bytes, allocation_size);
+  if (!protocol_receive_n_data(session, data, (size_t)size)) {
+    free(data);
+    protocol_release_memory(allocation_size);
+    return NULL;
+  }
   log_message(LOG_LEVEL_DEBUG, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {

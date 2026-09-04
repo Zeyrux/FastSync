@@ -26,6 +26,13 @@ typedef struct {
   bool released;
 } AccountingWorkerArg;
 
+typedef struct {
+  ProtocolSession* session;
+  atomic_int* ready;
+  atomic_bool* release;
+  bool received;
+} ConcurrentAccountingWorkerArg;
+
 static int accounting_worker(void* arg) {
   AccountingWorkerArg* worker = arg;
   protocol_session_bind(worker->session);
@@ -36,6 +43,19 @@ static int accounting_worker(void* arg) {
   }
   protocol_session_unbind();
   return data ? thrd_success : thrd_error;
+}
+
+static int concurrent_accounting_worker(void* arg) {
+  ConcurrentAccountingWorkerArg* worker = arg;
+  protocol_session_bind(worker->session);
+  Data* data = protocol_receive_data_limited(worker->session, 8);
+  worker->received = data != NULL;
+  atomic_fetch_add(worker->ready, 1);
+  while (!atomic_load(worker->release))
+    thrd_yield();
+  data_destroy(data);
+  protocol_session_unbind();
+  return thrd_success;
 }
 
 static void test_send_receive_n_data() {
@@ -296,6 +316,80 @@ static void test_protocol_accounting_is_released_in_worker_threads() {
   }
 }
 
+static void test_protocol_accounting_reservation_is_atomic() {
+  enum { WORKER_COUNT = 8 };
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+  protocol_session_set_max_alloc(&session, 64);
+  const unsigned long long budget_before = MAX_SERVER_ALLOC - 8;
+  atomic_store(&session.total_allocated_bytes, budget_before);
+
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    unsigned long long size = 8;
+    EXPECT_EQ_INT((int)write(p[1], &size, sizeof(size)), (int)sizeof(size));
+    EXPECT_EQ_INT((int)write(p[1], "12345678", 8), 8);
+  }
+  close(p[1]);
+
+  atomic_int ready;
+  atomic_bool release;
+  atomic_init(&ready, 0);
+  atomic_init(&release, false);
+  ConcurrentAccountingWorkerArg args[WORKER_COUNT] = {0};
+  thrd_t threads[WORKER_COUNT];
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    args[i].session = &session;
+    args[i].ready = &ready;
+    args[i].release = &release;
+    EXPECT_EQ_INT(thrd_create(&threads[i], concurrent_accounting_worker, &args[i]), thrd_success);
+  }
+  while (atomic_load(&ready) != WORKER_COUNT)
+    thrd_yield();
+  bool budget_ok = atomic_load(&session.total_allocated_bytes) == budget_before + 8;
+  atomic_store(&release, true);
+  int received = 0;
+  for (int i = 0; i < WORKER_COUNT; i++) {
+    int result;
+    EXPECT_EQ_INT(thrd_join(threads[i], &result), thrd_success);
+    EXPECT_EQ_INT(result, thrd_success);
+    received += args[i].received ? 1 : 0;
+  }
+  EXPECT_EQ_INT(received, 1);
+  EXPECT_TRUE(budget_ok);
+  EXPECT_EQ_INT((int)atomic_load(&session.total_allocated_bytes), (int)budget_before);
+  close(p[0]);
+}
+
+static void test_protocol_string_accounting_is_transient() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+  protocol_session_set_max_alloc(&session, 64);
+  EXPECT_TRUE(protocol_send_str(&session, "temporary"));
+  char* received = protocol_receive_str(&session);
+  EXPECT_NOT_NULL(received);
+  EXPECT_EQ_STR(received, "temporary");
+  EXPECT_EQ_INT((int)atomic_load(&session.total_allocated_bytes), 0);
+  free(received);
+  close(p[0]);
+  close(p[1]);
+}
+
+static void test_protocol_accounting_release_does_not_underflow() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  atomic_store(&session.total_allocated_bytes, 4);
+  protocol_session_bind(&session);
+  protocol_release_memory(8);
+  EXPECT_EQ_INT((int)atomic_load(&session.total_allocated_bytes), 0);
+  protocol_release_memory(1);
+  EXPECT_EQ_INT((int)atomic_load(&session.total_allocated_bytes), 0);
+  protocol_session_unbind();
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -311,4 +405,7 @@ void test_protocol() {
   test_max_alloc_allows_configured_buffer();
   test_max_alloc_is_bound_in_worker_threads();
   test_protocol_accounting_is_released_in_worker_threads();
+  test_protocol_accounting_reservation_is_atomic();
+  test_protocol_string_accounting_is_transient();
+  test_protocol_accounting_release_does_not_underflow();
 }
