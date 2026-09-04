@@ -394,8 +394,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--out-format",
                                         "--info",
                                         "--list-only",
-                                        "-u",
-                                        "--update",
                                         "--append",
                                         "--append-verify",
                                         "--delete-excluded",
@@ -463,6 +461,20 @@ static void test_parse_args_human_readable() {
     EXPECT_TRUE(cfg->human_readable);
     config_delete(cfg);
   }
+}
+
+static void test_parse_args_update() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-u", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->update);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
 }
 
 /* Test parse_args with --archive flag */
@@ -634,6 +646,7 @@ void test_client_cli() {
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();
+  test_parse_args_update();
   test_parse_args_archive();
   test_parse_args_fsync();
   test_parse_args_ignore_times();

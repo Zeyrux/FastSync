@@ -61,16 +61,13 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     return false;
   }
 
-  /* --update is receiver-side policy: never replace a newer destination. */
-  if (config && config->update) {
-    struct stat destination_stat;
-    if (file_stat_secure(disk_path, &destination_stat) && file->metadata &&
-        destination_stat.st_mtime > file->metadata->mtime_sec) {
-      free(confined_backup);
-      free(confined_partial);
-      free(disk_path);
-      return true;
-    }
+  /* --update is receiver-side policy: never replace a newer destination.
+     The secure stat does not require read permission on the destination. */
+  if (config && config->update && file_destination_is_newer_secure(disk_path, file->metadata)) {
+    free(confined_backup);
+    free(confined_partial);
+    free(disk_path);
+    return true;
   }
 
   if (backup_enabled) {
@@ -103,8 +100,12 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     }
   }
 
-  bool ok = file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size, inplace,
-                                           sparse, file->metadata, config && config->use_fsync);
+  bool ok = config && config->update
+                ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
+                                             sparse, file->metadata)
+                : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
+                                                 inplace, sparse, file->metadata,
+                                                 config && config->use_fsync);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

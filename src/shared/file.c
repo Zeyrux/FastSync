@@ -183,13 +183,27 @@ bool file_stat_secure(const char* path, struct stat* st) {
   int parent_fd = file_open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)
     return false;
-  int fd = openat(parent_fd, leaf, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
-  bool exists = fd >= 0 && fstat(fd, st) == 0 && S_ISREG(st->st_mode);
-  if (fd >= 0)
-    close(fd);
+  bool exists = fstatat(parent_fd, leaf, st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st->st_mode);
   close(parent_fd);
   free(leaf);
   return exists;
+}
+
+static bool stat_is_newer(const struct stat* st, const FileMetadata* metadata) {
+  if (!st || !metadata)
+    return false;
+#ifdef __linux__
+  long mtime_nsec = st->st_mtim.tv_nsec;
+#else
+  long mtime_nsec = 0;
+#endif
+  return st->st_mtime > metadata->mtime_sec ||
+         (st->st_mtime == metadata->mtime_sec && mtime_nsec > metadata->mtime_nsec);
+}
+
+bool file_destination_is_newer_secure(const char* path, const FileMetadata* metadata) {
+  struct stat st;
+  return file_stat_secure(path, &st) && stat_is_newer(&st, metadata);
 }
 
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs) {
@@ -302,9 +316,9 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
   return ok;
 }
 
-bool file_to_disk_secure_with_fsync(const char* path, const void* data,
-                                    unsigned long long data_size, bool inplace, bool sparse,
-                                    const FileMetadata* metadata, bool use_fsync) {
+static bool file_to_disk_secure_impl(const char* path, const void* data,
+                                     unsigned long long data_size, bool inplace, bool sparse,
+                                     const FileMetadata* metadata, bool update, bool use_fsync) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -312,17 +326,38 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
   int fd = -1;
   bool ok = false;
   if (inplace) {
-    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (fd >= 0) {
-      if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
-        ok = write_all(fd, data, data_size);
-      if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata);
-      if (ok && use_fsync)
-        ok = fsync(fd) == 0;
+      struct stat destination_stat;
+      bool newer = false;
+      if (update && metadata && fstat(fd, &destination_stat) == 0 &&
+          S_ISREG(destination_stat.st_mode)) {
+        newer = stat_is_newer(&destination_stat, metadata);
+      }
+      if (newer) {
+        ok = true;
+      } else {
+        if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
+          ok = write_all(fd, data, data_size);
+        if (ok && metadata)
+          ok = file_restore_metadata_fd(fd, metadata);
+        if (ok && use_fsync)
+          ok = fsync(fd) == 0;
+      }
     }
   } else {
     char tmp[NAME_MAX];
+    if (update && metadata) {
+      /* This check protects the normal atomic path as far as possible.  A
+         concurrent replacement can still occur before the final rename. */
+      struct stat destination_stat;
+      if (fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+          S_ISREG(destination_stat.st_mode) && stat_is_newer(&destination_stat, metadata)) {
+        close(dirfd);
+        free(leaf);
+        return true;
+      }
+    }
     for (unsigned int i = 0; i < 100 && !ok; ++i) {
       snprintf(tmp, sizeof(tmp), ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
       fd = openat(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -354,7 +389,19 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
 
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                          bool inplace, bool sparse, const FileMetadata* metadata) {
-  return file_to_disk_secure_with_fsync(path, data, data_size, inplace, sparse, metadata, false);
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, false, false);
+}
+
+bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
+                                bool inplace, bool sparse, const FileMetadata* metadata) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, true, false);
+}
+
+bool file_to_disk_secure_with_fsync(const char* path, const void* data,
+                                    unsigned long long data_size, bool inplace, bool sparse,
+                                    const FileMetadata* metadata, bool use_fsync) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata, false,
+                                  use_fsync);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

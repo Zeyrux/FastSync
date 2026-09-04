@@ -27,6 +27,7 @@ bool file_set_authorized_root(int fd, const char* canonical_path);
 /* Secure path/filesystem primitives (symlink-safe, O_NOFOLLOW, root-confined). */
 bool file_path_exists_secure(const char* path);
 bool file_stat_secure(const char* path, struct stat* st);
+bool file_destination_is_newer_secure(const char* path, const FileMetadata* metadata);
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
 bool file_ensure_directory_secure(const char* path);
 bool file_rename_secure(const char* old_path, const char* new_path);
@@ -35,5 +36,10 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
                                     const FileMetadata* metadata, bool use_fsync);
+/* With update enabled, an existing newer destination is left untouched.  The
+   check is descriptor-based for inplace writes; atomic replacement still has
+   an unavoidable final rename race without filesystem locking. */
+bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
+                                bool inplace, bool sparse, const FileMetadata* metadata);
 
 #endif

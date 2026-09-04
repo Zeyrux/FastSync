@@ -219,6 +219,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
     {"--secluded-args", NULL, OPT_NOOP, 0},
+    {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
     {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
     {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
@@ -267,6 +268,8 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   switch (entry->kind) {
   case OPT_FLAG:
     *(bool*)field = true;
+    if (entry->offset == offsetof(Config, update))
+      config->use_metadata = true;
     return 0;
   case OPT_NOOP:
     return 0;
