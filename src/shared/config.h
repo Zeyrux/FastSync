@@ -83,6 +83,7 @@ typedef struct Config {
 
   // Issue #127: Transfer modes
   bool existing;
+  bool ignore_existing;
   bool update;
   bool inplace;
   bool use_fsync;

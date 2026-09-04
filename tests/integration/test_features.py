@@ -497,6 +497,60 @@ class TestExisting:
                 f.write(b"hello world\n")
 
 
+class TestIgnoreExisting:
+    def test_ignore_existing_preserves_existing_and_transfers_new(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        existing_file = os.path.join(received, "small.txt")
+        with open(existing_file, "wb") as f:
+            f.write(b"destination content\n")
+        new_source = os.path.join(SOURCE_DIR, "new.txt")
+        try:
+            with open(new_source, "wb") as f:
+                f.write(b"new file\n")
+
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=["--ignore-existing"], port=shared_server.port)
+            assert result.returncode == 0, f"Sync failed: {(result.stderr or result.stdout)[:200]}"
+            with open(existing_file, "rb") as f:
+                assert f.read() == b"destination content\n"
+            with open(os.path.join(received, "new.txt"), "rb") as f:
+                assert f.read() == b"new file\n"
+        finally:
+            if os.path.lexists(new_source):
+                os.unlink(new_source)
+
+
+class TestIgnoreExisting:
+    def test_ignore_existing_preserves_existing_and_transfers_new(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        existing_file = os.path.join(received, "small.txt")
+        with open(existing_file, "wb") as f:
+            f.write(b"destination content\n")
+        new_source = os.path.join(SOURCE_DIR, "new.txt")
+        try:
+            with open(new_source, "wb") as f:
+                f.write(b"new file\n")
+
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=["--ignore-existing"], port=shared_server.port)
+            assert result.returncode == 0, f"Sync failed: {(result.stderr or result.stdout)[:200]}"
+            with open(existing_file, "rb") as f:
+                assert f.read() == b"destination content\n"
+            with open(os.path.join(received, "new.txt"), "rb") as f:
+                assert f.read() == b"new file\n"
+        finally:
+            if os.path.lexists(new_source):
+                os.unlink(new_source)
+
+
 class TestDelete:
     def test_delete_removes_extra_files(self, shared_server):
         clean_dir(DEST_DIR)

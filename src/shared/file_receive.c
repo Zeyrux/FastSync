@@ -22,7 +22,9 @@
 #define MAX_FILE_DATA_SIZE MAX_RECEIVE_FILE_SIZE
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
-  bool backup_enabled = config && config->backup;
+  /* Backups are incompatible with ignore-existing: moving the entry first
+     would make a concurrent no-replace commit overwrite its old name. */
+  bool backup_enabled = config && config->backup && !config->ignore_existing;
   bool inplace = config && config->inplace;
   bool sparse = config && config->preserve_sparse;
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
@@ -73,6 +75,19 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     free(disk_path);
     return true;
   }
+
+  /* --ignore-existing checks the final destination before partial files or
+     overwrite policies can modify it. */
+  if (config && config->ignore_existing) {
+    bool exists = file_path_exists_secure(destination_path);
+    if (exists) {
+      free(confined_backup);
+      free(confined_partial);
+      free(destination_path);
+      free(disk_path);
+      return true;
+    }
+  }
   free(destination_path);
   destination_path = NULL;
 
@@ -115,12 +130,15 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     }
   }
 
-  bool ok = config && config->update
-                ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
-                                             sparse, file->metadata)
-                : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
-                                                 inplace, sparse, file->metadata,
-                                                 config && config->use_fsync);
+  bool ok = config && config->ignore_existing
+                ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size,
+                                                 sparse, file->metadata)
+                : config && config->update
+                      ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size,
+                                                   inplace, sparse, file->metadata)
+                      : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
+                                                       inplace, sparse, file->metadata,
+                                                       config && config->use_fsync);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

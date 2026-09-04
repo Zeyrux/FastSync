@@ -154,6 +154,99 @@ static void test_file_save_to_disk_existing() {
 
   config_delete(cfg);
   unlink(existing_path);
+  rmdir("test_existing_tmp");
+}
+
+static void test_file_save_to_disk_ignore_existing() {
+  const char* path = "test_ignore_existing_tmp/existing.txt";
+  EXPECT_TRUE(file_write_to_disk(path, "old", 3, false, false));
+
+  File* file = file_create("existing.txt");
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(3);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, "new", 3);
+  file->data->size = 3;
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->ignore_existing = true;
+  EXPECT_TRUE(file_save_to_disk("test_ignore_existing_tmp", file, config));
+
+  FILE* stream = fopen(path, "rb");
+  char content[4] = {0};
+  EXPECT_NOT_NULL(stream);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (stream) {
+    EXPECT_EQ_INT((int)fread(content, 1, 3, stream), 3);
+    fclose(stream);
+  }
+  EXPECT_EQ_STR(content, "old");
+
+  file_destroy(file);
+  config_delete(config);
+  unlink(path);
+  rmdir("test_ignore_existing_tmp");
+}
+
+static void test_file_save_to_disk_ignore_existing_entry_types() {
+  const char* root = "test_ignore_existing_entries_tmp";
+  const char* directory = "test_ignore_existing_entries_tmp/directory";
+  const char* link = "test_ignore_existing_entries_tmp/link";
+  const char* target = "test_ignore_existing_entries_tmp/target";
+  const char* backup = "test_ignore_existing_entries_tmp/backup.txt~";
+  const char* backup_file = "test_ignore_existing_entries_tmp/backup.txt";
+  Config* config = config_create();
+  File* file = file_create("unused");
+
+  unlink(link);
+  unlink(target);
+  unlink(backup);
+  unlink(backup_file);
+  rmdir(directory);
+  rmdir(root);
+  EXPECT_NOT_NULL(config);
+  EXPECT_NOT_NULL(file);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (!config || !file)
+    return;
+  config->ignore_existing = true;
+  config->backup = true;
+  file->data->data = malloc(3);
+  EXPECT_NOT_NULL(file->data->data);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (!file->data->data) {
+    file_destroy(file);
+    config_delete(config);
+    return;
+  }
+  memcpy(file->data->data, "new", 3);
+  file->data->size = 3;
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(directory, 0755), 0);
+  EXPECT_TRUE(file_write_to_disk(target, "old", 3, false, false));
+  EXPECT_EQ_INT(symlink("target", link), 0);
+  free(file->path);
+  file->path = str_dup("directory");
+  EXPECT_TRUE(file_save_to_disk(root, file, config));
+  free(file->path);
+  file->path = str_dup("link");
+  EXPECT_TRUE(file_save_to_disk(root, file, config));
+
+  free(file->path);
+  file->path = str_dup("backup.txt");
+  EXPECT_TRUE(file_write_to_disk(backup_file, "old", 3, false, false));
+  EXPECT_TRUE(file_save_to_disk(root, file, config));
+  EXPECT_TRUE(file_path_exists_secure(backup_file));
+  EXPECT_FALSE(file_path_exists_secure(backup));
+
+  file_destroy(file);
+  config_delete(config);
+  unlink(link);
+  unlink(target);
+  unlink(backup_file);
+  rmdir(directory);
   rmdir(root);
 }
 
@@ -540,6 +633,8 @@ void test_file() {
   test_file_save_to_disk();
   test_file_save_to_disk_with_fsync_config();
   test_file_save_to_disk_existing();
+  test_file_save_to_disk_ignore_existing();
+  test_file_save_to_disk_ignore_existing_entry_types();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_with_fsync();
   test_file_write_to_disk_creates_dirs();

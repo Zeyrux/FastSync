@@ -41,5 +41,8 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
    an unavoidable final rename race without filesystem locking. */
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
                                 bool inplace, bool sparse, const FileMetadata* metadata);
+bool file_to_disk_secure_no_replace(const char* path, const void* data,
+                                    unsigned long long data_size, bool sparse,
+                                    const FileMetadata* metadata);
 
 #endif

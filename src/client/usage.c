@@ -23,6 +23,7 @@ void print_usage(void) {
   printf("  --progress          Show transfer progress\n");
   printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");
   printf("  --delete            Delete files on receiver not in source\n");
+  printf("  --ignore-existing  Skip files that already exist on receiver\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --exclude-from <file> Read exclude patterns from file\n");
