@@ -16,11 +16,14 @@
 #include "transport_ssh.h"
 #include "transport_tls.h"
 #include "utils.h"
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define STREAM_THRESHOLD (64ULL * 1024 * 1024)
@@ -102,6 +105,88 @@ static bool finalize_transfer(Client* client) {
   Status status;
   return send_status(client->file_descriptor, STATUS_FINISHED) &&
          receive_status(client->file_descriptor, &status) && status == STATUS_OK;
+}
+
+typedef struct {
+  char* path;
+  dev_t device;
+  ino_t inode;
+} SourceFile;
+
+static void source_file_destroy(void* item) {
+  SourceFile* source = item;
+  if (source) {
+    free(source->path);
+    free(source);
+  }
+}
+
+/* Remove only the same regular source file that was sent. */
+static void remove_transferred_sources(const Config* config, ArrayList* paths) {
+  if (!config->remove_source_files || !paths)
+    return;
+  for (int i = 0; i < paths->size; i++) {
+    SourceFile* source = paths->items[i];
+    const char* slash = strrchr(source->path, '/');
+    const char* leaf = slash ? slash + 1 : source->path;
+    char parent[PATH_MAX];
+    if (slash) {
+      size_t parent_length = (size_t)(slash - source->path);
+      if (parent_length == 0)
+        parent_length = 1;
+      if (parent_length >= sizeof(parent))
+        continue;
+      memcpy(parent, source->path, parent_length);
+      parent[parent_length] = '\0';
+    } else {
+      (void)snprintf(parent, sizeof(parent), ".");
+    }
+
+    int dirfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0)
+      continue;
+    struct stat st;
+    if (fstatat(dirfd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_dev != source->device || st.st_ino != source->inode) {
+      close(dirfd);
+      continue;
+    }
+    if (unlinkat(dirfd, leaf, 0) != 0)
+      log_message(LOG_LEVEL_WARNING, "Could not remove source file %s", source->path);
+    close(dirfd);
+  }
+}
+
+static SourceFile* source_file_create(const File* file) {
+  if (!file || !file->path)
+    return NULL;
+  struct stat st;
+  if (lstat(file->path, &st) != 0 || !S_ISREG(st.st_mode))
+    return NULL;
+  SourceFile* source = malloc(sizeof(*source));
+  if (!source)
+    return NULL;
+  source->path = str_dup(file->path);
+  source->device = st.st_dev;
+  source->inode = st.st_ino;
+  if (!source->path) {
+    source_file_destroy(source);
+    return NULL;
+  }
+  return source;
+}
+
+static bool remember_source_file(ArrayList* paths, const File* file) {
+  if (!paths || !file || !file->path)
+    return true;
+  SourceFile* source = source_file_create(file);
+  if (!source)
+    return true;
+  if (!array_list_add(paths, source)) {
+    source_file_destroy(source);
+    return false;
+  }
+  return true;
 }
 
 static void mark_sender_done(PipelineContextSender* context) {
@@ -343,8 +428,15 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   return 0;
 }
 
-int send_chunk(Client* client, Chunk* chunk, Config* config) {
+static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
+                                   ArrayList* remove_sources) {
   if (config->use_chunk_serialization) {
+    if (remove_sources) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        if (!remember_source_file(remove_sources, chunk->items[i]))
+          return -1;
+      }
+    }
     if (!send_status(client->file_descriptor, STATUS_CHUNK))
       return -1;
     Data* data;
@@ -370,13 +462,26 @@ int send_chunk(Client* client, Chunk* chunk, Config* config) {
     bool stream = f->data->data == NULL && f->data->size > 0;
     bool use_sendfile =
         (config->use_sendfile && !config->use_compression) || (stream && !config->use_compression);
+    SourceFile* source = remove_sources ? source_file_create(f) : NULL;
     int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
-    if (rc == 1)
+    if (rc == 1) {
+      source_file_destroy(source);
       continue;
-    if (rc < 0)
+    }
+    if (rc < 0) {
+      source_file_destroy(source);
       return -1;
+    }
+    if (source && !array_list_add(remove_sources, source)) {
+      source_file_destroy(source);
+      return -1;
+    }
   }
   return 0;
+}
+
+int send_chunk(Client* client, Chunk* chunk, Config* config) {
+  return send_chunk_with_removal(client, chunk, config, NULL);
 }
 
 static int send_chunks_multithreaded(void* pipeline_context) {
@@ -419,6 +524,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
           goto send_fail;
       }
       bool ok = finalize_transfer(client);
+      if (ok)
+        remove_transferred_sources(context->config, context->remove_source_files);
       disconnect_transfer_client(client);
       mark_sender_done(context);
       protocol_session_unbind();
@@ -431,7 +538,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       protocol_session_unbind();
       return thrd_error;
     }
-    if (send_chunk(client, current_chunk, context->config) != 0) {
+    if (send_chunk_with_removal(client, current_chunk, context->config,
+                                context->remove_source_files) != 0) {
       log_message(LOG_LEVEL_ERROR, "unexpected error while sending chunk");
       chunk_destroy(current_chunk);
       pipeline_cancel(context);
@@ -603,12 +711,16 @@ int send_files(Config* config) {
   int ret = 1;
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
+  ArrayList* remove_sources = NULL;
   if (!config_send(client->file_descriptor, config))
     goto send_fail;
   ScannerOptions scanner_options = scanner_options_from_config(config, 0);
   scanner = directory_scanner_create_with_options(config->send_directory, &scanner_options);
   manifest = create_transfer_manifest(config);
-  if (!scanner || (config->use_delete && !manifest))
+  if (config->remove_source_files)
+    remove_sources = array_list_create(source_file_destroy);
+  if (!scanner || (config->use_delete && !manifest) ||
+      (config->remove_source_files && !remove_sources))
     goto send_fail;
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
@@ -642,7 +754,7 @@ int send_files(Config* config) {
         goto send_fail;
       }
     }
-    if (send_chunk(client, current_chunk, config) != 0) {
+    if (send_chunk_with_removal(client, current_chunk, config, remove_sources) != 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
       chunk_destroy(current_chunk);
       if (manifest)
@@ -672,6 +784,8 @@ int send_files(Config* config) {
     manifest = NULL;
   }
   bool ok = finalize_transfer(client);
+  if (ok)
+    remove_transferred_sources(config, remove_sources);
   if (config->show_progress)
     print_transfer_progress(total_bytes, start, "Done.\n");
   if (config->stats) {
@@ -687,6 +801,8 @@ send_fail:
      here even on success without --delete, fixing a pre-existing leak. */
   if (manifest)
     array_list_delete(manifest);
+  if (remove_sources)
+    array_list_delete(remove_sources);
   if (scanner)
     directory_scanner_destroy(scanner);
   disconnect_transfer_client(client);
@@ -731,7 +847,10 @@ int send_files_multithreaded(Config** config_ptr) {
   *config_ptr = NULL; /* context now owns config through all remaining paths */
   if (config->use_delete)
     context->manifest = array_list_create(free);
-  if (config->use_delete && !context->manifest) {
+  if (config->remove_source_files)
+    context->remove_source_files = array_list_create(source_file_destroy);
+  if ((config->use_delete && !context->manifest) ||
+      (config->remove_source_files && !context->remove_source_files)) {
     pipeline_context_sender_destroy(context);
     return 1;
   }

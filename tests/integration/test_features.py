@@ -36,6 +36,85 @@ class TestDryRun:
         assert "Dry run:" in result.stdout, f"No dry run output: {result.stdout[:200]}"
 
 
+class TestRemoveSourceFiles:
+    def test_removes_only_transferred_regular_files(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "one.txt"), "wb") as f:
+            f.write(b"one")
+        with open(os.path.join(source, "two.txt"), "wb") as f:
+            f.write(b"two")
+        os.makedirs(os.path.join(source, "directory"))
+        os.symlink("one.txt", os.path.join(source, "link.txt"))
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files", "-m"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Remove-source sync failed: {result.stderr[:200]}"
+        assert not os.path.exists(os.path.join(source, "one.txt"))
+        assert not os.path.exists(os.path.join(source, "two.txt"))
+        assert os.path.isdir(os.path.join(source, "directory"))
+        assert os.path.islink(os.path.join(source, "link.txt"))
+
+    def test_single_threaded_removes_transferred_file(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_single_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_single_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"single threaded")
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files"],
+                               port=shared_server.port)
+        assert result.returncode == 0
+        assert not os.path.exists(source_file)
+
+    def test_dry_run_preserves_source_files(self):
+        source = os.path.join(TEST_DATA_DIR, "remove_dry_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_dry_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"keep")
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files", "--dry-run"])
+        assert result.returncode == 0
+        assert os.path.isfile(source_file)
+
+    def test_failed_connection_preserves_source_files(self):
+        source = os.path.join(TEST_DATA_DIR, "remove_failed_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_failed_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"keep after failure")
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files"], port=1)
+        assert result.returncode != 0
+        assert os.path.isfile(source_file)
+
+    def test_incremental_skip_preserves_source_file(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_skipped_source")
+        dest = os.path.join(TEST_DATA_DIR, "remove_skipped_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"keep after skip")
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0
+        result, _ = run_client(source, dest,
+                               flags=["--remove-source-files", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0
+        assert os.path.isfile(source_file)
+
+
 class TestArchiveMode:
     def test_archive_mode(self, shared_server):
         clean_dir(DEST_DIR)

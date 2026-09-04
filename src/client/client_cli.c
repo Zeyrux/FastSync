@@ -137,6 +137,7 @@ typedef struct {
 /* Options that map directly onto a Config field with no side effects. */
 static const OptionEntry OPTION_TABLE[] = {
     {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
+    {"--remove-source-files", NULL, OPT_FLAG, offsetof(Config, remove_source_files)},
     {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
     {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
     {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},

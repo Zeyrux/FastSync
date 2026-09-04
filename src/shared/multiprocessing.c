@@ -26,6 +26,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scanner_done = false;
   context->loader_done = false;
   context->manifest = NULL;
+  context->remove_source_files = NULL;
   context->progress_bytes = 0;
   context->sender_done = false;
   atomic_init(&context->cancelled, false);
@@ -76,6 +77,8 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
+  if (context->remove_source_files)
+    array_list_delete(context->remove_source_files);
   config_delete(context->config);
   queue_destroy(context->queue_scanner);
   queue_destroy(context->queue_loader);
