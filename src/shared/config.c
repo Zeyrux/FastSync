@@ -36,6 +36,7 @@ static void config_set_defaults(Config* config) {
   config->min_size = 0;
   config->use_incremental = false;
   config->use_delta = false;
+  config->whole_file = false;
   config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
   config->delta_max_file_size = DELTA_MAX_FILE_SIZE;
   config->use_tls = false;
@@ -234,7 +235,7 @@ static bool send_core_fields(int fd, const Config* c) {
 
 static bool send_delta_fields(int fd, const Config* c) {
   return send_int(fd, c->use_delete) && send_int(fd, c->use_incremental) &&
-         send_int(fd, c->use_delta) &&
+         send_int(fd, c->use_delta && !c->whole_file) &&
          send_n_data(fd, &c->delta_block_size, sizeof(c->delta_block_size)) &&
          send_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
 }

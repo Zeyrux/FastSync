@@ -207,6 +207,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
     {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
     {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
+    {"--whole-file", "-W", OPT_FLAG, offsetof(Config, whole_file)},
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
     {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
     {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},

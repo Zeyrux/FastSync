@@ -23,15 +23,15 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "--incremental is not supported with -s (chunk serialization)");
     return false;
   }
-  if (config->use_delta && !config->use_incremental) {
+  if (config->use_delta && !config->whole_file && !config->use_incremental) {
     log_message(LOG_LEVEL_ERROR, "--delta requires --incremental");
     return false;
   }
-  if (config->use_delta && config->use_chunk_serialization) {
+  if (config->use_delta && !config->whole_file && config->use_chunk_serialization) {
     log_message(LOG_LEVEL_ERROR, "--delta cannot be combined with -s (chunk serialization)");
     return false;
   }
-  if (config->use_delta && config->use_sendfile) {
+  if (config->use_delta && !config->whole_file && config->use_sendfile) {
     log_message(LOG_LEVEL_ERROR, "--delta cannot be combined with -f (sendfile)");
     return false;
   }

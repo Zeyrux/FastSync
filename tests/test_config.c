@@ -125,6 +125,8 @@ static void test_config_send_receive() {
   send_cfg->use_compression = true;
   send_cfg->use_metadata = true;
   send_cfg->use_fsync = true;
+  send_cfg->use_delta = true;
+  send_cfg->whole_file = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
   send_cfg->eight_bit_output = true;
@@ -165,6 +167,11 @@ static void test_config_send_receive() {
       if (!recv_cfg->use_fsync)
         ok = false;
       if (!recv_cfg->eight_bit_output)
+        ok = false;
+      if (recv_cfg->use_delta)
+        ok = false;
+      if (!recv_cfg->whole_file)
+        ok = false;
     }
     config_delete(recv_cfg);
     close(p[0]);

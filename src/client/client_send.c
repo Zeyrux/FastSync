@@ -435,7 +435,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     delta_signature_destroy(sig);
     return 1;
   }
-  if (rc == 2 && config->use_delta) {
+  if (rc == 2 && config->use_delta && !config->whole_file) {
     int drc = send_delta(client, file, sig, config);
     delta_signature_destroy(sig);
     if (drc == 0)

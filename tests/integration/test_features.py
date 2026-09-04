@@ -331,6 +331,27 @@ class TestIncremental:
         with open(received_file, "rb") as f:
             assert f.read() == b"hello world\n"
 
+    def test_whole_file_disables_delta_and_keeps_compression(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        source_file = os.path.join(SOURCE_DIR, "medium.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"whole-file replacement\n" * 5000)
+
+        result, _ = run_client(
+            SOURCE_DIR,
+            DEST_DIR,
+            flags=["-M", "--incremental", "--delta", "-W", "-c"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Whole-file sync failed: {(result.stderr or result.stdout)[:200]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
 
 class TestDelete:
     def test_delete_removes_extra_files(self, shared_server):
