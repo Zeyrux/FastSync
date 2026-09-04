@@ -94,6 +94,7 @@ partial, alternate, and planned behavior.
 | `-n, --dry-run` | Scan and print what would be transferred |
 | `-p <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
+| `-q, --quiet` | Suppress non-error output |
 | `--progress` | Show real-time transfer speed |
 | `--delete` | Delete files on receiver not present in source |
 | `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |

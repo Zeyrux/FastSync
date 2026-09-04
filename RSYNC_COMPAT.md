@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 34 | Feature works end-to-end |
+| ✅ Implemented | 35 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 1 | Flag parsed/stored but behavior incomplete |
 | ❌ Not Implemented | 98 | Flag not recognized or no behavior |
-| **Total** | **136** | |
+| **Total** | **137** | |
 
 ---
 
@@ -20,7 +20,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `-a`, `--archive` | Archive mode is -rlptgoD | 🔀 Alt Arg | Maps to -c -m -M (compression + multithread + metadata) |
 | `-v`, `--verbose` | Increase verbosity | ✅ Implemented | Sets `log_level=DEBUG` |
-| `-q`, `--quiet` | Suppress non-error messages | ❌ Not Implemented | Removed because it had no effect |
+| `-q`, `--quiet` | Suppress non-error messages | ✅ Implemented | Suppresses client output while preserving errors |
 | `--help` | Show help | ✅ Implemented | Prints usage and exits; `-h` is not accepted |
 | `-V`, `--version` | Print version | ✅ Implemented | |
 | `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
