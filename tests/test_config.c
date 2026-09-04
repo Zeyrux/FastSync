@@ -193,7 +193,7 @@ static void test_config_send_receive_version_mismatch() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
-  cfg->version = str_dup("2.2.0");
+  cfg->version = str_dup("2.3.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 
@@ -237,6 +237,8 @@ static void test_config_receive_truncated() {
   /* A valid prefix exercises cleanup after allocated wire strings and a
    * partially received scalar field. */
   EXPECT_TRUE(send_str(p[1], PROTOCOL_VERSION));
+  unsigned long long max_alloc = DEFAULT_MAX_ALLOC;
+  EXPECT_TRUE(send_n_data(p[1], &max_alloc, sizeof(max_alloc)));
   EXPECT_TRUE(send_str(p[1], "/src"));
   EXPECT_TRUE(send_str(p[1], "/dst"));
   EXPECT_TRUE(send_int(p[1], 1));
