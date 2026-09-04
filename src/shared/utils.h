@@ -17,5 +17,6 @@ bool utils_set_authorized_root(int fd, const char* canonical_path);
 void utils_set_authorized_root_fd(int fd);
 bool has_path_traversal(const char* path);
 bool utils_valid_batch_path(const char* path);
+bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_size);
 
 #endif

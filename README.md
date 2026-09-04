@@ -110,6 +110,7 @@ partial, alternate, and planned behavior.
 | `--backup` | Backup existing destination files before overwriting |
 | `--backup-dir <dir>` | Target directory for backups (requires `--backup`) |
 | `--stats` | Print transfer statistics at end (bytes, files, timing) |
+| `-h, --human-readable` | Format transfer byte sizes with binary units |
 | `--max-depth <n>` | Maximum directory depth to recurse (0 = unlimited, default: 0) |
 | `--log-file <path>` | Write log messages to file instead of stderr |
 | `--source-dir <path>` | Source directory (overrides `FASTSYNC_SOURCE_DIR`) |

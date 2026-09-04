@@ -36,7 +36,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `--stats` | Give transfer stats | ✅ Implemented | Prints file/byte counts |
-| `-h`, `--human-readable` | Human-readable numbers | ❌ Not Implemented | Removed because it had no effect |
+| `-h`, `--human-readable` | Human-readable numbers | ✅ Implemented | Formats transfer byte sizes using binary units |
 | `-i`, `--itemize-changes` | Per-file change summary | ❌ Not Implemented | Removed because it had no effect |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
 | `-P` | Same as --partial --progress | ❌ Not Implemented | |

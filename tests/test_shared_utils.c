@@ -5,6 +5,15 @@
 #include <string.h>
 
 void test_shared_utils() {
+  char formatted[32];
+  EXPECT_TRUE(format_human_bytes(0, formatted, sizeof(formatted)));
+  EXPECT_EQ_STR(formatted, "0 B");
+  EXPECT_TRUE(format_human_bytes(1024, formatted, sizeof(formatted)));
+  EXPECT_EQ_STR(formatted, "1.0 KB");
+  EXPECT_TRUE(format_human_bytes(1536 * 1024, formatted, sizeof(formatted)));
+  EXPECT_EQ_STR(formatted, "1.5 MB");
+  EXPECT_FALSE(format_human_bytes(1024, formatted, 4));
+
   // Test str_dup
   const char* dup_null = str_dup(NULL);
   EXPECT_NULL(dup_null);
