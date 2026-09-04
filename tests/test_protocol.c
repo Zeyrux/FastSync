@@ -256,6 +256,28 @@ static void test_max_alloc_rejects_single_buffer() {
   close(p[1]);
 }
 
+static void test_explicit_session_max_alloc_cannot_be_bypassed() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession explicit_session;
+  ProtocolSession unrelated_session;
+  protocol_session_init(&explicit_session, p[0], p[1]);
+  protocol_session_init(&unrelated_session, p[0], p[1]);
+  protocol_session_set_max_alloc(&explicit_session, 4);
+  protocol_session_set_max_alloc(&unrelated_session, 64);
+  protocol_session_bind(&unrelated_session);
+
+  unsigned long long size = 8;
+  EXPECT_EQ_INT((int)write(p[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(p[1], "12345678", 8), 8);
+  EXPECT_NULL(protocol_receive_data_limited(&explicit_session, 8));
+  EXPECT_EQ_INT((int)atomic_load(&explicit_session.total_allocated_bytes), 0);
+
+  protocol_session_unbind();
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_max_alloc_allows_configured_buffer() {
   ProtocolSession session;
   protocol_session_init(&session, -1, -1);
@@ -402,6 +424,7 @@ void test_protocol() {
   test_receive_n_data_truncated();
   test_receive_str_truncated();
   test_max_alloc_rejects_single_buffer();
+  test_explicit_session_max_alloc_cannot_be_bypassed();
   test_max_alloc_allows_configured_buffer();
   test_max_alloc_is_bound_in_worker_threads();
   test_protocol_accounting_is_released_in_worker_threads();
