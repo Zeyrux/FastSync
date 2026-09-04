@@ -102,7 +102,7 @@ static int parse_ull_arg(const char* val, unsigned long long* out, const char* o
 }
 
 static int parse_size_arg(const char* value, unsigned long long* out) {
-  if (!value || *value == '\0' || *value == '-')
+  if (!value || *value < '0' || *value > '9')
     return -1;
   char* end;
   errno = 0;

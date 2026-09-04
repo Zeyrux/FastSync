@@ -277,7 +277,8 @@ static void test_parse_args_max_alloc_sizes() {
 }
 
 static void test_parse_args_rejects_invalid_max_alloc() {
-  const char* values[] = {"0", "-1", "1Z", "1K2", "18446744073709551615K"};
+  const char* values[] = {"0",  "-1",  "+1",  " 1",   "1 ",
+                          "1Z", "1K2", "1 K", "1\tK", "18446744073709551615K"};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--max-alloc", (char*)values[i], "/src", "/dst"};
