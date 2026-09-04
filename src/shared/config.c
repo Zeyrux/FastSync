@@ -69,6 +69,7 @@ static void config_set_defaults(Config* config) {
   config->debug_level = 0;
   config->list_only = false;
   config->human_readable = false;
+  config->eight_bit_output = false;
   config->update = false;
   config->inplace = false;
   config->use_fsync = false;
@@ -131,7 +132,7 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
-         valid_wire_bool(config->checksum) &&
+         valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -221,11 +222,13 @@ void config_delete(Config* config) {
  * helper call order in config_send and config_receive unchanged when adding
  * fields. */
 static bool send_core_fields(int fd, const Config* c) {
-  return send_str(fd, c->version) && send_str(fd, c->send_directory) &&
-         send_str(fd, c->receive_root_directory) && send_int(fd, c->save_to_disk) &&
-         send_int(fd, c->use_multithreading) && send_int(fd, c->use_chunk_serialization) &&
-         send_int(fd, c->use_compression) && send_int(fd, c->use_metadata) &&
-         send_int(fd, c->compression_level) &&
+  if (!send_str(fd, c->version) || !send_int(fd, c->eight_bit_output))
+    return false;
+  protocol_set_8_bit_output(c->eight_bit_output);
+  return send_str(fd, c->send_directory) && send_str(fd, c->receive_root_directory) &&
+         send_int(fd, c->save_to_disk) && send_int(fd, c->use_multithreading) &&
+         send_int(fd, c->use_chunk_serialization) && send_int(fd, c->use_compression) &&
+         send_int(fd, c->use_metadata) && send_int(fd, c->compression_level) &&
          send_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)) && send_int(fd, c->use_sendfile);
 }
 
@@ -262,6 +265,9 @@ static bool send_resume_options(int fd, const Config* c) {
 
 static bool receive_core_fields(int fd, Config* c) {
   int value;
+  if (!receive_wire_bool(fd, &c->eight_bit_output))
+    return false;
+  protocol_set_8_bit_output(c->eight_bit_output);
   c->send_directory = receive_str(fd);
   c->receive_root_directory = receive_str(fd);
   if (!c->send_directory || !c->receive_root_directory)
@@ -362,8 +368,10 @@ Config* config_receive(int file_descriptor) {
   if (!config->version)
     goto error;
   if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
-    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n", config->version,
-            PROTOCOL_VERSION);
+    char* escaped_version = output_escape(config->version, false);
+    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n",
+            escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    free(escaped_version);
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
@@ -375,7 +383,10 @@ Config* config_receive(int file_descriptor) {
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
-    fprintf(stderr, "Unsupported compression choice: %s\n", config->compress_choice);
+    char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
+    fprintf(stderr, "Unsupported compression choice: %s\n",
+            escaped_choice ? escaped_choice : "<allocation failed>");
+    free(escaped_choice);
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }

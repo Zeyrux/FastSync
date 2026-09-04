@@ -2,6 +2,7 @@
 #include "log.h"
 #include "protocol.h"
 #include "transport_tcp.h"
+#include "utils.h"
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -65,13 +66,19 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
       return NULL;
     }
     if (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) {
-      log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s", cert);
+      char* escaped = output_escape(cert, false);
+      log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0) {
-      log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s", key);
+      char* escaped = output_escape(key, false);
+      log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
@@ -85,7 +92,10 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
 
   if (ca_path) {
     if (!SSL_CTX_load_verify_locations(ctx, ca_path, NULL)) {
-      log_message(LOG_LEVEL_ERROR, "Failed to load CA: %s", ca_path);
+      char* escaped = output_escape(ca_path, false);
+      log_message(LOG_LEVEL_ERROR, "Failed to load CA: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;

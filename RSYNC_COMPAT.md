@@ -43,7 +43,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--out-format=FORMAT` | Custom output format | ❌ Not Implemented | Removed because it had no effect |
 | `--log-file=FILE` | Log to file | ✅ Implemented | `log_file` config field |
 | `--log-file-format=FMT` | Log format | ❌ Not Implemented | |
-| `--8-bit-output` | Leave high-bit chars unescaped | ❌ Not Implemented | |
+| `--8-bit-output`, `-8` | Leave high-bit chars unescaped | ✅ Implemented | Applies to displayed paths and protocol debug output |
 | `--list-only` | List files instead of copying | ❌ Not Implemented | Removed because it had no effect |
 
 ## 3. File Selection

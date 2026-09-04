@@ -75,6 +75,7 @@ typedef struct Config {
   int debug_level;
   bool list_only;
   bool human_readable;
+  bool eight_bit_output;
 
   // Issue #127: Transfer modes
   bool update;

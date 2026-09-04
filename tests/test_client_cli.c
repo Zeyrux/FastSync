@@ -397,6 +397,24 @@ static void test_parse_args_fsync() {
   config_delete(cfg);
 }
 
+static void test_parse_args_8_bit_output() {
+  Config* cfg = config_create();
+  char* long_argv[] = {"fastsync", "--8-bit-output", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, long_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->eight_bit_output);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* short_argv[] = {"fastsync", "-8", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, short_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->eight_bit_output);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -423,4 +441,5 @@ void test_client_cli() {
   test_parse_args_human_readable();
   test_parse_args_archive();
   test_parse_args_fsync();
+  test_parse_args_8_bit_output();
 }

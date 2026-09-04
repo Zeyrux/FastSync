@@ -127,6 +127,7 @@ static void test_config_send_receive() {
   send_cfg->use_fsync = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
+  send_cfg->eight_bit_output = true;
 
   /* Use socketpair for bidirectional communication */
   int p[2];
@@ -163,6 +164,7 @@ static void test_config_send_receive() {
         ok = false;
       if (!recv_cfg->use_fsync)
         ok = false;
+      if (!recv_cfg->eight_bit_output)
     }
     config_delete(recv_cfg);
     close(p[0]);

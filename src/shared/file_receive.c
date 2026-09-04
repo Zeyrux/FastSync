@@ -332,7 +332,10 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
 
   if (has_path_traversal(check_path)) {
-    log_message(LOG_LEVEL_ERROR, "Path traversal detected: %s", check_path);
+    char* escaped_path = output_escape(check_path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Path traversal detected: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
     free(check_path);
     return NULL;
   }
@@ -479,7 +482,10 @@ File* file_receive(const Config* config, int file_descriptor) {
   if (path == NULL)
     return NULL;
   if (path[0] == '\0' || has_path_traversal(path)) {
-    log_message(LOG_LEVEL_ERROR, "Invalid received file path: %s", path);
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received file path: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
     free(path);
     return NULL;
   }

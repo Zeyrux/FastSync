@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include "log.h"
+#include "utils.h"
 #include <errno.h>
 #include <limits.h>
 #include <openssl/ssl.h>
@@ -44,6 +45,7 @@ void io_set_fds(int read_fd, int write_fd) {
   legacy_io_session.read_fd = read_fd;
   legacy_io_session.write_fd = write_fd;
   legacy_io_session.ssl = NULL;
+  legacy_io_session.eight_bit_output = false;
   legacy_io_session.total_allocated_bytes = 0;
   protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
 }
@@ -59,6 +61,7 @@ void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) 
 
 void protocol_session_bind(ProtocolSession* session) {
   bound_session = session;
+  log_set_8_bit_output(session && session->eight_bit_output);
 }
 
 void protocol_session_unbind(void) {
@@ -101,6 +104,19 @@ void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long b
   clock_gettime(CLOCK_MONOTONIC, &now);
   session->bw_last_refill_sec = now.tv_sec;
   session->bw_last_refill_nsec = now.tv_nsec;
+}
+
+void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled) {
+  if (!session)
+    return;
+  session->eight_bit_output = enabled;
+  if (session == bound_session)
+    log_set_8_bit_output(enabled);
+}
+
+void protocol_set_8_bit_output(bool enabled) {
+  ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
+  protocol_session_set_8_bit_output(session, enabled);
 }
 
 static void bw_throttle_session(ProtocolSession* session, size_t bytes_written) {
@@ -328,7 +344,9 @@ bool protocol_send_str(ProtocolSession* session, const char* data) {
     return false;
   if (!protocol_send_n_data(session, data, size))
     return false;
-  log_message(LOG_LEVEL_DEBUG, "Send String: %s", data);
+  char* escaped = output_escape(data, session->eight_bit_output);
+  log_message(LOG_LEVEL_DEBUG, "Send String: %s", escaped ? escaped : "<allocation failed>");
+  free(escaped);
   return true;
 }
 
@@ -356,7 +374,9 @@ char* protocol_receive_str(ProtocolSession* session) {
   }
   data[size] = '\0';
   session->total_allocated_bytes += size + 1;
-  log_message(LOG_LEVEL_DEBUG, "Received String: %s", data);
+  char* escaped = output_escape(data, session->eight_bit_output);
+  log_message(LOG_LEVEL_DEBUG, "Received String: %s", escaped ? escaped : "<allocation failed>");
+  free(escaped);
   return data;
 }
 

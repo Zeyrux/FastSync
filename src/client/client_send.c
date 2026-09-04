@@ -233,11 +233,18 @@ static int send_dry_run_manifest(const Config* config) {
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
       if (!config->quiet) {
+        char* escaped_path = output_escape(chunk->items[i]->path, config->eight_bit_output);
+        if (!escaped_path) {
+          chunk_destroy(chunk);
+          directory_scanner_destroy(scanner);
+          return -1;
+        }
         if (config->human_readable)
-          printf("  %s (%s)\n", chunk->items[i]->path,
+          printf("  %s (%s)\n", escaped_path,
                  display_bytes(chunk->items[i]->data->size, true, size_buffer, sizeof(size_buffer)));
         else
-          printf("  %s (%zu bytes)\n", chunk->items[i]->path, chunk->items[i]->data->size);
+          printf("  %s (%zu bytes)\n", escaped_path, chunk->items[i]->data->size);
+        free(escaped_path);
       }
       total_bytes += chunk->items[i]->data->size;
       file_count++;
