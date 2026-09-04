@@ -345,6 +345,7 @@ features without changing the meaning of ordinary compatibility options.
 | `--compress-level <n>` | Set the zstd compression level. |
 | `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` and `none`. |
 | `--zl <n>` | Alias for `--compress-level`. |
+| `--skip-compress <list>` | Skip compression for comma-separated suffixes; incompatible with `-s`. |
 | `--chunk-size <bytes>` | Set the transfer chunk size. |
 | `-s` | Enable FastSync chunk serialization. |
 | `-f`, `--sendfile` | Use TCP `sendfile()` zero-copy transfer. Incompatible with compression and chunk serialization. |

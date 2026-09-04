@@ -55,6 +55,14 @@ static void test_data_compress_decompress_large() {
   data_destroy(decompressed);
 }
 
+static void test_skip_compress_suffix_matching() {
+  char* suffixes[] = {".ZIP", ".GZ"};
+  EXPECT_TRUE(compression_should_skip_with_suffixes("archive.zip", suffixes, 2));
+  EXPECT_TRUE(compression_should_skip_with_suffixes("backup.TAR.GZ", suffixes, 2));
+  EXPECT_FALSE(compression_should_skip_with_suffixes("notes.txt", suffixes, 2));
+  EXPECT_FALSE(compression_should_skip_with_suffixes("archive.zip", suffixes, 0));
+}
+
 static void test_chunk_compress_decompress_roundtrip() {
   char* path1 = "temp_comp_test_1.txt";
   char* content1 = "chunk compression test file 1";
@@ -115,5 +123,6 @@ static void test_chunk_compress_decompress_roundtrip() {
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
+  test_skip_compress_suffix_matching();
   test_chunk_compress_decompress_roundtrip();
 }

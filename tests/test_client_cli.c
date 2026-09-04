@@ -39,6 +39,9 @@ static void test_validate_config_incompatible_options() {
   cfg->use_incremental = true;
   cfg->use_chunk_serialization = true;
   EXPECT_FALSE(validate_config(cfg));
+  cfg->use_incremental = false;
+  cfg->skip_compress_set = true;
+  EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
 
@@ -426,6 +429,32 @@ static void test_parse_args_rejects_invalid_modify_window() {
   }
 }
 
+static void test_parse_args_skip_compress() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--skip-compress=.ZIP, .GZ", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->skip_compress_set);
+  EXPECT_EQ_INT(cfg->skip_compress_count, 2);
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[0], ".ZIP");
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[1], ".GZ");
+  config_delete(cfg);
+}
+
+static void test_parse_args_empty_skip_compress() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--skip-compress=", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->skip_compress_set);
+  EXPECT_EQ_INT(cfg->skip_compress_count, 0);
+  config_delete(cfg);
+}
+
 /* Test parse_args unknown option returns error */
 static void test_parse_args_unknown_option() {
   Config* cfg = config_create();
@@ -807,6 +836,8 @@ void test_client_cli() {
   test_parse_args_debug_flags_validation();
   test_parse_args_modify_window();
   test_parse_args_rejects_invalid_modify_window();
+  test_parse_args_skip_compress();
+  test_parse_args_empty_skip_compress();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();

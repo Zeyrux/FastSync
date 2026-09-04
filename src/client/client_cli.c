@@ -197,6 +197,29 @@ static int config_add_pattern(char*** patterns, int* count, const char* value,
   return 0;
 }
 
+static int parse_skip_compress(Config* config, const char* value) {
+  char* list = str_dup(value);
+  if (!list)
+    return -1;
+  config->skip_compress_set = true;
+  for (char* token = strtok(list, ","); token; token = strtok(NULL, ",")) {
+    while (*token == ' ' || *token == '\t')
+      token++;
+    size_t len = strlen(token);
+    while (len > 0 && (token[len - 1] == ' ' || token[len - 1] == '\t'))
+      token[--len] = '\0';
+    if (len == 0)
+      continue;
+    if (config_add_pattern(&config->skip_compress_suffixes, &config->skip_compress_count, token,
+                           "--skip-compress") != 0) {
+      free(list);
+      return -1;
+    }
+  }
+  free(list);
+  return 0;
+}
+
 typedef enum {
   OPT_FLAG,
   OPT_NOOP,
@@ -556,6 +579,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return debug_ret;
     } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--skip-compress=", 16) == 0) {
+      if (parse_skip_compress(config, argv[i] + 16) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--skip-compress", NULL) && i + 1 < argc) {
+      if (parse_skip_compress(config, argv[++i]) != 0)
         return -1;
     } else if (argv[i][0] == '-') {
       char* escaped = output_escape(argv[i], false);

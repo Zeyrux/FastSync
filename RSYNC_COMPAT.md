@@ -175,7 +175,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--compress-choice=STR`, `--zc=STR` | Choose compression algorithm | ✅ Implemented | FastSync supports `zstd` and `none` |
 | `--compress-level=NUM`, `--zl=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
 | `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
-| `--skip-compress=LIST` | Skip compress for suffixes | ❌ Not Implemented | Internal skip for hardcoded types; not user-configurable |
+| `--skip-compress=LIST` | Skip compress for suffixes | ✅ Implemented | Comma-separated, case-insensitive suffix list; empty list skips none; incompatible with FastSync chunk serialization (`-s`) |
 
 ## 13. Connectivity
 
@@ -249,11 +249,13 @@ Ranked by user demand, implementation complexity, and interoperability impact:
 | 2 | `--ignore-times` / `-I` | Low | Medium — useful for forcing re-transfer |
 | 3 | `--size-only` | Low | Medium — common migration scenario |
 | 4 | `--ignore-existing` | Low | Medium — common sync patterns |
-| 5 | `--delete-during` | Medium | High — performance improvement |
-| 6 | `--delay-updates` | Medium | High — atomic updates |
-| 7 | `--chmod` | Low | Medium — permission flexibility |
-| 8 | `--executability` / `-E` | Low | Low — simple flag |
-| 9 | `--skip-compress` | Low | Medium — performance tuning |
+| 5 | `--existing` | Low | Medium — common sync patterns |
+| 6 | `--remove-source-files` | Low | High — common for moves/backup |
+| 7 | `--delete-during` | Medium | High — performance improvement |
+| 8 | `--delay-updates` | Medium | High — atomic updates |
+| 9 | `--chmod` | Low | Medium — permission flexibility |
+| 10 | `--executability` / `-E` | Low | Low — simple flag |
+| 11 | `--skip-compress` | Low | Medium — performance tuning |
 
 ---
 

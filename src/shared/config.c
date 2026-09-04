@@ -110,6 +110,9 @@ static void config_set_defaults(Config* config) {
   config->checksum = false;
   config->compress_choice = NULL;
   config->chmod_spec = NULL;
+  config->skip_compress_suffixes = NULL;
+  config->skip_compress_count = 0;
+  config->skip_compress_set = false;
 }
 
 static bool valid_wire_bool(int value) {
@@ -145,13 +148,15 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
+         !(config->skip_compress_set && config->use_chunk_serialization) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
-         config->max_delete >= 0 &&
+         config->max_delete >= 0 && config->skip_compress_count >= 0 &&
+         config->skip_compress_count <= 10000 &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0}));
 }
@@ -228,6 +233,11 @@ void config_delete(Config* config) {
   free(config->daemon_config);
   free(config->compress_choice);
   free(config->chmod_spec);
+  if (config->skip_compress_suffixes) {
+    for (int i = 0; i < config->skip_compress_count; i++)
+      free(config->skip_compress_suffixes[i]);
+    free(config->skip_compress_suffixes);
+  }
   if (config->filters) {
     array_list_delete(config->filters);
   }
@@ -275,13 +285,24 @@ static bool send_selection_options(int fd, const Config* c) {
          send_int(fd, c->prune_empty_dirs);
 }
 
+static bool send_skip_compress_options(int fd, const Config* c) {
+  if (!send_int(fd, c->skip_compress_set) || !send_int(fd, c->skip_compress_count))
+    return false;
+  for (int i = 0; i < c->skip_compress_count; i++) {
+    if (!send_str(fd, c->skip_compress_suffixes[i]))
+      return false;
+  }
+  return true;
+}
+
 static bool send_resume_options(int fd, const Config* c) {
   return send_str(fd, c->temp_dir ? c->temp_dir : "") && send_int(fd, c->partial) &&
          send_str(fd, c->partial_dir ? c->partial_dir : "") &&
          send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
          send_int(fd, c->checksum) && send_int(fd, c->modify_window) &&
          send_str(fd, c->compress_choice ? c->compress_choice : "") &&
-         send_str(fd, c->chmod_spec ? c->chmod_spec : "");
+         send_str(fd, c->chmod_spec ? c->chmod_spec : "") &&
+         send_skip_compress_options(fd, c);
 }
 
 static bool receive_core_fields(int fd, Config* c) {
@@ -372,7 +393,22 @@ static bool receive_resume_options(int fd, Config* c) {
   if (!c->compress_choice)
     return false;
   c->chmod_spec = receive_str(fd);
-  return c->chmod_spec != NULL;
+  if (!c->chmod_spec ||
+      !receive_wire_bool(fd, &c->skip_compress_set) ||
+      !receive_int(fd, &c->skip_compress_count) || c->skip_compress_count < 0 ||
+      c->skip_compress_count > 10000)
+    return false;
+  if (c->skip_compress_count > 0) {
+    c->skip_compress_suffixes = calloc((size_t)c->skip_compress_count, sizeof(char*));
+    if (!c->skip_compress_suffixes)
+      return false;
+    for (int i = 0; i < c->skip_compress_count; i++) {
+      c->skip_compress_suffixes[i] = receive_str(fd);
+      if (!c->skip_compress_suffixes[i])
+        return false;
+    }
+  }
+  return true;
 }
 
 bool config_send(int file_descriptor, const Config* config) {
