@@ -142,15 +142,13 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   }
   bool ok = config && config->ignore_existing
                 ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size,
-                                                   sparse, metadata, preserve_executability)
-                : config && config->update
-                      ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size,
-                                                     inplace, sparse, metadata,
-                                                     preserve_executability)
-                      : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
-                                                         inplace, sparse, metadata,
-                                                         preserve_executability,
-                                                         config && config->use_fsync);
+                                                 sparse, metadata, preserve_executability)
+            : config && config->update
+                ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
+                                             sparse, metadata, preserve_executability)
+                : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
+                                                 inplace, sparse, metadata, preserve_executability,
+                                                 config && config->use_fsync);
   free(parent_copy);
   free(backup_path);
   free(confined_backup);

@@ -414,14 +414,14 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
                          bool inplace, bool sparse, const FileMetadata* metadata,
                          bool preserve_executability) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
-                                   preserve_executability, false, false, false);
+                                  preserve_executability, false, false, false);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
                                 bool inplace, bool sparse, const FileMetadata* metadata,
                                 bool preserve_executability) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
-                                   preserve_executability, true, false, false);
+                                  preserve_executability, true, false, false);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
@@ -429,14 +429,14 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     const FileMetadata* metadata, bool preserve_executability,
                                     bool use_fsync) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
-                                   preserve_executability, false, false, use_fsync);
+                                  preserve_executability, false, false, use_fsync);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse,
                                     const FileMetadata* metadata, bool preserve_executability) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, metadata,
-                                   preserve_executability, false, true, false);
+                                  preserve_executability, false, true, false);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

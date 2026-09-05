@@ -33,8 +33,8 @@ bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_
   Data* compressed_data = NULL;
   if (compression_level > 0 &&
       !compression_should_skip_with_suffixes(file->path, skip_suffixes, skip_count)) {
-    compressed_data = data_compress_with_threads(file->data, compression_level,
-                                                 compression_threads);
+    compressed_data =
+        data_compress_with_threads(file->data, compression_level, compression_threads);
     if (compressed_data == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
       return false;

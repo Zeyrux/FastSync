@@ -144,10 +144,9 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
          valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->ignore_existing) &&
-         valid_wire_bool(config->existing) &&
-         valid_wire_bool(config->update) && valid_wire_bool(config->inplace) &&
-         valid_wire_bool(config->append) && valid_wire_bool(config->use_fsync) &&
-         valid_wire_bool(config->append_verify) &&
+         valid_wire_bool(config->existing) && valid_wire_bool(config->update) &&
+         valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
+         valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
@@ -158,7 +157,7 @@ static bool validate_received_config(const Config* config) {
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
-config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
+         config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
          config->max_delete >= 0 && config->skip_compress_count >= 0 &&
          config->skip_compress_count <= 10000 && config->max_alloc > 0 &&
          (!config->chmod_spec || !*config->chmod_spec ||
@@ -283,12 +282,11 @@ static bool send_file_options(int fd, const Config* c) {
 }
 
 static bool send_selection_options(int fd, const Config* c) {
-  return send_int(fd, c->ignore_existing) && send_int(fd, c->existing) && send_int(fd, c->update) && send_int(fd, c->inplace) &&
-         send_int(fd, c->append) && send_int(fd, c->use_fsync) &&
-         send_int(fd, c->append_verify) &&
-         send_int(fd, c->delete_excluded) && send_int(fd, c->delete_after) &&
-         send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
-         send_int(fd, c->prune_empty_dirs);
+  return send_int(fd, c->ignore_existing) && send_int(fd, c->existing) && send_int(fd, c->update) &&
+         send_int(fd, c->inplace) && send_int(fd, c->append) && send_int(fd, c->use_fsync) &&
+         send_int(fd, c->append_verify) && send_int(fd, c->delete_excluded) &&
+         send_int(fd, c->delete_after) && send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) &&
+         send_int(fd, c->relative) && send_int(fd, c->prune_empty_dirs);
 }
 
 static bool send_skip_compress_options(int fd, const Config* c) {
@@ -307,8 +305,7 @@ static bool send_resume_options(int fd, const Config* c) {
          send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
          send_int(fd, c->checksum) && send_int(fd, c->modify_window) &&
          send_str(fd, c->compress_choice ? c->compress_choice : "") &&
-         send_str(fd, c->chmod_spec ? c->chmod_spec : "") &&
-         send_skip_compress_options(fd, c);
+         send_str(fd, c->chmod_spec ? c->chmod_spec : "") && send_skip_compress_options(fd, c);
 }
 
 static bool receive_core_fields(int fd, Config* c) {
@@ -372,8 +369,8 @@ static bool receive_file_options(int fd, Config* c) {
 }
 
 static bool receive_selection_options(int fd, Config* c) {
-  bool* flags[] = {&c->ignore_existing, &c->existing,   &c->update,          &c->inplace,     &c->append,
-                   &c->use_fsync,
+  bool* flags[] = {&c->ignore_existing, &c->existing,        &c->update,
+                   &c->inplace,         &c->append,          &c->use_fsync,
                    &c->append_verify,   &c->delete_excluded, &c->delete_after};
   for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
     if (!receive_wire_bool(fd, flags[i]))
@@ -404,8 +401,7 @@ static bool receive_resume_options(int fd, Config* c) {
   if (!c->compress_choice)
     return false;
   c->chmod_spec = receive_str(fd);
-  if (!c->chmod_spec ||
-      !receive_wire_bool(fd, &c->skip_compress_set) ||
+  if (!c->chmod_spec || !receive_wire_bool(fd, &c->skip_compress_set) ||
       !receive_int(fd, &c->skip_compress_count) || c->skip_compress_count < 0 ||
       c->skip_compress_count > 10000)
     return false;

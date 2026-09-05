@@ -71,10 +71,9 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
       old_mtime_nsec = st.st_mtim.tv_nsec;
 #endif
     }
-    bool match =
-        !config->ignore_times && has_old && (unsigned long long)st.st_size == check_size &&
-        metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
-                               (long)check_mtime_nsec, config->modify_window);
+    bool match = !config->ignore_times && has_old && (unsigned long long)st.st_size == check_size &&
+                 metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
+                                        (long)check_mtime_nsec, config->modify_window);
     bool sent = send_status(file_descriptor, match ? STATUS_OK : STATUS_NEXT);
     free(full_path);
     free(check_path);

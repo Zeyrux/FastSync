@@ -64,7 +64,7 @@ void io_set_fds(int read_fd, int write_fd) {
   legacy_io_session.read_fd = read_fd;
   legacy_io_session.write_fd = write_fd;
   legacy_io_session.ssl = NULL;
-legacy_io_session.eight_bit_output = false;
+  legacy_io_session.eight_bit_output = false;
   atomic_store(&legacy_io_session.total_allocated_bytes, 0);
   legacy_io_session.max_alloc = DEFAULT_MAX_ALLOC;
   protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
@@ -473,7 +473,7 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
     protocol_release_memory_for_session(session, allocation_size);
     return NULL;
   }
-log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
+  log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     protocol_release_memory_for_session(session, allocation_size);

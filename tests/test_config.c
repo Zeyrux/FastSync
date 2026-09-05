@@ -132,7 +132,7 @@ static void test_config_send_receive() {
   send_cfg->size_only = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
-send_cfg->eight_bit_output = true;
+  send_cfg->eight_bit_output = true;
   send_cfg->modify_window = 4;
   send_cfg->existing = true;
   send_cfg->ignore_existing = true;
@@ -175,7 +175,7 @@ send_cfg->eight_bit_output = true;
         ok = false;
       if (recv_cfg->chunk_size != 1024)
         ok = false;
-if (!recv_cfg->use_executability)
+      if (!recv_cfg->use_executability)
         ok = false;
       if (!recv_cfg->size_only)
         ok = false;
@@ -225,7 +225,7 @@ static void test_config_send_receive_version_mismatch() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
-cfg->version = str_dup("2.3.0");
+  cfg->version = str_dup("2.3.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 

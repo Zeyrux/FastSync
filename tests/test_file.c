@@ -273,8 +273,8 @@ static void test_file_write_to_disk_basic() {
 static void test_file_write_to_disk_with_fsync() {
   const char* path = "test_file_write_to_disk_fsync.txt";
   const char* content = "fsync file content";
-  EXPECT_TRUE(
-      file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, NULL, false, true));
+  EXPECT_TRUE(file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, NULL,
+                                             false, true));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
