@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-bool mkdir_r(const char* path);
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
 char* path_cat(const char* path1, const char* path2);
