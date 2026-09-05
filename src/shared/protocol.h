@@ -22,6 +22,10 @@
 #define DEFAULT_MAX_ALLOC (1ULL * 1024 * 1024 * 1024)
 /* Server policy ceiling for a client-provided allocation limit. */
 #define MAX_SERVER_ALLOC (256ULL * 1024 * 1024)
+/* Bounded cumulative per-connection receive budget.  In-flight wire buffers,
+   decompression buffers and queued (not yet written) file payloads for a
+   connection must stay within this ceiling. */
+#define MAX_CONNECTION_MEMORY (256ULL * 1024 * 1024)
 
 typedef struct ssl_st SSL;
 

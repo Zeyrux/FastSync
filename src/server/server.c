@@ -4,6 +4,7 @@
 #include "log.h"
 #include "metadata.h"
 #include "multiprocessing.h"
+#include "protocol.h"
 #include "queue.h"
 #include "receiver.h"
 #include "transport_tcp.h"
@@ -25,6 +26,13 @@ static int authorized_root_fd = -1;
 static bool allow_delete;
 static bool allow_unauthenticated;
 static const char* required_client_cn;
+
+/* Aggregate payload bytes the multithreaded receiver may buffer ahead of the
+   slow disk writer.  Receiving one more chunk adds up to ~2 * MAX_CHUNK_SIZE
+   of transient wire/decompression buffers on top of the queued payloads, so
+   this ceiling keeps total per-connection receive memory (decompressed and
+   per-file copied chunk buffers included) within MAX_CONNECTION_MEMORY. */
+#define RECEIVER_QUEUE_MAX_BYTES (MAX_CONNECTION_MEMORY - 2 * MAX_CHUNK_SIZE)
 
 static bool tls_client_identity_allowed(SSL* ssl) {
   if (!ssl || !required_client_cn)
@@ -314,6 +322,7 @@ void handler(int file_descriptor) {
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
+    pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);
     thrd_t receiver, writer;
     bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
     bool writer_created = false;

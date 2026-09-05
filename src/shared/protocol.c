@@ -14,7 +14,6 @@
 
 #define RECEIVE_TIMEOUT_SEC 60 /* 60 second per-message timeout */
 #define SEND_TIMEOUT_SEC 60
-#define MAX_CONNECTION_MEMORY (256ULL * 1024 * 1024) /* bounded cumulative receive budget */
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;

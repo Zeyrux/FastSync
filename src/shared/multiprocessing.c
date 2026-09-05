@@ -108,6 +108,8 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   protocol_session_init(&context->session, file_descriptor, file_descriptor);
   protocol_session_set_ssl(&context->session, ssl);
   context->receiver_done = false;
+  context->queued_bytes = 0;
+  context->max_queue_bytes = 0;
   atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
@@ -143,14 +145,73 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   free(context);
 }
 
+void pipeline_context_receiver_set_queue_byte_limit(PipelineContextReceiver* context,
+                                                    size_t max_bytes) {
+  if (context == NULL)
+    return;
+  mtx_lock(&context->mutex);
+  context->max_queue_bytes = max_bytes;
+  context->queued_bytes = 0;
+  cnd_broadcast(&context->condition_not_full);
+  mtx_unlock(&context->mutex);
+}
+
+void pipeline_context_receiver_note_bytes_released(PipelineContextReceiver* context,
+                                                   size_t released_bytes) {
+  if (context == NULL || context->max_queue_bytes == 0 || released_bytes == 0)
+    return;
+  mtx_lock(&context->mutex);
+  if (released_bytes >= context->queued_bytes)
+    context->queued_bytes = 0;
+  else
+    context->queued_bytes -= released_bytes;
+  cnd_signal(&context->condition_not_full);
+  mtx_unlock(&context->mutex);
+}
+
+bool pipeline_context_receiver_enqueue_file(PipelineContextReceiver* context, File* file) {
+  if (context == NULL || file == NULL)
+    return false;
+  size_t file_bytes = file->data ? file->data->size : 0;
+  mtx_lock(&context->mutex);
+  while (!atomic_load(&context->cancelled)) {
+    bool blocked_by_count = queue_is_full(context->queue);
+    bool blocked_by_budget = false;
+    if (context->max_queue_bytes > 0) {
+      size_t budget = context->max_queue_bytes;
+      size_t used = context->queued_bytes;
+      if (used >= budget) {
+        blocked_by_budget = true;
+      } else if (file_bytes > budget - used) {
+        /* A single payload larger than the whole budget (not possible with
+           the per-file receive cap) is only admitted to an empty pipeline so
+           the wait can never deadlock. */
+        blocked_by_budget = used != 0;
+      }
+    }
+    if (!blocked_by_count && !blocked_by_budget)
+      break;
+    cnd_wait(&context->condition_not_full, &context->mutex);
+  }
+  if (atomic_load(&context->cancelled)) {
+    mtx_unlock(&context->mutex);
+    file_destroy(file);
+    return false;
+  }
+  if (!queue_enqueue(context->queue, file)) {
+    mtx_unlock(&context->mutex);
+    file_destroy(file);
+    return false;
+  }
+  context->queued_bytes += file_bytes;
+  cnd_signal(&context->condition_not_empty);
+  mtx_unlock(&context->mutex);
+  return true;
+}
+
 static bool receiver_enqueue_file(File* file, void* context_pointer) {
-  PipelineContextReceiver* context = context_pointer;
-  if (queue_enqueue_multithreaded_cancel(context->queue, file, &context->mutex,
-                                         &context->condition_not_empty,
-                                         &context->condition_not_full, &context->cancelled))
-    return true;
-  file_destroy(file);
-  return false;
+  PipelineContextReceiver* context = (PipelineContextReceiver*)context_pointer;
+  return pipeline_context_receiver_enqueue_file(context, file);
 }
 
 static void receiver_thread_fail(PipelineContextReceiver* context) {
@@ -211,8 +272,10 @@ int write_thread(void* pipeline_context) {
       protocol_session_unbind();
       return thrd_success;
     }
+    size_t file_bytes = file->data ? file->data->size : 0;
     if (save_to_disk && !file_save_to_disk(root_directory, file, context->config)) {
       file_destroy(file);
+      pipeline_context_receiver_note_bytes_released(context, file_bytes);
       mtx_lock(&context->mutex);
       atomic_store(&context->cancelled, true);
       context->receiver_done = true;
@@ -224,5 +287,6 @@ int write_thread(void* pipeline_context) {
       return thrd_error;
     }
     file_destroy(file);
+    pipeline_context_receiver_note_bytes_released(context, file_bytes);
   }
 }
