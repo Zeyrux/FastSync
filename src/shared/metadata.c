@@ -43,6 +43,8 @@ bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, l
     seconds--;
     nanoseconds += 1000000000LL;
   }
+  if (modify_window == 0)
+    return left == right;
   return seconds < modify_window || (seconds == modify_window && nanoseconds == 0);
 }
 
