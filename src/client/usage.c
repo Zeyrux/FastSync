@@ -52,6 +52,8 @@ void print_usage(void) {
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -q, --quiet         Suppress non-error output\n");
   printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
+  printf("  --info=FLAGS        Fine-grained info: copy,misc,skip,stats,all,none\n");
+  printf("                      none suppresses info even with --verbose\n");
   printf("  -M, --preserve      Preserve file metadata\n");
   printf("  -E, --executability Preserve executable permission bits\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");

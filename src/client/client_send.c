@@ -240,8 +240,9 @@ static int send_dry_run_manifest(const Config* config) {
           return -1;
         }
         if (config->human_readable)
-          printf("  %s (%s)\n", escaped_path,
-                 display_bytes(chunk->items[i]->data->size, true, size_buffer, sizeof(size_buffer)));
+          printf(
+              "  %s (%s)\n", escaped_path,
+              display_bytes(chunk->items[i]->data->size, true, size_buffer, sizeof(size_buffer)));
         else
           printf("  %s (%zu bytes)\n", escaped_path, chunk->items[i]->data->size);
         free(escaped_path);
@@ -397,6 +398,7 @@ static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata, con
 static int send_single_file(Client* client, File* file, Config* config, bool use_incremental,
                             bool use_sendfile) {
   int compression_level = config->use_compression ? config->compression_level : 0;
+  log_info_message(LOG_INFO_COPY, "Transferring %s", file->path);
 
   if (!use_incremental) {
     if (use_sendfile) {
@@ -415,6 +417,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     DeltaSignature* sig = NULL;
     int rc = incremental_check(client, file, config, &sig);
     if (rc == 1) {
+      log_info_message(LOG_INFO_SKIP, "Skipping unchanged %s", file->path);
       delta_signature_destroy(sig);
       return 1;
     }
@@ -447,6 +450,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     return -1;
   }
   if (rc == 1) {
+    log_info_message(LOG_INFO_SKIP, "Skipping unchanged %s", file->path);
     delta_signature_destroy(sig);
     return 1;
   }
@@ -574,6 +578,14 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       bool ok = finalize_transfer(client);
       if (ok)
         remove_transferred_sources(context->config, context->remove_source_files);
+      mtx_lock(&context->mutex_progress);
+      int total_files = context->total_files;
+      unsigned long long total_bytes = context->total_bytes;
+      mtx_unlock(&context->mutex_progress);
+      if (context->config->stats)
+        fprintf(stderr, "Stats: %d files, %.1f MB\n", total_files, total_bytes / 1048576.0);
+      log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
+                       total_bytes / 1048576.0);
       disconnect_transfer_client(client);
       mark_sender_done(context);
       protocol_session_unbind();
@@ -596,16 +608,19 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       protocol_session_unbind();
       return thrd_error;
     }
-    if (context->config->show_progress) {
-      unsigned long long chunk_bytes = 0;
-      for (int i = 0; i < current_chunk->element_count; i++) {
-        if (current_chunk->items[i] && current_chunk->items[i]->data)
-          chunk_bytes += current_chunk->items[i]->data->size;
+    unsigned long long chunk_bytes = 0;
+    int chunk_files = 0;
+    for (int i = 0; i < current_chunk->element_count; i++) {
+      if (current_chunk->items[i] && current_chunk->items[i]->data) {
+        chunk_files++;
+        chunk_bytes += current_chunk->items[i]->data->size;
       }
-      mtx_lock(&context->mutex_progress);
-      context->progress_bytes += chunk_bytes;
-      mtx_unlock(&context->mutex_progress);
     }
+    mtx_lock(&context->mutex_progress);
+    context->total_files += chunk_files;
+    context->total_bytes += chunk_bytes;
+    context->progress_bytes = context->total_bytes;
+    mtx_unlock(&context->mutex_progress);
     chunk_destroy(current_chunk);
   }
 }
@@ -871,6 +886,8 @@ int send_files(Config* config) {
               rate);
     }
   }
+  log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
+                   total_bytes / 1048576.0);
   ret = ok ? 0 : 1;
 
 send_fail:

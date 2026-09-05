@@ -1,5 +1,6 @@
 #include "log.h"
 #include <errno.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,6 +9,8 @@
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
 static LogLevel current_log_level = LOG_LEVEL_WARNING;
 static uint32_t current_debug_flags = 0;
+static uint32_t info_flags = 0;
+static bool info_flags_explicit = false;
 static FILE* log_fp = NULL;
 static _Thread_local bool eight_bit_output;
 static LogStderrMode stderr_mode = LOG_STDERR_ERRORS;
@@ -22,6 +25,15 @@ void set_log_debug_flags(uint32_t flags) {
 
 uint32_t get_log_debug_flags(void) {
   return current_debug_flags;
+}
+
+void set_log_info_flags(uint32_t flags) {
+  info_flags = flags;
+  info_flags_explicit = true;
+}
+
+uint32_t get_log_info_flags(void) {
+  return info_flags;
 }
 
 void log_set_file(FILE* fp) {
@@ -97,6 +109,28 @@ void log_debug_message(LogDebugFlag flag, const char* format, ...) {
   if (log_fp) {
     va_start(args, format);
     write_message(log_fp, LOG_LEVEL_DEBUG, t, format, args);
+    va_end(args);
+  }
+}
+
+void log_info_message(LogInfoFlag flag, const char* format, ...) {
+  if ((info_flags_explicit && (info_flags & flag) == 0) ||
+      (!info_flags_explicit && current_log_level > LOG_LEVEL_DEBUG))
+    return;
+
+  time_t now = time(NULL);
+  struct tm t;
+  if (!localtime_r(&now, &t))
+    return;
+
+  va_list args;
+  va_start(args, format);
+  write_message(stdout, LOG_LEVEL_INFO, t, format, args);
+  va_end(args);
+
+  if (log_fp) {
+    va_start(args, format);
+    write_message(log_fp, LOG_LEVEL_INFO, t, format, args);
     va_end(args);
   }
 }

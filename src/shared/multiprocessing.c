@@ -27,7 +27,9 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->loader_done = false;
   context->manifest = NULL;
   context->remove_source_files = NULL;
+  context->total_files = 0;
   context->progress_bytes = 0;
+  context->total_bytes = 0;
   context->sender_done = false;
   atomic_init(&context->cancelled, false);
   protocol_session_init(&context->allocation_session, -1, -1);

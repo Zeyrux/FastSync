@@ -24,8 +24,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-q`, `--quiet` | Suppress non-error messages | ✅ Implemented | Suppresses client output while preserving errors |
 | `--help` | Show help | ✅ Implemented | Prints usage and exits; `-h` is not accepted |
 | `-V`, `--version` | Print version | ✅ Implemented | |
-| `--info=FLAGS` | Fine-grained info verbosity | ❌ Not Implemented | Removed because it had no effect |
-| `--debug=FLAGS` | Fine-grained debug verbosity | ⚠️ Partial | `io`, `proto`, `pack`, and `util` are supported; other rsync categories are rejected |
+| `--info=FLAGS` | Fine-grained info verbosity | ✅ Implemented | Supports `copy`, `misc`, `skip`, `stats`, `all`, and `none`; explicit flags override `--verbose`, and `none` suppresses info output; unsupported names are rejected |
+| `--debug=FLAGS` | Fine-grained debug verbosity | ✅ Implemented | `io`, `proto`, `pack`, and `util` are supported; `--debug=help` lists flags; other rsync categories are rejected |
 | `--stderr=MODE` | Change stderr output mode | ⚠️ Partial | `errors` (default) and `all` are supported; `client` is rejected because FastSync has no rsync message channel |
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |
 | `--exclude=PATTERN` | Exclude files matching pattern | ✅ Implemented | Glob matching in scanner |
