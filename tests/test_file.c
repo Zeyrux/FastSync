@@ -5,6 +5,7 @@
 #include "utils.h"
 #include "protocol.h"
 #include "test_utils.h"
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -624,6 +625,161 @@ static void test_file_send_single_calls_metadata_and_path() {
   }
 }
 
+static void test_inplace_overwrite_clears_special_mode_bits() {
+  const char* root = "test_inplace_tmp";
+  const char* path = "test_inplace_tmp/priv.txt";
+  const char* content = "olddata";
+  unlink(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  /* Create a destination carrying setuid + sticky bits. */
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  EXPECT_TRUE(fd >= 0);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (fd < 0) {
+    rmdir(root);
+    return;
+  }
+  EXPECT_EQ_INT((int)write(fd, content, strlen(content)), (int)strlen(content));
+  EXPECT_EQ_INT(fchmod(fd, S_ISUID | S_ISVTX | 0755), 0);
+  EXPECT_EQ_INT(close(fd), 0);
+
+  /* Overwrite in place without metadata: the mode must be normalized to a
+     safe default (0644) and the setuid/sticky bits must be gone. */
+  File* f = file_create("priv.txt");
+  EXPECT_NOT_NULL(f);
+  const char* new_content = "newdata";
+  f->data->data = malloc(strlen(new_content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, new_content, strlen(new_content));
+  f->data->size = strlen(new_content);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->inplace = true;
+  EXPECT_TRUE(file_save_to_disk(root, f, cfg));
+  file_destroy(f);
+  config_delete(cfg);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  FILE* stream = fopen(path, "rb");
+  char buf[16] = {0};
+  EXPECT_NOT_NULL(stream);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (stream) {
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, stream);
+    fclose(stream);
+    EXPECT_EQ_INT((int)nread, (int)strlen(new_content));
+  }
+  EXPECT_EQ_STR(buf, new_content);
+
+  unlink(path);
+  rmdir(root);
+}
+
+static void test_inplace_overwrite_metadata_strips_special_bits() {
+  const char* root = "test_inplace_meta_tmp";
+  const char* path = "test_inplace_meta_tmp/meta.txt";
+  const char* source = "test_inplace_meta_source.txt";
+  unlink(path);
+  unlink(source);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  /* Existing destination with setuid+sticky set. */
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  EXPECT_TRUE(fd >= 0);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (fd < 0) {
+    rmdir(root);
+    return;
+  }
+  EXPECT_EQ_INT((int)write(fd, "olddata", 7), 7);
+  EXPECT_EQ_INT(fchmod(fd, S_ISUID | S_ISVTX | 0755), 0);
+  EXPECT_EQ_INT(close(fd), 0);
+
+  /* Build source metadata carrying a plain executable mode (no specials). */
+  EXPECT_TRUE(file_write_to_disk(source, "source", 6, false, false));
+  EXPECT_EQ_INT(chmod(source, 0755), 0);
+  struct stat source_st;
+  EXPECT_EQ_INT(stat(source, &source_st), 0);
+
+  File* f = file_create("meta.txt");
+  EXPECT_NOT_NULL(f);
+  const char* new_content = "meta";
+  f->data->data = malloc(strlen(new_content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, new_content, strlen(new_content));
+  f->data->size = strlen(new_content);
+  f->metadata = file_metadata_create(&source_st);
+  EXPECT_NOT_NULL(f->metadata);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->inplace = true;
+  EXPECT_TRUE(file_save_to_disk(root, f, cfg));
+  file_destroy(f);
+  config_delete(cfg);
+  unlink(source);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  /* Metadata-derived mode is applied and never includes setuid/setgid/sticky. */
+  EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
+
+  unlink(path);
+  rmdir(root);
+}
+
+static void test_inplace_overwrite_truncates_shorter_payload() {
+  const char* root = "test_inplace_trunc_tmp";
+  const char* path = "test_inplace_trunc_tmp/big.txt";
+  unlink(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  const char* old_content = "0123456789abcdef"; /* 16 bytes */
+  EXPECT_TRUE(file_write_to_disk(path, old_content, strlen(old_content), false, false));
+
+  File* f = file_create("big.txt");
+  EXPECT_NOT_NULL(f);
+  const char* new_content = "hi";
+  f->data->data = malloc(strlen(new_content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, new_content, strlen(new_content));
+  f->data->size = strlen(new_content);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->inplace = true;
+  EXPECT_TRUE(file_save_to_disk(root, f, cfg));
+  file_destroy(f);
+  config_delete(cfg);
+
+  /* A shorter payload must truncate the file: no stale trailing bytes. */
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, (int)strlen(new_content));
+  FILE* stream = fopen(path, "rb");
+  char buf[32] = {0};
+  EXPECT_NOT_NULL(stream);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (stream) {
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, stream);
+    fclose(stream);
+    EXPECT_EQ_INT((int)nread, (int)strlen(new_content));
+  }
+  EXPECT_EQ_STR(buf, new_content);
+
+  unlink(path);
+  rmdir(root);
+}
+
 void test_file() {
   test_file_create();
   test_file_destroy_null();
@@ -654,4 +810,7 @@ void test_file() {
     test_file_send_single_calls_metadata_and_path();
   }
   test_file_metadata_create();
+  test_inplace_overwrite_clears_special_mode_bits();
+  test_inplace_overwrite_metadata_strips_special_bits();
+  test_inplace_overwrite_truncates_shorter_payload();
 }
