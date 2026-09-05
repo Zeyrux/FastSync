@@ -484,10 +484,11 @@ defaults to the current directory. |
 
 ## Protocol and Security
 
-FastSync protocol version `2.4.0` is shared by the client and server. The
+FastSync protocol version `2.5.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
-manifests, keep-alives, abort handling, and FastSync-native delta messages.
+manifests, keep-alives, abort handling, per-file remove-source results, and
+FastSync-native delta messages.
 Client and server versions must currently match exactly.
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate

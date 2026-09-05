@@ -1,4 +1,5 @@
 """Feature tests: incremental sync, bandwidth limiting, dry run, metadata, filters."""
+import filecmp
 import os
 import shutil
 import sys
@@ -813,3 +814,186 @@ class TestBandwidthLimit:
         mismatches, missing = verify_transfer(SOURCE_DIR, received)
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
+
+
+def _read_file(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+class TestRemoveSourceFilesSkips:
+    """--remove-source-files must not delete sources the receiver skipped
+    (rsync reference behavior)."""
+
+    def test_existing_first_sync_keeps_new_source(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_rsf_existing_src")
+        dest = os.path.join(TEST_DATA_DIR, "remove_rsf_existing_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "only.txt"), "wb") as f:
+            f.write(b"keep me")
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files", "--existing"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Sync failed: {result.stderr[:200]}"
+        # The file exists only on the source side, so --existing makes the
+        # receiver skip it; the source must therefore not be removed.
+        assert os.path.isfile(os.path.join(source, "only.txt"))
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(os.path.join(received, "only.txt"))
+
+    def test_ignore_existing_keeps_skipped_source(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_rsf_ignore_src")
+        dest = os.path.join(TEST_DATA_DIR, "remove_rsf_ignore_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"payload")
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files", "--ignore-existing"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Sync failed: {result.stderr[:200]}"
+        # Destination already has the file, so the second run is a receiver
+        # skip; the source file must survive.
+        assert os.path.isfile(source_file)
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "file.txt")) == b"payload"
+
+    def test_update_newer_destination_keeps_source(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remove_rsf_update_src")
+        dest = os.path.join(TEST_DATA_DIR, "remove_rsf_update_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"source payload")
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(dest, source)
+        received_file = os.path.join(received, "file.txt")
+        with open(received_file, "wb") as f:
+            f.write(b"newer destination payload")
+        os.utime(received_file, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+
+        result, _ = run_client(source, dest, flags=["--remove-source-files", "--update"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Sync failed: {result.stderr[:200]}"
+        # --update skips a destination that is newer than the source, so the
+        # source must not be removed.
+        assert os.path.isfile(source_file)
+        assert _read_file(received_file) == b"newer destination payload"
+
+
+class TestBackup:
+    def _sync(self, source, dest, flags, port):
+        return run_client(source, dest, flags=flags, port=port)
+
+    def test_plain_backup_keeps_previous_version(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "backup_src")
+        dest = os.path.join(TEST_DATA_DIR, "backup_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"AAAA")
+
+        result, _ = self._sync(source, dest, ["--backup"], shared_server.port)
+        assert result.returncode == 0, f"Backup sync failed: {result.stderr[:200]}"
+
+        with open(source_file, "wb") as f:
+            f.write(b"BBBB")
+        result, _ = self._sync(source, dest, ["--backup"], shared_server.port)
+        assert result.returncode == 0, f"Backup sync failed: {result.stderr[:200]}"
+
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "f.txt")) == b"BBBB"
+        # rsync default suffix "~" keeps the overwritten version.
+        assert _read_file(os.path.join(received, "f.txt~")) == b"AAAA"
+
+    def test_backup_custom_suffix(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "backup_suffix_src")
+        dest = os.path.join(TEST_DATA_DIR, "backup_suffix_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"AAAA")
+
+        flags = ["--backup", "--suffix", ".bak"]
+        result, _ = self._sync(source, dest, flags, shared_server.port)
+        assert result.returncode == 0, f"Backup sync failed: {result.stderr[:200]}"
+        with open(source_file, "wb") as f:
+            f.write(b"BBBB")
+        result, _ = self._sync(source, dest, flags, shared_server.port)
+        assert result.returncode == 0, f"Backup sync failed: {result.stderr[:200]}"
+
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "f.txt")) == b"BBBB"
+        assert _read_file(os.path.join(received, "f.txt.bak")) == b"AAAA"
+
+    def test_backup_dir_stores_backups_separately(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "backup_dir_src")
+        dest = os.path.join(TEST_DATA_DIR, "backup_dir_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"AAAA")
+
+        flags = ["--backup", "--backup-dir", "backups"]
+        result, _ = self._sync(source, dest, flags, shared_server.port)
+        assert result.returncode == 0, f"Backup sync failed: {result.stderr[:200]}"
+        with open(source_file, "wb") as f:
+            f.write(b"BBBB")
+        result, _ = self._sync(source, dest, flags, shared_server.port)
+        assert result.returncode == 0, f"Backup sync failed: {result.stderr[:200]}"
+
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "f.txt")) == b"BBBB"
+        backup = os.path.join(dest, "backups", os.path.relpath(source_file, os.path.sep))
+        assert _read_file(backup) == b"AAAA"
+
+
+class TestPartialDir:
+    def test_completed_transfer_installed_in_destination(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "partial_src")
+        dest = os.path.join(TEST_DATA_DIR, "partial_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"partial payload")
+
+        result, _ = run_client(source, dest, flags=["--partial", "--partial-dir", ".partial"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Partial sync failed: {result.stderr[:200]}"
+
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "f.txt")) == b"partial payload"
+        # A completed transfer must not remain under the partial directory.
+        partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
+        assert not os.path.exists(partial)
+
+
+class TestLargeFile:
+    def test_transfer_100mb_file(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "large_src")
+        dest = os.path.join(TEST_DATA_DIR, "large_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "big.bin")
+        chunk = os.urandom(1024 * 1024)
+        with open(source_file, "wb") as f:
+            for _ in range(100):
+                f.write(chunk)
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, f"Large-file sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert filecmp.cmp(source_file, os.path.join(received, "big.bin"), shallow=False)

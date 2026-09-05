@@ -20,9 +20,14 @@
 #include "utils.h"
 
 #define MAX_SERVER_DELETE_COUNT 100000U
-#define MAX_FILE_DATA_SIZE MAX_RECEIVE_FILE_SIZE
+#define MAX_FILE_DATA_SIZE MAX_RECEIVE_WHOLE_FILE_SIZE
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
+  return file_save_to_disk_full(root_directory, file, config) != FILE_SAVE_ERROR;
+}
+
+FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
+                                      const Config* config) {
   /* Backups are incompatible with ignore-existing: moving the entry first
      would make a concurrent no-replace commit overwrite its old name. */
   bool backup_enabled = config && config->backup && !config->ignore_existing;
@@ -32,6 +37,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
+  bool use_partial_root = partial_dir && config && config->partial;
   char *confined_backup = NULL, *confined_partial = NULL, *disk_path = NULL;
   char* destination_path = NULL;
   char *backup_path = NULL, *parent_copy = NULL;
@@ -42,23 +48,22 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
        (!backup_suffix || backup_suffix[0] == '\0' || strchr(backup_suffix, '/') != NULL ||
         strcmp(backup_suffix, ".") == 0 || strcmp(backup_suffix, "..") == 0))) {
     log_message(LOG_LEVEL_ERROR, "Invalid file or path received");
-    return false;
+    return FILE_SAVE_ERROR;
   }
 
   /* These options arrive from the client.  They are names below the server
      root, never independent filesystem roots. */
   if ((backup_dir && (backup_dir[0] == '/' || has_path_traversal(backup_dir))) ||
       (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))))
-    return false;
+    return FILE_SAVE_ERROR;
   if (backup_dir && !(confined_backup = path_cat(root_directory, backup_dir)))
-    return false;
+    return FILE_SAVE_ERROR;
   if (partial_dir && !(confined_partial = path_cat(root_directory, partial_dir))) {
     free(confined_backup);
-    return false;
+    return FILE_SAVE_ERROR;
   }
 
-  const char* actual_root =
-      (partial_dir && config && config->partial) ? confined_partial : root_directory;
+  const char* actual_root = use_partial_root ? confined_partial : root_directory;
   destination_path = path_cat(root_directory, file->path);
   disk_path = path_cat(actual_root, file->path);
   if (destination_path == NULL || disk_path == NULL) {
@@ -66,7 +71,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     free(confined_partial);
     free(destination_path);
     free(disk_path);
-    return false;
+    return FILE_SAVE_ERROR;
   }
 
   /* --existing checks the final destination, not a temporary partial path. */
@@ -75,7 +80,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
     free(confined_partial);
     free(destination_path);
     free(disk_path);
-    return true;
+    return FILE_SAVE_SKIPPED;
   }
 
   /* --ignore-existing checks the final destination before partial files or
@@ -87,34 +92,40 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
       free(confined_partial);
       free(destination_path);
       free(disk_path);
-      return true;
+      return FILE_SAVE_SKIPPED;
     }
   }
-  free(destination_path);
-  destination_path = NULL;
 
   /* --update is receiver-side policy: never replace a newer destination.
-     The secure stat does not require read permission on the destination. */
-  if (config && config->update && file_destination_is_newer_secure(disk_path, file->metadata)) {
+     In partial-dir mode the entry that would be replaced is the real
+     destination, not the temporary partial file.  The secure stat does not
+     require read permission on the destination. */
+  const char* update_target = use_partial_root ? destination_path : disk_path;
+  if (config && config->update && file_destination_is_newer_secure(update_target, file->metadata)) {
     free(confined_backup);
     free(confined_partial);
+    free(destination_path);
     free(disk_path);
-    return true;
+    return FILE_SAVE_SKIPPED;
   }
 
   if (backup_enabled) {
+    /* Back up the entry that the incoming write will replace.  When writing
+       through a partial dir the pre-existing destination file is the one to
+       preserve; any stale partial file is overwritten without a backup. */
+    const char* replace_target = use_partial_root ? destination_path : disk_path;
     struct stat backup_stat;
-    if (file_stat_secure(disk_path, &backup_stat)) {
+    if (file_stat_secure(replace_target, &backup_stat)) {
       if (backup_dir) {
         backup_path = path_cat(confined_backup, file->path);
       } else {
-        size_t path_len = strlen(disk_path);
+        size_t path_len = strlen(replace_target);
         size_t suffix_len = strlen(backup_suffix);
         if (path_len > SIZE_MAX - suffix_len - 1)
           goto fail;
         backup_path = malloc(path_len + suffix_len + 1);
         if (backup_path) {
-          memcpy(backup_path, disk_path, path_len);
+          memcpy(backup_path, replace_target, path_len);
           memcpy(backup_path + path_len, backup_suffix, suffix_len + 1);
         }
       }
@@ -125,7 +136,7 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
         goto fail;
       free(parent_copy);
       parent_copy = NULL;
-      if (!file_rename_secure(disk_path, backup_path))
+      if (!file_rename_secure(replace_target, backup_path))
         goto fail;
       free(backup_path);
       backup_path = NULL;
@@ -149,13 +160,25 @@ bool file_save_to_disk(const char* root_directory, const File* file, const Confi
                 : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
                                                  inplace, sparse, metadata, preserve_executability,
                                                  config && config->use_fsync);
+  if (!ok)
+    goto fail;
+
+  /* --partial --partial-dir writes the complete file under the partial dir so
+     interrupted transfers leave a resumable copy there.  Once the file is
+     fully written it must be atomically installed at the real destination;
+     otherwise completed transfers would linger under the partial dir. */
+  if (use_partial_root) {
+    if (!file_rename_secure(disk_path, destination_path))
+      goto fail;
+  }
+
   free(parent_copy);
   free(backup_path);
   free(confined_backup);
   free(confined_partial);
   free(destination_path);
   free(disk_path);
-  return ok;
+  return FILE_SAVE_WRITTEN;
 
 fail:
   free(parent_copy);
@@ -164,13 +187,15 @@ fail:
   free(confined_partial);
   free(destination_path);
   free(disk_path);
-  return false;
+  return FILE_SAVE_ERROR;
 }
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
                                 void* old_data, unsigned long long old_size, bool* failed) {
-  if (!old_data)
+  if (!old_data) {
+    *failed = true;
     return NULL;
+  }
 
   DeltaSignature* sig = delta_signature_create(old_data, old_size, config->delta_block_size);
   if (!sig) {
@@ -206,7 +231,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   }
 
   if (resp == STATUS_DELTA_DATA) {
-    Data* delta_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
+    Data* delta_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
     if (!delta_data) {
       delta_signature_destroy(sig);
       free(old_data);
@@ -219,7 +244,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         !compression_should_skip_with_suffixes(
             check_path, config->skip_compress_suffixes,
             config->skip_compress_set ? config->skip_compress_count : -1)) {
-      raw_delta = data_decompress_limited(delta_data, MAX_RECEIVE_FILE_SIZE);
+      raw_delta = data_decompress_limited(delta_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
       data_destroy(delta_data);
       if (!raw_delta) {
         free(old_data);
@@ -239,11 +264,12 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     }
 
     uint64_t new_size = delta->new_file_size;
-    if (new_size > MAX_RECEIVE_FILE_SIZE || new_size > SIZE_MAX) {
+    if (new_size > MAX_RECEIVE_WHOLE_FILE_SIZE || new_size > SIZE_MAX) {
       delta_destroy(delta);
       free(old_data);
       delta_signature_destroy(sig);
       send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
     void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
@@ -284,6 +310,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       free(old_data);
       delta_signature_destroy(sig);
       send_status(fd, STATUS_ERROR);
+      *failed = true;
       return NULL;
     }
     data_destroy(file->data);
@@ -314,7 +341,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       }
     }
 
-    Data* file_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
+    Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
     if (file_data == NULL) {
       file_destroy(file);
       *failed = true;
@@ -325,7 +352,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         !compression_should_skip_with_suffixes(
             file->path, config->skip_compress_suffixes,
             config->skip_compress_set ? config->skip_compress_count : -1)) {
-      Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
+      Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
       data_destroy(file_data);
       if (uncompressed == NULL) {
         file_destroy(file);
@@ -384,7 +411,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
-  if (check_size > MAX_RECEIVE_FILE_SIZE) {
+  if (check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
     free(check_path);
     send_status(fd, STATUS_ERROR);
     return NULL;
@@ -405,6 +432,9 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     send_status(fd, STATUS_ERROR);
     return NULL;
   }
+
+  /* Open the existing destination entry (if any) once and keep the descriptor
+     until the quick-check below decides whether the old contents are needed. */
   struct stat st;
   bool has_old_file = false;
   int old_fd = -1;
@@ -416,9 +446,34 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     close(parent_fd);
     has_old_file = old_fd >= 0 && fstat(old_fd, &st) == 0 && S_ISREG(st.st_mode);
   }
+  if (!has_old_file && old_fd >= 0) {
+    close(old_fd);
+    old_fd = -1;
+  }
   unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
+
+  /* Decide from metadata alone whether the receiver already holds the file
+     the sender is offering.  The old contents are only read into memory when
+     a checksum comparison or a delta transfer actually requires them. */
+  bool size_equal = has_old_file && old_size == check_size;
+  bool match_by_metadata = false;
+  if (size_equal && !config->ignore_times && !config->size_only) {
+    long long old_mtime_nsec = 0;
+#ifdef __linux__
+    old_mtime_nsec = st.st_mtim.tv_nsec;
+#endif
+    match_by_metadata = metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
+                                               (long)check_mtime_nsec, config->modify_window);
+  }
+
+  bool try_delta = config->use_delta && !config->whole_file && has_old_file &&
+                   delta_should_attempt(old_size, check_size, config->delta_max_file_size);
+  bool checksum_needs_read = size_equal && !config->ignore_times && config->checksum;
+  bool need_old_data = checksum_needs_read || try_delta;
+
   void* old_data = NULL;
-  if (has_old_file && old_size > 0 && old_size <= MAX_RECEIVE_FILE_SIZE && old_size <= SIZE_MAX) {
+  if (need_old_data && has_old_file && old_size > 0 && old_size <= MAX_RECEIVE_WHOLE_FILE_SIZE &&
+      old_size <= SIZE_MAX) {
     old_data = protocol_alloc((size_t)old_size);
     if (old_data) {
       size_t got = 0;
@@ -433,73 +488,63 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
       }
     }
   }
-  if (old_fd >= 0) {
-    close(old_fd);
-  }
 
-  bool match =
-      !config->ignore_times && has_old_file && (unsigned long long)st.st_size == check_size;
-  if (match && config->checksum) {
-    uint64_t old_checksum = old_size == 0 ? delta_xxhash64("", 0) : 0;
-    if (old_data)
-      old_checksum = delta_xxhash64(old_data, (size_t)old_size);
-    match = (old_size == 0 || old_data) && old_checksum == check_checksum;
-    free(old_data);
-    old_data = NULL;
-  } else if (match && !config->size_only) {
-    long long old_mtime_nsec = 0;
-#ifdef __linux__
-    old_mtime_nsec = st.st_mtim.tv_nsec;
-#endif
-    match = metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
-                                   (long)check_mtime_nsec, config->modify_window);
+  /* Quick-skip decision.  If no content comparison is required this is final
+     and the old file was never read; if the read failed the file is not
+     skipped and the transfer proceeds with the full new contents. */
+  bool match = false;
+  if (checksum_needs_read) {
+    if (old_size == 0)
+      match = delta_xxhash64("", 0) == check_checksum;
+    else
+      match = old_data != NULL && delta_xxhash64(old_data, (size_t)old_size) == check_checksum;
+  } else if (size_equal && !config->ignore_times) {
+    match = config->size_only || match_by_metadata;
   }
 
   if (match) {
     free(old_data);
     if (!send_status(fd, STATUS_OK)) {
+      close(old_fd);
       free(full_path);
       free(check_path);
       return NULL;
     }
+    close(old_fd);
     free(full_path);
     free(check_path);
     *skipped = true;
     return NULL;
   }
 
-  bool try_delta = config->use_delta && !config->whole_file && has_old_file && old_data != NULL &&
-                   delta_should_attempt(old_size, check_size, config->delta_max_file_size);
-
-  if (try_delta) {
+  if (try_delta && old_data != NULL) {
     bool delta_failed = false;
     File* delta_file =
         receive_delta_file(fd, config, check_path, old_data, old_size, &delta_failed);
     old_data = NULL; /* receive_delta_file consumes the snapshot on every path */
     if (delta_file) {
+      close(old_fd);
       free(full_path);
       free(check_path);
       return delta_file;
     }
     if (delta_failed) {
+      close(old_fd);
       free(full_path);
       free(check_path);
       return NULL;
     }
-    free(old_data);
-    old_data = NULL;
-    try_delta = false;
   }
+  free(old_data);
+  old_data = NULL;
 
-  if (!try_delta) {
-    free(old_data);
-    old_data = NULL;
-    if (!send_status(fd, STATUS_NEXT)) {
-      free(full_path);
-      free(check_path);
-      return NULL;
-    }
+  if (!send_status(fd, STATUS_NEXT)) {
+    close(old_fd);
+    free(full_path);
+    free(check_path);
+    return NULL;
   }
+  close(old_fd);
 
   File* file = file_create(check_path);
   free(check_path);
@@ -517,7 +562,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     }
   }
 
-  Data* file_data = receive_data_limited(fd, MAX_RECEIVE_FILE_SIZE);
+  Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
   if (file_data == NULL) {
     file_destroy(file);
     return NULL;
@@ -527,7 +572,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
       !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
                                              config->skip_compress_set ? config->skip_compress_count
                                                                        : -1)) {
-    Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
+    Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
     data_destroy(file_data);
     if (uncompressed == NULL) {
       file_destroy(file);
@@ -571,7 +616,7 @@ File* file_receive(const Config* config, int file_descriptor) {
       return NULL;
     }
   }
-  Data* file_data = receive_data_limited(file_descriptor, MAX_RECEIVE_FILE_SIZE);
+  Data* file_data = receive_data_limited(file_descriptor, MAX_RECEIVE_WHOLE_FILE_SIZE);
   if (file_data == NULL) {
     file_destroy(file);
     return NULL;
@@ -580,7 +625,7 @@ File* file_receive(const Config* config, int file_descriptor) {
       !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
                                              config->skip_compress_set ? config->skip_compress_count
                                                                        : -1)) {
-    Data* file_data_uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_FILE_SIZE);
+    Data* file_data_uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
     data_destroy(file_data);
     if (file_data_uncompressed == NULL) {
       file_destroy(file);

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static void test_file_create() {
@@ -247,6 +248,111 @@ static void test_file_save_to_disk_ignore_existing_entry_types() {
   unlink(target);
   unlink(backup_file);
   rmdir(directory);
+  rmdir(root);
+}
+
+/* Issue #253: with --partial --partial-dir a completed write must be installed
+   at the real destination rather than left under the partial directory. */
+static void test_file_save_to_disk_partial_install() {
+  const char* root = "test_partial_install_tmp";
+  const char* dest_file = "test_partial_install_tmp/file.txt";
+  const char* partial_file = "test_partial_install_tmp/.partial/file.txt";
+  unlink(dest_file);
+  unlink(partial_file);
+  rmdir("test_partial_install_tmp/.partial");
+  rmdir(root);
+
+  File* f = file_create("file.txt");
+  EXPECT_NOT_NULL(f);
+  const char* content = "partial-dir content";
+  f->data->data = malloc(strlen(content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, content, strlen(content));
+  f->data->size = strlen(content);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->partial = true;
+  config->partial_dir = str_dup(".partial");
+
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
+
+  FILE* fp = fopen(dest_file, "rb");
+  EXPECT_NOT_NULL(fp);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (fp) {
+    char buf[64] = {0};
+    size_t nread = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    EXPECT_EQ_INT((int)nread, (int)strlen(content));
+    EXPECT_EQ_INT(memcmp(buf, content, strlen(content)), 0);
+  }
+  /* A completed transfer must not linger under the partial dir. */
+  EXPECT_EQ_INT(access(partial_file, F_OK), -1);
+
+  file_destroy(f);
+  config_delete(config);
+  unlink(dest_file);
+  rmdir(root);
+}
+
+/* Issue #251: file_save_to_disk_full must distinguish receiver-side skips
+   (--existing/--ignore-existing/--update) from real writes so the sender can
+   decide whether --remove-source-files may unlink its source. */
+static void test_file_save_to_disk_reports_skips() {
+  const char* root = "test_save_skip_tmp";
+  const char* existing_path = "test_save_skip_tmp/existing.txt";
+  unlink(existing_path);
+  rmdir(root);
+  EXPECT_TRUE(file_write_to_disk(existing_path, "old", 3, false, false));
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+
+  File* new_file = file_create("missing.txt");
+  EXPECT_NOT_NULL(new_file);
+  new_file->data->data = malloc(7);
+  EXPECT_NOT_NULL(new_file->data->data);
+  memcpy(new_file->data->data, "skipped", 7);
+  new_file->data->size = 7;
+
+  /* --existing: destination is missing -> skipped, not an error. */
+  cfg->existing = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, new_file, cfg), FILE_SAVE_SKIPPED);
+  cfg->existing = false;
+
+  /* --ignore-existing: destination present -> skipped. */
+  File* present = file_create("existing.txt");
+  EXPECT_NOT_NULL(present);
+  present->data->data = malloc(3);
+  EXPECT_NOT_NULL(present->data->data);
+  memcpy(present->data->data, "new", 3);
+  present->data->size = 3;
+  cfg->ignore_existing = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, present, cfg), FILE_SAVE_SKIPPED);
+  cfg->ignore_existing = false;
+
+  /* A normal overwrite of an existing file is a real write. */
+  EXPECT_EQ_INT(file_save_to_disk_full(root, present, cfg), FILE_SAVE_WRITTEN);
+
+  /* --update: a newer destination is skipped. */
+  struct stat st;
+  EXPECT_EQ_INT(stat(existing_path, &st), 0);
+  time_t now = time(NULL);
+  FileMetadata metadata = {.mode = st.st_mode,
+                           .uid = st.st_uid,
+                           .gid = st.st_gid,
+                           .mtime_sec = now - 100,
+                           .mtime_nsec = 0};
+  present->metadata = &metadata;
+  cfg->update = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, present, cfg), FILE_SAVE_SKIPPED);
+  present->metadata = NULL;
+
+  file_destroy(new_file);
+  file_destroy(present);
+  config_delete(cfg);
+  unlink(existing_path);
   rmdir(root);
 }
 
@@ -635,6 +741,8 @@ void test_file() {
   test_file_save_to_disk_existing();
   test_file_save_to_disk_ignore_existing();
   test_file_save_to_disk_ignore_existing_entry_types();
+  test_file_save_to_disk_partial_install();
+  test_file_save_to_disk_reports_skips();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_with_fsync();
   test_file_write_to_disk_creates_dirs();

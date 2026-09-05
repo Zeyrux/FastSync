@@ -342,9 +342,15 @@ void handler(int file_descriptor) {
     int writer_result;
     thrd_join(receiver, &receiver_result);
     thrd_join(writer, &writer_result);
-    send_status(file_descriptor, receiver_result == thrd_success && writer_result == thrd_success
-                                     ? STATUS_OK
-                                     : STATUS_ERROR);
+    bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
+    if (transfer_ok) {
+      if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
+        transfer_ok = false;
+    } else {
+      send_status(file_descriptor, STATUS_ERROR);
+    }
+    if (!transfer_ok)
+      log_message(LOG_LEVEL_ERROR, "Transfer failed");
     pipeline_context_receiver_destroy(context);
   } else {
     if (receiver_receive_files(config, file_descriptor) != 0)

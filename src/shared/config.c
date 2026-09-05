@@ -139,8 +139,9 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->use_delete) && valid_wire_bool(config->use_incremental) &&
          valid_wire_bool(config->size_only) && valid_wire_bool(config->ignore_times) &&
          valid_wire_bool(config->use_delta) && valid_wire_bool(config->backup) &&
-         valid_wire_bool(config->follow_symlinks) && valid_wire_bool(config->copy_links) &&
-         valid_wire_bool(config->safe_links) && valid_wire_bool(config->copy_unsafe_links) &&
+         valid_wire_bool(config->remove_source_files) && valid_wire_bool(config->follow_symlinks) &&
+         valid_wire_bool(config->copy_links) && valid_wire_bool(config->safe_links) &&
+         valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
          valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->ignore_existing) &&
@@ -274,11 +275,11 @@ static bool send_delta_fields(int fd, const Config* c) {
 
 static bool send_file_options(int fd, const Config* c) {
   return send_int(fd, c->backup) && send_str(fd, c->backup_dir ? c->backup_dir : "") &&
-         send_int(fd, c->follow_symlinks) && send_int(fd, c->copy_links) &&
-         send_int(fd, c->safe_links) && send_int(fd, c->copy_unsafe_links) &&
-         send_int(fd, c->preserve_hard_links) && send_int(fd, c->preserve_acls) &&
-         send_int(fd, c->preserve_xattrs) && send_int(fd, c->preserve_devices) &&
-         send_int(fd, c->preserve_sparse);
+         send_int(fd, c->remove_source_files) && send_int(fd, c->follow_symlinks) &&
+         send_int(fd, c->copy_links) && send_int(fd, c->safe_links) &&
+         send_int(fd, c->copy_unsafe_links) && send_int(fd, c->preserve_hard_links) &&
+         send_int(fd, c->preserve_acls) && send_int(fd, c->preserve_xattrs) &&
+         send_int(fd, c->preserve_devices) && send_int(fd, c->preserve_sparse);
 }
 
 static bool send_selection_options(int fd, const Config* c) {
@@ -355,8 +356,17 @@ static bool receive_delta_fields(int fd, Config* c) {
 static bool receive_file_options(int fd, Config* c) {
   if (!receive_wire_bool(fd, &c->backup))
     return false;
-  c->backup_dir = receive_str(fd);
-  if (!c->backup_dir)
+  char* backup_dir = receive_str(fd);
+  if (!backup_dir)
+    return false;
+  if (*backup_dir != '\0') {
+    c->backup_dir = backup_dir;
+  } else {
+    /* The sender serializes an unset (NULL) string as "", so canonicalize the
+       empty wire value back to NULL to preserve NULL-vs-empty semantics. */
+    free(backup_dir);
+  }
+  if (!receive_wire_bool(fd, &c->remove_source_files))
     return false;
   bool* flags[] = {&c->follow_symlinks,   &c->copy_links,          &c->safe_links,
                    &c->copy_unsafe_links, &c->preserve_hard_links, &c->preserve_acls,
@@ -386,12 +396,37 @@ static bool receive_selection_options(int fd, Config* c) {
 }
 
 static bool receive_resume_options(int fd, Config* c) {
-  c->temp_dir = receive_str(fd);
-  if (!c->temp_dir || !receive_wire_bool(fd, &c->partial))
+  char* temp_dir = receive_str(fd);
+  if (!temp_dir)
     return false;
-  c->partial_dir = receive_str(fd);
-  c->suffix = c->partial_dir ? receive_str(fd) : NULL;
-  if (!c->partial_dir || !c->suffix || !receive_wire_bool(fd, &c->delete_before))
+  if (*temp_dir != '\0') {
+    c->temp_dir = temp_dir;
+  } else {
+    free(temp_dir);
+  }
+  if (!receive_wire_bool(fd, &c->partial))
+    return false;
+  /* These options have NULL client defaults, so the sender transmits an empty
+     string for "unset".  Canonicalize the empty wire value back to NULL so
+     receivers observe exactly what the client configured (plain --backup, for
+     example, must not look like --backup-dir ""). */
+  char* partial_dir = receive_str(fd);
+  if (!partial_dir)
+    return false;
+  if (*partial_dir != '\0') {
+    c->partial_dir = partial_dir;
+  } else {
+    free(partial_dir);
+  }
+  char* suffix = receive_str(fd);
+  if (!suffix)
+    return false;
+  if (*suffix != '\0') {
+    c->suffix = suffix;
+  } else {
+    free(suffix);
+  }
+  if (!receive_wire_bool(fd, &c->delete_before))
     return false;
   if (!receive_wire_bool(fd, &c->checksum))
     return false;

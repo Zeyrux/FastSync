@@ -9,10 +9,16 @@
 /* Maximum allowed string size for receive_str (64 KB) */
 #define MAX_STRING_SIZE (64 * 1024)
 
-/* Maximum allowed data payload size for receive_data (100 MB) */
-#define MAX_DATA_PAYLOAD_SIZE (100ULL * 1024 * 1024)
-/* Maximum uncompressed file payload accepted by the receiver. */
-#define MAX_RECEIVE_FILE_SIZE (64ULL * 1024 * 1024)
+/* Maximum uncompressed file payload accepted by the receiver's whole-file
+ * paths.  A single whole file is charged against the per-connection memory
+ * reservation (MAX_CONNECTION_MEMORY) and against the server allocation
+ * ceiling (MAX_SERVER_ALLOC), so this mirrors those 256 MB bounds rather than
+ * the older 64 MB chunk-era cap.  Chunk-serialized payloads keep their own
+ * 64 MB cap (MAX_CHUNK_SIZE). */
+#define MAX_RECEIVE_WHOLE_FILE_SIZE (256ULL * 1024 * 1024)
+
+/* Maximum allowed data payload size for receive_data (whole-file bound) */
+#define MAX_DATA_PAYLOAD_SIZE MAX_RECEIVE_WHOLE_FILE_SIZE
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
