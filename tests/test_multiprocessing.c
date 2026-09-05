@@ -250,6 +250,87 @@ static void test_write_thread_done() {
   config_delete(cfg);
 }
 
+typedef struct {
+  PipelineContextReceiver* context;
+  File* file;
+  atomic_bool* done;
+  atomic_bool* result;
+} ByteBudgetEnqueueArg;
+
+static int byte_budget_enqueue_worker(void* arg) {
+  ByteBudgetEnqueueArg* worker = arg;
+  bool ok = pipeline_context_receiver_enqueue_file(worker->context, worker->file);
+  atomic_store(worker->result, ok);
+  atomic_store(worker->done, true);
+  return thrd_success;
+}
+
+/* A receiver must not buffer more decompressed/copied payload bytes ahead of
+   the (slow) disk writer than the configured byte budget: an enqueue that
+   would exceed the budget blocks until the writer releases bytes. */
+static void test_receiver_enqueue_byte_budget() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  cfg->save_to_disk = false;
+
+  Queue* q = queue_create(16, file_destroy);
+  EXPECT_NOT_NULL(q);
+  PipelineContextReceiver* ctx = pipeline_context_receiver_create(cfg, q, -1, NULL);
+  EXPECT_NOT_NULL(ctx);
+  pipeline_context_receiver_set_queue_byte_limit(ctx, 3000);
+  ctx->receiver_done = false;
+
+  File* first = file_create("budget_file_1");
+  EXPECT_NOT_NULL(first);
+  first->data->size = 2000;
+  EXPECT_TRUE(pipeline_context_receiver_enqueue_file(ctx, first));
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 2000);
+
+  /* Second 2000-byte payload would push the pipeline to 4000 > 3000 budget,
+     so the enqueue must block until the first payload is released. */
+  File* second = file_create("budget_file_2");
+  EXPECT_NOT_NULL(second);
+  second->data->size = 2000;
+  atomic_bool done;
+  atomic_bool result;
+  atomic_init(&done, false);
+  atomic_init(&result, false);
+  ByteBudgetEnqueueArg arg = {ctx, second, &done, &result};
+  thrd_t enqueuer;
+  EXPECT_EQ_INT(thrd_create(&enqueuer, byte_budget_enqueue_worker, &arg), thrd_success);
+
+  /* Give a broken (unbounded) implementation every chance to enqueue. */
+  struct timespec wait = {0, 200 * 1000000L};
+  thrd_sleep(&wait, NULL);
+  EXPECT_FALSE(atomic_load(&done));
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 2000); /* budget still honored */
+
+  /* Simulate the disk writer: dequeue + destroy + release the first file. */
+  File* drained = queue_dequeue_multithreaded(q, &ctx->mutex, &ctx->condition_not_empty,
+                                              &ctx->condition_not_full, &ctx->receiver_done);
+  EXPECT_NOT_NULL(drained);
+  file_destroy(drained);
+  pipeline_context_receiver_note_bytes_released(ctx, 2000);
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 0);
+
+  EXPECT_EQ_INT(thrd_join(enqueuer, NULL), thrd_success);
+  EXPECT_TRUE(atomic_load(&done));
+  EXPECT_TRUE(atomic_load(&result));
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 2000); /* second payload now in flight */
+
+  /* Tear down: the second file is still queued and is freed by queue_destroy. */
+  mtx_destroy(&ctx->mutex);
+  cnd_destroy(&ctx->condition_not_full);
+  cnd_destroy(&ctx->condition_not_empty);
+  free(ctx);
+  queue_destroy(q);
+  config_delete(cfg);
+}
+
 void test_multiprocessing() {
   test_sender_create_destroy();
   test_receiver_create_destroy();
@@ -261,4 +342,5 @@ void test_multiprocessing() {
     test_receive_thread_failure_wakes_writer();
   }
   test_write_thread_done();
+  test_receiver_enqueue_byte_budget();
 }

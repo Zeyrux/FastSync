@@ -348,10 +348,25 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (newer) {
         ok = true;
       } else {
-        if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
+        /* In-place overwrites: pre-size sparse targets and always trim the
+           file to the new payload length afterwards so shorter payloads can
+           never leave stale trailing bytes from a previous version. */
+        if (sparse && data_size > 0)
+          ok = ftruncate(fd, (off_t)data_size) == 0;
+        if (ok || !sparse || data_size == 0)
           ok = write_all(fd, data, data_size);
-        if (ok && metadata)
-          ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+        if (ok)
+          ok = ftruncate(fd, (off_t)data_size) == 0;
+        /* Normalize the mode: apply the metadata-derived safe mode when the
+           sender supplied metadata (setuid/setgid/sticky are never honored);
+           otherwise fall back to a safe default so dangerous bits on an
+           existing destination cannot survive an overwrite. */
+        if (ok) {
+          if (metadata)
+            ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+          else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
+            ok = false;
+        }
         if (ok && use_fsync)
           ok = fsync(fd) == 0;
       }
