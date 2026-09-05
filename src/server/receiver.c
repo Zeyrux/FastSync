@@ -1,12 +1,55 @@
 #include "receiver.h"
 
 #include "chunk.h"
+#include "file_receive.h"
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
 #include <stdlib.h>
 #include <sys/stat.h>
+
+bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code) {
+  if (!outcomes)
+    return false;
+  if (outcomes->count == outcomes->capacity) {
+    size_t new_capacity = outcomes->capacity == 0 ? 64 : outcomes->capacity * 2;
+    if (new_capacity < outcomes->capacity)
+      return false;
+    unsigned char* grown = realloc(outcomes->entries, new_capacity);
+    if (!grown)
+      return false;
+    outcomes->entries = grown;
+    outcomes->capacity = new_capacity;
+  }
+  outcomes->entries[outcomes->count++] = code;
+  return true;
+}
+
+void receiver_outcomes_destroy(ReceiverOutcomes* outcomes) {
+  if (!outcomes)
+    return;
+  free(outcomes->entries);
+  outcomes->entries = NULL;
+  outcomes->count = 0;
+  outcomes->capacity = 0;
+}
+
+/* End-of-transfer success frame.  When --remove-source-files was negotiated
+   each processed data file is acknowledged first (STATUS_NEXT = written,
+   STATUS_OK = skipped) so the sender never removes a source the receiver did
+   not actually store.  The frame always ends with a plain STATUS_OK. */
+bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes) {
+  if (!config->remove_source_files)
+    return send_status(fd, STATUS_OK);
+  size_t count = outcomes ? outcomes->count : 0;
+  for (size_t i = 0; i < count; i++) {
+    Status per_file = outcomes->entries[i] == FILE_SAVE_WRITTEN ? STATUS_NEXT : STATUS_OK;
+    if (!send_status(fd, per_file))
+      return false;
+  }
+  return send_status(fd, STATUS_OK);
+}
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
   if (!chunk || !sink || !sink->store_file)
@@ -52,7 +95,7 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
       send_status(file_descriptor, STATUS_ERROR);
       return false;
     }
-    if (check_size > MAX_RECEIVE_FILE_SIZE) {
+    if (check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
       free(check_path);
       send_status(file_descriptor, STATUS_ERROR);
       return false;
@@ -130,8 +173,14 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
     log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
     goto receive_error;
   }
-  if (sink->send_success && !send_status(file_descriptor, STATUS_OK))
-    return -1;
+  if (sink->send_success) {
+    if (sink->send_success_frame) {
+      if (!sink->send_success_frame(file_descriptor, sink->context))
+        return -1;
+    } else if (!send_status(file_descriptor, STATUS_OK)) {
+      return -1;
+    }
+  }
   return 0;
 
 receive_error:
@@ -140,15 +189,41 @@ receive_error:
   return -1;
 }
 
-static bool receiver_save_file(File* file, void* context) {
-  Config* config = context;
-  bool success =
-      !config->save_to_disk || file_save_to_disk(config->receive_root_directory, file, config);
+/* ---- Single-threaded sink (used by receiver_receive_files) ---- */
+
+typedef struct {
+  Config* config;
+  ReceiverOutcomes outcomes;
+} ReceiverSaveContext;
+
+static bool receiver_save_file(File* file, void* context_pointer) {
+  ReceiverSaveContext* context = context_pointer;
+  FileSaveResult result = FILE_SAVE_ERROR;
+  if (!context->config->save_to_disk) {
+    /* Nothing is stored; report the file as not-written so a
+       --remove-source-files sender keeps its source. */
+    result = FILE_SAVE_SKIPPED;
+  } else {
+    result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
+  }
+  if (result != FILE_SAVE_ERROR && context->config->remove_source_files &&
+      !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
+    file_destroy(file);
+    return false;
+  }
   file_destroy(file);
-  return success;
+  return result != FILE_SAVE_ERROR;
+}
+
+static bool receiver_send_success_frame(int fd, void* context_pointer) {
+  ReceiverSaveContext* context = context_pointer;
+  return receiver_send_final_success(fd, context->config, &context->outcomes);
 }
 
 int receiver_receive_files(Config* config, int file_descriptor) {
-  ReceiverSink sink = {receiver_save_file, config, true, true};
-  return receiver_process(config, file_descriptor, &sink);
+  ReceiverSaveContext context = {.config = config, .outcomes = {0}};
+  ReceiverSink sink = {receiver_save_file, &context, true, true, receiver_send_success_frame};
+  int ret = receiver_process(config, file_descriptor, &sink);
+  receiver_outcomes_destroy(&context.outcomes);
+  return ret;
 }

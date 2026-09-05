@@ -9,6 +9,7 @@
 #include "file.h"
 #include "protocol.h"
 #include "queue.h"
+#include "receiver.h"
 #include <openssl/ssl.h>
 
 typedef struct {
@@ -40,6 +41,7 @@ typedef struct PipelineContextReceiver {
   int file_descriptor;
   SSL* ssl;
   ProtocolSession session;
+  ReceiverOutcomes outcomes;
   mtx_t mutex;
   cnd_t condition_not_full;
   cnd_t condition_not_empty;

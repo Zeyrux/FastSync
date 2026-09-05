@@ -109,16 +109,13 @@ static bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
   return true;
 }
 
-static bool finalize_transfer(Client* client) {
-  Status status;
-  return send_status(client->file_descriptor, STATUS_FINISHED) &&
-         receive_status(client->file_descriptor, &status) && status == STATUS_OK;
-}
+/* (finalize_transfer is defined after the SourceFile helpers below.) */
 
-typedef struct {
+typedef struct SourceFile {
   char* path;
   dev_t device;
   ino_t inode;
+  bool skipped; /* receiver reported the file was not written */
 } SourceFile;
 
 static void source_file_destroy(void* item) {
@@ -135,6 +132,8 @@ static void remove_transferred_sources(const Config* config, ArrayList* paths) {
     return;
   for (int i = 0; i < paths->size; i++) {
     SourceFile* source = paths->items[i];
+    if (source->skipped)
+      continue;
     const char* slash = strrchr(source->path, '/');
     const char* leaf = slash ? slash + 1 : source->path;
     char parent[PATH_MAX];
@@ -177,6 +176,7 @@ static SourceFile* source_file_create(const File* file) {
   source->path = str_dup(file->path);
   source->device = st.st_dev;
   source->inode = st.st_ino;
+  source->skipped = false;
   if (!source->path) {
     source_file_destroy(source);
     return NULL;
@@ -201,6 +201,33 @@ static void mark_sender_done(PipelineContextSender* context) {
   mtx_lock(&context->mutex_progress);
   context->sender_done = true;
   mtx_unlock(&context->mutex_progress);
+}
+
+/* Send the final STATUS_FINISHED frame and await the receiver's verdict.
+   When --remove-source-files is active the receiver acknowledges each data
+   file it processed, in send order: STATUS_NEXT means the file was written,
+   STATUS_OK means the file was skipped/unchanged.  Skipped sources are marked
+   so the later removal pass keeps them. */
+static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources) {
+  if (!send_status(client->file_descriptor, STATUS_FINISHED))
+    return false;
+  if (config->remove_source_files && remove_sources) {
+    for (int i = 0; i < remove_sources->size; i++) {
+      Status per_file;
+      if (!receive_status(client->file_descriptor, &per_file))
+        return false;
+      if (per_file == STATUS_ERROR)
+        return false;
+      if (per_file == STATUS_OK) {
+        ((SourceFile*)remove_sources->items[i])->skipped = true;
+      } else if (per_file != STATUS_NEXT) {
+        log_message(LOG_LEVEL_ERROR, "Unexpected per-file status from receiver");
+        return false;
+      }
+    }
+  }
+  Status status;
+  return receive_status(client->file_descriptor, &status) && status == STATUS_OK;
 }
 
 static void pipeline_cancel(PipelineContextSender* context) {
@@ -575,7 +602,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         if (send_delete_manifest(client->file_descriptor, context->manifest) != 0)
           goto send_fail;
       }
-      bool ok = finalize_transfer(client);
+      bool ok = finalize_transfer(client, context->config, context->remove_source_files);
       if (ok)
         remove_transferred_sources(context->config, context->remove_source_files);
       mtx_lock(&context->mutex_progress);
@@ -866,7 +893,7 @@ int send_files(Config* config) {
     array_list_delete(manifest);
     manifest = NULL;
   }
-  bool ok = finalize_transfer(client);
+  bool ok = finalize_transfer(client, config, remove_sources);
   if (ok)
     remove_transferred_sources(config, remove_sources);
   if (config->show_progress && !config->quiet)

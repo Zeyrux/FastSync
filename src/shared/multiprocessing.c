@@ -105,6 +105,9 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->queue = queue;
   context->file_descriptor = file_descriptor;
   context->ssl = ssl;
+  context->outcomes.entries = NULL;
+  context->outcomes.count = 0;
+  context->outcomes.capacity = 0;
   protocol_session_init(&context->session, file_descriptor, file_descriptor);
   protocol_session_set_ssl(&context->session, ssl);
   context->receiver_done = false;
@@ -137,6 +140,7 @@ fail:
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   config_delete(context->config);
   queue_destroy(context->queue);
+  receiver_outcomes_destroy(&context->outcomes);
   mtx_destroy(&context->mutex);
   cnd_destroy(&context->condition_not_full);
   cnd_destroy(&context->condition_not_empty);
@@ -170,7 +174,7 @@ int receive_thread(void* pipeline_context) {
   const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
-  ReceiverSink sink = {receiver_enqueue_file, context, false, false};
+  ReceiverSink sink = {receiver_enqueue_file, context, false, false, NULL};
   if (receiver_process((Config*)config, file_descriptor, &sink) != 0) {
     receiver_thread_fail(context);
     protocol_session_unbind();
@@ -211,7 +215,26 @@ int write_thread(void* pipeline_context) {
       protocol_session_unbind();
       return thrd_success;
     }
-    if (save_to_disk && !file_save_to_disk(root_directory, file, context->config)) {
+    FileSaveResult result = FILE_SAVE_SKIPPED;
+    if (save_to_disk) {
+      result = file_save_to_disk_full(root_directory, file, context->config);
+      if (result == FILE_SAVE_ERROR) {
+        file_destroy(file);
+        mtx_lock(&context->mutex);
+        atomic_store(&context->cancelled, true);
+        context->receiver_done = true;
+        cnd_broadcast(&context->condition_not_full);
+        cnd_broadcast(&context->condition_not_empty);
+        mtx_unlock(&context->mutex);
+        free(root_directory);
+        protocol_session_unbind();
+        return thrd_error;
+      }
+    }
+    /* Record the per-file outcome so a --remove-source-files sender learns
+       which sources were actually written versus skipped on the receiver. */
+    if (context->config->remove_source_files &&
+        !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
       file_destroy(file);
       mtx_lock(&context->mutex);
       atomic_store(&context->cancelled, true);

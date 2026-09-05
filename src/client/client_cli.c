@@ -12,6 +12,7 @@
 #include "utils.h"
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -903,6 +904,10 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
 
 #ifndef FASTSYNC_TEST_BUILD
 int main(int argc, char* argv[]) {
+  /* The server may close a connection mid-stream (e.g. when it rejects an
+     oversized delta).  Ignore SIGPIPE so that a broken TCP connection
+     surfaces as a clean write error instead of killing the client. */
+  signal(SIGPIPE, SIG_IGN);
   const char* env_source = NULL;
   const char* env_dest = NULL;
   bool save_to_disk = false;

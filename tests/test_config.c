@@ -282,6 +282,105 @@ static void test_config_receive_truncated() {
   close(p[1]);
 }
 
+static bool config_string_roundtrip_matches(const Config* send_cfg, Config* recv) {
+  /* The sender serializes NULL strings as "" on the wire.  Receivers must
+     canonicalize those empty values back to NULL for the options whose client
+     default is NULL (backup_dir, temp_dir, partial_dir, suffix), while a real
+     non-empty value round-trips unchanged. */
+  const char* fields[4];
+  char* const* recv_fields[4];
+  fields[0] = send_cfg->backup_dir;
+  recv_fields[0] = &recv->backup_dir;
+  fields[1] = send_cfg->temp_dir;
+  recv_fields[1] = &recv->temp_dir;
+  fields[2] = send_cfg->partial_dir;
+  recv_fields[2] = &recv->partial_dir;
+  fields[3] = send_cfg->suffix;
+  recv_fields[3] = &recv->suffix;
+  for (int i = 0; i < 4; i++) {
+    const char* sent = fields[i];
+    const char* got = *recv_fields[i];
+    if (sent == NULL || sent[0] == '\0') {
+      if (got != NULL)
+        return false;
+    } else if (got == NULL || strcmp(sent, got) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool roundtrip_config_ok(const Config* send_cfg) {
+  int p[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0)
+    return false;
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL;
+    if (ok) {
+      ok = recv->version != NULL && strcmp(recv->version, PROTOCOL_VERSION) == 0;
+      ok = ok && recv->send_directory && recv->receive_root_directory;
+      ok = ok && config_string_roundtrip_matches(send_cfg, recv);
+    }
+    config_delete(recv);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    return sent && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  }
+}
+
+/* Issue #252: NULL-vs-empty must survive the wire for backup_dir, temp_dir,
+   partial_dir, and suffix.  NULL and explicitly-empty client values are both
+   serialized as "" and must be reconstructed as NULL so plain --backup (with
+   no --suffix/--backup-dir) works exactly like the client configured it. */
+static void test_config_string_null_vs_empty_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+
+  /* NULL values on the wire must come back as NULL. */
+  Config* a = config_create();
+  EXPECT_NOT_NULL(a);
+  a->send_directory = str_dup("/src");
+  a->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(roundtrip_config_ok(a));
+  config_delete(a);
+
+  /* Explicitly empty strings (indistinguishable on the wire from NULL) must
+     be canonicalized to NULL by the receiver. */
+  Config* b = config_create();
+  EXPECT_NOT_NULL(b);
+  b->send_directory = str_dup("/src");
+  b->receive_root_directory = str_dup("/dst");
+  b->backup_dir = str_dup("");
+  b->temp_dir = str_dup("");
+  b->partial_dir = str_dup("");
+  b->suffix = str_dup("");
+  EXPECT_TRUE(roundtrip_config_ok(b));
+  config_delete(b);
+
+  /* Non-empty values must round-trip unchanged. */
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->backup_dir = str_dup("backups");
+  c->temp_dir = str_dup("/tmp/fast");
+  c->partial_dir = str_dup(".partial");
+  c->suffix = str_dup(".bak");
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
 static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
@@ -315,6 +414,7 @@ void test_config() {
     test_config_send_receive();
     test_config_send_receive_version_mismatch();
     test_config_receive_truncated();
+    test_config_string_null_vs_empty_roundtrip();
   }
   test_config_is_remote_dest();
 }
