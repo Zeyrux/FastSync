@@ -191,6 +191,56 @@ static int parse_ull_arg(const char* val, unsigned long long* out, const char* o
   return 0;
 }
 
+static int parse_size_arg(const char* value, unsigned long long* out) {
+  if (!value || *value < '0' || *value > '9')
+    return -1;
+  char* end;
+  errno = 0;
+  unsigned long long number = strtoull(value, &end, 10);
+  if (errno != 0 || end == value)
+    return -1;
+  unsigned long long multiplier = 1;
+  if (*end != '\0') {
+    if (end[1] != '\0')
+      return -1;
+    switch (*end) {
+    case 'b':
+    case 'B':
+      break;
+    case 'k':
+    case 'K':
+      multiplier = 1024ULL;
+      break;
+    case 'm':
+    case 'M':
+      multiplier = 1024ULL * 1024;
+      break;
+    case 'g':
+    case 'G':
+      multiplier = 1024ULL * 1024 * 1024;
+      break;
+    case 't':
+    case 'T':
+      multiplier = 1024ULL * 1024 * 1024 * 1024;
+      break;
+    case 'p':
+    case 'P':
+      multiplier = 1024ULL * 1024 * 1024 * 1024 * 1024;
+      break;
+    case 'e':
+    case 'E':
+      multiplier = 1024ULL * 1024 * 1024 * 1024 * 1024 * 1024;
+      break;
+    default:
+      return -1;
+    }
+  }
+  if (number == 0 || number > ULLONG_MAX / multiplier)
+    return -1;
+  *out = number * multiplier;
+  return 0;
+}
+
 /* Append a duplicated pattern to a growable pattern array. Returns 0 on success, -1 on error. */
 static int config_add_pattern(char*** patterns, int* count, const char* value,
                               const char* optname) {
@@ -369,7 +419,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   bool verbose = false;
   protocol_set_8_bit_output(config->eight_bit_output);
   for (int i = 1; i < argc; i++) {
-    const char* modify_window_prefix = "--modify-window=";
+const char* modify_window_prefix = "--modify-window=";
     if (strncmp(argv[i], modify_window_prefix, strlen(modify_window_prefix)) == 0) {
       if (set_nonneg_int_option(&config->modify_window, argv[i] + strlen(modify_window_prefix),
                                 "--modify-window") != 0)
@@ -386,6 +436,22 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (set_compression_threads_option(&config->compression_threads,
                                          argv[i] + strlen(threads_prefix)) != 0)
         return -1;
+      continue;
+    }
+    if (strncmp(argv[i], "--max-alloc=", 12) == 0 || strcmp(argv[i], "--max-alloc") == 0) {
+      const char* value = strcmp(argv[i], "--max-alloc") == 0 ? "" : argv[i] + 12;
+      if (*value == '\0') {
+        if (i + 1 >= argc) {
+          log_message(LOG_LEVEL_ERROR, "missing argument for --max-alloc");
+          return -1;
+        }
+        value = argv[++i];
+      }
+      if (parse_size_arg(value, &config->max_alloc) != 0) {
+        log_message(LOG_LEVEL_ERROR,
+                    "--max-alloc must be a positive size (B, K, M, G, T, P, or E)");
+        return -1;
+      }
       continue;
     }
     const OptionEntry* entry = find_table_option(argv[i]);

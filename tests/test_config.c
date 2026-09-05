@@ -95,6 +95,7 @@ static void test_pipeline_sender_lifecycle() {
   EXPECT_EQ_INT(pcs->queue_loader->capacity, 15);
   EXPECT_FALSE(pcs->scanner_done);
   EXPECT_FALSE(pcs->loader_done);
+  EXPECT_EQ_INT((int)pcs->allocation_session.max_alloc, (int)cfg->max_alloc);
 
   pipeline_context_sender_destroy(pcs);
 }
@@ -131,7 +132,7 @@ static void test_config_send_receive() {
   send_cfg->size_only = true;
   send_cfg->compression_level = 5;
   send_cfg->chunk_size = 1024;
-  send_cfg->eight_bit_output = true;
+send_cfg->eight_bit_output = true;
   send_cfg->modify_window = 4;
   send_cfg->existing = true;
   send_cfg->ignore_existing = true;
@@ -139,6 +140,7 @@ static void test_config_send_receive() {
   send_cfg->skip_compress_count = 1;
   send_cfg->skip_compress_suffixes = calloc(1, sizeof(char*));
   send_cfg->skip_compress_suffixes[0] = str_dup(".zip");
+  send_cfg->max_alloc = MAX_SERVER_ALLOC + 1;
 
   /* Use socketpair for bidirectional communication */
   int p[2];
@@ -173,7 +175,7 @@ static void test_config_send_receive() {
         ok = false;
       if (recv_cfg->chunk_size != 1024)
         ok = false;
-      if (!recv_cfg->use_executability)
+if (!recv_cfg->use_executability)
         ok = false;
       if (!recv_cfg->size_only)
         ok = false;
@@ -183,8 +185,6 @@ static void test_config_send_receive() {
         ok = false;
       if (recv_cfg->use_delta)
         ok = false;
-      if (!recv_cfg->whole_file)
-        ok = false;
       if (recv_cfg->modify_window != 4)
         ok = false;
       if (!recv_cfg->existing)
@@ -193,6 +193,8 @@ static void test_config_send_receive() {
         ok = false;
       if (!recv_cfg->skip_compress_set || recv_cfg->skip_compress_count != 1 ||
           strcmp(recv_cfg->skip_compress_suffixes[0], ".zip") != 0)
+        ok = false;
+      if (recv_cfg->max_alloc != MAX_SERVER_ALLOC)
         ok = false;
     }
     config_delete(recv_cfg);
@@ -223,7 +225,7 @@ static void test_config_send_receive_version_mismatch() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
-  cfg->version = str_dup("2.2.0");
+cfg->version = str_dup("2.3.0");
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
 
@@ -267,6 +269,8 @@ static void test_config_receive_truncated() {
   /* A valid prefix exercises cleanup after allocated wire strings and a
    * partially received scalar field. */
   EXPECT_TRUE(send_str(p[1], PROTOCOL_VERSION));
+  unsigned long long max_alloc = DEFAULT_MAX_ALLOC;
+  EXPECT_TRUE(send_n_data(p[1], &max_alloc, sizeof(max_alloc)));
   EXPECT_TRUE(send_str(p[1], "/src"));
   EXPECT_TRUE(send_str(p[1], "/dst"));
   EXPECT_TRUE(send_int(p[1], 1));

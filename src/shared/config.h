@@ -36,6 +36,7 @@ typedef struct Config {
   int include_count;
   unsigned long long max_size;
   unsigned long long min_size;
+  unsigned long long max_alloc;
   bool use_incremental;
   bool ignore_times;
   bool size_only;
@@ -144,7 +145,7 @@ typedef struct Config {
   bool skip_compress_set;
 } Config;
 
-#define PROTOCOL_VERSION "2.3.0"
+#define PROTOCOL_VERSION "2.4.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

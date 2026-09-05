@@ -4,6 +4,7 @@
 #include "data.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 /* Maximum allowed string size for receive_str (64 KB) */
 #define MAX_STRING_SIZE (64 * 1024)
@@ -18,6 +19,9 @@
 #define MAX_MANIFEST_ENTRIES (1024 * 1024)
 /* Aggregate bytes retained by one received deletion manifest. */
 #define MAX_MANIFEST_BYTES (16ULL * 1024 * 1024)
+#define DEFAULT_MAX_ALLOC (1ULL * 1024 * 1024 * 1024)
+/* Server policy ceiling for a client-provided allocation limit. */
+#define MAX_SERVER_ALLOC (256ULL * 1024 * 1024)
 
 typedef struct ssl_st SSL;
 
@@ -35,8 +39,9 @@ typedef struct ProtocolSession {
   long long bw_tokens;
   long long bw_last_refill_sec;
   long bw_last_refill_nsec;
-  unsigned long long total_allocated_bytes;
+  atomic_ullong total_allocated_bytes;
   bool eight_bit_output;
+  unsigned long long max_alloc;
 } ProtocolSession;
 
 typedef int Status;
@@ -66,6 +71,9 @@ void protocol_session_bind(ProtocolSession* session);
 void protocol_session_unbind(void);
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
+void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc);
+void* protocol_alloc(size_t size);
+void* protocol_realloc(void* ptr, size_t size);
 void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled);
 void protocol_set_8_bit_output(bool enabled);
 bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t data_size);

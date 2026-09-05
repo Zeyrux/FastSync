@@ -109,6 +109,20 @@ static void test_delta_deserialize_garbage() {
   data_destroy(d);
 }
 
+static void test_delta_deserialize_respects_max_alloc() {
+  unsigned char serialized[sizeof(uint64_t) + sizeof(uint32_t)] = {0};
+  Data data = {.data = serialized, .size = sizeof(serialized)};
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_set_max_alloc(&session, sizeof(Delta) - 1);
+  protocol_session_bind(&session);
+
+  const Delta* result = delta_deserialize(&data);
+  EXPECT_NULL(result);
+
+  protocol_session_unbind();
+}
+
 static void test_delta_signature_deserialize_truncated() {
   char old_data[4096];
   for (int i = 0; i < 4096; i++)
@@ -206,6 +220,7 @@ void test_robustness() {
   test_delta_deserialize_truncated();
   test_delta_deserialize_empty();
   test_delta_deserialize_garbage();
+  test_delta_deserialize_respects_max_alloc();
   test_delta_deserialize_truncated_instructions();
   test_delta_signature_deserialize_truncated();
   test_delta_apply_null();

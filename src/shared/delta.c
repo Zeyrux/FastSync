@@ -1,5 +1,6 @@
 #include "delta.h"
 #include "log.h"
+#include "protocol.h"
 #include <stdint.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -43,7 +44,7 @@ DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_f
 
   uint32_t block_count = (uint32_t)((old_file_size + block_size - 1) / block_size);
 
-  DeltaSignature* sig = malloc(sizeof(DeltaSignature));
+  DeltaSignature* sig = protocol_alloc(sizeof(DeltaSignature));
   if (!sig)
     return NULL;
 
@@ -54,7 +55,7 @@ DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_f
     free(sig);
     return NULL;
   }
-  sig->blocks = malloc((size_t)block_count * sizeof(DeltaBlockSig));
+  sig->blocks = protocol_alloc((size_t)block_count * sizeof(DeltaBlockSig));
   if (!sig->blocks) {
     free(sig);
     return NULL;
@@ -82,7 +83,7 @@ Data* delta_signature_serialize(const DeltaSignature* sig) {
       total > SIZE_MAX)
     return NULL;
 
-  uint8_t* buf = malloc((size_t)total);
+  uint8_t* buf = protocol_alloc((size_t)total);
   if (!buf)
     return NULL;
 
@@ -111,7 +112,7 @@ DeltaSignature* delta_signature_deserialize(const Data* data) {
   const uint8_t* buf = (const uint8_t*)data->data;
   size_t pos = 0;
 
-  DeltaSignature* sig = malloc(sizeof(DeltaSignature));
+  DeltaSignature* sig = protocol_alloc(sizeof(DeltaSignature));
   if (!sig)
     return NULL;
 
@@ -149,7 +150,7 @@ DeltaSignature* delta_signature_deserialize(const Data* data) {
     free(sig);
     return NULL;
   }
-  sig->blocks = malloc((size_t)blocks_size);
+  sig->blocks = protocol_alloc((size_t)blocks_size);
   if (!sig->blocks) {
     free(sig);
     return NULL;
@@ -178,7 +179,7 @@ static bool ensure_capacity(DeltaInstruction** instrs, uint32_t* capacity, uint3
   if (*capacity > MAX_DELTA_INSTRUCTIONS / 2)
     return false;
   uint32_t new_cap = *capacity * 2;
-  DeltaInstruction* tmp = realloc(*instrs, (size_t)new_cap * sizeof(DeltaInstruction));
+  DeltaInstruction* tmp = protocol_realloc(*instrs, (size_t)new_cap * sizeof(DeltaInstruction));
   if (!tmp)
     return false;
   *instrs = tmp;
@@ -195,7 +196,7 @@ static bool flush_literal(DeltaInstruction** instrs, uint32_t* capacity, uint32_
   uint32_t lit_len = (uint32_t)(end - start);
   if (!ensure_capacity(instrs, capacity, *count))
     return false;
-  uint8_t* lit_data = malloc(lit_len);
+  uint8_t* lit_data = protocol_alloc(lit_len);
   if (!lit_data)
     return false;
   memcpy(lit_data, data + start, lit_len);
@@ -225,7 +226,7 @@ Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const De
 
   uint32_t capacity = 64;
   uint32_t count = 0;
-  DeltaInstruction* instrs = malloc((size_t)capacity * sizeof(DeltaInstruction));
+  DeltaInstruction* instrs = protocol_alloc((size_t)capacity * sizeof(DeltaInstruction));
   if (!instrs)
     return NULL;
 
@@ -309,7 +310,7 @@ Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const De
     }
   }
 
-  Delta* delta = malloc(sizeof(Delta));
+  Delta* delta = protocol_alloc(sizeof(Delta));
   if (!delta) {
     free_instructions(instrs, count);
     return NULL;
@@ -355,7 +356,7 @@ Data* delta_serialize(const Delta* delta) {
   if (delta->delta_size > UINT64_MAX - header_size || header_size + delta->delta_size > SIZE_MAX)
     return NULL;
   uint64_t total = header_size + delta->delta_size;
-  uint8_t* buf = malloc((size_t)total);
+  uint8_t* buf = protocol_alloc((size_t)total);
   if (!buf)
     return NULL;
 
@@ -395,7 +396,7 @@ Delta* delta_deserialize(const Data* data) {
   const uint8_t* buf = (const uint8_t*)data->data;
   size_t pos = 0;
 
-  Delta* delta = malloc(sizeof(Delta));
+  Delta* delta = protocol_alloc(sizeof(Delta));
   if (!delta)
     return NULL;
 
@@ -412,9 +413,10 @@ Delta* delta_deserialize(const Data* data) {
     return NULL;
   }
 
-  delta->instructions = delta->instruction_count == 0
-                            ? NULL
-                            : malloc((size_t)delta->instruction_count * sizeof(DeltaInstruction));
+  delta->instructions =
+      delta->instruction_count == 0
+          ? NULL
+          : protocol_alloc((size_t)delta->instruction_count * sizeof(DeltaInstruction));
   if (delta->instruction_count > 0 && !delta->instructions) {
     free(delta);
     return NULL;
@@ -465,7 +467,7 @@ Delta* delta_deserialize(const Data* data) {
         free(delta);
         return NULL;
       }
-      delta->instructions[i].literal.data = malloc(lit_len ? lit_len : 1);
+      delta->instructions[i].literal.data = protocol_alloc(lit_len ? lit_len : 1);
       if (!delta->instructions[i].literal.data) {
         log_message(LOG_LEVEL_ERROR, "Failed to allocate %u bytes for literal data", lit_len);
         free_instructions(delta->instructions, i);
@@ -492,7 +494,7 @@ void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta,
       delta->new_file_size > DELTA_MAX_FILE_SIZE || delta->new_file_size > SIZE_MAX)
     return NULL;
 
-  void* output = malloc(delta->new_file_size ? (size_t)delta->new_file_size : 1);
+  void* output = protocol_alloc(delta->new_file_size ? (size_t)delta->new_file_size : 1);
   if (!output)
     return NULL;
 

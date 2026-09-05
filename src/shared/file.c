@@ -14,6 +14,7 @@
 #include "log.h"
 #include "metadata.h"
 #include "utils.h"
+#include "protocol.h"
 
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
@@ -45,14 +46,14 @@ bool file_checksum(File* file, uint64_t* checksum) {
 File* file_create(const char* path) {
   if (!path)
     return NULL;
-  File* file = (File*)malloc(sizeof(File));
+  File* file = (File*)protocol_alloc(sizeof(File));
   if (file == NULL) {
     log_perror("ERROR: Could not allocate memory for file struct");
     return NULL;
   }
 
   size_t path_len = strlen(path);
-  file->path = (char*)malloc(path_len + 1);
+  file->path = (char*)protocol_alloc(path_len + 1);
   if (file->path == NULL) {
     free(file);
     return NULL;
@@ -85,7 +86,7 @@ void file_destroy(void* item) {
 }
 
 FileMetadata* file_metadata_create(const struct stat* stats) {
-  FileMetadata* m = malloc(sizeof(FileMetadata));
+  FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL) {
     log_perror("ERROR: Could not allocate memory for file metadata");
     return NULL;
@@ -112,7 +113,7 @@ bool file_load_data(File* file) {
   if (file->data->data == NULL) {
     if (file->data->size == 0)
       return true;
-    file->data->data = malloc(file->data->size);
+    file->data->data = protocol_alloc(file->data->size);
     if (file->data->data == NULL) {
       log_perror("Could not allocate memory for file data");
       return false;

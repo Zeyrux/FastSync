@@ -20,7 +20,8 @@ static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
 static __thread SSL* io_ssl;
 static __thread ProtocolSession* bound_session;
-static __thread ProtocolSession legacy_io_session = {.read_fd = -1, .write_fd = -1};
+static __thread ProtocolSession legacy_io_session = {
+    .read_fd = -1, .write_fd = -1, .max_alloc = DEFAULT_MAX_ALLOC};
 
 static unsigned long long io_bwlimit = 0;
 static mtx_t bw_mutex;
@@ -28,12 +29,30 @@ static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
 static unsigned long long global_bwlimit(void);
 
+static bool protocol_reserve_memory(ProtocolSession* session, size_t charge) {
+  unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
+  while (true) {
+    if (allocated > MAX_CONNECTION_MEMORY ||
+        (unsigned long long)charge > MAX_CONNECTION_MEMORY - allocated)
+      return false;
+    if (atomic_compare_exchange_weak(&session->total_allocated_bytes, &allocated,
+                                     allocated + (unsigned long long)charge))
+      return true;
+  }
+}
+
+static void protocol_release_memory_for_session(ProtocolSession* session, size_t charge) {
+  unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
+  while (true) {
+    unsigned long long remaining = (unsigned long long)charge >= allocated ? 0 : allocated - charge;
+    if (atomic_compare_exchange_weak(&session->total_allocated_bytes, &allocated, remaining))
+      break;
+  }
+}
+
 void protocol_release_memory(size_t charge) {
   ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
-  if ((unsigned long long)charge >= session->total_allocated_bytes)
-    session->total_allocated_bytes = 0;
-  else
-    session->total_allocated_bytes -= charge;
+  protocol_release_memory_for_session(session, charge);
 }
 void io_set_fds(int read_fd, int write_fd) {
   bound_session = NULL;
@@ -45,8 +64,9 @@ void io_set_fds(int read_fd, int write_fd) {
   legacy_io_session.read_fd = read_fd;
   legacy_io_session.write_fd = write_fd;
   legacy_io_session.ssl = NULL;
-  legacy_io_session.eight_bit_output = false;
-  legacy_io_session.total_allocated_bytes = 0;
+legacy_io_session.eight_bit_output = false;
+  atomic_store(&legacy_io_session.total_allocated_bytes, 0);
+  legacy_io_session.max_alloc = DEFAULT_MAX_ALLOC;
   protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
 }
 
@@ -56,7 +76,41 @@ void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) 
   memset(session, 0, sizeof(*session));
   session->read_fd = read_fd;
   session->write_fd = write_fd;
+  session->max_alloc = DEFAULT_MAX_ALLOC;
+  atomic_init(&session->total_allocated_bytes, 0);
   protocol_session_set_bwlimit(session, global_bwlimit());
+}
+
+void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc) {
+  if (!session)
+    session = bound_session ? bound_session : &legacy_io_session;
+  session->max_alloc = max_alloc;
+}
+
+static bool allocation_allowed(const ProtocolSession* session, size_t size) {
+  return (unsigned long long)size <= session->max_alloc;
+}
+
+static void* protocol_alloc_for_session(const ProtocolSession* session, size_t size) {
+  if (!allocation_allowed(session, size))
+    return NULL;
+  return malloc(size);
+}
+
+static void* protocol_realloc_for_session(const ProtocolSession* session, void* ptr, size_t size) {
+  if (!allocation_allowed(session, size))
+    return NULL;
+  return realloc(ptr, size);
+}
+
+void* protocol_alloc(size_t size) {
+  const ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
+  return protocol_alloc_for_session(session, size);
+}
+
+void* protocol_realloc(void* ptr, size_t size) {
+  const ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
+  return protocol_realloc_for_session(session, ptr, size);
 }
 
 void protocol_session_bind(ProtocolSession* session) {
@@ -169,7 +223,8 @@ static ProtocolSession* legacy_session(int read_fd, int write_fd) {
       legacy_io_session.write_fd != target_write_fd) {
     legacy_io_session.read_fd = target_read_fd;
     legacy_io_session.write_fd = target_write_fd;
-    legacy_io_session.total_allocated_bytes = 0;
+    atomic_store(&legacy_io_session.total_allocated_bytes, 0);
+    legacy_io_session.max_alloc = DEFAULT_MAX_ALLOC;
     protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
   } else if (legacy_io_session.bwlimit != global_bwlimit()) {
     protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
@@ -352,13 +407,12 @@ char* protocol_receive_str(ProtocolSession* session) {
   size_t size;
   if (!protocol_receive_n_data(session, &size, sizeof(size_t)))
     return NULL;
-  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1 ||
-      size + 1 > MAX_CONNECTION_MEMORY - session->total_allocated_bytes) {
+  if (size > MAX_STRING_SIZE || size > SIZE_MAX - 1) {
     log_message(LOG_LEVEL_ERROR, "String size %zu exceeds maximum %llu", size,
                 (unsigned long long)MAX_STRING_SIZE);
     return NULL;
   }
-  char* data = (char*)malloc(size + 1);
+  char* data = (char*)protocol_alloc_for_session(session, size + 1);
   if (data == NULL)
     return NULL;
   if (!protocol_receive_n_data(session, data, size)) {
@@ -371,7 +425,6 @@ char* protocol_receive_str(ProtocolSession* session) {
     return NULL;
   }
   data[size] = '\0';
-  session->total_allocated_bytes += size + 1;
   log_debug_message(LOG_DEBUG_PROTO, "Received String: %s", data);
   return data;
 }
@@ -401,25 +454,29 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
                 (unsigned long long)MAX_DATA_PAYLOAD_SIZE);
     return NULL;
   }
+  if (size > SIZE_MAX)
+    return NULL;
   size_t allocation_size = size == 0 ? 1 : (size_t)size;
-  if (allocation_size > MAX_CONNECTION_MEMORY - session->total_allocated_bytes) {
+  if (!protocol_reserve_memory(session, allocation_size)) {
     log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded (%llu + %llu > %llu)",
-                (unsigned long long)session->total_allocated_bytes, size,
+                (unsigned long long)atomic_load(&session->total_allocated_bytes), size,
                 (unsigned long long)MAX_CONNECTION_MEMORY);
     return NULL;
   }
-  void* data = malloc(allocation_size);
-  if (data == NULL)
-    return NULL;
-  if (!protocol_receive_n_data(session, data, (size_t)size)) {
-    free(data);
+  void* data = protocol_alloc_for_session(session, allocation_size);
+  if (data == NULL) {
+    protocol_release_memory_for_session(session, allocation_size);
     return NULL;
   }
-  session->total_allocated_bytes += allocation_size;
-  log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
+  if (!protocol_receive_n_data(session, data, (size_t)size)) {
+    free(data);
+    protocol_release_memory_for_session(session, allocation_size);
+    return NULL;
+  }
+log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
-    session->total_allocated_bytes -= allocation_size;
+    protocol_release_memory_for_session(session, allocation_size);
     return NULL;
   }
   result->protocol_charge = allocation_size;

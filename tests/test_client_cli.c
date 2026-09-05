@@ -435,6 +435,48 @@ static void test_parse_args_rejects_invalid_modify_window() {
   }
 }
 
+static void test_parse_args_max_alloc_sizes() {
+  const char* values[] = {"1", "4K", "2m", "3G", "1T", "1P", "1E", "512B"};
+  const unsigned long long expected[] = {1,
+                                         4ULL * 1024,
+                                         2ULL * 1024 * 1024,
+                                         3ULL * 1024 * 1024 * 1024,
+                                         1ULL * 1024 * 1024 * 1024 * 1024,
+                                         1ULL * 1024 * 1024 * 1024 * 1024 * 1024,
+                                         1ULL * 1024 * 1024 * 1024 * 1024 * 1024 * 1024,
+                                         512};
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--max-alloc", (char*)values[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->max_alloc == expected[i]);
+    config_delete(cfg);
+  }
+
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--max-alloc=8M", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->max_alloc == 8ULL * 1024 * 1024);
+  config_delete(cfg);
+}
+
+static void test_parse_args_rejects_invalid_max_alloc() {
+  const char* values[] = {"0",  "-1",  "+1",  " 1",   "1 ",
+                          "1Z", "1K2", "1 K", "1\tK", "18446744073709551615K"};
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--max-alloc", (char*)values[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 static void test_parse_args_skip_compress() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--skip-compress=.ZIP, .GZ", "/src", "/dst"};
@@ -867,7 +909,7 @@ void test_client_cli() {
   test_parse_args_invalid_server_port();
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
-  test_parse_args_debug_flags();
+test_parse_args_debug_flags();
   test_parse_args_debug_help();
   test_parse_args_debug_flags_validation();
   test_parse_args_modify_window();
@@ -875,6 +917,8 @@ void test_client_cli() {
   test_parse_args_skip_compress();
   test_parse_args_empty_skip_compress();
   test_parse_args_compression_threads();
+  test_parse_args_max_alloc_sizes();
+  test_parse_args_rejects_invalid_max_alloc();
   test_parse_args_unknown_option();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();

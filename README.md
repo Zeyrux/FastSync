@@ -103,6 +103,7 @@ partial, alternate, and planned behavior.
 | `--include <pattern>` | Only transfer files matching glob pattern (repeatable, whitelist) |
 | `--max-size <n>` | Skip files larger than n bytes |
 | `--min-size <n>` | Skip files smaller than n bytes |
+| `--max-alloc <SIZE>` | Maximum single allocation (binary units: B, K, M, G, T, P, E; default 1G) |
 | `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `-s`. |
 | `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
@@ -478,11 +479,11 @@ defaults to the current directory. |
 
 ## Protocol and Security
 
-FastSync protocol version `2.3.0` is shared by the client and server. The
+FastSync protocol version `2.4.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
-incremental checks, checksums, manifests, keep-alives, abort handling, and
-FastSync-native delta messages. Client and server versions must currently
-match exactly.
+including the maximum allocation limit, incremental checks, checksums,
+manifests, keep-alives, abort handling, and FastSync-native delta messages.
+Client and server versions must currently match exactly.
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not

@@ -22,7 +22,7 @@
 Chunk* chunk_create(File** items, int element_count) {
   if (element_count < 0 || (element_count > 0 && items == NULL))
     return NULL;
-  Chunk* chunk = (Chunk*)malloc(sizeof(Chunk));
+  Chunk* chunk = (Chunk*)protocol_alloc(sizeof(Chunk));
   if (chunk == NULL) {
     log_perror("ERROR: Could not allocate memory for chunk structure");
     return NULL;
@@ -35,7 +35,7 @@ Chunk* chunk_create(File** items, int element_count) {
       free(chunk);
       return NULL;
     }
-    chunk->items = (File**)malloc((size_t)element_count * sizeof(File*));
+    chunk->items = (File**)protocol_alloc((size_t)element_count * sizeof(File*));
     if (chunk->items == NULL) {
       free(chunk);
       return NULL;
@@ -158,7 +158,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       array_list_delete(files);
       return NULL;
     }
-    char* path = malloc(path_len + 1);
+    char* path = protocol_alloc(path_len + 1);
     if (path == NULL) {
       log_perror("Could not allocate memory for file path");
       array_list_delete(files);
@@ -245,7 +245,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
 
     size_t allocation_size = file_data_size > 0 ? file_data_size : 1;
-    void* file_data = malloc(allocation_size);
+    void* file_data = protocol_alloc(allocation_size);
     if (file_data == NULL) {
       log_perror("Could not allocate memory for file data");
       file_destroy(file);

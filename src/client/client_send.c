@@ -612,14 +612,16 @@ static int send_chunks_multithreaded(void* pipeline_context) {
 
 static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
+  protocol_session_bind(&context->allocation_session);
   ScannerOptions options = scanner_options_from_config(context->config, 4);
-  ParallelScanner* scanner =
-      parallel_scanner_create_with_options(context->config->send_directory, &options);
+  ParallelScanner* scanner = parallel_scanner_create_with_options(
+      context->config->send_directory, &options, &context->allocation_session);
 
   Chunk* current_chunk;
   if (scanner == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to create parallel scanner");
     pipeline_cancel(context);
+    protocol_session_unbind();
     return thrd_error;
   }
   while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
@@ -631,6 +633,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
         pipeline_cancel(context);
         chunk_destroy(current_chunk);
         parallel_scanner_destroy(scanner);
+        protocol_session_unbind();
         return thrd_error;
       }
     }
@@ -641,6 +644,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       chunk_destroy(current_chunk);
       pipeline_cancel(context);
       parallel_scanner_destroy(scanner);
+      protocol_session_unbind();
       return thrd_error;
     }
   }
@@ -652,6 +656,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
     cnd_broadcast(&context->condition_not_full_scanner);
     mtx_unlock(&context->mutex_scanner);
     pipeline_cancel(context);
+    protocol_session_unbind();
     return thrd_error;
   }
   mtx_lock(&context->mutex_scanner);
@@ -660,11 +665,13 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   mtx_unlock(&context->mutex_scanner);
 
   parallel_scanner_destroy(scanner);
+  protocol_session_unbind();
   return thrd_success;
 }
 
 static int load_files_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
+  protocol_session_bind(&context->allocation_session);
   while (true) {
     Chunk* chunk = queue_dequeue_multithreaded(
         context->queue_scanner, &context->mutex_scanner, &context->condition_not_empty_scanner,
@@ -674,6 +681,7 @@ static int load_files_multithreaded(void* pipeline_context) {
       context->loader_done = true;
       cnd_signal(&context->condition_not_empty_loader);
       mtx_unlock(&context->mutex_loader);
+      protocol_session_unbind();
       return thrd_success;
     }
     if (!context->config->use_sendfile) {
@@ -685,6 +693,7 @@ static int load_files_multithreaded(void* pipeline_context) {
           log_message(LOG_LEVEL_ERROR, "Failed to load file data");
           chunk_destroy(chunk);
           pipeline_cancel(context);
+          protocol_session_unbind();
           return thrd_error;
         }
       }
@@ -695,6 +704,7 @@ static int load_files_multithreaded(void* pipeline_context) {
                                             &context->cancelled)) {
       chunk_destroy(chunk);
       pipeline_cancel(context);
+      protocol_session_unbind();
       return thrd_error;
     }
   }
