@@ -25,6 +25,8 @@ void print_usage(void) {
   printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
+  printf(
+      "  --dirs, --old-dirs, --old-d  Transfer directories without recursing (not implemented)\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --exclude-from <file> Read exclude patterns from file\n");
@@ -96,7 +98,7 @@ void print_usage(void) {
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf("  --fsync             Fsync every written file before publication\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
-printf("  --zl <n>             Alias for --compress-level\n");
+  printf("  --zl <n>             Alias for --compress-level\n");
   printf("  --skip-compress=LIST    Skip compression for comma-separated suffixes\n");
   printf("  --compress-threads <n> Compression worker threads (requires zstd threaded support)\n");
   printf("  --no-OPTION         Disable a supported boolean option\n");

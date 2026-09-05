@@ -546,6 +546,34 @@ static void test_parse_args_unknown_option() {
   config_delete(cfg);
 }
 
+/* Directory aliases must report the unsupported directory-only behavior clearly. */
+static void test_parse_args_rejects_dirs_aliases() {
+  static const char* const options[] = {"--dirs", "--old-dirs", "--old-d"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    FILE* log_file = tmpfile();
+    char log_buffer[256] = {0};
+
+    EXPECT_NOT_NULL(log_file);
+    log_set_file(log_file);
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    fflush(log_file);
+    rewind(log_file);
+    EXPECT_TRUE(fread(log_buffer, 1, sizeof(log_buffer) - 1, log_file) > 0);
+    EXPECT_TRUE(strstr(log_buffer, options[i]) != NULL);
+    EXPECT_TRUE(strstr(log_buffer, "directory-only transfer is not implemented") != NULL);
+    EXPECT_TRUE(strstr(log_buffer, "requires --dirs") == NULL);
+    log_set_file(NULL);
+    fclose(log_file);
+    config_delete(cfg);
+  }
+}
+
 /* Parsed-but-unimplemented options must fail instead of being silently accepted. */
 static void test_parse_args_rejects_unimplemented_options() {
   static const char* const options[] = {"--silent",
@@ -1081,6 +1109,7 @@ void test_client_cli() {
   test_parse_args_max_alloc_sizes();
   test_parse_args_rejects_invalid_max_alloc();
   test_parse_args_unknown_option();
+  test_parse_args_rejects_dirs_aliases();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();

@@ -335,6 +335,7 @@ typedef enum {
   OPT_POS_INT,
   OPT_NONNEG_INT,
   OPT_ULL,
+  OPT_UNSUPPORTED,
 } OptKind;
 
 typedef struct {
@@ -384,6 +385,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--existing", NULL, OPT_FLAG, offsetof(Config, existing)},
     {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
     {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
+    {"--dirs", "--old-dirs", OPT_UNSUPPORTED, 0},
+    {"--old-d", NULL, OPT_UNSUPPORTED, 0},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -491,10 +494,10 @@ static int apply_negation(Config* config, const char* arg) {
   return 0;
 }
 
-static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
+static int apply_table_option(Config* config, const OptionEntry* entry, const char* option_name,
+                              const char* value) {
   if (entry->kind == OPT_NOOP)
     return 0;
-
   void* field = (char*)config + entry->offset;
   switch (entry->kind) {
   case OPT_FLAG:
@@ -517,6 +520,11 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     *(unsigned long long*)field = v;
     return 0;
   }
+  case OPT_UNSUPPORTED:
+    log_message(LOG_LEVEL_ERROR,
+                "%s: directory-only transfer is not implemented; refusing to ignore option",
+                option_name);
+    return -1;
   }
   return -1;
 }
@@ -592,19 +600,23 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     if (!entry)
       entry = find_table_option_with_equals(argv[i], &inline_value);
     if (entry) {
+      const char* option_name = argv[i];
+      const char* value = NULL;
       if (entry->kind != OPT_FLAG) {
-        const char* value = inline_value;
-        if (!value && i + 1 < argc)
-          value = argv[++i];
-        if (!value) {
-          log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
-          return -1;
+        if (entry->kind != OPT_UNSUPPORTED) {
+          value = inline_value;
+          if (!value && i + 1 < argc)
+            value = argv[++i];
+          if (!value) {
+            log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
+            return -1;
+          }
         }
         if (strcmp(entry->name, "--compress-choice") == 0) {
           if (set_compression_choice(config, value) != 0)
             return -1;
         } else {
-          if (apply_table_option(config, entry, value) != 0)
+          if (apply_table_option(config, entry, option_name, value) != 0)
             return -1;
           if (strcmp(entry->name, "--compress-level") == 0 &&
               (config->compression_level < 1 || config->compression_level > 22)) {
@@ -620,7 +632,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
             config->use_metadata = true;
           }
         }
-      } else if (apply_table_option(config, entry, NULL) != 0) {
+      } else if (apply_table_option(config, entry, option_name, NULL) != 0) {
         return -1;
       }
       if (entry->offset == offsetof(Config, eight_bit_output))
@@ -839,7 +851,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
     }
   }
-set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   if (config->compress_choice)
     config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
 
