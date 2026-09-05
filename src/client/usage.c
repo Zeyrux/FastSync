@@ -38,6 +38,8 @@ void print_usage(void) {
   printf("  -@, --modify-window <sec>  Modification time tolerance\n");
   printf("  -u, --update        Skip files newer than the source on receiver\n");
   printf("  --existing          Skip files not already present at destination\n");
+  printf("  --checksum-choice, --cc <alg>  Checksum algorithm (not supported yet; xxHash64 is "
+         "used)\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
   printf("  -W, --whole-file    Transfer changed files without delta processing\n");
   printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
