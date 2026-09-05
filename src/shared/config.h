@@ -19,6 +19,7 @@ typedef struct Config {
   bool use_sendfile;
   bool use_metadata;
   bool use_executability;
+  bool metadata_explicitly_disabled;
   bool show_progress;
   bool dry_run;
   bool remove_source_files;

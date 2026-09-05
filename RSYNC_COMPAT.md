@@ -235,7 +235,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--iconv=CONVERT_SPEC` | Charset conversion | ❌ Not Implemented | |
 | `--checksum-seed=NUM` | Set checksum seed | ❌ Not Implemented | |
 | `--secluded-args` | Use protocol to send args | 🔄 Compatibility No-op | Accepted for CLI compatibility; it does not change FastSync transport or protocol behavior. `-s` remains chunk serialization. |
-| `--no-OPTION` | Turn off implied option | ❌ Not Implemented | |
+| `--no-OPTION` | Turn off implied option | ✅ Supported | Supported boolean FastSync options and archive-implied options; unsafe or value-taking options are rejected. |
 
 ---
 

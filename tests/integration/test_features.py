@@ -169,6 +169,20 @@ class TestArchiveMode:
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
 
+    def test_archive_implied_options_can_be_negated(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--archive", "--no-compress", "--no-m", "--no-preserve"],
+            port=shared_server.port,
+        )
+        if result.returncode != 0:
+            pytest.fail(f"Exit {result.returncode}: {(result.stderr or result.stdout)[:200]}")
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
 
 class TestExecutability:
     def test_preserves_only_executable_bits(self, shared_server):

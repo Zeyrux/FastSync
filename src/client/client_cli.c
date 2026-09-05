@@ -345,6 +345,13 @@ typedef struct {
 } OptionEntry;
 
 /* Options parsed directly into Config, plus compatibility options with no effect. */
+typedef struct {
+  const char* name;
+  const char* alias;
+  size_t offset; /* offsetof of the boolean target field in Config */
+} NegatableOption;
+
+/* Options that map directly onto a Config field with no side effects. */
 static const OptionEntry OPTION_TABLE[] = {
     {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
     {"--remove-source-files", NULL, OPT_FLAG, offsetof(Config, remove_source_files)},
@@ -398,6 +405,35 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--min-size", NULL, OPT_ULL, offsetof(Config, min_size)},
 };
 
+/* Only boolean options with no required argument are safe to negate. */
+static const NegatableOption NEGATABLE_OPTIONS[] = {
+    {"dry-run", "n", offsetof(Config, dry_run)},
+    {"delete", NULL, offsetof(Config, use_delete)},
+    {"incremental", NULL, offsetof(Config, use_incremental)},
+    {"delta", NULL, offsetof(Config, use_delta)},
+    {"save-to-disk", NULL, offsetof(Config, save_to_disk)},
+    {"progress", NULL, offsetof(Config, show_progress)},
+    {"tls", NULL, offsetof(Config, use_tls)},
+    {"backup", NULL, offsetof(Config, backup)},
+    {"stats", NULL, offsetof(Config, stats)},
+    {"partial", NULL, offsetof(Config, partial)},
+    {"links", "l", offsetof(Config, follow_symlinks)},
+    {"copy-links", NULL, offsetof(Config, copy_links)},
+    {"safe-links", NULL, offsetof(Config, safe_links)},
+    {"copy-unsafe-links", NULL, offsetof(Config, copy_unsafe_links)},
+    {"sparse", "S", offsetof(Config, preserve_sparse)},
+    {"inplace", NULL, offsetof(Config, inplace)},
+    {"checksum", NULL, offsetof(Config, checksum)},
+
+    /* These options are also implied by --archive or handled outside the table. */
+    {"compress", "c", offsetof(Config, use_compression)},
+    {"compress", "z", offsetof(Config, use_compression)},
+    {"multithreading", "m", offsetof(Config, use_multithreading)},
+    {"preserve", "M", offsetof(Config, use_metadata)},
+    {"sendfile", "f", offsetof(Config, use_sendfile)},
+    {"chunk-serialization", "s", offsetof(Config, use_chunk_serialization)},
+};
+
 static bool opt_is(const char* arg, const char* name, const char* alias) {
   return strcmp(arg, name) == 0 || (alias && strcmp(arg, alias) == 0);
 }
@@ -427,6 +463,31 @@ static const OptionEntry* find_table_option_with_equals(const char* arg, const c
     }
   }
   return NULL;
+}
+
+static const NegatableOption* find_negatable_option(const char* name) {
+  for (size_t i = 0; i < sizeof(NEGATABLE_OPTIONS) / sizeof(NEGATABLE_OPTIONS[0]); i++)
+    if (strcmp(name, NEGATABLE_OPTIONS[i].name) == 0 ||
+        (NEGATABLE_OPTIONS[i].alias && strcmp(name, NEGATABLE_OPTIONS[i].alias) == 0))
+      return &NEGATABLE_OPTIONS[i];
+  return NULL;
+}
+
+static int apply_negation(Config* config, const char* arg) {
+  const char* name = arg + strlen("--no-");
+  if (*name == '\0') {
+    fprintf(stderr, "Cannot negate an empty option name: %s\n", arg);
+    return -1;
+  }
+  const NegatableOption* entry = find_negatable_option(name);
+  if (!entry) {
+    fprintf(stderr, "Cannot negate unsupported or unsafe option: %s\n", arg);
+    return -1;
+  }
+  *(bool*)((char*)config + entry->offset) = false;
+  if (entry->offset == offsetof(Config, use_metadata))
+    config->metadata_explicitly_disabled = true;
+  return 0;
 }
 
 static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
@@ -479,6 +540,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   }
 
   for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {
+      if (apply_negation(config, argv[i]) != 0)
+        return -1;
+      continue;
+    }
     const char* modify_window_prefix = "--modify-window=";
     if (strncmp(argv[i], modify_window_prefix, strlen(modify_window_prefix)) == 0) {
       if (set_nonneg_int_option(&config->modify_window, argv[i] + strlen(modify_window_prefix),
@@ -759,9 +825,16 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
     }
   }
-  set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   if (config->compress_choice)
     config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
+
+  /* Incremental and delta transfers need metadata unless the user disabled it. */
+  if ((config->use_incremental || config->use_delta) && !config->use_metadata &&
+      !config->metadata_explicitly_disabled) {
+    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for incremental/delta transfer");
+    config->use_metadata = true;
+  }
   return 0;
 }
 
@@ -871,15 +944,6 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* Enable implicit flags */
-  if (config->use_incremental && !config->use_metadata) {
-    log_info_message(LOG_INFO_MISC, "Enabling metadata preservation for --incremental");
-    config->use_metadata = true;
-  }
-  if (config->use_delta && !config->use_metadata) {
-    log_info_message(LOG_INFO_MISC, "Enabling metadata preservation for --delta");
-    config->use_metadata = true;
-  }
   /* Initialize TLS if needed */
   if (config->use_tls)
     tls_global_init();

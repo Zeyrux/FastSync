@@ -91,9 +91,10 @@ void print_usage(void) {
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf("  --fsync             Fsync every written file before publication\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
-  printf("  --zl <n>             Alias for --compress-level\n");
+printf("  --zl <n>             Alias for --compress-level\n");
   printf("  --skip-compress=LIST    Skip compression for comma-separated suffixes\n");
   printf("  --compress-threads <n> Compression worker threads (requires zstd threaded support)\n");
+  printf("  --no-OPTION         Disable a supported boolean option\n");
   printf("  --help              Show this help\n");
   printf("  -V, --version       Show version\n");
 }

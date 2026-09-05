@@ -703,6 +703,69 @@ static void test_parse_args_archive() {
   config_delete(cfg);
 }
 
+/* Negations must override archive's implied options in argument order. */
+static void test_parse_args_negations() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync",      "--archive",    "--no-compress", "--no-m",
+                  "--no-preserve", "--no-dry-run", "/src",          "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 8, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->use_compression);
+  EXPECT_FALSE(cfg->use_multithreading);
+  EXPECT_FALSE(cfg->use_metadata);
+  EXPECT_FALSE(cfg->dry_run);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+static void test_parse_args_negation_order() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--no-z", "-c", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_compression);
+  config_delete(cfg);
+}
+
+static void test_parse_args_no_preserve_blocks_implicit_metadata() {
+  static const char* const options[][3] = {
+      {"--incremental", "--no-preserve", "/src"},
+      {"--no-preserve", "--incremental", "/src"},
+      {"--delta", "--no-preserve", "/src"},
+      {"--no-preserve", "--delta", "/src"},
+  };
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i][0], (char*)options[i][1], (char*)options[i][2],
+                    "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->use_metadata);
+    EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+    config_delete(cfg);
+  }
+}
+
+static void test_parse_args_rejects_unsafe_negation() {
+  static const char* const options[] = {"--no-archive", "--no-timeout", "--no-unknown"};
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 static void test_parse_args_fsync() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--fsync", "/src", "/dst"};
@@ -969,6 +1032,10 @@ void test_client_cli() {
   test_parse_args_info_verbose_order();
   test_parse_args_rejects_invalid_info_flag();
   test_parse_args_archive();
+  test_parse_args_negations();
+  test_parse_args_negation_order();
+  test_parse_args_no_preserve_blocks_implicit_metadata();
+  test_parse_args_rejects_unsafe_negation();
   test_parse_args_fsync();
   test_parse_args_existing();
   test_parse_args_ignore_times();

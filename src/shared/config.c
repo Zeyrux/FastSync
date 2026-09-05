@@ -19,6 +19,7 @@ static void config_set_defaults(Config* config) {
   config->use_compression = false;
   config->use_metadata = false;
   config->use_executability = false;
+  config->metadata_explicitly_disabled = false;
   config->show_progress = false;
   config->dry_run = false;
   config->remove_source_files = false;
