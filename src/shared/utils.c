@@ -1,6 +1,5 @@
 #include "utils.h"
 #include "array_list.h"
-#include "libgen.h"
 #include "log.h"
 #include <dirent.h>
 #include <errno.h>
@@ -81,45 +80,6 @@ static int open_authorized_destination(const char* dest_root) {
 
   free(relative);
   return dirfd;
-}
-
-bool mkdir_r(const char* path) {
-  if (!path || *path == '\0')
-    return false;
-  char* duplicate = str_dup(path);
-  if (!duplicate)
-    return false;
-  int dirfd = open(path[0] == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  if (dirfd < 0) {
-    free(duplicate);
-    return false;
-  }
-  bool ok = true;
-  char* saveptr = NULL;
-  char* component = strtok_r(duplicate, "/", &saveptr);
-  while (component) {
-    if (strcmp(component, "..") == 0) {
-      ok = false;
-      break;
-    }
-    if (strcmp(component, ".") != 0) {
-      int next = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-      if (next < 0 && errno == ENOENT) {
-        if (mkdirat(dirfd, component, 0755) == 0 || errno == EEXIST)
-          next = openat(dirfd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-      }
-      if (next < 0) {
-        ok = false;
-        break;
-      }
-      close(dirfd);
-      dirfd = next;
-    }
-    component = strtok_r(NULL, "/", &saveptr);
-  }
-  close(dirfd);
-  free(duplicate);
-  return ok;
 }
 
 char* str_dup(const char* string) {
