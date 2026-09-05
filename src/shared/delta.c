@@ -216,6 +216,119 @@ static void free_instructions(DeltaInstruction* instrs, uint32_t count) {
   free(instrs);
 }
 
+/* Sentinel meaning "no signature block" in the lookup index chains.  Block
+ * counts are bounded well below UINT32_MAX, so it doubles as a null link. */
+#define DELTA_NO_BLOCK UINT32_MAX
+
+/* Avalanche mix for the rolling checksum so blocks do not cluster in the
+ * bucket table when the weak checksum has little entropy (e.g. all-zero or
+ * patterned files). */
+static uint32_t delta_adler_mix(uint32_t h) {
+  h ^= h >> 16;
+  h *= 0x7feb352dU;
+  h ^= h >> 15;
+  h *= 0x846ca68bU;
+  h ^= h >> 16;
+  return h;
+}
+
+/* Smallest power of two >= v.  v must be non-zero. */
+static uint32_t delta_next_pow2(uint32_t v) {
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  return v + 1;
+}
+
+/* Build a hash index over sig->blocks keyed by the (mixed) rolling checksum.
+ * All blocks sharing an Adler-32 value land in the same bucket; collisions
+ * are chained through a single contiguous allocation:
+ *
+ *   [0, bucket_count)                 heads (first block per bucket)
+ *   [bucket_count, 2*bucket_count)    tails (last block per bucket)
+ *   [2*bucket_count, ...)             per-block chain links
+ *
+ * Blocks are inserted in ascending index order so every bucket chain is
+ * ordered exactly like the historical linear scan.  Returns the base pointer
+ * (also the heads array) or NULL when no index could be allocated; callers
+ * then fall back to the linear scan. */
+static uint32_t* delta_build_index(const DeltaSignature* sig, uint32_t bucket_count) {
+  if (sig->block_count == 0 || bucket_count == 0)
+    return NULL;
+
+  size_t entries = (size_t)2 * bucket_count + sig->block_count;
+  if (entries > SIZE_MAX / sizeof(uint32_t))
+    return NULL;
+
+  uint32_t* index = protocol_alloc(entries * sizeof(uint32_t));
+  if (!index)
+    return NULL;
+
+  uint32_t* heads = index;
+  uint32_t* tails = index + bucket_count;
+  uint32_t* next = index + 2 * bucket_count;
+  uint32_t mask = bucket_count - 1;
+
+  memset(heads, 0xFF, (size_t)bucket_count * sizeof(uint32_t));
+  memset(tails, 0xFF, (size_t)bucket_count * sizeof(uint32_t));
+
+  for (uint32_t j = 0; j < sig->block_count; j++) {
+    uint32_t b = delta_adler_mix(sig->blocks[j].adler32) & mask;
+    if (heads[b] == DELTA_NO_BLOCK)
+      heads[b] = j;
+    else
+      next[tails[b]] = j;
+    tails[b] = j;
+    next[j] = DELTA_NO_BLOCK;
+  }
+  return index;
+}
+
+/* Locate the signature block matching the byte window at new_data[i].
+ *
+ * Mirrors the original per-window behaviour exactly: only a full block_size
+ * window can match, candidates are accepted only when the weak (Adler-32) and
+ * strong (xxHash32) checksums both agree, and the lowest block index wins so
+ * the emitted op stream is byte-identical to the linear scan.  When heads is
+ * non-NULL the candidate set is reached through the bucket index (expected
+ * O(1) per window); otherwise an exact linear scan is used. */
+static uint32_t delta_find_match(const uint8_t* window, uint32_t window_len, uint32_t adler,
+                                 bool full_window, const DeltaSignature* sig, const uint32_t* heads,
+                                 const uint32_t* next, uint32_t mask) {
+  if (!full_window || sig->block_count == 0)
+    return DELTA_NO_BLOCK;
+
+  if (heads) {
+    uint32_t b = delta_adler_mix(adler) & mask;
+    uint32_t window_xxh = 0;
+    bool have_xxh = false;
+    for (uint32_t j = heads[b]; j != DELTA_NO_BLOCK; j = next[j]) {
+      if (sig->blocks[j].adler32 != adler)
+        continue;
+      if (!have_xxh) {
+        window_xxh = delta_xxhash32(window, window_len);
+        have_xxh = true;
+      }
+      if (window_xxh == sig->blocks[j].xxhash)
+        return j;
+    }
+    return DELTA_NO_BLOCK;
+  }
+
+  /* Fallback used when the index could not be allocated. */
+  for (uint32_t j = 0; j < sig->block_count; j++) {
+    if (sig->blocks[j].adler32 == adler) {
+      uint32_t window_xxh = delta_xxhash32(window, window_len);
+      if (window_xxh == sig->blocks[j].xxhash)
+        return j;
+    }
+  }
+  return DELTA_NO_BLOCK;
+}
+
 Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const DeltaSignature* sig,
                      uint32_t block_size) {
   if (!new_file_data || !sig || !sig->blocks || new_file_size == 0 || block_size == 0 ||
@@ -229,6 +342,25 @@ Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const De
   DeltaInstruction* instrs = protocol_alloc((size_t)capacity * sizeof(DeltaInstruction));
   if (!instrs)
     return NULL;
+
+  /* Build a one-time bucket index over the signature blocks keyed by the weak
+   * checksum.  This turns the per-byte-window candidate lookup from an
+   * O(block_count) linear scan into an expected O(1) probe, which dominates
+   * the cost for large mostly-matching files (the diff steps one byte at a
+   * time through changed regions).  On allocation failure the probe falls back
+   * to the original linear scan, so behaviour is unchanged under memory
+   * pressure. */
+  uint32_t* index = NULL;
+  const uint32_t* chain_next = NULL;
+  uint32_t mask = 0;
+  if (sig->block_count > 0) {
+    uint32_t bucket_count = delta_next_pow2(sig->block_count);
+    index = delta_build_index(sig, bucket_count);
+    if (index) {
+      chain_next = index + 2 * bucket_count;
+      mask = bucket_count - 1;
+    }
+  }
 
   uint64_t literal_start = 0;
   bool has_literal = false;
@@ -264,34 +396,32 @@ Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const De
     }
 
     bool matched = false;
-    for (uint32_t j = 0; j < sig->block_count; j++) {
-      if (adler == sig->blocks[j].adler32 && full_window) {
-        uint32_t xxh = delta_xxhash32(new_data + i, window_len);
-        if (xxh == sig->blocks[j].xxhash) {
-          if (has_literal) {
-            if (!flush_literal(&instrs, &capacity, &count, new_data, literal_start, i)) {
-              free_instructions(instrs, count);
-              return NULL;
-            }
-            has_literal = false;
-          }
-
-          if (!ensure_capacity(&instrs, &capacity, count)) {
-            free_instructions(instrs, count);
-            return NULL;
-          }
-          instrs[count].type = DELTA_INSTR_BLOCK_MATCH;
-          instrs[count].match.block_index = j;
-          instrs[count].match.block_offset = 0;
-          instrs[count].match.length = window_len;
-          count++;
-
-          i += window_len;
-          rolling_valid = false;
-          matched = true;
-          break;
+    uint32_t match_block = delta_find_match(new_data + i, window_len, adler, full_window, sig,
+                                            index, chain_next, mask);
+    if (match_block != DELTA_NO_BLOCK) {
+      if (has_literal) {
+        if (!flush_literal(&instrs, &capacity, &count, new_data, literal_start, i)) {
+          free_instructions(instrs, count);
+          free(index);
+          return NULL;
         }
+        has_literal = false;
       }
+
+      if (!ensure_capacity(&instrs, &capacity, count)) {
+        free_instructions(instrs, count);
+        free(index);
+        return NULL;
+      }
+      instrs[count].type = DELTA_INSTR_BLOCK_MATCH;
+      instrs[count].match.block_index = match_block;
+      instrs[count].match.block_offset = 0;
+      instrs[count].match.length = window_len;
+      count++;
+
+      i += window_len;
+      rolling_valid = false;
+      matched = true;
     }
 
     if (!matched) {
@@ -302,6 +432,8 @@ Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const De
       i++;
     }
   }
+
+  free(index);
 
   if (has_literal) {
     if (!flush_literal(&instrs, &capacity, &count, new_data, literal_start, new_file_size)) {
