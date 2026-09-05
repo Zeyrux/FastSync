@@ -766,6 +766,17 @@ static void test_parse_args_rejects_unsafe_negation() {
   }
 }
 
+static void test_parse_args_old_args() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--old-args", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->old_args);
+  config_delete(cfg);
+}
+
 static void test_parse_args_fsync() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--fsync", "/src", "/dst"};
@@ -1036,6 +1047,7 @@ void test_client_cli() {
   test_parse_args_negation_order();
   test_parse_args_no_preserve_blocks_implicit_metadata();
   test_parse_args_rejects_unsafe_negation();
+  test_parse_args_old_args();
   test_parse_args_fsync();
   test_parse_args_existing();
   test_parse_args_ignore_times();

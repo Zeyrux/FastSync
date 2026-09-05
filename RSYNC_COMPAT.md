@@ -212,7 +212,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Max data/string/chunk sizes | Prevent OOM attacks | ✅ Implemented | Per-message limits |
 | Per-connection memory limit | 1GB per connection | ✅ Implemented | `MAX_CONNECTION_MEMORY` |
 | `--trust-sender` | Trust remote sender's file list | ❌ Not Implemented | |
-| `--old-args` | Disable modern arg protection | ❌ Not Implemented | |
+| `--old-args` | Disable modern arg protection | ✅ Implemented | SSH-only legacy mode; restores raw remote command construction and permits shell interpretation of the configured server path |
 | `--ignore-missing-args` | Ignore missing source args | ❌ Not Implemented | |
 | `--delete-missing-args` | Delete missing source args | ❌ Not Implemented | |
 

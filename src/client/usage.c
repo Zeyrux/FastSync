@@ -83,6 +83,8 @@ void print_usage(void) {
   printf("  --partial-dir <dir> Directory for partial files\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
+  printf(
+      "  --old-args          Disable safe SSH command argument quoting (legacy compatibility)\n");
   printf("  -l, --links         Copy symlinks as symlinks\n");
   printf("  --copy-links        Transform symlinks into referent files\n");
   printf("  --safe-links        Skip symlinks that point outside transfer tree\n");

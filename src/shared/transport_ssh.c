@@ -3,6 +3,7 @@
 #include "utils.h"
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -14,6 +15,12 @@ typedef struct {
   char* host;
   char* remote_path;
 } RemoteDest;
+
+static void ssh_child_setup_failed(int status_fd) {
+  ssize_t wret = write(status_fd, "x", 1);
+  (void)wret;
+  _exit(1);
+}
 
 static void remote_dest_destroy(RemoteDest* r) {
   free(r->user);
@@ -68,7 +75,52 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
   return 0;
 }
 
-Client* client_connect_ssh(const char* destination, int port, const char* server_path) {
+char* ssh_build_remote_command(const char* server_path, bool old_args) {
+  const char* path = server_path ? server_path : "fastsync-server";
+  const char* suffix = " --stdio";
+  size_t path_len = strlen(path);
+  size_t suffix_len = strlen(suffix);
+
+  if (old_args) {
+    if (path_len > SIZE_MAX - suffix_len - 1)
+      return NULL;
+    char* command = malloc(path_len + suffix_len + 1);
+    if (!command)
+      return NULL;
+    memcpy(command, path, path_len);
+    memcpy(command + path_len, suffix, suffix_len + 1);
+    return command;
+  }
+
+  /* Quote the executable as one remote-shell word. This is the default safety boundary. */
+  size_t quote_count = 0;
+  for (const char* p = path; *p; p++)
+    if (*p == '\'')
+      quote_count++;
+  if (path_len > SIZE_MAX - suffix_len - 4 ||
+      quote_count > (SIZE_MAX - path_len - suffix_len - 4) / 4)
+    return NULL;
+  size_t command_len = path_len + quote_count * 4 + suffix_len + 4;
+  char* command = malloc(command_len + 1);
+  if (!command)
+    return NULL;
+  char* out = command;
+  *out++ = '\'';
+  for (const char* p = path; *p; p++) {
+    if (*p == '\'') {
+      memcpy(out, "'\\''", 4);
+      out += 4;
+    } else {
+      *out++ = *p;
+    }
+  }
+  *out++ = '\'';
+  memcpy(out, suffix, suffix_len + 1);
+  return command;
+}
+
+Client* client_connect_ssh(const char* destination, int port, const char* server_path,
+                           bool old_args) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     char* escaped = output_escape(destination, false);
@@ -113,11 +165,12 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
   if (pid == 0) {
     close(sv[0]);
     close(exec_pipe[0]);
-    fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC);
-    if (sv[1] != STDIN_FILENO)
-      dup2(sv[1], STDIN_FILENO);
-    if (sv[1] != STDOUT_FILENO)
-      dup2(sv[1], STDOUT_FILENO);
+    if (fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC) < 0)
+      ssh_child_setup_failed(exec_pipe[1]);
+    if (sv[1] != STDIN_FILENO && dup2(sv[1], STDIN_FILENO) < 0)
+      ssh_child_setup_failed(exec_pipe[1]);
+    if (sv[1] != STDOUT_FILENO && dup2(sv[1], STDOUT_FILENO) < 0)
+      ssh_child_setup_failed(exec_pipe[1]);
     if (sv[1] > 1)
       close(sv[1]);
 
@@ -128,7 +181,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
       ssh_user_len = strlen(r.host) + 1;
     char* ssh_user = malloc(ssh_user_len);
     if (!ssh_user)
-      _exit(1);
+      ssh_child_setup_failed(exec_pipe[1]);
     if (r.user && r.user[0] != '\0')
       snprintf(ssh_user, ssh_user_len, "%s@%s", r.user, r.host);
     else
@@ -137,6 +190,9 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     char* ssh_argv[16];
     int ac = 0;
     char port_str[16];
+    char* remote_command = ssh_build_remote_command(server_path, old_args);
+    if (!remote_command)
+      ssh_child_setup_failed(exec_pipe[1]);
     ssh_argv[ac++] = "ssh";
     ssh_argv[ac++] = "-o";
     ssh_argv[ac++] = "Compression=no";
@@ -150,14 +206,11 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
       ssh_argv[ac++] = port_str;
     }
     ssh_argv[ac++] = ssh_user;
-    ssh_argv[ac++] = (char*)(server_path ? server_path : "fastsync-server");
-    ssh_argv[ac++] = "--stdio";
+    ssh_argv[ac++] = remote_command;
     ssh_argv[ac] = NULL;
     execvp("ssh", ssh_argv);
     log_perror("exec of ssh failed");
-    ssize_t wret = write(exec_pipe[1], "x", 1);
-    (void)wret;
-    _exit(1);
+    ssh_child_setup_failed(exec_pipe[1]);
   }
 
   close(sv[1]);
@@ -167,7 +220,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
   ssize_t n = read(exec_pipe[0], &exec_status, 1);
   close(exec_pipe[0]);
 
-  if (n > 0) {
+  if (n != 0) {
     close(sv[0]);
     waitpid(pid, NULL, 0);
     remote_dest_destroy(&r);
