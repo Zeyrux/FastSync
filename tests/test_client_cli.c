@@ -928,6 +928,22 @@ static void test_parse_args_compression_aliases() {
   config_delete(cfg);
 }
 
+/* Test rsync-compatible -P parsing; resumable partial-file retention is not implied. */
+static void test_parse_args_partial_progress() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-P", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_TRUE(cfg->partial);
+  EXPECT_TRUE(cfg->show_progress);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+}
+
 static void test_parse_args_compression_equals_and_none() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "-z", "--zc=none", "--zl=7", "/src", "/dst"};
@@ -1043,7 +1059,7 @@ void test_client_cli() {
   test_parse_args_info_verbose_order();
   test_parse_args_rejects_invalid_info_flag();
   test_parse_args_archive();
-  test_parse_args_negations();
+test_parse_args_negations();
   test_parse_args_negation_order();
   test_parse_args_no_preserve_blocks_implicit_metadata();
   test_parse_args_rejects_unsafe_negation();
@@ -1063,4 +1079,5 @@ void test_client_cli() {
   test_parse_args_compression_alias_equals();
   test_parse_args_rejects_invalid_compression_level_equals();
   test_parse_args_rejects_invalid_compression_choice();
+  test_parse_args_partial_progress();
 }

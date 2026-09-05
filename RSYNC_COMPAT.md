@@ -40,7 +40,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-h`, `--human-readable` | Human-readable numbers | ✅ Implemented | Formats transfer byte sizes using binary units |
 | `-i`, `--itemize-changes` | Per-file change summary | ❌ Not Implemented | Removed because it had no effect |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
-| `-P` | Same as --partial --progress | ❌ Not Implemented | |
+| `-P` | Same as --partial --progress | ⚠️ Partial | Parses and enables progress, but interrupted files are not retained for resumable transfers |
 | `--out-format=FORMAT` | Custom output format | ❌ Not Implemented | Removed because it had no effect |
 | `--log-file=FILE` | Log to file | ✅ Implemented | `log_file` config field |
 | `--log-file-format=FMT` | Log format | ❌ Not Implemented | |

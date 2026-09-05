@@ -541,6 +541,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   }
 
   for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-P") == 0) {
+      config->partial = true;
+      config->show_progress = true;
+      continue;
+    }
     if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {
       if (apply_negation(config, argv[i]) != 0)
         return -1;
@@ -581,6 +586,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       continue;
     }
+
     const OptionEntry* entry = find_table_option(argv[i]);
     const char* inline_value = NULL;
     if (!entry)
