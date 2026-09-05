@@ -57,7 +57,7 @@ static bool parse_positive_int(const char* s, int* out_val) {
   return true;
 }
 
-/* Duplicate a string argument into *dest, freeing the old value. Returns true on success, false on
+/* Duplicate a string argument into *dest, freeing the old value. Returns 0 on success, -1 on
  * failure. */
 static int set_string_option(char** dest, const char* value, const char* option_name) {
   char* dup = str_dup(value);
@@ -70,7 +70,7 @@ static int set_string_option(char** dest, const char* value, const char* option_
   return 0;
 }
 
-/* Parse a string as a positive integer into *dest. Returns true on success, false on error. */
+/* Parse a string as a positive integer into *dest. Returns 0 on success, -1 on error. */
 static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
     log_message(LOG_LEVEL_ERROR, "%s must be a positive integer", option_name);
@@ -102,7 +102,7 @@ static int set_compression_threads_option(int* dest, const char* value) {
   return 0;
 }
 
-/* Parse a string as a non-negative integer into *dest. Returns true on success, false on error. */
+/* Parse a string as a non-negative integer into *dest. Returns 0 on success, -1 on error. */
 static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
     log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", option_name);
@@ -237,7 +237,10 @@ static int parse_ull_arg(const char* val, unsigned long long* out, const char* o
   return 0;
 }
 
-static int parse_size_arg(const char* value, unsigned long long* out) {
+/* Parse a byte count with an optional single-letter binary suffix (K/M/G/T/P/E).
+ * When allow_zero is false, a bare 0 is rejected (size limits use true, since 0
+ * means "no limit"). Returns 0 on success, -1 on error. */
+static int parse_size_arg_allow_zero(const char* value, unsigned long long* out, bool allow_zero) {
   if (!value || *value < '0' || *value > '9')
     return -1;
   char* end;
@@ -281,10 +284,14 @@ static int parse_size_arg(const char* value, unsigned long long* out) {
       return -1;
     }
   }
-  if (number == 0 || number > ULLONG_MAX / multiplier)
+  if ((!allow_zero && number == 0) || number > ULLONG_MAX / multiplier)
     return -1;
   *out = number * multiplier;
   return 0;
+}
+
+static int parse_size_arg(const char* value, unsigned long long* out) {
+  return parse_size_arg_allow_zero(value, out, false);
 }
 
 /* Append a duplicated pattern to a growable pattern array. Returns 0 on success, -1 on error. */
@@ -450,6 +457,8 @@ static const OptionEntry* find_table_option(const char* arg) {
   return NULL;
 }
 
+/* Match a "--opt=value" argument against table options that take a value. Flags,
+ * no-ops, and unsupported options do not accept an inline "=" value. */
 static const OptionEntry* find_table_option_with_equals(const char* arg, const char** value) {
   const char* equals = strchr(arg, '=');
   if (!equals || equals == arg)
@@ -460,8 +469,8 @@ static const OptionEntry* find_table_option_with_equals(const char* arg, const c
     if ((strlen(entry->name) == name_len && strncmp(arg, entry->name, name_len) == 0) ||
         (entry->alias && strlen(entry->alias) == name_len &&
          strncmp(arg, entry->alias, name_len) == 0)) {
-      if (strcmp(entry->name, "--compress-choice") == 0 ||
-          strcmp(entry->name, "--compress-level") == 0) {
+      if (entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
+          entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL) {
         *value = equals + 1;
         return entry;
       }
@@ -516,8 +525,13 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     return set_nonneg_int_option((int*)field, value, entry->name);
   case OPT_ULL: {
     unsigned long long v;
-    if (parse_ull_arg(value, &v, entry->name) != 0)
+    /* Size-limit options accept rsync-style suffixes (e.g. --max-size=2G); a
+     * plain byte count, including 0 ("no limit"), stays valid. */
+    if (parse_size_arg_allow_zero(value, &v, true) != 0) {
+      log_message(LOG_LEVEL_ERROR, "%s must be a non-negative size (B, K, M, G, T, P, or E)",
+                  entry->name);
       return -1;
+    }
     *(unsigned long long*)field = v;
     return 0;
   }
@@ -667,22 +681,38 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       config->use_multithreading = true;
       config->use_metadata = true;
       log_info_message(LOG_INFO_MISC, "Enabled archive mode (-c -m -M)");
-    } else if (opt_is(argv[i], "-p", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "-p", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (set_positive_int_option(&config->ssh_port, argv[++i], "-p") != 0)
         return -1;
       if (config->ssh_port > 65535) {
         log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
         return -1;
       }
-    } else if (opt_is(argv[i], "--exclude", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--exclude", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, argv[++i],
                              "--exclude") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--include", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--include", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (config_add_pattern(&config->include_patterns, &config->include_count, argv[++i],
                              "--include") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--delta-block", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--delta-block", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       unsigned long long val;
       if (parse_ull_arg(argv[++i], &val, "--delta-block") != 0)
         return -1;
@@ -690,7 +720,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         config->delta_block_size = (uint32_t)val;
       else
         log_message(LOG_LEVEL_WARNING, "--delta-block value %llu out of range, using default", val);
-    } else if (opt_is(argv[i], "--delta-max", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--delta-max", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       unsigned long long val;
       if (parse_ull_arg(argv[++i], &val, "--delta-max") != 0)
         return -1;
@@ -731,7 +765,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "-s", NULL)) {
       config->use_chunk_serialization = true;
       log_info_message(LOG_INFO_MISC, "Enabled Chunk Serialization");
-    } else if (opt_is(argv[i], "--server-port", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--server-port", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (!parse_positive_int(argv[++i], &config->server_port)) {
         char* escaped = output_escape(argv[i], false);
         log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s",
@@ -743,7 +781,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         log_message(LOG_LEVEL_ERROR, "server port must be 1-65535");
         return -1;
       }
-    } else if (opt_is(argv[i], "--bwlimit", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--bwlimit", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       unsigned long long kbps;
       if (parse_ull_arg(argv[++i], &kbps, "--bwlimit") != 0)
         return -1;
@@ -757,7 +799,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       io_set_bwlimit(kbps * 1024);
       log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
-    } else if (opt_is(argv[i], "--chunk-size", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--chunk-size", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       unsigned long long val;
       if (parse_ull_arg(argv[++i], &val, "--chunk-size") != 0)
         return -1;
@@ -766,7 +812,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
       config->chunk_size = val;
-    } else if (opt_is(argv[i], "--log-file", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--log-file", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (config->log_file) {
         fclose(config->log_file);
         config->log_file = NULL;
@@ -788,11 +838,19 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "--stderr", NULL)) {
       if (i + 1 >= argc || set_stderr_mode(argv[++i]) != 0)
         return -1;
-    } else if (opt_is(argv[i], "--exclude-from", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--exclude-from", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
           0)
         return -1;
-    } else if (opt_is(argv[i], "--include-from", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--include-from", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (read_patterns_from_file(argv[++i], &config->include_patterns, &config->include_count) !=
           0)
         return -1;
@@ -817,16 +875,28 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "--info", NULL)) {
       if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
         return -1;
-    } else if (opt_is(argv[i], "-T", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "-T", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
     } else if (strncmp(argv[i], "--skip-compress=", 16) == 0) {
       if (parse_skip_compress(config, argv[i] + 16) != 0)
         return -1;
-    } else if (opt_is(argv[i], "--skip-compress", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--skip-compress", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (parse_skip_compress(config, argv[++i]) != 0)
         return -1;
-    } else if (opt_is(argv[i], "--compress-threads", NULL) && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--compress-threads", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (set_compression_threads_option(&config->compression_threads, argv[++i]) != 0)
         return -1;
     } else if (opt_is(argv[i], "--checksum-choice", "--cc")) {

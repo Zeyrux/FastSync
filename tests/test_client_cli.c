@@ -1088,6 +1088,70 @@ static void test_parse_args_rejects_invalid_compression_choice() {
   config_delete(cfg);
 }
 
+/* Every value-taking table option accepts an inline "--opt=value" form. */
+static void test_parse_args_table_equals_size_options() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--max-size=2G", "--min-size=1K", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->max_size == 2ULL * 1024 * 1024 * 1024);
+  EXPECT_TRUE(cfg->min_size == 1024ULL);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+static void test_parse_args_table_equals_string_and_int_options() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--suffix=.bak", "--timeout=30", "--max-depth=5", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->suffix, ".bak");
+  EXPECT_EQ_INT(cfg->timeout, 30);
+  EXPECT_EQ_INT(cfg->max_depth, 5);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* backup_argv[] = {"fastsync", "--backup-dir=/tmp/bak", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, backup_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->backup_dir, "/tmp/bak");
+  config_delete(cfg);
+}
+
+/* Options that take a separate value must report "missing argument", not the
+ * generic "Unknown option", when they are the final argv entry. */
+static void test_parse_args_missing_argument_diagnostic() {
+  static const char* const options[] = {"--exclude", "--server-port", "--skip-compress", "-T"};
+
+  for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)options[i]};
+    int positional_args[2];
+    int positional_count = 0;
+    FILE* log_file = tmpfile();
+    char log_buffer[512] = {0};
+
+    EXPECT_NOT_NULL(log_file);
+    log_set_file(log_file);
+
+    EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
+    fflush(log_file);
+    rewind(log_file);
+    EXPECT_TRUE(fread(log_buffer, 1, sizeof(log_buffer) - 1, log_file) > 0);
+    EXPECT_TRUE(strstr(log_buffer, "missing argument") != NULL);
+    EXPECT_TRUE(strstr(log_buffer, "Unknown option") == NULL);
+
+    log_set_file(NULL);
+    fclose(log_file);
+    config_delete(cfg);
+  }
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -1155,6 +1219,9 @@ void test_client_cli() {
   test_parse_args_compression_alias_equals();
   test_parse_args_rejects_invalid_compression_level_equals();
   test_parse_args_rejects_invalid_compression_choice();
+  test_parse_args_table_equals_size_options();
+  test_parse_args_table_equals_string_and_int_options();
+  test_parse_args_missing_argument_diagnostic();
   test_parse_args_partial_progress();
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
