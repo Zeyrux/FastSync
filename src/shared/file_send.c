@@ -20,19 +20,21 @@
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
   return file_send_single_calls_with_skip(file, file_descriptor, use_metadata, compression_level,
-                                          send_path, NULL, -1);
+                                          send_path, NULL, -1, 0);
 }
 
 bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_metadata,
                                       int compression_level, bool send_path,
-                                      char* const* skip_suffixes, int skip_count) {
+                                      char* const* skip_suffixes, int skip_count,
+                                      int compression_threads) {
   if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data))
     return false;
   const Data* data_to_send = file->data;
   Data* compressed_data = NULL;
   if (compression_level > 0 &&
       !compression_should_skip_with_suffixes(file->path, skip_suffixes, skip_count)) {
-    compressed_data = data_compress(file->data, compression_level);
+    compressed_data = data_compress_with_threads(file->data, compression_level,
+                                                 compression_threads);
     if (compressed_data == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to compress file data");
       return false;
@@ -58,17 +60,18 @@ bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path) {
   return file_send_sendfile_with_skip(file, file_descriptor, use_metadata, compression_level,
-                                      send_path, NULL, -1);
+                                      send_path, NULL, -1, 0);
 }
 
 bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_metadata,
                                   int compression_level, bool send_path, char* const* skip_suffixes,
-                                  int skip_count) {
+                                  int skip_count, int compression_threads) {
   if (!file || !file->path || !file->data)
     return false;
   if (compression_level > 0)
     return file_send_single_calls_with_skip(file, file_descriptor, use_metadata, compression_level,
-                                            send_path, skip_suffixes, skip_count);
+                                            send_path, skip_suffixes, skip_count,
+                                            compression_threads);
 
   if (send_path && !send_str(file_descriptor, file->path))
     return false;

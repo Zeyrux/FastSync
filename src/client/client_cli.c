@@ -1,6 +1,7 @@
 #include "client_send.h"
 #include "client_validation.h"
 #include "chmod.h"
+#include "compression.h"
 #include "config.h"
 #include "delta.h"
 #include "log.h"
@@ -87,6 +88,17 @@ static int set_compression_choice(Config* config, const char* value) {
   if (set_string_option(&config->compress_choice, value, "--compress-choice") != 0)
     return -1;
   config->use_compression = strcmp(value, "zstd") == 0;
+  return 0;
+}
+
+static int set_compression_threads_option(int* dest, const char* value) {
+  if (set_positive_int_option(dest, value, "--compress-threads") != 0)
+    return -1;
+  if (*dest > COMPRESSION_MAX_THREADS) {
+    log_message(LOG_LEVEL_ERROR, "--compress-threads must be between 1 and %d",
+                COMPRESSION_MAX_THREADS);
+    return -1;
+  }
   return 0;
 }
 
@@ -369,6 +381,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       continue;
     }
+    const char* threads_prefix = "--compress-threads=";
+    if (strncmp(argv[i], threads_prefix, strlen(threads_prefix)) == 0) {
+      if (set_compression_threads_option(&config->compression_threads,
+                                         argv[i] + strlen(threads_prefix)) != 0)
+        return -1;
+      continue;
+    }
     const OptionEntry* entry = find_table_option(argv[i]);
     const char* inline_value = NULL;
     if (!entry)
@@ -585,6 +604,9 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
     } else if (opt_is(argv[i], "--skip-compress", NULL) && i + 1 < argc) {
       if (parse_skip_compress(config, argv[++i]) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--compress-threads", NULL) && i + 1 < argc) {
+      if (set_compression_threads_option(&config->compression_threads, argv[++i]) != 0)
         return -1;
     } else if (argv[i][0] == '-') {
       char* escaped = output_escape(argv[i], false);

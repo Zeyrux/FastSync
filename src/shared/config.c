@@ -24,6 +24,7 @@ static void config_set_defaults(Config* config) {
   config->remove_source_files = false;
   config->use_delete = false;
   config->compression_level = 5;
+  config->compression_threads = 0;
   config->use_sendfile = false;
   config->chunk_size = DEFAULT_CHUNK_SIZE;
   config->ssh_port = 22;

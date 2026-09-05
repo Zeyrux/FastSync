@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 #include <zstd.h>
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
@@ -38,7 +39,15 @@ bool compression_should_skip_with_suffixes(const char* path, char* const* suffix
 }
 
 Data* data_compress(Data* data_to_compress, int compression_level) {
-  log_debug_message(LOG_DEBUG_UTIL, "Starting to compress data");
+  return data_compress_with_threads(data_to_compress, compression_level, 0);
+}
+
+Data* data_compress_with_threads(Data* data_to_compress, int compression_level,
+                                 int compression_threads) {
+  if (!data_to_compress || (!data_to_compress->data && data_to_compress->size != 0) ||
+      compression_threads < 0 || compression_threads > COMPRESSION_MAX_THREADS)
+    return NULL;
+  log_message(LOG_LEVEL_DEBUG, "Starting to compress data");
   size_t dst_size = ZSTD_compressBound(data_to_compress->size);
   Data* compressed_data = data_create_empty(dst_size);
   if (compressed_data == NULL)
@@ -57,6 +66,30 @@ Data* data_compress(Data* data_to_compress, int compression_level) {
     ZSTD_freeCCtx(cctx);
     data_destroy(compressed_data);
     return NULL;
+  }
+
+  if (compression_threads > 0) {
+    long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int available_threads = online_cpus > 0 && online_cpus < compression_threads
+                                ? (int)online_cpus
+                                : compression_threads;
+    zret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, available_threads);
+    if (ZSTD_isError(zret)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set compression threads: %s",
+                  ZSTD_getErrorName(zret));
+      ZSTD_freeCCtx(cctx);
+      data_destroy(compressed_data);
+      return NULL;
+    }
+    /* Streaming compression needs the source size before threaded mode can end a frame. */
+    zret = ZSTD_CCtx_setPledgedSrcSize(cctx, data_to_compress->size);
+    if (ZSTD_isError(zret)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to set compression source size: %s",
+                  ZSTD_getErrorName(zret));
+      ZSTD_freeCCtx(cctx);
+      data_destroy(compressed_data);
+      return NULL;
+    }
   }
 
   ZSTD_inBuffer input = {data_to_compress->data, data_to_compress->size, 0};

@@ -354,7 +354,8 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   if (config->use_compression && !compression_should_skip_with_suffixes(
                                      file->path, config->skip_compress_suffixes, skip_count)) {
-    to_send = data_compress(delta_data, config->compression_level);
+    to_send = data_compress_with_threads(delta_data, config->compression_level,
+                                         config->compression_threads);
     data_destroy(delta_data);
     if (!to_send)
       return send_status(client->file_descriptor, STATUS_NEXT) ? 1 : -1;
@@ -377,7 +378,8 @@ static bool send_file_direct(File* file, int fd, bool use_metadata, int compress
     return false;
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   return file_send_single_calls_with_skip(file, fd, use_metadata, compression_level, true,
-                                          config->skip_compress_suffixes, skip_count);
+                                          config->skip_compress_suffixes, skip_count,
+                                          config->compression_threads);
 }
 
 // Send a single file directly via sendfile (non-incremental path).
@@ -386,7 +388,8 @@ static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata, con
     return false;
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   return file_send_sendfile_with_skip(file, fd, use_metadata, 0, true,
-                                      config->skip_compress_suffixes, skip_count);
+                                      config->skip_compress_suffixes, skip_count,
+                                      config->compression_threads);
 }
 
 // Process one file in a chunk: either via incremental check or direct send.
@@ -430,7 +433,8 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     // Fall through: send full file via sendfile (pass 0 for compression_level)
     int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
     if (!file_send_sendfile_with_skip(file, client->file_descriptor, config->use_metadata, 0, false,
-                                      config->skip_compress_suffixes, skip_count))
+                                      config->skip_compress_suffixes, skip_count,
+                                      config->compression_threads))
       return -1;
     return 0;
   }
@@ -466,7 +470,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   if (!file_send_single_calls_with_skip(file, client->file_descriptor, config->use_metadata,
                                         compression_level, false, config->skip_compress_suffixes,
-                                        skip_count))
+                                        skip_count, config->compression_threads))
     return -1;
   return 0;
 }
@@ -484,7 +488,8 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       return -1;
     Data* data;
     if (config->use_compression) {
-      data = chunk_compress(chunk, config->compression_level, config->use_metadata);
+      data = chunk_compress_with_threads(chunk, config->compression_level, config->use_metadata,
+                                         config->compression_threads);
     } else {
       data = chunk_serialize(chunk, config->use_metadata);
     }
