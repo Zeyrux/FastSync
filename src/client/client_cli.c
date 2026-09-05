@@ -387,6 +387,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
     {"--dirs", "--old-dirs", OPT_UNSUPPORTED, 0},
     {"--old-d", NULL, OPT_UNSUPPORTED, 0},
+    {"--delete-during", "--del", OPT_UNSUPPORTED, 0},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -520,11 +521,13 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     *(unsigned long long*)field = v;
     return 0;
   }
-  case OPT_UNSUPPORTED:
-    log_message(LOG_LEVEL_ERROR,
-                "%s: directory-only transfer is not implemented; refusing to ignore option",
-                option_name);
+  case OPT_UNSUPPORTED: {
+    const char* reason = "directory-only transfer is not implemented";
+    if (strcmp(entry->name, "--delete-during") == 0)
+      reason = "delete-during is not implemented";
+    log_message(LOG_LEVEL_ERROR, "%s: %s; refusing to ignore option", option_name, reason);
     return -1;
+  }
   }
   return -1;
 }

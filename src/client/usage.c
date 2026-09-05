@@ -27,6 +27,7 @@ void print_usage(void) {
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
   printf(
       "  --dirs, --old-dirs, --old-d  Transfer directories without recursing (not implemented)\n");
+  printf("  --del               Alias for --delete-during (not implemented)\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --exclude-from <file> Read exclude patterns from file\n");
