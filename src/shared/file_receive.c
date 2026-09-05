@@ -363,6 +363,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         data_destroy(uncompressed);
         file_destroy(file);
         send_status(fd, STATUS_ERROR);
+        *failed = true;
         return NULL;
       }
       file_data = uncompressed;
@@ -581,7 +582,6 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     if (uncompressed->size > MAX_FILE_DATA_SIZE) {
       data_destroy(uncompressed);
       file_destroy(file);
-      send_status(fd, STATUS_ERROR);
       return NULL;
     }
     file_data = uncompressed;

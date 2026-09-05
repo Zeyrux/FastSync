@@ -889,6 +889,30 @@ class TestRemoveSourceFilesSkips:
         assert os.path.isfile(source_file)
         assert _read_file(received_file) == b"newer destination payload"
 
+    def test_multithreaded_ignore_existing_keeps_skipped_source(self, shared_server):
+        """The multithreaded writer path must also report per-file outcomes so a
+        --remove-source-files sender does not delete skipped sources."""
+        source = os.path.join(TEST_DATA_DIR, "remove_rsf_mt_ignore_src")
+        dest = os.path.join(TEST_DATA_DIR, "remove_rsf_mt_ignore_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "file.txt")
+        with open(source_file, "wb") as f:
+            f.write(b"payload")
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0
+
+        result, _ = run_client(source, dest,
+                               flags=["--remove-source-files", "--ignore-existing", "-m"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"Sync failed: {result.stderr[:200]}"
+        # Destination already has the file, so the receiver (writer thread)
+        # skips it; the source must survive.
+        assert os.path.isfile(source_file)
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "file.txt")) == b"payload"
+
 
 class TestBackup:
     def _sync(self, source, dest, flags, port):
