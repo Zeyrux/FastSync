@@ -63,6 +63,14 @@ typedef struct Config {
   bool size_only;
   bool use_delta;
   bool whole_file;
+  /* -y/--fuzzy: when a file must be transferred and the destination holds no
+   * usable file at the exact path, the receiver may reuse a SIMILAR-named
+   * existing regular file in the same destination directory as the delta
+   * basis so the sender transmits only the differences.  Crosses the wire
+   * (the receiver performs the candidate search); the CLI implies
+   * --incremental + --delta because the similar-basis only matters on the
+   * receiver-driven delta path.  Off by default. */
+  bool fuzzy;
   int modify_window;
   uint32_t delta_block_size;
   unsigned long long delta_max_file_size;

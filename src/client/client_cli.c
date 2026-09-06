@@ -418,6 +418,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--modify-window", "-@", OPT_NONNEG_INT, offsetof(Config, modify_window)},
     {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
     {"--whole-file", "-W", OPT_FLAG, offsetof(Config, whole_file)},
+    {"--fuzzy", "-y", OPT_FLAG, offsetof(Config, fuzzy)},
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
     {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
     {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},
@@ -492,6 +493,7 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"delete", NULL, offsetof(Config, use_delete)},
     {"incremental", NULL, offsetof(Config, use_incremental)},
     {"delta", NULL, offsetof(Config, use_delta)},
+    {"fuzzy", NULL, offsetof(Config, fuzzy)},
     {"save-to-disk", NULL, offsetof(Config, save_to_disk)},
     {"progress", NULL, offsetof(Config, show_progress)},
     {"tls", NULL, offsetof(Config, use_tls)},
@@ -613,6 +615,11 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   bool verbose = false;
+  /* Explicit --no-delta / --no-incremental seen on the command line: the user
+     switched part of the delta machinery off, so the --fuzzy implication must
+     not silently turn it back on. */
+  bool no_delta = false;
+  bool no_incremental = false;
   protocol_set_8_bit_output(config->eight_bit_output);
 
   /* Apply output controls before processing other options so their order is irrelevant. */
@@ -642,6 +649,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       continue;
     }
     if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {
+      if (strcmp(argv[i], "--no-delta") == 0)
+        no_delta = true;
+      else if (strcmp(argv[i], "--no-incremental") == 0)
+        no_incremental = true;
       if (apply_negation(config, argv[i]) != 0)
         return -1;
       continue;
@@ -1072,6 +1083,24 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
    * --incremental (and, via the block below, metadata) on the sender. */
   if (config_has_basis(config))
     config->use_incremental = true;
+
+  /* -y/--fuzzy reuses an existing similar-named destination file as the delta
+   * basis, so it is meaningless without the receiver-driven delta path:
+   * imply --incremental and --delta unless --whole-file or an explicit
+   * --no-delta / --no-incremental switched the machinery off.  FastSync has
+   * delta OFF by default (unlike rsync), so a bare --fuzzy must turn it on or
+   * it would be a silent no-op.  -W/--no-delta/--no-incremental therefore
+   * leave fuzzy inert, matching rsync where --whole-file makes fuzzy
+   * irrelevant (note: unlike the basis-dir options, --fuzzy honors an
+   * explicit --no-incremental instead of forcing the handshake back on). */
+  if (config->fuzzy) {
+    if (!no_incremental)
+      config->use_incremental = true;
+    /* Delta needs the incremental per-file handshake, so an explicit
+     * --no-incremental also suppresses the delta implication. */
+    if (!config->whole_file && !no_delta && !no_incremental)
+      config->use_delta = true;
+  }
 
   /* Incremental and delta transfers need metadata unless the user disabled it. */
   if ((config->use_incremental || config->use_delta) && !config->use_metadata &&

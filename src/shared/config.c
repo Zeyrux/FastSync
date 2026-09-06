@@ -46,6 +46,7 @@ static void config_set_defaults(Config* config) {
   config->size_only = false;
   config->use_delta = false;
   config->whole_file = false;
+  config->fuzzy = false;
   config->modify_window = 0;
   config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
   config->delta_max_file_size = DELTA_MAX_FILE_SIZE;
@@ -154,9 +155,9 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->use_delete) && valid_wire_bool(config->use_incremental) &&
          valid_wire_bool(config->size_only) && valid_wire_bool(config->ignore_times) &&
          valid_wire_bool(config->use_delta) && valid_wire_bool(config->backup) &&
-         valid_wire_bool(config->remove_source_files) && valid_wire_bool(config->follow_symlinks) &&
-         valid_wire_bool(config->copy_links) && valid_wire_bool(config->safe_links) &&
-         valid_wire_bool(config->copy_unsafe_links) &&
+         valid_wire_bool(config->fuzzy) && valid_wire_bool(config->remove_source_files) &&
+         valid_wire_bool(config->follow_symlinks) && valid_wire_bool(config->copy_links) &&
+         valid_wire_bool(config->safe_links) && valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
          valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->ignore_existing) &&
@@ -455,6 +456,12 @@ static bool send_basis_options(int fd, const Config* c) {
   return true;
 }
 
+/* -y/--fuzzy (receiver-side similar-file basis selection).  Trailing field on
+ * the config frame; protocol 2.9.0. */
+static bool send_fuzzy_option(int fd, const Config* c) {
+  return send_int(fd, c->fuzzy);
+}
+
 static bool receive_core_fields(int fd, Config* c) {
   int value;
   if (!receive_wire_bool(fd, &c->eight_bit_output))
@@ -626,12 +633,17 @@ static bool receive_basis_options(int fd, Config* c) {
   return true;
 }
 
+static bool receive_fuzzy_option(int fd, Config* c) {
+  return receive_wire_bool(fd, &c->fuzzy);
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
       !send_file_options(file_descriptor, config) ||
       !send_selection_options(file_descriptor, config) ||
-      !send_resume_options(file_descriptor, config) || !send_basis_options(file_descriptor, config))
+      !send_resume_options(file_descriptor, config) ||
+      !send_basis_options(file_descriptor, config) || !send_fuzzy_option(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -664,7 +676,8 @@ Config* config_receive(int file_descriptor) {
       !receive_file_options(file_descriptor, config) ||
       !receive_selection_options(file_descriptor, config) ||
       !receive_resume_options(file_descriptor, config) ||
-      !receive_basis_options(file_descriptor, config))
+      !receive_basis_options(file_descriptor, config) ||
+      !receive_fuzzy_option(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
