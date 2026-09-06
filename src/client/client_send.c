@@ -218,6 +218,49 @@ static bool files_from_list_valid(const Config* config) {
   return no_implied_dirs_files_from_valid(config);
 }
 
+/* Basis directories are honored by the receiver's per-file incremental check,
+   which (like every whole-file payload path in FastSync) is bounded by
+   MAX_RECEIVE_WHOLE_FILE_SIZE.  rsync would apply basis dirs to files of any
+   size; FastSync cannot, so when basis dirs are requested this preflight scan
+   refuses the run up front with a clear diagnostic instead of letting the
+   receiver abort the whole transfer mid-stream with no client explanation.
+   Returns true when the tree can be transferred. */
+static bool basis_oversize_preflight(const Config* config) {
+  PreparedScanner prepared;
+  if (!prepare_scanner(config, 0, &prepared))
+    return false;
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &prepared.options);
+  prepared_scanner_destroy(&prepared);
+  if (!scanner)
+    return false;
+  bool ok = true;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      File* f = chunk->items[i];
+      if (f == NULL || f->is_dir || f->data == NULL || f->data->size <= MAX_RECEIVE_WHOLE_FILE_SIZE)
+        continue;
+      char* escaped = output_escape(file_wire_path(f), config->eight_bit_output);
+      log_message(LOG_LEVEL_ERROR,
+                  "%s is %llu bytes, larger than the %llu-byte whole-file transfer limit; "
+                  "--compare-dest/--copy-dest/--link-dest cannot sync files above this limit",
+                  escaped ? escaped : "<allocation failed>", (unsigned long long)f->data->size,
+                  (unsigned long long)MAX_RECEIVE_WHOLE_FILE_SIZE);
+      free(escaped);
+      ok = false;
+      break;
+    }
+    chunk_destroy(chunk);
+    if (!ok)
+      break;
+  }
+  if (directory_scanner_failed(scanner))
+    ok = false;
+  directory_scanner_destroy(scanner);
+  return ok;
+}
+
 /* Select the configured transport for both transfer execution paths. */
 static Client* connect_transfer_client(const Config* config) {
   if (config->transport == TRANSPORT_SSH) {
@@ -1159,6 +1202,8 @@ int send_files(Config* config) {
     return send_dry_run_manifest(config);
   if (!files_from_list_valid(config))
     return 1;
+  if (config_has_basis(config) && !basis_oversize_preflight(config))
+    return 1;
 
   Client* client = connect_transfer_client(config);
   if (!client) {
@@ -1297,6 +1342,8 @@ int send_files_multithreaded(Config** config_ptr) {
   if (config->dry_run)
     return send_dry_run_manifest(config);
   if (!files_from_list_valid(config))
+    return 1;
+  if (config_has_basis(config) && !basis_oversize_preflight(config))
     return 1;
 
   long pages = sysconf(_SC_AVPHYS_PAGES);
