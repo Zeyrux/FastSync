@@ -218,6 +218,20 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return FILE_SAVE_SKIPPED;
   }
 
+  /* --force (rsync semantics): an incoming regular file may replace a
+     destination DIRECTORY by removing that (possibly non-empty, symlink-safe)
+     tree first, so the atomic temp+rename below can install the file.  Only the
+     immediate-install path does this: a --delay-updates run stages into its own
+     tree and is unaffected here (its publication renames over regular files
+     only).  The blocking directory is removed only after the --update /
+     --existing / --ignore-existing decisions above, which see it as an existing
+     destination entry. */
+  if (config && config->force_delete && !file->is_dir &&
+      file_directory_exists_secure(destination_path)) {
+    if (!file_remove_tree_secure(destination_path))
+      goto fail;
+  }
+
   if (backup_enabled) {
     /* Back up the entry that the incoming write will replace.  When writing
        through a partial dir the pre-existing destination file is the one to
@@ -1021,63 +1035,93 @@ File* file_receive_directory(int file_descriptor) {
 }
 
 /* Read a delete-manifest frame (the STATUS_MANIFEST leading code has already
-   been consumed): an entry count followed by that many destination-relative
-   paths.  The frame is self-delimiting (the count is authoritative), so the
-   caller decides what to do next and continues reading the following STATUS_*
-   frame.  Returns an owned ArrayList of validated path strings, or NULL after
-   sending STATUS_ERROR when the frame is malformed (bad count, empty/absolute
-   path, path traversal, or an aggregate size beyond MAX_MANIFEST_BYTES). */
-ArrayList* receive_manifest_entries(int fd) {
+   been consumed): a keep-set entry count followed by that many
+   destination-relative paths, then a protected-prefix count followed by that
+   many destination-relative prefixes.  The frame is self-delimiting (the counts
+   are authoritative), so the caller decides what to do next and continues
+   reading the following STATUS_* frame.  Returns an owned DeleteManifest, or
+   NULL after sending STATUS_ERROR when the frame is malformed (bad count,
+   empty/absolute path, path traversal, or an aggregate size beyond
+   MAX_MANIFEST_BYTES). */
+static bool receive_manifest_section(int fd, ArrayList* list, size_t* manifest_bytes) {
   int count;
   if (!receive_int(fd, &count)) {
     send_status(fd, STATUS_ERROR);
-    return NULL;
+    return false;
   }
   if (count < 0 || count > MAX_MANIFEST_ENTRIES) {
     send_status(fd, STATUS_ERROR);
-    return NULL;
+    return false;
   }
-  ArrayList* manifest = array_list_create(free);
-  if (!manifest) {
-    send_status(fd, STATUS_ERROR);
-    return NULL;
-  }
-  size_t manifest_bytes = 0;
   for (int i = 0; i < count; i++) {
     char* s = receive_str(fd);
     size_t entry_size = s ? strlen(s) : 0;
     if (!s || s[0] == '\0' || s[0] == '/' || has_path_traversal(s) ||
-        entry_size > MAX_MANIFEST_BYTES - manifest_bytes ||
-        (manifest_bytes += entry_size) > MAX_MANIFEST_BYTES || !array_list_add(manifest, s)) {
+        entry_size > MAX_MANIFEST_BYTES - *manifest_bytes ||
+        (*manifest_bytes += entry_size) > MAX_MANIFEST_BYTES || !array_list_add(list, s)) {
       free(s);
-      array_list_delete(manifest);
       send_status(fd, STATUS_ERROR);
-      return NULL;
+      return false;
     }
+  }
+  return true;
+}
+
+DeleteManifest* receive_manifest_entries(int fd) {
+  DeleteManifest* manifest = calloc(1, sizeof(DeleteManifest));
+  if (!manifest) {
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+  manifest->keeps = array_list_create(free);
+  manifest->protected = array_list_create(free);
+  if (!manifest->keeps || !manifest->protected) {
+    delete_manifest_free(manifest);
+    send_status(fd, STATUS_ERROR);
+    return NULL;
+  }
+  size_t manifest_bytes = 0;
+  if (!receive_manifest_section(fd, manifest->keeps, &manifest_bytes) ||
+      !receive_manifest_section(fd, manifest->protected, &manifest_bytes)) {
+    delete_manifest_free(manifest);
+    return NULL;
   }
   return manifest;
 }
 
-/* Remove every destination entry under the receive root that is not listed in
-   `manifest`, bounded by MAX_SERVER_DELETE_COUNT, using the symlink-safe
-   delete walker.  With --delay-updates the not-yet-published staging directory
-   is a direct child of the receive root and must not be treated as a set of
-   extras.  Prints a notice and returns true on success. */
-bool manifest_delete_extras(const Config* config, ArrayList* manifest) {
-  if (!config || !manifest)
+void delete_manifest_free(DeleteManifest* manifest) {
+  if (!manifest)
+    return;
+  array_list_delete(manifest->keeps);
+  array_list_delete(manifest->protected);
+  free(manifest);
+}
+
+/* Remove every destination entry under the receive root that is not in the
+   keep-set, bounded by MAX_SERVER_DELETE_COUNT (or a smaller client
+   --max-delete=NUM, which is all-or-nothing), using the symlink-safe delete
+   walker.  With --delay-updates the not-yet-published staging directory is a
+   direct child of the receive root and must not be treated as a set of extras;
+   the manifest's protected prefixes (paths excluded on the source) and the
+   alternate basis directories are never destination content and are skipped at
+   any depth.  Prints a notice and returns true on success. */
+bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
+  if (!config || !manifest || !manifest->keeps)
     return false;
   fprintf(stderr, "Deleting files not in manifest...\n");
-  /* With --delay-updates the staged (not yet published) files live directly
-     under the receive root in the staging directory; the delete walker must
-     not treat them as extras or it would remove every staged file before it
-     can be published.  That staging name is protected only as a DIRECT child
-     of the receive root so a nested destination directory that happens to be
-     named .fastsync-stage is still ordinary content.  Alternate basis
-     directories (--compare-dest / --copy-dest / --link-dest) are excluded at
-     any depth: they are extra comparison snapshots the user pointed at, not
-     destination content, and deleting them would destroy the very files a
-     --link-dest run just linked into place. */
-  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
+  /* Protected entries:
+     - the --delay-updates staging name, protected only as a DIRECT child of the
+       receive root (a nested destination directory that happens to be named
+       .fastsync-stage is ordinary content);
+     - alternate basis directories (--compare-dest / --copy-dest / --link-dest)
+       at any depth: they are extra comparison snapshots the user pointed at,
+       not destination content, and deleting them would destroy the very files a
+       --link-dest run just linked into place;
+     - the sender-side protected prefixes (source paths excluded by filters), at
+       any depth, so an excluded destination mirror survives --delete unless
+       --delete-excluded opts back into removing it. */
+  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
+                   (manifest->protected ? manifest->protected->size : 0);
   DeleteSkipEntry* skips = NULL;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
@@ -1094,9 +1138,40 @@ bool manifest_delete_extras(const Config* config, ArrayList* manifest) {
       skips[idx].top_level_only = false;
       idx++;
     }
+    for (int i = 0; i < manifest->protected->size; i++) {
+      skips[idx].prefix = (const char*)manifest->protected->items[i];
+      skips[idx].top_level_only = false;
+      idx++;
+    }
   }
-  bool deletion_ok = delete_extras_limited(config->receive_root_directory, manifest,
-                                           MAX_SERVER_DELETE_COUNT, skips, skip_count);
+  /* A client --max-delete=NUM smaller than the server's hard bound replaces it
+     for this run; both still bound the walk.  The walker is all-or-nothing, so
+     a run that would delete more than the bound removes nothing and fails with
+     an error that names the bound that was hit. */
+  bool user_limited =
+      config->max_delete >= 0 && (size_t)config->max_delete < MAX_SERVER_DELETE_COUNT;
+  size_t cap = user_limited ? (size_t)config->max_delete : MAX_SERVER_DELETE_COUNT;
+  size_t deleted_count = 0;
+  DeleteWalkResult result = delete_extras_limited(config->receive_root_directory, manifest->keeps,
+                                                  cap, skips, skip_count, &deleted_count);
   free(skips);
-  return deletion_ok;
+  if (result == DELETE_WALK_LIMIT_EXCEEDED) {
+    if (user_limited) {
+      log_message(LOG_LEVEL_ERROR,
+                  "deletion stopped: the destination holds more than --max-delete=%d extraneous "
+                  "entries; no files were deleted",
+                  config->max_delete);
+    } else {
+      log_message(LOG_LEVEL_ERROR,
+                  "deletion stopped: the destination holds more than %u extraneous entries "
+                  "(server deletion limit); no files were deleted",
+                  (unsigned)MAX_SERVER_DELETE_COUNT);
+    }
+    return false;
+  }
+  if (result != DELETE_WALK_OK) {
+    log_message(LOG_LEVEL_ERROR, "deletion failed while removing extraneous files");
+    return false;
+  }
+  return true;
 }

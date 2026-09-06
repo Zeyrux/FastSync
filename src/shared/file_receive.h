@@ -10,14 +10,30 @@
 File* file_receive(const Config* config, int file_descriptor);
 File* file_receive_directory(int file_descriptor);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
-/* Read a delete-manifest frame: entry count then paths (self-delimiting; the
-   leading STATUS_MANIFEST code has been consumed).  Returns an owned path
-   ArrayList, or NULL after signalling STATUS_ERROR on a malformed frame. */
-ArrayList* receive_manifest_entries(int fd);
+
+/* A received delete-manifest frame: the keep-set (`keeps`, destination-relative
+   paths the sender transferred/keeps) plus `protected`, destination-relative
+   prefixes the sender asks the receiver never to delete (paths excluded on the
+   source, protected at any depth).  When --delete-excluded is given the sender
+   transmits an empty protected list so excluded destination mirrors are treated
+   as ordinary extras. */
+typedef struct DeleteManifest {
+  ArrayList* keeps;
+  ArrayList* protected;
+} DeleteManifest;
+
+void delete_manifest_free(DeleteManifest* manifest);
+/* Read a delete-manifest frame: keep count + keeps, then protected count +
+   protected prefixes (self-delimiting; the leading STATUS_MANIFEST code has been
+   consumed).  Returns an owned DeleteManifest, or NULL after signalling
+   STATUS_ERROR on a malformed frame. */
+DeleteManifest* receive_manifest_entries(int fd);
 /* Remove destination entries under config->receive_root_directory that are not
-   in `manifest` (bounded walk, staging-dir skip).  The caller decides WHEN to
-   run it based on the negotiated delete timing. */
-bool manifest_delete_extras(const Config* config, ArrayList* manifest);
+   in `manifest` (bounded, all-or-nothing walk; staging-dir, basis-dir and
+   protected-prefix skips).  `--max-delete` and `--force` are honored here.  The
+   caller decides WHEN to run it based on the negotiated delete timing.  Returns
+   false (and the transfer fails) when the deletion cannot be committed. */
+bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
 
 /* Outcome of a single file_save_to_disk operation.  The receiver needs to
    distinguish "written" from "skipped" so --remove-source-files can be told
