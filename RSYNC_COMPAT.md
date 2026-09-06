@@ -129,6 +129,30 @@ manifest ack. `--delete-delay` and `--delete-during` are each implemented as
 the closest safe approximation their engine mode allows; the divergences are
 noted in the rows above.
 
+Manifest size: the sender's keep-set collection (streaming or early pre-scan)
+is unbounded, but the receiver rejects any manifest beyond `MAX_MANIFEST_ENTRIES`
+(1 048 576 entries) / `MAX_MANIFEST_BYTES` (16 MB of paths) as a hard protocol
+error. In the commit modes this only means the deletion is refused after the
+data already arrived; in the NEW early modes (`--delete-before`/`--delete-during`)
+the manifest is the first frame, so an oversized keep-set now aborts the whole
+transfer BEFORE any data is sent (previously all data transferred and only the
+deletion step failed). Keep the source tree small enough for the receiver's
+manifest caps when using the early timing.
+
+Early-delete ACK wait: after committing a large deletion (up to
+`MAX_SERVER_DELETE_COUNT` unlinks) the receiver's `STATUS_OK`/`STATUS_ERROR`
+reply can legitimately take much longer than a normal round trip, so the sender
+waits for that single ACK with an extended explicit deadline (1 hour) instead
+of the default 60 s per-message receive window. A receiver that is genuinely
+gone still aborts the wait via connection close/error; the extended bound only
+protects against aborting after the deletion already committed on the receiver.
+
+Flag-conflict policy: unlike rsync's last-one-wins behaviour, every deletion
+timing flag implies `--delete`, and combining a timing flag with `--no-delete`
+(in either argument order) — or more than one timing flag — is rejected as a
+configuration error rather than silently resolved. Note the check is
+order-independent because it runs over the fully parsed config.
+
 ## 8. Metadata Preservation
 
 | Flag | Rsync Description | FastSync Status | Notes |
