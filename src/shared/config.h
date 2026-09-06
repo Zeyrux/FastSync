@@ -115,7 +115,19 @@ typedef struct Config {
   bool per_dir_filter;  /* -F: apply per-directory .rsync-filter files */
   bool prune_empty_dirs;
   bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
+  /* -R/--relative: crosses the wire; with --files-from listed entries keep
+   * their bare relative destination path (no source-root mirror prefix). */
   bool relative;
+  /* --no-implied-dirs: client-only.  With -R + --files-from, refuse to place a
+   * listed file whose ancestor directory is not itself explicitly listed. */
+  bool no_implied_dirs;
+  /* -d/--dirs: client-only.  Transfer the directory entries named by the
+   * source argument / --files-from list without recursing into contents. */
+  bool dirs;
+  /* --mkpath: crosses the wire.  Tells the server to create the destination
+   * root directory (and missing leading components below its authorized root)
+   * at connection start instead of requiring it to already exist. */
+  bool mkpath;
 
   // Issue #130: Remote shell/connection options
   char* rsh_command;
@@ -162,7 +174,7 @@ typedef struct Config {
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.6.0"
+#define PROTOCOL_VERSION "2.7.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

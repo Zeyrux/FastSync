@@ -1635,6 +1635,338 @@ class TestFilesFrom:
     transfers its whole subtree. The manifest (and thus --delete) derives from
     what was actually sent."""
 
+
+def _make_relative_source(name):
+    """A small tree used by the -R/--dirs/--no-implied-dirs tests."""
+    source = os.path.join(TEST_DATA_DIR, name)
+    clean_dir(source)
+    entries = {
+        "top.txt": b"top\n",
+        "a/b.txt": b"nested\n",
+        "sub/x.txt": b"x\n",
+        "sub/y.txt": b"y\n",
+        "dir1/keep.txt": b"dir content\n",
+    }
+    for rel, content in entries.items():
+        full = os.path.join(source, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(content)
+    return source
+
+
+def _write_rel_list(rel_text):
+    path = os.path.join(TEST_DATA_DIR, "rel_list.txt")
+    with open(path, "wb") as fh:
+        fh.write(rel_text)
+    return path
+
+
+class TestRelativeFilesFrom:
+    """-R/--relative with --files-from keeps each listed entry's bare relative
+    destination path below the destination root instead of mirroring the full
+    source path.  Without -R the layout is unchanged (full source mirror)."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_relative_files_from_keeps_relative_layout(self, shared_server, mt):
+        source = _make_relative_source("rel_src")
+        dest = os.path.join(TEST_DATA_DIR, "rel_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"top.txt\nsub/x.txt\n")
+        flags = ["--files-from", lst, "-R"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"-R files-from sync failed: {result.stderr[:200]}"
+        assert _read_file(os.path.join(dest, "sub", "x.txt")) == b"x\n", \
+            "listed file must land at <dest>/sub/x.txt"
+        assert _read_file(os.path.join(dest, "top.txt")) == b"top\n", \
+            "top-level listed file must land at <dest>/top.txt"
+        assert not os.path.exists(os.path.join(dest, "sub", "y.txt"))
+        # The source-root mirror must not be reproduced under -R.
+        assert not os.path.exists(get_dest_received_dir(dest, source)), \
+            "-R must not mirror the full source path"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_relative_without_files_from_has_no_effect(self, shared_server, mt):
+        """-R alone (no --files-from) must leave the normal full-source mirror
+        layout untouched."""
+        source = _make_relative_source("rel_only_src")
+        dest = os.path.join(TEST_DATA_DIR, "rel_only_dst")
+        clean_dir(dest)
+        flags = ["-R"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"-R alone sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing and not mismatches
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_without_relative_layout_unchanged(self, shared_server, mt):
+        source = _make_relative_source("rel_noR_src")
+        dest = os.path.join(TEST_DATA_DIR, "rel_noR_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"sub/x.txt\n")
+        flags = ["--files-from", lst] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"files-from sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
+            "without -R the full source mirror layout is preserved"
+        assert not os.path.exists(os.path.join(dest, "sub")), \
+            "bare relative layout must not appear without -R"
+
+    def test_relative_delete_manifest_stays_consistent(self):
+        """--delete derives from the sent (-R) relative paths, so a later
+        subset run removes unlisted relative entries but keeps listed ones."""
+        source = _make_relative_source("rel_del_src")
+        dest = os.path.join(TEST_DATA_DIR, "rel_del_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            lst = _write_rel_list(b"sub/x.txt\nsub/y.txt\n")
+            result, _ = run_client(source, dest, flags=["--files-from", lst, "-R"],
+                                   port=server.port)
+            assert result.returncode == 0, f"seed -R sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(dest, "sub", "y.txt"))
+
+            subset = _write_rel_list(b"sub/x.txt\n")
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", subset, "-R", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, f"-R delete sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(dest, "sub", "x.txt")), "listed file was deleted"
+            assert not os.path.exists(os.path.join(dest, "sub", "y.txt")), \
+                "unlisted relative file was not deleted"
+
+
+class TestNoImpliedDirs:
+    """--no-implied-dirs (only meaningful with -R + --files-from) refuses to
+    place a listed file whose parent directory is not itself listed."""
+
+    def _make(self):
+        return _make_relative_source("noimplied_src")
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_implied_dir_only_fails_entry(self, shared_server, mt):
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "noimplied_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"a/b.txt\n")  # "a" itself is not listed
+        flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode != 0, "implied parent directory was not rejected"
+        assert "--no-implied-dirs" in (result.stderr or result.stdout)
+        assert not os.path.exists(os.path.join(dest, "a", "b.txt"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_listed_dir_allows_file(self, shared_server, mt):
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "noimplied_ok_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"a\na/b.txt\n")
+        flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"listed dir + file sync failed: {result.stderr[:200]}"
+        assert _read_file(os.path.join(dest, "a", "b.txt")) == b"nested\n"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_no_implied_dirs_without_relative_changes_nothing(self, shared_server, mt):
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "noimplied_noR_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"a/b.txt\n")
+        flags = ["--files-from", lst, "--no-implied-dirs"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, "--no-implied-dirs without -R changed behavior"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "a", "b.txt")) == b"nested\n"
+
+
+class TestDirs:
+    """-d/--dirs (and the --old-dirs/--old-d aliases) transfer directory entries
+    without recursing into their contents."""
+
+    def _make(self):
+        return _make_relative_source("dirs_src")
+
+    def _assert_only_empty_mirror(self, dest, source):
+        mirror = get_dest_received_dir(dest, source)
+        assert os.path.isdir(mirror), "source-root mirror directory was not created"
+        files = []
+        for root, _dirs, names in os.walk(mirror):
+            files.extend(os.path.relpath(os.path.join(root, n), mirror) for n in names)
+        assert files == [], f"--dirs descended into contents: {files}"
+
+    @pytest.mark.parametrize("flag", ["--dirs", "-d", "--old-dirs", "--old-d"])
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_transfers_empty_dir_only(self, shared_server, flag, mt):
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_dst")
+        clean_dir(dest)
+        flags = [flag] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"{flag} sync failed: {result.stderr[:200]}"
+        self._assert_only_empty_mirror(dest, source)
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_with_files_from(self, shared_server, mt):
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_ff_dst")
+        clean_dir(dest)
+        # A listed directory is created empty; a listed file is transferred.
+        lst = _write_rel_list(b"dir1\nsub/x.txt\n")
+        flags = ["--files-from", lst, "--dirs", "-R"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"dirs files-from sync failed: {result.stderr[:200]}"
+        assert os.path.isdir(os.path.join(dest, "dir1")), "listed dir was not created"
+        assert not os.path.exists(os.path.join(dest, "dir1", "keep.txt")), \
+            "--dirs must not descend into a listed directory"
+        assert _read_file(os.path.join(dest, "sub", "x.txt")) == b"x\n", \
+            "listed file content was not transferred"
+        assert not os.path.exists(os.path.join(dest, "sub", "y.txt")), \
+            "unlisted file appeared"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_with_files_from_mirror_layout(self, shared_server, mt):
+        """Without -R the dirs+files-from entries still mirror the source path."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_ff_noR_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"dir1\n")
+        flags = ["--files-from", lst, "--dirs"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"dirs files-from no-R sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isdir(os.path.join(received, "dir1")), "mirrored dir entry not created"
+        assert not os.path.exists(os.path.join(received, "dir1", "keep.txt")), \
+            "--dirs must not descend into a listed directory"
+        assert not os.path.exists(os.path.join(received, "sub")), \
+            "unlisted subtree appeared"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_chunk_serialization(self, shared_server, mt):
+        """--dirs entries survive the chunk-serialization wire path (type
+        marker round-trips); a listed dir lands empty and a listed file lands
+        with content, with no protocol desync under -s -m."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_s_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"dir1\nsub/x.txt\n")
+        flags = ["--files-from", lst, "--dirs", "-R", "-s"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"dirs -s sync failed: {result.stderr[:200]}"
+        assert os.path.isdir(os.path.join(dest, "dir1")), "listed dir was not created"
+        assert not os.path.exists(os.path.join(dest, "dir1", "keep.txt")), \
+            "--dirs must not descend into a listed directory"
+        assert _read_file(os.path.join(dest, "sub", "x.txt")) == b"x\n", \
+            "listed file content was not transferred"
+
+    def test_dirs_delete_keeps_transferred_empty_dir(self):
+        """Directory entries appear in the delete manifest, so the empty dir a
+        --dirs run just created is not pruned as an extra by --delete."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_del_dst")
+        clean_dir(dest)
+        extra = os.path.join(dest, "extra.txt")
+        with open(extra, "wb") as fh:
+            fh.write(b"delete me")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["--dirs", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, f"--dirs --delete sync failed: {result.stderr[:200]}"
+            assert not os.path.exists(extra), "--delete did not remove the extra file"
+            mirror = get_dest_received_dir(dest, source)
+            assert os.path.isdir(mirror), "transferred empty dir was pruned as an extra"
+            files = []
+            for root, _dirs, names in os.walk(mirror):
+                files.extend(os.path.relpath(os.path.join(root, n), mirror) for n in names)
+            assert files == [], f"--dirs descended into contents: {files}"
+
+    def test_dirs_listed_dir_colliding_with_file_fails(self, shared_server):
+        """A listed directory that already exists as a regular file at the
+        destination fails the transfer cleanly instead of clobbering the file."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_coll_dst")
+        clean_dir(dest)
+        blocker = os.path.join(dest, "dir1")
+        with open(blocker, "wb") as fh:
+            fh.write(b"blocking file")
+        lst = _write_rel_list(b"dir1\n")
+        result, _ = run_client(source, dest, flags=["--files-from", lst, "--dirs", "-R"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "dir entry over an existing file did not fail"
+        assert os.path.isfile(blocker), "blocking regular file was clobbered"
+
+
+class TestMkpath:
+    """--mkpath tells the server to create the destination root directory (and
+    missing leading components) when it does not exist yet; without it a missing
+    destination root fails the transfer."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_missing_root_fails_without_mkpath(self, mt):
+        source = _make_relative_source("mkpath_fail_src")
+        dest = os.path.join(TEST_DATA_DIR, "mkpath_missing_dst")
+        shutil.rmtree(dest, ignore_errors=True)
+        with ServerManager() as server:
+            server.start()
+            flags = ["-m"] if mt else []
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode != 0, "missing destination root did not fail without --mkpath"
+            assert not os.path.exists(dest), "missing root was created without --mkpath"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_mkpath_creates_missing_root(self, mt):
+        source = _make_relative_source("mkpath_ok_src")
+        dest = os.path.join(TEST_DATA_DIR, "deep", "mkpath_dst")
+        shutil.rmtree(os.path.join(TEST_DATA_DIR, "deep"), ignore_errors=True)
+        with ServerManager() as server:
+            server.start()
+            flags = ["--mkpath"] + (["-m"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"--mkpath sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
+                "file not transferred into the --mkpath-created root"
+
+    @pytest.mark.parametrize("mkpath", [False, True])
+    def test_existing_dest_with_trailing_slash(self, shared_server, mkpath):
+        """A destination root written with a trailing slash must keep working:
+        an existing root is accepted both with and without --mkpath."""
+        source = _make_relative_source("mkpath_trail_src")
+        dest = os.path.join(TEST_DATA_DIR, "mkpath_trail_dst")
+        clean_dir(dest)
+        dest_slash = dest + "/"
+        flags = ["--mkpath"] if mkpath else []
+        result, _ = run_client(source, dest_slash, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"trailing-slash dest sync (mkpath={mkpath}) failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
+            "file not transferred into the trailing-slash destination root"
+
+    @pytest.mark.parametrize("mkpath", [False, True])
+    def test_dest_equal_authorized_root(self, mkpath):
+        """A destination that is exactly the server's authorized root works
+        without --mkpath, and with --mkpath creates no stray <root>/<basename>
+        nested directory."""
+        root = os.path.join(TEST_DATA_DIR, "mkpath_eq_root")
+        clean_dir(root)
+        source = _make_relative_source("mkpath_eq_src")
+        with ServerManager() as server:
+            server.start(extra_args=["--destination-root", root])
+            flags = ["--mkpath"] if mkpath else []
+            result, _ = run_client(source, root, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"dest==authorized-root sync (mkpath={mkpath}) failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(root, source)
+            assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
+                "file not transferred when the dest equals the authorized root"
+            basename = os.path.basename(root.rstrip(os.sep))
+            assert not os.path.exists(os.path.join(root, basename)), \
+                "--mkpath created a spurious nested <root>/<basename> directory"
+
+
 class TestFilters:
     """--filter/-C/-F rule layer: excludes prune, ordering is first-match-wins,
     the default with no matching rule is include, and legacy --exclude remains

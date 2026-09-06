@@ -133,7 +133,8 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
   if (!receive_status(file_descriptor, &status))
     return -1;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
-         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
+         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
+         status == STATUS_MKDIR) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
         return -1;
@@ -156,6 +157,10 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
       if (!receiver_process_batch(config, file_descriptor))
         return -1;
       goto next;
+    } else if (status == STATUS_MKDIR) {
+      File* dir = file_receive_directory(file_descriptor);
+      if (!dir || !sink->store_file(dir, sink->context))
+        goto receive_error;
     } else {
       File* file = file_receive(config, file_descriptor);
       if (!file) {
@@ -208,7 +213,7 @@ static bool receiver_save_file(File* file, void* context_pointer) {
   } else {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
   }
-  if (result != FILE_SAVE_ERROR && context->config->remove_source_files &&
+  if (result != FILE_SAVE_ERROR && context->config->remove_source_files && !file->is_dir &&
       !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
     file_destroy(file);
     return false;

@@ -425,8 +425,11 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
     {"--delay-updates", NULL, OPT_FLAG, offsetof(Config, delay_updates)},
     {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
-    {"--dirs", "--old-dirs", OPT_UNSUPPORTED, 0},
-    {"--old-d", NULL, OPT_UNSUPPORTED, 0},
+    {"--dirs", "-d", OPT_FLAG, offsetof(Config, dirs)},
+    {"--old-dirs", NULL, OPT_FLAG, offsetof(Config, dirs)},
+    {"--old-d", NULL, OPT_FLAG, offsetof(Config, dirs)},
+    {"--relative", "-R", OPT_FLAG, offsetof(Config, relative)},
+    {"--mkpath", NULL, OPT_FLAG, offsetof(Config, mkpath)},
     {"--delete-during", "--del", OPT_UNSUPPORTED, 0},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
@@ -576,9 +579,7 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     return 0;
   }
   case OPT_UNSUPPORTED: {
-    const char* reason = "directory-only transfer is not implemented";
-    if (strcmp(entry->name, "--delete-during") == 0)
-      reason = "delete-during is not implemented";
+    const char* reason = "delete-during is not implemented";
     log_message(LOG_LEVEL_ERROR, "%s: %s; refusing to ignore option", option_name, reason);
     return -1;
   }
@@ -609,6 +610,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     if (strcmp(argv[i], "-P") == 0) {
       config->partial = true;
       config->show_progress = true;
+      continue;
+    }
+    /* "--no-implied-dirs" is a real rsync option name, not a negation of
+     * "--implied-dirs", so it must be handled before the generic --no-*
+     * negation branch. */
+    if (strcmp(argv[i], "--no-implied-dirs") == 0) {
+      config->no_implied_dirs = true;
       continue;
     }
     if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {

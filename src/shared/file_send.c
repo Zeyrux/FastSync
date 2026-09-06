@@ -41,7 +41,7 @@ bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_
     }
     data_to_send = compressed_data;
   }
-  if (send_path && !send_str(file_descriptor, file->path)) {
+  if (send_path && !send_str(file_descriptor, file_wire_path(file))) {
     data_destroy(compressed_data);
     return false;
   }
@@ -73,7 +73,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
                                             send_path, skip_suffixes, skip_count,
                                             compression_threads);
 
-  if (send_path && !send_str(file_descriptor, file->path))
+  if (send_path && !send_str(file_descriptor, file_wire_path(file)))
     return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
     return false;

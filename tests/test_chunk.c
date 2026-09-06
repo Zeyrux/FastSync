@@ -89,7 +89,78 @@ static void test_chunk_operations() {
   unlink(path2);
 }
 
+/* A chunk mixing a regular file and an explicit directory entry (--dirs, with
+ * or without metadata) must round-trip through serialize/deserialize with the
+ * is_dir flag and the entry type marker preserved. */
+static void test_chunk_dir_entry_roundtrip() {
+  const char* file_path = "temp_chunk_dir_file.txt";
+  const char* dir_path = "temp_chunk_dir_entry";
+  const char* content = "regular file payload";
+
+  /* A failed earlier run can leave artifacts behind; start clean. */
+  rmdir(dir_path);
+  unlink(file_path);
+
+  file_write_to_disk(file_path, content, strlen(content), false, false);
+  EXPECT_EQ_INT(mkdir(dir_path, 0755), 0);
+
+  for (int use_metadata = 0; use_metadata <= 1; use_metadata++) {
+    struct stat st;
+    EXPECT_EQ_INT(stat(file_path, &st), 0);
+
+    File* reg = file_create(file_path);
+    EXPECT_NOT_NULL(reg);
+    reg->data->size = (unsigned long long)st.st_size;
+    EXPECT_TRUE(file_load_data(reg));
+
+    File* dir = file_create(dir_path);
+    EXPECT_NOT_NULL(dir);
+    dir->is_dir = true;
+
+    if (use_metadata) {
+      reg->metadata = file_metadata_create(&st);
+      EXPECT_NOT_NULL(reg->metadata);
+      struct stat dst;
+      EXPECT_EQ_INT(stat(dir_path, &dst), 0);
+      dir->metadata = file_metadata_create(&dst);
+      EXPECT_NOT_NULL(dir->metadata);
+    }
+
+    File* files[2] = {reg, dir};
+    Chunk* chunk = chunk_create(files, 2);
+    EXPECT_NOT_NULL(chunk);
+
+    Data* serialized = chunk_serialize(chunk, use_metadata != 0);
+    EXPECT_NOT_NULL(serialized);
+    Chunk* deserialized = chunk_deserialize(serialized, use_metadata != 0);
+    EXPECT_NOT_NULL(deserialized);
+    EXPECT_EQ_INT(deserialized->element_count, 2);
+    EXPECT_FALSE(deserialized->items[0]->is_dir);
+    EXPECT_EQ_STR(deserialized->items[0]->path, file_path);
+    EXPECT_EQ_INT((int)deserialized->items[0]->data->size, (int)strlen(content));
+    EXPECT_EQ_INT(memcmp(deserialized->items[0]->data->data, content, strlen(content)), 0);
+    EXPECT_TRUE(deserialized->items[1]->is_dir);
+    EXPECT_EQ_STR(deserialized->items[1]->path, dir_path);
+    EXPECT_EQ_INT((int)deserialized->items[1]->data->size, 0);
+    if (use_metadata) {
+      EXPECT_NOT_NULL(deserialized->items[0]->metadata);
+      EXPECT_NOT_NULL(deserialized->items[1]->metadata);
+    } else {
+      EXPECT_NULL(deserialized->items[0]->metadata);
+      EXPECT_NULL(deserialized->items[1]->metadata);
+    }
+
+    data_destroy(serialized);
+    chunk_destroy(deserialized);
+    chunk_destroy(chunk); /* frees reg and dir */
+  }
+
+  unlink(file_path);
+  rmdir(dir_path);
+}
+
 void test_chunk() {
   test_file_operations();
   test_chunk_operations();
+  test_chunk_dir_entry_roundtrip();
 }

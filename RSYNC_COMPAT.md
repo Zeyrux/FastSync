@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 63 | Feature works end-to-end |
+| ✅ Implemented | 67 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 75 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 71 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
@@ -72,10 +72,10 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
 | `-r`, `--recursive` | Recurse into directories | ✅ Implemented | Default behavior |
-| `-R`, `--relative` | Use relative path names | ❌ Not Implemented | Removed because it had no effect |
-| `--no-implied-dirs` | Don't send implied dirs with -R | ❌ Not Implemented | |
-| `-d`, `--dirs`, `--old-dirs`, `--old-d` | Transfer dirs without recursing | ❌ Not Implemented | The aliases are recognized and rejected explicitly; they depend on the unimplemented `--dirs` behavior |
-| `--mkpath` | Create missing path components | ❌ Not Implemented | |
+| `-R`, `--relative` | Use relative path names | ✅ Implemented | Meaningful together with `--files-from` (FastSync's default full-tree scan always mirrors the full source argument path below the destination root, so -R does not change it). With `-R` + `--files-from` each listed entry is transmitted under its bare relative destination path: an entry `sub/x.txt` lands at `<dest>/sub/x.txt` (its leading components preserved) instead of under the `<dest>/<full source path>` mirror. Only the path sent on the wire changes; the client still reads the absolute source path, and the delete manifest derives from the sent (relative) paths so `--delete` and `--remove-source-files` stay consistent in both layouts. Works single-threaded and under `-m` (including chunk serialization) |
+| `--no-implied-dirs` | Don't send implied dirs with -R | ✅ Implemented | Client-side, meaningful only with `-R` + `--files-from`. rsync would normally create the ancestor directories implied by a listed file so it can be written; with `--no-implied-dirs` a listed file whose parent directory is not itself (or via an ancestor) explicitly listed cannot be placed, and FastSync fails the whole run up front with a clear error (`--no-implied-dirs: cannot place file '...': parent directory '...' is not explicitly listed`). Listing the directory (or an ancestor of it, or the whole tree `.`) permits the file. In every other mode the option has no effect. FastSync has no per-entry skip channel, so the rsync "omit the file" case is surfaced as a hard pre-transfer error |
+| `-d`, `--dirs`, `--old-dirs`, `--old-d` | Transfer dirs without recursing | ✅ Implemented | `-d <dir>` transmits an explicit directory entry for the source-root directory, so the destination mirror is created empty and nothing is descended into. With `--files-from` exactly the listed items are transferred: a listed directory is created empty (no descent) and a listed file is transferred with its content; the dest layout follows the same -R rules as plain files. A new wire frame (`STATUS_MKDIR`) carries each directory entry (path only); the receiver creates it with the same confined mkdir-parent semantics as regular writes, in single-threaded and `-m` receivers (chunk serialization carries a per-entry type marker). Directory entries appear in the delete manifest so `--delete` prunes correctly. FastSync divergences: directory mtimes/modes are not transmitted, filter/`--exclude` rules are not re-applied to the listed dirs mode (there is no descent during which they would apply), and `-d` never creates the intermediate directories between the destination root and a listed file beyond the usual on-demand parent creation. Under `--delay-updates` only regular files are staged: directory entries are created immediately, so a delayed run that fails part way can leave the already-created empty directories behind (matching rsync, which also creates directories as it processes the file list and only delays regular-file data) |
+| `--mkpath` | Create missing path components | ✅ Implemented | Wire option (client → server). At connection start the server creates the client's destination root directory (and any missing leading components below its own authorized root) when `--mkpath` is set, failing the connection cleanly if it cannot. Without `--mkpath` a destination root that does not exist yet is rejected up front (rsync semantics), so the flag is the only way to transfer into a not-yet-created destination directory. Creation is confined by the same secure mkdir walk as file writes (`O_NOFOLLOW`, no `..`) |
 
 ## 5. Transfer Modifications
 

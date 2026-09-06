@@ -8,6 +8,7 @@
 /* Server-side file receive/save path. */
 
 File* file_receive(const Config* config, int file_descriptor);
+File* file_receive_directory(int file_descriptor);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 int receive_manifest(int fd, const Config* config, int* next_status);
 

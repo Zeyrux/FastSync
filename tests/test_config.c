@@ -137,6 +137,8 @@ static void test_config_send_receive() {
   send_cfg->existing = true;
   send_cfg->ignore_existing = true;
   send_cfg->delay_updates = true;
+  send_cfg->relative = true;
+  send_cfg->mkpath = true;
   send_cfg->skip_compress_set = true;
   send_cfg->skip_compress_count = 1;
   send_cfg->skip_compress_suffixes = calloc(1, sizeof(char*));
@@ -193,6 +195,10 @@ static void test_config_send_receive() {
       if (!recv_cfg->ignore_existing)
         ok = false;
       if (!recv_cfg->delay_updates)
+        ok = false;
+      if (!recv_cfg->relative)
+        ok = false;
+      if (!recv_cfg->mkpath)
         ok = false;
       if (!recv_cfg->skip_compress_set || recv_cfg->skip_compress_count != 1 ||
           strcmp(recv_cfg->skip_compress_suffixes[0], ".zip") != 0)

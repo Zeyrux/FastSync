@@ -17,9 +17,24 @@ typedef struct {
 
 typedef struct {
   char* path;
+  /* Sender-side override for the path transmitted on the wire (and used for
+   * the delete manifest / change output).  NULL means "use `path`".  With
+   * -R + --files-from this holds the entry's bare relative destination path,
+   * while `path` stays the absolute local source path the client reads from.
+   * Never populated on the receiver. */
+  char* send_path;
   Data* data;
   FileMetadata* metadata;
   bool skip;
+  /* True when this entry is an explicit directory entry (--dirs mode): the
+   * receiver creates the directory instead of writing a regular file. */
+  bool is_dir;
 } File;
+
+/* The path that should be sent on the wire and used for the receiver-side
+ * destination layout (see send_path). */
+static inline const char* file_wire_path(const File* file) {
+  return file && file->send_path ? file->send_path : (file ? file->path : NULL);
+}
 
 #endif

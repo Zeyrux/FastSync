@@ -886,6 +886,42 @@ static void test_inplace_overwrite_truncates_shorter_payload() {
   rmdir(root);
 }
 
+/* Explicit directory entries (--dirs) create the directory under the receive
+   root through the same save funnel, creating parents as needed, and reject
+   traversal the same way a file path does. */
+static void test_dir_entry_save_to_disk() {
+  const char* root = "test_dir_entry_root";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+
+  File* dir = file_create("alpha/beta/gamma");
+  EXPECT_NOT_NULL(dir);
+  dir->is_dir = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, dir, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, dir, config), FILE_SAVE_WRITTEN);
+  file_destroy(dir);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat("test_dir_entry_root/alpha/beta/gamma", &st), 0);
+  EXPECT_TRUE(S_ISDIR(st.st_mode));
+
+  /* The directory-entry save path never follows or escapes. */
+  File* evil = file_create("../dir_entry_escape");
+  EXPECT_NOT_NULL(evil);
+  evil->is_dir = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, evil, config), FILE_SAVE_ERROR);
+  file_destroy(evil);
+  EXPECT_EQ_INT(lstat("../dir_entry_escape", &st), -1);
+
+  config_delete(config);
+  rmdir("test_dir_entry_root/alpha/beta/gamma");
+  rmdir("test_dir_entry_root/alpha/beta");
+  rmdir("test_dir_entry_root/alpha");
+  rmdir(root);
+}
+
 void test_file() {
   test_file_create();
   test_file_destroy_null();
@@ -906,6 +942,7 @@ void test_file() {
   test_file_content_to_buffer();
   test_file_save_to_disk_path_traversal();
   test_file_save_to_disk_deep_traversal();
+  test_dir_entry_save_to_disk();
   if (!is_running_under_valgrind()) {
     // Fork tests are skipped under valgrind because the parent process runs
     // orders of magnitude slower than the child (parent is instrumented, child

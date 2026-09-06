@@ -102,6 +102,9 @@ static void config_set_defaults(Config* config) {
   config->prune_empty_dirs = false;
   config->one_file_system = false;
   config->relative = false;
+  config->no_implied_dirs = false;
+  config->dirs = false;
+  config->mkpath = false;
   config->rsh_command = NULL;
   config->rsync_path = NULL;
   config->old_args = false;
@@ -159,7 +162,8 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
-         valid_wire_bool(config->delay_updates) && !(config->delay_updates && config->inplace) &&
+         valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
+         !(config->delay_updates && config->inplace) &&
          !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
@@ -307,7 +311,7 @@ static bool send_selection_options(int fd, const Config* c) {
          send_int(fd, c->use_fsync) && send_int(fd, c->append_verify) &&
          send_int(fd, c->delete_excluded) && send_int(fd, c->delete_after) &&
          send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
-         send_int(fd, c->prune_empty_dirs);
+         send_int(fd, c->prune_empty_dirs) && send_int(fd, c->mkpath);
 }
 
 static bool send_skip_compress_options(int fd, const Config* c) {
@@ -411,6 +415,8 @@ static bool receive_selection_options(int fd, Config* c) {
   if (!receive_wire_bool(fd, &c->relative))
     return false;
   if (!receive_wire_bool(fd, &c->prune_empty_dirs))
+    return false;
+  if (!receive_wire_bool(fd, &c->mkpath))
     return false;
   return true;
 }

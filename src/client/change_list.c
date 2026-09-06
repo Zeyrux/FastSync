@@ -289,7 +289,10 @@ void change_emit_file_sent(const Config* config, const File* file) {
     return;
   ChangeEvent event;
   memset(&event, 0, sizeof(event));
-  event.path = file->path;
+  /* The displayed path is the one transmitted (with -R + --files-from this is
+     the bare relative destination path); the metadata fallback below still
+     stats the local absolute path. */
+  event.path = file_wire_path(file);
   event.decision = CHANGE_SENT;
   event.is_directory = false;
   event.size = file->data != NULL ? file->data->size : 0;
@@ -306,5 +309,21 @@ void change_emit_file_sent(const Config* config, const File* file) {
     if (file->path != NULL && stat(file->path, &st) == 0)
       event.mtime_sec = st.st_mtime;
   }
+  change_emit(config, &event);
+}
+
+/* Build and emit a CHANGE_SENT event for an explicit directory entry (-d). */
+void change_emit_dir_sent(const Config* config, const File* file) {
+  if (file == NULL || !change_list_enabled(config))
+    return;
+  ChangeEvent event;
+  memset(&event, 0, sizeof(event));
+  event.path = file_wire_path(file);
+  event.decision = CHANGE_SENT;
+  event.is_directory = true;
+  event.size = 0;
+  event.bytes_sent = 0;
+  if (file->metadata != NULL)
+    event.mtime_sec = file->metadata->mtime_sec;
   change_emit(config, &event);
 }
