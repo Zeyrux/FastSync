@@ -773,11 +773,19 @@ static size_t fuzzy_edit_distance(FuzzyEditBuffer* buf, const char* a, size_t la
   size_t p = 0;
   while (p < la && p < lb && a[p] == b[p])
     p++;
-  size_t s = 0;
-  while (s < la - p && s < lb - p && a[la - 1 - s] == b[lb - 1 - s])
-    s++;
-  size_t ma = la - p - s;
-  size_t mb = lb - p - s;
+  /* Trim the common suffix (never overlapping the prefix).  Working with two
+     moving end indices keeps the region arithmetic explicit and safe. */
+  size_t ae = la;
+  size_t be = lb;
+  while (ae > p && be > p && a[ae - 1] == b[be - 1]) {
+    ae--;
+    be--;
+  }
+  size_t ma = ae - p;
+  size_t mb = be - p;
+  /* cppcheck-suppress knownConditionTrueFalse -- the prefix/suffix trims above
+     only run while the corresponding ends match, so a middle can remain; the
+     analysis unsoundly concludes the trims always consume everything. */
   if (ma == 0)
     return mb;
   if (mb == 0)
