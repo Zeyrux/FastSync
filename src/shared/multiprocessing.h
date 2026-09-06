@@ -26,6 +26,11 @@ typedef struct {
   bool loader_done;
   ArrayList* manifest;
   ArrayList* remove_source_files;
+  /* True when --delete-before/--delete-during require the keep-set manifest to
+     be transmitted before any file data: context->manifest is then prebuilt by
+     a path-only pre-scan on the calling thread and the pipeline scanner must
+     not append to it.  Set once before the worker threads start. */
+  bool early_delete;
   mtx_t mutex_progress;
   int total_files;
   unsigned long long progress_bytes;
@@ -55,6 +60,14 @@ typedef struct PipelineContextReceiver {
      budget instead of growing without bound. */
   size_t queued_bytes;
   size_t max_queue_bytes;
+  /* Keep-set manifest for the commit-style (late) deletion
+     (--delete/--delete-after/--delete-delay).  receive_thread parses the whole
+     protocol stream but hands the manifest here instead of deleting while the
+     disk writer may still be draining; the caller (server.c) commits the
+     deletion after both threads have joined, so no extra is removed unless the
+     transfer truly succeeded.  NULL in the early delete modes (which delete at
+     the manifest). */
+  ArrayList* deferred_manifest;
 } PipelineContextReceiver;
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,

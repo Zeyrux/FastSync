@@ -438,6 +438,129 @@ static void test_config_delay_updates_reserved_backup_rejected() {
   config_delete(c);
 }
 
+static void test_config_delete_timing_early_helper() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_has_valid_delete_timing(cfg));
+  cfg->use_delete = true;
+  EXPECT_TRUE(config_has_valid_delete_timing(cfg));
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  cfg->use_delete = true;
+  cfg->delete_before = true;
+  EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_has_valid_delete_timing(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  cfg->use_delete = true;
+  cfg->delete_during = true;
+  EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_has_valid_delete_timing(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  cfg->use_delete = true;
+  cfg->delete_delay = true;
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_has_valid_delete_timing(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  cfg->use_delete = true;
+  cfg->delete_after = true;
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_has_valid_delete_timing(cfg));
+  config_delete(cfg);
+
+  /* Two simultaneous timings are invalid. */
+  cfg = config_create();
+  cfg->use_delete = true;
+  cfg->delete_before = true;
+  cfg->delete_after = true;
+  EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_has_valid_delete_timing(cfg));
+  config_delete(cfg);
+
+  /* A timing flag without deletion is invalid. */
+  cfg = config_create();
+  cfg->delete_delay = true;
+  EXPECT_FALSE(config_has_valid_delete_timing(cfg));
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  config_delete(cfg);
+}
+
+/* New delete-timing fields must survive config_send/config_receive unchanged,
+   and a config carrying two conflicting timings must be rejected. */
+static void test_config_delete_timing_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+
+  struct {
+    bool before, during, delay, after;
+  } cases[] = {
+      {false, false, false, false}, {true, false, false, false}, {false, true, false, false},
+      {false, false, true, false},  {false, false, false, true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL;
+      if (ok) {
+        ok = recv->use_delete && recv->delete_before == cases[i].before &&
+             recv->delete_during == cases[i].during && recv->delete_delay == cases[i].delay &&
+             recv->delete_after == cases[i].after;
+      }
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->use_delete = true;
+      send_cfg->delete_before = cases[i].before;
+      send_cfg->delete_during = cases[i].during;
+      send_cfg->delete_delay = cases[i].delay;
+      send_cfg->delete_after = cases[i].after;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
+/* The receiver-side wire validation rejects a keep-set config with two
+   conflicting delete-timing flags. */
+static void test_config_delete_timing_conflict_rejected() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->use_delete = true;
+  c->delete_before = true;
+  c->delete_delay = true;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
 static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
@@ -474,6 +597,9 @@ void test_config() {
     test_config_string_null_vs_empty_roundtrip();
     test_config_temp_dir_roundtrip();
     test_config_delay_updates_reserved_backup_rejected();
+    test_config_delete_timing_wire_roundtrip();
+    test_config_delete_timing_conflict_rejected();
   }
+  test_config_delete_timing_early_helper();
   test_config_is_remote_dest();
 }

@@ -412,6 +412,25 @@ static void test_protocol_accounting_release_does_not_underflow() {
   protocol_session_unbind();
 }
 
+static void test_send_receive_status_timed() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  /* The extended-deadline variant must read an ordinary status just like the
+     default window, and must fail cleanly on EOF rather than block. */
+  EXPECT_TRUE(send_status(0, STATUS_OK));
+  Status received = -1;
+  EXPECT_TRUE(receive_status_timed(0, &received, 5));
+  EXPECT_EQ_INT((int)received, (int)STATUS_OK);
+
+  close(p[1]);
+  EXPECT_FALSE(receive_status_timed(0, &received, 5));
+
+  close(p[0]);
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -421,6 +440,7 @@ void test_protocol() {
   test_send_receive_data();
   test_send_receive_int();
   test_send_receive_status();
+  test_send_receive_status_timed();
   test_receive_n_data_truncated();
   test_receive_str_truncated();
   test_max_alloc_rejects_single_buffer();

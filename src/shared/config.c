@@ -115,6 +115,8 @@ static void config_set_defaults(Config* config) {
   config->partial_dir = NULL;
   config->suffix = NULL;
   config->delete_before = false;
+  config->delete_during = false;
+  config->delete_delay = false;
   config->address = NULL;
   config->bind_address = NULL;
   config->ipv6 = false;
@@ -161,12 +163,14 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
          valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
+         valid_wire_bool(config->delete_delay) && valid_wire_bool(config->delete_during) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
          !(config->delay_updates && config->inplace) &&
          !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
+         config_has_valid_delete_timing(config) &&
          !(config->skip_compress_set && config->use_chunk_serialization) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
@@ -186,6 +190,26 @@ Config* config_create(void) {
     return NULL;
   config_set_defaults(config);
   return config;
+}
+
+bool config_delete_timing_early(const Config* config) {
+  if (!config)
+    return false;
+  return config->delete_before || config->delete_during;
+}
+
+/* A delete-timing flag is only meaningful together with --delete.  At most one
+   of the four flags may be set; several simultaneous timings are a client bug
+   and are rejected on both ends. */
+bool config_has_valid_delete_timing(const Config* config) {
+  if (!config)
+    return false;
+  if (!config->use_delete)
+    return !config->delete_before && !config->delete_during && !config->delete_delay &&
+           !config->delete_after;
+  int timing_count = (config->delete_before ? 1 : 0) + (config->delete_during ? 1 : 0) +
+                     (config->delete_delay ? 1 : 0) + (config->delete_after ? 1 : 0);
+  return timing_count <= 1;
 }
 
 bool config_is_remote_dest(const char* s) {
@@ -311,7 +335,8 @@ static bool send_selection_options(int fd, const Config* c) {
          send_int(fd, c->use_fsync) && send_int(fd, c->append_verify) &&
          send_int(fd, c->delete_excluded) && send_int(fd, c->delete_after) &&
          send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
-         send_int(fd, c->prune_empty_dirs) && send_int(fd, c->mkpath);
+         send_int(fd, c->prune_empty_dirs) && send_int(fd, c->mkpath) &&
+         send_int(fd, c->delete_during) && send_int(fd, c->delete_delay);
 }
 
 static bool send_skip_compress_options(int fd, const Config* c) {
@@ -418,7 +443,9 @@ static bool receive_selection_options(int fd, Config* c) {
     return false;
   if (!receive_wire_bool(fd, &c->mkpath))
     return false;
-  return true;
+  if (!receive_wire_bool(fd, &c->delete_during))
+    return false;
+  return receive_wire_bool(fd, &c->delete_delay);
 }
 
 static bool receive_resume_options(int fd, Config* c) {

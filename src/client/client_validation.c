@@ -71,5 +71,11 @@ bool validate_config(const Config* config) {
                 "staging directory)");
     return false;
   }
+  if (!config_has_valid_delete_timing(config)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--delete-before/--delete-during/--delete-delay/--delete-after select the delete "
+                "timing; at most one may be given and each implies --delete");
+    return false;
+  }
   return true;
 }

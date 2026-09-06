@@ -370,7 +370,6 @@ typedef enum {
   OPT_POS_INT,
   OPT_NONNEG_INT,
   OPT_ULL,
-  OPT_UNSUPPORTED,
 } OptKind;
 
 typedef struct {
@@ -430,7 +429,10 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--old-d", NULL, OPT_FLAG, offsetof(Config, dirs)},
     {"--relative", "-R", OPT_FLAG, offsetof(Config, relative)},
     {"--mkpath", NULL, OPT_FLAG, offsetof(Config, mkpath)},
-    {"--delete-during", "--del", OPT_UNSUPPORTED, 0},
+    {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
+    {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
+    {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
+    {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -547,8 +549,7 @@ static int apply_negation(Config* config, const char* arg) {
   return 0;
 }
 
-static int apply_table_option(Config* config, const OptionEntry* entry, const char* option_name,
-                              const char* value) {
+static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
   if (entry->kind == OPT_NOOP)
     return 0;
   void* field = (char*)config + entry->offset;
@@ -577,11 +578,6 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     }
     *(unsigned long long*)field = v;
     return 0;
-  }
-  case OPT_UNSUPPORTED: {
-    const char* reason = "delete-during is not implemented";
-    log_message(LOG_LEVEL_ERROR, "%s: %s; refusing to ignore option", option_name, reason);
-    return -1;
   }
   }
   return -1;
@@ -665,23 +661,20 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     if (!entry)
       entry = find_table_option_with_equals(argv[i], &inline_value);
     if (entry) {
-      const char* option_name = argv[i];
       const char* value = NULL;
       if (entry->kind != OPT_FLAG) {
-        if (entry->kind != OPT_UNSUPPORTED) {
-          value = inline_value;
-          if (!value && i + 1 < argc)
-            value = argv[++i];
-          if (!value) {
-            log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
-            return -1;
-          }
+        value = inline_value;
+        if (!value && i + 1 < argc)
+          value = argv[++i];
+        if (!value) {
+          log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
+          return -1;
         }
         if (strcmp(entry->name, "--compress-choice") == 0) {
           if (set_compression_choice(config, value) != 0)
             return -1;
         } else {
-          if (apply_table_option(config, entry, option_name, value) != 0)
+          if (apply_table_option(config, entry, value) != 0)
             return -1;
           if (strcmp(entry->name, "--compress-level") == 0 &&
               (config->compression_level < 1 || config->compression_level > 22)) {
@@ -697,11 +690,18 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
             config->use_metadata = true;
           }
         }
-      } else if (apply_table_option(config, entry, option_name, NULL) != 0) {
+      } else if (apply_table_option(config, entry, NULL) != 0) {
         return -1;
       }
       if (entry->offset == offsetof(Config, eight_bit_output))
         protocol_set_8_bit_output(true);
+      /* A delete-timing flag selects when --delete removes extras, so it
+         implies --delete exactly like the rsync options do. */
+      if (entry->offset == offsetof(Config, delete_before) ||
+          entry->offset == offsetof(Config, delete_during) ||
+          entry->offset == offsetof(Config, delete_delay) ||
+          entry->offset == offsetof(Config, delete_after))
+        config->use_delete = true;
       continue;
     }
 

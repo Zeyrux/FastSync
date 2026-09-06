@@ -27,6 +27,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->loader_done = false;
   context->manifest = NULL;
   context->remove_source_files = NULL;
+  context->early_delete = false;
   context->total_files = 0;
   context->progress_bytes = 0;
   context->total_bytes = 0;
@@ -113,6 +114,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->receiver_done = false;
   context->queued_bytes = 0;
   context->max_queue_bytes = 0;
+  context->deferred_manifest = NULL;
   atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
@@ -141,6 +143,8 @@ fail:
 
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   config_delete(context->config);
+  if (context->deferred_manifest)
+    array_list_delete(context->deferred_manifest);
   queue_destroy(context->queue);
   receiver_outcomes_destroy(&context->outcomes);
   mtx_destroy(&context->mutex);
@@ -236,7 +240,8 @@ int receive_thread(void* pipeline_context) {
   mtx_unlock(&context->mutex);
 
   ReceiverSink sink = {receiver_enqueue_file, context, false, false, NULL};
-  if (receiver_process((Config*)config, file_descriptor, &sink) != 0) {
+  if (receiver_process_pending((Config*)config, file_descriptor, &sink,
+                               &context->deferred_manifest) != 0) {
     receiver_thread_fail(context);
     protocol_session_unbind();
     return thrd_error;

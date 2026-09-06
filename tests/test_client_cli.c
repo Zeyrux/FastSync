@@ -595,8 +595,9 @@ static void test_parse_args_relative_no_implied_mkpath() {
   config_delete(cfg);
 }
 
-/* --del is recognized as the rsync alias, but its timing mode is not implemented. */
-static void test_parse_args_delete_during_alias_unimplemented() {
+/* --del is accepted as the rsync alias for --delete-during: it enables
+ * deletion with the during (early) timing. */
+static void test_parse_args_delete_during_alias() {
   static const char* const options[] = {"--del", "--delete-during"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
@@ -605,10 +606,79 @@ static void test_parse_args_delete_during_alias_unimplemented() {
     int positional_args[2];
     int positional_count = 0;
 
-    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-    EXPECT_FALSE(cfg->use_delete);
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->use_delete);
+    EXPECT_TRUE(cfg->delete_during);
+    EXPECT_FALSE(cfg->delete_before);
+    EXPECT_FALSE(cfg->delete_delay);
+    EXPECT_FALSE(cfg->delete_after);
     config_delete(cfg);
   }
+}
+
+/* Each rsync deletion-timing flag is accepted and implies --delete. */
+static void test_parse_args_delete_timing_flags() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delete-before", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_before);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_after[] = {"fastsync", "--delete-after", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_after, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_before);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_delay[] = {"fastsync", "--delete-delay", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_delay, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_delay);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_after);
+  config_delete(cfg);
+}
+
+/* Two different delete-timing flags on one command line are a conflict, not a
+ * silent last-one-wins choice. */
+static void test_parse_args_delete_timing_conflict_rejected() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delete-before", "--delete-after", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--delete-during", "--delete-delay", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+/* A timing flag whose --delete was then negated away must be rejected: timing
+ * without deletion is meaningless. */
+static void test_parse_args_delete_timing_without_delete_rejected() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delete-before", "--no-delete", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_before);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
 }
 
 /* Parsed-but-unimplemented options must fail instead of being silently accepted. */
@@ -626,7 +696,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--append",
                                         "--append-verify",
                                         "--delete-excluded",
-                                        "--delete-after",
                                         "--max-delete",
                                         "--prune-empty-dirs",
                                         "-e",
@@ -635,7 +704,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--compare-dest",
                                         "--copy-dest",
                                         "--link-dest",
-                                        "--delete-before",
                                         "--address",
                                         "--bind-address",
                                         "--ipv6",
@@ -1542,7 +1610,10 @@ void test_client_cli() {
   test_parse_args_unknown_option();
   test_parse_args_dirs_aliases();
   test_parse_args_relative_no_implied_mkpath();
-  test_parse_args_delete_during_alias_unimplemented();
+  test_parse_args_delete_during_alias();
+  test_parse_args_delete_timing_flags();
+  test_parse_args_delete_timing_conflict_rejected();
+  test_parse_args_delete_timing_without_delete_rejected();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();

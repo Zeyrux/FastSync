@@ -24,6 +24,19 @@ void print_usage(void) {
   printf("  -P                  Partial mode with progress (retention incomplete)\n");
   printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");
   printf("  --delete            Delete files on receiver not in source\n");
+  printf("                      (default timing: delete only after the whole\n");
+  printf("                      transfer has succeeded)\n");
+  printf("  --delete-before     Delete extras before the transfer starts\n");
+  printf("                      (implies --delete)\n");
+  printf("  --delete-during     Delete extras once the keep-set manifest is known,\n");
+  printf("                      before the data is applied (implies --delete)\n");
+  printf("  --del               Alias for --delete-during\n");
+  printf("  --delete-delay      Delete extras only after a successful transfer\n");
+  printf("                      (implies --delete)\n");
+  printf("  --delete-after      Delete only after the whole transfer succeeded\n");
+  printf("                      (the default --delete timing; implies --delete)\n");
+  printf("  Note: each timing flag implies --delete.  Combining a timing flag with\n");
+  printf("  --no-delete (in either order) is rejected as a config error.\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
   printf("  --delay-updates    Put updated files into place only at the end of transfer\n");
   printf("  --dirs, -d, --old-dirs, --old-d  Transfer the named directory entries without\n");
@@ -37,7 +50,6 @@ void print_usage(void) {
   printf("                    parent directory is not itself listed\n");
   printf("  --mkpath          Create the destination root directory on the server when it\n");
   printf("                    does not exist yet\n");
-  printf("  --del               Alias for --delete-during (not implemented)\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --exclude-from <file> Read exclude patterns from file\n");

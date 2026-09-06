@@ -129,20 +129,40 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
 }
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink) {
+  return receiver_process_pending(config, file_descriptor, sink, NULL);
+}
+
+/* Runs the whole receive loop.  The delete manifest may legitimately arrive
+   either FIRST (--delete-before / --delete-during: the sender transmits the
+   validated keep-set before any file data) or LAST (plain --delete /
+   --delete-after / --delete-delay: the manifest closes the data stream).  In
+   the early modes the receiver deletes as soon as the manifest has been read
+   and acknowledges with STATUS_OK so the sender only starts streaming once the
+   deletion has committed (or failed); in the late modes the manifest is held
+   and the deletion is committed only after the terminal STATUS_FINISHED proves
+   the whole transfer succeeded.  See receiver_process_pending() for how the -m
+   receiver defers that commit until its disk writer has drained. */
+int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
+                             ArrayList** pending_manifest) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return -1;
+  bool early_delete = config_delete_timing_early(config);
+  /* Parked keep-set for the late/commit timing.  Every exit path below frees it
+     exactly once; the only exception is the successful FINISHED handoff, which
+     transfers ownership to *pending_manifest (used by the -m receiver). */
+  ArrayList* deferred_manifest = NULL;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
-         status == STATUS_MKDIR) {
+         status == STATUS_MKDIR || status == STATUS_MANIFEST) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
-        return -1;
-      goto next;
+        goto fail;
+      goto next_status;
     }
     if (status == STATUS_ABORT) {
       log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
-      return -1;
+      goto fail;
     }
     if (status == STATUS_CHECK) {
       bool skipped;
@@ -155,12 +175,46 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
         goto receive_error;
     } else if (status == STATUS_CHECK_BATCH) {
       if (!receiver_process_batch(config, file_descriptor))
-        return -1;
-      goto next;
+        goto fail;
+      goto next_status;
     } else if (status == STATUS_MKDIR) {
       File* dir = file_receive_directory(file_descriptor);
       if (!dir || !sink->store_file(dir, sink->context))
         goto receive_error;
+    } else if (status == STATUS_MANIFEST) {
+      ArrayList* manifest = receive_manifest_entries(file_descriptor);
+      if (!manifest)
+        goto fail; /* receive_manifest_entries already sent STATUS_ERROR */
+      if (early_delete) {
+        /* --delete-before / --delete-during: the manifest is authoritative the
+           moment it arrives, before any file data.  Delete now and acknowledge
+           so the sender only starts streaming once the deletion committed (or
+           failed).  This is the rsync delete-before/delete-during window: a
+           later transfer failure does not restore these deletions. */
+        bool deletion_ok = config->use_delete ? manifest_delete_extras(config, manifest) : true;
+        array_list_delete(manifest);
+        if (!deletion_ok) {
+          send_status(file_descriptor, STATUS_ERROR);
+          goto fail;
+        }
+        if (!send_status(file_descriptor, STATUS_OK))
+          goto fail;
+      } else if (config->use_delete) {
+        /* Plain --delete / --delete-after / --delete-delay: hold the keep-set
+           and commit the deletion only after STATUS_FINISHED. */
+        if (deferred_manifest) {
+          log_message(LOG_LEVEL_ERROR, "Received a second delete manifest");
+          array_list_delete(deferred_manifest);
+          deferred_manifest = NULL;
+          array_list_delete(manifest);
+          send_status(file_descriptor, STATUS_ERROR);
+          goto fail;
+        }
+        deferred_manifest = manifest;
+      } else {
+        array_list_delete(manifest);
+      }
+      goto next_status;
     } else {
       File* file = file_receive(config, file_descriptor);
       if (!file) {
@@ -170,27 +224,61 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
       if (!sink->store_file(file, sink->context))
         goto receive_error;
     }
-  next:
+  next_status:
     if (!receive_status(file_descriptor, &status))
       goto receive_error;
   }
-  if (status == STATUS_MANIFEST && receive_manifest(file_descriptor, config, &status) != 0)
-    return -1;
   if (status != STATUS_FINISHED) {
     log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
     goto receive_error;
   }
+  /* Commit-style (late) deletion: every data frame has been received and the
+     sender proved the whole tree with STATUS_FINISHED.  The single-threaded
+     receiver stores files synchronously, so everything is on disk here and the
+     deletion can be committed before the --delay-updates publication in
+     send_success (the walker skips the staging dir, so staged files are never
+     treated as extras).  The -m receiver passes `pending_manifest` because its
+     disk writer may still be draining; the caller commits after the writer has
+     joined so no extra file is removed unless the transfer is known to have
+     succeeded. */
+  if (deferred_manifest) {
+    if (pending_manifest) {
+      *pending_manifest = deferred_manifest;
+      deferred_manifest = NULL;
+    } else {
+      bool deletion_ok = manifest_delete_extras(config, deferred_manifest);
+      array_list_delete(deferred_manifest);
+      deferred_manifest = NULL;
+      if (!deletion_ok) {
+        send_status(file_descriptor, STATUS_ERROR);
+        goto fail;
+      }
+    }
+  }
   if (sink->send_success) {
     if (sink->send_success_frame) {
       if (!sink->send_success_frame(file_descriptor, sink->context))
-        return -1;
+        goto fail;
     } else if (!send_status(file_descriptor, STATUS_OK)) {
-      return -1;
+      goto fail;
     }
   }
   return 0;
 
+fail:
+  /* Failure exits that must not (or already did) report a STATUS_ERROR.  The
+     parked keep-set is dropped: never commit a deletion for a failed stream. */
+  if (deferred_manifest) {
+    array_list_delete(deferred_manifest);
+    deferred_manifest = NULL;
+  }
+  return -1;
+
 receive_error:
+  if (deferred_manifest) {
+    array_list_delete(deferred_manifest);
+    deferred_manifest = NULL;
+  }
   if (sink->send_error)
     send_status(file_descriptor, STATUS_ERROR);
   return -1;

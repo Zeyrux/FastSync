@@ -302,15 +302,25 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
   return true;
 }
 
+bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t data_size,
+                                   int timeout_sec);
+
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size) {
+  return protocol_receive_n_data_timed(session, data, data_size, RECEIVE_TIMEOUT_SEC);
+}
+
+bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t data_size,
+                                   int timeout_sec) {
   log_debug_message(LOG_DEBUG_IO, "    Receiving n Data: %zu", data_size);
   if (!session)
     return false;
   int fd = session->read_fd;
+  if (timeout_sec <= 0)
+    timeout_sec = RECEIVE_TIMEOUT_SEC;
 
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += RECEIVE_TIMEOUT_SEC;
+  deadline.tv_sec += timeout_sec;
 
   size_t total_bytes_received = 0;
   short wait_events = POLLIN;
@@ -319,7 +329,7 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
       struct pollfd pfd = {.fd = fd, .events = wait_events};
       int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
       if (poll_result == 0) {
-        log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", RECEIVE_TIMEOUT_SEC);
+        log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", timeout_sec);
         return false;
       }
       if (poll_result < 0) {
@@ -516,6 +526,17 @@ bool protocol_receive_status(ProtocolSession* session, Status* status) {
   return true;
 }
 
+/* protocol_receive_status with an explicit per-message deadline (seconds).
+   Used where a single reply may legitimately take far longer than the default
+   60 s receive window - e.g. the sender waiting for the early-delete ACK after
+   the receiver committed a large (up to MAX_SERVER_DELETE_COUNT) deletion. */
+bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int timeout_sec) {
+  if (!protocol_receive_n_data_timed(session, status, sizeof(Status), timeout_sec))
+    return false;
+  log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
+  return true;
+}
+
 bool send_str(int fd, const char* data) {
   return protocol_send_str(legacy_session(-1, fd), data);
 }
@@ -542,4 +563,7 @@ bool send_status(int fd, Status status) {
 }
 bool receive_status(int fd, Status* status) {
   return protocol_receive_status(legacy_session(fd, -1), status);
+}
+bool receive_status_timed(int fd, Status* status, int timeout_sec) {
+  return protocol_receive_status_timed(legacy_session(fd, -1), status, timeout_sec);
 }

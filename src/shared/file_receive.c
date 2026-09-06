@@ -792,26 +792,27 @@ File* file_receive_directory(int file_descriptor) {
   return file;
 }
 
-int receive_manifest(int fd, const Config* config, int* next_status) {
-  if (!config) {
-    send_status(fd, STATUS_ERROR);
-    return -1;
-  }
-  int received_status = STATUS_ERROR;
-  int* status_out = next_status ? next_status : &received_status;
+/* Read a delete-manifest frame (the STATUS_MANIFEST leading code has already
+   been consumed): an entry count followed by that many destination-relative
+   paths.  The frame is self-delimiting (the count is authoritative), so the
+   caller decides what to do next and continues reading the following STATUS_*
+   frame.  Returns an owned ArrayList of validated path strings, or NULL after
+   sending STATUS_ERROR when the frame is malformed (bad count, empty/absolute
+   path, path traversal, or an aggregate size beyond MAX_MANIFEST_BYTES). */
+ArrayList* receive_manifest_entries(int fd) {
   int count;
   if (!receive_int(fd, &count)) {
     send_status(fd, STATUS_ERROR);
-    return -1;
+    return NULL;
   }
   if (count < 0 || count > MAX_MANIFEST_ENTRIES) {
     send_status(fd, STATUS_ERROR);
-    return -1;
+    return NULL;
   }
   ArrayList* manifest = array_list_create(free);
   if (!manifest) {
     send_status(fd, STATUS_ERROR);
-    return -1;
+    return NULL;
   }
   size_t manifest_bytes = 0;
   for (int i = 0; i < count; i++) {
@@ -823,32 +824,22 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
       free(s);
       array_list_delete(manifest);
       send_status(fd, STATUS_ERROR);
-      return -1;
+      return NULL;
     }
   }
-  if (!receive_status(fd, status_out)) {
-    array_list_delete(manifest);
-    send_status(fd, STATUS_ERROR);
-    return -1;
-  }
-  /* Deletion is a commit operation: never perform it until the sender has
-     completed the manifest frame successfully. */
-  if (*status_out != STATUS_FINISHED || !config->use_delete) {
-    array_list_delete(manifest);
-    if (*status_out != STATUS_FINISHED)
-      send_status(fd, STATUS_ERROR);
-    return *status_out == STATUS_FINISHED ? 0 : -1;
-  }
+  return manifest;
+}
+
+/* Remove every destination entry under the receive root that is not listed in
+   `manifest`, bounded by MAX_SERVER_DELETE_COUNT, using the symlink-safe
+   delete walker.  With --delay-updates the not-yet-published staging directory
+   is a direct child of the receive root and must not be treated as a set of
+   extras.  Prints a notice and returns true on success. */
+bool manifest_delete_extras(const Config* config, ArrayList* manifest) {
+  if (!config || !manifest)
+    return false;
   fprintf(stderr, "Deleting files not in manifest...\n");
-  /* With --delay-updates the staged (not yet published) files live directly
-     under the receive root in the staging directory; the delete walker must
-     not treat them as extras or it would remove every staged file before it
-     can be published. */
   const char* skip_staging = config->delay_updates ? DELAY_UPDATES_STAGING_DIR : NULL;
-  bool deletion_ok = delete_extras_limited(config->receive_root_directory, manifest,
-                                           MAX_SERVER_DELETE_COUNT, skip_staging);
-  array_list_delete(manifest);
-  if (!deletion_ok)
-    send_status(fd, STATUS_ERROR);
-  return deletion_ok ? 0 : -1;
+  return delete_extras_limited(config->receive_root_directory, manifest, MAX_SERVER_DELETE_COUNT,
+                               skip_staging);
 }
