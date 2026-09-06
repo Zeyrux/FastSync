@@ -37,7 +37,11 @@ typedef struct {
    max_delete is not SIZE_MAX the run is all-or-nothing: extras are counted
    first and DELETE_WALK_LIMIT_EXCEEDED is returned (with nothing removed) when
    the count would exceed the cap.  `deleted_out` optionally receives the number
-   of entries actually removed. */
+   of entries actually removed.  The all-or-nothing guarantee holds only while
+   the destination tree is not being concurrently modified: the rehearsal pass
+   and the delete pass are two separate walks, so a concurrent change between
+   them (another process adding/removing entries) can make the second pass
+   delete a different set than the first one counted. */
 DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifest,
                                        size_t max_delete, const DeleteSkipEntry* skips,
                                        int skip_count, size_t* deleted_out);

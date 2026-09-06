@@ -154,17 +154,24 @@ then reported an error (a truncated deletion); it now removes nothing and fails
 with an error naming the bound. Directories count toward the bound. A directory
 that still holds entries the walker leaves in place (a protected excluded file,
 a kept manifest entry, a symlink) is left behind rather than failing the run —
-matching rsync's "cannot delete non-empty directory" behaviour.
+matching rsync's "cannot delete non-empty directory" behaviour. The
+all-or-nothing guarantee holds only while the destination is not concurrently
+modified: rehearsal and delete are two separate walks, so a concurrent change
+between them (another process adding or removing destination entries) can make
+the actual deletion diverge from the counted set.
 
 Manifest size: the sender's keep-set and protected-prefix collections (streaming
 or early pre-scan) are unbounded, but the receiver rejects a manifest beyond
-`MAX_MANIFEST_ENTRIES` (1 048 576 entries) / `MAX_MANIFEST_BYTES` (16 MB of
-paths, counted across both sections) as a hard protocol error. In the commit
+`MAX_MANIFEST_ENTRIES` (1 048 576 entries, applied to EACH section — a frame can
+therefore total up to 2 097 152 entries) / `MAX_MANIFEST_BYTES` (16 MB of paths,
+counted across BOTH sections) as a hard protocol error. A heavily filtered
+source whose exclusion list grows large thus fails the run cleanly on the
+receiver (STATUS_ERROR) instead of being silently truncated. In the commit
 modes this only means the deletion is refused after the data already arrived; in
 the early modes (`--delete-before`/`--delete-during`) the manifest is the first
-frame, so an oversized keep-set aborts the whole transfer BEFORE any data is
-sent. Keep the source tree small enough for the receiver's manifest caps when
-using the early timing.
+frame, so an oversized keep-set or protected list aborts the whole transfer
+BEFORE any data is sent. Keep the source tree small enough for the receiver's
+manifest caps when using the early timing.
 
 Early-delete ACK wait: after committing a large deletion (up to
 `MAX_SERVER_DELETE_COUNT` removals) the receiver's `STATUS_OK`/`STATUS_ERROR`
