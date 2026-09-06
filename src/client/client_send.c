@@ -7,6 +7,8 @@
 #include "data.h"
 #include "delta.h"
 #include "file.h"
+#include "file_list.h"
+#include "filter.h"
 #include "metadata.h"
 #include "log.h"
 #include "multiprocessing.h"
@@ -40,16 +42,72 @@ static const char* display_bytes(unsigned long long bytes, bool human_readable, 
   return buffer;
 }
 
-static ScannerOptions scanner_options_from_config(const Config* config, int num_threads) {
-  ScannerOptions options = {config->use_metadata,     config->chunk_size,
-                            config->exclude_patterns, config->exclude_count,
-                            config->include_patterns, config->include_count,
-                            config->max_size,         config->min_size,
-                            config->max_depth,        num_threads,
-                            config->follow_symlinks,  config->copy_links,
-                            config->safe_links,       config->copy_unsafe_links,
-                            config->checksum,         config->one_file_system};
-  return options;
+/* Compiled scanner inputs that are shared read-only across scanner instances
+ * and, in -m mode, across worker threads. `base_filters` owns the compiled
+ * command-line + -C rules; the FileListSet allow-set lives in the Config. */
+typedef struct {
+  ScannerOptions options;
+  FilterRuleList* base_filters; /* owned; may be NULL */
+} PreparedScanner;
+
+/* Build the scanner options for one scan. Returns false and logs on failure. */
+static bool prepare_scanner(const Config* config, int num_threads, PreparedScanner* out) {
+  if (!out)
+    return false;
+  out->base_filters = NULL;
+  memset(&out->options, 0, sizeof(out->options));
+
+  int rule_count = config->filters ? config->filters->size : 0;
+  const char** texts = NULL;
+  if (rule_count > 0) {
+    texts = malloc((size_t)rule_count * sizeof(char*));
+    if (!texts) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed for filter rules");
+      return false;
+    }
+    for (int i = 0; i < rule_count; i++)
+      texts[i] = (const char*)config->filters->items[i];
+  }
+  if (rule_count > 0 || config->cvs_exclude) {
+    char err[160];
+    out->base_filters = filter_base_build(texts, rule_count, config->cvs_exclude, err, sizeof(err));
+    free(texts);
+    if (!out->base_filters) {
+      log_message(LOG_LEVEL_ERROR, "invalid filter rule: %s", err);
+      return false;
+    }
+  } else {
+    free(texts);
+  }
+
+  ScannerOptions* options = &out->options;
+  options->use_metadata = config->use_metadata;
+  options->chunk_size = config->chunk_size;
+  options->exclude_patterns = config->exclude_patterns;
+  options->exclude_count = config->exclude_count;
+  options->include_patterns = config->include_patterns;
+  options->include_count = config->include_count;
+  options->max_size = config->max_size;
+  options->min_size = config->min_size;
+  options->max_depth = config->max_depth;
+  options->num_threads = num_threads;
+  options->follow_symlinks = config->follow_symlinks;
+  options->copy_links = config->copy_links;
+  options->safe_links = config->safe_links;
+  options->copy_unsafe_links = config->copy_unsafe_links;
+  options->checksum = config->checksum;
+  options->one_file_system = config->one_file_system;
+  options->file_list = (const FileListSet*)config->files_from_set;
+  options->base_filters = out->base_filters;
+  options->per_dir_filters = config->per_dir_filter;
+  return true;
+}
+
+static void prepared_scanner_destroy(PreparedScanner* prepared) {
+  if (!prepared)
+    return;
+  filter_rule_list_free(prepared->base_filters);
+  prepared->base_filters = NULL;
 }
 
 /* Select the configured transport for both transfer execution paths. */
@@ -249,11 +307,15 @@ static void pipeline_cancel(PipelineContextSender* context) {
 
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
 static int send_dry_run_manifest(const Config* config) {
-  ScannerOptions options = scanner_options_from_config(config, 0);
-  DirectoryScanner* scanner =
-      directory_scanner_create_with_options(config->send_directory, &options);
-  if (!scanner)
+  PreparedScanner prepared;
+  if (!prepare_scanner(config, 0, &prepared))
     return -1;
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &prepared.options);
+  if (!scanner) {
+    prepared_scanner_destroy(&prepared);
+    return -1;
+  }
   Chunk* chunk;
   int file_count = 0;
   unsigned long long total_bytes = 0;
@@ -267,6 +329,7 @@ static int send_dry_run_manifest(const Config* config) {
         if (!escaped_path) {
           chunk_destroy(chunk);
           directory_scanner_destroy(scanner);
+          prepared_scanner_destroy(&prepared);
           return -1;
         }
         if (config->human_readable)
@@ -283,6 +346,7 @@ static int send_dry_run_manifest(const Config* config) {
     chunk_destroy(chunk);
   }
   directory_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
   if (!config->quiet) {
     if (config->human_readable)
       printf("Total: %d files, %s\n", file_count,
@@ -319,12 +383,16 @@ static int compare_list_entries(const void* left, const void* right) {
  * Directory lines are not printed because the scanner only yields regular
  * transfer candidates. Returns 0 on success, 1 on error. */
 static int send_list_only(const Config* config) {
-  ScannerOptions options = scanner_options_from_config(config, 0);
-  options.use_metadata = true; /* capture mode + mtime for the listing */
-  DirectoryScanner* scanner =
-      directory_scanner_create_with_options(config->send_directory, &options);
-  if (!scanner)
+  PreparedScanner prepared;
+  if (!prepare_scanner(config, 0, &prepared))
     return 1;
+  prepared.options.use_metadata = true; /* capture mode + mtime for the listing */
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &prepared.options);
+  if (!scanner) {
+    prepared_scanner_destroy(&prepared);
+    return 1;
+  }
   ListEntry* entries = NULL;
   size_t count = 0;
   size_t capacity = 0;
@@ -378,6 +446,7 @@ static int send_list_only(const Config* config) {
   }
   bool failed = oom || directory_scanner_failed(scanner);
   directory_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
   if (failed) {
     list_entries_destroy(entries, count);
     if (oom)
@@ -770,14 +839,20 @@ static int send_chunks_multithreaded(void* pipeline_context) {
 static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
   protocol_session_bind(&context->allocation_session);
-  ScannerOptions options = scanner_options_from_config(context->config, 4);
+  PreparedScanner prepared;
+  if (!prepare_scanner(context->config, 4, &prepared)) {
+    pipeline_cancel(context);
+    protocol_session_unbind();
+    return thrd_error;
+  }
   ParallelScanner* scanner = parallel_scanner_create_with_options(
-      context->config->send_directory, &options, &context->allocation_session);
+      context->config->send_directory, &prepared.options, &context->allocation_session);
 
   Chunk* current_chunk;
   if (scanner == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to create parallel scanner");
     pipeline_cancel(context);
+    prepared_scanner_destroy(&prepared);
     protocol_session_unbind();
     return thrd_error;
   }
@@ -790,6 +865,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
         pipeline_cancel(context);
         chunk_destroy(current_chunk);
         parallel_scanner_destroy(scanner);
+        prepared_scanner_destroy(&prepared);
         protocol_session_unbind();
         return thrd_error;
       }
@@ -801,12 +877,14 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       chunk_destroy(current_chunk);
       pipeline_cancel(context);
       parallel_scanner_destroy(scanner);
+      prepared_scanner_destroy(&prepared);
       protocol_session_unbind();
       return thrd_error;
     }
   }
   if (parallel_scanner_failed(scanner)) {
     parallel_scanner_destroy(scanner);
+    prepared_scanner_destroy(&prepared);
     mtx_lock(&context->mutex_scanner);
     context->scanner_done = true;
     cnd_broadcast(&context->condition_not_empty_scanner);
@@ -822,6 +900,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   mtx_unlock(&context->mutex_scanner);
 
   parallel_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
   protocol_session_unbind();
   return thrd_success;
 }
@@ -939,10 +1018,13 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
   ArrayList* remove_sources = NULL;
+  PreparedScanner prepared;
+  memset(&prepared, 0, sizeof(prepared));
   if (!config_send(client->file_descriptor, config))
     goto send_fail;
-  ScannerOptions scanner_options = scanner_options_from_config(config, 0);
-  scanner = directory_scanner_create_with_options(config->send_directory, &scanner_options);
+  if (!prepare_scanner(config, 0, &prepared))
+    goto send_fail;
+  scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
   manifest = create_transfer_manifest(config);
   if (config->remove_source_files)
     remove_sources = array_list_create(source_file_destroy);
@@ -1043,6 +1125,7 @@ send_fail:
     array_list_delete(remove_sources);
   if (scanner)
     directory_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
   disconnect_transfer_client(client);
   protocol_session_unbind();
   return ret;

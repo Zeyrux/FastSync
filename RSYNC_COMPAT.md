@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 57 | Feature works end-to-end |
+| ✅ Implemented | 62 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 81 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 76 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
@@ -30,7 +30,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--no-motd` | Suppress daemon MOTD | ❌ Not Implemented | |
 | `--exclude=PATTERN` | Exclude files matching pattern | ✅ Implemented | Glob matching in scanner |
 | `--include=PATTERN` | Include files matching pattern | ✅ Implemented | Glob matching in scanner |
-| `-C`, `--cvs-exclude` | Auto-ignore CVS files | ❌ Not Implemented | Removed because it had no effect |
+| `-C`, `--cvs-exclude` | Auto-ignore CVS files | ✅ Implemented | Applies the well-known rsync default exclude set as exclude rules during scanning (RCS SCCS CVS CVS.adm RCSLOG cvslog.* tags TAGS .make.state .nse_depinfo *~ #* .#* ,* _$* *$ *.old *.bak *.BAK *.orig *.rej .del-* *.a *.olb *.o *.obj *.so *.exe *.Z *.elc *.ln core .svn/ .git/ .hg/ .bzr/); `.git/`-style repo dirs are pruned without descending |
 
 ## 2. Modifying Output
 
@@ -53,9 +53,9 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `--exclude-from=FILE` | Read exclude patterns from file | ✅ Implemented | Reads patterns from file |
 | `--include-from=FILE` | Read include patterns from file | ✅ Implemented | Reads patterns from file |
-| `--filter=RULE` | Add file-filtering rule | ❌ Not Implemented | Removed because it had no effect |
-| `--files-from=FILE` | Read source file list from file | ❌ Not Implemented | Removed because it had no effect |
-| `-0`, `--from0` | Delimit *-from files with NULs | ❌ Not Implemented | |
+| `--filter=RULE` | Add file-filtering rule | ✅ Implemented | Long option only: rsync's short `-f` conflicts with FastSync sendfile (see FastSync-specific list), so `-f` is not reassigned. Supported subset: `+`/`-` include/exclude, implicit-exclude patterns, `include`/`exclude` word forms, a leading `/` anchor (to the transfer root, or to a `.rsync-filter` file's directory), and a trailing `/` for dir-only rules; first match wins with a default of include inside the filter layer. `merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` and rule modifiers are rejected with a clear error. Filters are an independent layer from `--exclude`/`--include` (an entry must pass both) |
+| `--files-from=FILE` | Read source file list from file | ✅ Implemented | Entries are paths relative to the source root (leading `./` stripped, `..`/absolute entries rejected at parse time, blank lines ignored). A listed regular file is transferred; a listed directory transfers its whole subtree (FastSync recursion is always on, unlike rsync's non-recursive default). Non-listed paths and their subtrees are pruned by the scanner. The delete manifest still derives from what was actually sent, so `--delete` stays consistent with the subset |
+| `-0`, `--from0` | Delimit *-from files with NULs | ✅ Implemented | `--files-from` entries become NUL-delimited; the flag may appear before or after `--files-from` on the command line |
 | `--max-size=SIZE` | Skip files larger than SIZE | ✅ Implemented | `max_size` in scanner |
 | `--min-size=SIZE` | Skip files smaller than SIZE | ✅ Implemented | `min_size` in scanner |
 | `-I`, `--ignore-times` | Don't skip files matching size+time | ❌ Not Implemented | |
@@ -65,7 +65,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
 | `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |
 | `-x`, `--one-file-system` | Do not cross filesystem boundaries | ✅ Implemented | Sender scanner captures the root device and skips descending into mount-point crossings (`st_dev` differs); cross-filesystem mount-point subdirectories are dropped entirely, matching rsync |
-| `-F` | Add the default `.rsync-filter` rules | ❌ Not Implemented | |
+| `-F` | Add the default `.rsync-filter` rules | ✅ Implemented | Reads one filter rule per line from each directory's `.rsync-filter` file during traversal and applies it to that directory's subtree (rules inherit into deeper directories and are overridable by deeper files); `.rsync-filter` files are never transferred. The rsync `-FF` behavior (also `.cvsignore`) is out of scope; unsupported rule types inside the file abort with a clear error |
 
 ## 4. Directory Options
 

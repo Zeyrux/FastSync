@@ -17,7 +17,55 @@
 typedef struct {
   char* path;
   int depth;
+  FilterNode* context; /* inherited per-directory filter context */
 } DirEntry;
+
+/* A chain node: `own` holds the .rsync-filter rules of one directory, `parent`
+ * the context that directory inherited (nearest ancestor with a filter file).
+ * Rules are evaluated base-first, then from the outermost node inward. */
+struct FilterNode {
+  FilterNode* parent;
+  FilterRuleList* own;
+};
+
+static void filter_node_destroy(void* item) {
+  if (item) {
+    FilterNode* node = (FilterNode*)item;
+    if (node->own)
+      filter_rule_list_free(node->own);
+    free(node);
+  }
+}
+
+static FilterNode* filter_node_alloc(FilterNode* parent, FilterRuleList* own) {
+  FilterNode* node = malloc(sizeof(FilterNode));
+  if (!node)
+    return NULL;
+  node->parent = parent;
+  node->own = own;
+  return node;
+}
+
+/* Evaluate a rule chain (base rules, then per-directory nodes outermost
+ * first). Returns FILTER_ACTION_NONE when nothing matched. */
+static FilterAction chain_rules_apply(const FilterRuleList* base, const FilterNode* node,
+                                      const char* rel, const char* leaf, bool is_dir) {
+  if (node) {
+    FilterAction parent_action = chain_rules_apply(base, node->parent, rel, leaf, is_dir);
+    if (parent_action != FILTER_ACTION_NONE)
+      return parent_action;
+    return filter_rules_apply(node->own, rel, leaf, is_dir);
+  }
+  return base ? filter_rules_apply(base, rel, leaf, is_dir) : FILTER_ACTION_NONE;
+}
+
+static bool entry_allowed(const FilterRuleList* base, const FilterNode* node, const char* rel,
+                          const char* leaf, bool is_dir, bool per_dir_filters) {
+  /* -F: per-directory .rsync-filter files are never transferred. */
+  if (per_dir_filters && !is_dir && strcmp(leaf, ".rsync-filter") == 0)
+    return false;
+  return chain_rules_apply(base, node, rel, leaf, is_dir) != FILTER_ACTION_EXCLUDE;
+}
 
 static void dir_entry_destroy(void* item) {
   if (item) {
@@ -27,7 +75,7 @@ static void dir_entry_destroy(void* item) {
   }
 }
 
-static DirEntry* dir_entry_create(const char* path, int depth) {
+static DirEntry* dir_entry_create(const char* path, int depth, FilterNode* context) {
   DirEntry* de = malloc(sizeof(DirEntry));
   if (!de)
     return NULL;
@@ -37,6 +85,7 @@ static DirEntry* dir_entry_create(const char* path, int depth) {
     return NULL;
   }
   de->depth = depth;
+  de->context = context;
   return de;
 }
 
@@ -64,6 +113,73 @@ typedef struct {
  * directory is about to be descended into. */
 bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device) {
   return !one_file_system || entry_device == root_device;
+}
+
+/* Relative path of an on-disk path below `root`. The transfer root may be
+ * given with a trailing slash; the returned rel path never has one and is ""
+ * for the root itself. */
+static char* rel_for_fs_path(const char* root, const char* fs_path) {
+  size_t root_len = strlen(root);
+  while (root_len > 1 && root[root_len - 1] == '/')
+    root_len--;
+  if (strncmp(root, fs_path, root_len) != 0)
+    return NULL;
+  if (fs_path[root_len] == '\0')
+    return str_dup("");
+  if (fs_path[root_len] != '/')
+    return NULL;
+  return str_dup(fs_path + root_len + 1);
+}
+
+/* Relative path of a child entry below the current directory. */
+static char* child_rel_path(const char* parent_rel, const char* name) {
+  if (!parent_rel || parent_rel[0] == '\0')
+    return str_dup(name);
+  return path_cat(parent_rel, name);
+}
+
+/* Apply the --files-from allow-set and the filter layer to one entry. */
+static bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* base,
+                                   const FilterNode* node, const char* rel, const char* leaf,
+                                   bool is_dir, bool per_dir_filters) {
+  if (file_list && !file_list_affects(file_list, rel))
+    return false;
+  if (base || per_dir_filters)
+    return entry_allowed(base, node, rel, leaf, is_dir, per_dir_filters);
+  return true;
+}
+
+/* Merge the open directory's own .rsync-filter rules into the inherited
+ * context, returning the context used for this directory's entries. On a parse
+ * error the scanner is marked failed. Returns 0 on success, -1 on failure. */
+static int open_directory_filter_context(DirectoryScanner* scanner, const FilterNode* inherited) {
+  if (!scanner->per_dir_filters) {
+    scanner->current_node = (FilterNode*)inherited;
+    return 0;
+  }
+  char err[256];
+  bool exists = false;
+  FilterRuleList* own =
+      filter_file_read(scanner->current_path, scanner->current_rel ? scanner->current_rel : "",
+                       &exists, err, sizeof(err));
+  if (!own) {
+    log_message(LOG_LEVEL_ERROR, "invalid .rsync-filter in %s: %s", scanner->current_path, err);
+    scanner->failed = true;
+    return -1;
+  }
+  if (exists && own->count > 0) {
+    FilterNode* node = filter_node_alloc((FilterNode*)inherited, own);
+    if (!node || !array_list_add(scanner->filter_nodes, node)) {
+      filter_node_destroy(node);
+      scanner->failed = true;
+      return -1;
+    }
+    scanner->current_node = node;
+  } else {
+    filter_rule_list_free(own);
+    scanner->current_node = (FilterNode*)inherited;
+  }
+  return 0;
 }
 
 /* Inspect symlinks, resolve the entry type, and apply file filters once for both scanners. */
@@ -165,25 +281,54 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->checksum = options->checksum;
   scanner->one_file_system = options->one_file_system;
   scanner->failed = false;
+  scanner->root_path = str_dup(root_directory);
+  if (!scanner->root_path) {
+    queue_destroy(scanner->directories);
+    free(scanner);
+    return NULL;
+  }
+  scanner->current_rel = NULL;
+  scanner->at_seed_dir = true;
+  scanner->seed_node = NULL;
+  scanner->current_node = NULL;
+  scanner->file_list = options->file_list;
+  scanner->base_filters = options->base_filters;
+  scanner->per_dir_filters = options->per_dir_filters;
+  scanner->filter_nodes = NULL;
+  if (scanner->base_filters || scanner->per_dir_filters) {
+    scanner->filter_nodes = array_list_create(filter_node_destroy);
+    if (!scanner->filter_nodes) {
+      free(scanner->root_path);
+      queue_destroy(scanner->directories);
+      free(scanner);
+      return NULL;
+    }
+  }
   if (scanner->one_file_system) {
     struct stat root_stats;
     if (stat(root_directory, &root_stats) != 0) {
       log_perror("Could not stat source directory");
+      free(scanner->root_path);
       queue_destroy(scanner->directories);
+      array_list_delete(scanner->filter_nodes);
       free(scanner);
       return NULL;
     }
     scanner->root_dev = root_stats.st_dev;
   }
-  DirEntry* root = dir_entry_create(root_directory, 0);
+  DirEntry* root = dir_entry_create(root_directory, 0, NULL);
   if (!root) {
+    free(scanner->root_path);
     queue_destroy(scanner->directories);
+    array_list_delete(scanner->filter_nodes);
     free(scanner);
     return NULL;
   }
   if (!queue_enqueue(scanner->directories, root)) {
     dir_entry_destroy(root);
+    free(scanner->root_path);
     queue_destroy(scanner->directories);
+    array_list_delete(scanner->filter_nodes);
     free(scanner);
     return NULL;
   }
@@ -197,14 +342,25 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            unsigned long long min_size, int max_depth,
                                            bool follow_symlinks, bool copy_links, bool safe_links,
                                            bool copy_unsafe_links, bool checksum) {
-  ScannerOptions options = {use_metadata,     chunk_size,
-                            exclude_patterns, exclude_count,
-                            include_patterns, include_count,
-                            max_size,         min_size,
-                            max_depth,        0,
-                            follow_symlinks,  copy_links,
-                            safe_links,       copy_unsafe_links,
-                            checksum,         false};
+  ScannerOptions options = {use_metadata,
+                            chunk_size,
+                            exclude_patterns,
+                            exclude_count,
+                            include_patterns,
+                            include_count,
+                            max_size,
+                            min_size,
+                            max_depth,
+                            0,
+                            follow_symlinks,
+                            copy_links,
+                            safe_links,
+                            copy_unsafe_links,
+                            checksum,
+                            false,
+                            NULL,
+                            NULL,
+                            false};
   return directory_scanner_create_with_options(root_directory, &options);
 }
 
@@ -216,6 +372,9 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
     scanner->current_dir = NULL;
   }
   free(scanner->current_path);
+  free(scanner->current_rel);
+  free(scanner->root_path);
+  array_list_delete(scanner->filter_nodes);
   queue_destroy(scanner->directories);
   free(scanner);
 }
@@ -246,13 +405,32 @@ static int open_next_directory(DirectoryScanner* scanner) {
   DirEntry* de = (DirEntry*)queue_dequeue(scanner->directories);
   scanner->current_path = de->path;
   scanner->current_depth = de->depth;
+  /* The seed directory inherits the scanner's configured context (the root
+   * .rsync-filter context in parallel mode); other dirs inherit the context of
+   * the directory that enqueued them. */
+  const FilterNode* inherited = scanner->at_seed_dir ? scanner->seed_node : de->context;
+  scanner->at_seed_dir = false;
   free(de);
+
+  free(scanner->current_rel);
+  scanner->current_rel = rel_for_fs_path(scanner->root_path, scanner->current_path);
+  if (!scanner->current_rel) {
+    log_message(LOG_LEVEL_ERROR, "Could not compute relative path under %s", scanner->root_path);
+    scanner->failed = true;
+    return -1;
+  }
+
   scanner->current_dir = opendir(scanner->current_path);
   if (scanner->current_dir == NULL) {
     log_perror("Could not open directory");
     free(scanner->current_path);
     scanner->current_path = NULL;
     scanner->failed = true;
+    return -1;
+  }
+  if (open_directory_filter_context(scanner, inherited) != 0) {
+    closedir(scanner->current_dir);
+    scanner->current_dir = NULL;
     return -1;
   }
   return 1;
@@ -294,7 +472,9 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
                               scanner->max_depth,        0,
                               scanner->follow_symlinks,  scanner->copy_links,
                               scanner->safe_links,       scanner->copy_unsafe_links,
-                              scanner->checksum,         scanner->one_file_system};
+                              scanner->checksum,         scanner->one_file_system,
+                              scanner->file_list,        scanner->base_filters,
+                              scanner->per_dir_filters};
     ScannerEntry inspected;
     int inspection = scanner_inspect_entry(&options, scanner->current_path, scanner->current_path,
                                            entry->d_name, &inspected);
@@ -307,14 +487,32 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     char* cur_path = inspected.path;
     struct stat stats = inspected.stats;
 
-    if (inspected.is_directory) {
+    /* --files-from allow-set and the filter layer apply to files and to
+     * directories (an excluded directory is not descended into). */
+    bool is_dir = inspected.is_directory;
+    char* rel = child_rel_path(scanner->current_rel, entry->d_name);
+    if (!rel) {
+      free(cur_path);
+      scanner->failed = true;
+      break;
+    }
+    bool passes_selection =
+        entry_passes_selection(scanner->file_list, scanner->base_filters, scanner->current_node,
+                               rel, entry->d_name, is_dir, scanner->per_dir_filters);
+    free(rel);
+    if (!passes_selection) {
+      free(cur_path);
+      continue;
+    }
+
+    if (is_dir) {
       if (!scanner_same_filesystem(scanner->one_file_system, scanner->root_dev, stats.st_dev)) {
         free(cur_path);
         continue;
       }
       int next_depth = scanner->current_depth + 1;
       if (scanner->max_depth <= 0 || next_depth < scanner->max_depth) {
-        DirEntry* de = dir_entry_create(cur_path, next_depth);
+        DirEntry* de = dir_entry_create(cur_path, next_depth, scanner->current_node);
         if (!de || !queue_enqueue(scanner->directories, de)) {
           dir_entry_destroy(de);
           scanner->failed = true;
@@ -376,6 +574,7 @@ typedef struct {
   ParallelScanner* ps;
   char** dirs;
   int dir_count;
+  char* root_dir; /* the transfer root, for relative-path computation */
   ScannerOptions options;
   ProtocolSession* allocation_session;
 } ParallelWorkerArg;
@@ -398,6 +597,13 @@ static int parallel_worker_thread(void* arg) {
         free(wa->dirs[j]);
       break;
     }
+    /* Root .rsync-filter rules (parsed by the parallel scanner) apply to the
+     * contents of every assigned subdirectory. Relative paths (used by the
+     * allow-set and per-directory rules) are computed against the transfer
+     * root, not the subdirectory the worker is seeded with. */
+    free(ds->root_path);
+    ds->root_path = str_dup(wa->root_dir);
+    ds->seed_node = wa->ps->root_filter_node;
     Chunk* chunk;
     while ((chunk = directory_scanner_next(ds)) != NULL) {
       if (!queue_enqueue_multithreaded_cancel(wa->ps->result_queue, chunk, &wa->ps->result_mutex,
@@ -419,6 +625,7 @@ static int parallel_worker_thread(void* arg) {
     free(wa->dirs[i]);
   }
   ParallelScanner* ps = wa->ps;
+  free(wa->root_dir);
   free(wa->dirs);
   free(wa);
   mtx_lock(&ps->result_mutex);
@@ -549,9 +756,10 @@ static Chunk* batch_files(ArrayList* files, unsigned long long chunk_size, Queue
 }
 
 /* Scan one root-directory entry into either the subdirs or files list. */
-static void scan_root_entry(const ScannerOptions* options, const char* root_directory,
-                            const struct dirent* entry, ArrayList* root_files, ArrayList* subdirs,
-                            dev_t root_dev, ParallelScanner* ps) {
+static void scan_root_entry(const ScannerOptions* options, const FilterNode* root_node,
+                            const char* root_directory, const struct dirent* entry,
+                            ArrayList* root_files, ArrayList* subdirs, dev_t root_dev,
+                            ParallelScanner* ps) {
   ScannerEntry inspected;
   int inspection =
       scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);
@@ -563,7 +771,21 @@ static void scan_root_entry(const ScannerOptions* options, const char* root_dire
     return;
   char* cur_path = inspected.path;
   struct stat st = inspected.stats;
-  if (inspected.is_directory) {
+  bool is_dir = inspected.is_directory;
+  char* rel = str_dup(entry->d_name);
+  if (!rel) {
+    free(cur_path);
+    ps->failed = true;
+    return;
+  }
+  bool passes = entry_passes_selection(options->file_list, options->base_filters, root_node, rel,
+                                       entry->d_name, is_dir, options->per_dir_filters);
+  free(rel);
+  if (!passes) {
+    free(cur_path);
+    return;
+  }
+  if (is_dir) {
     if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
       free(cur_path);
       return;
@@ -597,8 +819,8 @@ static void scan_root_entry(const ScannerOptions* options, const char* root_dire
 /* Scan the root directory itself, collecting root files and subdirectories.
  * Returns false if the root directory could not be opened. */
 static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
-                                const ScannerOptions* options, dev_t root_dev,
-                                ArrayList* root_files, ArrayList* subdirs) {
+                                const ScannerOptions* options, const FilterNode* root_node,
+                                dev_t root_dev, ArrayList* root_files, ArrayList* subdirs) {
   DIR* dir = opendir(root_directory);
   if (!dir) {
     log_perror("Could not open root directory for parallel scan");
@@ -608,7 +830,7 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    scan_root_entry(options, root_directory, entry, root_files, subdirs, root_dev, ps);
+    scan_root_entry(options, root_node, root_directory, entry, root_files, subdirs, root_dev, ps);
   }
   closedir(dir);
   return true;
@@ -616,7 +838,8 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
 
 /* Spawn worker threads, one per group of subdirectories. */
 static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
-                                   const ScannerOptions* options, unsigned long long cs) {
+                                   const ScannerOptions* options, const char* root_directory,
+                                   unsigned long long cs) {
   if (subdirs->size <= 0)
     return;
   int n = options->num_threads > 0 ? options->num_threads : 4;
@@ -647,7 +870,10 @@ static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
     }
     wa->ps = ps;
     wa->dirs = calloc(count, sizeof(char*));
-    if (!wa->dirs) {
+    wa->root_dir = str_dup(root_directory);
+    if (!wa->dirs || !wa->root_dir) {
+      free(wa->root_dir);
+      free(wa->dirs);
       free(wa);
       parallel_scanner_creation_failed(ps);
       break;
@@ -661,6 +887,7 @@ static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
     if (!dup_ok) {
       for (int j = 0; j < count; j++)
         free(wa->dirs[j]);
+      free(wa->root_dir);
       free(wa->dirs);
       free(wa);
       parallel_scanner_creation_failed(ps);
@@ -674,6 +901,7 @@ static void spawn_parallel_workers(ParallelScanner* ps, ArrayList* subdirs,
     if (thrd_create(&ps->threads[t], parallel_worker_thread, wa) != thrd_success) {
       for (int j = 0; j < count; j++)
         free(wa->dirs[j]);
+      free(wa->root_dir);
       free(wa->dirs);
       free(wa);
       parallel_scanner_creation_failed(ps);
@@ -720,7 +948,37 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     root_dev = root_stats.st_dev;
   }
 
-  if (!scan_root_directory(ps, root_directory, options, root_dev, root_files, subdirs)) {
+  /* Build the root directory's .rsync-filter context once; workers seed their
+   * scanners with it so per-dir rules behave identically to the sequential
+   * scanner. */
+  FilterNode* root_node = NULL;
+  if (options->per_dir_filters) {
+    char err[256];
+    bool exists = false;
+    FilterRuleList* own = filter_file_read(root_directory, "", &exists, err, sizeof(err));
+    if (!own) {
+      log_message(LOG_LEVEL_ERROR, "invalid .rsync-filter in %s: %s", root_directory, err);
+      array_list_delete(root_files);
+      array_list_delete(subdirs);
+      parallel_scanner_destroy(ps);
+      return NULL;
+    }
+    if (exists && own->count > 0) {
+      root_node = filter_node_alloc(NULL, own);
+      if (!root_node) {
+        filter_rule_list_free(own);
+        array_list_delete(root_files);
+        array_list_delete(subdirs);
+        parallel_scanner_destroy(ps);
+        return NULL;
+      }
+    } else {
+      filter_rule_list_free(own);
+    }
+  }
+  ps->root_filter_node = root_node;
+
+  if (!scan_root_directory(ps, root_directory, options, root_node, root_dev, root_files, subdirs)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);
@@ -731,7 +989,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   ps->initial_chunk = batch_files(root_files, cs, ps->result_queue, &ps->failed);
   array_list_delete(root_files);
 
-  spawn_parallel_workers(ps, subdirs, options, cs);
+  spawn_parallel_workers(ps, subdirs, options, root_directory, cs);
   array_list_delete(subdirs);
   return ps;
 }
@@ -774,6 +1032,8 @@ void parallel_scanner_destroy(ParallelScanner* ps) {
   for (int i = 0; i < ps->num_threads; i++)
     thrd_join(ps->threads[i], NULL);
   free(ps->threads);
+  if (ps->root_filter_node)
+    filter_node_destroy(ps->root_filter_node);
   if (ps->initial_chunk)
     chunk_destroy(ps->initial_chunk);
   queue_destroy(ps->result_queue);

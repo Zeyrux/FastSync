@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (
-    PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR,
+    PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR, ServerManager,
     run_client,
     generate_test_files, verify_transfer, clean_dir, make_result,
     get_dest_received_dir, CLIENT_CMD,
@@ -1405,3 +1405,228 @@ class TestLogFileFormat:
         expected = {f"{os.path.join(source, rel)} {len(data)}" for rel, data in files.items()}
         for line in expected:
             assert line in content, f"log file (-m) missing {line!r}"
+
+
+class TestFilesFrom:
+    """--files-from transfers exactly the listed files; a listed directory
+    transfers its whole subtree. The manifest (and thus --delete) derives from
+    what was actually sent."""
+
+    def _make_source(self, name):
+        source = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(source)
+        entries = {
+            "top.txt": b"top\n",
+            "sub/a.txt": b"a\n",
+            "sub/b.txt": b"b\n",
+            "other/c.txt": b"c\n",
+        }
+        for rel, content in entries.items():
+            full = os.path.join(source, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(content)
+        return source
+
+    def _write_list(self, rel_text):
+        path = os.path.join(TEST_DATA_DIR, "files_from.list")
+        with open(path, "wb") as fh:
+            fh.write(rel_text)
+        return path
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_files_from_exact_subset(self, shared_server, mt):
+        source = self._make_source("ff_subset_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_subset_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"top.txt\nsub/a.txt\n")
+        flags = ["--files-from", lst] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"files-from sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "top.txt"))
+        assert os.path.isfile(os.path.join(received, "sub", "a.txt"))
+        assert not os.path.exists(os.path.join(received, "sub", "b.txt")), \
+            "unlisted sub/b.txt must not be transferred"
+        assert not os.path.exists(os.path.join(received, "other")), \
+            "unlisted other/ subtree must not be transferred"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_files_from_listed_directory_transfers_subtree(self, shared_server, mt):
+        source = self._make_source("ff_subdir_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_subdir_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"sub\n")
+        flags = ["--files-from", lst] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"files-from dir sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "sub", "a.txt"))
+        assert os.path.isfile(os.path.join(received, "sub", "b.txt"))
+        assert not os.path.exists(os.path.join(received, "top.txt"))
+        assert not os.path.exists(os.path.join(received, "other"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_files_from_nul_separated(self, shared_server, mt):
+        source = self._make_source("ff_nul_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_nul_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"top.txt\0other/c.txt\0")
+        flags = ["--files-from", lst, "--from0"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"files-from -0 sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "top.txt"))
+        assert os.path.isfile(os.path.join(received, "other", "c.txt"))
+        assert not os.path.exists(os.path.join(received, "sub"))
+
+    def test_files_from_missing_list_file_rejected(self):
+        result, _ = run_client(
+            os.path.join(TEST_DATA_DIR, "nowhere_src"),
+            os.path.join(TEST_DATA_DIR, "nowhere_dst"),
+            flags=["--files-from", os.path.join(TEST_DATA_DIR, "no_such_list.txt")],
+        )
+        assert result.returncode != 0, "missing --files-from file must be rejected"
+        assert "--files-from" in result.stderr
+
+    def test_files_from_delete_deletes_unlisted(self):
+        source = self._make_source("ff_delete_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_delete_dst")
+        clean_dir(dest)
+        server = ServerManager()
+        server.start(extra_args=["--allow-delete"])
+        try:
+            # Full transfer first.
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"full sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            assert os.path.isfile(os.path.join(received, "top.txt"))
+
+            # A subset sync with --delete deletes everything not in the sent
+            # manifest (which is derived from what was actually sent).
+            lst = self._write_list(b"sub/a.txt\n")
+            result, _ = run_client(source, dest, flags=["--files-from", lst, "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, f"files-from delete sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(received, "sub", "a.txt"))
+            assert not os.path.exists(os.path.join(received, "top.txt")), \
+                "unlisted file not deleted"
+            assert not os.path.exists(os.path.join(received, "other")), \
+                "unlisted subtree not deleted"
+        finally:
+            server.stop()
+
+
+class TestFilters:
+    """--filter/-C/-F rule layer: excludes prune, ordering is first-match-wins,
+    the default with no matching rule is include, and legacy --exclude remains
+    an independent layer."""
+
+    def _make_tree(self, name, with_filter_file=False):
+        source = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(source)
+        entries = {
+            "data/keep.txt": b"keep\n",
+            "data/drop.tmp": b"drop\n",
+            "nested/deep.tmp": b"deep\n",
+            "nested/ok.log": b"log\n",
+            "top.bin": b"bin\n",
+        }
+        for rel, content in entries.items():
+            full = os.path.join(source, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(content)
+        if with_filter_file:
+            with open(os.path.join(source, ".rsync-filter"), "wb") as fh:
+                fh.write(b"- *.tmp\n")
+        return source
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_filter_excludes_glob(self, shared_server, mt):
+        source = self._make_tree("filter_tmp_src")
+        dest = os.path.join(TEST_DATA_DIR, "filter_tmp_dst")
+        clean_dir(dest)
+        flags = ["--filter", "- *.tmp"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"filter sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "data", "keep.txt"))
+        assert os.path.isfile(os.path.join(received, "nested", "ok.log"))
+        assert os.path.isfile(os.path.join(received, "top.bin"))
+        assert not os.path.exists(os.path.join(received, "data", "drop.tmp"))
+        assert not os.path.exists(os.path.join(received, "nested", "deep.tmp"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_filter_anchored_include_overrides_exclude_all(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, "filter_keep_src")
+        clean_dir(source)
+        with open(os.path.join(source, "a.keepme"), "wb") as fh:
+            fh.write(b"keep me")
+        with open(os.path.join(source, "b.other"), "wb") as fh:
+            fh.write(b"drop me")
+        dest = os.path.join(TEST_DATA_DIR, "filter_keep_dst")
+        clean_dir(dest)
+        # First match wins: the anchored include beats the catch-all exclude.
+        flags = ["--filter=+ /a.keepme", "--filter=- *"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"filter include sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "a.keepme"))
+        assert not os.path.exists(os.path.join(received, "b.other"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_cvs_exclude_ignores_scm_and_build_artifacts(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, "filter_cvs_src")
+        clean_dir(source)
+        entries = {
+            "src/main.c": b"int main() {}\n",
+            "src/main.o": b"obj\n",
+            "src/notes.txt~": b"backup\n",
+            ".git/HEAD": b"ref\n",
+            ".git/config": b"cfg\n",
+            "README.md": b"readme\n",
+        }
+        for rel, content in entries.items():
+            full = os.path.join(source, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(content)
+        dest = os.path.join(TEST_DATA_DIR, "filter_cvs_dst")
+        clean_dir(dest)
+        flags = ["-C"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"-C sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "src", "main.c"))
+        assert os.path.isfile(os.path.join(received, "README.md"))
+        assert not os.path.exists(os.path.join(received, ".git")), ".git/ must be pruned"
+        assert not os.path.exists(os.path.join(received, "src", "main.o")), "*.o must be pruned"
+        assert not os.path.exists(os.path.join(received, "src", "notes.txt~")), "*~ must be pruned"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_per_dir_filter_file(self, shared_server, mt):
+        source = self._make_tree("filter_file_src", with_filter_file=True)
+        dest = os.path.join(TEST_DATA_DIR, "filter_file_dst")
+        clean_dir(dest)
+        flags = ["-F"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"-F sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "data", "keep.txt"))
+        assert os.path.isfile(os.path.join(received, "nested", "ok.log"))
+        assert not os.path.exists(os.path.join(received, "data", "drop.tmp"))
+        assert not os.path.exists(os.path.join(received, "nested", "deep.tmp"))
+        assert not os.path.exists(os.path.join(received, ".rsync-filter")), \
+            ".rsync-filter must not be transferred"
+
+    def test_filter_leaves_default_behavior_unchanged(self, shared_server):
+        source = self._make_tree("filter_default_src")
+        dest = os.path.join(TEST_DATA_DIR, "filter_default_dst")
+        clean_dir(dest)
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, f"plain sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"

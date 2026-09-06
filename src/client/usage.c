@@ -32,6 +32,13 @@ void print_usage(void) {
   printf("  --include <pattern> Only include files matching pattern\n");
   printf("  --exclude-from <file> Read exclude patterns from file\n");
   printf("  --include-from <file> Read include patterns from file\n");
+  printf("  --files-from <file> Read the source file list from FILE (paths relative to the "
+         "source root)\n");
+  printf("  -0, --from0       Entries in --files-from are NUL-delimited\n");
+  printf("  --filter=RULE     rsync-style filter rule (+/- include/exclude; repeatable; the\n");
+  printf("                    rsync -f short form conflicts with FastSync sendfile -f)\n");
+  printf("  -C, --cvs-exclude Auto-ignore common CVS/SCM files (.git/, .svn/, *.o, *~, ...)\n");
+  printf("  -F                Apply per-directory .rsync-filter files during the scan\n");
   printf("  --max-size <n>      Skip files larger than n bytes\n");
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --max-alloc <SIZE>  Maximum single allocation (default: 1G)\n");

@@ -2,6 +2,8 @@
 #define SCANNER_H
 
 #include "chunk.h"
+#include "file_list.h"
+#include "filter.h"
 #include "protocol.h"
 #include "queue.h"
 #include <dirent.h>
@@ -27,7 +29,17 @@ typedef struct {
   bool copy_unsafe_links;
   bool checksum;
   bool one_file_system;
+  /* Phase 2 (files-from / filter layer). All pointers are shared read-only
+   * across scanner instances and worker threads; ownership stays with the
+   * caller (client_send). */
+  const FileListSet* file_list;       /* --files-from allow-set, or NULL */
+  const FilterRuleList* base_filters; /* command-line + -C rules, or NULL */
+  bool per_dir_filters;               /* -F: read .rsync-filter per directory */
 } ScannerOptions;
+
+/* Internal per-scanner filter state. FilterNode chains represent the ordered
+ * per-directory .rsync-filter rules that apply below a directory. */
+typedef struct FilterNode FilterNode;
 
 typedef struct {
   Queue* directories;
@@ -51,6 +63,16 @@ typedef struct {
   bool one_file_system;
   dev_t root_dev;
   bool failed;
+  /* Phase 2 (files-from / filter layer). */
+  char* root_path;          /* transfer root (fs path) for rel computation */
+  char* current_rel;        /* rel path of the open directory ("" == root) */
+  bool at_seed_dir;         /* next open is the seed directory */
+  FilterNode* seed_node;    /* inherited context of the seed dir, or NULL */
+  FilterNode* current_node; /* filter context of the open directory */
+  ArrayList* filter_nodes;  /* owned FilterNode arena (may be NULL) */
+  const FileListSet* file_list;
+  const FilterRuleList* base_filters;
+  bool per_dir_filters;
 } DirectoryScanner;
 
 typedef struct {
@@ -68,6 +90,7 @@ typedef struct {
   int completed;
   Chunk* initial_chunk;
   ProtocolSession* allocation_session;
+  FilterNode* root_filter_node; /* root .rsync-filter context (owned by ps) */
 } ParallelScanner;
 
 DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,
