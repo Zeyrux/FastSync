@@ -12,6 +12,7 @@
 #include "compression.h"
 #include "config.h"
 #include "data.h"
+#include "delay_updates.h"
 #include "delta.h"
 #include "file.h"
 #include "log.h"
@@ -24,6 +25,72 @@
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
   return file_save_to_disk_full(root_directory, file, config) != FILE_SAVE_ERROR;
+}
+
+/* --delay-updates receiver path: write the file into a private staging tree
+   below the receive root instead of its final destination, and remember it so
+   it can be atomically renamed into place only once the whole transfer has
+   succeeded.  Existence/update policies (--existing/--ignore-existing/--update)
+   are decided against the FINAL destination path at stage time so the run
+   decides exactly what an immediate (non-delayed) run would decide; the staged
+   file is then never re-checked at publication.  Backups are deferred to
+   publication so the final destination is untouched until the transfer ends. */
+static FileSaveResult file_stage_delayed_update(const char* root_directory,
+                                                const char* destination_path, const File* file,
+                                                Config* config) {
+  if (!config)
+    return FILE_SAVE_ERROR;
+  bool sparse = config->preserve_sparse;
+  bool preserve_executability = config->use_executability;
+
+  if (config->existing && !file_path_exists_secure(destination_path))
+    return FILE_SAVE_SKIPPED;
+  if (config->ignore_existing && file_path_exists_secure(destination_path))
+    return FILE_SAVE_SKIPPED;
+  if (config->update && file_destination_is_newer_secure(destination_path, file->metadata))
+    return FILE_SAVE_SKIPPED;
+
+  FileMetadata adjusted_metadata;
+  const FileMetadata* metadata = file->metadata;
+  if (metadata && config->chmod_spec && *config->chmod_spec) {
+    adjusted_metadata = *metadata;
+    if (!chmod_apply(adjusted_metadata.mode, config->chmod_spec, &adjusted_metadata.mode))
+      return FILE_SAVE_ERROR;
+    metadata = &adjusted_metadata;
+  }
+
+  if (!config->delay_context) {
+    config->delay_context = delay_updates_context_create(root_directory);
+    if (!config->delay_context)
+      return FILE_SAVE_ERROR;
+  }
+  DelayUpdatesContext* context = config->delay_context;
+  if (!delay_updates_prepare(context))
+    return FILE_SAVE_ERROR;
+
+  char* staged_path = path_cat(context->staging_root, file->path);
+  if (!staged_path)
+    return FILE_SAVE_ERROR;
+
+  /* The staged location is brand new (stale leftovers from a prior crash were
+     wiped by prepare), so the plain atomic temp+rename engine installs the
+     complete file there.  --temp-dir scratch is deliberately not layered on
+     top of the delay-updates staging tree. */
+  bool ok =
+      file_to_disk_secure_with_fsync(staged_path, file->data->data, file->data->size, false, sparse,
+                                     metadata, preserve_executability, config->use_fsync, NULL);
+  if (!ok) {
+    free(staged_path);
+    return FILE_SAVE_ERROR;
+  }
+
+  if (!delay_updates_record(context, staged_path, destination_path, file->path)) {
+    unlink(staged_path);
+    free(staged_path);
+    return FILE_SAVE_ERROR;
+  }
+  free(staged_path);
+  return FILE_SAVE_WRITTEN;
 }
 
 FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
@@ -77,6 +144,18 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     free(destination_path);
     free(disk_path);
     return FILE_SAVE_ERROR;
+  }
+
+  /* --delay-updates diverts the whole write into the staging tree; the rest of
+     this function is the immediate-install path. */
+  if (config && config->delay_updates) {
+    FileSaveResult result =
+        file_stage_delayed_update(root_directory, destination_path, file, (Config*)config);
+    free(confined_backup);
+    free(confined_partial);
+    free(destination_path);
+    free(disk_path);
+    return result;
   }
 
   /* --existing checks the final destination, not a temporary partial path. */
@@ -718,8 +797,13 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
     return *status_out == STATUS_FINISHED ? 0 : -1;
   }
   fprintf(stderr, "Deleting files not in manifest...\n");
-  bool deletion_ok =
-      delete_extras_limited(config->receive_root_directory, manifest, MAX_SERVER_DELETE_COUNT);
+  /* With --delay-updates the staged (not yet published) files live directly
+     under the receive root in the staging directory; the delete walker must
+     not treat them as extras or it would remove every staged file before it
+     can be published. */
+  const char* skip_staging = config->delay_updates ? DELAY_UPDATES_STAGING_DIR : NULL;
+  bool deletion_ok = delete_extras_limited(config->receive_root_directory, manifest,
+                                           MAX_SERVER_DELETE_COUNT, skip_staging);
   array_list_delete(manifest);
   if (!deletion_ok)
     send_status(fd, STATUS_ERROR);

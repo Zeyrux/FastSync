@@ -5,6 +5,7 @@
 #include "test_compression.h"
 #include "test_config.h"
 #include "test_data.h"
+#include "test_delay_updates.h"
 #include "test_delta.h"
 #include "test_file.h"
 #include "test_file_sendfile.h"
@@ -51,6 +52,7 @@ int main() {
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
   RUN_TEST(test_file);
+  RUN_TEST(test_delay_updates);
   RUN_TEST(test_file_sendfile);
   RUN_TEST(test_multiprocessing);
   RUN_TEST(test_log);

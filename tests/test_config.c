@@ -136,6 +136,7 @@ static void test_config_send_receive() {
   send_cfg->modify_window = 4;
   send_cfg->existing = true;
   send_cfg->ignore_existing = true;
+  send_cfg->delay_updates = true;
   send_cfg->skip_compress_set = true;
   send_cfg->skip_compress_count = 1;
   send_cfg->skip_compress_suffixes = calloc(1, sizeof(char*));
@@ -190,6 +191,8 @@ static void test_config_send_receive() {
       if (!recv_cfg->existing)
         ok = false;
       if (!recv_cfg->ignore_existing)
+        ok = false;
+      if (!recv_cfg->delay_updates)
         ok = false;
       if (!recv_cfg->skip_compress_set || recv_cfg->skip_compress_count != 1 ||
           strcmp(recv_cfg->skip_compress_suffixes[0], ".zip") != 0)
@@ -405,6 +408,30 @@ static void test_config_temp_dir_roundtrip() {
   config_delete(c);
 }
 
+static void test_config_delay_updates_reserved_backup_rejected() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->delay_updates = true;
+  c->backup_dir = str_dup(".fastsync-stage");
+  /* The receiver-side wire validation must reject a --backup-dir that collides
+     with the internal delay-updates staging directory. */
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->delay_updates = true;
+  c->backup_dir = str_dup("backups");
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
 static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
@@ -440,6 +467,7 @@ void test_config() {
     test_config_receive_truncated();
     test_config_string_null_vs_empty_roundtrip();
     test_config_temp_dir_roundtrip();
+    test_config_delay_updates_reserved_backup_rejected();
   }
   test_config_is_remote_dest();
 }

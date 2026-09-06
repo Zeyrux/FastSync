@@ -1,5 +1,6 @@
 #include "config.h"
 #include "chmod.h"
+#include "delay_updates.h"
 #include "delta.h"
 #include "log.h"
 #include "protocol.h"
@@ -84,6 +85,7 @@ static void config_set_defaults(Config* config) {
   config->ignore_existing = false;
   config->update = false;
   config->inplace = false;
+  config->delay_updates = false;
   config->use_fsync = false;
   config->append = false;
   config->append_verify = false;
@@ -119,6 +121,7 @@ static void config_set_defaults(Config* config) {
   config->skip_compress_suffixes = NULL;
   config->skip_compress_count = 0;
   config->skip_compress_set = false;
+  config->delay_context = NULL;
 }
 
 static bool valid_wire_bool(int value) {
@@ -152,6 +155,8 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
+         valid_wire_bool(config->delay_updates) && !(config->delay_updates && config->inplace) &&
+         !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          !(config->skip_compress_set && config->use_chunk_serialization) &&
@@ -248,6 +253,12 @@ void config_delete(Config* config) {
   if (config->filters) {
     array_list_delete(config->filters);
   }
+  /* A --delay-updates staging tree is transient receiver state: remove any
+     leftovers on every exit path (success already emptied it). */
+  if (config->delay_context)
+    delay_updates_cleanup(config->delay_context);
+  delay_updates_context_destroy(config->delay_context);
+  config->delay_context = NULL;
   free(config);
 }
 
@@ -287,10 +298,11 @@ static bool send_file_options(int fd, const Config* c) {
 
 static bool send_selection_options(int fd, const Config* c) {
   return send_int(fd, c->ignore_existing) && send_int(fd, c->existing) && send_int(fd, c->update) &&
-         send_int(fd, c->inplace) && send_int(fd, c->append) && send_int(fd, c->use_fsync) &&
-         send_int(fd, c->append_verify) && send_int(fd, c->delete_excluded) &&
-         send_int(fd, c->delete_after) && send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) &&
-         send_int(fd, c->relative) && send_int(fd, c->prune_empty_dirs);
+         send_int(fd, c->inplace) && send_int(fd, c->delay_updates) && send_int(fd, c->append) &&
+         send_int(fd, c->use_fsync) && send_int(fd, c->append_verify) &&
+         send_int(fd, c->delete_excluded) && send_int(fd, c->delete_after) &&
+         send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
+         send_int(fd, c->prune_empty_dirs);
 }
 
 static bool send_skip_compress_options(int fd, const Config* c) {
@@ -382,9 +394,9 @@ static bool receive_file_options(int fd, Config* c) {
 }
 
 static bool receive_selection_options(int fd, Config* c) {
-  bool* flags[] = {&c->ignore_existing, &c->existing,        &c->update,
-                   &c->inplace,         &c->append,          &c->use_fsync,
-                   &c->append_verify,   &c->delete_excluded, &c->delete_after};
+  bool* flags[] = {&c->ignore_existing, &c->existing,    &c->update,    &c->inplace,
+                   &c->delay_updates,   &c->append,      &c->use_fsync, &c->append_verify,
+                   &c->delete_excluded, &c->delete_after};
   for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
     if (!receive_wire_bool(fd, flags[i]))
       return false;

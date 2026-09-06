@@ -8,6 +8,10 @@
 
 typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
 
+/* Receiver-side staging state for --delay-updates.  Forward-declared here so
+   Config can carry it; the concrete type lives in delay_updates.h. */
+typedef struct DelayUpdatesContext DelayUpdatesContext;
+
 typedef struct Config {
   char* version;
   char* send_directory;
@@ -91,6 +95,7 @@ typedef struct Config {
   bool ignore_existing;
   bool update;
   bool inplace;
+  bool delay_updates;
   bool use_fsync;
   bool append;
   bool append_verify;
@@ -147,9 +152,13 @@ typedef struct Config {
   char** skip_compress_suffixes;
   int skip_compress_count;
   bool skip_compress_set;
+
+  // Receiver-side runtime staging registry for --delay-updates.  Never sent
+  // over the wire and never set on the sender side.
+  DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.5.0"
+#define PROTOCOL_VERSION "2.6.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);

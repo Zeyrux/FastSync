@@ -396,6 +396,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--log-file-format", NULL, OPT_STRING, offsetof(Config, log_file_format)},
     {"--existing", NULL, OPT_FLAG, offsetof(Config, existing)},
     {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
+    {"--delay-updates", NULL, OPT_FLAG, offsetof(Config, delay_updates)},
     {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
     {"--dirs", "--old-dirs", OPT_UNSUPPORTED, 0},
     {"--old-d", NULL, OPT_UNSUPPORTED, 0},

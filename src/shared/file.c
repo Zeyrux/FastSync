@@ -338,23 +338,22 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
   return ok;
 }
 
-/* Open the configured --temp-dir scratch directory, creating it (and any
-   missing path components) on demand.  scratch_path is expected to already be
-   confined below the authorized root by the caller; file_open_secure_parent
-   re-checks that confinement and rejects `..` components, so a scratch
-   directory can never be created or opened outside the destination root.
-   Returns an O_DIRECTORY|O_NOFOLLOW fd, or -1 on error. */
-static int file_open_scratch_dir(const char* scratch_path) {
-  if (!scratch_path)
+/* Open a private staging/scratch directory, creating it (and any missing path
+   components) on demand.  dir_path is expected to already be confined below
+   the authorized root by the caller; file_open_secure_parent re-checks that
+   confinement and rejects `..` components, so a scratch directory can never be
+   created or opened outside the destination root.  The directory itself is
+   created 0700 so other users cannot race on names inside it.  Returns an
+   O_DIRECTORY|O_NOFOLLOW fd, or -1 on error. */
+int file_open_private_dir(const char* dir_path) {
+  if (!dir_path)
     return -1;
   char* leaf = NULL;
-  int parent_fd = file_open_secure_parent(scratch_path, &leaf, true);
+  int parent_fd = file_open_secure_parent(dir_path, &leaf, true);
   if (parent_fd < 0)
     return -1;
   int fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0 && errno == ENOENT) {
-    /* A scratch directory holds transient working copies only; keep it
-       private (0700) so other users cannot race on temp names inside it. */
     if (mkdirat(parent_fd, leaf, 0700) == 0 || errno == EEXIST)
       fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   }
@@ -429,7 +428,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
        file is created in the destination directory, exactly as historically. */
     int scratch_dirfd = -1;
     if (temp_dir) {
-      scratch_dirfd = file_open_scratch_dir(temp_dir);
+      scratch_dirfd = file_open_private_dir(temp_dir);
       if (scratch_dirfd < 0) {
         int saved_errno = errno;
         log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s",

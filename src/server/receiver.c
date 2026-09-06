@@ -1,6 +1,8 @@
 #include "receiver.h"
 
 #include "chunk.h"
+#include "config.h"
+#include "delay_updates.h"
 #include "file_receive.h"
 #include "log.h"
 #include "metadata.h"
@@ -217,6 +219,17 @@ static bool receiver_save_file(File* file, void* context_pointer) {
 
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
+  /* --delay-updates: the whole protocol stream (including manifest/delete
+     handling, which ran inside receiver_process) has succeeded and every
+     staged file was fully written.  Publish them atomically now, before the
+     success/outcome frame tells a --remove-source-files sender it may delete
+     its sources. */
+  if (context->config->delay_updates && context->config->delay_context) {
+    if (!delay_updates_publish(context->config->delay_context, context->config)) {
+      send_status(fd, STATUS_ERROR);
+      return false;
+    }
+  }
   return receiver_send_final_success(fd, context->config, &context->outcomes);
 }
 
@@ -224,6 +237,8 @@ int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
   ReceiverSink sink = {receiver_save_file, &context, true, true, receiver_send_success_frame};
   int ret = receiver_process(config, file_descriptor, &sink);
+  if (ret != 0 && config->delay_updates && config->delay_context)
+    delay_updates_cleanup(config->delay_context);
   receiver_outcomes_destroy(&context.outcomes);
   return ret;
 }

@@ -1,4 +1,5 @@
 #include "client_validation.h"
+#include "delay_updates.h"
 #include "log.h"
 #include "usage.h"
 #include <stdio.h>
@@ -59,6 +60,16 @@ bool validate_config(const Config* config) {
       log_message(LOG_LEVEL_ERROR, "--tls requires --cert, --key, and --ca");
       return false;
     }
+  }
+  if (config->delay_updates && config->inplace) {
+    log_message(LOG_LEVEL_ERROR, "--delay-updates does not work with --inplace");
+    return false;
+  }
+  if (config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--backup-dir is reserved when --delay-updates is active (used for the internal "
+                "staging directory)");
+    return false;
   }
   return true;
 }

@@ -31,6 +31,10 @@ bool file_destination_is_newer_secure(const char* path, const FileMetadata* meta
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
 bool file_ensure_directory_secure(const char* path);
 bool file_rename_secure(const char* old_path, const char* new_path);
+/* Open a private 0700 directory (creating it on demand) that must live below
+   the authorized root.  Used for the --temp-dir scratch directory and the
+   --delay-updates staging directory. */
+int file_open_private_dir(const char* dir_path);
 
 /* The file_to_disk_secure* variants write a temporary copy in the destination
    directory and atomically rename it over `path`.  temp_dir is an absolute,
