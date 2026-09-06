@@ -102,7 +102,11 @@ partial, alternate, and planned behavior.
 | `-q, --quiet` | Suppress non-error output |
 | `--progress` | Show real-time transfer speed |
 | `-P` | Enables partial-transfer mode and progress output (partial retention is incomplete) |
-| `--delete` | Delete files on receiver not present in source |
+| `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded) |
+| `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
+| `--delete-during`, `--del` | Delete extras once the keep-set is known, before data is applied (implies `--delete`) |
+| `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`) |
+| `--delete-after` | Explicit delete-after timing (implies `--delete`) |
 | `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
 | `--exclude-from <file>` | Read exclude patterns from a file (one per line) |
 | `--include <pattern>` | Only transfer files matching glob pattern (repeatable, whitelist) |
@@ -386,7 +390,11 @@ option.
 |---|---|
 | `-a`, `--archive` | Enable current archive preset. Full rsync archive semantics are planned. |
 | `-n`, `--dry-run` | Scan and report without writing files. |
-| `--delete` | Request removal of destination entries absent from the source. The server must allow deletion. |
+| `--delete` | Request removal of destination entries absent from the source. The server must allow deletion. Default timing is delete-after: extras are removed only after the whole transfer succeeded. |
+| `--delete-before` | Delete extras before the transfer starts (implies `--delete`). |
+| `--delete-during`, `--del` | Delete extras once the keep-set manifest is known, before data is applied (implies `--delete`; early mode, same engine behaviour as `--delete-before`). |
+| `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`; commit mode, same behaviour as `--delete-after`). |
+| `--delete-after` | Explicit delete-after timing: delete only after the transfer succeeded (implies `--delete`). |
 | `--exclude <pattern>` | Exclude matching paths. Repeatable. |
 | `--include <pattern>` | Include matching paths. Repeatable. |
 | `--exclude-from <file>` | Read exclude patterns from a file. |

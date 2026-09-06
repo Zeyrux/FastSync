@@ -103,16 +103,31 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `--delete` | Delete extraneous files from dest | ✅ Implemented | `use_delete` config field |
-| `--delete-before` | Delete before transfer | ❌ Not Implemented | Removed because it had no effect |
-| `--del`, `--delete-during` | Delete during transfer | ❌ Not Implemented | Both flags are recognized but rejected; delete timing is not implemented |
-| `--delete-delay` | Find deletions during, delete after | ❌ Not Implemented | |
-| `--delete-after` | Delete after transfer | ❌ Not Implemented | Removed because it had no effect |
+| `--delete` | Delete extraneous files from dest | ✅ Implemented | `use_delete` config field. Deletion is always derived from the transmitted keep-set manifest of the paths the sender sent/keeps (never from unchecked input), runs through the symlink-safe walker bounded by `MAX_SERVER_DELETE_COUNT`, and skips the `.fastsync-stage` staging dir under `--delay-updates`. FastSync's default timing when no timing flag is given is **delete-after** (extras are removed only once the whole transfer succeeded) — intentionally NOT rsync's `--del`/delete-during default, to preserve FastSync's commit-style safety |
+| `--delete-before` | Delete before transfer | ✅ Implemented | Implies `--delete`. The sender runs a full source pre-scan (paths only) and transmits the keep-set manifest BEFORE any file data; the receiver validates it, removes every destination entry not listed (bounded walk, staging-dir skip), then acks `STATUS_OK`. The sender only starts streaming after the deletion committed, or aborts if the receiver reported a deletion error. By definition the deletions already happened when a later transfer phase fails — rsync's delete-before is destructive the same way; a subsequent failure does not restore the removed files. Divergence: the keep-set is the pre-scan snapshot, so a file that appears on the source between the pre-scan and the data pass is still transferred but was not protected from deletion |
+| `--del`, `--delete-during` | Delete during transfer | ✅ Implemented | Both spellings accepted; imply `--delete`. FastSync streams the source in a single directory scan and has no per-directory generator pass, so deletions cannot be interleaved per-directory the way rsync's delete-during does. `--delete-during` therefore selects the same early engine mode as `--delete-before` (manifest transmitted before any data, extras removed and acknowledged before data is applied); observable success/failure behaviour equals `--delete-before`. That is the documented divergence from rsync, where `--del` is the default meaning of `--delete` |
+| `--delete-delay` | Find deletions during, delete after | ✅ Implemented | Implies `--delete`. Commit-mode timing: extras are removed only after the whole transfer succeeded. rsync's delete-delay records the deletion list during its scan and applies it at the end; FastSync never snapshots the destination while data flows (the keep-set is the transmitted manifest and the destination is listed only at deletion time), so `--delete-delay` is implemented as the same end-of-transfer commit as `--delete-after` with identical safety. That is the documented divergence |
+| `--delete-after` | Delete after transfer | ✅ Implemented | Implies `--delete`. The delete-after timing is also what plain `--delete` does: the keep-set manifest closes the data stream and the receiver commits the bounded deletion only after the terminal `STATUS_FINISHED` proves the whole transfer (every data frame received and stored) succeeded. A failed or aborted transfer removes nothing |
 | `--delete-excluded` | Also delete excluded files | ❌ Not Implemented | Removed because it had no effect |
 | `--max-delete=NUM` | Max files to delete | ❌ Not Implemented | Removed because it had no effect |
 | `--ignore-errors` | Delete even with I/O errors | ❌ Not Implemented | |
 | `--force` | Force deletion of non-empty dirs | ❌ Not Implemented | |
 | `--prune-empty-dirs` | Prune empty dir chains | ❌ Not Implemented | Removed because it had no effect |
+
+**Deletion-timing implementation notes (Phase 3):** the delete flags above are
+real. Two new config booleans (`delete_during`, `delete_delay`) join the already
+serialized `delete_before`/`delete_after`, so the on-the-wire config layout
+changed and `PROTOCOL_VERSION` was bumped **2.7.0 → 2.8.0** (peers must match).
+The `STATUS_MANIFEST` frame is count-delimited and position-independent: the
+receiver commits the deletion either when the manifest arrives (early modes:
+`--delete-before`/`--delete-during`, which additionally acknowledge with
+`STATUS_OK` before data flows) or after the terminal `STATUS_FINISHED` proves
+the whole transfer succeeded (commit modes: plain `--delete`/`--delete-after`/
+`--delete-delay`). Timing is chosen purely from the config, so server policy
+(`--allow-delete` off) still disables deletion without deadlocking the early
+manifest ack. `--delete-delay` and `--delete-during` are each implemented as
+the closest safe approximation their engine mode allows; the divergences are
+noted in the rows above.
 
 ## 8. Metadata Preservation
 
