@@ -204,9 +204,26 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   return false;
 }
 
+/* True when child_rel is, or lies below, a protected entry.  A prefix "a"
+   therefore protects "a" and "a/b/c" but not "ab".  Entries with top_level_only
+   set only protect DIRECT children of the receive root (at_root); nested
+   directories that share such a name stay ordinary destination content. */
+static bool path_under_skip_prefix(const char* child_rel, bool at_root,
+                                   const DeleteSkipEntry* skips, int skip_count) {
+  for (int i = 0; i < skip_count; i++) {
+    if (skips[i].top_level_only && !at_root)
+      continue;
+    size_t prefix_len = strlen(skips[i].prefix);
+    if (strncmp(child_rel, skips[i].prefix, prefix_len) == 0 &&
+        (child_rel[prefix_len] == '\0' || child_rel[prefix_len] == '/'))
+      return true;
+  }
+  return false;
+}
+
 static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest,
-                             size_t max_delete, size_t* deleted_count,
-                             const char* skip_root_child) {
+                             size_t max_delete, size_t* deleted_count, const DeleteSkipEntry* skips,
+                             int skip_count) {
   int scanfd = dup(dirfd);
   if (scanfd < 0)
     return false;
@@ -220,16 +237,20 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    /* A --delay-updates run keeps its staging directory as a direct child of
-       the receive root.  Its contents are not manifest entries yet (they are
-       published after deletion), so descending into it would delete every
-       staged file as an "extra".  Skip only the top-level staging name; nested
-       directories with the same name are ordinary destination content. */
-    if (rel_path[0] == '\0' && skip_root_child && strcmp(entry->d_name, skip_root_child) == 0)
-      continue;
     char* child_rel = path_cat((char*)rel_path, entry->d_name);
     if (!child_rel) {
       operation_ok = false;
+      continue;
+    }
+    /* A --delay-updates run keeps its staging directory as a direct child of
+       the receive root, and basis-dir snapshots live below it too.  Their
+       contents are not manifest entries, so descending into them would delete
+       every staged / basis file as an "extra".  Only the staging name (a
+       top-level-only prefix) and the basis prefixes are protected: a nested
+       destination directory that happens to be called .fastsync-stage is
+       ordinary content. */
+    if (path_under_skip_prefix(child_rel, rel_path[0] == '\0', skips, skip_count)) {
+      free(child_rel);
       continue;
     }
     struct stat st;
@@ -249,7 +270,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       bool child_removed = false;
       if (childfd >= 0) {
         child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count,
-                                         skip_root_child);
+                                         skips, skip_count);
         if (!child_removed)
           operation_ok = false;
         close(childfd);
@@ -301,7 +322,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
 }
 
 bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete,
-                           const char* skip_root_child) {
+                           const DeleteSkipEntry* skips, int skip_count) {
   if (!manifest)
     return false;
   int rootfd;
@@ -318,14 +339,14 @@ bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t ma
   if (rootfd < 0)
     return false;
   size_t deleted_count = 0;
-  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count, skip_root_child);
+  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count, skips, skip_count);
   if (close(rootfd) != 0)
     ok = false;
   return ok;
 }
 
 bool delete_extras(const char* dest_root, ArrayList* manifest) {
-  return delete_extras_limited(dest_root, manifest, SIZE_MAX, NULL);
+  return delete_extras_limited(dest_root, manifest, SIZE_MAX, NULL, 0);
 }
 
 bool has_path_traversal(const char* path) {

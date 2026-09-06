@@ -109,9 +109,8 @@ static void config_set_defaults(Config* config) {
   config->rsync_path = NULL;
   config->old_args = false;
   config->temp_dir = NULL;
-  config->compare_dest = NULL;
-  config->copy_dest = NULL;
-  config->link_dest = NULL;
+  config->basis_dirs = NULL;
+  config->basis_count = 0;
   config->partial_dir = NULL;
   config->suffix = NULL;
   config->delete_before = false;
@@ -212,6 +211,87 @@ bool config_has_valid_delete_timing(const Config* config) {
   return timing_count <= 1;
 }
 
+bool config_has_basis(const Config* config) {
+  return config && config->basis_count > 0;
+}
+
+/* A basis-dir path travels from the client to the receiver and is resolved
+ * below the destination root, so it must be a non-empty relative path with no
+ * "." or ".." component and no traversal: an absolute or escaping path would
+ * make the receiver read or link files outside its authorized root.
+ *
+ * Returns a malloc'd CANONICAL copy of an accepted path, or NULL when the path
+ * is rejected.  Canonicalization collapses interior empty components ("a//b" ->
+ * "a/b"), drops "." components and trailing "/"s, so validation, the delete
+ * walker prefix match and the receiver's basis lookup all agree on one form.
+ * The normalizer is the single source of truth for both config_basis_path_valid
+ * and config_basis_append. */
+static char* basis_path_normalize(const char* path) {
+  if (!path || path[0] == '\0' || path[0] == '/' || has_path_traversal(path))
+    return NULL;
+  if (strcmp(path, ".") == 0)
+    return NULL;
+  char* dup = str_dup(path);
+  if (!dup)
+    return NULL;
+  size_t out_len = 0;
+  char* out = malloc(strlen(path) + 1);
+  if (!out) {
+    free(dup);
+    return NULL;
+  }
+  char* saveptr = NULL;
+  bool ok = true;
+  for (char* part = strtok_r(dup, "/", &saveptr); part; part = strtok_r(NULL, "/", &saveptr)) {
+    if (strcmp(part, "..") == 0) {
+      ok = false;
+      break;
+    }
+    if (strcmp(part, ".") == 0)
+      continue;
+    if (out_len > 0)
+      out[out_len++] = '/';
+    size_t len = strlen(part);
+    memcpy(out + out_len, part, len);
+    out_len += len;
+  }
+  free(dup);
+  if (!ok || out_len == 0) {
+    free(out);
+    return NULL;
+  }
+  out[out_len] = '\0';
+  return out;
+}
+
+bool config_basis_path_valid(const char* path) {
+  char* normalized = basis_path_normalize(path);
+  if (!normalized)
+    return false;
+  free(normalized);
+  return true;
+}
+
+int config_basis_append(Config* config, BasisDestType type, const char* path) {
+  if (!config ||
+      (type != BASIS_DEST_COMPARE && type != BASIS_DEST_COPY && type != BASIS_DEST_LINK) ||
+      config->basis_count >= MAX_BASIS_DIRS)
+    return -1;
+  char* normalized = basis_path_normalize(path);
+  if (!normalized)
+    return -1;
+  BasisDest* grown = realloc(config->basis_dirs, (config->basis_count + 1) * sizeof(BasisDest));
+  if (!grown) {
+    free(normalized);
+    return -1;
+  }
+  config->basis_dirs = grown;
+  config->basis_dirs[config->basis_count].type = type;
+  config->basis_dirs[config->basis_count].path = normalized;
+  config->basis_count++;
+  return 0;
+}
+
 bool config_is_remote_dest(const char* s) {
   if (s == NULL)
     return false;
@@ -268,9 +348,13 @@ void config_delete(Config* config) {
   free(config->rsh_command);
   free(config->rsync_path);
   free(config->temp_dir);
-  free(config->compare_dest);
-  free(config->copy_dest);
-  free(config->link_dest);
+  for (int i = 0; i < config->basis_count; i++) {
+    free(config->basis_dirs[i].path);
+    config->basis_dirs[i].path = NULL;
+  }
+  free(config->basis_dirs);
+  config->basis_dirs = NULL;
+  config->basis_count = 0;
   free(config->partial_dir);
   free(config->suffix);
   free(config->address);
@@ -356,6 +440,17 @@ static bool send_resume_options(int fd, const Config* c) {
          send_int(fd, c->checksum) && send_int(fd, c->modify_window) &&
          send_str(fd, c->compress_choice ? c->compress_choice : "") &&
          send_str(fd, c->chmod_spec ? c->chmod_spec : "") && send_skip_compress_options(fd, c);
+}
+
+static bool send_basis_options(int fd, const Config* c) {
+  if (!send_int(fd, c->basis_count))
+    return false;
+  for (int i = 0; i < c->basis_count; i++) {
+    if (!send_int(fd, (int)c->basis_dirs[i].type) ||
+        !send_str(fd, c->basis_dirs[i].path ? c->basis_dirs[i].path : ""))
+      return false;
+  }
+  return true;
 }
 
 static bool receive_core_fields(int fd, Config* c) {
@@ -506,12 +601,35 @@ static bool receive_resume_options(int fd, Config* c) {
   return true;
 }
 
+static bool receive_basis_options(int fd, Config* c) {
+  int count;
+  if (!receive_int(fd, &count))
+    return false;
+  if (count < 0 || count > MAX_BASIS_DIRS)
+    return false;
+  for (int i = 0; i < count; i++) {
+    int type;
+    if (!receive_int(fd, &type) || type <= BASIS_DEST_NONE || type > BASIS_DEST_LINK)
+      return false;
+    char* path = receive_str(fd);
+    if (!path)
+      return false;
+    /* config_basis_append validates and canonicalizes the path; a rejected
+       path (absolute / traversal / empty) drops the whole connection. */
+    bool ok = config_basis_append(c, (BasisDestType)type, path) == 0;
+    free(path);
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
       !send_file_options(file_descriptor, config) ||
       !send_selection_options(file_descriptor, config) ||
-      !send_resume_options(file_descriptor, config))
+      !send_resume_options(file_descriptor, config) || !send_basis_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -543,7 +661,8 @@ Config* config_receive(int file_descriptor) {
       !receive_delta_fields(file_descriptor, config) ||
       !receive_file_options(file_descriptor, config) ||
       !receive_selection_options(file_descriptor, config) ||
-      !receive_resume_options(file_descriptor, config))
+      !receive_resume_options(file_descriptor, config) ||
+      !receive_basis_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

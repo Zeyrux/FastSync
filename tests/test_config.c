@@ -561,6 +561,119 @@ static void test_config_delete_timing_conflict_rejected() {
   config_delete(c);
 }
 
+/* Basis-dir lists survive the config wire: each entry's type and path must
+   round-trip unchanged. */
+static void test_config_basis_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  EXPECT_EQ_INT(config_basis_append(send_cfg, BASIS_DEST_LINK, "prior"), 0);
+  EXPECT_EQ_INT(config_basis_append(send_cfg, BASIS_DEST_COMPARE, "snap/2026-01"), 0);
+  EXPECT_EQ_INT(config_basis_append(send_cfg, BASIS_DEST_COPY, "copy"), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL && recv->basis_count == 3 && recv->basis_dirs != NULL;
+    if (ok) {
+      ok = recv->basis_dirs[0].type == BASIS_DEST_LINK &&
+           strcmp(recv->basis_dirs[0].path, "prior") == 0;
+      ok = ok && recv->basis_dirs[1].type == BASIS_DEST_COMPARE &&
+           strcmp(recv->basis_dirs[1].path, "snap/2026-01") == 0;
+      ok = ok && recv->basis_dirs[2].type == BASIS_DEST_COPY &&
+           strcmp(recv->basis_dirs[2].path, "copy") == 0;
+    }
+    config_delete(recv);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* The receiver must reject a basis-dir path that would escape the destination
+   root.  The values are injected directly (bypassing the client-side append
+   validator) so the receiver-side wire validation is what is exercised. */
+static void test_config_basis_wire_rejects_escaping() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->basis_count = 1;
+  c->basis_dirs = calloc(1, sizeof(BasisDest));
+  c->basis_dirs[0].type = BASIS_DEST_LINK;
+  c->basis_dirs[0].path = str_dup("../../etc");
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->basis_count = 1;
+  c->basis_dirs = calloc(1, sizeof(BasisDest));
+  c->basis_dirs[0].type = BASIS_DEST_LINK;
+  c->basis_dirs[0].path = str_dup("/abs");
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* A well-formed list still round-trips even with a manually built struct. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->basis_count = 1;
+  c->basis_dirs = calloc(1, sizeof(BasisDest));
+  c->basis_dirs[0].type = BASIS_DEST_COPY;
+  c->basis_dirs[0].path = str_dup("safe");
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+/* Basis-dir paths are canonicalized on the way in: trailing slashes and
+   interior empty / "." components are dropped so validation, the delete-walker
+   prefix and the receiver lookup all agree on one stored form. */
+static void test_config_basis_normalization() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "prior/"), 0);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "a//b"), 0);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "./x/./y/"), 0);
+  EXPECT_EQ_INT(c->basis_count, 3);
+  EXPECT_EQ_STR(c->basis_dirs[0].path, "prior");
+  EXPECT_EQ_STR(c->basis_dirs[1].path, "a/b");
+  EXPECT_EQ_STR(c->basis_dirs[2].path, "x/y");
+
+  /* Degenerate values that normalize away to nothing stay rejected. */
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "."), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ".."), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/abs"), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "a/../b"), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ""), -1);
+  config_delete(c);
+}
+
 static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
@@ -599,6 +712,9 @@ void test_config() {
     test_config_delay_updates_reserved_backup_rejected();
     test_config_delete_timing_wire_roundtrip();
     test_config_delete_timing_conflict_rejected();
+    test_config_basis_roundtrip();
+    test_config_basis_wire_rejects_escaping();
+    test_config_basis_normalization();
   }
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

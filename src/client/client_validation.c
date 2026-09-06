@@ -11,6 +11,12 @@ bool validate_config(const Config* config) {
     print_usage();
     return false;
   }
+  if (config_has_basis(config) && config->use_chunk_serialization) {
+    log_message(LOG_LEVEL_ERROR,
+                "--compare-dest/--copy-dest/--link-dest require per-file incremental checks and "
+                "cannot be combined with -s (chunk serialization)");
+    return false;
+  }
   if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
     log_message(LOG_LEVEL_ERROR, "-f/--sendfile cannot be combined with -c (compression) or -s "
                                  "(chunk serialization)");

@@ -114,6 +114,27 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
   return 0;
 }
 
+/* Validate and append one --compare-dest/--copy-dest/--link-dest directory.
+ * The path is interpreted on the receiver relative to the destination root,
+ * so it must be a non-empty relative path with no "." / ".." components (an
+ * absolute or escaping path is rejected up front instead of failing on the
+ * server). Returns 0 on success, -1 on error. */
+static int set_basis_dest_option(Config* config, BasisDestType type, const char* value,
+                                 const char* option_name) {
+  if (!value || !value[0]) {
+    log_message(LOG_LEVEL_ERROR, "missing argument for %s", option_name);
+    return -1;
+  }
+  if (config_basis_append(config, type, value) != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "%s requires a non-empty relative directory name with no '.', '..', or absolute "
+                "path (resolved below the destination root)",
+                option_name);
+    return -1;
+  }
+  return 0;
+}
+
 static int set_stderr_mode(const char* value) {
   if (strcmp(value, "errors") == 0 || strcmp(value, "e") == 0)
     log_set_stderr_mode(LOG_STDERR_ERRORS);
@@ -974,6 +995,36 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       log_message(LOG_LEVEL_ERROR, "%s is not supported yet (xxHash64 is used)", argv[i]);
       return -1;
+    } else if (strncmp(argv[i], "--compare-dest=", 15) == 0) {
+      if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[i] + 15, "--compare-dest") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--compare-dest", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[++i], "--compare-dest") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--copy-dest=", 12) == 0) {
+      if (set_basis_dest_option(config, BASIS_DEST_COPY, argv[i] + 12, "--copy-dest") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--copy-dest", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_basis_dest_option(config, BASIS_DEST_COPY, argv[++i], "--copy-dest") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--link-dest=", 12) == 0) {
+      if (set_basis_dest_option(config, BASIS_DEST_LINK, argv[i] + 12, "--link-dest") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--link-dest", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_basis_dest_option(config, BASIS_DEST_LINK, argv[++i], "--link-dest") != 0)
+        return -1;
     } else if (argv[i][0] == '-') {
       char* escaped = output_escape(argv[i], false);
       fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
@@ -1009,6 +1060,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     file_list_destroy((FileListSet*)config->files_from_set);
     config->files_from_set = set;
   }
+
+  /* The "unchanged" decision for --compare-dest/--copy-dest/--link-dest must
+   * be made on the receiver against the basis directories, which requires the
+   * per-file STATUS_CHECK handshake: basis-dir options therefore imply
+   * --incremental (and, via the block below, metadata) on the sender. */
+  if (config_has_basis(config))
+    config->use_incremental = true;
 
   /* Incremental and delta transfers need metadata unless the user disabled it. */
   if ((config->use_incremental || config->use_delta) && !config->use_metadata &&
