@@ -2136,12 +2136,13 @@ class TestDeletePolicy:
             fh.write(content)
 
     @pytest.mark.parametrize("mt", [False, True])
-    @pytest.mark.parametrize("timing", ["--delete", "--delete-before"])
+    @pytest.mark.parametrize("timing",
+                             ["--delete", "--delete-before", "--delete-after", "--delete-delay"])
     def test_delete_protects_excluded_by_default_and_delete_excluded_removes(self, mt, timing):
-        """rsync parity: with --delete a destination mirror path whose source was
-        excluded survives (protected by default); --delete-excluded opts back
-        into deleting it.  Verified single-threaded, -m, and an early timing
-        run (--delete-before) where the manifest arrives before any data."""
+        """rsync parity: with a --delete timing the destination mirror path whose
+        source was excluded survives (protected by default); --delete-excluded
+        opts back into deleting it.  Verified single-threaded and -m across every
+        timing (commit and early)."""
         source = os.path.join(TEST_DATA_DIR, f"delexcl_{timing.strip('-')}_{mt}_src")
         clean_dir(source)
         entries = {
@@ -2307,8 +2308,34 @@ class TestDeletePolicy:
             assert os.path.isfile(os.path.join(received, "sub")), \
                 "--force did not replace the directory with the file"
             assert _read_file(os.path.join(received, "sub")) == b"now a file\n"
-            assert not os.path.exists(os.path.join(received, "sub", "old.txt")), \
-                "--force left the old directory content behind"
+
+    def test_force_inert_under_delay_updates(self):
+        """Documented divergence: --force acts on the immediate-install path; a
+        --delay-updates run stages into its own tree and its publication renames
+        over regular files only, so a blocking directory is not cleared and the
+        run fails."""
+        source = os.path.join(TEST_DATA_DIR, "force_delay_src")
+        clean_dir(source)
+        self._write(os.path.join(source, "sub", "old.txt"), b"old\n")
+        self._write(os.path.join(source, "keep.txt"), b"kept\n")
+        dest = os.path.join(TEST_DATA_DIR, "force_delay_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            os.unlink(os.path.join(source, "sub", "old.txt"))
+            os.rmdir(os.path.join(source, "sub"))
+            self._write(os.path.join(source, "sub"), b"now a file\n")
+            result, _ = run_client(source, dest, flags=["--force", "--delay-updates"],
+                                   port=server.port)
+            assert result.returncode != 0, \
+                "--force --delay-updates unexpectedly replaced the blocking directory"
+            assert os.path.isdir(os.path.join(received, "sub")), \
+                "blocking directory was cleared although --delay-updates should keep --force inert"
+            assert os.path.exists(os.path.join(received, "sub", "old.txt")), \
+                "blocking directory content was lost"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_prune_empty_dirs_dirs_mode(self, mt):
@@ -2396,14 +2423,22 @@ class TestDeletePolicy:
             assert os.path.exists(os.path.join(received, "a", "keep.log")), \
                 "excluded file mirror was deleted under --delete (rsync protects it)"
 
-    def test_ignore_errors_keeps_deletion_active_on_scan_error(self):
-        """A source I/O error (unreadable directory) aborts the run so no
+    def _run_client_as_nobody(self, source, dest, port, flags):
+        cmd = CLIENT_CMD + ["--source-dir", source, "--dest-dir", dest,
+                            "--save-to-disk", "--server-port", str(port)] + flags
+        return subprocess.run(["setpriv", "--reuid=65534", "--regid=65534",
+                               "--clear-groups"] + cmd, text=True, capture_output=True)
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_ignore_errors_keeps_deletion_active_on_scan_error(self, mt):
+        """A source I/O error (unreadable subdirectory) aborts the run so no
         deletion happens by default; --ignore-errors continues, still transfers
-        the readable tree and still deletes.  Run as an unprivileged user so the
-        mode-000 directory is genuinely unreadable."""
+        the readable tree and still deletes, single-threaded and under -m.  Run
+        as an unprivileged user so the mode-000 directory is genuinely
+        unreadable."""
         if os.geteuid() != 0 or shutil.which("setpriv") is None:
             pytest.skip("requires root + setpriv to drop privileges for the client")
-        tag = f"ioerr_{os.getpid()}"
+        tag = f"ioerr_{os.getpid()}_{mt}"
         source = os.path.join(TEST_DATA_DIR, f"{tag}_src")
         clean_dir(source)
         self._write(os.path.join(source, "top.txt"), b"top\n")
@@ -2422,28 +2457,85 @@ class TestDeletePolicy:
 
                 # Default: scan error aborts the run; nothing is deleted.
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
-                cmd = CLIENT_CMD + ["--source-dir", source, "--dest-dir", dest,
-                                    "--save-to-disk", "--server-port", str(server.port),
-                                    "--delete"]
-                result = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534",
-                                         "--clear-groups"] + cmd, text=True, capture_output=True)
+                flags = ["--delete"] + (["-m"] if mt else [])
+                result = self._run_client_as_nobody(source, dest, server.port, flags)
                 assert result.returncode != 0, "unreadable source dir did not fail the run"
                 assert os.path.exists(os.path.join(received, "extra.txt")), \
                     "default run deleted although the scan hit an I/O error"
 
                 # --ignore-errors: the readable tree transfers, deletion still runs.
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
-                cmd = CLIENT_CMD + ["--source-dir", source, "--dest-dir", dest,
-                                    "--save-to-disk", "--server-port", str(server.port),
-                                    "--delete", "--ignore-errors"]
-                result = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534",
-                                         "--clear-groups"] + cmd, text=True, capture_output=True)
+                flags = ["--delete", "--ignore-errors"] + (["-m"] if mt else [])
+                result = self._run_client_as_nobody(source, dest, server.port, flags)
                 assert not os.path.exists(os.path.join(received, "extra.txt")), \
                     f"--ignore-errors did not keep deletion active: {result.stderr[:300]}"
                 assert not os.path.exists(os.path.join(received, "locked")), \
-                    "mirror of the unreadable dir was not treated as an extra"
+                    "mirror of the unreadable dir was left behind (should be an extra)"
             finally:
                 os.chmod(os.path.join(source, "locked"), 0o755)
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("timing", ["--delete", "--delete-before"])
+    def test_ignore_errors_unreadable_root_never_deletes(self, mt, timing):
+        """An unreadable SOURCE ROOT must never be treated as a skippable scan
+        error: with --ignore-errors the sequential scanner treats the root as
+        fatal (matching the -m path, which cannot even create its scanner), so
+        no empty keep-set manifest is sent and the destination is never wiped.
+        Run as an unprivileged user so the mode-000 root is genuinely
+        unreadable."""
+        if os.geteuid() != 0 or shutil.which("setpriv") is None:
+            pytest.skip("requires root + setpriv to drop privileges for the client")
+        tag = f"rootio_{os.getpid()}_{mt}_{timing.strip('-')}"
+        source = os.path.join(TEST_DATA_DIR, f"{tag}_src")
+        clean_dir(source)
+        self._write(os.path.join(source, "file.txt"), b"content\n")
+        dest = os.path.join(TEST_DATA_DIR, f"{tag}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            try:
+                os.chmod(source, 0)
+                self._write(os.path.join(received, "extra.txt"), b"extra\n")
+                flags = [timing, "--ignore-errors"] + (["-m"] if mt else [])
+                result = self._run_client_as_nobody(source, dest, server.port, flags)
+                assert result.returncode != 0, \
+                    f"unreadable source root with {timing} (mt={mt}) unexpectedly succeeded"
+                assert os.path.exists(os.path.join(received, "file.txt")), \
+                    f"{timing} (mt={mt}) wiped a kept destination file"
+                assert os.path.exists(os.path.join(received, "extra.txt")), \
+                    f"{timing} (mt={mt}) deleted the extra although the scan could not read the root"
+            finally:
+                os.chmod(source, 0o755)
+
+    def test_delete_excluded_protection_is_sender_derived(self):
+        """Plain --delete protects destination mirrors of files the SOURCE scan
+        excluded, but a destination-only file that merely matches an exclude
+        rule is still an extra and is removed (protection never re-applies rules
+        to the destination)."""
+        source = os.path.join(TEST_DATA_DIR, "senderderived_src")
+        clean_dir(source)
+        self._write(os.path.join(source, "keep.txt"), b"kept\n")
+        self._write(os.path.join(source, "secret.log"), b"secret\n")
+        dest = os.path.join(TEST_DATA_DIR, "senderderived_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            # A destination-only file that happens to match the exclude rule.
+            self._write(os.path.join(received, "stray.log"), b"never on the source\n")
+            result, _ = run_client(source, dest, flags=["--exclude", "*.log", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, \
+                f"delete sync failed: {(result.stderr or result.stdout)[:300]}"
+            assert os.path.exists(os.path.join(received, "secret.log")), \
+                "source-excluded mirror was deleted under plain --delete"
+            assert not os.path.exists(os.path.join(received, "stray.log")), \
+                "destination-only file matching the exclude rule was left (should be deleted)"
 
 
 def _pin_mtime(path, ts):

@@ -205,6 +205,53 @@ static void test_walker_unlimited_deletes_all() {
   free(root);
 }
 
+/* The 100000-entry server hard bound (MAX_SERVER_DELETE_COUNT, which this test
+   exercises through a literal to avoid reaching into file_receive.c) is also
+   all-or-nothing: a destination holding more extras than the bound must be left
+   completely untouched.  Skipped under valgrind: 100k file creations would be
+   far too slow under instrumentation. */
+static void test_walker_hard_bound_all_or_nothing() {
+  if (is_running_under_valgrind())
+    return;
+  enum { HARD_BOUND = 100000 };
+  char* root = make_walk_root("hardbound");
+  EXPECT_NOT_NULL(root);
+  int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  EXPECT_TRUE(rootfd >= 0);
+  bool created = rootfd >= 0;
+  for (int i = 0; created && i < HARD_BOUND + 1; i++) {
+    char name[32];
+    snprintf(name, sizeof(name), "f%d", i);
+    int fd = openat(rootfd, name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+      created = false;
+    else
+      close(fd);
+  }
+  EXPECT_TRUE(created);
+  const char* keeps[1] = {NULL};
+  ArrayList* manifest = make_manifest_strings(keeps, 0);
+  EXPECT_NOT_NULL(manifest);
+  size_t deleted = 999;
+  DeleteWalkResult result = delete_extras_limited(root, manifest, HARD_BOUND, NULL, 0, &deleted);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_LIMIT_EXCEEDED);
+  EXPECT_EQ_INT((int)deleted, 0);
+  EXPECT_TRUE(file_exists(root, "f0"));
+  EXPECT_TRUE(file_exists(root, "f100000"));
+  array_list_delete(manifest);
+  /* Fast cleanup: unlink every created name through the still-open root fd. */
+  if (rootfd >= 0) {
+    for (int i = 0; i < HARD_BOUND + 1; i++) {
+      char name[32];
+      snprintf(name, sizeof(name), "f%d", i);
+      (void)unlinkat(rootfd, name, 0);
+    }
+    close(rootfd);
+  }
+  rmdir(root);
+  free(root);
+}
+
 typedef struct {
   bool eight_bit_output;
   const char* expected;
@@ -227,6 +274,7 @@ void test_shared_utils() {
   test_walker_max_delete_exceeded_deletes_nothing();
   test_walker_max_delete_exact_bound_deletes();
   test_walker_unlimited_deletes_all();
+  test_walker_hard_bound_all_or_nothing();
 
   char formatted[32];
   EXPECT_TRUE(format_human_bytes(0, formatted, sizeof(formatted)));
