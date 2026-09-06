@@ -336,6 +336,7 @@ fail:
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
                                 void* old_data, unsigned long long old_size, bool* failed) {
   if (!old_data) {
+    free(old_data); /* defensive: old_data is always non-NULL today */
     *failed = true;
     return NULL;
   }
@@ -699,7 +700,12 @@ static bool basis_match_find(const Config* config, const char* check_path,
  * ------------------------------------------------------------------------- */
 
 /* A directory scan is linear in the number of entries; the fuzzy search stops
- * after this many so a pathological huge directory cannot stall a transfer. */
+ * after this many so a pathological huge directory cannot stall a transfer.
+ * The cap bounds the readdir() ITERATIONS, not the per-entry work: every
+ * entry that survives the (cheap) size and pre-name gates still runs an
+ * edit-distance DP, so the per-entry DP cost is separately bounded below by
+ * pre-pruning on the name length gap and the absent-character bound, and by
+ * trimming the common prefix/suffix before the DP runs on the middles only. */
 #define FUZZY_MAX_DIRECTORY_SCAN 4096
 /* Names longer than this never take part in fuzzy matching: the edit-distance
  * DP below is O(len^2), so over-long names are bounded out of the search. */
@@ -712,24 +718,80 @@ typedef struct {
   unsigned long long size_gap;
 } FuzzyCandidate;
 
-/* Levenshtein edit distance, or SIZE_MAX when the operands are too long or the
- * DP could not be allocated. */
-static size_t fuzzy_edit_distance(const char* a, size_t la, const char* b, size_t lb) {
-  if (la > FUZZY_NAME_LIMIT || lb > FUZZY_NAME_LIMIT)
-    return SIZE_MAX;
-  size_t* prev = malloc((lb + 1) * sizeof(size_t));
-  size_t* cur = malloc((lb + 1) * sizeof(size_t));
-  if (!prev || !cur) {
-    free(prev);
-    free(cur);
-    return SIZE_MAX;
+/* Two-row DP scratch, allocated once per directory scan (not per candidate) so
+ * a 4096-entry directory never performs 4096 malloc/free pairs. */
+typedef struct {
+  size_t* prev;
+  size_t* cur;
+} FuzzyEditBuffer;
+
+static bool fuzzy_edit_buffer_init(FuzzyEditBuffer* buf) {
+  buf->prev = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
+  buf->cur = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
+  if (!buf->prev || !buf->cur) {
+    free(buf->prev);
+    free(buf->cur);
+    buf->prev = NULL;
+    buf->cur = NULL;
+    return false;
   }
-  for (size_t j = 0; j <= lb; j++)
+  return true;
+}
+
+static void fuzzy_edit_buffer_destroy(FuzzyEditBuffer* buf) {
+  free(buf->prev);
+  free(buf->cur);
+  buf->prev = NULL;
+  buf->cur = NULL;
+}
+
+/* Cheap lower bounds used to reject a candidate BEFORE the DP:
+ *  - any edit script must at least absorb the length gap: d >= |la - lb|;
+ *  - any character of `a` that does not occur in `b` at all must be deleted or
+ *    substituted at its own position: d >= (count of such characters).
+ * The acceptance gate is d*2 <= longer, so a candidate whose max of these two
+ * bounds already violates it can be skipped without computing the distance. */
+static size_t fuzzy_absent_char_bound(const char* a, size_t la, const char* b, size_t lb) {
+  if (lb == 0)
+    return la;
+  bool present[256] = {false};
+  for (size_t i = 0; i < lb; i++)
+    present[(uint8_t)b[i]] = true;
+  size_t absent = 0;
+  for (size_t i = 0; i < la; i++)
+    if (!present[(uint8_t)a[i]])
+      absent++;
+  return absent;
+}
+
+/* Levenshtein edit distance between the two basenames.  A shared prefix and a
+ * (non-overlapping) shared suffix can always be aligned at no cost, so the DP
+ * only runs over the differing middles; its two rows come from `buf` (allocated
+ * once by the caller).  Callers enforce la, lb <= FUZZY_NAME_LIMIT. */
+static size_t fuzzy_edit_distance(FuzzyEditBuffer* buf, const char* a, size_t la, const char* b,
+                                  size_t lb) {
+  size_t p = 0;
+  while (p < la && p < lb && a[p] == b[p])
+    p++;
+  size_t s = 0;
+  while (s < la - p && s < lb - p && a[la - 1 - s] == b[lb - 1 - s])
+    s++;
+  size_t ma = la - p - s;
+  size_t mb = lb - p - s;
+  if (ma == 0)
+    return mb;
+  if (mb == 0)
+    return ma;
+  const char* A = a + p;
+  const char* B = b + p;
+  size_t* prev = buf->prev;
+  size_t* cur = buf->cur;
+  for (size_t j = 0; j <= mb; j++)
     prev[j] = j;
-  for (size_t i = 1; i <= la; i++) {
+  for (size_t i = 1; i <= ma; i++) {
     cur[0] = i;
-    for (size_t j = 1; j <= lb; j++) {
-      size_t cost = a[i - 1] == b[j - 1] ? 0 : 1;
+    for (size_t j = 1; j <= mb; j++) {
+      size_t cost = A[i - 1] == B[j - 1] ? 0 : 1;
       size_t del = prev[j] + 1;
       size_t ins = cur[j - 1] + 1;
       size_t sub = prev[j - 1] + cost;
@@ -740,10 +802,7 @@ static size_t fuzzy_edit_distance(const char* a, size_t la, const char* b, size_
     prev = cur;
     cur = tmp;
   }
-  size_t distance = prev[lb];
-  free(prev);
-  free(cur);
-  return distance;
+  return prev[mb];
 }
 
 /* Deterministic ordering of two fuzzy candidates: smallest edit distance,
@@ -783,6 +842,14 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     return NULL;
   }
   size_t target_len = strlen(leaf);
+  /* A target basename longer than FUZZY_NAME_LIMIT can never pass the name gate
+     (every candidate name is bounded by the same limit), so skip the scan. */
+  if (target_len > FUZZY_NAME_LIMIT) {
+    close(dir_fd);
+    free(leaf);
+    free(full_path);
+    return NULL;
+  }
 
   int scanfd = dup(dir_fd);
   if (scanfd < 0) {
@@ -800,10 +867,24 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     return NULL;
   }
 
+  /* The DP scratch rows are allocated once per scan (not once per candidate). */
+  FuzzyEditBuffer ebuf;
+  if (!fuzzy_edit_buffer_init(&ebuf)) {
+    closedir(dir);
+    close(dir_fd);
+    free(leaf);
+    free(full_path);
+    return NULL;
+  }
+
   FuzzyCandidate best;
   memset(&best, 0, sizeof(best));
   const struct dirent* entry;
   size_t scanned = 0;
+  /* readdir() yields entries in filesystem-dependent order, so the SET of
+     candidates seen is order-dependent; the winner is still deterministic
+     because every candidate is compared with the total ordering in
+     fuzzy_candidate_better (acceptable for a heuristic). */
   while (scanned < FUZZY_MAX_DIRECTORY_SCAN && (entry = readdir(dir)) != NULL) {
     scanned++;
     const char* name = entry->d_name;
@@ -817,9 +898,21 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE ||
         !delta_should_attempt(cand_size, check_size, config->delta_max_file_size))
       continue;
-    size_t distance = fuzzy_edit_distance(leaf, target_len, name, name_len);
+    /* Cheap pre-name gates run BEFORE the edit-distance DP.  The edit distance
+       is bounded below by the length gap |la-lb| and by the number of
+       characters of one basename that are absent from the other (each such
+       position costs at least one op), so a candidate whose acceptance gate
+       (distance*2 <= longer) already fails on the max of those bounds is
+       skipped without running the DP. */
     size_t longer = target_len > name_len ? target_len : name_len;
-    if (distance == SIZE_MAX || distance * 2 > longer)
+    size_t bound = longer - (target_len < name_len ? target_len : name_len);
+    size_t absent = fuzzy_absent_char_bound(leaf, target_len, name, name_len);
+    if (absent > bound)
+      bound = absent;
+    if (bound * 2 > longer)
+      continue;
+    size_t distance = fuzzy_edit_distance(&ebuf, leaf, target_len, name, name_len);
+    if (distance * 2 > longer)
       continue;
     FuzzyCandidate cand;
     memcpy(cand.name, name, name_len + 1);
@@ -831,10 +924,15 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
   }
   closedir(dir);
   free(leaf);
+  fuzzy_edit_buffer_destroy(&ebuf);
 
   void* basis = NULL;
   if (best.name[0]) {
-    int fd = openat(dir_fd, best.name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* O_NONBLOCK: a name raced to a FIFO between the fstatat gate and this open
+       would otherwise block the receive thread forever on open(2); with it the
+       open fails (ENXIO) and the fstat/S_ISREG gate below would reject it too.
+       A regular file opened with O_NONBLOCK is unaffected. */
+    int fd = openat(dir_fd, best.name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd >= 0) {
       struct stat st;
       if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
