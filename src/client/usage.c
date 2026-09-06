@@ -58,6 +58,13 @@ void print_usage(void) {
   printf("  -@, --modify-window <sec>  Modification time tolerance\n");
   printf("  -u, --update        Skip files newer than the source on receiver\n");
   printf("  --existing          Skip files not already present at destination\n");
+  printf("  --compare-dest <dir>  Treat DIR (relative to destination root) as an extra\n");
+  printf("                    comparison basis: unchanged files are not transferred\n");
+  printf("                    (requires --incremental, which is implied)\n");
+  printf("  --copy-dest <dir>   Like --compare-dest, but copies the unchanged file from DIR\n");
+  printf("                    into the destination instead of transferring its data\n");
+  printf("  --link-dest <dir>   Like --copy-dest, but hard-links the unchanged file from DIR\n");
+  printf("                    into the destination (repeatable; earlier DIRs win)\n");
   printf("  --checksum-choice, --cc <alg>  Checksum algorithm (not supported yet; xxHash64 is "
          "used)\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");

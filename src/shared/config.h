@@ -12,6 +12,22 @@ typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
    Config can carry it; the concrete type lives in delay_updates.h. */
 typedef struct DelayUpdatesContext DelayUpdatesContext;
 
+/* Alternate basis-directory modes (--compare-dest / --copy-dest /
+ * --link-dest).  Each flag adds one entry to the ordered Config->basis_dirs
+ * list; the receiver consults entries in command-line order and stops at the
+ * first exact match, mirroring rsync's basis-dir priority rules. */
+typedef enum {
+  BASIS_DEST_NONE = 0,
+  BASIS_DEST_COMPARE, /* compare only: never copies, never materializes */
+  BASIS_DEST_COPY,    /* local copy of the matched basis file */
+  BASIS_DEST_LINK     /* hard link to the matched basis file */
+} BasisDestType;
+
+typedef struct BasisDest {
+  BasisDestType type;
+  char* path; /* relative to the destination root (receiver-confined) */
+} BasisDest;
+
 typedef struct Config {
   char* version;
   char* send_directory;
@@ -134,9 +150,12 @@ typedef struct Config {
   char* rsync_path;
   bool old_args;
   char* temp_dir;
-  char* compare_dest;
-  char* copy_dest;
-  char* link_dest;
+  /* Alternate basis directories, ordered by command-line appearance.  Each
+   * entry's type selects compare/copy/link behavior on an exact match.  These
+   * cross the wire so the receiver can consult them; they are interpreted
+   * relative to the destination root and confined there. */
+  BasisDest* basis_dirs;
+  int basis_count;
 
   // PR #174: Partial transfer resumption
   char* partial_dir;
@@ -174,8 +193,10 @@ typedef struct Config {
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.7.0"
+#define PROTOCOL_VERSION "2.8.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
+/* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
+#define MAX_BASIS_DIRS 64
 
 Config* config_create(void);
 void config_delete(Config* config);
@@ -183,5 +204,12 @@ bool config_send(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
 bool config_is_remote_dest(const char* s);
 void config_parse_ssh_dest(Config* config);
+
+/* True when at least one --compare-dest/--copy-dest/--link-dest was set. */
+bool config_has_basis(const Config* config);
+/* Append one basis-dir entry. Returns 0 on success, -1 on allocation failure. */
+int config_basis_append(Config* config, BasisDestType type, const char* path);
+/* Validate a client-provided basis-dir path (relative, confined, non-empty). */
+bool config_basis_path_valid(const char* path);
 
 #endif
