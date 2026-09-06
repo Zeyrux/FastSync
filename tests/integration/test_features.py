@@ -147,7 +147,10 @@ class TestRemoveSourceFiles:
         with open(source_file, "wb") as f:
             f.write(b"keep after skip")
 
-        result, _ = run_client(source, dest, port=shared_server.port)
+        # The seed run preserves timestamps (-M) so the destination copy has the
+        # source's exact mtime; otherwise the incremental skip would depend on
+        # both writes landing in the same whole second (a race).
+        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
         assert result.returncode == 0
         result, _ = run_client(source, dest,
                                flags=["--remove-source-files", "--incremental"],
