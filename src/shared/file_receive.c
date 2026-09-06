@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <stdio.h>
@@ -660,6 +661,208 @@ static bool basis_match_find(const Config* config, const char* check_path,
   return false;
 }
 
+/* ---------------------------------------------------------------------------
+ * -y/--fuzzy similar-file delta basis.
+ *
+ * When a file must be transferred and the destination holds no usable content
+ * at the exact path (the destination file is absent, or is outside the delta
+ * engine's size bounds), --fuzzy lets the receiver reuse an EXISTING regular
+ * file in the SAME destination directory as the delta basis, so the sender
+ * transmits only the differences instead of the whole file.  This is the
+ * rsync "find a similar file to use as a basis for a transfer" case (e.g. a
+ * file recreated under a new name whose old-named sibling is still present).
+ *
+ * The delta handshake is unchanged and receiver-driven, so the sender never
+ * learns the basis was a different file and needs no new protocol.  Byte
+ * exactness never depends on which bytes the basis holds: the delta protocol
+ * only references basis blocks whose Adler-32 + xxHash32 checksums match the
+ * source, delta_apply validates every reference against the basis size, and a
+ * basis that shares nothing simply makes the sender reply STATUS_NEXT (full
+ * transfer).  A fuzzy basis can therefore waste bandwidth but never corrupt a
+ * file.
+ *
+ * Similarity heuristic (deterministic, deliberately simpler than rsync's):
+ *   * candidates are the target's sibling entries in its destination
+ *     directory, opened through the confined root (file_open_secure_parent +
+ *     openat O_NOFOLLOW, fstatat AT_SYMLINK_NOFOLLOW) -- symlinks are never
+ *     followed and nothing outside the destination root is ever read;
+ *   * dotfiles, directories, the target's own name, and the .fastsync-stage /
+ *     temp scratch names are never candidates;
+ *   * size gate = the delta engine's own bounds (delta_should_attempt: both
+ *     files >= DELTA_MIN_FILE_SIZE, <= delta_max_file_size, ratio <= 10x),
+ *     NOT rsync's ~1.5x size window;
+ *   * name gate = Levenshtein edit distance between the basenames, accepted
+ *     only when distance <= half the length of the longer basename;
+ *   * the single best candidate (smallest distance; tie-break: size closest
+ *     to the incoming file, then lexicographically smaller basename) is read
+ *     and returned as the basis.
+ * ------------------------------------------------------------------------- */
+
+/* A directory scan is linear in the number of entries; the fuzzy search stops
+ * after this many so a pathological huge directory cannot stall a transfer. */
+#define FUZZY_MAX_DIRECTORY_SCAN 4096
+/* Names longer than this never take part in fuzzy matching: the edit-distance
+ * DP below is O(len^2), so over-long names are bounded out of the search. */
+#define FUZZY_NAME_LIMIT 192
+
+typedef struct {
+  char name[FUZZY_NAME_LIMIT + 1];
+  unsigned long long size;
+  size_t distance;
+  unsigned long long size_gap;
+} FuzzyCandidate;
+
+/* Levenshtein edit distance, or SIZE_MAX when the operands are too long or the
+ * DP could not be allocated. */
+static size_t fuzzy_edit_distance(const char* a, size_t la, const char* b, size_t lb) {
+  if (la > FUZZY_NAME_LIMIT || lb > FUZZY_NAME_LIMIT)
+    return SIZE_MAX;
+  size_t* prev = malloc((lb + 1) * sizeof(size_t));
+  size_t* cur = malloc((lb + 1) * sizeof(size_t));
+  if (!prev || !cur) {
+    free(prev);
+    free(cur);
+    return SIZE_MAX;
+  }
+  for (size_t j = 0; j <= lb; j++)
+    prev[j] = j;
+  for (size_t i = 1; i <= la; i++) {
+    cur[0] = i;
+    for (size_t j = 1; j <= lb; j++) {
+      size_t cost = a[i - 1] == b[j - 1] ? 0 : 1;
+      size_t del = prev[j] + 1;
+      size_t ins = cur[j - 1] + 1;
+      size_t sub = prev[j - 1] + cost;
+      size_t m = del < ins ? del : ins;
+      cur[j] = m < sub ? m : sub;
+    }
+    size_t* tmp = prev;
+    prev = cur;
+    cur = tmp;
+  }
+  size_t distance = prev[lb];
+  free(prev);
+  free(cur);
+  return distance;
+}
+
+/* Deterministic ordering of two fuzzy candidates: smallest edit distance,
+ * then the size closest to the incoming file, then the lexical basename. */
+static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandidate* best) {
+  if (!best->name[0])
+    return true;
+  if (cand->distance != best->distance)
+    return cand->distance < best->distance;
+  if (cand->size_gap != best->size_gap)
+    return cand->size_gap < best->size_gap;
+  return strcmp(cand->name, best->name) < 0;
+}
+
+/* Search the destination directory that will contain `check_path` for a
+ * similar regular file usable as a --fuzzy delta basis and return its full
+ * content in a malloc'd (protocol_alloc) buffer.  Returns NULL (with *out_size
+ * = 0) when no candidate qualifies, which means the caller performs the normal
+ * whole-file transfer. */
+static void* fuzzy_basis_find_and_load(const Config* config, const char* check_path,
+                                       unsigned long long check_size,
+                                       unsigned long long* out_size) {
+  *out_size = 0;
+  if (!config || !config->receive_root_directory || !config->fuzzy || !config->use_delta ||
+      !check_path || check_size < DELTA_MIN_FILE_SIZE || check_size > config->delta_max_file_size ||
+      check_size > MAX_RECEIVE_WHOLE_FILE_SIZE)
+    return NULL;
+
+  char* full_path = path_cat(config->receive_root_directory, check_path);
+  if (!full_path)
+    return NULL;
+  char* leaf = NULL;
+  int dir_fd = file_open_secure_parent(full_path, &leaf, false);
+  if (dir_fd < 0 || !leaf) {
+    free(leaf);
+    free(full_path);
+    return NULL;
+  }
+  size_t target_len = strlen(leaf);
+
+  int scanfd = dup(dir_fd);
+  if (scanfd < 0) {
+    close(dir_fd);
+    free(leaf);
+    free(full_path);
+    return NULL;
+  }
+  DIR* dir = fdopendir(scanfd);
+  if (!dir) {
+    close(scanfd);
+    close(dir_fd);
+    free(leaf);
+    free(full_path);
+    return NULL;
+  }
+
+  FuzzyCandidate best;
+  memset(&best, 0, sizeof(best));
+  const struct dirent* entry;
+  size_t scanned = 0;
+  while (scanned < FUZZY_MAX_DIRECTORY_SCAN && (entry = readdir(dir)) != NULL) {
+    scanned++;
+    const char* name = entry->d_name;
+    size_t name_len = strlen(name);
+    if (name[0] == '.' || name_len == 0 || name_len > FUZZY_NAME_LIMIT || strcmp(name, leaf) == 0)
+      continue;
+    struct stat st;
+    if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode))
+      continue;
+    unsigned long long cand_size = (unsigned long long)st.st_size;
+    if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE ||
+        !delta_should_attempt(cand_size, check_size, config->delta_max_file_size))
+      continue;
+    size_t distance = fuzzy_edit_distance(leaf, target_len, name, name_len);
+    size_t longer = target_len > name_len ? target_len : name_len;
+    if (distance == SIZE_MAX || distance * 2 > longer)
+      continue;
+    FuzzyCandidate cand;
+    memcpy(cand.name, name, name_len + 1);
+    cand.size = cand_size;
+    cand.distance = distance;
+    cand.size_gap = cand_size > check_size ? cand_size - check_size : check_size - cand_size;
+    if (fuzzy_candidate_better(&cand, &best))
+      best = cand;
+  }
+  closedir(dir);
+  free(leaf);
+
+  void* basis = NULL;
+  if (best.name[0]) {
+    int fd = openat(dir_fd, best.name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd >= 0) {
+      struct stat st;
+      if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+          (unsigned long long)st.st_size == best.size && best.size <= SIZE_MAX) {
+        basis = protocol_alloc((size_t)best.size);
+        if (basis) {
+          size_t got = 0;
+          while (got < (size_t)best.size) {
+            ssize_t n = read(fd, (char*)basis + got, (size_t)best.size - got);
+            if (n <= 0) {
+              free(basis);
+              basis = NULL;
+              break;
+            }
+            got += (size_t)n;
+          }
+        }
+      }
+      close(fd);
+    }
+  }
+  close(dir_fd);
+  free(full_path);
+  if (basis)
+    *out_size = best.size;
+  return basis;
+}
+
 File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (!config || !skipped) {
     send_status(fd, STATUS_ERROR);
@@ -890,6 +1093,40 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
   free(old_data);
   old_data = NULL;
+
+  /* ---- -y/--fuzzy similar-file delta basis ----
+   * Reaching this point means the file must be transferred and the
+   * destination's own content at the exact path could not serve as a delta
+   * basis (it is absent, outside the delta size bounds, or unreadable).  With
+   * --fuzzy the receiver tries an existing similar-named file in the same
+   * destination directory instead.  receive_delta_file performs the whole
+   * handshake: when the sender judges the delta not worthwhile it replies
+   * STATUS_NEXT and the full content is received there, so a fuzzy attempt
+   * can only improve bandwidth, never fall through into the plain transfer
+   * below (that path is reserved for "no usable candidate was found"). */
+  if (config->fuzzy && config->use_delta) {
+    unsigned long long fuzzy_size = 0;
+    void* fuzzy_basis = fuzzy_basis_find_and_load(config, check_path, check_size, &fuzzy_size);
+    if (fuzzy_basis != NULL) {
+      bool fuzzy_failed = false;
+      File* fuzzy_file =
+          receive_delta_file(fd, config, check_path, fuzzy_basis, fuzzy_size, &fuzzy_failed);
+      fuzzy_basis = NULL; /* receive_delta_file consumes the buffer on every path */
+      if (fuzzy_file) {
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        return fuzzy_file;
+      }
+      if (fuzzy_failed) {
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        return NULL;
+      }
+    }
+    free(fuzzy_basis);
+  }
 
   if (!send_status(fd, STATUS_NEXT)) {
     close(old_fd);
