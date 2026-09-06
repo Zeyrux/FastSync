@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 54 | Feature works end-to-end |
+| ✅ Implemented | 57 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 84 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 81 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
