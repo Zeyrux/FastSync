@@ -849,12 +849,14 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
         }
         if (materialized) {
           if (!send_status(fd, STATUS_OK)) {
+            basis_match_free(&basis);
             file_destroy(materialized);
             close(old_fd);
             free(full_path);
             free(check_path);
             return NULL;
           }
+          basis_match_free(&basis);
           free(old_data);
           close(old_fd);
           free(full_path);
@@ -1069,29 +1071,38 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
   /* With --delay-updates the staged (not yet published) files live directly
      under the receive root in the staging directory; the delete walker must
      not treat them as extras or it would remove every staged file before it
-     can be published.  Alternate basis directories (--compare-dest /
-     --copy-dest / --link-dest) are also excluded: they are extra comparison
-     snapshots the user pointed at, not destination content, and deleting them
-     would destroy the very files a --link-dest run just linked into place. */
+     can be published.  That staging name is protected only as a DIRECT child
+     of the receive root so a nested destination directory that happens to be
+     named .fastsync-stage is still ordinary content.  Alternate basis
+     directories (--compare-dest / --copy-dest / --link-dest) are excluded at
+     any depth: they are extra comparison snapshots the user pointed at, not
+     destination content, and deleting them would destroy the very files a
+     --link-dest run just linked into place. */
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
-  const char** skip_prefixes = NULL;
+  DeleteSkipEntry* skips = NULL;
   bool deletion_ok = false;
   if (skip_count > 0) {
-    skip_prefixes = calloc((size_t)skip_count, sizeof(char*));
-    if (!skip_prefixes) {
+    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
+    if (!skips) {
       array_list_delete(manifest);
       send_status(fd, STATUS_ERROR);
       return -1;
     }
     int idx = 0;
-    if (config->delay_updates)
-      skip_prefixes[idx++] = DELAY_UPDATES_STAGING_DIR;
-    for (int i = 0; i < config->basis_count; i++)
-      skip_prefixes[idx++] = config->basis_dirs[i].path;
+    if (config->delay_updates) {
+      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
+      skips[idx].top_level_only = true;
+      idx++;
+    }
+    for (int i = 0; i < config->basis_count; i++) {
+      skips[idx].prefix = config->basis_dirs[i].path;
+      skips[idx].top_level_only = false;
+      idx++;
+    }
   }
   deletion_ok = delete_extras_limited(config->receive_root_directory, manifest,
-                                      MAX_SERVER_DELETE_COUNT, skip_prefixes, skip_count);
-  free(skip_prefixes);
+                                      MAX_SERVER_DELETE_COUNT, skips, skip_count);
+  free(skips);
   array_list_delete(manifest);
   if (!deletion_ok)
     send_status(fd, STATUS_ERROR);
