@@ -144,6 +144,7 @@ static void test_walker_removes_extras_keeps_manifest_and_protected() {
   EXPECT_TRUE(deleted >= 2);
   array_list_delete(manifest);
   remove_walk_tree(root);
+  free(root);
 }
 
 static void test_walker_max_delete_exceeded_deletes_nothing() {
@@ -164,6 +165,7 @@ static void test_walker_max_delete_exceeded_deletes_nothing() {
   EXPECT_TRUE(file_exists(root, "c.txt"));
   array_list_delete(manifest);
   remove_walk_tree(root);
+  free(root);
 }
 
 static void test_walker_max_delete_exact_bound_deletes() {
@@ -182,6 +184,7 @@ static void test_walker_max_delete_exact_bound_deletes() {
   EXPECT_FALSE(file_exists(root, "b.txt"));
   array_list_delete(manifest);
   remove_walk_tree(root);
+  free(root);
 }
 
 static void test_walker_unlimited_deletes_all() {
@@ -199,6 +202,7 @@ static void test_walker_unlimited_deletes_all() {
   EXPECT_FALSE(dir_exists(root, "emptydir"));
   array_list_delete(manifest);
   remove_walk_tree(root);
+  free(root);
 }
 
 typedef struct {
