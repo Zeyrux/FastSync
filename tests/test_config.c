@@ -528,6 +528,29 @@ static void test_config_basis_wire_rejects_escaping() {
   config_delete(c);
 }
 
+/* Basis-dir paths are canonicalized on the way in: trailing slashes and
+   interior empty / "." components are dropped so validation, the delete-walker
+   prefix and the receiver lookup all agree on one stored form. */
+static void test_config_basis_normalization() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "prior/"), 0);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "a//b"), 0);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "./x/./y/"), 0);
+  EXPECT_EQ_INT(c->basis_count, 3);
+  EXPECT_EQ_STR(c->basis_dirs[0].path, "prior");
+  EXPECT_EQ_STR(c->basis_dirs[1].path, "a/b");
+  EXPECT_EQ_STR(c->basis_dirs[2].path, "x/y");
+
+  /* Degenerate values that normalize away to nothing stay rejected. */
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "."), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ".."), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/abs"), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "a/../b"), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ""), -1);
+  config_delete(c);
+}
+
 static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
@@ -566,6 +589,7 @@ void test_config() {
     test_config_delay_updates_reserved_backup_rejected();
     test_config_basis_roundtrip();
     test_config_basis_wire_rejects_escaping();
+    test_config_basis_normalization();
   }
   test_config_is_remote_dest();
 }

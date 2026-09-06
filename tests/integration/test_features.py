@@ -1990,7 +1990,11 @@ class TestBasisDestDirs:
     STAGING = ".fastsync-stage"
     TS = 1577836800  # 2020-01-01 00:00:00 UTC, used to pin matching mtimes
 
-    # files: rel-path -> (source content, basis content or None, matched?)
+    # fixture files: source and basis share the mtime pin, so a basis "match"
+    # is decided purely by content (xxHash).  unchanged.txt is byte-identical;
+    # changed.txt is byte-DIFFERENT but has the SAME SIZE as the source (and
+    # the same pinned mtime), which is what forces the content-hash gate;
+    # added.txt does not exist in the basis at all.
     UNCHANGED = "unchanged.txt"
     CHANGED = "changed.txt"
     ADDED = "added.txt"
@@ -2006,21 +2010,21 @@ class TestBasisDestDirs:
             _pin_mtime(full, self.TS)
         return src
 
-    def _basis_root(self, dest, source):
-        received = get_dest_received_dir(dest, source)
-        rel = os.path.relpath(received, dest)
-        return os.path.join(dest, rel)
-
-    def _seed_basis(self, dest, source, basis_dir, basis_files):
+    def _seed_basis_file(self, dest, source, basis_dir, rel, content, ts=None):
         base = os.path.join(dest, basis_dir, os.path.relpath(
             get_dest_received_dir(dest, source), dest))
+        full = os.path.join(base, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(content)
+        _pin_mtime(full, self.TS if ts is None else ts)
+        return full
+
+    def _seed_basis(self, dest, source, basis_dir, basis_files):
         for rel, content in basis_files.items():
-            full = os.path.join(base, rel)
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "wb") as fh:
-                fh.write(content)
-            _pin_mtime(full, self.TS)
-        return base
+            self._seed_basis_file(dest, source, basis_dir, rel, content)
+        return os.path.join(dest, basis_dir, os.path.relpath(
+            get_dest_received_dir(dest, source), dest))
 
     def _source_tree(self, prefix):
         return {
@@ -2030,12 +2034,37 @@ class TestBasisDestDirs:
         }
 
     def _basis_tree(self, prefix):
-        # unchanged.txt matches the source; changed.txt differs in CONTENT but
-        # shares size/mtime pinning; added.txt is missing from the basis.
+        # unchanged.txt is identical to the source; changed.txt has the SAME
+        # byte size and pinned mtime but a different body (equal size forces
+        # the xxHash gate); added.txt is missing from the basis.
         return {
             self.UNCHANGED: b"stable content v1\n",
-            self.CHANGED: b"ANCIENT DIFFERENT CONTENT!\n",
+            self.CHANGED: b"CHANGED CONTENT NOW\n",
         }
+
+    def test_same_size_different_content_is_not_a_basis_match(self, shared_server):
+        # Core safety property: equal size + pinned mtime but different content
+        # must NEVER be hard-linked or copied from the basis -- the xxHash gate
+        # rejects it and the sender's data is transferred instead.
+        for flag, basis_dir in (("--link-dest", "szlb"), ("--copy-dest", "szcp"),
+                                ("--compare-dest", "szcmp")):
+            source = self._make_source("basis_same_size_src",
+                                       {self.UNCHANGED: b"same length body\n"})
+            dest = os.path.join(TEST_DATA_DIR, f"basis_same_size_dst_{basis_dir}")
+            clean_dir(dest)
+            basis_file = self._seed_basis_file(dest, source, basis_dir, self.UNCHANGED,
+                                               b"SAME LENGTH BODY!")
+            result, _ = run_client(source, dest, flags=[f"{flag}={basis_dir}"],
+                                   port=shared_server.port)
+            assert result.returncode == 0, \
+                f"{flag} same-size mismatch failed: {result.stderr[:300]}"
+            received = get_dest_received_dir(dest, source)
+            dest_file = os.path.join(received, self.UNCHANGED)
+            assert _read_file(dest_file) == b"same length body\n", \
+                f"{flag}: basis content leaked into the destination on a hash mismatch"
+            if flag != "--compare-dest":
+                assert os.stat(dest_file).st_ino != os.stat(basis_file).st_ino, \
+                    f"{flag}: linked/copied from a content-mismatched basis file"
 
     def test_compare_dest_skips_matching_and_transfers_missing(self, shared_server):
         source = self._make_source("basis_compare_src", self._source_tree("c"))
@@ -2087,7 +2116,7 @@ class TestBasisDestDirs:
         assert _read_file(unchanged) == b"stable content v1\n", "unchanged file not materialized"
         # A real local copy, NOT a hard link to the basis file.
         assert os.stat(unchanged).st_ino != os.stat(os.path.join(basis, self.UNCHANGED)).st_ino
-        # Changed content falls back to a normal transfer of the sender data.
+        # Equal-size/different-content basis file falls back to the sender data.
         assert _read_file(os.path.join(received, self.CHANGED)) == \
             self._source_tree("cp")[self.CHANGED]
         assert _read_file(os.path.join(received, self.ADDED)) == \
@@ -2109,7 +2138,8 @@ class TestBasisDestDirs:
         assert os.stat(unchanged).st_ino == os.stat(basis_file).st_ino, \
             "link-dest did not produce a hard link"
         assert os.stat(unchanged).st_nlink >= 2
-        # Content mismatch must fall back to a plain transfer (not a link).
+        # Equal-size/different-content basis file must fall back to a plain
+        # transfer (not a link).
         changed = os.path.join(received, self.CHANGED)
         assert _read_file(changed) == self._source_tree("ln")[self.CHANGED]
         assert os.stat(changed).st_ino != os.stat(os.path.join(basis, self.CHANGED)).st_ino
@@ -2181,3 +2211,137 @@ class TestBasisDestDirs:
                 "basis directory was deleted by --delete"
             assert os.stat(os.path.join(received, self.UNCHANGED)).st_ino == \
                 os.stat(os.path.join(basis, self.UNCHANGED)).st_ino
+
+    def test_delay_delete_keeps_nested_staging_named_dir_as_content(self):
+        # The real --delay-updates staging directory is protected from --delete
+        # only as a DIRECT child of the receive root.  A nested destination
+        # directory that merely shares the staging name is ordinary content, so
+        # its extras must still be deleted (regression guard for the walker).
+        source = self._make_source("basis_nested_stage_src",
+                                   {"top.txt": b"top\n", "sub/real.txt": b"real\n"})
+        dest = os.path.join(TEST_DATA_DIR, "basis_nested_stage_dst")
+        clean_dir(dest)
+        self._seed_basis(dest, source, "nstbasis",
+                         {"top.txt": b"top\n", "sub/real.txt": b"real\n"})
+        received = get_dest_received_dir(dest, source)
+        nested = os.path.join(received, "sub", self.STAGING)
+        os.makedirs(nested, exist_ok=True)
+        extra = os.path.join(nested, "extra.txt")
+        with open(extra, "wb") as fh:
+            fh.write(b"nested extra")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest,
+                                   flags=["--link-dest=nstbasis", "--delete",
+                                          "--delay-updates"],
+                                   port=server.port)
+            assert result.returncode == 0, \
+                f"delay-delete nested staging failed: {result.stderr[:300]}"
+            assert not os.path.exists(extra), \
+                "extra inside a nested .fastsync-stage dir was not deleted"
+            assert not os.path.isdir(nested), \
+                "nested .fastsync-stage dir should have been removed after its extra"
+            assert _read_file(os.path.join(received, "sub", "real.txt")) == b"real\n"
+            assert not os.path.isdir(os.path.join(dest, self.STAGING)), \
+                "real delay-updates staging tree was not cleaned up"
+
+    def test_basis_priority_first_match_wins(self, shared_server):
+        # Two link-dest dirs both hold the exact file: the FIRST (command-line
+        # order) basis directory must win and supply the hard link.
+        source = self._make_source("basis_prio_src", {"f.txt": b"content\n"})
+        dest = os.path.join(TEST_DATA_DIR, "basis_prio_dst")
+        clean_dir(dest)
+        first = self._seed_basis_file(dest, source, "b1", "f.txt", b"content\n")
+        self._seed_basis_file(dest, source, "b2", "f.txt", b"content\n")
+        result, _ = run_client(source, dest, flags=["--link-dest=b1", "--link-dest=b2"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"link-dest priority failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.stat(os.path.join(received, "f.txt")).st_ino == os.stat(first).st_ino, \
+            "first basis dir did not win over the second"
+
+    def test_basis_priority_across_compare_and_link(self, shared_server):
+        # A compare-dest entry listed BEFORE a link-dest entry shadows it (the
+        # exact match is found first and nothing is materialized); reversing the
+        # order lets the link-dest entry win and materialize a hard link.
+        source = self._make_source("basis_prio_mixed_src", {"f.txt": b"content\n"})
+
+        dest = os.path.join(TEST_DATA_DIR, "basis_prio_mixed_dst")
+        clean_dir(dest)
+        self._seed_basis_file(dest, source, "cmpb", "f.txt", b"content\n")
+        self._seed_basis_file(dest, source, "lnb", "f.txt", b"content\n")
+        result, _ = run_client(source, dest,
+                               flags=["--compare-dest=cmpb", "--link-dest=lnb"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"mixed priority (compare first) failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(os.path.join(received, "f.txt")), \
+            "compare-dest matched first, so the file must stay sparse (no link-dest materialize)"
+
+        dest = os.path.join(TEST_DATA_DIR, "basis_prio_mixed_dst2")
+        clean_dir(dest)
+        self._seed_basis_file(dest, source, "cmpb", "f.txt", b"content\n")
+        linkb2 = self._seed_basis_file(dest, source, "lnb", "f.txt", b"content\n")
+        result, _ = run_client(source, dest,
+                               flags=["--link-dest=lnb", "--compare-dest=cmpb"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"mixed priority (link first) failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.stat(os.path.join(received, "f.txt")).st_ino == os.stat(linkb2).st_ino, \
+            "link-dest did not materialize when listed before compare-dest"
+
+    def test_link_dest_size_only_ignores_mtime(self, shared_server):
+        # --size-only drops the mtime leg of the quick check: a basis file with
+        # the SAME content but a DIFFERENT mtime is still an exact match.
+        source = self._make_source("basis_sizeonly_src", {"f.txt": b"content\n"})
+        dest = os.path.join(TEST_DATA_DIR, "basis_sizeonly_dst")
+        clean_dir(dest)
+        basis_file = self._seed_basis_file(dest, source, "sob", "f.txt", b"content\n",
+                                           ts=self.TS + 500)
+        result, _ = run_client(source, dest, flags=["--link-dest=sob", "--size-only"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"size-only link-dest failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.stat(os.path.join(received, "f.txt")).st_ino == os.stat(basis_file).st_ino, \
+            "--size-only should link a basis file whose mtime differs"
+
+    def test_link_dest_ignore_times_never_links(self, shared_server):
+        # -I/--ignore-times forces every file to be updated, so a basis dir is
+        # never used to hard-link (rsync parity).  The file is transferred and
+        # stored as a fresh inode even though it matches the basis exactly.
+        source = self._make_source("basis_igntimes_src", {"f.txt": b"content\n"})
+        dest = os.path.join(TEST_DATA_DIR, "basis_igntimes_dst")
+        clean_dir(dest)
+        basis_file = self._seed_basis_file(dest, source, "itb", "f.txt", b"content\n")
+        result, _ = run_client(source, dest, flags=["--link-dest=itb", "--ignore-times"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"ignore-times link-dest failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        dest_file = os.path.join(received, "f.txt")
+        assert _read_file(dest_file) == b"content\n"
+        assert os.stat(dest_file).st_ino != os.stat(basis_file).st_ino, \
+            "--ignore-times must not hard-link to a basis file"
+
+    def test_basis_refuses_file_above_whole_file_limit(self, shared_server):
+        # Every whole-file payload path in FastSync (basis dirs included) is
+        # bounded by MAX_RECEIVE_WHOLE_FILE_SIZE.  rsync supports basis dirs for
+        # arbitrary sizes; FastSync refuses such a run up front with a clear
+        # diagnostic instead of letting the receiver abort the whole transfer
+        # mid-stream with no client-side explanation.
+        source = self._make_source("basis_oversize_src", {"small.txt": b"ok\n"})
+        big = os.path.join(source, "huge.bin")
+        with open(big, "wb") as fh:
+            os.ftruncate(fh.fileno(), 256 * 1024 * 1024 + 4096)
+        dest = os.path.join(TEST_DATA_DIR, "basis_oversize_dst")
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--link-dest=nope"],
+                               port=shared_server.port)
+        assert result.returncode != 0, \
+            "basis run with an over-limit file unexpectedly succeeded"
+        assert "larger than" in result.stderr, \
+            f"no clear over-limit diagnostic: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(received), \
+            "over-limit basis run transferred files before failing"
