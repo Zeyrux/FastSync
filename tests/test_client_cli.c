@@ -1246,6 +1246,32 @@ static void test_parse_args_fuzzy_respects_no_delta() {
   }
 }
 
+/* An explicit --no-incremental is respected by the --fuzzy implication in
+ * either argument order (unlike the basis-dir options, --fuzzy does not force
+ * the incremental handshake back on).  Because delta needs the handshake, the
+ * delta implication is suppressed too, so the run is a plain (default-mode)
+ * transfer rather than an invalid "--delta requires --incremental" config. */
+static void test_parse_args_fuzzy_respects_no_incremental() {
+  static const char* const combos[][2] = {
+      {"--fuzzy", "--no-incremental"},
+      {"--no-incremental", "--fuzzy"},
+  };
+  for (size_t i = 0; i < sizeof(combos) / sizeof(combos[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)combos[i][0], (char*)combos[i][1], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->fuzzy);
+    EXPECT_FALSE(cfg->use_incremental);
+    EXPECT_FALSE(cfg->use_delta);
+    cfg->send_directory = str_dup("/src");
+    cfg->receive_root_directory = str_dup("/dst");
+    EXPECT_TRUE(validate_config(cfg));
+    config_delete(cfg);
+  }
+}
+
 /* --fuzzy requires the delta machinery, which the chunk-serialization (-s) and
  * sendfile (-f) modes reject -- mirroring the --delta constraint checks. */
 static void test_validate_config_fuzzy_incompatible_modes() {
@@ -1831,6 +1857,7 @@ void test_client_cli() {
   test_parse_args_fuzzy_negation();
   test_parse_args_fuzzy_with_whole_file();
   test_parse_args_fuzzy_respects_no_delta();
+  test_parse_args_fuzzy_respects_no_incremental();
   test_validate_config_fuzzy_incompatible_modes();
   test_parse_args_one_file_system();
   test_parse_args_compression_aliases();

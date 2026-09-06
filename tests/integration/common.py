@@ -106,6 +106,7 @@ class CountingProxy:
                 server_sock = socket.create_connection(("127.0.0.1", self.target_port),
                                                        timeout=10)
             except OSError:
+                self._listener.close()
                 return
             c2s, s2c = [0], [0]
             a = threading.Thread(target=self._pump, args=(client_sock, server_sock, c2s))
@@ -116,6 +117,7 @@ class CountingProxy:
             b.join()
             self.client_to_server = c2s[0]
             self.server_to_client = s2c[0]
+            self._listener.close()
 
         thread = threading.Thread(target=serve)
         thread.start()

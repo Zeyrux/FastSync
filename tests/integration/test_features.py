@@ -2513,6 +2513,8 @@ class TestFuzzy:
 
     OLD_NAME = "report-2025.dat"
     NEW_NAME = "report-2026.dat"
+    TS = 1577836800  # 2020-01-01, used to pin stale destination mtimes
+    SIZE = 2 * 1024 * 1024
 
     def _client_via_proxy(self, source, dest, flags, proxy):
         cmd = (CLIENT_CMD + ["--source-dir", source, "--dest-dir", dest,
@@ -2720,4 +2722,113 @@ class TestFuzzy:
         received = get_dest_received_dir(dest, source)
         assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
         assert _read_file(os.path.join(received, self.OLD_NAME)) == old_bytes
+
+    @staticmethod
+    def _rand_bytes(size, seed):
+        return random.Random(seed).randbytes(size)
+
+    def _replace_source_file(self, source, old_name, new_name, new_bytes):
+        """Remove old_name from source and add new_name with new_bytes."""
+        os.unlink(os.path.join(source, old_name))
+        with open(os.path.join(source, new_name), "wb") as fh:
+            fh.write(new_bytes)
+
+    def test_worthless_fuzzy_basis_falls_back_inside_handshake(self, shared_server):
+        # The sibling passes the name AND size gates but shares no blocks with
+        # the incoming file, so the sender's delta is not worthwhile: it replies
+        # STATUS_NEXT and the receiver consumes the WHOLE file inside the delta
+        # handshake.  This proves a bad fuzzy basis cannot desync the protocol
+        # or corrupt the result.
+        source, dest = self._prepare("worthless")
+        basis = self._rand_bytes(self.SIZE, 424242)
+        target = self._rand_bytes(self.SIZE, 777777)
+        self._seed_dest(source, dest, {self.OLD_NAME: basis}, shared_server.port)
+        self._replace_source_file(source, self.OLD_NAME, self.NEW_NAME, target)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy worthless-basis run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == target, \
+            "whole-file fallback after a worthless fuzzy basis is not byte-exact"
+        assert proxy.client_to_server > self.SIZE // 2, \
+            "a worthless basis should have made the sender fall back to the whole file"
+
+    def test_existing_dest_file_preferred_over_fuzzy_sibling(self, shared_server):
+        # Non-displacement: the destination holds a file at the exact path that
+        # is inside the delta size bounds (same size, different content, older
+        # mtime).  FastSync must delta against THAT file -- even though it
+        # shares nothing with the source -- and must NOT reuse a similar-named
+        # sibling that is byte-identical to the source.
+        source, dest = self._prepare("nondisp")
+        sibling = self._rand_bytes(self.SIZE, 111)   # will equal the incoming file
+        stale = self._rand_bytes(self.SIZE, 333)     # worthless exact-path file
+        self._seed_dest(source, dest,
+                        {self.OLD_NAME: sibling, self.NEW_NAME: stale},
+                        shared_server.port)
+        # Force the exact-path destination file's mtime into the past so the
+        # quick check deterministically decides to transfer it.
+        os.utime(os.path.join(get_dest_received_dir(dest, source), self.NEW_NAME),
+                 (self.TS, self.TS))
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(sibling)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy non-displacement run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == sibling
+        assert proxy.client_to_server > self.SIZE // 2, \
+            "the exact-path destination file must be the delta basis, not the fuzzy sibling"
+
+    def test_fuzzy_basis_larger_than_source(self, shared_server):
+        # The similar sibling is LARGER than the incoming file (within the delta
+        # engine's 10x ratio); the new file is an exact prefix of the basis, so
+        # every block matches and only a tiny delta travels.
+        source, dest = self._prepare("largerbasis")
+        big = self._rand_bytes(1536 * 1024, 1)
+        prefix = big[:1024 * 1024]
+        self._seed_dest(source, dest, {self.OLD_NAME: big}, shared_server.port)
+        self._replace_source_file(source, self.OLD_NAME, self.NEW_NAME, prefix)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy larger-basis run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == prefix, \
+            "shrunken file reconstructed from a larger fuzzy basis is not byte-exact"
+        assert proxy.client_to_server < len(prefix) // 4, \
+            "larger fuzzy basis should have carried most of the file as block matches"
+
+    def test_fuzzy_basis_smaller_than_source(self, shared_server):
+        # The similar sibling is SMALLER than the incoming file; the new file
+        # appends data past the basis, so the appended tail travels as literals
+        # while the shared prefix is block-matched.
+        source, dest = self._prepare("smallerbasis")
+        base = self._rand_bytes(self.SIZE, 2)
+        tail = self._rand_bytes(64 * 1024, 3)
+        new_bytes = base + tail
+        self._seed_dest(source, dest, {self.OLD_NAME: base}, shared_server.port)
+        self._replace_source_file(source, self.OLD_NAME, self.NEW_NAME, new_bytes)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy smaller-basis run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes, \
+            "grown file reconstructed from a smaller fuzzy basis is not byte-exact"
+        assert proxy.client_to_server < len(new_bytes) // 4, \
+            "smaller fuzzy basis should have block-matched the shared prefix"
+
+    def test_no_fuzzy_end_to_end_equals_no_flag(self, shared_server):
+        # --no-fuzzy must not enable anything: a run with it behaves exactly
+        # like a run without it (whole-file transfer, byte-exact output).
+        source, dest = self._prepare("nofuzzye2e")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        self._replace_source_file(source, self.OLD_NAME, self.NEW_NAME, new_bytes)
+        result, proxy = self._run_measured(source, dest, ["--no-fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--no-fuzzy run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server > len(new_bytes) // 2, \
+            "--no-fuzzy should leave the default whole-file behavior intact"
 
