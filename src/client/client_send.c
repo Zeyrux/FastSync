@@ -1,5 +1,6 @@
 #include "client_send.h"
 #include "array_list.h"
+#include "change_list.h"
 #include "chunk.h"
 #include "compression.h"
 #include "config.h"
@@ -292,6 +293,113 @@ static int send_dry_run_manifest(const Config* config) {
   return 0;
 }
 
+typedef struct {
+  char* path;
+  mode_t mode;
+  unsigned long long size;
+  time_t mtime;
+} ListEntry;
+
+static void list_entries_destroy(ListEntry* entries, size_t count) {
+  if (entries == NULL)
+    return;
+  for (size_t i = 0; i < count; i++)
+    free(entries[i].path);
+  free(entries);
+}
+
+static int compare_list_entries(const void* left, const void* right) {
+  const ListEntry* a = (const ListEntry*)left;
+  const ListEntry* b = (const ListEntry*)right;
+  return strcmp(a->path, b->path);
+}
+
+/* --list-only: print an ls-style listing of the files that WOULD be
+ * transferred and exit without contacting the server or writing anything.
+ * Directory lines are not printed because the scanner only yields regular
+ * transfer candidates. Returns 0 on success, 1 on error. */
+static int send_list_only(const Config* config) {
+  ScannerOptions options = scanner_options_from_config(config, 0);
+  options.use_metadata = true; /* capture mode + mtime for the listing */
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &options);
+  if (!scanner)
+    return 1;
+  ListEntry* entries = NULL;
+  size_t count = 0;
+  size_t capacity = 0;
+  Chunk* chunk;
+  bool oom = false;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      File* f = chunk->items[i];
+      if (f == NULL)
+        continue;
+      if (count == capacity) {
+        size_t new_capacity = capacity > 0 ? capacity * 2 : 64;
+        if (new_capacity <= capacity) {
+          oom = true;
+          break;
+        }
+        ListEntry* grown = realloc(entries, new_capacity * sizeof(ListEntry));
+        if (!grown) {
+          oom = true;
+          break;
+        }
+        entries = grown;
+        capacity = new_capacity;
+      }
+      char* path = str_dup(f->path);
+      if (!path) {
+        oom = true;
+        break;
+      }
+      mode_t mode = 0;
+      time_t mtime = 0;
+      if (f->metadata != NULL) {
+        mode = f->metadata->mode;
+        mtime = f->metadata->mtime_sec;
+      } else {
+        struct stat st;
+        if (stat(f->path, &st) == 0) {
+          mode = st.st_mode;
+          mtime = st.st_mtime;
+        }
+      }
+      entries[count].path = path;
+      entries[count].mode = mode;
+      entries[count].mtime = mtime;
+      entries[count].size = f->data != NULL ? f->data->size : 0;
+      count++;
+    }
+    chunk_destroy(chunk);
+    if (oom)
+      break;
+  }
+  bool failed = oom || directory_scanner_failed(scanner);
+  directory_scanner_destroy(scanner);
+  if (failed) {
+    list_entries_destroy(entries, count);
+    if (oom)
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed while listing");
+    return 1;
+  }
+  if (count > 1)
+    qsort(entries, count, sizeof(ListEntry), compare_list_entries);
+  for (size_t i = 0; i < count; i++) {
+    char* line = change_render_list_line(entries[i].mode, entries[i].size, entries[i].mtime,
+                                         entries[i].path);
+    if (line != NULL) {
+      char* escaped = output_escape(line, config->eight_bit_output);
+      printf("%s\n", escaped != NULL ? escaped : line);
+      free(escaped);
+      free(line);
+    }
+  }
+  list_entries_destroy(entries, count);
+  return 0;
+}
+
 /* Send the delete manifest (list of files) to the server. Returns 0 on success, -1 on failure. */
 static int send_delete_manifest(int fd, ArrayList* manifest) {
   if (!manifest)
@@ -533,6 +641,10 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       return -1;
     }
     data_destroy(data);
+    for (int i = 0; i < chunk->element_count; i++) {
+      if (chunk->items[i] != NULL)
+        change_emit_file_sent(config, chunk->items[i]);
+    }
     return 0;
   }
 
@@ -553,6 +665,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       source_file_destroy(source);
       return -1;
     }
+    change_emit_file_sent(config, f);
     if (source && !array_list_add(remove_sources, source)) {
       source_file_destroy(source);
       return -1;
@@ -806,6 +919,8 @@ static int progress_thread_fn(void* arg) {
 }
 
 int send_files(Config* config) {
+  if (config->list_only)
+    return send_list_only(config);
   if (config->dry_run)
     return send_dry_run_manifest(config);
 
@@ -937,6 +1052,8 @@ int send_files_multithreaded(Config** config_ptr) {
   if (!config_ptr || !*config_ptr)
     return 1;
   Config* config = *config_ptr;
+  if (config->list_only)
+    return send_list_only(config);
   if (config->dry_run)
     return send_dry_run_manifest(config);
 

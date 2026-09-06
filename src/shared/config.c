@@ -74,6 +74,7 @@ static void config_set_defaults(Config* config) {
   config->preserve_sparse = false;
   config->itemize_changes = false;
   config->out_format = NULL;
+  config->log_file_format = NULL;
   config->info_level = 0;
   config->debug_level = 0;
   config->list_only = false;
@@ -224,6 +225,7 @@ void config_delete(Config* config) {
   free(config->backup_dir);
   free(config->server_host);
   free(config->out_format);
+  free(config->log_file_format);
   free(config->files_from);
   free(config->rsh_command);
   free(config->rsync_path);

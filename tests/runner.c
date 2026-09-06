@@ -1,5 +1,6 @@
 #include "test_array_list.h"
 #include "test_chunk.h"
+#include "test_change_list.h"
 #include "test_client_cli.h"
 #include "test_compression.h"
 #include "test_config.h"
@@ -40,6 +41,7 @@ int main() {
   RUN_TEST(test_array_list);
   RUN_TEST(test_shared_utils);
   RUN_TEST(test_chunk);
+  RUN_TEST(test_change_list);
   RUN_TEST(test_config);
   RUN_TEST(test_compression);
   RUN_TEST(test_scanner);

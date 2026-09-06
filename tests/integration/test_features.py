@@ -1225,3 +1225,183 @@ class TestTempDir:
                                port=shared_server.port)
         assert result.returncode != 0, "absolute --temp-dir was not rejected"
         assert not os.path.lexists(abs_escape), "file created outside the destination root"
+
+
+def _source_files():
+    """All source paths (absolute) that a transfer would send right now."""
+    return [
+        os.path.join(root, name)
+        for root, _dirs, names in os.walk(SOURCE_DIR)
+        for name in names
+    ]
+
+
+class TestListOnly:
+    """--list-only prints every transfer candidate and changes nothing."""
+
+    def test_list_only_prints_each_file_and_does_not_transfer(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only"])
+        assert result.returncode == 0, f"list-only failed: {result.stderr[:200]}"
+        for full_path in _source_files():
+            assert full_path in result.stdout, f"list-only omitted {full_path}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert not os.path.exists(received), "list-only wrote to the destination"
+
+    def test_list_only_with_dry_run_does_not_error(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "--dry-run"])
+        assert result.returncode == 0, f"list-only -n failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert not os.path.exists(received)
+
+    def test_list_only_multithreaded(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "-m"])
+        assert result.returncode == 0, f"list-only -m failed: {result.stderr[:200]}"
+        for full_path in _source_files():
+            assert full_path in result.stdout, f"list-only -m omitted {full_path}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert not os.path.exists(received), "list-only -m wrote to the destination"
+
+
+class TestItemizeChanges:
+    """-i/--itemize-changes prints rsync-style lines only for files sent."""
+
+    def test_first_run_prints_sent_lines(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "-i"], port=shared_server.port)
+        assert result.returncode == 0, f"itemize sync failed: {result.stderr[:200]}"
+        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        assert sent_lines <= set(result.stdout.splitlines()), (
+            f"missing itemize lines; got {result.stdout[:500]}"
+        )
+
+    def test_incremental_second_run_prints_no_line_for_unchanged(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "-i", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
+        itemized = [line for line in result.stdout.splitlines() if line and line[0] in ">.<c"]
+        assert itemized == [], f"unchanged files were itemized: {itemized[:5]}"
+
+    def test_multithreaded_emits_same_itemize_lines(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "-i", "-m"], port=shared_server.port)
+        assert result.returncode == 0, f"itemize -m sync failed: {result.stderr[:200]}"
+        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        assert sent_lines <= set(result.stdout.splitlines()), (
+            f"missing itemize lines in -m mode; got {result.stdout[:500]}"
+        )
+
+    def test_dry_run_with_itemize_does_not_error(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-i", "--dry-run"])
+        assert result.returncode == 0, f"dry-run -i failed: {result.stderr[:200]}"
+
+    def test_changed_file_on_second_incremental_run_prints_exactly_one_line(self, shared_server):
+        """A changed file itemizes exactly once on an incremental rerun while
+        unchanged files print nothing (no double emission)."""
+        source = os.path.join(TEST_DATA_DIR, "itemize_change_src")
+        dest = os.path.join(TEST_DATA_DIR, "itemize_change_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        changed = os.path.join(source, "changed.txt")
+        untouched = os.path.join(source, "untouched.txt")
+        with open(changed, "wb") as fh:
+            fh.write(b"original\n")
+        with open(untouched, "wb") as fh:
+            fh.write(b"stable\n")
+
+        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+
+        with open(changed, "wb") as fh:
+            fh.write(b"edited payload\n")
+
+        result, _ = run_client(source, dest,
+                               flags=["-M", "-i", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
+        itemized = [line for line in result.stdout.splitlines() if line.startswith(">f")]
+        assert itemized == [">f+++++++++ " + changed], (
+            f"expected exactly one itemize line for {changed}, got {itemized}"
+        )
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "changed.txt")) == b"edited payload\n"
+        assert _read_file(os.path.join(received, "untouched.txt")) == b"stable\n"
+
+
+class TestOutFormat:
+    """--out-format prints a line per transferred file using the template."""
+
+    def test_out_format_path_and_size(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--out-format=%f %l"], port=shared_server.port)
+        assert result.returncode == 0, f"out-format sync failed: {result.stderr[:200]}"
+        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        got = set(result.stdout.splitlines())
+        assert expected <= got, f"out-format lines missing: expected {len(expected)} got {len(got)}"
+
+    def test_out_format_multithreaded_matches_single(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--out-format=%f %l", "-m"], port=shared_server.port)
+        assert result.returncode == 0, f"out-format -m sync failed: {result.stderr[:200]}"
+        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        got = set(result.stdout.splitlines())
+        assert expected <= got, f"out-format -m lines missing: {result.stdout[:500]}"
+
+
+class TestLogFileFormat:
+    """--log-file plus --log-file-format writes per-file lines to the log."""
+
+    def test_log_file_format_writes_transferred_files(self, shared_server):
+        clean_dir(DEST_DIR)
+        log_path = os.path.join(TEST_DATA_DIR, "itemize_transfer.log")
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+        result, _ = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--log-file", log_path, "--log-file-format=%f %l"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"log-file sync failed: {result.stderr[:200]}"
+        assert os.path.exists(log_path), "--log-file created no log"
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        for line in expected:
+            assert line in content, f"log file missing {line!r}"
+
+    def test_log_file_format_multithreaded_writes_transferred_files(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "itemize_log_mt_src")
+        dest = os.path.join(TEST_DATA_DIR, "itemize_log_mt_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        files = {"a.txt": b"alpha\n", "b.txt": b"beta\n"}
+        for rel, data in files.items():
+            with open(os.path.join(source, rel), "wb") as fh:
+                fh.write(data)
+        log_path = os.path.join(TEST_DATA_DIR, "itemize_mt.log")
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+        result, _ = run_client(
+            source,
+            dest,
+            flags=["--log-file", log_path, "--log-file-format=%f %l", "-m"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"log-file -m sync failed: {result.stderr[:200]}"
+        assert os.path.exists(log_path), "--log-file created no log"
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        expected = {f"{os.path.join(source, rel)} {len(data)}" for rel, data in files.items()}
+        for line in expected:
+            assert line in content, f"log file (-m) missing {line!r}"

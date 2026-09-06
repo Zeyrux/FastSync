@@ -81,6 +81,10 @@ void print_usage(void) {
   printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
   printf("  --suffix <str>      Backup suffix (default: ~)\n");
   printf("  --stats             Print transfer statistics at end\n");
+  printf("  -i, --itemize-changes  Print an rsync-style per-file change line\n");
+  printf("  --out-format=FORMAT Output format for changed files (%%f %%n %%l %%b %%M %%%%)\n");
+  printf("  --list-only         List source files instead of transferring\n");
+  printf("  --log-file-format=FORMAT  Per-file log line format (needs --log-file)\n");
   printf("  -h, --human-readable  Print byte sizes in human-readable form\n");
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  -x, --one-file-system  Do not cross filesystem boundaries\n");
