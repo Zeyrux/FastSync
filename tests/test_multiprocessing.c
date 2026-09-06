@@ -309,13 +309,14 @@ static void test_receiver_enqueue_byte_budget() {
   EXPECT_FALSE(atomic_load(&done));
   EXPECT_EQ_INT((int)ctx->queued_bytes, 2000); /* budget still honored */
 
-  /* Simulate the disk writer: dequeue + destroy + release the first file. */
+  /* Simulate the disk writer: dequeue + destroy + release the first file.
+     Releasing bytes unblocks the waiting enqueuer, which then admits the
+     second payload, so only the post-join state (below) is deterministic. */
   File* drained = queue_dequeue_multithreaded(q, &ctx->mutex, &ctx->condition_not_empty,
                                               &ctx->condition_not_full, &ctx->receiver_done);
   EXPECT_NOT_NULL(drained);
   file_destroy(drained);
   pipeline_context_receiver_note_bytes_released(ctx, 2000);
-  EXPECT_EQ_INT((int)ctx->queued_bytes, 0);
 
   EXPECT_EQ_INT(thrd_join(enqueuer, NULL), thrd_success);
   EXPECT_TRUE(atomic_load(&done));
