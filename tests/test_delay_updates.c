@@ -274,7 +274,20 @@ out:
   remove_tree(root);
 }
 
+/* The reserved staging name must be recognizable for validation, including
+   with a trailing slash. */
+static void test_delay_updates_reserved_name_helper() {
+  EXPECT_TRUE(delay_updates_staging_name_conflict(".fastsync-stage"));
+  EXPECT_TRUE(delay_updates_staging_name_conflict(".fastsync-stage/"));
+  EXPECT_TRUE(delay_updates_staging_name_conflict(".fastsync-stage///"));
+  EXPECT_FALSE(delay_updates_staging_name_conflict(NULL));
+  EXPECT_FALSE(delay_updates_staging_name_conflict(""));
+  EXPECT_FALSE(delay_updates_staging_name_conflict("backups"));
+  EXPECT_FALSE(delay_updates_staging_name_conflict(".fastsync-stage.bak"));
+}
+
 void test_delay_updates() {
+  test_delay_updates_reserved_name_helper();
   test_delay_updates_no_final_before_publish();
   test_delay_updates_publish_installs_files();
   test_delay_updates_cleanup_removes_staged();

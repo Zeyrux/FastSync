@@ -28,11 +28,17 @@ typedef struct DelayUpdatesContext {
   StagedFileEntry* entries;
   size_t count;
   size_t capacity;
-  bool prepared; /* staging dir created and stale leftovers wiped once */
+  bool prepared; /* staging dir created, wiped, and exclusively locked */
+  int lock_fd;   /* advisory exclusive flock held on the staging dir, or -1 */
 } DelayUpdatesContext;
 
 /* Name of the private staging subdirectory created under the receive root. */
 #define DELAY_UPDATES_STAGING_DIR ".fastsync-stage"
+
+/* True when `dir` (ignoring a trailing "/") is the reserved staging directory
+   name.  Used to reject a --backup-dir that would collide with the internal
+   staging area. */
+bool delay_updates_staging_name_conflict(const char* dir);
 
 /* Create an empty staging context rooted below root_directory.  Does not touch
    the filesystem yet. */

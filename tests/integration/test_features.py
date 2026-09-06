@@ -12,7 +12,7 @@ from common import (
     PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR,
     run_client,
     generate_test_files, verify_transfer, clean_dir, make_result,
-    get_dest_received_dir, CLIENT_CMD,
+    get_dest_received_dir, CLIENT_CMD, ServerManager,
 )
 
 SOURCE_DIR = os.path.join(TEST_DATA_DIR, "feature_source")
@@ -1494,30 +1494,103 @@ class TestDelayUpdates:
         assert not os.path.isdir(os.path.join(dest, self.STAGING))
 
     @pytest.mark.parametrize("mt", [False, True])
-    def test_abort_publish_failure_installs_nothing(self, shared_server, mt):
-        """A deterministic publication failure must fail the transfer, leave no
-        file in the final destination, and clean up the staging area.  A plain
-        file is planted where the final destination directory must be created,
-        so the very first stage->publish rename fails (mkdir is impossible on
-        top of a file even for root).  Exercised in both single and -m modes so
-        the multithreaded publish-once ordering is covered."""
-        source = self._make_source("delay_abort_src")
-        dest = os.path.join(TEST_DATA_DIR, "delay_abort_dst")
+    def test_delete_with_delay_updates(self, mt):
+        """--delete runs before publication, so the delete walker must not treat
+        the staging directory as a set of extras: a changed file must still be
+        published after genuine extras are removed.  Uses its own server started
+        with --allow-delete (the shared session server refuses deletion)."""
+        source = os.path.join(TEST_DATA_DIR, "delay_delete_src")
+        dest = os.path.join(TEST_DATA_DIR, "delay_delete_dst")
+        clean_dir(source)
         clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"AAAA")
+        with open(os.path.join(source, "extra.txt"), "wb") as fh:
+            fh.write(b"seed extra")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            assert _read_file(os.path.join(received, "extra.txt")) == b"seed extra"
+
+            # Second source state: f.txt changed, extra.txt removed from source.
+            with open(os.path.join(source, "f.txt"), "wb") as fh:
+                fh.write(b"BBBB")
+            os.remove(os.path.join(source, "extra.txt"))
+
+            flags = ["--delete", "--delay-updates"] + (["-m"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"delete+delay-updates sync failed: {result.stderr[:200]}"
+            assert _read_file(os.path.join(received, "f.txt")) == b"BBBB", \
+                "changed file was not published after deletion"
+            assert not os.path.exists(os.path.join(received, "extra.txt")), \
+                "genuine extra file was not deleted"
+            assert not os.path.isdir(os.path.join(dest, self.STAGING))
+
+    def test_delay_updates_rejects_reserved_backup_dir(self):
+        """--backup-dir equal to the internal staging name must be rejected so
+        an old backup can never be silently installed as the "new" file."""
+        source = self._make_source("delay_reserved_bak_src")
+        for variant, suffix in (("bare", ""), ("slash", "/")):
+            dest = os.path.join(TEST_DATA_DIR, f"delay_reserved_bak_{variant}_dst")
+            clean_dir(dest)
+            flags = ["--delay-updates", "--backup", "--backup-dir",
+                     ".fastsync-stage" + suffix]
+            result, _ = run_client(source, dest, flags=flags, port=None)
+            assert result.returncode != 0, \
+                f"reserved --backup-dir '{suffix}' was accepted"
+            assert not os.path.isdir(os.path.join(dest, self.STAGING)), \
+                "staging directory created by a rejected run"
+
+    @pytest.mark.parametrize("remove_source_files", [False, True])
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_mid_publish_failure_keeps_published_no_rollback(self, shared_server, mt,
+                                                             remove_source_files):
+        """A stage->publish rename failing part way through publication must
+        fail the whole transfer, keep the already-published top-level file (no
+        rollback), leave the not-yet-published nested file absent, and clean up
+        the staging area.  A regular file is planted where the final "sub"
+        directory must be created, so the nested rename fails (mkdir over a
+        file is impossible even for root) while the top-level file, which is
+        always staged first, publishes.  With --remove-source-files the sender
+        must keep every source because no success/outcome frame is ever sent."""
+        source = os.path.join(TEST_DATA_DIR, "delay_mid_src")
+        dest = os.path.join(TEST_DATA_DIR, "delay_mid_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        top_path = os.path.join(source, "top.txt")
+        deep_path = os.path.join(source, "sub", "deep.txt")
+        with open(top_path, "wb") as fh:
+            fh.write(b"top payload\n")
+        os.makedirs(os.path.dirname(deep_path))
+        with open(deep_path, "wb") as fh:
+            fh.write(b"deep payload\n")
+
         received = get_dest_received_dir(dest, source)
-        os.makedirs(os.path.dirname(received), exist_ok=True)
-        with open(received, "wb") as fh:
-            fh.write(b"blocks the destination directory")
+        os.makedirs(received)
+        with open(os.path.join(received, "sub"), "wb") as fh:
+            fh.write(b"blocks the nested destination directory")
+
         flags = ["--delay-updates"] + (["-m"] if mt else [])
+        if remove_source_files:
+            flags += ["--remove-source-files"]
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
-        assert result.returncode != 0, "blocked destination publish did not fail"
-        for root, _dirs, files in os.walk(source):
-            for name in files:
-                rel = os.path.relpath(os.path.join(root, name), source)
-                assert not os.path.exists(os.path.join(received, rel)), \
-                    f"file appeared at final destination despite failed publish: {rel}"
+        assert result.returncode != 0, "blocked nested publish did not fail"
+
+        # The top-level file was published before the nested rename failed and
+        # is intentionally NOT rolled back.
+        assert _read_file(os.path.join(received, "top.txt")) == b"top payload\n"
+        # The nested file was never published.
+        assert not os.path.lexists(os.path.join(received, "sub", "deep.txt")), \
+            "nested file appeared despite a failed publish"
         assert not os.path.isdir(os.path.join(dest, self.STAGING)), \
-            "staging leftovers after a failed publish"
+            "staging leftovers after a failed mid-publish"
+        # Sources survive: no success frame was sent, so a remove-source-files
+        # sender must not delete anything.
+        assert os.path.isfile(top_path)
+        assert os.path.isfile(deep_path)
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_remove_source_files_keeps_receiver_skipped_source(self, shared_server, mt):

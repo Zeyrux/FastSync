@@ -1287,6 +1287,27 @@ static void test_validate_config_delay_updates_rejects_inplace() {
   config_delete(cfg);
 }
 
+/* --backup-dir may not collide with the internal --delay-updates staging
+   directory (with or without a trailing slash), or old backups would silently
+   be installed as the "new" file. */
+static void test_validate_config_delay_updates_rejects_reserved_backup_dir() {
+  static const char* const reserved[] = {".fastsync-stage", ".fastsync-stage/"};
+  for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+    Config* cfg = valid_client_config();
+    cfg->delay_updates = true;
+    cfg->backup_dir = str_dup(reserved[i]);
+    EXPECT_FALSE(validate_config(cfg));
+    config_delete(cfg);
+  }
+
+  /* A non-colliding backup dir is fine alongside --delay-updates. */
+  Config* ok = valid_client_config();
+  ok->delay_updates = true;
+  ok->backup_dir = str_dup("backups");
+  EXPECT_TRUE(validate_config(ok));
+  config_delete(ok);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -1368,4 +1389,5 @@ void test_client_cli() {
   test_parse_args_temp_dir();
   test_parse_args_delay_updates();
   test_validate_config_delay_updates_rejects_inplace();
+  test_validate_config_delay_updates_rejects_reserved_backup_dir();
 }

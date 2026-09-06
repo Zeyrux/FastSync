@@ -156,6 +156,7 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->delete_after) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->delay_updates) && !(config->delay_updates && config->inplace) &&
+         !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          !(config->skip_compress_set && config->use_chunk_serialization) &&

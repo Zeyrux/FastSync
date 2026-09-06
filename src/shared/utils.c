@@ -205,7 +205,8 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
 }
 
 static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest,
-                             size_t max_delete, size_t* deleted_count) {
+                             size_t max_delete, size_t* deleted_count,
+                             const char* skip_root_child) {
   int scanfd = dup(dirfd);
   if (scanfd < 0)
     return false;
@@ -218,6 +219,13 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    /* A --delay-updates run keeps its staging directory as a direct child of
+       the receive root.  Its contents are not manifest entries yet (they are
+       published after deletion), so descending into it would delete every
+       staged file as an "extra".  Skip only the top-level staging name; nested
+       directories with the same name are ordinary destination content. */
+    if (rel_path[0] == '\0' && skip_root_child && strcmp(entry->d_name, skip_root_child) == 0)
       continue;
     char* child_rel = path_cat((char*)rel_path, entry->d_name);
     if (!child_rel) {
@@ -240,7 +248,8 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       bool child_removed = false;
       if (childfd >= 0) {
-        child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count);
+        child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count,
+                                         skip_root_child);
         if (!child_removed)
           operation_ok = false;
         close(childfd);
@@ -291,7 +300,8 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
   return operation_ok;
 }
 
-bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete) {
+bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete,
+                           const char* skip_root_child) {
   if (!manifest)
     return false;
   int rootfd;
@@ -308,14 +318,14 @@ bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t ma
   if (rootfd < 0)
     return false;
   size_t deleted_count = 0;
-  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count);
+  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count, skip_root_child);
   if (close(rootfd) != 0)
     ok = false;
   return ok;
 }
 
 bool delete_extras(const char* dest_root, ArrayList* manifest) {
-  return delete_extras_limited(dest_root, manifest, SIZE_MAX);
+  return delete_extras_limited(dest_root, manifest, SIZE_MAX, NULL);
 }
 
 bool has_path_traversal(const char* path) {

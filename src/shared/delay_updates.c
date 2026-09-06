@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -35,6 +36,7 @@ DelayUpdatesContext* delay_updates_context_create(const char* root_directory) {
   context->count = 0;
   context->capacity = 0;
   context->prepared = false;
+  context->lock_fd = -1;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success) {
     free(context->staging_root);
     free(context->root_directory);
@@ -48,6 +50,9 @@ void delay_updates_context_destroy(DelayUpdatesContext* context) {
   if (!context)
     return;
   mtx_destroy(&context->mutex);
+  if (context->lock_fd >= 0)
+    close(context->lock_fd);
+  context->lock_fd = -1;
   free(context->staging_root);
   free(context->root_directory);
   for (size_t i = 0; i < context->count; i++) {
@@ -57,6 +62,18 @@ void delay_updates_context_destroy(DelayUpdatesContext* context) {
   }
   free(context->entries);
   free(context);
+}
+
+bool delay_updates_staging_name_conflict(const char* dir) {
+  if (!dir || !*dir)
+    return false;
+  size_t length = strlen(dir);
+  while (length > 0 && dir[length - 1] == '/')
+    length--;
+  size_t reserved_length = strlen(DELAY_UPDATES_STAGING_DIR);
+  if (length != reserved_length)
+    return false;
+  return strncmp(dir, DELAY_UPDATES_STAGING_DIR, length) == 0;
 }
 
 /* Recursively delete every entry inside an open directory (never following
@@ -117,12 +134,37 @@ bool delay_updates_prepare(DelayUpdatesContext* context) {
     free(escaped);
     return false;
   }
+  /* Hold an exclusive advisory lock on the staging directory for the whole
+     transfer.  The staging directory name is fixed, so two simultaneous
+     delayed transfers to the same destination root would otherwise share it
+     and destroy each other's staged files.  The lock makes the second session
+     fail cleanly instead of corrupting the first.  The lock is released when
+     the context (and its file descriptor) is destroyed. */
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    int saved_errno = errno;
+    close(fd);
+    if (saved_errno == EWOULDBLOCK || saved_errno == EAGAIN) {
+      char* escaped = output_escape(context->staging_root, false);
+      log_message(LOG_LEVEL_ERROR,
+                  "another --delay-updates transfer to '%s' is already in progress; refusing to "
+                  "share the staging directory",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
+    } else {
+      log_message(LOG_LEVEL_ERROR, "could not lock --delay-updates staging directory '%s': %s",
+                  context->staging_root, strerror(saved_errno));
+    }
+    return false;
+  }
+  context->lock_fd = fd;
+  /* Only now, with exclusive ownership, wipe leftovers from an interrupted
+     earlier transfer; this can never race with a live session. */
   bool ok = delay_wipe_dir_fd(fd);
-  if (close(fd) != 0)
-    ok = false;
   if (!ok) {
     log_message(LOG_LEVEL_ERROR, "could not clear stale --delay-updates staging files under '%s'",
                 context->staging_root);
+    close(context->lock_fd);
+    context->lock_fd = -1;
     return false;
   }
   context->prepared = true;
@@ -176,7 +218,7 @@ bool delay_updates_record(DelayUpdatesContext* context, const char* staged_path,
 /* Move an existing final destination file aside before the staged replacement
    is installed.  Deferred from stage time so the final destination is not
    modified until publication.  Mirrors the immediate-mode backup logic. */
-static bool delay_publish_backup(DelayUpdatesContext* context, const Config* config,
+static bool delay_publish_backup(const DelayUpdatesContext* context, const Config* config,
                                  const StagedFileEntry* entry) {
   bool backup_enabled = config && config->backup && !config->ignore_existing;
   if (!backup_enabled)
@@ -241,6 +283,20 @@ static bool delay_publish_entry(DelayUpdatesContext* context, const Config* conf
   return true;
 }
 
+/* Remove the staging tree (contents plus the directory itself).  Returns true
+   when nothing is left behind (including the case where it never existed). */
+static bool delay_updates_remove_staging_tree(DelayUpdatesContext* context) {
+  int fd = open(context->staging_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0)
+    return errno == ENOENT;
+  bool ok = delay_wipe_dir_fd(fd);
+  if (close(fd) != 0)
+    ok = false;
+  if (ok && rmdir(context->staging_root) != 0 && errno != ENOENT)
+    ok = false;
+  return ok;
+}
+
 bool delay_updates_publish(DelayUpdatesContext* context, const Config* config) {
   if (!context)
     return false;
@@ -257,12 +313,14 @@ bool delay_updates_publish(DelayUpdatesContext* context, const Config* config) {
   /* Renaming files out of the staging tree leaves the mirrored directories
      behind, and a mid-publish failure leaves the remaining staged files.
      Remove whatever is left so a later run starts from a clean staging area
-     and no staged content can linger after a failed publish. */
-  int fd = open(context->staging_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (fd >= 0) {
-    delay_wipe_dir_fd(fd);
-    close(fd);
-    rmdir(context->staging_root);
+     and no staged content can linger after a failed publish.  If that cleanup
+     fails, tell the operator: a stale staging directory would otherwise
+     silently accumulate and make the next transfer's prepare-wipe fail. */
+  if (!delay_updates_remove_staging_tree(context)) {
+    log_message(LOG_LEVEL_WARNING,
+                "could not fully remove --delay-updates staging directory '%s' after publish; a "
+                "later --delay-updates transfer to this destination will try to clear it",
+                context->staging_root);
   }
   return ok;
 }
@@ -270,10 +328,11 @@ bool delay_updates_publish(DelayUpdatesContext* context, const Config* config) {
 void delay_updates_cleanup(DelayUpdatesContext* context) {
   if (!context)
     return;
-  int fd = open(context->staging_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (fd < 0)
+  /* Only a context that gained exclusive ownership may touch the shared
+     staging directory.  If prepare never succeeded (e.g. lock contention with
+     another live session) the directory belongs to that other session and must
+     be left alone. */
+  if (!context->prepared)
     return;
-  delay_wipe_dir_fd(fd);
-  close(fd);
-  rmdir(context->staging_root);
+  delay_updates_remove_staging_tree(context);
 }
