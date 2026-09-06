@@ -1049,7 +1049,9 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     free(rel);
     file_destroy(file);
     ps->failed = true;
+    return;
   }
+  free(rel);
 }
 
 /* Scan the root directory itself, collecting root files and subdirectories.
