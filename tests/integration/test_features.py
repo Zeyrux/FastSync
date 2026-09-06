@@ -2052,10 +2052,14 @@ class TestDeleteTiming:
                 f"{flag}: nested file was not written after the early deletion"
 
     @pytest.mark.parametrize("flag", ["--delete", "--delete-after", "--delete-delay"])
-    def test_late_flags_commit_only_after_success(self, flag):
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_late_flags_commit_only_after_success(self, flag, mt):
         """Plain --delete/--delete-after/--delete-delay defer deletion until the
         whole transfer succeeds: a mid-transfer write failure must leave every
-        extra in place (commit-style safety)."""
+        extra in place (commit-style safety).  The -m receiver must also keep
+        the extras: the deferred keep-set is committed by the server only after
+        the disk-writer thread has finished, and a failing writer means the
+        manifest is freed, never applied."""
         source = self._seed("late")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_late_dst")
         clean_dir(dest)
@@ -2072,13 +2076,14 @@ class TestDeleteTiming:
             with open(blocker, "wb") as fh:
                 fh.write(b"blocks the nested destination directory")
 
-            result, _ = run_client(source, dest, flags=[flag], port=server.port)
+            flags = [flag] + (["-m"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode != 0, \
-                f"{flag} unexpectedly succeeded (deletion must be deferred)"
+                f"{flag} (mt={mt}) unexpectedly succeeded (deletion must be deferred)"
             assert os.path.exists(extra), \
-                f"{flag} removed an extra although the transfer failed"
+                f"{flag} (mt={mt}) removed an extra although the transfer failed"
             assert os.path.isfile(blocker), \
-                f"{flag} deleted the blocker although the transfer failed"
+                f"{flag} (mt={mt}) deleted the blocker although the transfer failed"
 
     def test_early_flag_respected_when_server_refuses_delete(self, shared_server):
         """With an --allow-delete-less server the client's early timing still

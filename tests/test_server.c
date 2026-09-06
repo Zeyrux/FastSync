@@ -460,6 +460,95 @@ static void test_incremental_check_delta_oversize_reports_failure() {
   }
 }
 
+/* Late-timing keep-set leak guard: a manifest parked by the commit path must
+   be freed on every error exit, never leaked.  These tests drive
+   receiver_process_pending() through an error AFTER the manifest was parked and
+   are exercised under ASan/valgrind to prove the list is released. */
+
+static Config* make_late_delete_config(const char* root) {
+  Config* cfg = config_create();
+  if (!cfg)
+    return NULL;
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  cfg->delete_after = true;
+  return cfg;
+}
+
+static int run_pending_receiver(Config* cfg, int fd, ArrayList** pending) {
+  ReceiverSink sink = {0};
+  return receiver_process_pending(cfg, fd, &sink, pending);
+}
+
+static void test_late_manifest_abort_frees_keepset() {
+  Config* cfg = make_late_delete_config("/tmp/fastsync_late_abort");
+  EXPECT_NOT_NULL(cfg);
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_status(p[1], STATUS_ABORT));
+
+  ArrayList* pending = NULL;
+  EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
+  EXPECT_NULL(pending);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+static void test_late_manifest_eof_frees_keepset() {
+  Config* cfg = make_late_delete_config("/tmp/fastsync_late_eof");
+  EXPECT_NOT_NULL(cfg);
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  shutdown(p[1], SHUT_WR);
+
+  ArrayList* pending = NULL;
+  EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
+  EXPECT_NULL(pending);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+static void test_late_second_manifest_frees_both() {
+  Config* cfg = make_late_delete_config("/tmp/fastsync_late_second");
+  EXPECT_NOT_NULL(cfg);
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "first.txt"));
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "second.txt"));
+
+  ArrayList* pending = NULL;
+  EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
+  EXPECT_NULL(pending);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
 void test_server() {
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
@@ -470,5 +559,8 @@ void test_server() {
     test_incremental_check_quick_skip_by_mtime();
     test_incremental_check_size_mismatch_full_transfer();
     test_incremental_check_delta_oversize_reports_failure();
+    test_late_manifest_abort_frees_keepset();
+    test_late_manifest_eof_frees_keepset();
+    test_late_second_manifest_frees_both();
   }
 }
