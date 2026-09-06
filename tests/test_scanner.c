@@ -995,6 +995,89 @@ static void test_per_dir_filter(bool parallel) {
   rmdir(root);
 }
 
+/* scanner_path_relative maps an on-disk path to its transfer-relative path,
+ * including the "/" transfer-root edge case (regression: children of "/" used
+ * to abort the scan because the suffix was mis-read). */
+static void test_scanner_path_relative() {
+  char* rel = NULL;
+
+  rel = scanner_path_relative("/", "/");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "");
+  free(rel);
+
+  rel = scanner_path_relative("/", "/etc");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "etc");
+  free(rel);
+
+  rel = scanner_path_relative("/", "/etc/passwd");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "etc/passwd");
+  free(rel);
+
+  /* Normal roots: with and without a trailing slash on the root. */
+  rel = scanner_path_relative("/tmp/foo", "/tmp/foo");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "");
+  free(rel);
+
+  rel = scanner_path_relative("/tmp/foo", "/tmp/foo/bar");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "bar");
+  free(rel);
+
+  rel = scanner_path_relative("/tmp/foo/", "/tmp/foo/bar/baz.txt");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "bar/baz.txt");
+  free(rel);
+
+  /* A path outside the root maps to NULL. */
+  EXPECT_NULL(scanner_path_relative("/tmp/foo", "/tmp"));
+  EXPECT_NULL(scanner_path_relative("/tmp/foo", "/tmp/foobar"));
+}
+
+/* rsync precedence: a deeper .rsync-filter overrides a shallower one, so an
+ * inner "+ *.tmp" re-includes what the outer "- *.tmp" excluded. */
+static void test_per_dir_filter_override(bool parallel) {
+  const char* root = "test_scan_perdir_ovr";
+  const char* sub = "test_scan_perdir_ovr/sub";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  create_test_file("test_scan_perdir_ovr/.rsync-filter", "- *.tmp\n");
+  create_test_file("test_scan_perdir_ovr/sub/.rsync-filter", "+ *.tmp\n");
+  create_test_file("test_scan_perdir_ovr/top.tmp", "x");
+  create_test_file("test_scan_perdir_ovr/keep.txt", "keep");
+  create_test_file("test_scan_perdir_ovr/sub/inside.tmp", "x");
+
+  ScannerOptions options = {0};
+  options.per_dir_filters = true;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  /* top.tmp is still excluded by the root file; inside.tmp is re-included by
+   * the subdir file; .rsync-filter files are never transferred. */
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "keep.txt"));
+  EXPECT_TRUE(has_path(paths, count, "sub/inside.tmp"));
+  EXPECT_FALSE(has_path(paths, count, "top.tmp"));
+  EXPECT_FALSE(has_path(paths, count, ".rsync-filter"));
+  EXPECT_FALSE(has_path(paths, count, "sub/.rsync-filter"));
+  free_paths(paths, count);
+
+  unlink("test_scan_perdir_ovr/top.tmp");
+  unlink("test_scan_perdir_ovr/keep.txt");
+  unlink("test_scan_perdir_ovr/sub/inside.tmp");
+  unlink("test_scan_perdir_ovr/.rsync-filter");
+  unlink("test_scan_perdir_ovr/sub/.rsync-filter");
+  rmdir(sub);
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1024,4 +1107,7 @@ void test_scanner() {
   test_cvs_defaults(true);
   test_per_dir_filter(false);
   test_per_dir_filter(true);
+  test_scanner_path_relative();
+  test_per_dir_filter_override(false);
+  test_per_dir_filter_override(true);
 }

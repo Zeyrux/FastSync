@@ -19,6 +19,13 @@ static bool rule_text_is_unsupported_word(const char* p, size_t len) {
   return false;
 }
 
+/* rsync include/exclude rule modifiers we do NOT implement. A rule whose +/- is
+ * immediately followed by one of these is rejected instead of being silently
+ * parsed as a literal pattern. */
+static bool is_unsupported_rule_modifier(char c) {
+  return c == '!' || c == 'C' || c == 's' || c == 'r' || c == 'p' || c == 'x';
+}
+
 FilterRule* filter_rule_parse(const char* line, char* err, size_t err_size) {
   if (err && err_size > 0)
     err[0] = '\0';
@@ -34,7 +41,6 @@ FilterRule* filter_rule_parse(const char* line, char* err, size_t err_size) {
   while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r'))
     text[--len] = '\0';
 
-  FilterAction action = FILTER_ACTION_EXCLUDE;
   const char* p = text;
   while (*p == ' ' || *p == '\t')
     p++;
@@ -44,11 +50,35 @@ FilterRule* filter_rule_parse(const char* line, char* err, size_t err_size) {
     return NULL;
   }
 
+  FilterAction action = FILTER_ACTION_EXCLUDE;
   if (*p == '+' || *p == '-') {
     action = *p == '+' ? FILTER_ACTION_INCLUDE : FILTER_ACTION_EXCLUDE;
     p++;
-    /* Accept the rsync word forms include/exclude. */
+    /* rsync attaches rule modifiers directly to the +/- (e.g. "-s foo"). Only
+     * the '/' anchor modifier is supported; anything else is a clear error
+     * rather than a silently-ignored literal. */
+    if (*p != ' ' && *p != '\t' && *p != '\0' && is_unsupported_rule_modifier(*p)) {
+      snprintf(err, err_size,
+               "filter rule modifier '%c' is not supported (only the '/' anchor after +/- "
+               "is implemented; put a space between +/- and the pattern)",
+               *p);
+      free(text);
+      return NULL;
+    }
+    while (*p == ' ' || *p == '\t')
+      p++;
   } else {
+    /* ':' (dir-merge) and '.' (merge) are rsync filter-rule shorthands. At the
+     * start of a rule they mean "merge this file", so reject them instead of
+     * silently turning them into inert exclude patterns. */
+    if (*p == ':' || *p == '.' || *p == '!') {
+      snprintf(err, err_size,
+               "filter rule starting with '%c' is not supported (merge/dir-merge/list-clear "
+               "shorthands are not implemented; use +/- include/exclude rules)",
+               *p);
+      free(text);
+      return NULL;
+    }
     const char* sp = p;
     while (*sp != '\0' && *sp != ' ' && *sp != '\t')
       sp++;
@@ -68,16 +98,17 @@ FilterRule* filter_rule_parse(const char* line, char* err, size_t err_size) {
       action = FILTER_ACTION_EXCLUDE;
       p = sp;
     }
+    while (*p == ' ' || *p == '\t')
+      p++;
   }
 
-  while (*p == ' ' || *p == '\t')
-    p++;
   if (*p == '\0') {
     snprintf(err, err_size, "filter rule has no pattern");
     free(text);
     return NULL;
   }
 
+  /* A pattern beginning with '/' is anchored (either as "-/foo" or "- /foo"). */
   bool anchored = false;
   if (*p == '/') {
     anchored = true;

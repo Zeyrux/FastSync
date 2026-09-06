@@ -18,8 +18,12 @@
  *      contains a .rsync-filter file for per-directory rules)
  *   a trailing '/' makes the rule match directories only
  *
- * Unsupported rsync rule types (merge/dir-merge/hide/show/protect/risk/clear,
- * rule modifiers other than '/') are rejected with a clear error.
+ * Rejected explicitly (no silent no-ops): the rsync merge/dir-merge/list-clear
+ * shorthands written as a rule that starts with ':' or '.' or '!', the
+ * merge/dir-merge/hide/show/protect/risk/clear words, and every include/exclude
+ * rule modifier other than '/' (! C s r p x). The pattern must be separated
+ * from +/- by a space (or a single '/' anchor), exactly like rsync's
+ * "-s foo"/"-p ..." modifier syntax is refused.
  */
 
 typedef enum {

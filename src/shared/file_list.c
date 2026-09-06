@@ -39,16 +39,19 @@ static bool string_list_add(StringList* list, const char* text) {
 /* Validate and normalize one entry. Returns:
  *   1 -> added to `out`
  *   0 -> blank entry, skip
- *  -1 -> invalid (message set in `err`) */
-static int normalize_entry(const char* raw, size_t len, StringList* out, char* err,
-                           size_t err_size) {
-  /* Trim the trailing newline/carriage-return from line mode. */
-  while (len > 0 && (raw[len - 1] == '\n' || raw[len - 1] == '\r'))
-    len--;
+ *  -1 -> invalid (message set in `err`)
+ * `strip_line_endings` trims a trailing CR/LF (line mode only); NUL mode keeps
+ * the entry bytes verbatim so names ending in CR/LF survive. */
+static int normalize_entry(const char* raw, size_t len, bool strip_line_endings, StringList* out,
+                           char* err, size_t err_size) {
+  if (strip_line_endings) {
+    while (len > 0 && (raw[len - 1] == '\n' || raw[len - 1] == '\r'))
+      len--;
+  }
   if (len == 0)
     return 0;
   if (raw[0] == '/') {
-    snprintf(err, err_size, "absolute path entries are not allowed: '%s'", raw);
+    snprintf(err, err_size, "absolute path entries are not allowed: '%.*s'", (int)len, raw);
     return -1;
   }
   /* Reject NUL bytes inside a token defensively (NUL-delimited mode splits on
@@ -134,7 +137,7 @@ FileListSet* file_list_load(const char* path, bool null_separated, char* err, si
   bool ok = true;
   char delim = null_separated ? '\0' : '\n';
   while (ok && (n = getdelim(&line, &line_cap, delim, fp)) != -1) {
-    int r = normalize_entry(line, (size_t)n, &raw, err, err_size);
+    int r = normalize_entry(line, (size_t)n, !null_separated, &raw, err, err_size);
     if (r < 0) {
       ok = false;
       break;

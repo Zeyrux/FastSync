@@ -22,7 +22,9 @@ typedef struct {
 
 /* A chain node: `own` holds the .rsync-filter rules of one directory, `parent`
  * the context that directory inherited (nearest ancestor with a filter file).
- * Rules are evaluated base-first, then from the outermost node inward. */
+ * The chain for a directory's contents runs from that directory's own node up
+ * to the root; the command-line base rules are evaluated after the whole
+ * chain. */
 struct FilterNode {
   FilterNode* parent;
   FilterRuleList* own;
@@ -46,15 +48,19 @@ static FilterNode* filter_node_alloc(FilterNode* parent, FilterRuleList* own) {
   return node;
 }
 
-/* Evaluate a rule chain (base rules, then per-directory nodes outermost
- * first). Returns FILTER_ACTION_NONE when nothing matched. */
+/* Evaluate a rule chain for an entry inside the directory whose content
+ * context is `node`. rsync precedence, highest first: the innermost (current)
+ * directory's .rsync-filter rules, then each ancestor's, then the root's, and
+ * finally the command-line base rules (--filter/-C). A deeper per-directory
+ * file therefore overrides a shallower one, and per-directory files override
+ * the base rules by default. Returns FILTER_ACTION_NONE when nothing matched. */
 static FilterAction chain_rules_apply(const FilterRuleList* base, const FilterNode* node,
                                       const char* rel, const char* leaf, bool is_dir) {
   if (node) {
-    FilterAction parent_action = chain_rules_apply(base, node->parent, rel, leaf, is_dir);
-    if (parent_action != FILTER_ACTION_NONE)
-      return parent_action;
-    return filter_rules_apply(node->own, rel, leaf, is_dir);
+    FilterAction own_action = filter_rules_apply(node->own, rel, leaf, is_dir);
+    if (own_action != FILTER_ACTION_NONE)
+      return own_action;
+    return chain_rules_apply(base, node->parent, rel, leaf, is_dir);
   }
   return base ? filter_rules_apply(base, rel, leaf, is_dir) : FILTER_ACTION_NONE;
 }
@@ -117,13 +123,19 @@ bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entr
 
 /* Relative path of an on-disk path below `root`. The transfer root may be
  * given with a trailing slash; the returned rel path never has one and is ""
- * for the root itself. */
-static char* rel_for_fs_path(const char* root, const char* fs_path) {
+ * for the root itself. A root of "/" is handled (its children start at "/").
+ * Exposed so tests can exercise the mapping directly. */
+char* scanner_path_relative(const char* root, const char* fs_path) {
   size_t root_len = strlen(root);
   while (root_len > 1 && root[root_len - 1] == '/')
     root_len--;
   if (strncmp(root, fs_path, root_len) != 0)
     return NULL;
+  if (root_len == 1 && root[0] == '/') {
+    if (fs_path[1] == '\0')
+      return str_dup("");
+    return str_dup(fs_path + 1);
+  }
   if (fs_path[root_len] == '\0')
     return str_dup("");
   if (fs_path[root_len] != '/')
@@ -413,7 +425,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
   free(de);
 
   free(scanner->current_rel);
-  scanner->current_rel = rel_for_fs_path(scanner->root_path, scanner->current_path);
+  scanner->current_rel = scanner_path_relative(scanner->root_path, scanner->current_path);
   if (!scanner->current_rel) {
     log_message(LOG_LEVEL_ERROR, "Could not compute relative path under %s", scanner->root_path);
     scanner->failed = true;

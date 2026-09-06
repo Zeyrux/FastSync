@@ -1489,6 +1489,43 @@ class TestFilesFrom:
         assert result.returncode != 0, "missing --files-from file must be rejected"
         assert "--files-from" in result.stderr
 
+    def test_files_from_missing_entry_rejected(self):
+        source = self._make_source("ff_missing_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_missing_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"top.txt\nno_such_file.txt\n")
+        result, _ = run_client(source, dest, flags=["--files-from", lst])
+        assert result.returncode != 0, "a listed-but-missing file must be a hard error"
+        assert "not found" in result.stderr
+
+    def test_files_from_missing_entry_rejected_dry_run(self):
+        source = self._make_source("ff_missing_dry_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_missing_dry_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"gone.bin\n")
+        result, _ = run_client(source, dest, flags=["--files-from", lst, "--dry-run"])
+        assert result.returncode != 0, "dry-run must also reject a listed-but-missing file"
+        assert "not found" in result.stderr
+
+    def test_files_from_empty_list_rejected(self):
+        source = self._make_source("ff_empty_src")
+        dest = os.path.join(TEST_DATA_DIR, "ff_empty_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"")
+        result, _ = run_client(source, dest, flags=["--files-from", lst])
+        assert result.returncode != 0, "an empty --files-from list must be rejected"
+        assert "no entries" in result.stderr
+
+    def test_files_from_empty_directory_listed_is_not_an_error(self, shared_server):
+        source = self._make_source("ff_emptydir_src")
+        os.makedirs(os.path.join(source, "emptydir"), exist_ok=True)
+        dest = os.path.join(TEST_DATA_DIR, "ff_emptydir_dst")
+        clean_dir(dest)
+        lst = self._write_list(b"emptydir\n")
+        result, _ = run_client(source, dest, flags=["--files-from", lst],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"empty listed directory errored: {result.stderr[:200]}"
+
     def test_files_from_delete_deletes_unlisted(self):
         source = self._make_source("ff_delete_src")
         dest = os.path.join(TEST_DATA_DIR, "ff_delete_dst")
@@ -1619,6 +1656,36 @@ class TestFilters:
         assert not os.path.exists(os.path.join(received, "nested", "deep.tmp"))
         assert not os.path.exists(os.path.join(received, ".rsync-filter")), \
             ".rsync-filter must not be transferred"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_per_dir_filter_deeper_file_overrides_outer(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, "filter_ovr_src")
+        clean_dir(source)
+        entries = {
+            "top.tmp": b"outer excludes me\n",
+            "keep.txt": b"kept\n",
+            "sub/inside.tmp": b"inner re-includes me\n",
+            ".rsync-filter": b"- *.tmp\n",
+            "sub/.rsync-filter": b"+ *.tmp\n",
+        }
+        for rel, content in entries.items():
+            full = os.path.join(source, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(content)
+        dest = os.path.join(TEST_DATA_DIR, "filter_ovr_dst")
+        clean_dir(dest)
+        flags = ["-F"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"-F override sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.isfile(os.path.join(received, "keep.txt"))
+        assert os.path.isfile(os.path.join(received, "sub", "inside.tmp")), \
+            "inner + *.tmp must re-include what the root - *.tmp excluded"
+        assert not os.path.exists(os.path.join(received, "top.tmp")), \
+            "outer - *.tmp still excludes root-level tmp files"
+        assert not os.path.exists(os.path.join(received, ".rsync-filter"))
+        assert not os.path.exists(os.path.join(received, "sub", ".rsync-filter"))
 
     def test_filter_leaves_default_behavior_unchanged(self, shared_server):
         source = self._make_tree("filter_default_src")

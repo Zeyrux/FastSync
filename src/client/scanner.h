@@ -111,6 +111,11 @@ void directory_scanner_destroy(DirectoryScanner* scanner);
  * the transfer root. Exposed so tests can exercise the rule directly. */
 bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device);
 
+/* Relative path of an on-disk path below `root` ("" == the root itself, NULL
+ * when `fs_path` is not under `root`). Handles trailing slashes and a root of
+ * "/". Exposed so tests can exercise the mapping directly. */
+char* scanner_path_relative(const char* root, const char* fs_path);
+
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
                                                       const ScannerOptions* options,
                                                       ProtocolSession* allocation_session);

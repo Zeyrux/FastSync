@@ -1289,6 +1289,29 @@ static void test_parse_args_filter_rules() {
   char* missing_argv[] = {"fastsync", "/src", "/dst", "--filter"};
   EXPECT_EQ_INT(parse_args(cfg, 4, missing_argv, positional_args, &positional_count), -1);
   config_delete(cfg);
+
+  /* rsync shorthands/modifiers we do not support are rejected instead of being
+   * silently parsed as literal patterns. */
+  static const char* const unsupported[] = {
+      ": .rsync-filter", ". /tmp/rules", "-s foo", "-p bar", "-C", "-! *.o", "!",
+  };
+  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+    cfg = config_create();
+    positional_count = 0;
+    char* rule_argv[] = {"fastsync", "--filter", (char*)unsupported[i], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 5, rule_argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  /* Supported spellings still parse: space- or slash-separated, attached
+   * wildcards, and anchored rules. */
+  cfg = config_create();
+  positional_count = 0;
+  char* ok_argv[] = {"fastsync",         "--filter=-*.o", "--filter=- /foo",
+                     "--filter=+ /bar/", "/src",          "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 6, ok_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->filters->size, 3);
+  config_delete(cfg);
 }
 
 /* -0/--from0, -C/--cvs-exclude and -F wire into their config flags. */
@@ -1314,6 +1337,19 @@ static void test_parse_args_from0_cvs_filter_file_flags() {
     EXPECT_EQ_INT(cfg->from0, cases[i].from0);
     EXPECT_EQ_INT(cfg->cvs_exclude, cases[i].cvs);
     EXPECT_EQ_INT(cfg->per_dir_filter, cases[i].per_dir);
+    config_delete(cfg);
+  }
+
+  /* The plain booleans are negatable (--no-* simply clears the flag). */
+  static const char* const on[][2] = {{"--from0", "--no-from0"}, {"-C", "--no-cvs-exclude"}};
+  for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
+    Config* cfg = config_create();
+    int positional_args[2];
+    int positional_count = 0;
+    char* argv[] = {"fastsync", (char*)on[i][0], (char*)on[i][1], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->from0);
+    EXPECT_FALSE(cfg->cvs_exclude);
     config_delete(cfg);
   }
 }
@@ -1347,7 +1383,8 @@ static void test_parse_args_files_from() {
   config_delete(cfg);
   remove(list_path);
 
-  /* -0 switches the separator to NUL regardless of argument order. */
+  /* -0 switches the separator to NUL regardless of argument order, and NUL
+   * mode preserves entry bytes exactly (a trailing CR/LF is part of the name). */
   write_file_bytes(list_path, "x.txt\0y/z.bin\0", 14);
   cfg = config_create();
   positional_count = 0;
@@ -1362,6 +1399,21 @@ static void test_parse_args_files_from() {
   EXPECT_TRUE(file_list_affects(set, "y/z.bin"));
   EXPECT_TRUE(file_list_affects(set, "y"));
   EXPECT_FALSE(file_list_affects(set, "z.txt"));
+  config_delete(cfg);
+  remove(list_path);
+
+  write_file_bytes(list_path, "crlf\n\0tail\0", 11);
+  cfg = config_create();
+  positional_count = 0;
+  char* nul_nl_argv[] = {"fastsync",
+                         "--files-from="
+                         "cli_files_from_list.txt",
+                         "-0", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, nul_nl_argv, positional_args, &positional_count), 0);
+  set = (FileListSet*)cfg->files_from_set;
+  EXPECT_NOT_NULL(set);
+  EXPECT_TRUE(file_list_affects(set, "crlf\n"));
+  EXPECT_TRUE(file_list_affects(set, "tail"));
   config_delete(cfg);
   remove(list_path);
 

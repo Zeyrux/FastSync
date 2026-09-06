@@ -110,6 +110,46 @@ static void prepared_scanner_destroy(PreparedScanner* prepared) {
   prepared->base_filters = NULL;
 }
 
+/* --files-from semantics: every listed entry must resolve under the source
+ * root, otherwise rsync reports a hard error instead of silently transferring
+ * nothing. An empty list is also an error. An entry of "." (the whole tree)
+ * and listed-but-empty directories are valid. Runs before any transfer so the
+ * failure is surfaced uniformly in the single-threaded, -m, dry-run and
+ * --list-only paths. */
+static bool files_from_list_valid(const Config* config) {
+  const FileListSet* set = (const FileListSet*)config->files_from_set;
+  if (!set)
+    return true;
+  if (!config->send_directory) {
+    log_message(LOG_LEVEL_ERROR, "--files-from requires a source directory");
+    return false;
+  }
+  if (set->count == 0) {
+    log_message(LOG_LEVEL_ERROR, "--files-from file '%s' contains no entries; nothing to transfer",
+                config->files_from ? config->files_from : "");
+    return false;
+  }
+  for (int i = 0; i < set->count; i++) {
+    const char* entry = set->entries[i];
+    if (entry[0] == '\0')
+      continue; /* "." == list the whole tree */
+    char* full = path_cat(config->send_directory, entry);
+    if (!full) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed while validating --files-from");
+      return false;
+    }
+    struct stat st;
+    if (lstat(full, &st) != 0) {
+      log_message(LOG_LEVEL_ERROR, "--files-from entry '%s' not found in source '%s'", entry,
+                  config->send_directory);
+      free(full);
+      return false;
+    }
+    free(full);
+  }
+  return true;
+}
+
 /* Select the configured transport for both transfer execution paths. */
 static Client* connect_transfer_client(const Config* config) {
   if (config->transport == TRANSPORT_SSH) {
@@ -307,6 +347,8 @@ static void pipeline_cancel(PipelineContextSender* context) {
 
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
 static int send_dry_run_manifest(const Config* config) {
+  if (!files_from_list_valid(config))
+    return -1;
   PreparedScanner prepared;
   if (!prepare_scanner(config, 0, &prepared))
     return -1;
@@ -383,6 +425,8 @@ static int compare_list_entries(const void* left, const void* right) {
  * Directory lines are not printed because the scanner only yields regular
  * transfer candidates. Returns 0 on success, 1 on error. */
 static int send_list_only(const Config* config) {
+  if (!files_from_list_valid(config))
+    return 1;
   PreparedScanner prepared;
   if (!prepare_scanner(config, 0, &prepared))
     return 1;
@@ -1002,6 +1046,8 @@ int send_files(Config* config) {
     return send_list_only(config);
   if (config->dry_run)
     return send_dry_run_manifest(config);
+  if (!files_from_list_valid(config))
+    return 1;
 
   Client* client = connect_transfer_client(config);
   if (!client) {
@@ -1139,6 +1185,8 @@ int send_files_multithreaded(Config** config_ptr) {
     return send_list_only(config);
   if (config->dry_run)
     return send_dry_run_manifest(config);
+  if (!files_from_list_valid(config))
+    return 1;
 
   long pages = sysconf(_SC_AVPHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);

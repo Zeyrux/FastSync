@@ -473,6 +473,8 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"sparse", "S", offsetof(Config, preserve_sparse)},
     {"inplace", NULL, offsetof(Config, inplace)},
     {"checksum", NULL, offsetof(Config, checksum)},
+    {"from0", NULL, offsetof(Config, from0)},
+    {"cvs-exclude", NULL, offsetof(Config, cvs_exclude)},
 
     /* These options are also implied by --archive or handled outside the table. */
     {"compress", "c", offsetof(Config, use_compression)},
