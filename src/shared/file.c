@@ -446,7 +446,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
        format. */
     int tmp_size;
     if (scratch_dirfd >= 0)
-      tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%llu", leaf, (long)getpid(), ULLONG_MAX);
+      tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%llu", leaf, (long)getpid(), ~0ULL);
     else
       tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%u", leaf, (long)getpid(), 999U);
     if (tmp_size < 0) {

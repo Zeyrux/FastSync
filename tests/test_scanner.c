@@ -591,13 +591,11 @@ static void test_scanner_one_file_system_cross_device() {
   snprintf(shm_file, sizeof(shm_file), "%s/inside.txt", shm_dir);
 
   bool ready = mkdir(nested, 0755) == 0 && symlink(shm_dir, link_path) == 0;
-  if (ready)
+  if (ready) {
     create_test_file(root_file, "keep");
-  if (ready)
     create_test_file(shm_file, "cross");
+  }
 
-  int rc, total;
-  bool found;
   int seq_off_rc, seq_off_total, seq_on_rc, seq_on_total;
   bool seq_off_found, seq_on_found;
   int par_off_rc, par_off_total, par_on_rc, par_on_total;
@@ -607,6 +605,8 @@ static void test_scanner_one_file_system_cross_device() {
     seq_off_total = seq_on_total = par_off_total = par_on_total = 0;
     seq_off_found = seq_on_found = par_off_found = par_on_found = false;
   } else {
+    int rc, total;
+    bool found;
     rc = collect_directory_scan(root_dir, false, "inside.txt", &found, &total);
     seq_off_rc = rc;
     seq_off_total = total;
