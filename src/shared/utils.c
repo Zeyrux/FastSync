@@ -204,9 +204,22 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
   return false;
 }
 
+/* True when the relative path is, or lies below, one of the protected
+   prefixes.  A prefix "a" therefore protects "a" and "a/b/c" but not "ab". */
+static bool path_under_skip_prefix(const char* rel_path, const char* const* prefixes,
+                                   int prefix_count) {
+  for (int i = 0; i < prefix_count; i++) {
+    size_t prefix_len = strlen(prefixes[i]);
+    if (strncmp(rel_path, prefixes[i], prefix_len) == 0 &&
+        (rel_path[prefix_len] == '\0' || rel_path[prefix_len] == '/'))
+      return true;
+  }
+  return false;
+}
+
 static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest,
                              size_t max_delete, size_t* deleted_count,
-                             const char* skip_root_child) {
+                             const char* const* skip_prefixes, int skip_prefix_count) {
   int scanfd = dup(dirfd);
   if (scanfd < 0)
     return false;
@@ -220,16 +233,17 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    /* A --delay-updates run keeps its staging directory as a direct child of
-       the receive root.  Its contents are not manifest entries yet (they are
-       published after deletion), so descending into it would delete every
-       staged file as an "extra".  Skip only the top-level staging name; nested
-       directories with the same name are ordinary destination content. */
-    if (rel_path[0] == '\0' && skip_root_child && strcmp(entry->d_name, skip_root_child) == 0)
-      continue;
     char* child_rel = path_cat((char*)rel_path, entry->d_name);
     if (!child_rel) {
       operation_ok = false;
+      continue;
+    }
+    /* A --delay-updates run keeps its staging directory below the receive
+       root, and basis-dir snapshots live there too.  Their contents are not
+       manifest entries, so descending into them would delete every staged /
+       basis file as an "extra". */
+    if (path_under_skip_prefix(child_rel, skip_prefixes, skip_prefix_count)) {
+      free(child_rel);
       continue;
     }
     struct stat st;
@@ -249,7 +263,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       bool child_removed = false;
       if (childfd >= 0) {
         child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count,
-                                         skip_root_child);
+                                         skip_prefixes, skip_prefix_count);
         if (!child_removed)
           operation_ok = false;
         close(childfd);
@@ -301,7 +315,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
 }
 
 bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t max_delete,
-                           const char* skip_root_child) {
+                           const char* const* skip_prefixes, int skip_prefix_count) {
   if (!manifest)
     return false;
   int rootfd;
@@ -318,14 +332,15 @@ bool delete_extras_limited(const char* dest_root, ArrayList* manifest, size_t ma
   if (rootfd < 0)
     return false;
   size_t deleted_count = 0;
-  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count, skip_root_child);
+  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count, skip_prefixes,
+                             skip_prefix_count);
   if (close(rootfd) != 0)
     ok = false;
   return ok;
 }
 
 bool delete_extras(const char* dest_root, ArrayList* manifest) {
-  return delete_extras_limited(dest_root, manifest, SIZE_MAX, NULL);
+  return delete_extras_limited(dest_root, manifest, SIZE_MAX, NULL, 0);
 }
 
 bool has_path_traversal(const char* path) {
