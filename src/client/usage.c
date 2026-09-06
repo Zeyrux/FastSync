@@ -84,7 +84,8 @@ void print_usage(void) {
   printf("  -y, --fuzzy         Use a similar-named file already in the destination\n");
   printf("                    directory as the delta basis when the destination has no\n");
   printf("                    usable file at the exact path (saves bandwidth; implies\n");
-  printf("                    --incremental and --delta; inert with --whole-file)\n");
+  printf("                    --incremental and --delta; inert with --whole-file,\n");
+  printf("                    --no-delta, or --no-incremental)\n");
   printf("  --no-fuzzy          Disable --fuzzy\n");
   printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
          DELTA_BLOCK_SIZE_DEFAULT);
