@@ -620,7 +620,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "-e",
                                         "--rsh",
                                         "--rsync-path",
-                                        "--temp-dir",
                                         "--compare-dest",
                                         "--copy-dest",
                                         "--link-dest",
@@ -838,6 +837,34 @@ static void test_parse_args_checksum_choice_requires_value() {
     EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+}
+
+/* --temp-dir accepts both the "--temp-dir=DIR" and "--temp-dir DIR" forms. */
+static void test_parse_args_temp_dir() {
+  Config* cfg = config_create();
+  char* equals_argv[] = {"fastsync", "--temp-dir=scratch", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, equals_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->temp_dir, "scratch");
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* space_argv[] = {"fastsync", "--temp-dir", "scratch/sub", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, space_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->temp_dir, "scratch/sub");
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  /* A value-taking option may not be passed without a value. */
+  cfg = config_create();
+  char* missing_argv[] = {"fastsync", "--temp-dir"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 2, missing_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
 }
 
 static void test_parse_args_old_args() {
@@ -1225,4 +1252,5 @@ void test_client_cli() {
   test_parse_args_partial_progress();
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
+  test_parse_args_temp_dir();
 }

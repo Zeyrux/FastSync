@@ -381,6 +381,30 @@ static void test_config_string_null_vs_empty_roundtrip() {
   config_delete(c);
 }
 
+/* A --temp-dir value must survive config_send/config_receive unchanged on the
+   receive side (round-trips through the resume-options wire block). */
+static void test_config_temp_dir_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->temp_dir = str_dup("scratch");
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* An empty-STRING wire value is canonicalized back to NULL (never an empty
+     scratch-dir name). */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->temp_dir = str_dup("");
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
 static void test_config_is_remote_dest() {
   /* Valid SSH-style destinations */
   EXPECT_TRUE(config_is_remote_dest("user@host:/path"));
@@ -415,6 +439,7 @@ void test_config() {
     test_config_send_receive_version_mismatch();
     test_config_receive_truncated();
     test_config_string_null_vs_empty_roundtrip();
+    test_config_temp_dir_roundtrip();
   }
   test_config_is_remote_dest();
 }

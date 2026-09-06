@@ -1021,3 +1021,90 @@ class TestLargeFile:
         assert result.returncode == 0, f"Large-file sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
         assert filecmp.cmp(source_file, os.path.join(received, "big.bin"), shallow=False)
+
+
+def _walk_tmp_files(root):
+    """Recursively list *.tmp* leftovers under root (empty if root missing)."""
+    leftovers = []
+    if not os.path.isdir(root):
+        return leftovers
+    for base, _, files in os.walk(root):
+        for name in files:
+            if ".tmp." in name:
+                leftovers.append(os.path.join(base, name))
+    return leftovers
+
+
+class TestTempDir:
+    """--temp-dir=DIR puts the receiver's temporary working copies in a scratch
+    directory below the destination root and atomically renames each completed
+    file into its final destination.  Files sharing a basename across
+    directories exercise the flat scratch namespace."""
+
+    def _make_source(self, name):
+        source = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(source)
+        entries = {
+            "top.txt": b"top level\n",
+            "sub/file.txt": b"nested file\n" * 20,
+            "other/file.txt": b"other nested file\n",
+            "sub/deep.bin": bytes(range(256)) * 8,
+        }
+        for rel, content in entries.items():
+            full = os.path.join(source, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(content)
+        return source
+
+    def _assert_clean_scratch(self, scratch):
+        assert os.path.isdir(scratch), f"scratch dir {scratch} was not created"
+        leftovers = _walk_tmp_files(scratch)
+        assert leftovers == [], f"leftover temp files in scratch dir: {leftovers}"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_temp_dir_scratch(self, shared_server, mt):
+        source = self._make_source("tempdir_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_dst")
+        clean_dir(dest)
+        flags = ["--temp-dir=scratch"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"temp-dir sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+        self._assert_clean_scratch(os.path.join(dest, "scratch"))
+
+    def test_default_behavior_has_no_scratch_dir(self, shared_server):
+        source = self._make_source("tempdir_default_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_default_dst")
+        clean_dir(dest)
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, f"Default sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+        assert not os.path.exists(os.path.join(dest, "scratch"))
+
+    def test_temp_dir_escape_rejected(self, shared_server):
+        source = self._make_source("tempdir_escape_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_escape_dst")
+        clean_dir(dest)
+        # "../escape" would resolve one level above the destination root.
+        outside = os.path.join(TEST_DATA_DIR, "escape")
+        assert not os.path.lexists(outside)
+
+        result, _ = run_client(source, dest, flags=["--temp-dir=../escape"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "relative escaping --temp-dir was not rejected"
+        assert not os.path.lexists(outside), "file created outside the destination root"
+
+        clean_dir(dest)
+        abs_escape = os.path.join(TEST_DATA_DIR, "abs_escape_probe")
+        assert not os.path.lexists(abs_escape)
+        result, _ = run_client(source, dest, flags=["--temp-dir", abs_escape],
+                               port=shared_server.port)
+        assert result.returncode != 0, "absolute --temp-dir was not rejected"
+        assert not os.path.lexists(abs_escape), "file created outside the destination root"

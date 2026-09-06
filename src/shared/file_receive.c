@@ -37,6 +37,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
+  const char* temp_dir = (config && config->temp_dir) ? config->temp_dir : NULL;
   bool use_partial_root = partial_dir && config && config->partial;
   char *confined_backup = NULL, *confined_partial = NULL, *disk_path = NULL;
   char* destination_path = NULL;
@@ -52,9 +53,13 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   }
 
   /* These options arrive from the client.  They are names below the server
-     root, never independent filesystem roots. */
+     root, never independent filesystem roots.  --temp-dir is confined exactly
+     like --backup-dir/--partial-dir: an absolute or `..`-escaping scratch
+     directory is rejected outright so nothing is ever created outside the
+     authorized destination root. */
   if ((backup_dir && (backup_dir[0] == '/' || has_path_traversal(backup_dir))) ||
-      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))))
+      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))) ||
+      (temp_dir && (temp_dir[0] == '/' || has_path_traversal(temp_dir))))
     return FILE_SAVE_ERROR;
   if (backup_dir && !(confined_backup = path_cat(root_directory, backup_dir)))
     return FILE_SAVE_ERROR;
@@ -151,15 +156,37 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
       goto fail;
     metadata = &adjusted_metadata;
   }
-  bool ok = config && config->ignore_existing
-                ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size,
-                                                 sparse, metadata, preserve_executability)
-            : config && config->update
-                ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
-                                             sparse, metadata, preserve_executability)
-                : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
-                                                 inplace, sparse, metadata, preserve_executability,
-                                                 config && config->use_fsync);
+
+  /* A configured --temp-dir sends the temporary working copy to a scratch
+     directory resolved below the receive root; the engine then atomically
+     renames the completed file into the final destination directory.  The
+     partial-dir flow already keeps its working copy in a separate directory
+     and --inplace writes directly, so neither diverts through the scratch
+     dir (matching rsync, where --inplace/--partial-dir supersede --temp-dir). */
+  char* confined_temp = NULL;
+  bool use_temp_dir = temp_dir != NULL && !inplace && !use_partial_root;
+  if (use_temp_dir) {
+    confined_temp = path_cat(root_directory, temp_dir);
+    if (!confined_temp)
+      goto fail;
+    /* A user-supplied trailing slash would leave the scratch path ending in
+       "/", which has no final component to create/open.  Normalize it away. */
+    size_t temp_len = strlen(confined_temp);
+    while (temp_len > 1 && confined_temp[temp_len - 1] == '/')
+      confined_temp[--temp_len] = '\0';
+  }
+  bool ok =
+      config && config->ignore_existing
+          ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size, sparse,
+                                           metadata, preserve_executability, confined_temp)
+      : config && config->update
+          ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
+                                       sparse, metadata, preserve_executability, confined_temp)
+          : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size, inplace,
+                                           sparse, metadata, preserve_executability,
+                                           config && config->use_fsync, confined_temp);
+  free(confined_temp);
+  confined_temp = NULL;
   if (!ok)
     goto fail;
 
