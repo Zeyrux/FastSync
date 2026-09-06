@@ -454,6 +454,11 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
     {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
+    {"--delete-excluded", NULL, OPT_FLAG, offsetof(Config, delete_excluded)},
+    {"--max-delete", NULL, OPT_NONNEG_INT, offsetof(Config, max_delete)},
+    {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
+    {"--force", NULL, OPT_FLAG, offsetof(Config, force_delete)},
+    {"--prune-empty-dirs", NULL, OPT_FLAG, offsetof(Config, prune_empty_dirs)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},

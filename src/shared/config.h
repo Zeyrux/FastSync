@@ -117,9 +117,26 @@ typedef struct Config {
   bool append_verify;
 
   // Issue #128: Extended delete options
+  /* --delete-excluded: also delete destination entries that were excluded on
+   * the source.  Default (off) matches rsync: excluded paths are protected from
+   * deletion.  Crosses the wire (the sender encodes the choice by whether it
+   * transmits a protected-prefix list with the keep-set manifest). */
   bool delete_excluded;
   bool delete_after;
+  /* --max-delete=NUM: the receiver refuses to delete more than NUM entries per
+   * run (all-or-nothing: when the extras would exceed NUM nothing is removed and
+   * the transfer fails with a distinct error).  -1 == no client limit (the
+   * server hard bound MAX_SERVER_DELETE_COUNT still applies). */
   int max_delete;
+  /* --ignore-errors (client-only, never serialized): a sender-side source I/O
+   * error (an unreadable directory during the scan) normally aborts the run so
+   * no deletion happens; with --ignore-errors the scan continues and the
+   * (partial) keep-set is still transmitted so the deletion runs. */
+  bool ignore_errors;
+  /* --force (receiver-side): a regular file may replace a destination
+   * directory by removing that (possibly non-empty, symlink-safe) directory
+   * tree first, instead of failing the write.  Crosses the wire. */
+  bool force_delete;
 
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).
@@ -206,7 +223,7 @@ typedef struct Config {
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.8.0"
+#define PROTOCOL_VERSION "2.9.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
