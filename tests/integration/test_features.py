@@ -1064,6 +1064,8 @@ class TestOneFileSystem:
         dest_plain = os.path.join(TEST_DATA_DIR, "ofs_mnt_plain_dst")
         mountpoint = os.path.join(source, "external")
         clean_dir(source)
+        clean_dir(dest)
+        clean_dir(dest_plain)
         os.makedirs(mountpoint)
         os.makedirs(os.path.join(source, "nested"))
         with open(os.path.join(source, "root.txt"), "wb") as f:
@@ -1071,6 +1073,7 @@ class TestOneFileSystem:
         with open(os.path.join(source, "nested", "inner.txt"), "wb") as f:
             f.write(b"inner")
         mounted = False
+        unmount_error = ""
         try:
             mount = subprocess.run(["mount", "-t", "tmpfs", "tmpfs", mountpoint],
                                    capture_output=True, text=True)
@@ -1093,4 +1096,8 @@ class TestOneFileSystem:
                 "without -x the mounted subtree must be transferred"
         finally:
             if mounted:
-                subprocess.run(["umount", mountpoint], capture_output=True, text=True)
+                umount = subprocess.run(["umount", mountpoint], capture_output=True, text=True)
+                if umount.returncode != 0:
+                    unmount_error = umount.stderr.strip()
+        if unmount_error:
+            pytest.fail(f"test mountpoint {mountpoint} still mounted after umount: {unmount_error}")
