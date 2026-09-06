@@ -405,6 +405,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--ca", NULL, OPT_STRING, offsetof(Config, tls_ca)},
     {"--backup-dir", NULL, OPT_STRING, offsetof(Config, backup_dir)},
     {"--fastsync-server-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
+    {"--temp-dir", NULL, OPT_STRING, offsetof(Config, temp_dir)},
     {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
     {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
     {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},

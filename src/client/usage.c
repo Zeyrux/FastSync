@@ -88,6 +88,7 @@ void print_usage(void) {
   printf("  --stderr=MODE       Route logging to stderr: errors or all\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --partial-dir <dir> Directory for partial files\n");
+  printf("  --temp-dir <dir>    Scratch dir for temp files before atomic install\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf(

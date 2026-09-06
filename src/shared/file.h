@@ -31,21 +31,32 @@ bool file_destination_is_newer_secure(const char* path, const FileMetadata* meta
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
 bool file_ensure_directory_secure(const char* path);
 bool file_rename_secure(const char* old_path, const char* new_path);
+
+/* The file_to_disk_secure* variants write a temporary copy in the destination
+   directory and atomically rename it over `path`.  temp_dir is an absolute,
+   root-confined scratch directory (already validated by the caller): when it
+   is non-NULL the temporary copy is instead created there (with a name unique
+   across the whole scratch directory) and atomically renamed into the
+   destination directory once fully written and fsynced.  A rename across
+   filesystems (EXDEV) fails the write with an error; the file is never
+   silently copied into place.  Pass NULL for the historical same-directory
+   behavior.  --inplace writes never use temp_dir. */
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                          bool inplace, bool sparse, const FileMetadata* metadata,
-                         bool preserve_executability);
+                         bool preserve_executability, const char* temp_dir);
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
                                     const FileMetadata* metadata, bool preserve_executability,
-                                    bool use_fsync);
+                                    bool use_fsync, const char* temp_dir);
 /* With update enabled, an existing newer destination is left untouched.  The
    check is descriptor-based for inplace writes; atomic replacement still has
    an unavoidable final rename race without filesystem locking. */
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
                                 bool inplace, bool sparse, const FileMetadata* metadata,
-                                bool preserve_executability);
+                                bool preserve_executability, const char* temp_dir);
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse,
-                                    const FileMetadata* metadata, bool preserve_executability);
+                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const char* temp_dir);
 
 #endif
