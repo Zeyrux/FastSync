@@ -1842,19 +1842,66 @@ class TestDirs:
         assert not os.path.exists(os.path.join(received, "sub")), \
             "unlisted subtree appeared"
 
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_chunk_serialization(self, shared_server, mt):
+        """--dirs entries survive the chunk-serialization wire path (type
+        marker round-trips); a listed dir lands empty and a listed file lands
+        with content, with no protocol desync under -s -m."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_s_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"dir1\nsub/x.txt\n")
+        flags = ["--files-from", lst, "--dirs", "-R", "-s"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"dirs -s sync failed: {result.stderr[:200]}"
+        assert os.path.isdir(os.path.join(dest, "dir1")), "listed dir was not created"
+        assert not os.path.exists(os.path.join(dest, "dir1", "keep.txt")), \
+            "--dirs must not descend into a listed directory"
+        assert _read_file(os.path.join(dest, "sub", "x.txt")) == b"x\n", \
+            "listed file content was not transferred"
+
+    def test_dirs_delete_keeps_transferred_empty_dir(self):
+        """Directory entries appear in the delete manifest, so the empty dir a
+        --dirs run just created is not pruned as an extra by --delete."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_del_dst")
+        clean_dir(dest)
+        extra = os.path.join(dest, "extra.txt")
+        with open(extra, "wb") as fh:
+            fh.write(b"delete me")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["--dirs", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, f"--dirs --delete sync failed: {result.stderr[:200]}"
+            assert not os.path.exists(extra), "--delete did not remove the extra file"
+            mirror = get_dest_received_dir(dest, source)
+            assert os.path.isdir(mirror), "transferred empty dir was pruned as an extra"
+            files = []
+            for root, _dirs, names in os.walk(mirror):
+                files.extend(os.path.relpath(os.path.join(root, n), mirror) for n in names)
+            assert files == [], f"--dirs descended into contents: {files}"
+
+    def test_dirs_listed_dir_colliding_with_file_fails(self, shared_server):
+        """A listed directory that already exists as a regular file at the
+        destination fails the transfer cleanly instead of clobbering the file."""
+        source = self._make()
+        dest = os.path.join(TEST_DATA_DIR, "dirs_coll_dst")
+        clean_dir(dest)
+        blocker = os.path.join(dest, "dir1")
+        with open(blocker, "wb") as fh:
+            fh.write(b"blocking file")
+        lst = _write_rel_list(b"dir1\n")
+        result, _ = run_client(source, dest, flags=["--files-from", lst, "--dirs", "-R"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "dir entry over an existing file did not fail"
+        assert os.path.isfile(blocker), "blocking regular file was clobbered"
+
 
 class TestMkpath:
     """--mkpath tells the server to create the destination root directory (and
     missing leading components) when it does not exist yet; without it a missing
     destination root fails the transfer."""
-
-    def _transfer(self, dest, mt, mkpath):
-        source = _make_relative_source("mkpath_src")
-        flags = ["--mkpath"] if mkpath else []
-        if mt:
-            flags += ["-m"]
-        result, _ = run_client(source, dest, flags=flags, port=self.server.port)
-        return result
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_missing_root_fails_without_mkpath(self, mt):
@@ -1881,6 +1928,43 @@ class TestMkpath:
             received = get_dest_received_dir(dest, source)
             assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
                 "file not transferred into the --mkpath-created root"
+
+    @pytest.mark.parametrize("mkpath", [False, True])
+    def test_existing_dest_with_trailing_slash(self, shared_server, mkpath):
+        """A destination root written with a trailing slash must keep working:
+        an existing root is accepted both with and without --mkpath."""
+        source = _make_relative_source("mkpath_trail_src")
+        dest = os.path.join(TEST_DATA_DIR, "mkpath_trail_dst")
+        clean_dir(dest)
+        dest_slash = dest + "/"
+        flags = ["--mkpath"] if mkpath else []
+        result, _ = run_client(source, dest_slash, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"trailing-slash dest sync (mkpath={mkpath}) failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
+            "file not transferred into the trailing-slash destination root"
+
+    @pytest.mark.parametrize("mkpath", [False, True])
+    def test_dest_equal_authorized_root(self, mkpath):
+        """A destination that is exactly the server's authorized root works
+        without --mkpath, and with --mkpath creates no stray <root>/<basename>
+        nested directory."""
+        root = os.path.join(TEST_DATA_DIR, "mkpath_eq_root")
+        clean_dir(root)
+        source = _make_relative_source("mkpath_eq_src")
+        with ServerManager() as server:
+            server.start(extra_args=["--destination-root", root])
+            flags = ["--mkpath"] if mkpath else []
+            result, _ = run_client(source, root, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"dest==authorized-root sync (mkpath={mkpath}) failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(root, source)
+            assert _read_file(os.path.join(received, "sub", "x.txt")) == b"x\n", \
+                "file not transferred when the dest equals the authorized root"
+            basename = os.path.basename(root.rstrip(os.sep))
+            assert not os.path.exists(os.path.join(root, basename)), \
+                "--mkpath created a spurious nested <root>/<basename> directory"
 
 
 class TestFilters:

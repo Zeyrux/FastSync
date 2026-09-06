@@ -385,6 +385,8 @@ static const char* status_to_string(Status status) {
     return "ABORT";
   case STATUS_CHECK_BATCH:
     return "CHECK_BATCH";
+  case STATUS_MKDIR:
+    return "MKDIR";
   default:
     return "UNKNOWN";
   }

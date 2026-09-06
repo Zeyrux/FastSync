@@ -465,6 +465,11 @@ static int open_next_directory(DirectoryScanner* scanner) {
    listed regular files are transferred as files; nothing else is scanned, so
    no descent into a listed directory can happen. */
 
+/* Directory entries carry no payload, so the dirs generator also bounds every
+   chunk by element count; chunk_deserialize refuses more than this many files
+   per chunk (see MAX_FILES_PER_CHUNK in chunk.c). */
+#define DIRS_CHUNK_MAX_FILES 65536U
+
 /* Build the File for the transfer root directory itself (the `-d <dir>` and
  * "." cases). */
 static File* dirs_root_dir_file(DirectoryScanner* scanner) {
@@ -618,6 +623,11 @@ static Chunk* directory_scanner_next_dirs(DirectoryScanner* scanner) {
       return NULL;
     }
     scanner->dirs_batch_size += file->data ? file->data->size : 0;
+    /* Empty directory entries carry no bytes, so a large --dirs --files-from
+       list must also be bounded by element count (the chunk deserializer caps
+       the number of files per chunk). */
+    if (scanner->dirs_batch->size >= (int)DIRS_CHUNK_MAX_FILES)
+      return dirs_flush_batch(scanner);
   }
   return dirs_flush_batch(scanner);
 }

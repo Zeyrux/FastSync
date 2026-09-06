@@ -429,7 +429,6 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--old-dirs", NULL, OPT_FLAG, offsetof(Config, dirs)},
     {"--old-d", NULL, OPT_FLAG, offsetof(Config, dirs)},
     {"--relative", "-R", OPT_FLAG, offsetof(Config, relative)},
-    {"--no-implied-dirs", NULL, OPT_FLAG, offsetof(Config, no_implied_dirs)},
     {"--mkpath", NULL, OPT_FLAG, offsetof(Config, mkpath)},
     {"--delete-during", "--del", OPT_UNSUPPORTED, 0},
 

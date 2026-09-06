@@ -435,7 +435,8 @@ static int send_dry_run_manifest(const Config* config) {
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
       if (!config->quiet) {
-        char* escaped_path = output_escape(chunk->items[i]->path, config->eight_bit_output);
+        char* escaped_path =
+            output_escape(file_wire_path(chunk->items[i]), config->eight_bit_output);
         if (!escaped_path) {
           chunk_destroy(chunk);
           directory_scanner_destroy(scanner);
@@ -529,7 +530,7 @@ static int send_list_only(const Config* config) {
         entries = grown;
         capacity = new_capacity;
       }
-      char* path = str_dup(f->path);
+      char* path = str_dup(file_wire_path(f));
       if (!path) {
         oom = true;
         break;

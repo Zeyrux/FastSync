@@ -308,9 +308,41 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
   return fd;
 }
 
+/* Normalized copy of a directory path: leading '/' kept, trailing '/' removed
+ * ("/" and "//" both collapse to "/").  A trailing slash otherwise makes the
+ * last path component empty, so probing that empty leaf below its parent
+ * always fails. */
+static char* normalize_directory_path(const char* path) {
+  if (!path)
+    return NULL;
+  size_t len = strlen(path);
+  while (len > 1 && path[len - 1] == '/')
+    len--;
+  char* norm = malloc(len + 1);
+  if (!norm)
+    return NULL;
+  memcpy(norm, path, len);
+  norm[len] = '\0';
+  return norm;
+}
+
 bool file_ensure_directory_secure(const char* path) {
+  if (!path)
+    return false;
+  char* norm = normalize_directory_path(path);
+  if (!norm)
+    return false;
+  /* The authorized root is already an open directory, and the filesystem root
+     is always present: there is no final component left to create for them. */
+  bool root_is_open =
+      authorized_root_fd >= 0 && authorized_root_path && strcmp(norm, authorized_root_path) == 0;
+  if (root_is_open || strcmp(norm, "/") == 0) {
+    free(norm);
+    return true;
+  }
   char* leaf = NULL;
-  int parent_fd = file_open_secure_parent(path, &leaf, true);
+  int parent_fd = file_open_secure_parent(norm, &leaf, true);
+  free(norm);
   if (parent_fd < 0)
     return false;
 
@@ -329,12 +361,24 @@ bool file_ensure_directory_secure(const char* path) {
 
 /* True when `path` resolves to an existing directory below the authorized root
  * (never creating anything). Used by the server to decide whether a client's
- * destination root already exists. */
+ * destination root already exists. A trailing slash on `path` and a destination
+ * equal to the authorized root itself are normalized/handled here so both
+ * previously-working destination forms keep working. */
 bool file_directory_exists_secure(const char* path) {
   if (!path)
     return false;
+  char* norm = normalize_directory_path(path);
+  if (!norm)
+    return false;
+  bool root_is_open =
+      authorized_root_fd >= 0 && authorized_root_path && strcmp(norm, authorized_root_path) == 0;
+  if (root_is_open || strcmp(norm, "/") == 0) {
+    free(norm);
+    return true;
+  }
   char* leaf = NULL;
-  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  int parent_fd = file_open_secure_parent(norm, &leaf, false);
+  free(norm);
   if (parent_fd < 0)
     return false;
   int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
