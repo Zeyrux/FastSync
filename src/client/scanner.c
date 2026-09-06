@@ -502,11 +502,20 @@ static int open_next_directory(DirectoryScanner* scanner) {
     if (scanner->current_dir == NULL) {
       scanner->io_error = true;
       log_perror("Could not open directory");
+      /* The transfer ROOT (a sequential scanner's seed directory) must be
+         readable even under --ignore-errors: an unreadable root would produce
+         an empty scan whose keep-set would delete the whole destination.  Only
+         subdirectories discovered during an otherwise-successful root scan are
+         skippable.  (The parallel scanner never reaches this for the root: its
+         root open failure aborts scanner creation; worker seeds are assigned
+         subdirectories with a non-empty relative path and stay skippable.) */
+      bool is_root_seed = scanner->current_rel != NULL && scanner->current_rel[0] == '\0' &&
+                          scanner->current_depth == 0;
       free(scanner->current_rel);
       scanner->current_rel = NULL;
       free(scanner->current_path);
       scanner->current_path = NULL;
-      if (!scanner->ignore_io_errors) {
+      if (!scanner->ignore_io_errors || is_root_seed) {
         scanner->failed = true;
         return -1;
       }
