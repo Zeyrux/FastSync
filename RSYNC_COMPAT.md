@@ -6,12 +6,12 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 35 | Feature works end-to-end |
-| 🔀 Alt Arg | 4 | Functionality exists but under different flag/semantics |
+| ✅ Implemented | 51 | Feature works end-to-end |
+| 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 95 | Flag not recognized or no behavior |
-| **Total** | **141** | |
+| ❌ Not Implemented | 87 | Flag not recognized or no behavior |
+| **Total** | **147** | |
 
 ---
 
@@ -64,6 +64,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--existing` | Skip creating new files on receiver | ✅ Implemented | Existing destination files continue through normal update handling |
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
 | `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |
+| `-x`, `--one-file-system` | Do not cross filesystem boundaries | ❌ Not Implemented | |
+| `-F` | Add the default `.rsync-filter` rules | ❌ Not Implemented | |
 
 ## 4. Directory Options
 
@@ -95,6 +97,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--backup-dir=DIR` | Backup directory hierarchy | ✅ Implemented | `backup_dir` config field |
 | `--suffix=SUFFIX` | Backup suffix (default ~) | ✅ Implemented | `suffix` config field |
 | `--delay-updates` | Put updated files in place at end | ❌ Not Implemented | |
+| `-T`, `--temp-dir=DIR` | Create temporary files in DIR | ❌ Not Implemented | `-T` is FastSync's timeout alias |
 
 ## 7. Deletion
 
@@ -136,6 +139,12 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-J`, `--omit-link-times` | Omit symlinks from --times | ❌ Not Implemented | |
 | `--super` | Receiver attempts super-user activities | ❌ Not Implemented | |
 | `--fake-super` | Store/recover privileged attrs via xattrs | ❌ Not Implemented | |
+| `--open-noatime` | Avoid changing access time when opening files | ❌ Not Implemented | |
+| `--numeric-ids` | Do not map uid/gid by name | ❌ Not Implemented | |
+| `--usermap=STRING` | Map usernames | ❌ Not Implemented | |
+| `--groupmap=STRING` | Map group names | ❌ Not Implemented | |
+| `--chown=USER:GROUP` | Map owner and group | ❌ Not Implemented | |
+| `--copy-as=USER[:GROUP]` | Perform the copy as another user/group | ❌ Not Implemented | |
 
 ## 9. Symlink Handling
 
@@ -190,6 +199,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--address=ADDRESS` | Bind address for outgoing socket | ❌ Not Implemented | Removed because it had no effect |
 | `-4`, `--ipv4` | Prefer IPv4 | ❌ Not Implemented | Removed because it had no effect |
 | `-6`, `--ipv6` | Prefer IPv6 | ❌ Not Implemented | Removed because it had no effect |
+| `--remote-option=OPT`, `-M` | Send an option only to the remote side | ❌ Not Implemented | `-M` is FastSync's metadata-preservation flag |
 
 ## 14. Daemon Mode
 
@@ -211,6 +221,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | Protocol version check | Verify compatible versions | ✅ Implemented | `config_receive()` |
 | Max data/string/chunk sizes | Prevent OOM attacks | ✅ Implemented | Per-message limits |
 | Per-connection memory limit | 1GB per connection | ✅ Implemented | `MAX_CONNECTION_MEMORY` |
+| `--max-alloc=SIZE` | Limit a single memory allocation | ✅ Implemented | Caps the largest single allocation; binary units, default 1G |
 | `--trust-sender` | Trust remote sender's file list | ❌ Not Implemented | |
 | `--old-args` | Disable modern arg protection | ✅ Implemented | SSH-only legacy mode; restores raw remote command construction and permits shell interpretation of the configured server path |
 | `--ignore-missing-args` | Ignore missing source args | ❌ Not Implemented | |
@@ -236,6 +247,112 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--checksum-seed=NUM` | Set checksum seed | ❌ Not Implemented | |
 | `--secluded-args` | Use protocol to send args | 🔄 Compatibility No-op | Accepted for CLI compatibility; it does not change FastSync transport or protocol behavior. `-s` remains chunk serialization. |
 | `--no-OPTION` | Turn off implied option | ✅ Supported | Supported boolean FastSync options and archive-implied options; unsafe or value-taking options are rejected. |
+
+---
+
+## Implementation Difficulty Plan
+
+The estimates below cover the currently unimplemented features in this document. They assume one engineer familiar with the codebase, include implementation and focused tests, and exclude production rollout time. A feature should not be marked implemented until its behavior is tested in both local and SSH/TCP paths where applicable.
+
+> **Note:** This plan is a superset snapshot written while several of the listed features were still outstanding. The Summary matrix above is the authoritative record of what is already shipped (for example quiet/info/debug output, `--existing`, `--remove-source-files`, `-h`, and `--size-only` are now implemented on `dev`). Treat the phases as sequencing guidance for the work that remains unimplemented.
+
+| Effort | Typical duration | Meaning |
+|--------|------------------|---------|
+| XS | 0.5-1 day | CLI alias or a local formatting/validation change |
+| S | 1-3 days | Isolated behavior with little or no protocol change |
+| M | 3-7 days | Cross-cutting client, server, or scanner behavior |
+| L | 1-3 weeks | Protocol, filesystem, privilege, or compatibility work |
+| XL | 3+ weeks | New transfer mode, daemon subsystem, or broad interoperability effort |
+
+### Phase 1: Low-Risk CLI and Local Behavior
+
+These are the best first changes because they require limited wire-format work and can be tested with existing transfer fixtures.
+
+| Features | Effort | Implementation plan |
+|----------|--------|--------------------|
+| `--quiet`, `-q`; `--human-readable`, `-h`; `--8-bit-output`, `-8`; `--stderr=MODE`; `--info=FLAGS`; `--debug=FLAGS` | S | Extend logging and output formatting without changing transferred data. |
+| `--no-OPTION`; `--old-args`; `--secluded-args`, `-s` | M | Add option implication/negation and safely serialize or protect remote arguments. `-s` currently has FastSync-specific semantics and needs a compatibility decision. |
+| `-P`; `--del`; `--old-dirs`, `--old-d`; `--cc`; `--zc`; `--zl` | XS | Add aliases and composed behaviors after the underlying options exist. |
+| `--whole-file`, `-W`; `--ignore-times`, `-I`; `--size-only`; `--modify-window`, `-@`; `--update`, `-u` | S | Extend the existing incremental comparison decision. |
+| `--existing`; `--ignore-existing`; `--remove-source-files` | S | Add scanner/receiver eligibility checks and remove successfully synchronized source files. |
+| `--executability`, `-E`; `--chmod=CHMOD` | M | Apply permission transformations safely while preserving current metadata behavior. |
+| `--skip-compress=LIST`; `--compress-threads=NUM` | S | Make compression selection configurable and validate the thread setting against zstd behavior. |
+| `--max-alloc=SIZE`; `--fsync` | S | Reuse existing allocation limits and add an explicit durability step after file writes. |
+
+### Phase 2: Filesystem Selection and Update Semantics
+
+These features are moderate because they affect traversal, temporary files, manifests, or the receiver's update policy.
+
+| Features | Effort | Implementation plan |
+|----------|--------|--------------------|
+| `--one-file-system`, `-x` | M | Track the source device during scanner traversal and skip mount-point crossings. |
+| `--relative`, `-R`; `--no-implied-dirs`; `--dirs`, `-d`; `--mkpath` | M | Extend path-list construction and destination directory creation while preserving traversal safety. |
+| `--temp-dir`, `-T` | M | Separate temporary-file placement from FastSync's timeout alias and define collision, permissions, and cleanup rules. |
+| `--delay-updates` | L | Stage all successful updates and publish them at completion, including crash and cancellation cleanup. |
+| `--files-from=FILE`; `--from0`, `-0`; `--filter=RULE`, `-f`; `-F`; `--cvs-exclude`, `-C` | L | Build a complete filter/parser layer and integrate it with scanner pruning, manifests, and delete behavior. `-f` conflicts with FastSync sendfile mode. |
+| `--list-only`; `--itemize-changes`, `-i`; `--out-format=FORMAT`; `--log-file-format=FMT` | M | Add a structured change-event model so output modes share one source of truth. |
+
+### Phase 3: Deletion, Comparison, and Delta Compatibility
+
+These features require careful interaction with manifests, incremental checks, backups, and the existing delta protocol.
+
+| Features | Effort | Implementation plan |
+|----------|--------|--------------------|
+| `--delete-during`; `--delete-before`; `--delete-after`; `--delete-delay`; `--del` | L | Add deletion timing to the transfer state machine and ensure failures cannot remove files unexpectedly. |
+| `--delete-excluded`; `--max-delete=NUM`; `--ignore-errors`; `--force`; `--prune-empty-dirs`, `-m` | M | Extend delete walks with policy limits, error handling, empty-directory pruning, and the `-m` short-flag conflict. |
+| `--ignore-missing-args`; `--delete-missing-args` | M | Distinguish missing source arguments from traversal errors and apply explicit deletion policy. |
+| `--compare-dest=DIR`; `--copy-dest=DIR`; `--link-dest=DIR` | L | Add alternate basis roots and hard-link handling, including metadata and cross-filesystem failures. |
+| `--fuzzy`, `-y`; `--no-fuzzy` | L | Index candidate files and select a safe similar basis without making transfer time unbounded. |
+| `--append`; `--append-verify` | M | Negotiate file length and verify the retained prefix before resuming. |
+| `--checksum-choice=STR`, `--cc`; `--checksum-seed=NUM` | M | Negotiate checksum algorithms/seeds and preserve compatibility with existing xxHash checks. |
+
+### Phase 4: Metadata, Links, and Devices
+
+These features are platform-sensitive and need Linux permission, ACL, xattr, and special-file integration tests.
+
+| Features | Effort | Implementation plan |
+|----------|--------|--------------------|
+| `--numeric-ids`; `--usermap=STRING`; `--groupmap=STRING`; `--chown=USER:GROUP` | L | Define identity mapping, privilege failures, and wire representation before applying ownership. |
+| `--open-noatime`; `--atimes`, `-U`; `--crtimes`, `-N`; `--omit-dir-times`, `-O`; `--omit-link-times`, `-J` | L | Extend metadata capture/apply with platform capability checks and explicit unsupported-attribute handling. |
+| `--acls`, `-A`; `--xattrs`, `-X`; `--fake-super` | XL | Add portable serialization, size limits, privilege behavior, and security tests for ACL/xattr data. |
+| `--hard-links`, `-H` | L | Preserve inode relationships across the file list and coordinate hard-link creation order. |
+| `--munge-links`; `--copy-dirlinks`, `-k`; `--keep-dirlinks`, `-K` | L | Define symlink trust boundaries and receiver-side directory/link collision behavior. |
+| `--devices`; `--specials`; `-D`; `--copy-devices`; `--write-devices` | XL | Add privileged special-file handling with strict type, path, and authorization checks. |
+| `--super`; `--copy-as=USER[:GROUP]` | XL | Requires a deliberate privilege model, identity switching, and refusal paths; do not implement by blindly elevating the process. |
+| `--preallocate` | S | Use platform allocation APIs before writes and fall back cleanly when unsupported. |
+
+### Phase 5: Connectivity and Daemon Compatibility
+
+These options affect process startup, authentication, sockets, and remote execution. They should follow the filesystem and protocol work rather than being added as parser-only flags.
+
+| Features | Effort | Implementation plan |
+|----------|--------|--------------------|
+| `--rsh=COMMAND`, `-e`; `--rsync-path=PROGRAM`; `--blocking-io`; `--outbuf=N\|L\|B` | M | Generalize SSH command construction and subprocess I/O while retaining argument escaping and timeout guarantees. |
+| `--address=ADDRESS`; `--ipv4`, `-4`; `--ipv6`, `-6`; `--sockopts=OPTIONS`; `--port=PORT` daemon semantics | M | Add explicit socket-family/bind configuration and validate it independently for TCP client and daemon modes. |
+| `--remote-option=OPT`, `-M`; `--trust-sender` | L | Add authenticated remote-option/config negotiation and reject unsafe sender-controlled values. `-M` conflicts with FastSync metadata mode. |
+| `--daemon`; `--config=FILE`; `--dparam=OVERRIDE`; `--no-detach`; `--password-file=FILE`; `--early-input=FILE`; `--no-motd` | XL | Implement a real daemon lifecycle, module configuration, authentication, privilege separation, and process management. |
+
+### Phase 6: Batch, Encoding, and Protocol Interoperability
+
+These are the hardest compatibility items because they require durable formats or behavior that must interoperate with rsync itself.
+
+| Features | Effort | Implementation plan |
+|----------|--------|--------------------|
+| `--write-batch=FILE`; `--only-write-batch=FILE`; `--read-batch=FILE` | XL | Specify a versioned batch format, persist all required metadata, and test replay, corruption, and partial application. |
+| `--protocol=NUM` | XL | Add protocol-version negotiation and compatibility branches without weakening current validation. |
+| `--iconv=CONVERT_SPEC` | L | Convert filenames at the protocol boundary with invalid-sequence and normalization tests. |
+| `--stop-after=MINS`; `--stop-at=TIME` | M | Add deadline propagation, interruptible I/O, and safe checkpoint/cleanup behavior. |
+| `--early-input=FILE`; `--password-file=FILE` | M | Securely read startup credentials/input with permission checks and no secret disclosure in logs. |
+
+### Recommended Delivery Order
+
+1. Resolve short-option conflicts (`-m`, `-M`, `-T`, `-f`, `-s`) and define the compatibility contract.
+2. Implement Phase 1 comparison, update, output, and alias features with unit and integration coverage.
+3. Implement Phase 2 traversal/filtering and Phase 3 deletion semantics.
+4. Implement metadata and link features that are safe on the supported platforms.
+5. Treat daemon mode, special files, batch mode, and protocol-version compatibility as separate projects.
+
+The existing priority list below is a feature shortlist, not an implementation schedule; this plan supersedes it for effort and sequencing.
 
 ---
 
