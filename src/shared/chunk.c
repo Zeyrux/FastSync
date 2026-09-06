@@ -65,7 +65,7 @@ void chunk_destroy(void* item) {
 
 static unsigned long long per_file_serialize_size(File* file, bool use_metadata) {
   unsigned long long size = sizeof(size_t);
-  size_t path_len = strlen(file->path);
+  size_t path_len = strlen(file_wire_path(file));
   unsigned long long metadata_size =
       use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0;
   if ((unsigned long long)path_len > ULLONG_MAX - size)
@@ -74,6 +74,10 @@ static unsigned long long per_file_serialize_size(File* file, bool use_metadata)
   if (metadata_size > ULLONG_MAX - size)
     return 0;
   size += metadata_size;
+  /* Entry type marker: 0 = regular file, 1 = explicit directory entry. */
+  if (sizeof(int) > ULLONG_MAX - size)
+    return 0;
+  size += sizeof(int);
   if (sizeof(size_t) > ULLONG_MAX - size)
     return 0;
   size += sizeof(size_t);
@@ -89,7 +93,8 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
   for (int i = 0; i < chunk->element_count; i++) {
     if (!chunk->items[i] || !chunk->items[i]->path || !chunk->items[i]->data ||
         (chunk->items[i]->data->size > 0 && !chunk->items[i]->data->data) ||
-        chunk->items[i]->path[0] == '\0' || has_path_traversal(chunk->items[i]->path))
+        chunk->items[i]->path[0] == '\0' || has_path_traversal(chunk->items[i]->path) ||
+        (file_wire_path(chunk->items[i]))[0] == '\0')
       return NULL;
     unsigned long long file_size = per_file_serialize_size(chunk->items[i], use_metadata);
     if (file_size == 0 || file_size > ULLONG_MAX - data_size || data_size + file_size > SIZE_MAX)
@@ -104,11 +109,16 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
   char* data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
     File* file = chunk->items[i];
-    size_t path_len = strlen(file->path);
+    const char* wire_path = file_wire_path(file);
+    size_t path_len = strlen(wire_path);
     memcpy(data_pointer, &path_len, sizeof(size_t));
     data_pointer += sizeof(size_t);
-    memcpy(data_pointer, file->path, path_len);
+    memcpy(data_pointer, wire_path, path_len);
     data_pointer += path_len;
+
+    int entry_type = file->is_dir ? 1 : 0;
+    memcpy(data_pointer, &entry_type, sizeof(int));
+    data_pointer += sizeof(int);
 
     if (use_metadata)
       metadata_to_buf(&data_pointer, file->metadata);
@@ -116,7 +126,8 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
     size_t file_data_size = file->data->size;
     memcpy(data_pointer, &file_data_size, sizeof(size_t));
     data_pointer += sizeof(size_t);
-    memcpy(data_pointer, file->data->data, file_data_size);
+    if (file_data_size > 0)
+      memcpy(data_pointer, file->data->data, file_data_size);
     data_pointer += file_data_size;
   }
   return data;
@@ -186,6 +197,24 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       array_list_delete(files);
       return NULL;
     }
+
+    if (remaining_size < sizeof(int)) {
+      log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for entry type");
+      file_destroy(file);
+      array_list_delete(files);
+      return NULL;
+    }
+    int entry_type;
+    memcpy(&entry_type, data_pointer, sizeof(int));
+    if (entry_type != 0 && entry_type != 1) {
+      log_message(LOG_LEVEL_ERROR, "Invalid chunk format: bad entry type");
+      file_destroy(file);
+      array_list_delete(files);
+      return NULL;
+    }
+    file->is_dir = entry_type == 1;
+    data_pointer += sizeof(int);
+    remaining_size -= sizeof(int);
 
     if (use_metadata) {
       if (remaining_size < sizeof(int)) {

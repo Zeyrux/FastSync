@@ -72,4 +72,7 @@ void change_emit(const Config* config, const ChangeEvent* event);
 /* Build and emit a CHANGE_SENT event for a file the client just sent. */
 void change_emit_file_sent(const Config* config, const File* file);
 
+/* Build and emit a CHANGE_SENT event for an explicit directory entry (-d). */
+void change_emit_dir_sent(const Config* config, const File* file);
+
 #endif

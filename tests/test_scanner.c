@@ -397,8 +397,9 @@ static void test_parallel_scanner_root_chunks_without_workers() {
   create_test_file(file1, "a");
   create_test_file(file2, "b");
 
-  ScannerOptions options = {false, 1,     NULL,  0,     NULL,  0,     0,    0,    0,    0,
-                            false, false, false, false, false, false, NULL, NULL, false};
+  ScannerOptions options = {false, 1,     NULL, 0,     NULL,  0,     0,
+                            0,     0,     0,    false, false, false, false,
+                            false, false, NULL, NULL,  false, false, false};
   ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options, NULL);
   EXPECT_NOT_NULL(scanner);
 
@@ -1078,6 +1079,190 @@ static void test_per_dir_filter_override(bool parallel) {
   rmdir(root);
 }
 
+typedef struct {
+  char rel[512];
+  char send[512];
+  bool is_dir;
+} ScanInfo;
+
+/* Collect every scanner entry below `root` into `out` (at most `max`), mapping
+ * paths to their root-relative form and capturing send_path and is_dir. */
+static int collect_scan_info(const char* root, const ScannerOptions* options, ScanInfo out[],
+                             int max) {
+  DirectoryScanner* scanner = directory_scanner_create_with_options(root, options);
+  if (!scanner)
+    return -1;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  int count = 0;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count && count < max; i++) {
+      const File* f = chunk->items[i];
+      const char* rel = f->path + root_len;
+      if (*rel == '/')
+        rel++;
+      snprintf(out[count].rel, sizeof(out[count].rel), "%s", rel);
+      snprintf(out[count].send, sizeof(out[count].send), "%s", f->send_path ? f->send_path : "");
+      out[count].is_dir = f->is_dir;
+      count++;
+    }
+    chunk_destroy(chunk);
+  }
+  bool failed = directory_scanner_failed(scanner);
+  directory_scanner_destroy(scanner);
+  return failed ? -1 : count;
+}
+
+static bool scan_info_present(const ScanInfo* infos, int count, const char* rel, bool is_dir,
+                              const char* send) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(infos[i].rel, rel) == 0 && infos[i].is_dir == is_dir &&
+        strcmp(infos[i].send, send ? send : "") == 0)
+      return true;
+  }
+  return false;
+}
+
+/* Parallel variant of collect_scan_info; drains `scanner` fully and destroys
+ * it. */
+static int collect_scan_info_parallel(ParallelScanner* scanner, const char* root, ScanInfo out[],
+                                      int max) {
+  if (!scanner)
+    return -1;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  int count = 0;
+  Chunk* chunk;
+  while ((chunk = parallel_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count && count < max; i++) {
+      const File* f = chunk->items[i];
+      const char* rel = f->path + root_len;
+      if (*rel == '/')
+        rel++;
+      snprintf(out[count].rel, sizeof(out[count].rel), "%s", rel);
+      snprintf(out[count].send, sizeof(out[count].send), "%s", f->send_path ? f->send_path : "");
+      out[count].is_dir = f->is_dir;
+      count++;
+    }
+    chunk_destroy(chunk);
+  }
+  bool failed = parallel_scanner_failed(scanner);
+  parallel_scanner_destroy(scanner);
+  return failed ? -1 : count;
+}
+
+/* -d without --files-from emits exactly the source-root directory (empty) and
+ * never descends. */
+static void test_dirs_no_descent() {
+  const char* root = "test_scan_dirs_root";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_dirs_root/sub", 0755), 0);
+  create_test_file("test_scan_dirs_root/a.txt", "a");
+  create_test_file("test_scan_dirs_root/sub/b.txt", "b");
+
+  ScannerOptions options = {0};
+  options.dirs = true;
+  ScanInfo infos[8];
+  int count = collect_scan_info(root, &options, infos, 8);
+  EXPECT_EQ_INT(count, 1);
+  EXPECT_TRUE(scan_info_present(infos, count, "", true, NULL));
+  EXPECT_FALSE(scan_info_present(infos, count, "a.txt", false, ""));
+  EXPECT_FALSE(scan_info_present(infos, count, "sub/b.txt", false, ""));
+
+  unlink("test_scan_dirs_root/a.txt");
+  unlink("test_scan_dirs_root/sub/b.txt");
+  rmdir("test_scan_dirs_root/sub");
+  rmdir(root);
+}
+
+/* -d with --files-from transfers exactly the listed directory (empty) and the
+ * listed file; nothing is descended into. */
+static void test_dirs_files_from() {
+  const char* root = "test_scan_dirs_ff";
+  const char* list_path = "test_scan_dirs_ff.list";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_dirs_ff/sub", 0755), 0);
+  create_test_file("test_scan_dirs_ff/sub/keep.txt", "keep");
+  create_test_file("test_scan_dirs_ff/sub/skip.bin", "skip");
+  create_test_file("test_scan_dirs_ff/top.txt", "top");
+
+  char err[160];
+  create_test_file(list_path, "sub\nsub/keep.txt\n");
+  FileListSet* set = file_list_load(list_path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+
+  for (int relative = 0; relative <= 1; relative++) {
+    ScannerOptions options = {0};
+    options.dirs = true;
+    options.file_list = set;
+    options.relative = relative != 0;
+    ScanInfo infos[8];
+    int count = collect_scan_info(root, &options, infos, 8);
+    EXPECT_EQ_INT(count, 2);
+    if (relative) {
+      EXPECT_TRUE(scan_info_present(infos, count, "sub", true, "sub"));
+      EXPECT_TRUE(scan_info_present(infos, count, "sub/keep.txt", false, "sub/keep.txt"));
+    } else {
+      EXPECT_TRUE(scan_info_present(infos, count, "sub", true, NULL));
+      EXPECT_TRUE(scan_info_present(infos, count, "sub/keep.txt", false, NULL));
+    }
+    EXPECT_FALSE(scan_info_present(infos, count, "sub/skip.bin", false, ""));
+    EXPECT_FALSE(scan_info_present(infos, count, "top.txt", false, ""));
+  }
+  file_list_destroy(set);
+  remove(list_path);
+  unlink("test_scan_dirs_ff/sub/keep.txt");
+  unlink("test_scan_dirs_ff/sub/skip.bin");
+  unlink("test_scan_dirs_ff/top.txt");
+  rmdir("test_scan_dirs_ff/sub");
+  rmdir(root);
+}
+
+/* -R with --files-from (no -d): every file keeps its bare relative path as the
+ * send_path while the local scan path stays absolute-under-root. */
+static void test_files_from_relative_send_path() {
+  const char* root = "test_scan_rel_ff";
+  const char* list_path = "test_scan_rel_ff.list";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_rel_ff/sub", 0755), 0);
+  create_test_file("test_scan_rel_ff/root.txt", "root");
+  create_test_file("test_scan_rel_ff/sub/keep.txt", "keep");
+
+  char err[160];
+  create_test_file(list_path, "root.txt\nsub/keep.txt\n");
+  FileListSet* set = file_list_load(list_path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+
+  for (int parallel = 0; parallel <= 1; parallel++) {
+    ScannerOptions options = {0};
+    options.file_list = set;
+    options.relative = true;
+    if (parallel)
+      options.num_threads = 2;
+    ScanInfo infos[8];
+    int count;
+    if (parallel) {
+      ParallelScanner* scanner = parallel_scanner_create_with_options(root, &options, NULL);
+      EXPECT_NOT_NULL(scanner);
+      count = collect_scan_info_parallel(scanner, root, infos, 8);
+    } else {
+      count = collect_scan_info(root, &options, infos, 8);
+    }
+    EXPECT_EQ_INT(count, 2);
+    EXPECT_TRUE(scan_info_present(infos, count, "root.txt", false, "root.txt"));
+    EXPECT_TRUE(scan_info_present(infos, count, "sub/keep.txt", false, "sub/keep.txt"));
+  }
+  file_list_destroy(set);
+  remove(list_path);
+  unlink("test_scan_rel_ff/root.txt");
+  unlink("test_scan_rel_ff/sub/keep.txt");
+  rmdir("test_scan_rel_ff/sub");
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1110,4 +1295,7 @@ void test_scanner() {
   test_scanner_path_relative();
   test_per_dir_filter_override(false);
   test_per_dir_filter_override(true);
+  test_dirs_no_descent();
+  test_dirs_files_from();
+  test_files_from_relative_send_path();
 }

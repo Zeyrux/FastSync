@@ -73,6 +73,7 @@ File* file_create(const char* path) {
 
   memcpy(file->path, path, path_len);
   file->path[path_len] = '\0';
+  file->send_path = NULL;
   file->data = data_create_reserve(0);
   if (file->data == NULL) {
     free(file->path);
@@ -81,6 +82,7 @@ File* file_create(const char* path) {
   }
   file->metadata = NULL;
   file->skip = false;
+  file->is_dir = false;
   return file;
 }
 
@@ -94,6 +96,8 @@ void file_destroy(void* item) {
   file->metadata = NULL;
   free(file->path);
   file->path = NULL;
+  free(file->send_path);
+  file->send_path = NULL;
   free(file);
 }
 
@@ -315,6 +319,27 @@ bool file_ensure_directory_secure(const char* path) {
     if (mkdirat(parent_fd, leaf, 0755) == 0 || errno == EEXIST)
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   }
+  bool ok = dir_fd >= 0;
+  if (dir_fd >= 0)
+    close(dir_fd);
+  close(parent_fd);
+  free(leaf);
+  return ok;
+}
+
+/* True when `path` resolves to an existing directory below the authorized root
+ * (never creating anything). Used by the server to decide whether a client's
+ * destination root already exists. */
+bool file_directory_exists_secure(const char* path) {
+  if (!path)
+    return false;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return false;
+  int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dir_fd < 0 && errno == ENOENT)
+    dir_fd = -1;
   bool ok = dir_fd >= 0;
   if (dir_fd >= 0)
     close(dir_fd);

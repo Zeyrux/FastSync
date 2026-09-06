@@ -119,6 +119,24 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return FILE_SAVE_ERROR;
   }
 
+  /* Explicit directory entries (--dirs) carry an empty payload; the entry is
+     created as a directory under the receive root, applying the same secure
+     mkdir-parent semantics as regular writes.  Directories are created
+     immediately (they are never staged by --delay-updates, matching rsync,
+     where directory creation is not delayed). */
+  if (file->is_dir) {
+    if (file->path[0] == '\0' || has_path_traversal(file->path)) {
+      log_message(LOG_LEVEL_ERROR, "Invalid directory path received");
+      return FILE_SAVE_ERROR;
+    }
+    char* dir_path = path_cat(root_directory, file->path);
+    if (!dir_path)
+      return FILE_SAVE_ERROR;
+    bool ok = file_ensure_directory_secure(dir_path);
+    free(dir_path);
+    return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
+  }
+
   /* These options arrive from the client.  They are names below the server
      root, never independent filesystem roots.  --temp-dir is confined exactly
      like --backup-dir/--partial-dir: an absolute or `..`-escaping scratch
@@ -746,6 +764,31 @@ File* file_receive(const Config* config, int file_descriptor) {
   }
   data_destroy(file->data);
   file->data = file_data;
+  return file;
+}
+
+/* Receive an explicit directory entry (--dirs): a STATUS_MKDIR frame carries
+   only the destination path; the entry carries no payload.  The same path
+   validation as a regular file applies (non-empty, relative-or-mirrored, no
+   traversal), and the created File is routed through the regular store_file
+   sink so single-threaded and -m receivers handle directories identically. */
+File* file_receive_directory(int file_descriptor) {
+  char* path = receive_str(file_descriptor);
+  if (path == NULL)
+    return NULL;
+  if (path[0] == '\0' || has_path_traversal(path)) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received directory path: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
+    free(path);
+    return NULL;
+  }
+  File* file = file_create(path);
+  free(path);
+  if (file == NULL)
+    return NULL;
+  file->is_dir = true;
   return file;
 }
 

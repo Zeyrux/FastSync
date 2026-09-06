@@ -547,32 +547,52 @@ static void test_parse_args_unknown_option() {
   config_delete(cfg);
 }
 
-/* Directory aliases must report the unsupported directory-only behavior clearly. */
-static void test_parse_args_rejects_dirs_aliases() {
-  static const char* const options[] = {"--dirs", "--old-dirs", "--old-d"};
-
+/* -d/--dirs and the rsync --old-dirs/--old-d aliases all enable directory-only
+ * transfers (--dirs maps every spelling onto the same config field). */
+static void test_parse_args_dirs_aliases() {
+  static const char* const options[] = {"--dirs", "-d", "--old-dirs", "--old-d"};
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
-    FILE* log_file = tmpfile();
-    char log_buffer[256] = {0};
-
-    EXPECT_NOT_NULL(log_file);
-    log_set_file(log_file);
-
-    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-    fflush(log_file);
-    rewind(log_file);
-    EXPECT_TRUE(fread(log_buffer, 1, sizeof(log_buffer) - 1, log_file) > 0);
-    EXPECT_TRUE(strstr(log_buffer, options[i]) != NULL);
-    EXPECT_TRUE(strstr(log_buffer, "directory-only transfer is not implemented") != NULL);
-    EXPECT_TRUE(strstr(log_buffer, "requires --dirs") == NULL);
-    log_set_file(NULL);
-    fclose(log_file);
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->dirs);
     config_delete(cfg);
   }
+}
+
+/* -R/--relative, --no-implied-dirs and --mkpath are plain boolean flags. */
+static void test_parse_args_relative_no_implied_mkpath() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-R", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->relative);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* long_argv[] = {"fastsync", "--relative", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, long_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->relative);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* noimplied_argv[] = {"fastsync", "--no-implied-dirs", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, noimplied_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->no_implied_dirs);
+  EXPECT_FALSE(cfg->relative);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* mkpath_argv[] = {"fastsync", "--mkpath", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, mkpath_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->mkpath);
+  config_delete(cfg);
 }
 
 /* --del is recognized as the rsync alias, but its timing mode is not implemented. */
@@ -609,8 +629,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--delete-after",
                                         "--max-delete",
                                         "--prune-empty-dirs",
-                                        "-R",
-                                        "--relative",
                                         "-e",
                                         "--rsh",
                                         "--rsync-path",
@@ -1522,7 +1540,8 @@ void test_client_cli() {
   test_parse_args_max_alloc_sizes();
   test_parse_args_rejects_invalid_max_alloc();
   test_parse_args_unknown_option();
-  test_parse_args_rejects_dirs_aliases();
+  test_parse_args_dirs_aliases();
+  test_parse_args_relative_no_implied_mkpath();
   test_parse_args_delete_during_alias_unimplemented();
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();

@@ -35,6 +35,8 @@ typedef struct {
   const FileListSet* file_list;       /* --files-from allow-set, or NULL */
   const FilterRuleList* base_filters; /* command-line + -C rules, or NULL */
   bool per_dir_filters;               /* -F: read .rsync-filter per directory */
+  bool dirs;                          /* -d/--dirs: transfer dir entries, no recursion */
+  bool relative;                      /* -R/--relative (dest rel paths, with --files-from) */
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -73,6 +75,14 @@ typedef struct {
   const FileListSet* file_list;
   const FilterRuleList* base_filters;
   bool per_dir_filters;
+  /* --dirs / -R state for the directory-entry generator (dirs_mode replaces
+     the recursive scan). */
+  bool dirs_mode;
+  bool relative_mode; /* file_list && relative: send bare relative wire paths */
+  bool dirs_root_emitted;
+  int list_index;
+  ArrayList* dirs_batch; /* owned when non-NULL */
+  unsigned long long dirs_batch_size;
 } DirectoryScanner;
 
 typedef struct {

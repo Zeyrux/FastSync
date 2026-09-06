@@ -63,6 +63,21 @@ static bool path_is_within(const char* root, const char* path) {
   return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
+/* --mkpath contract: when the client's destination root directory does not
+   exist yet on the server side, --mkpath tells the server to create it (and
+   any missing leading components) below the authorized root at connection
+   start.  Without --mkpath the destination root must already exist: a missing
+   root is rejected up front instead of being silently invented by a later
+   write.  Both paths are confined to the authorized root by the secure file
+   helpers. */
+static bool ensure_receive_root(const Config* config) {
+  if (!config || !config->receive_root_directory)
+    return false;
+  if (config->mkpath)
+    return file_ensure_directory_secure(config->receive_root_directory);
+  return file_directory_exists_secure(config->receive_root_directory);
+}
+
 static bool __attribute__((unused)) configure_authorization(const char* root) {
   char resolved[PATH_MAX];
   if (!root) {
@@ -165,6 +180,17 @@ void handler(int file_descriptor) {
     return;
   }
   config->use_delete = config->use_delete && allow_delete;
+  /* --mkpath: create the destination root (and its missing leading components)
+     before anything else; without it the root must pre-exist.  A failure here
+     aborts the connection cleanly before any file data is exchanged. */
+  if (!ensure_receive_root(config)) {
+    log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
+                config->receive_root_directory);
+    config_delete(config);
+    close(file_descriptor);
+    protocol_session_unbind();
+    return;
+  }
   /* A --delay-updates transfer stages under a private 0700 directory inside
      the receive root.  Create it up front (wiping leftovers of any previously
      interrupted delayed transfer) so a fully-skipped run also starts clean. */

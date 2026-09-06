@@ -26,8 +26,17 @@ void print_usage(void) {
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
   printf("  --delay-updates    Put updated files into place only at the end of transfer\n");
-  printf(
-      "  --dirs, --old-dirs, --old-d  Transfer directories without recursing (not implemented)\n");
+  printf("  --dirs, -d, --old-dirs, --old-d  Transfer the named directory entries without\n");
+  printf("                    recursing into their contents (-d <dir> mirrors the source\n");
+  printf("                    directory empty; with --files-from listed dirs are created\n");
+  printf("                    empty and listed files are transferred)\n");
+  printf("  -R, --relative    With --files-from, preserve each listed entry's relative path\n");
+  printf("                    below the destination root instead of mirroring the full\n");
+  printf("                    source path (no effect without --files-from)\n");
+  printf("  --no-implied-dirs  With -R --files-from, refuse to place a listed file whose\n");
+  printf("                    parent directory is not itself listed\n");
+  printf("  --mkpath          Create the destination root directory on the server when it\n");
+  printf("                    does not exist yet\n");
   printf("  --del               Alias for --delete-during (not implemented)\n");
   printf("  --exclude <pattern> Exclude files matching pattern\n");
   printf("  --include <pattern> Only include files matching pattern\n");

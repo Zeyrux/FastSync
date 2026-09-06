@@ -306,6 +306,12 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->file_list = options->file_list;
   scanner->base_filters = options->base_filters;
   scanner->per_dir_filters = options->per_dir_filters;
+  scanner->dirs_mode = options->dirs;
+  scanner->relative_mode = options->relative && options->file_list != NULL;
+  scanner->dirs_root_emitted = false;
+  scanner->list_index = 0;
+  scanner->dirs_batch = NULL;
+  scanner->dirs_batch_size = 0;
   scanner->filter_nodes = NULL;
   if (scanner->base_filters || scanner->per_dir_filters) {
     scanner->filter_nodes = array_list_create(filter_node_destroy);
@@ -372,6 +378,8 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                             false,
                             NULL,
                             NULL,
+                            false,
+                            false,
                             false};
   return directory_scanner_create_with_options(root_directory, &options);
 }
@@ -387,6 +395,7 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
   free(scanner->current_rel);
   free(scanner->root_path);
   array_list_delete(scanner->filter_nodes);
+  array_list_delete(scanner->dirs_batch);
   queue_destroy(scanner->directories);
   free(scanner);
 }
@@ -448,7 +457,174 @@ static int open_next_directory(DirectoryScanner* scanner) {
   return 1;
 }
 
+/* ---- --dirs mode ----
+   With -d the scanner transfers directory entries and never recurses into
+   contents.  A plain `-d <dir>` sends only the source-root directory mirror
+   (created empty at the destination).  With -d + --files-from exactly the
+   listed items are sent: listed directories become empty directory entries and
+   listed regular files are transferred as files; nothing else is scanned, so
+   no descent into a listed directory can happen. */
+
+/* Build the File for the transfer root directory itself (the `-d <dir>` and
+ * "." cases). */
+static File* dirs_root_dir_file(DirectoryScanner* scanner) {
+  struct stat st;
+  if (stat(scanner->root_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    log_perror("Could not stat source directory");
+    scanner->failed = true;
+    return NULL;
+  }
+  File* file = file_create(scanner->root_path);
+  if (!file) {
+    scanner->failed = true;
+    return NULL;
+  }
+  file->is_dir = true;
+  if (scanner->use_metadata) {
+    file->metadata = file_metadata_create(&st);
+    if (!file->metadata) {
+      file_destroy(file);
+      scanner->failed = true;
+      return NULL;
+    }
+  }
+  return file;
+}
+
+/* Map one normalized --files-from entry to a File (a directory entry or a
+ * regular file to transfer), or NULL to skip the entry. */
+static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
+  if (entry[0] == '\0') {
+    /* "." (whole tree): under -R the bare receive root is the destination and
+       there is nothing to create for the root itself; otherwise mirror the
+       source-root directory (empty). */
+    if (scanner->relative_mode)
+      return NULL;
+    return dirs_root_dir_file(scanner);
+  }
+  char* abs_path = path_cat(scanner->root_path, entry);
+  if (!abs_path) {
+    scanner->failed = true;
+    return NULL;
+  }
+  struct stat link_stats;
+  if (lstat(abs_path, &link_stats) != 0) {
+    log_message(LOG_LEVEL_ERROR, "--dirs listed entry is not present under the source: %s", entry);
+    free(abs_path);
+    scanner->failed = true;
+    return NULL;
+  }
+  struct stat effective = link_stats;
+  if (S_ISLNK(link_stats.st_mode)) {
+    /* A symlink is transferred (following its referent) only when a link
+       resolution option is active, mirroring the regular scanner. */
+    bool resolve = scanner->follow_symlinks || scanner->copy_links || scanner->safe_links ||
+                   scanner->copy_unsafe_links;
+    if (!resolve || stat(abs_path, &effective) != 0) {
+      free(abs_path);
+      return NULL;
+    }
+  }
+  bool is_dir = S_ISDIR(effective.st_mode);
+  bool is_file = S_ISREG(effective.st_mode);
+  if (!is_dir && !is_file) {
+    free(abs_path);
+    return NULL;
+  }
+  File* file = file_create(abs_path);
+  free(abs_path);
+  if (!file) {
+    scanner->failed = true;
+    return NULL;
+  }
+  file->is_dir = is_dir;
+  file->data->size = is_file ? (unsigned long long)effective.st_size : 0;
+  if (scanner->relative_mode) {
+    file->send_path = str_dup(entry);
+    if (!file->send_path) {
+      file_destroy(file);
+      scanner->failed = true;
+      return NULL;
+    }
+  }
+  if (scanner->use_metadata) {
+    file->metadata = file_metadata_create(&effective);
+    if (!file->metadata) {
+      file_destroy(file);
+      scanner->failed = true;
+      return NULL;
+    }
+  }
+  return file;
+}
+
+/* The next File from the --dirs generator, or NULL when exhausted. */
+static File* dirs_next_file(DirectoryScanner* scanner) {
+  if (!scanner->file_list) {
+    if (scanner->dirs_root_emitted)
+      return NULL;
+    scanner->dirs_root_emitted = true;
+    return dirs_root_dir_file(scanner);
+  }
+  while (scanner->list_index < scanner->file_list->count) {
+    const char* entry = scanner->file_list->entries[scanner->list_index++];
+    File* file = dirs_file_for_entry(scanner, entry);
+    if (scanner->failed)
+      return NULL;
+    if (file)
+      return file;
+  }
+  return NULL;
+}
+
+static Chunk* dirs_flush_batch(DirectoryScanner* scanner) {
+  if (!scanner->dirs_batch || scanner->dirs_batch->size == 0) {
+    array_list_delete(scanner->dirs_batch);
+    scanner->dirs_batch = NULL;
+    scanner->dirs_batch_size = 0;
+    return NULL;
+  }
+  ArrayList* batch = scanner->dirs_batch;
+  scanner->dirs_batch = NULL;
+  scanner->dirs_batch_size = 0;
+  Chunk* chunk = chunk_data_to_chunk(batch);
+  if (!chunk)
+    scanner->failed = true;
+  return chunk;
+}
+
+static Chunk* directory_scanner_next_dirs(DirectoryScanner* scanner) {
+  while (scanner->dirs_batch == NULL || scanner->dirs_batch_size <= scanner->chunk_size) {
+    if (!scanner->dirs_batch) {
+      scanner->dirs_batch = array_list_create(file_destroy);
+      if (!scanner->dirs_batch) {
+        scanner->failed = true;
+        return NULL;
+      }
+      scanner->dirs_batch_size = 0;
+    }
+    File* file = dirs_next_file(scanner);
+    if (scanner->failed) {
+      dirs_flush_batch(scanner);
+      return NULL;
+    }
+    if (!file) {
+      return dirs_flush_batch(scanner);
+    }
+    if (!array_list_add(scanner->dirs_batch, file)) {
+      file_destroy(file);
+      scanner->failed = true;
+      dirs_flush_batch(scanner);
+      return NULL;
+    }
+    scanner->dirs_batch_size += file->data ? file->data->size : 0;
+  }
+  return dirs_flush_batch(scanner);
+}
+
 Chunk* directory_scanner_next(DirectoryScanner* scanner) {
+  if (scanner && scanner->dirs_mode)
+    return directory_scanner_next_dirs(scanner);
   ArrayList* chunk_data = array_list_create(file_destroy);
   if (!chunk_data) {
     scanner->failed = true;
@@ -477,16 +653,27 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
 
-    ScannerOptions options = {scanner->use_metadata,     scanner->chunk_size,
-                              scanner->exclude_patterns, scanner->exclude_count,
-                              scanner->include_patterns, scanner->include_count,
-                              scanner->max_size,         scanner->min_size,
-                              scanner->max_depth,        0,
-                              scanner->follow_symlinks,  scanner->copy_links,
-                              scanner->safe_links,       scanner->copy_unsafe_links,
-                              scanner->checksum,         scanner->one_file_system,
-                              scanner->file_list,        scanner->base_filters,
-                              scanner->per_dir_filters};
+    ScannerOptions options = {scanner->use_metadata,
+                              scanner->chunk_size,
+                              scanner->exclude_patterns,
+                              scanner->exclude_count,
+                              scanner->include_patterns,
+                              scanner->include_count,
+                              scanner->max_size,
+                              scanner->min_size,
+                              scanner->max_depth,
+                              0,
+                              scanner->follow_symlinks,
+                              scanner->copy_links,
+                              scanner->safe_links,
+                              scanner->copy_unsafe_links,
+                              scanner->checksum,
+                              scanner->one_file_system,
+                              scanner->file_list,
+                              scanner->base_filters,
+                              scanner->per_dir_filters,
+                              false,
+                              false};
     ScannerEntry inspected;
     int inspection = scanner_inspect_entry(&options, scanner->current_path, scanner->current_path,
                                            entry->d_name, &inspected);
@@ -511,13 +698,23 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     bool passes_selection =
         entry_passes_selection(scanner->file_list, scanner->base_filters, scanner->current_node,
                                rel, entry->d_name, is_dir, scanner->per_dir_filters);
+    /* With -R + --files-from the wire/destination path is the entry's bare
+       relative path; keep `rel` alive to attach it to a transferred file. */
+    char* rel_copy = scanner->relative_mode ? str_dup(rel) : NULL;
     free(rel);
+    if (rel_copy == NULL && scanner->relative_mode) {
+      free(cur_path);
+      scanner->failed = true;
+      break;
+    }
     if (!passes_selection) {
+      free(rel_copy);
       free(cur_path);
       continue;
     }
 
     if (is_dir) {
+      free(rel_copy);
       if (!scanner_same_filesystem(scanner->one_file_system, scanner->root_dev, stats.st_dev)) {
         free(cur_path);
         continue;
@@ -533,38 +730,45 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       free(cur_path);
     } else {
       if (scanner->max_depth > 0 && scanner->current_depth + 1 > scanner->max_depth) {
+        free(rel_copy);
         free(cur_path);
         continue;
       }
       File* file = file_create(cur_path);
+      free(cur_path);
       if (file == NULL) {
-        free(cur_path);
+        free(rel_copy);
         scanner->failed = true;
         continue;
       }
       file->data->size = stats.st_size;
+      if (scanner->relative_mode) {
+        file->send_path = rel_copy;
+        rel_copy = NULL;
+      }
       if (scanner->use_metadata)
         file->metadata = file_metadata_create(&stats);
       if (scanner->use_metadata && !file->metadata) {
+        free(rel_copy);
         file_destroy(file);
-        free(cur_path);
         scanner->failed = true;
         break;
       }
       if (!array_list_add(chunk_data, file)) {
+        free(rel_copy);
         file_destroy(file);
         scanner->failed = true;
         break;
       }
       chunk_data_size += file->data->size;
       if (chunk_data_size > scanner->chunk_size) {
-        free(cur_path);
+        free(rel_copy);
         Chunk* result = chunk_data_to_chunk(chunk_data);
         if (!result)
           scanner->failed = true;
         return result;
       }
-      free(cur_path);
+      free(rel_copy);
     }
   }
 
@@ -792,12 +996,15 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   }
   bool passes = entry_passes_selection(options->file_list, options->base_filters, root_node, rel,
                                        entry->d_name, is_dir, options->per_dir_filters);
-  free(rel);
+  /* -R + --files-from: root-level files keep their bare relative send path. */
+  bool use_rel = options->relative && options->file_list != NULL;
   if (!passes) {
+    free(rel);
     free(cur_path);
     return;
   }
   if (is_dir) {
+    free(rel);
     if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
       free(cur_path);
       return;
@@ -811,18 +1018,25 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   File* file = file_create(cur_path);
   free(cur_path);
   if (!file) {
+    free(rel);
     ps->failed = true;
     return;
   }
   file->data->size = st.st_size;
+  if (use_rel) {
+    file->send_path = rel;
+    rel = NULL;
+  }
   if (options->use_metadata)
     file->metadata = file_metadata_create(&st);
   if (options->use_metadata && !file->metadata) {
+    free(rel);
     file_destroy(file);
     ps->failed = true;
     return;
   }
   if (!array_list_add(root_files, file)) {
+    free(rel);
     file_destroy(file);
     ps->failed = true;
   }

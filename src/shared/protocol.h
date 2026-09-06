@@ -67,7 +67,10 @@ enum NET_STATUS {
   STATUS_DELTA_DATA,
   STATUS_KEEPALIVE,
   STATUS_ABORT,
-  STATUS_CHECK_BATCH
+  STATUS_CHECK_BATCH,
+  /* An explicit directory entry (--dirs): the sender transmits only the path;
+   * the receiver creates the directory below the receive root. */
+  STATUS_MKDIR
 };
 
 void io_set_fds(int read_fd, int write_fd);

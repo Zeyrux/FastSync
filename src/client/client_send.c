@@ -100,6 +100,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->file_list = (const FileListSet*)config->files_from_set;
   options->base_filters = out->base_filters;
   options->per_dir_filters = config->per_dir_filter;
+  options->dirs = config->dirs;
+  options->relative = config->relative;
   return true;
 }
 
@@ -108,6 +110,72 @@ static void prepared_scanner_destroy(PreparedScanner* prepared) {
     return;
   filter_rule_list_free(prepared->base_filters);
   prepared->base_filters = NULL;
+}
+
+/* True when some --files-from entry is an ancestor-or-equal directory of
+ * `rel` (an empty entry -- the whole tree "." -- counts as the root). */
+static bool file_list_ancestor_listed(const FileListSet* set, const char* rel) {
+  if (!set)
+    return true;
+  for (int i = 0; i < set->count; i++) {
+    const char* listed = set->entries[i];
+    if (listed[0] == '\0')
+      return true;
+    size_t n = strlen(listed);
+    if (strncmp(rel, listed, n) == 0 && (rel[n] == '/' || rel[n] == '\0'))
+      return true;
+  }
+  return false;
+}
+
+/* --no-implied-dirs (meaningful only with -R + --files-from): a listed file
+ * may only be placed when its parent directory (or one of its ancestors) is
+ * itself an explicitly listed entry.  rsync omits a file whose implied parent
+ * directory is suppressed, and an explicitly listed file that cannot be placed
+ * fails the transfer; FastSync fails the whole run up front with a clear error
+ * (it has no per-entry skip channel).  Without -R or --files-from the option
+ * has no effect. */
+static bool no_implied_dirs_files_from_valid(const Config* config) {
+  if (!config->no_implied_dirs || !config->relative)
+    return true;
+  const FileListSet* set = (const FileListSet*)config->files_from_set;
+  if (!set)
+    return true;
+  for (int i = 0; i < set->count; i++) {
+    const char* entry = set->entries[i];
+    if (entry[0] == '\0')
+      continue;
+    char* full = path_cat(config->send_directory, entry);
+    if (!full)
+      return false;
+    struct stat st;
+    bool is_file = lstat(full, &st) == 0 && S_ISREG(st.st_mode);
+    free(full);
+    if (!is_file)
+      continue;
+    const char* slash = strrchr(entry, '/');
+    if (!slash)
+      continue; /* top-level file: its parent is the receive root */
+    size_t parent_len = (size_t)(slash - entry);
+    if (parent_len == 0)
+      continue;
+    char* parent = malloc(parent_len + 1);
+    if (!parent)
+      return false;
+    memcpy(parent, entry, parent_len);
+    parent[parent_len] = '\0';
+    bool listed = file_list_ancestor_listed(set, parent);
+    if (!listed) {
+      log_message(LOG_LEVEL_ERROR,
+                  "--no-implied-dirs: cannot place file '%s': parent directory '%s' is not "
+                  "explicitly listed (list the directory or drop --no-implied-dirs)",
+                  entry, parent);
+    }
+    free(parent);
+    if (!listed)
+      return false;
+  }
+  return true;
 }
 
 /* --files-from semantics: every listed entry must resolve under the source
@@ -147,7 +215,7 @@ static bool files_from_list_valid(const Config* config) {
     }
     free(full);
   }
-  return true;
+  return no_implied_dirs_files_from_valid(config);
 }
 
 /* Select the configured transport for both transfer execution paths. */
@@ -194,7 +262,7 @@ static bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
   if (!manifest)
     return true;
   for (int i = 0; i < chunk->element_count; i++) {
-    const char* path = chunk->items[i]->path;
+    const char* path = file_wire_path(chunk->items[i]);
     if (*path == '/')
       path++;
     char* entry = str_dup(path);
@@ -533,7 +601,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
   *out_sig = NULL;
   if (!send_status(client->file_descriptor, STATUS_CHECK))
     return -1;
-  if (!send_str(client->file_descriptor, file->path))
+  if (!send_str(client->file_descriptor, file_wire_path(file)))
     return -1;
   unsigned long long fsize = file->data->size;
   long long mtime = file->metadata ? file->metadata->mtime_sec : 0;
@@ -631,6 +699,17 @@ static bool send_file_direct(File* file, int fd, bool use_metadata, int compress
   return file_send_single_calls_with_skip(file, fd, use_metadata, compression_level, true,
                                           config->skip_compress_suffixes, skip_count,
                                           config->compression_threads);
+}
+
+/* Transmit one explicit directory entry (--dirs): a STATUS_MKDIR frame whose
+   payload is only the destination path.  The receiver validates the path and
+   creates the directory under the receive root. */
+static bool send_directory_entry(Client* client, File* file) {
+  if (!file || !file_wire_path(file))
+    return false;
+  if (!send_status(client->file_descriptor, STATUS_MKDIR))
+    return false;
+  return send_str(client->file_descriptor, file_wire_path(file));
 }
 
 // Send a single file directly via sendfile (non-incremental path).
@@ -755,7 +834,11 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     }
     data_destroy(data);
     for (int i = 0; i < chunk->element_count; i++) {
-      if (chunk->items[i] != NULL)
+      if (chunk->items[i] == NULL)
+        continue;
+      if (chunk->items[i]->is_dir)
+        change_emit_dir_sent(config, chunk->items[i]);
+      else
         change_emit_file_sent(config, chunk->items[i]);
     }
     return 0;
@@ -765,6 +848,15 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     File* f = chunk->items[i];
     if (f == NULL)
       continue;
+    if (f->is_dir) {
+      /* Explicit directory entry (--dirs): a MKDIR frame carrying only the
+         destination path.  Directories have no source to remove and no
+         incremental check. */
+      if (!send_directory_entry(client, f))
+        return -1;
+      change_emit_dir_sent(config, f);
+      continue;
+    }
     bool stream = f->data->data == NULL && f->data->size > 0;
     bool use_sendfile =
         (config->use_sendfile && !config->use_compression) || (stream && !config->use_compression);
@@ -880,6 +972,9 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   }
 }
 
+/* Scan thread of the -m pipeline.  --dirs disables recursive traversal (the
+   transfer is a small set of explicit directory/file entries), so it uses the
+   sequential scanner rather than spawning worker threads. */
 static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
   protocol_session_bind(&context->allocation_session);
@@ -889,29 +984,42 @@ static int scan_directory_multithreaded(void* pipeline_context) {
     protocol_session_unbind();
     return thrd_error;
   }
-  ParallelScanner* scanner = parallel_scanner_create_with_options(
-      context->config->send_directory, &prepared.options, &context->allocation_session);
-
-  Chunk* current_chunk;
-  if (scanner == NULL) {
-    log_message(LOG_LEVEL_ERROR, "Failed to create parallel scanner");
+  bool dirs_mode = prepared.options.dirs;
+  DirectoryScanner* dscanner = NULL;
+  ParallelScanner* scanner = NULL;
+  if (dirs_mode) {
+    dscanner =
+        directory_scanner_create_with_options(context->config->send_directory, &prepared.options);
+  } else {
+    scanner = parallel_scanner_create_with_options(context->config->send_directory,
+                                                   &prepared.options, &context->allocation_session);
+  }
+  if (dscanner == NULL && scanner == NULL) {
+    log_message(LOG_LEVEL_ERROR, "Failed to create scanner");
     pipeline_cancel(context);
     prepared_scanner_destroy(&prepared);
     protocol_session_unbind();
     return thrd_error;
   }
-  while ((current_chunk = parallel_scanner_next(scanner)) != NULL) {
+  bool failed = false;
+  Chunk* current_chunk;
+  while (1) {
+    if (dirs_mode)
+      current_chunk = directory_scanner_next(dscanner);
+    else
+      current_chunk = parallel_scanner_next(scanner);
+    if (current_chunk == NULL) {
+      failed = dirs_mode ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
+      break;
+    }
     if (context->config->use_delete) {
       mtx_lock(&context->mutex_scanner);
       bool manifest_ok = add_chunk_to_manifest(context->manifest, current_chunk);
       mtx_unlock(&context->mutex_scanner);
       if (!manifest_ok) {
-        pipeline_cancel(context);
+        failed = true;
         chunk_destroy(current_chunk);
-        parallel_scanner_destroy(scanner);
-        prepared_scanner_destroy(&prepared);
-        protocol_session_unbind();
-        return thrd_error;
+        break;
       }
     }
     if (!queue_enqueue_multithreaded_cancel(
@@ -919,15 +1027,15 @@ static int scan_directory_multithreaded(void* pipeline_context) {
             &context->condition_not_empty_scanner, &context->condition_not_full_scanner,
             &context->cancelled)) {
       chunk_destroy(current_chunk);
-      pipeline_cancel(context);
-      parallel_scanner_destroy(scanner);
-      prepared_scanner_destroy(&prepared);
-      protocol_session_unbind();
-      return thrd_error;
+      failed = true;
+      break;
     }
   }
-  if (parallel_scanner_failed(scanner)) {
+  if (dirs_mode)
+    directory_scanner_destroy(dscanner);
+  else
     parallel_scanner_destroy(scanner);
+  if (failed) {
     prepared_scanner_destroy(&prepared);
     mtx_lock(&context->mutex_scanner);
     context->scanner_done = true;
@@ -943,7 +1051,6 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   cnd_signal(&context->condition_not_empty_scanner);
   mtx_unlock(&context->mutex_scanner);
 
-  parallel_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);
   protocol_session_unbind();
   return thrd_success;
