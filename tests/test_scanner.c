@@ -394,8 +394,8 @@ static void test_parallel_scanner_root_chunks_without_workers() {
   create_test_file(file1, "a");
   create_test_file(file2, "b");
 
-  ScannerOptions options = {false, 1, NULL,  0,     NULL,  0,     0,    0,
-                            0,     0, false, false, false, false, false};
+  ScannerOptions options = {false, 1, NULL,  0,     NULL,  0,     0,     0,
+                            0,     0, false, false, false, false, false, false};
   ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options, NULL);
   EXPECT_NOT_NULL(scanner);
 
@@ -414,6 +414,245 @@ static void test_parallel_scanner_root_chunks_without_workers() {
   rmdir(dir);
 }
 
+/* --one-file-system (-x) decision is a pure device comparison. */
+static void test_scanner_one_file_system_decision() {
+  /* Option disabled: every device is allowed (unchanged default behavior). */
+  EXPECT_TRUE(scanner_same_filesystem(false, 0, 123));
+  EXPECT_TRUE(scanner_same_filesystem(false, 7, 999));
+  /* Option enabled: only entries on the root device may be descended into. */
+  EXPECT_TRUE(scanner_same_filesystem(true, 7, 7));
+  EXPECT_FALSE(scanner_same_filesystem(true, 7, 8));
+}
+
+/* With -x over an ordinary tree (all one device) nothing may be skipped. */
+static void test_scanner_one_file_system_same_device() {
+  const char* root = "test_scan_ofs";
+  const char* sub = "test_scan_ofs/sub";
+  const char* deeper = "test_scan_ofs/sub/deeper";
+  const char* root_file = "test_scan_ofs/root.txt";
+  const char* sub_file = "test_scan_ofs/sub/inner.txt";
+  const char* deep_file = "test_scan_ofs/sub/deeper/deep.txt";
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  EXPECT_EQ_INT(mkdir(deeper, 0755), 0);
+  create_test_file(root_file, "root");
+  create_test_file(sub_file, "inner");
+  create_test_file(deep_file, "deep");
+
+  ScannerOptions options = {0};
+  options.one_file_system = true;
+  DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+  EXPECT_NOT_NULL(scanner);
+
+  int total_files = 0;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    total_files += chunk->element_count;
+    chunk_destroy(chunk);
+  }
+  EXPECT_EQ_INT(total_files, 3);
+  EXPECT_FALSE(directory_scanner_failed(scanner));
+
+  directory_scanner_destroy(scanner);
+  unlink(root_file);
+  unlink(sub_file);
+  unlink(deep_file);
+  rmdir(deeper);
+  rmdir(sub);
+  rmdir(root);
+}
+
+/* Multithreaded (-m) scan with -x over a single-device tree must match the
+ * single-threaded result. */
+static void test_parallel_scanner_one_file_system_same_device() {
+  const char* root = "test_parallel_scan_ofs";
+  const char* sub = "test_parallel_scan_ofs/sub";
+  const char* sub2 = "test_parallel_scan_ofs/sub2";
+  const char* root_file = "test_parallel_scan_ofs/root.txt";
+  const char* sub_file = "test_parallel_scan_ofs/sub/inner.txt";
+  const char* sub2_file = "test_parallel_scan_ofs/sub2/inner2.txt";
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub2, 0755), 0);
+  create_test_file(root_file, "root");
+  create_test_file(sub_file, "inner");
+  create_test_file(sub2_file, "inner2");
+
+  ScannerOptions options = {0};
+  options.one_file_system = true;
+  options.num_threads = 2;
+  ParallelScanner* scanner = parallel_scanner_create_with_options(root, &options, NULL);
+  EXPECT_NOT_NULL(scanner);
+
+  int total_files = 0;
+  Chunk* chunk;
+  while ((chunk = parallel_scanner_next(scanner)) != NULL) {
+    total_files += chunk->element_count;
+    chunk_destroy(chunk);
+  }
+  EXPECT_EQ_INT(total_files, 3);
+  EXPECT_FALSE(parallel_scanner_failed(scanner));
+
+  parallel_scanner_destroy(scanner);
+  unlink(root_file);
+  unlink(sub_file);
+  unlink(sub2_file);
+  rmdir(sub);
+  rmdir(sub2);
+  rmdir(root);
+}
+
+/* Scan a tree with copy_links semantics, collecting every emitted path.
+ * Returns 0 on success, -1 on scanner failure. */
+static int collect_directory_scan(const char* root, bool one_file_system, const char* needle,
+                                  bool* found, int* total) {
+  ScannerOptions options = {0};
+  options.copy_links = true;
+  options.one_file_system = one_file_system;
+  DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+  if (!scanner)
+    return -1;
+  *found = false;
+  *total = 0;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      (*total)++;
+      if (strstr(chunk->items[i]->path, needle) != NULL)
+        *found = true;
+    }
+    chunk_destroy(chunk);
+  }
+  bool failed = directory_scanner_failed(scanner);
+  directory_scanner_destroy(scanner);
+  return failed ? -1 : 0;
+}
+
+static int collect_parallel_scan(const char* root, bool one_file_system, const char* needle,
+                                 bool* found, int* total) {
+  ScannerOptions options = {0};
+  options.copy_links = true;
+  options.one_file_system = one_file_system;
+  options.num_threads = 2;
+  ParallelScanner* scanner = parallel_scanner_create_with_options(root, &options, NULL);
+  if (!scanner)
+    return -1;
+  *found = false;
+  *total = 0;
+  Chunk* chunk;
+  while ((chunk = parallel_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      (*total)++;
+      if (strstr(chunk->items[i]->path, needle) != NULL)
+        *found = true;
+    }
+    chunk_destroy(chunk);
+  }
+  bool failed = parallel_scanner_failed(scanner);
+  parallel_scanner_destroy(scanner);
+  return failed ? -1 : 0;
+}
+
+/* Rootless cross-filesystem test: a symlink nested under the scan root points
+ * at a directory on another device (typically /dev/shm, a tmpfs distinct from
+ * the build filesystem). With --copy-links semantics the scanner resolves the
+ * link and must descend into it only when -x is off. The nested placement
+ * exercises the skip decision in the sequential walker and in the parallel
+ * worker (depth > 1). Skips when no cross-device target is available. */
+static void test_scanner_one_file_system_cross_device() {
+  struct stat local_stat;
+  if (stat(".", &local_stat) != 0)
+    return;
+
+  char shm_dir[64] = "/dev/shm/fastsync_ofs_shm_XXXXXX";
+  if (mkdtemp(shm_dir) == NULL)
+    return;
+  struct stat shm_stat;
+  if (stat(shm_dir, &shm_stat) != 0 || shm_stat.st_dev == local_stat.st_dev) {
+    rmdir(shm_dir);
+    return;
+  }
+
+  char root_dir[64] = "./fastsync_ofs_root_XXXXXX";
+  if (mkdtemp(root_dir) == NULL) {
+    rmdir(shm_dir);
+    return;
+  }
+
+  char nested[96];
+  snprintf(nested, sizeof(nested), "%s/nested", root_dir);
+  char link_path[128];
+  snprintf(link_path, sizeof(link_path), "%s/link", nested);
+  char root_file[96];
+  snprintf(root_file, sizeof(root_file), "%s/keep.txt", root_dir);
+  char shm_file[96];
+  snprintf(shm_file, sizeof(shm_file), "%s/inside.txt", shm_dir);
+
+  bool ready = mkdir(nested, 0755) == 0 && symlink(shm_dir, link_path) == 0;
+  if (ready)
+    create_test_file(root_file, "keep");
+  if (ready)
+    create_test_file(shm_file, "cross");
+
+  int rc, total;
+  bool found;
+  int seq_off_rc, seq_off_total, seq_on_rc, seq_on_total;
+  bool seq_off_found, seq_on_found;
+  int par_off_rc, par_off_total, par_on_rc, par_on_total;
+  bool par_off_found, par_on_found;
+  if (!ready) {
+    seq_off_rc = seq_on_rc = par_off_rc = par_on_rc = -1;
+    seq_off_total = seq_on_total = par_off_total = par_on_total = 0;
+    seq_off_found = seq_on_found = par_off_found = par_on_found = false;
+  } else {
+    rc = collect_directory_scan(root_dir, false, "inside.txt", &found, &total);
+    seq_off_rc = rc;
+    seq_off_total = total;
+    seq_off_found = found;
+    rc = collect_directory_scan(root_dir, true, "inside.txt", &found, &total);
+    seq_on_rc = rc;
+    seq_on_total = total;
+    seq_on_found = found;
+    rc = collect_parallel_scan(root_dir, false, "inside.txt", &found, &total);
+    par_off_rc = rc;
+    par_off_total = total;
+    par_off_found = found;
+    rc = collect_parallel_scan(root_dir, true, "inside.txt", &found, &total);
+    par_on_rc = rc;
+    par_on_total = total;
+    par_on_found = found;
+  }
+
+  /* Hermetic cleanup regardless of scan outcome, before any assertions. */
+  unlink(shm_file);
+  rmdir(shm_dir);
+  unlink(link_path);
+  unlink(root_file);
+  rmdir(nested);
+  rmdir(root_dir);
+
+  if (!ready)
+    return;
+
+  /* Sequential: without -x the symlinked foreign subtree is included. */
+  EXPECT_EQ_INT(seq_off_rc, 0);
+  EXPECT_TRUE(seq_off_found);
+  EXPECT_EQ_INT(seq_off_total, 2);
+  /* Sequential: with -x the cross-device subtree is dropped, keep.txt remains. */
+  EXPECT_EQ_INT(seq_on_rc, 0);
+  EXPECT_FALSE(seq_on_found);
+  EXPECT_EQ_INT(seq_on_total, 1);
+  /* Parallel: same behavior, worker path (depth > 1). */
+  EXPECT_EQ_INT(par_off_rc, 0);
+  EXPECT_TRUE(par_off_found);
+  EXPECT_EQ_INT(par_off_total, 2);
+  EXPECT_EQ_INT(par_on_rc, 0);
+  EXPECT_FALSE(par_on_found);
+  EXPECT_EQ_INT(par_on_total, 1);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -429,4 +668,8 @@ void test_scanner() {
   test_scanner_mixed_patterns();
   test_scanner_no_patterns();
   test_parallel_scanner_root_chunks_without_workers();
+  test_scanner_one_file_system_decision();
+  test_scanner_one_file_system_same_device();
+  test_parallel_scanner_one_file_system_same_device();
+  test_scanner_one_file_system_cross_device();
 }

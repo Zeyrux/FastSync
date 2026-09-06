@@ -40,12 +40,14 @@ static const char* display_bytes(unsigned long long bytes, bool human_readable, 
 }
 
 static ScannerOptions scanner_options_from_config(const Config* config, int num_threads) {
-  ScannerOptions options = {
-      config->use_metadata,  config->chunk_size,        config->exclude_patterns,
-      config->exclude_count, config->include_patterns,  config->include_count,
-      config->max_size,      config->min_size,          config->max_depth,
-      num_threads,           config->follow_symlinks,   config->copy_links,
-      config->safe_links,    config->copy_unsafe_links, config->checksum};
+  ScannerOptions options = {config->use_metadata,     config->chunk_size,
+                            config->exclude_patterns, config->exclude_count,
+                            config->include_patterns, config->include_count,
+                            config->max_size,         config->min_size,
+                            config->max_depth,        num_threads,
+                            config->follow_symlinks,  config->copy_links,
+                            config->safe_links,       config->copy_unsafe_links,
+                            config->checksum,         config->one_file_system};
   return options;
 }
 

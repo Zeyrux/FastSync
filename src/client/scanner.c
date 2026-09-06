@@ -59,6 +59,13 @@ typedef struct {
   bool is_directory;
 } ScannerEntry;
 
+/* --one-file-system (-x) decision. Only directories can carry a different
+ * device than their parent (mount points), so this is checked when a child
+ * directory is about to be descended into. */
+bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device) {
+  return !one_file_system || entry_device == root_device;
+}
+
 /* Inspect symlinks, resolve the entry type, and apply file filters once for both scanners. */
 static int scanner_inspect_entry(const ScannerOptions* options, const char* source_root,
                                  const char* containing_dir, const char* name,
@@ -156,7 +163,18 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->safe_links = options->safe_links;
   scanner->copy_unsafe_links = options->copy_unsafe_links;
   scanner->checksum = options->checksum;
+  scanner->one_file_system = options->one_file_system;
   scanner->failed = false;
+  if (scanner->one_file_system) {
+    struct stat root_stats;
+    if (stat(root_directory, &root_stats) != 0) {
+      log_perror("Could not stat source directory");
+      queue_destroy(scanner->directories);
+      free(scanner);
+      return NULL;
+    }
+    scanner->root_dev = root_stats.st_dev;
+  }
   DirEntry* root = dir_entry_create(root_directory, 0);
   if (!root) {
     queue_destroy(scanner->directories);
@@ -179,10 +197,14 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            unsigned long long min_size, int max_depth,
                                            bool follow_symlinks, bool copy_links, bool safe_links,
                                            bool copy_unsafe_links, bool checksum) {
-  ScannerOptions options = {
-      use_metadata,    chunk_size, exclude_patterns, exclude_count,     include_patterns,
-      include_count,   max_size,   min_size,         max_depth,         0,
-      follow_symlinks, copy_links, safe_links,       copy_unsafe_links, checksum};
+  ScannerOptions options = {use_metadata,     chunk_size,
+                            exclude_patterns, exclude_count,
+                            include_patterns, include_count,
+                            max_size,         min_size,
+                            max_depth,        0,
+                            follow_symlinks,  copy_links,
+                            safe_links,       copy_unsafe_links,
+                            checksum,         false};
   return directory_scanner_create_with_options(root_directory, &options);
 }
 
@@ -272,7 +294,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
                               scanner->max_depth,        0,
                               scanner->follow_symlinks,  scanner->copy_links,
                               scanner->safe_links,       scanner->copy_unsafe_links,
-                              scanner->checksum};
+                              scanner->checksum,         scanner->one_file_system};
     ScannerEntry inspected;
     int inspection = scanner_inspect_entry(&options, scanner->current_path, scanner->current_path,
                                            entry->d_name, &inspected);
@@ -286,6 +308,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     struct stat stats = inspected.stats;
 
     if (inspected.is_directory) {
+      if (!scanner_same_filesystem(scanner->one_file_system, scanner->root_dev, stats.st_dev)) {
+        free(cur_path);
+        continue;
+      }
       int next_depth = scanner->current_depth + 1;
       if (scanner->max_depth <= 0 || next_depth < scanner->max_depth) {
         DirEntry* de = dir_entry_create(cur_path, next_depth);
@@ -525,7 +551,7 @@ static Chunk* batch_files(ArrayList* files, unsigned long long chunk_size, Queue
 /* Scan one root-directory entry into either the subdirs or files list. */
 static void scan_root_entry(const ScannerOptions* options, const char* root_directory,
                             const struct dirent* entry, ArrayList* root_files, ArrayList* subdirs,
-                            ParallelScanner* ps) {
+                            dev_t root_dev, ParallelScanner* ps) {
   ScannerEntry inspected;
   int inspection =
       scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);
@@ -538,6 +564,10 @@ static void scan_root_entry(const ScannerOptions* options, const char* root_dire
   char* cur_path = inspected.path;
   struct stat st = inspected.stats;
   if (inspected.is_directory) {
+    if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
+      free(cur_path);
+      return;
+    }
     if (!array_list_add(subdirs, cur_path)) {
       free(cur_path);
       ps->failed = true;
@@ -567,8 +597,8 @@ static void scan_root_entry(const ScannerOptions* options, const char* root_dire
 /* Scan the root directory itself, collecting root files and subdirectories.
  * Returns false if the root directory could not be opened. */
 static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
-                                const ScannerOptions* options, ArrayList* root_files,
-                                ArrayList* subdirs) {
+                                const ScannerOptions* options, dev_t root_dev,
+                                ArrayList* root_files, ArrayList* subdirs) {
   DIR* dir = opendir(root_directory);
   if (!dir) {
     log_perror("Could not open root directory for parallel scan");
@@ -578,7 +608,7 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    scan_root_entry(options, root_directory, entry, root_files, subdirs, ps);
+    scan_root_entry(options, root_directory, entry, root_files, subdirs, root_dev, ps);
   }
   closedir(dir);
   return true;
@@ -677,7 +707,20 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     return NULL;
   }
 
-  if (!scan_root_directory(ps, root_directory, options, root_files, subdirs)) {
+  dev_t root_dev = 0;
+  if (options->one_file_system) {
+    struct stat root_stats;
+    if (stat(root_directory, &root_stats) != 0) {
+      log_perror("Could not stat source directory");
+      array_list_delete(root_files);
+      array_list_delete(subdirs);
+      parallel_scanner_destroy(ps);
+      return NULL;
+    }
+    root_dev = root_stats.st_dev;
+  }
+
+  if (!scan_root_directory(ps, root_directory, options, root_dev, root_files, subdirs)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);

@@ -64,7 +64,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--existing` | Skip creating new files on receiver | ✅ Implemented | Existing destination files continue through normal update handling |
 | `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
 | `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |
-| `-x`, `--one-file-system` | Do not cross filesystem boundaries | ❌ Not Implemented | |
+| `-x`, `--one-file-system` | Do not cross filesystem boundaries | ✅ Implemented | Sender scanner captures the root device and skips descending into mount-point crossings (`st_dev` differs); cross-filesystem mount-point subdirectories are dropped entirely, matching rsync |
 | `-F` | Add the default `.rsync-filter` rules | ❌ Not Implemented | |
 
 ## 4. Directory Options

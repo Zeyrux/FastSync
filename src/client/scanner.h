@@ -6,8 +6,9 @@
 #include "queue.h"
 #include <dirent.h>
 #include <stdbool.h>
-#include <threads.h>
 #include <stdatomic.h>
+#include <sys/types.h>
+#include <threads.h>
 
 typedef struct {
   bool use_metadata;
@@ -25,6 +26,7 @@ typedef struct {
   bool safe_links;
   bool copy_unsafe_links;
   bool checksum;
+  bool one_file_system;
 } ScannerOptions;
 
 typedef struct {
@@ -46,6 +48,8 @@ typedef struct {
   bool safe_links;
   bool copy_unsafe_links;
   bool checksum;
+  bool one_file_system;
+  dev_t root_dev;
   bool failed;
 } DirectoryScanner;
 
@@ -78,6 +82,11 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
 Chunk* directory_scanner_next(DirectoryScanner* scanner);
 bool directory_scanner_failed(const DirectoryScanner* scanner);
 void directory_scanner_destroy(DirectoryScanner* scanner);
+
+/* --one-file-system (-x) decision: a directory entry may be descended into
+ * only when the option is disabled or the entry lives on the same device as
+ * the transfer root. Exposed so tests can exercise the rule directly. */
+bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device);
 
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
                                                       const ScannerOptions* options,

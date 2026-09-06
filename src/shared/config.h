@@ -104,6 +104,7 @@ typedef struct Config {
   char* files_from;
   bool cvs_exclude;
   bool prune_empty_dirs;
+  bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
   bool relative;
 
   // Issue #130: Remote shell/connection options
