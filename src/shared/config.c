@@ -194,52 +194,76 @@ bool config_has_basis(const Config* config) {
 /* A basis-dir path travels from the client to the receiver and is resolved
  * below the destination root, so it must be a non-empty relative path with no
  * "." or ".." component and no traversal: an absolute or escaping path would
- * make the receiver read or link files outside its authorized root. */
-bool config_basis_path_valid(const char* path) {
+ * make the receiver read or link files outside its authorized root.
+ *
+ * Returns a malloc'd CANONICAL copy of an accepted path, or NULL when the path
+ * is rejected.  Canonicalization collapses interior empty components ("a//b" ->
+ * "a/b"), drops "." components and trailing "/"s, so validation, the delete
+ * walker prefix match and the receiver's basis lookup all agree on one form.
+ * The normalizer is the single source of truth for both config_basis_path_valid
+ * and config_basis_append. */
+static char* basis_path_normalize(const char* path) {
   if (!path || path[0] == '\0' || path[0] == '/' || has_path_traversal(path))
-    return false;
+    return NULL;
   if (strcmp(path, ".") == 0)
-    return false;
+    return NULL;
   char* dup = str_dup(path);
   if (!dup)
-    return false;
-  bool ok = true;
+    return NULL;
+  size_t out_len = 0;
+  char* out = malloc(strlen(path) + 1);
+  if (!out) {
+    free(dup);
+    return NULL;
+  }
   char* saveptr = NULL;
+  bool ok = true;
   for (char* part = strtok_r(dup, "/", &saveptr); part; part = strtok_r(NULL, "/", &saveptr)) {
-    if (strcmp(part, ".") == 0) {
-      ok = false;
-      break;
-    }
     if (strcmp(part, "..") == 0) {
       ok = false;
       break;
     }
+    if (strcmp(part, ".") == 0)
+      continue;
+    if (out_len > 0)
+      out[out_len++] = '/';
+    size_t len = strlen(part);
+    memcpy(out + out_len, part, len);
+    out_len += len;
   }
   free(dup);
-  return ok;
+  if (!ok || out_len == 0) {
+    free(out);
+    return NULL;
+  }
+  out[out_len] = '\0';
+  return out;
+}
+
+bool config_basis_path_valid(const char* path) {
+  char* normalized = basis_path_normalize(path);
+  if (!normalized)
+    return false;
+  free(normalized);
+  return true;
 }
 
 int config_basis_append(Config* config, BasisDestType type, const char* path) {
-  if (!config || !config_basis_path_valid(path) ||
+  if (!config ||
       (type != BASIS_DEST_COMPARE && type != BASIS_DEST_COPY && type != BASIS_DEST_LINK) ||
       config->basis_count >= MAX_BASIS_DIRS)
     return -1;
+  char* normalized = basis_path_normalize(path);
+  if (!normalized)
+    return -1;
   BasisDest* grown = realloc(config->basis_dirs, (config->basis_count + 1) * sizeof(BasisDest));
-  if (!grown)
+  if (!grown) {
+    free(normalized);
     return -1;
+  }
   config->basis_dirs = grown;
-  /* Normalize a user-supplied trailing slash away so the stored path matches
-     the delete-walker prefix form exactly. */
-  size_t len = strlen(path);
-  while (len > 1 && path[len - 1] == '/')
-    len--;
-  char* dup = malloc(len + 1);
-  if (!dup)
-    return -1;
-  memcpy(dup, path, len);
-  dup[len] = '\0';
   config->basis_dirs[config->basis_count].type = type;
-  config->basis_dirs[config->basis_count].path = dup;
+  config->basis_dirs[config->basis_count].path = normalized;
   config->basis_count++;
   return 0;
 }
@@ -563,9 +587,9 @@ static bool receive_basis_options(int fd, Config* c) {
     char* path = receive_str(fd);
     if (!path)
       return false;
-    bool ok = config_basis_path_valid(path);
-    if (ok)
-      ok = config_basis_append(c, (BasisDestType)type, path) == 0;
+    /* config_basis_append validates and canonicalizes the path; a rejected
+       path (absolute / traversal / empty) drops the whole connection. */
+    bool ok = config_basis_append(c, (BasisDestType)type, path) == 0;
     free(path);
     if (!ok)
       return false;
