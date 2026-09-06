@@ -102,6 +102,10 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->per_dir_filters = config->per_dir_filter;
   options->dirs = config->dirs;
   options->relative = config->relative;
+  options->prune_empty_dirs = config->prune_empty_dirs;
+  options->ignore_io_errors = config->ignore_errors;
+  options->excluded_paths = NULL;
+  options->excluded_mutex = NULL;
   return true;
 }
 
@@ -255,7 +259,7 @@ static bool basis_oversize_preflight(const Config* config) {
     if (!ok)
       break;
   }
-  if (directory_scanner_failed(scanner))
+  if (directory_scanner_failed(scanner) || directory_scanner_had_io_error(scanner))
     ok = false;
   directory_scanner_destroy(scanner);
   return ok;
@@ -596,7 +600,7 @@ static int send_list_only(const Config* config) {
     if (oom)
       break;
   }
-  bool failed = oom || directory_scanner_failed(scanner);
+  bool failed = oom || directory_scanner_failed(scanner) || directory_scanner_had_io_error(scanner);
   directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);
   if (failed) {
@@ -621,8 +625,11 @@ static int send_list_only(const Config* config) {
   return 0;
 }
 
-/* Send the delete manifest (list of files) to the server. Returns 0 on success, -1 on failure. */
-static int send_delete_manifest(int fd, ArrayList* manifest) {
+/* Send the delete manifest (keep-set paths plus the protected excluded
+   prefixes) to the server. Returns 0 on success, -1 on failure.  When
+   --delete-excluded is given `protected` is empty: excluded destination
+   mirrors are then ordinary extras and are removed. */
+static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes) {
   if (!manifest)
     return -1;
   if (!send_status(fd, STATUS_MANIFEST))
@@ -631,6 +638,13 @@ static int send_delete_manifest(int fd, ArrayList* manifest) {
     return -1;
   for (int i = 0; i < manifest->size; i++) {
     if (!send_str(fd, (char*)manifest->items[i]))
+      return -1;
+  }
+  int protected_count = protected_prefixes ? protected_prefixes->size : 0;
+  if (!send_int(fd, protected_count))
+    return -1;
+  for (int i = 0; i < protected_count; i++) {
+    if (!send_str(fd, (char*)protected_prefixes->items[i]))
       return -1;
   }
   return 0;
@@ -647,10 +661,11 @@ static int send_delete_manifest(int fd, ArrayList* manifest) {
    instead of the default 60 s receive window. */
 #define DELETE_ACK_TIMEOUT_SEC 3600
 
-static bool send_delete_manifest_early(Client* client, ArrayList* manifest) {
+static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
+                                       ArrayList* protected_prefixes) {
   if (!client || !manifest)
     return false;
-  if (send_delete_manifest(client->file_descriptor, manifest) != 0)
+  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes) != 0)
     return false;
   Status ack;
   if (!receive_status_timed(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC))
@@ -666,9 +681,14 @@ static bool send_delete_manifest_early(Client* client, ArrayList* manifest) {
    paths, loading and sending nothing.  --delete-before/--delete-during need the
    complete keep-set manifest before the first data byte, so it is built by a
    dedicated pre-scan pass and transmitted early; the data pass then re-scans
-   with a fresh scanner. */
+   with a fresh scanner.  A source I/O error is fatal unless the options carry
+   --ignore-errors, in which case the scan continues past the unreadable
+   directory and *io_error_out reports it (the caller still performs the
+   deletion but reports the run as errored). */
 static bool scan_paths_only(const Config* config, const ScannerOptions* options,
-                            ArrayList* manifest) {
+                            ArrayList* manifest, bool* io_error_out) {
+  if (io_error_out)
+    *io_error_out = false;
   DirectoryScanner* scanner =
       directory_scanner_create_with_options(config->send_directory, options);
   if (!scanner)
@@ -685,6 +705,8 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
   }
   if (ok && directory_scanner_failed(scanner))
     ok = false;
+  if (io_error_out)
+    *io_error_out = directory_scanner_had_io_error(scanner);
   directory_scanner_destroy(scanner);
   return ok;
 }
@@ -1004,7 +1026,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   if (context->early_delete) {
     /* The keep-set manifest was prebuilt by a path-only pre-scan.  Transmit it
        and wait for the receiver to delete extras before streaming any data. */
-    if (!send_delete_manifest_early(client, context->manifest)) {
+    if (!send_delete_manifest_early(client, context->manifest, context->excluded_paths)) {
       pipeline_cancel(context);
       disconnect_transfer_client(client);
       mark_sender_done(context);
@@ -1026,10 +1048,15 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         return thrd_error;
       }
       if (context->config->use_delete && !context->early_delete) {
-        if (send_delete_manifest(client->file_descriptor, context->manifest) != 0)
+        if (send_delete_manifest(client->file_descriptor, context->manifest,
+                                 context->excluded_paths) != 0)
           goto send_fail;
       }
       bool ok = finalize_transfer(client, context->config, context->remove_source_files);
+      if (!ok && context->config->use_delete)
+        log_message(LOG_LEVEL_ERROR,
+                    "server reported a deletion failure (--delete); see the server log for the "
+                    "reason (a --max-delete limit that the run would exceed deletes nothing)");
       if (ok)
         remove_transferred_sources(context->config, context->remove_source_files);
       mtx_lock(&context->mutex_progress);
@@ -1091,6 +1118,12 @@ static int scan_directory_multithreaded(void* pipeline_context) {
     protocol_session_unbind();
     return thrd_error;
   }
+  /* The keep-set manifest for the late modes is built from this data pass, so
+     the parallel scanner records the protected excluded prefixes here.  The
+     early modes already transmitted the pre-scan keep-set and its protected
+     list, so the data pass must not append to it again. */
+  if (!context->early_delete)
+    prepared.options.excluded_paths = context->excluded_paths;
   bool dirs_mode = prepared.options.dirs;
   DirectoryScanner* dscanner = NULL;
   ParallelScanner* scanner = NULL;
@@ -1152,6 +1185,15 @@ static int scan_directory_multithreaded(void* pipeline_context) {
     pipeline_cancel(context);
     protocol_session_unbind();
     return thrd_error;
+  }
+  /* --ignore-errors: an unreadable subdirectory was skipped (workers recorded
+     io_error, not failure); the deletion still runs but the run reports it. */
+  bool had_io =
+      dirs_mode ? directory_scanner_had_io_error(dscanner) : parallel_scanner_had_io_error(scanner);
+  if (had_io) {
+    mtx_lock(&context->mutex_scanner);
+    context->scan_had_io_error = true;
+    mtx_unlock(&context->mutex_scanner);
   }
   mtx_lock(&context->mutex_scanner);
   context->scanner_done = true;
@@ -1280,8 +1322,11 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
   ArrayList* remove_sources = NULL;
+  /* Protected excluded prefixes (delete-excluded default protection). */
+  ArrayList* excluded = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
   bool send_failed = false;
+  bool had_scan_io = false;
   PreparedScanner prepared;
   memset(&prepared, 0, sizeof(prepared));
   if (!config_send(client->file_descriptor, config))
@@ -1292,6 +1337,16 @@ int send_files(Config* config) {
     remove_sources = array_list_create(source_file_destroy);
   if (config->remove_source_files && !remove_sources)
     goto send_fail;
+  /* Unless --delete-excluded opts out, collect the paths the source scan prunes
+     by user-selection rules so the receiver protects their destination mirrors
+     from --delete (rsync's default).  Only scans that build the keep-set get the
+     sink attached (prescan for early timing, the streaming data pass otherwise). */
+  if (config->use_delete && !config->delete_excluded) {
+    excluded = array_list_create(free);
+    if (!excluded)
+      goto send_fail;
+    prepared.options.excluded_paths = excluded;
+  }
   /* The late-timing modes (plain --delete / --delete-after / --delete-delay)
      build the manifest while streaming and send it after the last data frame.
      The early modes (--delete-before/--delete-during) send it up front from a
@@ -1303,13 +1358,15 @@ int send_files(Config* config) {
     ArrayList* early_manifest = array_list_create(free);
     if (!early_manifest)
       goto send_fail;
-    if (!scan_paths_only(config, &prepared.options, early_manifest)) {
-      array_list_delete(early_manifest);
-      goto send_fail;
-    }
-    bool early_ok = send_delete_manifest_early(client, early_manifest);
+    bool prescan_ok = scan_paths_only(config, &prepared.options, early_manifest, &had_scan_io);
+    bool early_ok = false;
+    if (prescan_ok)
+      early_ok = send_delete_manifest_early(client, early_manifest, excluded);
     array_list_delete(early_manifest);
-    if (!early_ok)
+    /* The keep-set (and its protected prefixes) are already on the wire; the
+       data pass must not append to the exclusion list again. */
+    prepared.options.excluded_paths = NULL;
+    if (!prescan_ok || !early_ok)
       goto send_fail;
   } else if (config->use_delete) {
     manifest = array_list_create(free);
@@ -1377,10 +1434,12 @@ int send_files(Config* config) {
   }
   if (directory_scanner_failed(scanner))
     goto send_fail;
+  if (directory_scanner_had_io_error(scanner))
+    had_scan_io = true;
   if (manifest) {
     /* Late (commit) ordering: all file data is out; transmit the keep-set
        manifest so the receiver deletes only after the transfer succeeds. */
-    if (send_delete_manifest(client->file_descriptor, manifest) != 0) {
+    if (send_delete_manifest(client->file_descriptor, manifest, excluded) != 0) {
       array_list_delete(manifest);
       manifest = NULL;
       goto send_fail;
@@ -1389,6 +1448,10 @@ int send_files(Config* config) {
     manifest = NULL;
   }
   bool ok = finalize_transfer(client, config, remove_sources);
+  if (!ok && config->use_delete)
+    log_message(LOG_LEVEL_ERROR,
+                "server reported a deletion failure (--delete); see the server log for the "
+                "reason (a --max-delete limit that the run would exceed deletes nothing)");
   if (ok)
     remove_transferred_sources(config, remove_sources);
   if (config->show_progress && !config->quiet)
@@ -1410,13 +1473,17 @@ int send_files(Config* config) {
   }
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    total_bytes / 1048576.0);
-  ret = ok ? 0 : 1;
+  /* --ignore-errors: an unreadable source directory was skipped but the run
+     still completed (and deleted); report the run as errored like rsync does. */
+  ret = (ok && !had_scan_io) ? 0 : 1;
 
 send_fail:
   /* Single cleanup path for all exits. The manifest is intentionally deleted
      here even on success without --delete, fixing a pre-existing leak. */
   if (manifest)
     array_list_delete(manifest);
+  if (excluded)
+    array_list_delete(excluded);
   if (remove_sources)
     array_list_delete(remove_sources);
   if (scanner)
@@ -1468,20 +1535,32 @@ int send_files_multithreaded(Config** config_ptr) {
     return 1;
   }
   *config_ptr = NULL; /* context now owns config through all remaining paths */
+  bool collect_excluded = config->use_delete && !config->delete_excluded;
   if (config->use_delete) {
     context->manifest = array_list_create(free);
     if (!context->manifest) {
       pipeline_context_sender_destroy(context);
       return 1;
     }
+    if (collect_excluded) {
+      context->excluded_paths = array_list_create(free);
+      if (!context->excluded_paths) {
+        pipeline_context_sender_destroy(context);
+        return 1;
+      }
+    }
     if (config_delete_timing_early(config)) {
       /* --delete-before/--delete-during: build the complete keep-set manifest
          (paths only, nothing loaded or sent) up front so the sender thread can
-         transmit it before the first data byte. */
+         transmit it before the first data byte.  The path-only pre-scan also
+         fills the protected excluded prefixes. */
       PreparedScanner prepared;
       memset(&prepared, 0, sizeof(prepared));
-      bool prebuilt = prepare_scanner(config, 4, &prepared) &&
-                      scan_paths_only(config, &prepared.options, context->manifest);
+      bool prepared_ok = prepare_scanner(config, 4, &prepared);
+      if (prepared_ok && context->excluded_paths)
+        prepared.options.excluded_paths = context->excluded_paths;
+      bool prebuilt = prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
+                                                     &context->scan_had_io_error);
       prepared_scanner_destroy(&prepared);
       if (!prebuilt) {
         pipeline_context_sender_destroy(context);
@@ -1548,6 +1627,13 @@ int send_files_multithreaded(Config** config_ptr) {
     thrd_join(progress, NULL);
   }
 
+  bool scan_io;
+  mtx_lock(&context->mutex_scanner);
+  scan_io = context->scan_had_io_error;
+  mtx_unlock(&context->mutex_scanner);
+  bool sender_ok = sender_result == thrd_success;
+  /* --ignore-errors: the run completed (and deleted) past an unreadable source
+     directory; report it as errored like rsync does. */
   pipeline_context_sender_destroy(context);
-  return sender_result == thrd_success ? 0 : 1;
+  return sender_ok && !scan_io ? 0 : 1;
 }

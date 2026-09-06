@@ -112,6 +112,10 @@ typedef struct {
   char* path;
   struct stat stats;
   bool is_directory;
+  /* True when the entry was pruned by a user selection rule (--filter/-C/per-dir
+     rules, the --exclude/--include layer, or --max-size/--min-size) rather than
+     skipped for another reason (unreadable, symlink policy, not applicable). */
+  bool excluded;
 } ScannerEntry;
 
 /* --one-file-system (-x) decision. Only directories can carry a different
@@ -161,6 +165,38 @@ static bool entry_passes_selection(const FileListSet* file_list, const FilterRul
   return true;
 }
 
+/* Append `rel` to the caller's exclusion sink, taking `mtx` when shared across
+   parallel worker threads.  Returns false on allocation failure (list left
+   unchanged). */
+static bool excluded_sink_append(ArrayList* list, mtx_t* mtx, const char* rel) {
+  if (!list)
+    return true;
+  char* dup = str_dup(rel);
+  if (!dup)
+    return false;
+  if (mtx)
+    mtx_lock(mtx);
+  bool ok = array_list_add(list, dup);
+  if (mtx)
+    mtx_unlock(mtx);
+  if (!ok)
+    free(dup);
+  return ok;
+}
+
+/* Record one pruned-by-user-selection filesystem path in the scanner's
+   exclusion sink (see ScannerOptions.excluded_paths).  The stored form is the
+   entry's wire/destination-relative path (a single leading '/' removed, exactly
+   how manifest keep entries are stored), so the receiver's walker prefixes
+   match the destination layout.  An allocation failure is a fatal scan error. */
+static void scanner_record_excluded(DirectoryScanner* scanner, const char* fs_path) {
+  if (!scanner->excluded_paths || !fs_path)
+    return;
+  const char* rel = *fs_path == '/' ? fs_path + 1 : fs_path;
+  if (!excluded_sink_append(scanner->excluded_paths, scanner->excluded_mutex, rel))
+    scanner->failed = true;
+}
+
 /* Merge the open directory's own .rsync-filter rules into the inherited
  * context, returning the context used for this directory's entries. On a parse
  * error the scanner is marked failed. Returns 0 on success, -1 on failure. */
@@ -198,6 +234,7 @@ static int open_directory_filter_context(DirectoryScanner* scanner, const Filter
 static int scanner_inspect_entry(const ScannerOptions* options, const char* source_root,
                                  const char* containing_dir, const char* name,
                                  ScannerEntry* entry) {
+  entry->excluded = false;
   entry->path = path_cat(containing_dir, name);
   if (!entry->path)
     return -1;
@@ -241,19 +278,25 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
   if (entry->is_directory)
     return 1;
   for (int i = 0; i < options->exclude_count; i++)
-    if (glob_match(options->exclude_patterns[i], name))
+    if (glob_match(options->exclude_patterns[i], name)) {
+      entry->excluded = true;
       goto skip;
+    }
   if (options->include_count > 0) {
     bool included = false;
     for (int i = 0; i < options->include_count; i++)
       if (glob_match(options->include_patterns[i], name))
         included = true;
-    if (!included)
+    if (!included) {
+      entry->excluded = true;
       goto skip;
+    }
   }
   if ((options->max_size > 0 && (unsigned long long)entry->stats.st_size > options->max_size) ||
-      (options->min_size > 0 && (unsigned long long)entry->stats.st_size < options->min_size))
+      (options->min_size > 0 && (unsigned long long)entry->stats.st_size < options->min_size)) {
+    entry->excluded = true;
     goto skip;
+  }
   return 1;
 
 skip:
@@ -306,8 +349,13 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->file_list = options->file_list;
   scanner->base_filters = options->base_filters;
   scanner->per_dir_filters = options->per_dir_filters;
+  scanner->excluded_paths = options->excluded_paths;
+  scanner->excluded_mutex = options->excluded_mutex;
+  scanner->ignore_io_errors = options->ignore_io_errors;
+  scanner->io_error = false;
   scanner->dirs_mode = options->dirs;
   scanner->relative_mode = options->relative && options->file_list != NULL;
+  scanner->prune_empty_dirs = options->prune_empty_dirs;
   scanner->dirs_root_emitted = false;
   scanner->list_index = 0;
   scanner->dirs_batch = NULL;
@@ -360,27 +408,29 @@ DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_
                                            unsigned long long min_size, int max_depth,
                                            bool follow_symlinks, bool copy_links, bool safe_links,
                                            bool copy_unsafe_links, bool checksum) {
-  ScannerOptions options = {use_metadata,
-                            chunk_size,
-                            exclude_patterns,
-                            exclude_count,
-                            include_patterns,
-                            include_count,
-                            max_size,
-                            min_size,
-                            max_depth,
-                            0,
-                            follow_symlinks,
-                            copy_links,
-                            safe_links,
-                            copy_unsafe_links,
-                            checksum,
-                            false,
-                            NULL,
-                            NULL,
-                            false,
-                            false,
-                            false};
+  ScannerOptions options = {
+      .use_metadata = use_metadata,
+      .chunk_size = chunk_size,
+      .exclude_patterns = exclude_patterns,
+      .exclude_count = exclude_count,
+      .include_patterns = include_patterns,
+      .include_count = include_count,
+      .max_size = max_size,
+      .min_size = min_size,
+      .max_depth = max_depth,
+      .num_threads = 0,
+      .follow_symlinks = follow_symlinks,
+      .copy_links = copy_links,
+      .safe_links = safe_links,
+      .copy_unsafe_links = copy_unsafe_links,
+      .checksum = checksum,
+      .one_file_system = false,
+      .file_list = NULL,
+      .base_filters = NULL,
+      .per_dir_filters = false,
+      .dirs = false,
+      .relative = false,
+  };
   return directory_scanner_create_with_options(root_directory, &options);
 }
 
@@ -413,48 +463,66 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
   return chunk;
 }
 
+/* Open the next queued directory and set up its filter context.  Returns 1 when
+   a directory is open, 0 when the queue is exhausted, and -1 on a fatal error.
+   A directory that cannot be opened is an I/O error: it is recorded on the
+   scanner and, when --ignore-errors is active, skipped so the rest of the tree
+   is still scanned (the caller decides whether to treat the recorded error as
+   fatal). */
 static int open_next_directory(DirectoryScanner* scanner) {
   if (scanner->current_dir) {
     closedir(scanner->current_dir);
     scanner->current_dir = NULL;
   }
   free(scanner->current_path);
+  scanner->current_path = NULL;
 
-  if (queue_is_empty(scanner->directories))
-    return 0;
+  while (!queue_is_empty(scanner->directories)) {
+    DirEntry* de = (DirEntry*)queue_dequeue(scanner->directories);
+    scanner->current_path = de->path;
+    scanner->current_depth = de->depth;
+    /* The seed directory inherits the scanner's configured context (the root
+     * .rsync-filter context in parallel mode); other dirs inherit the context of
+     * the directory that enqueued them. */
+    const FilterNode* inherited = scanner->at_seed_dir ? scanner->seed_node : de->context;
+    scanner->at_seed_dir = false;
+    free(de);
 
-  DirEntry* de = (DirEntry*)queue_dequeue(scanner->directories);
-  scanner->current_path = de->path;
-  scanner->current_depth = de->depth;
-  /* The seed directory inherits the scanner's configured context (the root
-   * .rsync-filter context in parallel mode); other dirs inherit the context of
-   * the directory that enqueued them. */
-  const FilterNode* inherited = scanner->at_seed_dir ? scanner->seed_node : de->context;
-  scanner->at_seed_dir = false;
-  free(de);
+    free(scanner->current_rel);
+    scanner->current_rel = scanner_path_relative(scanner->root_path, scanner->current_path);
+    if (!scanner->current_rel) {
+      log_message(LOG_LEVEL_ERROR, "Could not compute relative path under %s", scanner->root_path);
+      scanner->failed = true;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
+      return -1;
+    }
 
-  free(scanner->current_rel);
-  scanner->current_rel = scanner_path_relative(scanner->root_path, scanner->current_path);
-  if (!scanner->current_rel) {
-    log_message(LOG_LEVEL_ERROR, "Could not compute relative path under %s", scanner->root_path);
-    scanner->failed = true;
-    return -1;
+    scanner->current_dir = opendir(scanner->current_path);
+    if (scanner->current_dir == NULL) {
+      scanner->io_error = true;
+      log_perror("Could not open directory");
+      free(scanner->current_rel);
+      scanner->current_rel = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
+      if (!scanner->ignore_io_errors) {
+        scanner->failed = true;
+        return -1;
+      }
+      /* --ignore-errors: record the I/O error and keep scanning the rest. */
+      continue;
+    }
+    if (open_directory_filter_context(scanner, inherited) != 0) {
+      closedir(scanner->current_dir);
+      scanner->current_dir = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
+      return -1;
+    }
+    return 1;
   }
-
-  scanner->current_dir = opendir(scanner->current_path);
-  if (scanner->current_dir == NULL) {
-    log_perror("Could not open directory");
-    free(scanner->current_path);
-    scanner->current_path = NULL;
-    scanner->failed = true;
-    return -1;
-  }
-  if (open_directory_filter_context(scanner, inherited) != 0) {
-    closedir(scanner->current_dir);
-    scanner->current_dir = NULL;
-    return -1;
-  }
-  return 1;
+  return 0;
 }
 
 /* ---- --dirs mode ----
@@ -563,12 +631,35 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
   return file;
 }
 
+/* True when the directory contains no entries at all (ignoring "." and "..").
+   An unreadable directory is reported as non-empty so the regular (erroring)
+   root-entry path runs instead of silently transferring nothing. */
+static bool dirs_source_dir_is_empty(const char* path) {
+  DIR* dir = opendir(path);
+  if (!dir)
+    return false;
+  bool empty = true;
+  const struct dirent* entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+      empty = false;
+      break;
+    }
+  }
+  closedir(dir);
+  return empty;
+}
+
 /* The next File from the --dirs generator, or NULL when exhausted. */
 static File* dirs_next_file(DirectoryScanner* scanner) {
   if (!scanner->file_list) {
     if (scanner->dirs_root_emitted)
       return NULL;
     scanner->dirs_root_emitted = true;
+    /* --prune-empty-dirs: a physically empty source directory's explicit entry
+       would only create an empty destination directory, so it is omitted. */
+    if (scanner->prune_empty_dirs && dirs_source_dir_is_empty(scanner->root_path))
+      return NULL;
     return dirs_root_dir_file(scanner);
   }
   while (scanner->list_index < scanner->file_list->count) {
@@ -663,27 +754,29 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
 
-    ScannerOptions options = {scanner->use_metadata,
-                              scanner->chunk_size,
-                              scanner->exclude_patterns,
-                              scanner->exclude_count,
-                              scanner->include_patterns,
-                              scanner->include_count,
-                              scanner->max_size,
-                              scanner->min_size,
-                              scanner->max_depth,
-                              0,
-                              scanner->follow_symlinks,
-                              scanner->copy_links,
-                              scanner->safe_links,
-                              scanner->copy_unsafe_links,
-                              scanner->checksum,
-                              scanner->one_file_system,
-                              scanner->file_list,
-                              scanner->base_filters,
-                              scanner->per_dir_filters,
-                              false,
-                              false};
+    ScannerOptions options = {
+        .use_metadata = scanner->use_metadata,
+        .chunk_size = scanner->chunk_size,
+        .exclude_patterns = scanner->exclude_patterns,
+        .exclude_count = scanner->exclude_count,
+        .include_patterns = scanner->include_patterns,
+        .include_count = scanner->include_count,
+        .max_size = scanner->max_size,
+        .min_size = scanner->min_size,
+        .max_depth = scanner->max_depth,
+        .num_threads = 0,
+        .follow_symlinks = scanner->follow_symlinks,
+        .copy_links = scanner->copy_links,
+        .safe_links = scanner->safe_links,
+        .copy_unsafe_links = scanner->copy_unsafe_links,
+        .checksum = scanner->checksum,
+        .one_file_system = scanner->one_file_system,
+        .file_list = scanner->file_list,
+        .base_filters = scanner->base_filters,
+        .per_dir_filters = scanner->per_dir_filters,
+        .dirs = false,
+        .relative = false,
+    };
     ScannerEntry inspected;
     int inspection = scanner_inspect_entry(&options, scanner->current_path, scanner->current_path,
                                            entry->d_name, &inspected);
@@ -691,8 +784,21 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       scanner->failed = true;
       break;
     }
-    if (inspection == 0)
+    if (inspection == 0) {
+      /* The entry was pruned by a user selection rule (exclude/include/size) or
+         skipped for another reason; only the user-selection prunes protect the
+         corresponding destination mirror from --delete. */
+      if (inspected.excluded) {
+        char* abs_path = path_cat(scanner->current_path, entry->d_name);
+        if (!abs_path) {
+          scanner->failed = true;
+          break;
+        }
+        scanner_record_excluded(scanner, abs_path);
+        free(abs_path);
+      }
       continue;
+    }
     char* cur_path = inspected.path;
     struct stat stats = inspected.stats;
 
@@ -708,6 +814,16 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     bool passes_selection =
         entry_passes_selection(scanner->file_list, scanner->base_filters, scanner->current_node,
                                rel, entry->d_name, is_dir, scanner->per_dir_filters);
+    if (!passes_selection) {
+      /* --files-from subset pruning is not a filter exclusion: its delete
+         semantics stay keep-set-only (an unlisted source path is treated as
+         absent, so its destination mirror is a deletable extra).  A rule-based
+         exclusion is recorded as a protected prefix.  -R + --files-from bare
+         wire paths are never recorded (see ScannerOptions.excluded_paths). */
+      bool files_from_prune = scanner->file_list && !file_list_affects(scanner->file_list, rel);
+      if (!files_from_prune && !scanner->relative_mode)
+        scanner_record_excluded(scanner, cur_path);
+    }
     /* With -R + --files-from the wire/destination path is the entry's bare
        relative path; keep `rel` alive to attach it to a transferred file. */
     char* rel_copy = scanner->relative_mode ? str_dup(rel) : NULL;
@@ -796,6 +912,10 @@ bool directory_scanner_failed(const DirectoryScanner* scanner) {
   return scanner == NULL || scanner->failed;
 }
 
+bool directory_scanner_had_io_error(const DirectoryScanner* scanner) {
+  return scanner != NULL && scanner->io_error;
+}
+
 typedef struct {
   ParallelScanner* ps;
   char** dirs;
@@ -826,10 +946,12 @@ static int parallel_worker_thread(void* arg) {
     /* Root .rsync-filter rules (parsed by the parallel scanner) apply to the
      * contents of every assigned subdirectory. Relative paths (used by the
      * allow-set and per-directory rules) are computed against the transfer
-     * root, not the subdirectory the worker is seeded with. */
+     * root, not the subdirectory the worker is seeded with.  Exclusion
+     * recording shares one caller-owned list across the workers. */
     free(ds->root_path);
     ds->root_path = str_dup(wa->root_dir);
     ds->seed_node = wa->ps->root_filter_node;
+    ds->excluded_mutex = &wa->ps->result_mutex;
     Chunk* chunk;
     while ((chunk = directory_scanner_next(ds)) != NULL) {
       if (!queue_enqueue_multithreaded_cancel(wa->ps->result_queue, chunk, &wa->ps->result_mutex,
@@ -845,6 +967,11 @@ static int parallel_worker_thread(void* arg) {
       atomic_store(&wa->ps->cancelled, true);
       cnd_broadcast(&wa->ps->result_not_empty);
       cnd_broadcast(&wa->ps->result_not_full);
+      mtx_unlock(&wa->ps->result_mutex);
+    } else if (directory_scanner_had_io_error(ds)) {
+      /* --ignore-errors path: an unreadable directory was skipped, not fatal. */
+      mtx_lock(&wa->ps->result_mutex);
+      wa->ps->io_error = true;
       mtx_unlock(&wa->ps->result_mutex);
     }
     directory_scanner_destroy(ds);
@@ -993,8 +1120,23 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     ps->failed = true;
     return;
   }
-  if (inspection == 0)
+  if (inspection == 0) {
+    if (inspected.excluded && options->excluded_paths) {
+      /* A root-level user-selection prune protects the destination mirror of
+         the same-named wire path (at the root the bare name is the wire path in
+         every layout). */
+      char* abs_path = path_cat(root_directory, entry->d_name);
+      if (!abs_path) {
+        ps->failed = true;
+      } else {
+        const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
+        if (!excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel))
+          ps->failed = true;
+        free(abs_path);
+      }
+    }
     return;
+  }
   char* cur_path = inspected.path;
   struct stat st = inspected.stats;
   bool is_dir = inspected.is_directory;
@@ -1009,6 +1151,14 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   /* -R + --files-from: root-level files keep their bare relative send path. */
   bool use_rel = options->relative && options->file_list != NULL;
   if (!passes) {
+    /* --files-from subset pruning is not a filter exclusion; -R bare-wire-path
+       exclusions are never recorded (see ScannerOptions.excluded_paths). */
+    bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
+    if (!files_from_prune && !use_rel && options->excluded_paths) {
+      const char* rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
+      if (!excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
+        ps->failed = true;
+    }
     free(rel);
     free(cur_path);
     return;
@@ -1256,6 +1406,10 @@ Chunk* parallel_scanner_next(ParallelScanner* ps) {
 
 bool parallel_scanner_failed(const ParallelScanner* ps) {
   return ps == NULL || ps->failed;
+}
+
+bool parallel_scanner_had_io_error(const ParallelScanner* ps) {
+  return ps != NULL && ps->io_error;
 }
 
 void parallel_scanner_destroy(ParallelScanner* ps) {
