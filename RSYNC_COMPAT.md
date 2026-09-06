@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 51 | Feature works end-to-end |
+| ✅ Implemented | 54 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 87 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 84 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
@@ -38,14 +38,14 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `--stats` | Give transfer stats | ✅ Implemented | Prints file/byte counts |
 | `-h`, `--human-readable` | Human-readable numbers | ✅ Implemented | Formats transfer byte sizes using binary units |
-| `-i`, `--itemize-changes` | Per-file change summary | ❌ Not Implemented | Removed because it had no effect |
+| `-i`, `--itemize-changes` | Per-file change summary | ✅ Implemented | Prints rsync-style `>f+++++++++` lines to stdout only for files actually sent (also under `-m`); unchanged files print nothing, matching single-`-i` behavior |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
 | `-P` | Same as --partial --progress | ⚠️ Partial | Parses and enables progress, but interrupted files are not retained for resumable transfers |
-| `--out-format=FORMAT` | Custom output format | ❌ Not Implemented | Removed because it had no effect |
+| `--out-format=FORMAT` | Custom output format | ✅ Implemented | Per-transfer template on stdout; tokens `%f` `%n` `%l` `%b` `%M` `%%`; unknown escapes preserved |
 | `--log-file=FILE` | Log to file | ✅ Implemented | `log_file` config field |
-| `--log-file-format=FMT` | Log format | ❌ Not Implemented | |
+| `--log-file-format=FMT` | Log format | ✅ Implemented | Requires `--log-file`; writes one template line per transferred file using the same token set as `--out-format` |
 | `--8-bit-output`, `-8` | Leave high-bit chars unescaped | ✅ Implemented | Applies to displayed paths and protocol debug output |
-| `--list-only` | List files instead of copying | ❌ Not Implemented | Removed because it had no effect |
+| `--list-only` | List files instead of copying | ✅ Implemented | `ls -l`-style listing of files that would be transferred; scans the source only, contacts no server, writes nothing; also works with `-n` |
 
 ## 3. File Selection
 

@@ -79,6 +79,7 @@ typedef struct Config {
   // Issue #122: Output/logging options
   bool itemize_changes;
   char* out_format;
+  char* log_file_format;
   int info_level;
   int debug_level;
   bool list_only;

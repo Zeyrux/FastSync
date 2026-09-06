@@ -44,6 +44,10 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "--delta cannot be combined with -f (sendfile)");
     return false;
   }
+  if (config->log_file_format && !config->log_file) {
+    log_message(LOG_LEVEL_ERROR, "--log-file-format requires --log-file");
+    return false;
+  }
   if (config->append || config->append_verify) {
     fprintf(
         stderr,

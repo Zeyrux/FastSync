@@ -602,10 +602,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--xattrs",
                                         "-D",
                                         "--devices",
-                                        "-i",
-                                        "--itemize-changes",
-                                        "--out-format",
-                                        "--list-only",
                                         "--append",
                                         "--append-verify",
                                         "--delete-excluded",
@@ -1126,7 +1122,8 @@ static void test_parse_args_table_equals_string_and_int_options() {
 /* Options that take a separate value must report "missing argument", not the
  * generic "Unknown option", when they are the final argv entry. */
 static void test_parse_args_missing_argument_diagnostic() {
-  static const char* const options[] = {"--exclude", "--server-port", "--skip-compress", "-T"};
+  static const char* const options[] = {"--exclude", "--server-port", "--skip-compress",
+                                        "-T",        "--out-format",  "--log-file-format"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
@@ -1150,6 +1147,66 @@ static void test_parse_args_missing_argument_diagnostic() {
     fclose(log_file);
     config_delete(cfg);
   }
+}
+
+static void test_parse_args_itemize_changes() {
+  static const char* const flags[] = {"-i", "--itemize-changes"};
+  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)flags[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->itemize_changes);
+    EXPECT_EQ_INT(positional_count, 2);
+    config_delete(cfg);
+  }
+}
+
+static void test_parse_args_list_only() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--list-only", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->list_only);
+  config_delete(cfg);
+}
+
+static void test_parse_args_out_format() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--out-format=%f %l", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->out_format, "%f %l");
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* separate_argv[] = {"fastsync", "--out-format", "%f %l", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, separate_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->out_format, "%f %l");
+  config_delete(cfg);
+}
+
+static void test_parse_args_log_file_format() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--log-file-format=%n %M", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->log_file_format, "%n %M");
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* separate_argv[] = {"fastsync", "--log-file-format", "%n %M", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, separate_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->log_file_format, "%n %M");
+  config_delete(cfg);
 }
 
 void test_client_cli() {
@@ -1223,6 +1280,10 @@ void test_client_cli() {
   test_parse_args_table_equals_string_and_int_options();
   test_parse_args_missing_argument_diagnostic();
   test_parse_args_partial_progress();
+  test_parse_args_itemize_changes();
+  test_parse_args_list_only();
+  test_parse_args_out_format();
+  test_parse_args_log_file_format();
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
 }

@@ -1021,3 +1021,117 @@ class TestLargeFile:
         assert result.returncode == 0, f"Large-file sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
         assert filecmp.cmp(source_file, os.path.join(received, "big.bin"), shallow=False)
+
+
+def _source_files():
+    """All source paths (absolute) that a transfer would send right now."""
+    return [
+        os.path.join(root, name)
+        for root, _dirs, names in os.walk(SOURCE_DIR)
+        for name in names
+    ]
+
+
+class TestListOnly:
+    """--list-only prints every transfer candidate and changes nothing."""
+
+    def test_list_only_prints_each_file_and_does_not_transfer(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only"])
+        assert result.returncode == 0, f"list-only failed: {result.stderr[:200]}"
+        for full_path in _source_files():
+            assert full_path in result.stdout, f"list-only omitted {full_path}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert not os.path.exists(received), "list-only wrote to the destination"
+
+    def test_list_only_with_dry_run_does_not_error(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "--dry-run"])
+        assert result.returncode == 0, f"list-only -n failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert not os.path.exists(received)
+
+
+class TestItemizeChanges:
+    """-i/--itemize-changes prints rsync-style lines only for files sent."""
+
+    def test_first_run_prints_sent_lines(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "-i"], port=shared_server.port)
+        assert result.returncode == 0, f"itemize sync failed: {result.stderr[:200]}"
+        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        assert sent_lines <= set(result.stdout.splitlines()), (
+            f"missing itemize lines; got {result.stdout[:500]}"
+        )
+
+    def test_incremental_second_run_prints_no_line_for_unchanged(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "-i", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
+        itemized = [line for line in result.stdout.splitlines() if line and line[0] in ">.<c"]
+        assert itemized == [], f"unchanged files were itemized: {itemized[:5]}"
+
+    def test_multithreaded_emits_same_itemize_lines(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-M", "-i", "-m"], port=shared_server.port)
+        assert result.returncode == 0, f"itemize -m sync failed: {result.stderr[:200]}"
+        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        assert sent_lines <= set(result.stdout.splitlines()), (
+            f"missing itemize lines in -m mode; got {result.stdout[:500]}"
+        )
+
+    def test_dry_run_with_itemize_does_not_error(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-i", "--dry-run"])
+        assert result.returncode == 0, f"dry-run -i failed: {result.stderr[:200]}"
+
+
+class TestOutFormat:
+    """--out-format prints a line per transferred file using the template."""
+
+    def test_out_format_path_and_size(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--out-format=%f %l"], port=shared_server.port)
+        assert result.returncode == 0, f"out-format sync failed: {result.stderr[:200]}"
+        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        got = set(result.stdout.splitlines())
+        assert expected <= got, f"out-format lines missing: expected {len(expected)} got {len(got)}"
+
+    def test_out_format_multithreaded_matches_single(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--out-format=%f %l", "-m"], port=shared_server.port)
+        assert result.returncode == 0, f"out-format -m sync failed: {result.stderr[:200]}"
+        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        got = set(result.stdout.splitlines())
+        assert expected <= got, f"out-format -m lines missing: {result.stdout[:500]}"
+
+
+class TestLogFileFormat:
+    """--log-file plus --log-file-format writes per-file lines to the log."""
+
+    def test_log_file_format_writes_transferred_files(self, shared_server):
+        clean_dir(DEST_DIR)
+        log_path = os.path.join(TEST_DATA_DIR, "itemize_transfer.log")
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+        result, _ = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--log-file", log_path, "--log-file-format=%f %l"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"log-file sync failed: {result.stderr[:200]}"
+        assert os.path.exists(log_path), "--log-file created no log"
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        for line in expected:
+            assert line in content, f"log file missing {line!r}"
+
