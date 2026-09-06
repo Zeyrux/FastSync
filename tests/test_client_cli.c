@@ -1356,7 +1356,6 @@ static void test_parse_args_filter_rules() {
   config_delete(cfg);
 }
 
-
 static void test_parse_args_from0_cvs_filter_file_flags() {
   static const struct {
     const char* arg;
@@ -1396,14 +1395,12 @@ static void test_parse_args_from0_cvs_filter_file_flags() {
   }
 }
 
-
 static void write_file_bytes(const char* path, const char* bytes, size_t len) {
   FILE* fp = fopen(path, "wb");
   EXPECT_NOT_NULL(fp);
   EXPECT_EQ_INT((int)fwrite(bytes, 1, len, fp), (int)len);
   fclose(fp);
 }
-
 
 static void test_parse_args_files_from() {
   const char* list_path = "cli_files_from_list.txt";
@@ -1487,7 +1484,6 @@ static void test_parse_args_files_from() {
   config_delete(cfg);
   remove(list_path);
 }
-
 
 void test_client_cli() {
   test_validate_config_required_paths();
