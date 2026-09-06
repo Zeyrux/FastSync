@@ -256,6 +256,20 @@ void handler(int file_descriptor) {
     thrd_join(writer, &writer_result);
     bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
     if (transfer_ok) {
+      /* Commit-style (late) deletion: receive_thread handed the keep-set
+         manifest here instead of deleting while write_thread might still be
+         draining, so by now every file is on disk and the whole transfer is
+         known to have succeeded.  Remove the extras before publishing a
+         --delay-updates run; the walker skips the staging directory. */
+      if (context->deferred_manifest) {
+        if (!manifest_delete_extras(config, context->deferred_manifest)) {
+          transfer_ok = false;
+        }
+        array_list_delete(context->deferred_manifest);
+        context->deferred_manifest = NULL;
+      }
+    }
+    if (transfer_ok) {
       /* --delay-updates: receive_thread has finished the whole protocol stream
          (including manifest/delete handling) and write_thread has drained its
          queue, so every staged file is complete.  Publish atomically before the

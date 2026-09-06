@@ -254,10 +254,6 @@ static void disconnect_transfer_client(Client* client) {
   client_delete(client);
 }
 
-static ArrayList* create_transfer_manifest(const Config* config) {
-  return config->use_delete ? array_list_create(free) : NULL;
-}
-
 static bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
   if (!manifest)
     return true;
@@ -597,6 +593,53 @@ static int send_delete_manifest(int fd, ArrayList* manifest) {
   return 0;
 }
 
+/* Transmit the keep-set manifest and wait for the receiver's verdict.  Used by
+   --delete-before/--delete-during, where the extras are removed on the receiver
+   BEFORE the first byte of file data is sent: the receiver acknowledges with
+   STATUS_OK once the bounded delete committed, or STATUS_ERROR if it could not
+   (in which case the sender aborts without streaming any data). */
+static bool send_delete_manifest_early(Client* client, ArrayList* manifest) {
+  if (!client || !manifest)
+    return false;
+  if (send_delete_manifest(client->file_descriptor, manifest) != 0)
+    return false;
+  Status ack;
+  if (!receive_status(client->file_descriptor, &ack))
+    return false;
+  if (ack != STATUS_OK) {
+    log_message(LOG_LEVEL_ERROR, "Server failed to delete files before the transfer");
+    return false;
+  }
+  return true;
+}
+
+/* Walk the whole source tree once collecting only destination-relative wire
+   paths, loading and sending nothing.  --delete-before/--delete-during need the
+   complete keep-set manifest before the first data byte, so it is built by a
+   dedicated pre-scan pass and transmitted early; the data pass then re-scans
+   with a fresh scanner. */
+static bool scan_paths_only(const Config* config, const ScannerOptions* options,
+                            ArrayList* manifest) {
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, options);
+  if (!scanner)
+    return false;
+  bool ok = true;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    if (!add_chunk_to_manifest(manifest, chunk)) {
+      ok = false;
+      chunk_destroy(chunk);
+      break;
+    }
+    chunk_destroy(chunk);
+  }
+  if (ok && directory_scanner_failed(scanner))
+    ok = false;
+  directory_scanner_destroy(scanner);
+  return ok;
+}
+
 static int incremental_check(Client* client, File* file, const Config* config,
                              DeltaSignature** out_sig) {
   *out_sig = NULL;
@@ -906,6 +949,17 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     protocol_session_unbind();
     return thrd_error;
   }
+  if (context->early_delete) {
+    /* The keep-set manifest was prebuilt by a path-only pre-scan.  Transmit it
+       and wait for the receiver to delete extras before streaming any data. */
+    if (!send_delete_manifest_early(client, context->manifest)) {
+      pipeline_cancel(context);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
+      return thrd_error;
+    }
+  }
 
   while (true) {
     Chunk* current_chunk = queue_dequeue_multithreaded(
@@ -919,7 +973,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         protocol_session_unbind();
         return thrd_error;
       }
-      if (context->config->use_delete) {
+      if (context->config->use_delete && !context->early_delete) {
         if (send_delete_manifest(client->file_descriptor, context->manifest) != 0)
           goto send_fail;
       }
@@ -1013,7 +1067,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       failed = dirs_mode ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
       break;
     }
-    if (context->config->use_delete) {
+    if (context->config->use_delete && !context->early_delete) {
       mtx_lock(&context->mutex_scanner);
       bool manifest_ok = add_chunk_to_manifest(context->manifest, current_chunk);
       mtx_unlock(&context->mutex_scanner);
@@ -1172,19 +1226,46 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
   ArrayList* remove_sources = NULL;
+  bool delete_early = config->use_delete && config_delete_timing_early(config);
+  bool send_failed = false;
   PreparedScanner prepared;
   memset(&prepared, 0, sizeof(prepared));
   if (!config_send(client->file_descriptor, config))
     goto send_fail;
   if (!prepare_scanner(config, 0, &prepared))
     goto send_fail;
-  scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
-  manifest = create_transfer_manifest(config);
   if (config->remove_source_files)
     remove_sources = array_list_create(source_file_destroy);
-  if (!scanner || (config->use_delete && !manifest) ||
-      (config->remove_source_files && !remove_sources))
+  if (config->remove_source_files && !remove_sources)
     goto send_fail;
+  /* The late-timing modes (plain --delete / --delete-after / --delete-delay)
+     build the manifest while streaming and send it after the last data frame.
+     The early modes (--delete-before/--delete-during) send it up front from a
+     dedicated path-only pre-scan, so no manifest is kept during the data pass. */
+  if (delete_early) {
+    /* Pass 1: collect the complete keep-set (paths only, no data loaded) and
+       transmit it now, before any file data.  The receiver removes extras and
+       acks; the transfer aborts here if the deletion could not commit. */
+    ArrayList* early_manifest = array_list_create(free);
+    if (!early_manifest)
+      goto send_fail;
+    if (!scan_paths_only(config, &prepared.options, early_manifest)) {
+      array_list_delete(early_manifest);
+      goto send_fail;
+    }
+    bool early_ok = send_delete_manifest_early(client, early_manifest);
+    array_list_delete(early_manifest);
+    if (!early_ok)
+      goto send_fail;
+  } else if (config->use_delete) {
+    manifest = array_list_create(free);
+    if (!manifest)
+      goto send_fail;
+  }
+  scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
+  if (!scanner)
+    goto send_fail;
+
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   int total_files = 0;
@@ -1196,7 +1277,7 @@ int send_files(Config* config) {
       chunk_bytes += current_chunk->items[i]->data->size;
       total_files++;
     }
-    if (!add_chunk_to_manifest(manifest, current_chunk)) {
+    if (manifest && !add_chunk_to_manifest(manifest, current_chunk)) {
       chunk_destroy(current_chunk);
       goto send_fail;
     }
@@ -1220,9 +1301,7 @@ int send_files(Config* config) {
     if (send_chunk_with_removal(client, current_chunk, config, remove_sources) != 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
       chunk_destroy(current_chunk);
-      if (manifest)
-        array_list_delete(manifest);
-      manifest = NULL;
+      send_failed = true;
       break;
     }
     total_bytes += chunk_bytes;
@@ -1235,9 +1314,18 @@ int send_files(Config* config) {
     }
     chunk_destroy(current_chunk);
   }
-  if (directory_scanner_failed(scanner) || (config->use_delete && manifest == NULL))
+  if (send_failed) {
+    if (manifest) {
+      array_list_delete(manifest);
+      manifest = NULL;
+    }
     goto send_fail;
-  if (config->use_delete) {
+  }
+  if (directory_scanner_failed(scanner))
+    goto send_fail;
+  if (manifest) {
+    /* Late (commit) ordering: all file data is out; transmit the keep-set
+       manifest so the receiver deletes only after the transfer succeeds. */
     if (send_delete_manifest(client->file_descriptor, manifest) != 0) {
       array_list_delete(manifest);
       manifest = NULL;
@@ -1324,8 +1412,28 @@ int send_files_multithreaded(Config** config_ptr) {
     return 1;
   }
   *config_ptr = NULL; /* context now owns config through all remaining paths */
-  if (config->use_delete)
+  if (config->use_delete) {
     context->manifest = array_list_create(free);
+    if (!context->manifest) {
+      pipeline_context_sender_destroy(context);
+      return 1;
+    }
+    if (config_delete_timing_early(config)) {
+      /* --delete-before/--delete-during: build the complete keep-set manifest
+         (paths only, nothing loaded or sent) up front so the sender thread can
+         transmit it before the first data byte. */
+      PreparedScanner prepared;
+      memset(&prepared, 0, sizeof(prepared));
+      bool prebuilt = prepare_scanner(config, 4, &prepared) &&
+                      scan_paths_only(config, &prepared.options, context->manifest);
+      prepared_scanner_destroy(&prepared);
+      if (!prebuilt) {
+        pipeline_context_sender_destroy(context);
+        return 1;
+      }
+      context->early_delete = true;
+    }
+  }
   if (config->remove_source_files)
     context->remove_source_files = array_list_create(source_file_destroy);
   if ((config->use_delete && !context->manifest) ||

@@ -147,6 +147,19 @@ typedef struct Config {
   // PR #179: Delete policies
   bool delete_before;
 
+  /* rsync deletion-timing family (real from Phase 3).  At most one of
+     delete_before / delete_during / delete_delay / delete_after may be set, and
+     only together with use_delete (the CLI implies --delete for each of them).
+     delete_before and delete_during select the EARLY engine mode: the keep-set
+     manifest is transmitted before any file data and extras are removed then,
+     acknowledged, before the first data byte.  delete_delay and delete_after
+     select the LATE commit mode: extras are removed only after the whole
+     transfer has succeeded (plain --delete keeps this mode).  The exact
+     semantics and the divergences from rsync are documented in RSYNC_COMPAT.md
+     and in config_delete_timing_early() below. */
+  bool delete_during;
+  bool delete_delay;
+
   // PR #181: IPv6 and bind address
   char* address;
   char* bind_address;
@@ -174,7 +187,7 @@ typedef struct Config {
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.7.0"
+#define PROTOCOL_VERSION "2.8.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 
 Config* config_create(void);
@@ -183,5 +196,17 @@ bool config_send(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
 bool config_is_remote_dest(const char* s);
 void config_parse_ssh_dest(Config* config);
+
+/* True when the negotiated delete timing performs the extra-file deletion
+ * BEFORE the transfer data (--delete-before / --delete-during).  The flag is
+ * a pure function of the config and is used identically on the sender (to pick
+ * the manifest-first frame order) and the receiver (to delete when the early
+ * manifest arrives).  When false the deletion is committed only after the whole
+ * transfer succeeded (--delete / --delete-after / --delete-delay). */
+bool config_delete_timing_early(const Config* config);
+/* Delete-timing sanity: with deletion enabled at most one timing flag may be
+ * set (none = the default delete-after commit timing); without deletion no
+ * timing flag may be set (each timing flag implies --delete). */
+bool config_has_valid_delete_timing(const Config* config);
 
 #endif

@@ -180,7 +180,10 @@ static void test_receive_manifest_rejects_traversal() {
   io_set_fds(p[0], p[1]);
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "../outside"));
-  EXPECT_EQ_INT(receive_manifest(p[0], cfg, NULL), -1);
+  EXPECT_NULL(receive_manifest_entries(p[0]));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
   close(p[0]);
   close(p[1]);
   config_delete(cfg);

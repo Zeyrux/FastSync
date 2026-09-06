@@ -35,6 +35,14 @@ void receiver_outcomes_destroy(ReceiverOutcomes* outcomes);
 bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes);
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink);
+/* receiver_process with an escape hatch for the commit-style (late) deletion:
+   when `pending_manifest` is non-NULL the receiver does NOT delete at
+   STATUS_FINISHED itself; instead it stores the owned keep-set manifest there
+   (leaving *pending_manifest untouched on early modes/errors) so the caller can
+   commit the deletion only after its disk writer has fully drained.  Pass NULL
+   to keep the default behaviour (delete before the success frame). */
+int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
+                             ArrayList** pending_manifest);
 int receiver_receive_files(Config* config, int file_descriptor);
 
 #endif
