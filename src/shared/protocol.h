@@ -112,5 +112,10 @@ bool send_int(int file_descriptor, int data);
 bool receive_int(int file_descriptor, int* data);
 bool send_status(int file_descriptor, Status status);
 bool receive_status(int file_descriptor, Status* status);
+/* receive_status with an explicit per-message deadline in seconds, instead of
+   the default RECEIVE_TIMEOUT_SEC.  A reply that may legitimately take longer
+   (e.g. the early-delete ACK after a large receiver-side deletion) must use
+   this so the sender does not abort after the deletion already committed. */
+bool receive_status_timed(int file_descriptor, Status* status, int timeout_sec);
 
 #endif

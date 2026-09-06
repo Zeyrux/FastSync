@@ -597,14 +597,20 @@ static int send_delete_manifest(int fd, ArrayList* manifest) {
    --delete-before/--delete-during, where the extras are removed on the receiver
    BEFORE the first byte of file data is sent: the receiver acknowledges with
    STATUS_OK once the bounded delete committed, or STATUS_ERROR if it could not
-   (in which case the sender aborts without streaming any data). */
+   (in which case the sender aborts without streaming any data).  The ACK may
+   take much longer than an ordinary per-message round trip because the receiver
+   performs the whole bounded deletion walk (up to MAX_SERVER_DELETE_COUNT
+   unlinks) before replying, so the wait uses a generous explicit deadline
+   instead of the default 60 s receive window. */
+#define DELETE_ACK_TIMEOUT_SEC 3600
+
 static bool send_delete_manifest_early(Client* client, ArrayList* manifest) {
   if (!client || !manifest)
     return false;
   if (send_delete_manifest(client->file_descriptor, manifest) != 0)
     return false;
   Status ack;
-  if (!receive_status(client->file_descriptor, &ack))
+  if (!receive_status_timed(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC))
     return false;
   if (ack != STATUS_OK) {
     log_message(LOG_LEVEL_ERROR, "Server failed to delete files before the transfer");
