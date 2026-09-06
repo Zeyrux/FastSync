@@ -4,6 +4,8 @@
 #include "compression.h"
 #include "config.h"
 #include "delta.h"
+#include "file_list.h"
+#include "filter.h"
 #include "log.h"
 #include "protocol.h"
 #include "transport_tcp.h"
@@ -313,6 +315,31 @@ static int config_add_pattern(char*** patterns, int* count, const char* value,
   return 0;
 }
 
+/* Validate and append one --filter=RULE string. Returns 0 on success, -1 on error. */
+static int config_add_filter(Config* config, const char* rule) {
+  char err[160];
+  FilterRule* parsed = filter_rule_parse(rule, err, sizeof(err));
+  if (!parsed) {
+    log_message(LOG_LEVEL_ERROR, "invalid --filter rule '%s': %s", rule, err);
+    return -1;
+  }
+  filter_rule_free(parsed);
+  if (!config->filters) {
+    config->filters = array_list_create(free);
+    if (!config->filters) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed for --filter");
+      return -1;
+    }
+  }
+  char* dup = str_dup(rule);
+  if (!dup || !array_list_add(config->filters, dup)) {
+    free(dup);
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --filter");
+    return -1;
+  }
+  return 0;
+}
+
 static int parse_skip_compress(Config* config, const char* value) {
   char* list = str_dup(value);
   if (!list)
@@ -423,6 +450,9 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--max-size", NULL, OPT_ULL, offsetof(Config, max_size)},
     {"--min-size", NULL, OPT_ULL, offsetof(Config, min_size)},
     {"--one-file-system", "-x", OPT_FLAG, offsetof(Config, one_file_system)},
+    {"--from0", "-0", OPT_FLAG, offsetof(Config, from0)},
+    {"--cvs-exclude", "-C", OPT_FLAG, offsetof(Config, cvs_exclude)},
+    {"-F", NULL, OPT_FLAG, offsetof(Config, per_dir_filter)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -444,6 +474,8 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"sparse", "S", offsetof(Config, preserve_sparse)},
     {"inplace", NULL, offsetof(Config, inplace)},
     {"checksum", NULL, offsetof(Config, checksum)},
+    {"from0", NULL, offsetof(Config, from0)},
+    {"cvs-exclude", NULL, offsetof(Config, cvs_exclude)},
 
     /* These options are also implied by --archive or handled outside the table. */
     {"compress", "c", offsetof(Config, use_compression)},
@@ -862,6 +894,26 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (read_patterns_from_file(argv[++i], &config->include_patterns, &config->include_count) !=
           0)
         return -1;
+    } else if (strncmp(argv[i], "--filter=", 9) == 0) {
+      if (config_add_filter(config, argv[i] + 9) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--filter", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (config_add_filter(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--files-from=", 13) == 0) {
+      if (set_string_option(&config->files_from, argv[i] + 13, "--files-from") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--files-from", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_string_option(&config->files_from, argv[++i], "--files-from") != 0)
+        return -1;
     } else if (opt_is(argv[i], "-v", "--verbose")) {
       verbose = true;
       set_log_level(LOG_LEVEL_DEBUG);
@@ -935,6 +987,20 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   if (config->compress_choice)
     config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
+
+  /* --files-from is loaded after every argument is seen so that -0/--from0 may
+   * appear anywhere on the command line. A missing or unreadable file, and
+   * invalid (absolute / traversal) entries, are hard CLI errors. */
+  if (config->files_from) {
+    char err[256];
+    FileListSet* set = file_list_load(config->files_from, config->from0, err, sizeof(err));
+    if (!set) {
+      log_message(LOG_LEVEL_ERROR, "--files-from: %s", err);
+      return -1;
+    }
+    file_list_destroy((FileListSet*)config->files_from_set);
+    config->files_from_set = set;
+  }
 
   /* Incremental and delta transfers need metadata unless the user disabled it. */
   if ((config->use_incremental || config->use_delta) && !config->use_metadata &&

@@ -105,10 +105,14 @@ typedef struct Config {
   bool delete_after;
   int max_delete;
 
-  // Issue #129: Advanced file selection
-  ArrayList* filters;
-  char* files_from;
-  bool cvs_exclude;
+  // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
+  // never serialized to the wire (the receiver must not learn them).
+  ArrayList* filters;   /* --filter=RULE rule strings, in order */
+  char* files_from;     /* --files-from path (may be NULL) */
+  void* files_from_set; /* parsed FileListSet* allow-set, or NULL */
+  bool from0;           /* -0/--from0: NUL-delimited *-from files */
+  bool cvs_exclude;     /* -C/--cvs-exclude: standard CVS ignore set */
+  bool per_dir_filter;  /* -F: apply per-directory .rsync-filter files */
   bool prune_empty_dirs;
   bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
   bool relative;

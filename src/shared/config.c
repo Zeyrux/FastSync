@@ -2,6 +2,7 @@
 #include "chmod.h"
 #include "delay_updates.h"
 #include "delta.h"
+#include "file_list.h"
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
@@ -94,7 +95,10 @@ static void config_set_defaults(Config* config) {
   config->max_delete = 0;
   config->filters = NULL;
   config->files_from = NULL;
+  config->files_from_set = NULL;
+  config->from0 = false;
   config->cvs_exclude = false;
+  config->per_dir_filter = false;
   config->prune_empty_dirs = false;
   config->one_file_system = false;
   config->relative = false;
@@ -232,6 +236,7 @@ void config_delete(Config* config) {
   free(config->out_format);
   free(config->log_file_format);
   free(config->files_from);
+  file_list_destroy((FileListSet*)config->files_from_set);
   free(config->rsh_command);
   free(config->rsync_path);
   free(config->temp_dir);

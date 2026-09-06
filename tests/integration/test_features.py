@@ -1629,3 +1629,13 @@ class TestDelayUpdates:
         result, _ = run_client(source, dest, flags=["--delay-updates", "--inplace"])
         assert result.returncode != 0, "--inplace with --delay-updates was accepted"
         assert not os.path.isdir(os.path.join(dest, self.STAGING))
+
+class TestFilesFrom:
+    """--files-from transfers exactly the listed files; a listed directory
+    transfers its whole subtree. The manifest (and thus --delete) derives from
+    what was actually sent."""
+
+class TestFilters:
+    """--filter/-C/-F rule layer: excludes prune, ordering is first-match-wins,
+    the default with no matching rule is include, and legacy --exclude remains
+    an independent layer."""

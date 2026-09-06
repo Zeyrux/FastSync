@@ -1,7 +1,10 @@
 #include "test_utils.h"
 #include "scanner.h"
 #include "file.h"
+#include "file_list.h"
+#include "filter.h"
 #include "utils.h"
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -394,8 +397,8 @@ static void test_parallel_scanner_root_chunks_without_workers() {
   create_test_file(file1, "a");
   create_test_file(file2, "b");
 
-  ScannerOptions options = {false, 1, NULL,  0,     NULL,  0,     0,     0,
-                            0,     0, false, false, false, false, false, false};
+  ScannerOptions options = {false, 1,     NULL,  0,     NULL,  0,     0,    0,    0,    0,
+                            false, false, false, false, false, false, NULL, NULL, false};
   ParallelScanner* scanner = parallel_scanner_create_with_options(dir, &options, NULL);
   EXPECT_NOT_NULL(scanner);
 
@@ -653,6 +656,428 @@ static void test_scanner_one_file_system_cross_device() {
   EXPECT_EQ_INT(par_on_total, 1);
 }
 
+/* Collect emitted file paths (relative to `root`) from a sequential scan.
+ * Returns 0 on success with *out and *count set (caller frees *out). */
+static int collect_files(const char* root, const ScannerOptions* options, char*** out,
+                         int* out_count) {
+  DirectoryScanner* scanner = directory_scanner_create_with_options(root, options);
+  if (!scanner)
+    return -1;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  int cap = 16;
+  int count = 0;
+  char** paths = malloc((size_t)cap * sizeof(char*));
+  if (!paths) {
+    directory_scanner_destroy(scanner);
+    return -1;
+  }
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      const char* rel = chunk->items[i]->path + root_len;
+      if (*rel == '/')
+        rel++;
+      if (count == cap) {
+        cap *= 2;
+        char** grown = realloc(paths, (size_t)cap * sizeof(char*));
+        if (!grown) {
+          for (int k = 0; k < count; k++)
+            free(paths[k]);
+          free(paths);
+          chunk_destroy(chunk);
+          directory_scanner_destroy(scanner);
+          return -1;
+        }
+        paths = grown;
+      }
+      paths[count++] = str_dup(rel);
+    }
+    chunk_destroy(chunk);
+  }
+  bool failed = directory_scanner_failed(scanner);
+  directory_scanner_destroy(scanner);
+  if (failed) {
+    for (int k = 0; k < count; k++)
+      free(paths[k]);
+    free(paths);
+    return -1;
+  }
+  *out = paths;
+  *out_count = count;
+  return 0;
+}
+
+static int collect_files_parallel(const char* root, const ScannerOptions* options, char*** out,
+                                  int* out_count) {
+  ParallelScanner* scanner = parallel_scanner_create_with_options(root, options, NULL);
+  if (!scanner)
+    return -1;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  int cap = 16;
+  int count = 0;
+  char** paths = malloc((size_t)cap * sizeof(char*));
+  if (!paths) {
+    parallel_scanner_destroy(scanner);
+    return -1;
+  }
+  Chunk* chunk;
+  while ((chunk = parallel_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      const char* rel = chunk->items[i]->path + root_len;
+      if (*rel == '/')
+        rel++;
+      if (count == cap) {
+        cap *= 2;
+        char** grown = realloc(paths, (size_t)cap * sizeof(char*));
+        if (!grown) {
+          for (int k = 0; k < count; k++)
+            free(paths[k]);
+          free(paths);
+          chunk_destroy(chunk);
+          parallel_scanner_destroy(scanner);
+          return -1;
+        }
+        paths = grown;
+      }
+      paths[count++] = str_dup(rel);
+    }
+    chunk_destroy(chunk);
+  }
+  bool failed = parallel_scanner_failed(scanner);
+  parallel_scanner_destroy(scanner);
+  if (failed) {
+    for (int k = 0; k < count; k++)
+      free(paths[k]);
+    free(paths);
+    return -1;
+  }
+  *out = paths;
+  *out_count = count;
+  return 0;
+}
+
+static bool has_path(char** paths, int count, const char* rel) {
+  for (int i = 0; i < count; i++)
+    if (strcmp(paths[i], rel) == 0)
+      return true;
+  return false;
+}
+
+static void free_paths(char** paths, int count) {
+  for (int i = 0; i < count; i++)
+    free(paths[i]);
+  free(paths);
+}
+
+static const char* FILE_LIST_PATH = "test_scan_files_from.txt";
+
+/* --files-from: only the listed files (and the subtree of a listed directory)
+ * are emitted; unrelated files and directories are pruned. */
+static void test_files_from_subset(bool parallel) {
+  const char* root = "test_scan_ff";
+  const char* sub = "test_scan_ff/sub";
+  const char* other = "test_scan_ff/other";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  EXPECT_EQ_INT(mkdir(other, 0755), 0);
+  create_test_file("test_scan_ff/root.txt", "root");
+  create_test_file("test_scan_ff/sub/keep.txt", "keep");
+  create_test_file("test_scan_ff/sub/skip.bin", "skip");
+  create_test_file("test_scan_ff/other/unrelated.txt", "unrelated");
+
+  /* List a root file and a file under sub: sub is descended but its other file
+   * is not listed, and the whole `other` directory is pruned. */
+  create_test_file(FILE_LIST_PATH, "root.txt\nsub/keep.txt\n");
+  char err[160];
+  FileListSet* set = file_list_load(FILE_LIST_PATH, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+
+  ScannerOptions options = {0};
+  options.file_list = set;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "root.txt"));
+  EXPECT_TRUE(has_path(paths, count, "sub/keep.txt"));
+  EXPECT_FALSE(has_path(paths, count, "sub/skip.bin"));
+  EXPECT_FALSE(has_path(paths, count, "other/unrelated.txt"));
+  free_paths(paths, count);
+  file_list_destroy(set);
+  remove(FILE_LIST_PATH);
+
+  /* Listing a directory transfers its whole subtree. */
+  create_test_file(FILE_LIST_PATH, "sub\n");
+  set = file_list_load(FILE_LIST_PATH, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+  options.file_list = set;
+  rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "sub/keep.txt"));
+  EXPECT_TRUE(has_path(paths, count, "sub/skip.bin"));
+  EXPECT_FALSE(has_path(paths, count, "root.txt"));
+  EXPECT_FALSE(has_path(paths, count, "other/unrelated.txt"));
+  free_paths(paths, count);
+  file_list_destroy(set);
+  remove(FILE_LIST_PATH);
+
+  unlink("test_scan_ff/root.txt");
+  unlink("test_scan_ff/sub/keep.txt");
+  unlink("test_scan_ff/sub/skip.bin");
+  unlink("test_scan_ff/other/unrelated.txt");
+  rmdir(other);
+  rmdir(sub);
+  rmdir(root);
+}
+
+/* Filter layer: '-' excludes, first-match-wins ordering with '+', anchored
+ * rules, and dir-only rules all prune during the scan. */
+static void test_filter_rules(bool parallel) {
+  const char* root = "test_scan_filter";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  create_test_file("test_scan_filter/a.txt", "a");
+  create_test_file("test_scan_filter/b.tmp", "b");
+  create_test_file("test_scan_filter/c.txt", "c");
+
+  /* - *.tmp excludes only the tmp file; other files remain (default include). */
+  const char* exclude_only[] = {"- *.tmp"};
+  char err[160];
+  FilterRuleList* base = filter_base_build(exclude_only, 1, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  ScannerOptions options = {0};
+  options.base_filters = base;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "a.txt"));
+  EXPECT_TRUE(has_path(paths, count, "c.txt"));
+  EXPECT_FALSE(has_path(paths, count, "b.tmp"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  /* Anchored include then exclude-all: only root-level keep* survives. */
+  const char* anchored[] = {"+ /a.txt", "- *"};
+  base = filter_base_build(anchored, 2, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  options.base_filters = base;
+  rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 1);
+  EXPECT_TRUE(has_path(paths, count, "a.txt"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  unlink("test_scan_filter/a.txt");
+  unlink("test_scan_filter/b.tmp");
+  unlink("test_scan_filter/c.txt");
+  rmdir(root);
+}
+
+/* Anchored dir-only rules prune a whole subtree. */
+static void test_filter_dir_only_and_anchored(bool parallel) {
+  const char* root = "test_scan_filter_dir";
+  const char* sub = "test_scan_filter_dir/sub";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  create_test_file("test_scan_filter_dir/sub/inner.txt", "x");
+  create_test_file("test_scan_filter_dir/keep.txt", "keep");
+
+  const char* rules[] = {"- /sub/"};
+  char err[160];
+  FilterRuleList* base = filter_base_build(rules, 1, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  ScannerOptions options = {0};
+  options.base_filters = base;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 1);
+  EXPECT_TRUE(has_path(paths, count, "keep.txt"));
+  EXPECT_FALSE(has_path(paths, count, "sub/inner.txt"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  unlink("test_scan_filter_dir/sub/inner.txt");
+  unlink("test_scan_filter_dir/keep.txt");
+  rmdir(sub);
+  rmdir(root);
+}
+
+/* -C default CVS excludes prune .git/ directories and *.o files. */
+static void test_cvs_defaults(bool parallel) {
+  const char* root = "test_scan_cvs";
+  const char* git = "test_scan_cvs/.git";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(git, 0755), 0);
+  create_test_file("test_scan_cvs/.git/config", "cfg");
+  create_test_file("test_scan_cvs/object.o", "o");
+  create_test_file("test_scan_cvs/keep.txt", "keep");
+
+  char err[160];
+  FilterRuleList* base = filter_base_build(NULL, 0, true, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  ScannerOptions options = {0};
+  options.base_filters = base;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 1);
+  EXPECT_TRUE(has_path(paths, count, "keep.txt"));
+  EXPECT_FALSE(has_path(paths, count, ".git/config"));
+  EXPECT_FALSE(has_path(paths, count, "object.o"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  unlink("test_scan_cvs/.git/config");
+  unlink("test_scan_cvs/object.o");
+  unlink("test_scan_cvs/keep.txt");
+  rmdir(git);
+  rmdir(root);
+}
+
+/* -F: a .rsync-filter placed in a directory governs its subtree and the file
+ * itself is never transferred. */
+static void test_per_dir_filter(bool parallel) {
+  const char* root = "test_scan_perdir";
+  const char* sub = "test_scan_perdir/sub";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  create_test_file("test_scan_perdir/drop.tmp", "tmp");
+  create_test_file("test_scan_perdir/keep.txt", "keep");
+  create_test_file("test_scan_perdir/sub/nested.tmp", "tmp");
+  create_test_file("test_scan_perdir/.rsync-filter", "- *.tmp\n");
+
+  ScannerOptions options = {0};
+  options.per_dir_filters = true;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 1);
+  EXPECT_TRUE(has_path(paths, count, "keep.txt"));
+  EXPECT_FALSE(has_path(paths, count, "drop.tmp"));
+  EXPECT_FALSE(has_path(paths, count, "sub/nested.tmp"));
+  EXPECT_FALSE(has_path(paths, count, ".rsync-filter"));
+  free_paths(paths, count);
+
+  unlink("test_scan_perdir/drop.tmp");
+  unlink("test_scan_perdir/keep.txt");
+  unlink("test_scan_perdir/sub/nested.tmp");
+  unlink("test_scan_perdir/.rsync-filter");
+  rmdir(sub);
+  rmdir(root);
+}
+
+/* scanner_path_relative maps an on-disk path to its transfer-relative path,
+ * including the "/" transfer-root edge case (regression: children of "/" used
+ * to abort the scan because the suffix was mis-read). */
+static void test_scanner_path_relative() {
+  char* rel = NULL;
+
+  rel = scanner_path_relative("/", "/");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "");
+  free(rel);
+
+  rel = scanner_path_relative("/", "/etc");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "etc");
+  free(rel);
+
+  rel = scanner_path_relative("/", "/etc/passwd");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "etc/passwd");
+  free(rel);
+
+  /* Normal roots: with and without a trailing slash on the root. */
+  rel = scanner_path_relative("/tmp/foo", "/tmp/foo");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "");
+  free(rel);
+
+  rel = scanner_path_relative("/tmp/foo", "/tmp/foo/bar");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "bar");
+  free(rel);
+
+  rel = scanner_path_relative("/tmp/foo/", "/tmp/foo/bar/baz.txt");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "bar/baz.txt");
+  free(rel);
+
+  /* A path outside the root maps to NULL. */
+  EXPECT_NULL(scanner_path_relative("/tmp/foo", "/tmp"));
+  EXPECT_NULL(scanner_path_relative("/tmp/foo", "/tmp/foobar"));
+}
+
+/* rsync precedence: a deeper .rsync-filter overrides a shallower one, so an
+ * inner "+ *.tmp" re-includes what the outer "- *.tmp" excluded. */
+static void test_per_dir_filter_override(bool parallel) {
+  const char* root = "test_scan_perdir_ovr";
+  const char* sub = "test_scan_perdir_ovr/sub";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  create_test_file("test_scan_perdir_ovr/.rsync-filter", "- *.tmp\n");
+  create_test_file("test_scan_perdir_ovr/sub/.rsync-filter", "+ *.tmp\n");
+  create_test_file("test_scan_perdir_ovr/top.tmp", "x");
+  create_test_file("test_scan_perdir_ovr/keep.txt", "keep");
+  create_test_file("test_scan_perdir_ovr/sub/inside.tmp", "x");
+
+  ScannerOptions options = {0};
+  options.per_dir_filters = true;
+  if (parallel)
+    options.num_threads = 2;
+  char** paths = NULL;
+  int count = 0;
+  int rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                    : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  /* top.tmp is still excluded by the root file; inside.tmp is re-included by
+   * the subdir file; .rsync-filter files are never transferred. */
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "keep.txt"));
+  EXPECT_TRUE(has_path(paths, count, "sub/inside.tmp"));
+  EXPECT_FALSE(has_path(paths, count, "top.tmp"));
+  EXPECT_FALSE(has_path(paths, count, ".rsync-filter"));
+  EXPECT_FALSE(has_path(paths, count, "sub/.rsync-filter"));
+  free_paths(paths, count);
+
+  unlink("test_scan_perdir_ovr/top.tmp");
+  unlink("test_scan_perdir_ovr/keep.txt");
+  unlink("test_scan_perdir_ovr/sub/inside.tmp");
+  unlink("test_scan_perdir_ovr/.rsync-filter");
+  unlink("test_scan_perdir_ovr/sub/.rsync-filter");
+  rmdir(sub);
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -672,4 +1097,17 @@ void test_scanner() {
   test_scanner_one_file_system_same_device();
   test_parallel_scanner_one_file_system_same_device();
   test_scanner_one_file_system_cross_device();
+  test_files_from_subset(false);
+  test_files_from_subset(true);
+  test_filter_rules(false);
+  test_filter_rules(true);
+  test_filter_dir_only_and_anchored(false);
+  test_filter_dir_only_and_anchored(true);
+  test_cvs_defaults(false);
+  test_cvs_defaults(true);
+  test_per_dir_filter(false);
+  test_per_dir_filter(true);
+  test_scanner_path_relative();
+  test_per_dir_filter_override(false);
+  test_per_dir_filter_override(true);
 }
