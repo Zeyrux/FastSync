@@ -476,7 +476,7 @@ static Config* make_late_delete_config(const char* root) {
   return cfg;
 }
 
-static int run_pending_receiver(Config* cfg, int fd, ArrayList** pending) {
+static int run_pending_receiver(Config* cfg, int fd, DeleteManifest** pending) {
   ReceiverSink sink = {0};
   return receiver_process_pending(cfg, fd, &sink, pending);
 }
@@ -492,9 +492,10 @@ static void test_late_manifest_abort_frees_keepset() {
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_ABORT));
 
-  ArrayList* pending = NULL;
+  DeleteManifest* pending = NULL;
   EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
   EXPECT_NULL(pending);
 
@@ -514,9 +515,10 @@ static void test_late_manifest_eof_frees_keepset() {
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   shutdown(p[1], SHUT_WR);
 
-  ArrayList* pending = NULL;
+  DeleteManifest* pending = NULL;
   EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
   EXPECT_NULL(pending);
 
@@ -536,11 +538,13 @@ static void test_late_second_manifest_frees_both() {
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "first.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "second.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
 
-  ArrayList* pending = NULL;
+  DeleteManifest* pending = NULL;
   EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
   EXPECT_NULL(pending);
 

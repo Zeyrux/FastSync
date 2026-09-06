@@ -561,6 +561,61 @@ static void test_config_delete_timing_conflict_rejected() {
   config_delete(c);
 }
 
+/* The deletion-policy fields that cross the wire survive a config round trip:
+   --force (force_delete), --delete-excluded, --prune-empty-dirs and the
+   --max-delete number (default -1 == no client limit). */
+static void test_config_delete_policy_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+
+  struct {
+    bool force_delete, delete_excluded, prune_empty_dirs;
+    int max_delete;
+  } cases[] = {
+      {false, false, false, -1},
+      {true, false, false, 0},
+      {false, true, true, 7},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL;
+      if (ok) {
+        ok = recv->force_delete == cases[i].force_delete &&
+             recv->delete_excluded == cases[i].delete_excluded &&
+             recv->prune_empty_dirs == cases[i].prune_empty_dirs &&
+             recv->max_delete == cases[i].max_delete;
+      }
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->force_delete = cases[i].force_delete;
+      send_cfg->delete_excluded = cases[i].delete_excluded;
+      send_cfg->prune_empty_dirs = cases[i].prune_empty_dirs;
+      send_cfg->max_delete = cases[i].max_delete;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
 /* Basis-dir lists survive the config wire: each entry's type and path must
    round-trip unchanged. */
 static void test_config_basis_roundtrip() {
@@ -712,6 +767,7 @@ void test_config() {
     test_config_delay_updates_reserved_backup_rejected();
     test_config_delete_timing_wire_roundtrip();
     test_config_delete_timing_conflict_rejected();
+    test_config_delete_policy_wire_roundtrip();
     test_config_basis_roundtrip();
     test_config_basis_wire_rejects_escaping();
     test_config_basis_normalization();

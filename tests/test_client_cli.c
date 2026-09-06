@@ -1648,6 +1648,73 @@ static void test_parse_args_files_from() {
   remove(list_path);
 }
 
+/* The deletion-policy family parses onto the config fields: --delete-excluded,
+ * --ignore-errors and --force are flags, --max-delete takes a non-negative
+ * number, and --prune-empty-dirs is the long-only spelling (FastSync's -m stays
+ * multithreading).  None of them implies --delete by itself. */
+static void test_parse_args_delete_policy_flags() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync",
+                  "--delete",
+                  "--delete-excluded",
+                  "--max-delete=5",
+                  "--ignore-errors",
+                  "--force",
+                  "--prune-empty-dirs",
+                  "/src",
+                  "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 9, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_excluded);
+  EXPECT_EQ_INT(cfg->max_delete, 5);
+  EXPECT_TRUE(cfg->ignore_errors);
+  EXPECT_TRUE(cfg->force_delete);
+  EXPECT_TRUE(cfg->prune_empty_dirs);
+  EXPECT_FALSE(cfg->delete_before);
+  config_delete(cfg);
+
+  /* --max-delete accepts the separated-argument and zero forms. */
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--max-delete", "0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->max_delete, 0);
+  config_delete(cfg);
+}
+
+static void test_parse_args_delete_policy_invalid_values() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--max-delete=abc", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--max-delete=-3", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
+/* --max-delete without --delete is inert (it only bounds a --delete run); the
+ * config stays valid. */
+static void test_parse_args_max_delete_inert_without_delete() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--max-delete=5", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->use_delete);
+  EXPECT_EQ_INT(cfg->max_delete, 5);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -1740,4 +1807,7 @@ void test_client_cli() {
   test_parse_args_basis_dirs();
   test_parse_args_basis_invalid_paths();
   test_validate_config_basis_rejects_chunk_serialization();
+  test_parse_args_delete_policy_flags();
+  test_parse_args_delete_policy_invalid_values();
+  test_parse_args_max_delete_inert_without_delete();
 }
