@@ -1169,6 +1169,120 @@ static void test_parse_args_whole_file() {
   config_delete(cfg);
 }
 
+/* -y/--fuzzy reuses a similar destination file as a delta basis, so it implies
+ * the receiver-driven delta path (--incremental + --delta): FastSync's delta
+ * machinery is OFF by default, so without the implication a bare --fuzzy would
+ * be a silent no-op.  Both spellings behave identically. */
+static void test_parse_args_fuzzy_implies_delta() {
+  static const char* const spellings[] = {"--fuzzy", "-y"};
+  for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)spellings[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->fuzzy);
+    EXPECT_TRUE(cfg->use_incremental);
+    EXPECT_TRUE(cfg->use_delta);
+    EXPECT_TRUE(cfg->use_metadata);
+    config_delete(cfg);
+  }
+}
+
+/* --no-fuzzy turns the flag back off; the incremental/delta implication must
+ * only fire when the FINAL value of the flag is true (order-independent). */
+static void test_parse_args_fuzzy_negation() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--fuzzy", "--no-fuzzy", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->fuzzy);
+  EXPECT_FALSE(cfg->use_delta);
+  EXPECT_FALSE(cfg->use_incremental);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* reordered[] = {"fastsync", "--no-fuzzy", "--fuzzy", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, reordered, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->fuzzy);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_TRUE(cfg->use_delta);
+  config_delete(cfg);
+}
+
+/* -W/--whole-file switches the delta machinery off, so --fuzzy is inert (the
+ * per-file quick check still needs --incremental, which stays implied). */
+static void test_parse_args_fuzzy_with_whole_file() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--fuzzy", "-W", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->fuzzy);
+  EXPECT_TRUE(cfg->whole_file);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_FALSE(cfg->use_delta);
+  config_delete(cfg);
+}
+
+/* An explicit --no-delta is respected by the --fuzzy implication in either
+ * argument order (a user who switched delta off does not want it forced on). */
+static void test_parse_args_fuzzy_respects_no_delta() {
+  static const char* const combos[][2] = {
+      {"--fuzzy", "--no-delta"},
+      {"--no-delta", "--fuzzy"},
+  };
+  for (size_t i = 0; i < sizeof(combos) / sizeof(combos[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)combos[i][0], (char*)combos[i][1], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->fuzzy);
+    EXPECT_FALSE(cfg->use_delta);
+    config_delete(cfg);
+  }
+}
+
+/* --fuzzy requires the delta machinery, which the chunk-serialization (-s) and
+ * sendfile (-f) modes reject -- mirroring the --delta constraint checks. */
+static void test_validate_config_fuzzy_incompatible_modes() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--fuzzy", "-s", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* sendfile_argv[] = {"fastsync", "--fuzzy", "-f", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, sendfile_argv, positional_args, &positional_count), 0);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(cfg->use_delta);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* A plain --fuzzy run is a valid configuration. */
+  cfg = config_create();
+  char* ok_argv[] = {"fastsync", "--fuzzy", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, ok_argv, positional_args, &positional_count), 0);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(cfg->use_delta);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 /* -x and --one-file-system enable client-side single-filesystem scanning. */
 static void test_parse_args_one_file_system() {
   Config* cfg = config_create();
@@ -1713,6 +1827,11 @@ void test_client_cli() {
   test_parse_args_secluded_args();
   test_parse_args_short_s_remains_chunk_serialization();
   test_parse_args_whole_file();
+  test_parse_args_fuzzy_implies_delta();
+  test_parse_args_fuzzy_negation();
+  test_parse_args_fuzzy_with_whole_file();
+  test_parse_args_fuzzy_respects_no_delta();
+  test_validate_config_fuzzy_incompatible_modes();
   test_parse_args_one_file_system();
   test_parse_args_compression_aliases();
   test_parse_args_compression_equals_and_none();

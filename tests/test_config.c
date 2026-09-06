@@ -128,6 +128,7 @@ static void test_config_send_receive() {
   send_cfg->use_executability = true;
   send_cfg->use_delta = true;
   send_cfg->whole_file = true;
+  send_cfg->fuzzy = true;
   send_cfg->ignore_times = true;
   send_cfg->size_only = true;
   send_cfg->compression_level = 5;
@@ -187,6 +188,8 @@ static void test_config_send_receive() {
       if (!recv_cfg->eight_bit_output)
         ok = false;
       if (recv_cfg->use_delta)
+        ok = false;
+      if (!recv_cfg->fuzzy)
         ok = false;
       if (recv_cfg->modify_window != 4)
         ok = false;

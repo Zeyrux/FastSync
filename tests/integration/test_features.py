@@ -1,6 +1,7 @@
 """Feature tests: incremental sync, bandwidth limiting, dry run, metadata, filters."""
 import filecmp
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (
     PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR,
-    run_client,
+    run_client, CountingProxy,
     generate_test_files, verify_transfer, clean_dir, make_result,
     get_dest_received_dir, CLIENT_CMD, ServerManager,
 )
@@ -2479,3 +2480,244 @@ class TestBasisDestDirs:
         received = get_dest_received_dir(dest, source)
         assert not os.path.exists(received), \
             "over-limit basis run transferred files before failing"
+
+
+def _random_payloads(size=2 * 1024 * 1024, changed=64 * 1024, seed=1234):
+    """Return (old, new) byte strings of equal length where `new` differs from
+    `old` only in one contiguous `changed`-byte region.  Incompressible (random)
+    data keeps the whole-file wire cost near the file size, so a delta transfer
+    is distinguishable from a whole-file one by its wire bytes."""
+    r = random.Random(seed)
+    data = bytearray(r.randbytes(size))
+    old = bytes(data)
+    off = size // 3
+    for i in range(off, off + changed):
+        data[i] = r.randrange(256)
+    return old, bytes(data)
+
+
+class TestFuzzy:
+    """-y/--fuzzy similar-file delta basis.
+
+    Scenario modelled on rsync's --fuzzy: a file is recreated under a similar
+    NEW basename in the same directory.  The destination still holds the
+    old-named file (nothing deleted it), but the new path has no content of its
+    own at the destination, so without --fuzzy the receiver has no delta basis
+    and the whole file is sent.  With --fuzzy the receiver searches the
+    destination directory, picks the similar-named sibling as the delta basis,
+    sends its block signature, and the sender transmits only the differences.
+    The reconstructed file must be byte-identical to the source in every mode;
+    only the wire usage changes (observed through CountingProxy, because client
+    --stats report source lengths, not wire bytes).
+    """
+
+    OLD_NAME = "report-2025.dat"
+    NEW_NAME = "report-2026.dat"
+
+    def _client_via_proxy(self, source, dest, flags, proxy):
+        cmd = (CLIENT_CMD + ["--source-dir", source, "--dest-dir", dest,
+                             "--save-to-disk", "--server-port", str(proxy.port)] + flags)
+        return proxy.run(cmd)
+
+    def _seed_dest(self, source, dest, files, port):
+        """Write `files` {rel: bytes} into source and mirror them to dest."""
+        for rel, content in files.items():
+            full = os.path.join(source, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(content)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, port=port)
+        assert result.returncode == 0, f"seed failed: {(result.stderr or result.stdout)[:300]}"
+
+    def _prepare(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"fuzzy_{tag}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"fuzzy_{tag}_dst")
+        clean_dir(source)
+        return source, dest
+
+    def _run_measured(self, source, dest, flags, port):
+        """Run a transfer through a byte-counting proxy. Returns (result, proxy)."""
+        proxy = CountingProxy(port)
+        result = self._client_via_proxy(source, dest, flags, proxy)
+        return result, proxy
+
+    def test_fuzzy_uses_similar_sibling_as_delta_basis(self, shared_server):
+        source, dest = self._prepare("basis")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        # Recreate the file under a similar new name; the old sibling stays on
+        # the destination (nothing deletes it).
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy rename transfer failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes, \
+            "fuzzy reconstruction is not byte-exact"
+        # The wire carried the delta, not the 2 MiB whole file.
+        assert proxy.client_to_server < len(new_bytes) // 4, \
+            f"fuzzy transfer sent {proxy.client_to_server} bytes; expected a delta"
+
+    def test_without_fuzzy_sends_the_whole_file(self, shared_server):
+        source, dest = self._prepare("whole")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+
+        result, proxy = self._run_measured(source, dest, ["--incremental", "--delta"], shared_server.port)
+        assert result.returncode == 0, f"no-fuzzy rename failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        # No similar basis: the whole file goes over the wire.
+        assert proxy.client_to_server > len(new_bytes) // 2, \
+            f"expected a whole-file transfer, got {proxy.client_to_server} bytes"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_fuzzy_byte_exact_single_and_multithreaded(self, shared_server, mt):
+        source, dest = self._prepare(f"mt{'1' if mt else '0'}")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+
+        flags = ["--fuzzy"] + (["-m"] if mt else [])
+        result, proxy = self._run_measured(source, dest, flags, shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy {'-m ' if mt else ''}rename failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes, \
+            f"fuzzy {'-m ' if mt else ''}reconstruction is not byte-exact"
+        assert proxy.client_to_server < len(new_bytes) // 4
+
+    def test_no_candidate_falls_back_to_whole_file(self, shared_server):
+        # A brand-new destination directory holds no sibling at all, so --fuzzy
+        # finds nothing and the file is transferred whole (and correctly).
+        source, dest = self._prepare("nocand")
+        clean_dir(dest)
+        os.makedirs(source, exist_ok=True)
+        _, new_bytes = _random_payloads()
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy no-candidate fallback failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server > len(new_bytes) // 2, \
+            "no-candidate fuzzy run should have sent the whole file"
+
+    def test_dissimilar_sibling_is_not_used(self, shared_server):
+        # The destination holds a large sibling whose basename is too different
+        # from the incoming name; the name gate must reject it and fall back to
+        # a whole-file transfer.
+        source, dest = self._prepare("dissim")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {"totally-unrelated-notes.bin": old_bytes},
+                           shared_server.port)
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy dissimilar-sibling run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server > len(new_bytes) // 2, \
+            "a dissimilar-named sibling must not be used as a fuzzy basis"
+
+    def test_fuzzy_helps_when_dest_holds_an_unsuitable_file(self, shared_server):
+        # The destination DOES hold the exact new name, but it is a tiny stale
+        # file (below the delta engine's minimum, ratio far outside its window),
+        # so it cannot serve as the basis.  --fuzzy then falls back to the
+        # similar-named sibling.
+        source, dest = self._prepare("unsuitable")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest,
+                        {self.OLD_NAME: old_bytes, self.NEW_NAME: b"stale small file\n"},
+                        shared_server.port)
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy unsuitable-dest run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes, \
+            "byte-exactness broken when the destination file was unsuitable"
+        assert proxy.client_to_server < len(new_bytes) // 4, \
+            "fuzzy should have reused the similar sibling as the basis"
+
+    def test_whole_file_makes_fuzzy_inert(self, shared_server):
+        # -W/--whole-file switches the delta machinery off, so --fuzzy has
+        # nothing to attach to and the file is transferred whole (rsync parity).
+        source, dest = self._prepare("wholefile")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, proxy = self._run_measured(source, dest, ["--fuzzy", "-W"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy -W run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server > len(new_bytes) // 2, \
+            "--whole-file must disable the fuzzy delta basis"
+
+    def test_fuzzy_via_short_y_alias(self, shared_server):
+        source, dest = self._prepare("shorty")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, proxy = self._run_measured(source, dest, ["-y"], shared_server.port)
+        assert result.returncode == 0, f"-y rename failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server < len(new_bytes) // 4, "-y did not enable fuzzy"
+
+    def test_fuzzy_with_delay_updates_publishes_cleanly(self, shared_server):
+        # A fuzzy-reconstructed file goes through the normal store engine, so
+        # --delay-updates must stage and publish it with no staging leftovers.
+        source, dest = self._prepare("delay")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, _ = run_client(source, dest,
+                               flags=["--fuzzy", "--delay-updates"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy --delay-updates failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert not os.path.isdir(os.path.join(dest, ".fastsync-stage")), \
+            "delay-updates staging tree was not cleaned up"
+
+    def test_fuzzy_source_removed_after_transfer(self, shared_server):
+        # A fuzzy transfer is a real transfer (not a skip), so
+        # --remove-source-files must remove the renamed source file.
+        source, dest = self._prepare("rm")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {self.OLD_NAME: old_bytes}, shared_server.port)
+        os.unlink(os.path.join(source, self.OLD_NAME))
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        result, _ = run_client(source, dest,
+                               flags=["--fuzzy", "--remove-source-files"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy --remove-source-files failed: {(result.stderr or result.stdout)[:300]}"
+        assert not os.path.exists(os.path.join(source, self.NEW_NAME)), \
+            "a fuzzy-transferred source should have been removed"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert _read_file(os.path.join(received, self.OLD_NAME)) == old_bytes
+
