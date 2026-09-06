@@ -25,6 +25,18 @@ typedef struct {
   cnd_t condition_not_empty_loader;
   bool loader_done;
   ArrayList* manifest;
+  /* Protected prefixes (paths the source scan excluded by user rules) sent
+     with the keep-set manifest so --delete leaves them alone unless
+     --delete-excluded is set.  NULL when not collecting.  Populated by the
+     scanner thread (parallel workers append under mutex_scanner via the
+     scanner's exclusion sink) or, in the early modes, by the path-only pre-scan
+     on the calling thread before the pipeline starts. */
+  ArrayList* excluded_paths;
+  /* A source I/O error (unreadable directory) was recorded during the scan.
+     Set by the pre-scan (before the threads start) or by the scanner thread
+     under mutex_scanner; the caller turns it into a non-zero exit when
+     --ignore-errors kept the run going. */
+  bool scan_had_io_error;
   ArrayList* remove_source_files;
   /* True when --delete-before/--delete-during require the keep-set manifest to
      be transmitted before any file data: context->manifest is then prebuilt by
@@ -65,9 +77,9 @@ typedef struct PipelineContextReceiver {
      protocol stream but hands the manifest here instead of deleting while the
      disk writer may still be draining; the caller (server.c) commits the
      deletion after both threads have joined, so no extra is removed unless the
-     transfer truly succeeded.  NULL in the early delete modes (which delete at
-     the manifest). */
-  ArrayList* deferred_manifest;
+      transfer truly succeeded.  NULL in the early delete modes (which delete at
+      the manifest). */
+  DeleteManifest* deferred_manifest;
 } PipelineContextReceiver;
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,

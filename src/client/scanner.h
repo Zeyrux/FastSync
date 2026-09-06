@@ -37,6 +37,28 @@ typedef struct {
   bool per_dir_filters;               /* -F: read .rsync-filter per directory */
   bool dirs;                          /* -d/--dirs: transfer dir entries, no recursion */
   bool relative;                      /* -R/--relative (dest rel paths, with --files-from) */
+  /* --prune-empty-dirs (long only): in --dirs mode an empty source directory's
+     explicit entry is omitted from the transfer file list (so nothing is
+     created at the destination and it can be pruned by --delete); explicitly
+     --files-from-listed directories always pass through.  Recursive transfers
+     never emit empty directories, so the flag has no additional effect there. */
+  bool prune_empty_dirs;
+  /* Delete-excluded protection sink (optional): when non-NULL the scanner
+   * appends the destination-relative path of every entry it prunes because a
+   * USER SELECTION rule excluded it (--filter/-C/per-dir rules, the legacy
+   * --exclude/--include layer, and --max-size/--min-size).  The sender turns
+   * this list into the manifest's protected prefixes so `--delete` leaves the
+   * destination mirror of excluded source paths alone (rsync's default), and
+   * empties it when --delete-excluded opts back into deleting them.  NOT
+   * recorded for --files-from subset pruning (whose delete semantics stay
+   * keep-set-only) or for -R/--files-from relative wire paths.  When
+   * `excluded_mutex` is non-NULL it is taken around every append (the parallel
+   * scanner shares one list across its worker threads). */
+  ArrayList* excluded_paths;
+  mtx_t* excluded_mutex;
+  /* --ignore-errors: an unreadable directory during the scan is recorded as an
+   * I/O error and skipped instead of aborting the scan.  Client-only. */
+  bool ignore_io_errors;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -79,10 +101,21 @@ typedef struct {
      the recursive scan). */
   bool dirs_mode;
   bool relative_mode; /* file_list && relative: send bare relative wire paths */
+  bool prune_empty_dirs;
   bool dirs_root_emitted;
   int list_index;
   ArrayList* dirs_batch; /* owned when non-NULL */
   unsigned long long dirs_batch_size;
+  /* Excluded-path sink (see ScannerOptions). `excluded_mutex` is shared across
+     parallel worker threads. */
+  ArrayList* excluded_paths;
+  mtx_t* excluded_mutex;
+  /* --ignore-errors: continue past unreadable directories (records io_error). */
+  bool ignore_io_errors;
+  /* A directory could not be opened (I/O error, e.g. EACCES).  With
+     --ignore-errors the scan continues past it and the caller decides what to
+     do; `failed` is reserved for fatal errors that always abort the scan. */
+  bool io_error;
 } DirectoryScanner;
 
 typedef struct {
@@ -96,6 +129,8 @@ typedef struct {
   thrd_t* threads;
   bool done;
   bool failed;
+  /* A worker skipped an unreadable directory under --ignore-errors (non-fatal). */
+  bool io_error;
   atomic_bool cancelled;
   int completed;
   Chunk* initial_chunk;
@@ -131,6 +166,11 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
                                                       ProtocolSession* allocation_session);
 Chunk* parallel_scanner_next(ParallelScanner* scanner);
 bool parallel_scanner_failed(const ParallelScanner* scanner);
+bool parallel_scanner_had_io_error(const ParallelScanner* scanner);
 void parallel_scanner_destroy(ParallelScanner* scanner);
+
+/* True when a directory could not be opened during the scan (an I/O error,
+   recorded even when --ignore-errors keeps the scan going past it). */
+bool directory_scanner_had_io_error(const DirectoryScanner* scanner);
 
 #endif

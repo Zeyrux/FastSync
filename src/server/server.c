@@ -265,7 +265,7 @@ void handler(int file_descriptor) {
         if (!manifest_delete_extras(config, context->deferred_manifest)) {
           transfer_ok = false;
         }
-        array_list_delete(context->deferred_manifest);
+        delete_manifest_free(context->deferred_manifest);
         context->deferred_manifest = NULL;
       }
     }

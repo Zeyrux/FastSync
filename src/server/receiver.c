@@ -143,7 +143,7 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    the whole transfer succeeded.  See receiver_process_pending() for how the -m
    receiver defers that commit until its disk writer has drained. */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             ArrayList** pending_manifest) {
+                             DeleteManifest** pending_manifest) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return -1;
@@ -151,7 +151,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   /* Parked keep-set for the late/commit timing.  Every exit path below frees it
      exactly once; the only exception is the successful FINISHED handoff, which
      transfers ownership to *pending_manifest (used by the -m receiver). */
-  ArrayList* deferred_manifest = NULL;
+  DeleteManifest* deferred_manifest = NULL;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
          status == STATUS_MKDIR || status == STATUS_MANIFEST) {
@@ -182,7 +182,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       if (!dir || !sink->store_file(dir, sink->context))
         goto receive_error;
     } else if (status == STATUS_MANIFEST) {
-      ArrayList* manifest = receive_manifest_entries(file_descriptor);
+      DeleteManifest* manifest = receive_manifest_entries(file_descriptor);
       if (!manifest)
         goto fail; /* receive_manifest_entries already sent STATUS_ERROR */
       if (early_delete) {
@@ -192,7 +192,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            failed).  This is the rsync delete-before/delete-during window: a
            later transfer failure does not restore these deletions. */
         bool deletion_ok = config->use_delete ? manifest_delete_extras(config, manifest) : true;
-        array_list_delete(manifest);
+        delete_manifest_free(manifest);
         if (!deletion_ok) {
           send_status(file_descriptor, STATUS_ERROR);
           goto fail;
@@ -204,15 +204,15 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            and commit the deletion only after STATUS_FINISHED. */
         if (deferred_manifest) {
           log_message(LOG_LEVEL_ERROR, "Received a second delete manifest");
-          array_list_delete(deferred_manifest);
+          delete_manifest_free(deferred_manifest);
           deferred_manifest = NULL;
-          array_list_delete(manifest);
+          delete_manifest_free(manifest);
           send_status(file_descriptor, STATUS_ERROR);
           goto fail;
         }
         deferred_manifest = manifest;
       } else {
-        array_list_delete(manifest);
+        delete_manifest_free(manifest);
       }
       goto next_status;
     } else {
@@ -247,7 +247,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       deferred_manifest = NULL;
     } else {
       bool deletion_ok = manifest_delete_extras(config, deferred_manifest);
-      array_list_delete(deferred_manifest);
+      delete_manifest_free(deferred_manifest);
       deferred_manifest = NULL;
       if (!deletion_ok) {
         send_status(file_descriptor, STATUS_ERROR);
@@ -269,14 +269,14 @@ fail:
   /* Failure exits that must not (or already did) report a STATUS_ERROR.  The
      parked keep-set is dropped: never commit a deletion for a failed stream. */
   if (deferred_manifest) {
-    array_list_delete(deferred_manifest);
+    delete_manifest_free(deferred_manifest);
     deferred_manifest = NULL;
   }
   return -1;
 
 receive_error:
   if (deferred_manifest) {
-    array_list_delete(deferred_manifest);
+    delete_manifest_free(deferred_manifest);
     deferred_manifest = NULL;
   }
   if (sink->send_error)

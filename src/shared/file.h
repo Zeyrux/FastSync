@@ -32,6 +32,10 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
 bool file_ensure_directory_secure(const char* path);
 bool file_directory_exists_secure(const char* path);
 bool file_rename_secure(const char* old_path, const char* new_path);
+/* Remove the whole directory tree at `path` (confined, symlink-safe).  Used by
+   --force to clear a non-empty destination directory that blocks an incoming
+   regular file.  See the .c for the exact success semantics. */
+bool file_remove_tree_secure(const char* path);
 /* Open a private 0700 directory (creating it on demand) that must live below
    the authorized root.  Used for the --temp-dir scratch directory and the
    --delay-updates staging directory. */

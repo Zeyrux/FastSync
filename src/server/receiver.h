@@ -42,7 +42,7 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    commit the deletion only after its disk writer has fully drained.  Pass NULL
    to keep the default behaviour (delete before the success frame). */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             ArrayList** pending_manifest);
+                             DeleteManifest** pending_manifest);
 int receiver_receive_files(Config* config, int file_descriptor);
 
 #endif

@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
@@ -407,6 +408,79 @@ bool file_rename_secure(const char* old_path, const char* new_path) {
     close(new_parent);
   free(old_leaf);
   free(new_leaf);
+  return ok;
+}
+
+/* Recursively delete every entry inside an open directory, never following a
+   symlink (an O_NOFOLLOW fd walk, so a symlink planted inside the tree can
+   never redirect removal outside of it).  The directory itself is left in
+   place; returns false on any failure. */
+static bool wipe_dir_fd(int dirfd) {
+  int scanfd = dup(dirfd);
+  if (scanfd < 0)
+    return false;
+  DIR* dir = fdopendir(scanfd);
+  if (!dir) {
+    close(scanfd);
+    return false;
+  }
+  bool operation_ok = true;
+  const struct dirent* entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    struct stat st;
+    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno != ENOENT)
+        operation_ok = false;
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      bool child_removed = false;
+      if (childfd >= 0) {
+        child_removed = wipe_dir_fd(childfd);
+        close(childfd);
+      } else if (errno != ENOENT) {
+        operation_ok = false;
+      }
+      if (child_removed && unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT)
+        operation_ok = false;
+    } else {
+      /* Files and symlinks alike are removed by name, never followed. */
+      if (unlinkat(dirfd, entry->d_name, 0) != 0 && errno != ENOENT)
+        operation_ok = false;
+    }
+  }
+  closedir(dir);
+  return operation_ok;
+}
+
+/* Remove the whole directory tree at `path` (confined below the authorized
+   root, symlink-safe).  --force uses this to clear a non-empty destination
+   directory that blocks an incoming regular file.  Returns true when the path
+   no longer exists as a directory (a missing path or a non-directory at the
+   final component is a no-op success; the normal write path replaces files). */
+bool file_remove_tree_secure(const char* path) {
+  if (!path)
+    return false;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return false;
+  int dirfd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dirfd < 0) {
+    bool absent = errno == ENOENT || errno == ENOTDIR || errno == ELOOP;
+    close(parent_fd);
+    free(leaf);
+    return absent;
+  }
+  bool ok = wipe_dir_fd(dirfd);
+  close(dirfd);
+  if (ok && unlinkat(parent_fd, leaf, AT_REMOVEDIR) != 0 && errno != ENOENT)
+    ok = false;
+  close(parent_fd);
+  free(leaf);
   return ok;
 }
 
