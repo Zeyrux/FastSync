@@ -595,6 +595,86 @@ static void test_parse_args_relative_no_implied_mkpath() {
   config_delete(cfg);
 }
 
+/* Parse --compare-dest/--copy-dest/--link-dest, including the =value and
+   separate-argument forms, and verify the ordered (repeatable) basis list. */
+static void test_parse_args_basis_dirs() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--link-dest=prior", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(config_has_basis(cfg));
+  EXPECT_EQ_INT(cfg->basis_count, 1);
+  EXPECT_EQ_INT(cfg->basis_dirs[0].type, BASIS_DEST_LINK);
+  EXPECT_EQ_STR(cfg->basis_dirs[0].path, "prior");
+  /* Basis dirs are honored by the receiver-side per-file check, so they imply
+     --incremental (and, unless disabled, metadata) on the sender. */
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--compare-dest", "cmp", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->basis_count, 1);
+  EXPECT_EQ_INT(cfg->basis_dirs[0].type, BASIS_DEST_COMPARE);
+  EXPECT_EQ_STR(cfg->basis_dirs[0].path, "cmp");
+  config_delete(cfg);
+
+  /* Repetition is supported: entries keep command-line order and type. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync",      "--link-dest=a", "--compare-dest=b",
+                   "--link-dest=c", "--copy-dest=d", "/src",
+                   "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->basis_count, 4);
+  EXPECT_EQ_INT(cfg->basis_dirs[0].type, BASIS_DEST_LINK);
+  EXPECT_EQ_STR(cfg->basis_dirs[0].path, "a");
+  EXPECT_EQ_INT(cfg->basis_dirs[1].type, BASIS_DEST_COMPARE);
+  EXPECT_EQ_STR(cfg->basis_dirs[1].path, "b");
+  EXPECT_EQ_INT(cfg->basis_dirs[2].type, BASIS_DEST_LINK);
+  EXPECT_EQ_STR(cfg->basis_dirs[2].path, "c");
+  EXPECT_EQ_INT(cfg->basis_dirs[3].type, BASIS_DEST_COPY);
+  EXPECT_EQ_STR(cfg->basis_dirs[3].path, "d");
+  config_delete(cfg);
+
+  /* Nested relative basis dirs are allowed (they resolve below the root). */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--copy-dest=snap/2026-01", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->basis_count, 1);
+  EXPECT_EQ_STR(cfg->basis_dirs[0].path, "snap/2026-01");
+  config_delete(cfg);
+}
+
+/* Absolute, escaping, or degenerate basis-dir values must be rejected up
+   front: they would resolve outside the destination root on the receiver. */
+static void test_parse_args_basis_invalid_paths() {
+  static const char* const invalid[] = {"/abs", "..", "a/../b", "."};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--link-dest", (char*)invalid[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
+/* Basis dirs require the per-file incremental handshake, which -s disables. */
+static void test_validate_config_basis_rejects_chunk_serialization() {
+  Config* cfg = valid_client_config();
+  EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_LINK, "prior"), 0);
+  cfg->use_chunk_serialization = true;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->use_chunk_serialization = false;
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 /* --del is recognized as the rsync alias, but its timing mode is not implemented. */
 static void test_parse_args_delete_during_alias_unimplemented() {
   static const char* const options[] = {"--del", "--delete-during"};
@@ -632,9 +712,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "-e",
                                         "--rsh",
                                         "--rsync-path",
-                                        "--compare-dest",
-                                        "--copy-dest",
-                                        "--link-dest",
                                         "--delete-before",
                                         "--address",
                                         "--bind-address",
@@ -1589,4 +1666,7 @@ void test_client_cli() {
   test_parse_args_files_from();
   test_parse_args_filter_rules();
   test_parse_args_from0_cvs_filter_file_flags();
+  test_parse_args_basis_dirs();
+  test_parse_args_basis_invalid_paths();
+  test_validate_config_basis_rejects_chunk_serialization();
 }
