@@ -75,10 +75,17 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
   /* The staged location is brand new (stale leftovers from a prior crash were
      wiped by prepare), so the plain atomic temp+rename engine installs the
      complete file there.  --temp-dir scratch is deliberately not layered on
-     top of the delay-updates staging tree. */
-  bool ok =
-      file_to_disk_secure_with_fsync(staged_path, file->data->data, file->data->size, false, sparse,
-                                     metadata, preserve_executability, config->use_fsync, NULL);
+     top of the delay-updates staging tree.  A --link-dest basis file is hard
+     linked into the staging tree (so publication's rename keeps the link). */
+  bool ok;
+  if (file->basis_link) {
+    ok = file_to_disk_secure_link(staged_path, file->basis_link, file->data->data, file->data->size,
+                                  metadata, preserve_executability, config->use_fsync, NULL);
+  } else {
+    ok = file_to_disk_secure_with_fsync(staged_path, file->data->data, file->data->size, false,
+                                        sparse, metadata, preserve_executability, config->use_fsync,
+                                        NULL);
+  }
   if (!ok) {
     free(staged_path);
     return FILE_SAVE_ERROR;
@@ -272,16 +279,27 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     while (temp_len > 1 && confined_temp[temp_len - 1] == '/')
       confined_temp[--temp_len] = '\0';
   }
-  bool ok =
-      config && config->ignore_existing
-          ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size, sparse,
-                                           metadata, preserve_executability, confined_temp)
-      : config && config->update
-          ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
-                                       sparse, metadata, preserve_executability, confined_temp)
-          : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size, inplace,
-                                           sparse, metadata, preserve_executability,
-                                           config && config->use_fsync, confined_temp);
+  /* A --link-dest basis hit installs an atomic hard link (with a byte-copy
+     fallback); --inplace and the update/no-replace write variants do not
+     apply to a fresh hard link, whose inode attributes already match.  The
+     existing/ignore-existing/update/backup preamble above has already made the
+     policy decision. */
+  bool ok;
+  if (config && file->basis_link) {
+    ok = file_to_disk_secure_link(disk_path, file->basis_link, file->data->data, file->data->size,
+                                  metadata, preserve_executability, config->use_fsync,
+                                  confined_temp);
+  } else {
+    ok = config && config->ignore_existing
+             ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size, sparse,
+                                              metadata, preserve_executability, confined_temp)
+         : config && config->update
+             ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
+                                          sparse, metadata, preserve_executability, confined_temp)
+             : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
+                                              inplace, sparse, metadata, preserve_executability,
+                                              config && config->use_fsync, confined_temp);
+  }
   free(confined_temp);
   confined_temp = NULL;
   if (!ok)
@@ -505,6 +523,143 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
   return NULL;
 }
 
+/* ---- Alternate basis directories (--compare-dest / --copy-dest / --link-dest) ----
+ * The receiver consults the ordered basis-dir list only when the destination
+ * entry is NOT already up to date.  An "exact match" requires an equal size,
+ * an equal mtime (unless --size-only), and an equal content xxHash64, so a
+ * hard link / local copy is only ever made from byte-identical content. */
+
+typedef struct BasisMatch {
+  bool hit;
+  BasisDestType type;
+  char* basis_path; /* owned absolute path of the matched basis file */
+  struct stat st;   /* fstat() of the matched basis file */
+  Data* content;    /* owned basis bytes (or empty Data), NULL when not loaded */
+} BasisMatch;
+
+static void basis_match_free(BasisMatch* match) {
+  if (!match)
+    return;
+  free(match->basis_path);
+  match->basis_path = NULL;
+  data_destroy(match->content);
+  match->content = NULL;
+  match->hit = false;
+  match->type = BASIS_DEST_NONE;
+}
+
+/* Open `path` (via the secure, root-confined primitives) and require it to be
+   a regular file of exactly `expected_size` bytes.  Returns an open read-only
+   descriptor and its fstat on success. */
+static bool basis_open_regular(const char* path, unsigned long long expected_size, int* out_fd,
+                               struct stat* out_st) {
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return false;
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  free(leaf);
+  close(parent_fd);
+  if (fd < 0)
+    return false;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      (unsigned long long)st.st_size != expected_size) {
+    close(fd);
+    return false;
+  }
+  *out_fd = fd;
+  *out_st = st;
+  return true;
+}
+
+/* Read the whole remaining content of an open descriptor.  A zero-length file
+   yields an empty Data (data pointer NULL). */
+static Data* basis_read_content(int fd, unsigned long long size) {
+  if (size == 0)
+    return data_create_reserve(0);
+  if (size > MAX_RECEIVE_WHOLE_FILE_SIZE || size > SIZE_MAX)
+    return NULL;
+  void* buf = protocol_alloc((size_t)size);
+  if (!buf)
+    return NULL;
+  size_t got = 0;
+  while (got < (size_t)size) {
+    ssize_t n = read(fd, (char*)buf + got, (size_t)size - got);
+    if (n <= 0) {
+      free(buf);
+      return NULL;
+    }
+    got += (size_t)n;
+  }
+  return data_create(buf, (size_t)size);
+}
+
+/* --ignore-times forces every file to be updated, so no basis hit is ever
+   declared (matching rsync, where -I prevents link-dest from linking). */
+static bool basis_quick_matches(const Config* config, const struct stat* st, time_t check_mtime,
+                                long check_mtime_nsec) {
+  if (config->size_only)
+    return true;
+  long mtime_nsec = 0;
+#ifdef __linux__
+  mtime_nsec = st->st_mtim.tv_nsec;
+#endif
+  return metadata_mtime_matches(st->st_mtime, mtime_nsec, check_mtime, check_mtime_nsec,
+                                config->modify_window);
+}
+
+/* Search the basis-dir list in command-line order and return the first exact
+   match.  When load_content is true the matched bytes are kept in out->content
+   so the caller can materialize the file without re-reading it. */
+static bool basis_match_find(const Config* config, const char* check_path,
+                             unsigned long long check_size, time_t check_mtime,
+                             long check_mtime_nsec, uint64_t check_checksum, bool load_content,
+                             BasisMatch* out) {
+  memset(out, 0, sizeof(*out));
+  if (!config || !config_has_basis(config) || config->ignore_times)
+    return false;
+  for (int i = 0; i < config->basis_count; i++) {
+    const BasisDest* entry = &config->basis_dirs[i];
+    char* basis_dir = path_cat(config->receive_root_directory, entry->path);
+    if (!basis_dir)
+      continue;
+    char* candidate = path_cat(basis_dir, check_path);
+    free(basis_dir);
+    if (!candidate)
+      continue;
+
+    int fd;
+    struct stat st;
+    if (basis_open_regular(candidate, check_size, &fd, &st)) {
+      if (basis_quick_matches(config, &st, check_mtime, check_mtime_nsec)) {
+        Data* content = basis_read_content(fd, check_size);
+        if (content) {
+          uint64_t basis_hash = check_size == 0 ? delta_xxhash64("", 0)
+                                : content->data ? delta_xxhash64(content->data, content->size)
+                                                : 0;
+          if (basis_hash == check_checksum) {
+            out->hit = true;
+            out->type = entry->type;
+            out->basis_path = candidate;
+            candidate = NULL; /* ownership transferred to out */
+            out->st = st;
+            out->content = load_content ? content : NULL;
+            if (!load_content)
+              data_destroy(content);
+            close(fd);
+            return true;
+          }
+        }
+        data_destroy(content);
+      }
+      close(fd);
+    }
+    free(candidate);
+  }
+  return false;
+}
+
 File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (!config || !skipped) {
     send_status(fd, STATUS_ERROR);
@@ -531,7 +686,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     send_status(fd, STATUS_ERROR);
     return NULL;
   }
-  if (config->checksum && !receive_n_data(fd, &check_checksum, sizeof(check_checksum))) {
+  if ((config->checksum || config_has_basis(config)) &&
+      !receive_n_data(fd, &check_checksum, sizeof(check_checksum))) {
     free(check_path);
     return NULL;
   }
@@ -640,6 +796,76 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     free(check_path);
     *skipped = true;
     return NULL;
+  }
+
+  /* ---- Alternate basis directories ---- */
+  if (config_has_basis(config)) {
+    BasisMatch basis;
+    basis_match_find(config, check_path, check_size, (time_t)check_mtime, (long)check_mtime_nsec,
+                     check_checksum, true, &basis);
+    if (basis.hit) {
+      if (basis.type == BASIS_DEST_COMPARE) {
+        /* compare-dest never copies: an exact match only suppresses the data
+           for a file the destination does not already hold (sparse backup).
+           When the destination holds a DIFFERENT version FastSync falls back to
+           a normal transfer rather than deleting the stale entry the way rsync
+           does (see RSYNC_COMPAT.md). */
+        basis_match_free(&basis);
+        if (!has_old_file) {
+          if (!send_status(fd, STATUS_OK)) {
+            close(old_fd);
+            free(full_path);
+            free(check_path);
+            return NULL;
+          }
+          free(old_data);
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          *skipped = true;
+          return NULL;
+        }
+      } else {
+        /* copy-dest / link-dest: materialize the unchanged file locally so the
+           sender can skip the data.  The store engine re-applies the normal
+           existing/ignore-existing/update/backup/delay-updates policy. */
+        File* materialized = file_create(check_path);
+        if (materialized && basis.content) {
+          materialized->data = basis.content;
+          basis.content = NULL;
+          materialized->metadata = file_metadata_create(&basis.st);
+          materialized->skip = true; /* receiver must not ack this as a data file */
+          if (basis.type == BASIS_DEST_LINK) {
+            materialized->basis_link = basis.basis_path;
+            basis.basis_path = NULL;
+          }
+          if (!materialized->metadata) {
+            file_destroy(materialized);
+            materialized = NULL;
+          }
+        } else {
+          file_destroy(materialized);
+          materialized = NULL;
+        }
+        if (materialized) {
+          if (!send_status(fd, STATUS_OK)) {
+            file_destroy(materialized);
+            close(old_fd);
+            free(full_path);
+            free(check_path);
+            return NULL;
+          }
+          free(old_data);
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          *skipped = false;
+          return materialized;
+        }
+        /* Materialization setup failed: fall through to the normal transfer. */
+      }
+    }
+    basis_match_free(&basis);
   }
 
   if (try_delta && old_data != NULL) {
@@ -843,10 +1069,29 @@ int receive_manifest(int fd, const Config* config, int* next_status) {
   /* With --delay-updates the staged (not yet published) files live directly
      under the receive root in the staging directory; the delete walker must
      not treat them as extras or it would remove every staged file before it
-     can be published. */
-  const char* skip_staging = config->delay_updates ? DELAY_UPDATES_STAGING_DIR : NULL;
-  bool deletion_ok = delete_extras_limited(config->receive_root_directory, manifest,
-                                           MAX_SERVER_DELETE_COUNT, skip_staging);
+     can be published.  Alternate basis directories (--compare-dest /
+     --copy-dest / --link-dest) are also excluded: they are extra comparison
+     snapshots the user pointed at, not destination content, and deleting them
+     would destroy the very files a --link-dest run just linked into place. */
+  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
+  const char** skip_prefixes = NULL;
+  bool deletion_ok = false;
+  if (skip_count > 0) {
+    skip_prefixes = calloc((size_t)skip_count, sizeof(char*));
+    if (!skip_prefixes) {
+      array_list_delete(manifest);
+      send_status(fd, STATUS_ERROR);
+      return -1;
+    }
+    int idx = 0;
+    if (config->delay_updates)
+      skip_prefixes[idx++] = DELAY_UPDATES_STAGING_DIR;
+    for (int i = 0; i < config->basis_count; i++)
+      skip_prefixes[idx++] = config->basis_dirs[i].path;
+  }
+  deletion_ok = delete_extras_limited(config->receive_root_directory, manifest,
+                                      MAX_SERVER_DELETE_COUNT, skip_prefixes, skip_count);
+  free(skip_prefixes);
   array_list_delete(manifest);
   if (!deletion_ok)
     send_status(fd, STATUS_ERROR);

@@ -29,6 +29,12 @@ typedef struct {
   /* True when this entry is an explicit directory entry (--dirs mode): the
    * receiver creates the directory instead of writing a regular file. */
   bool is_dir;
+  /* Receiver-only, --link-dest: when set, install the destination entry as a
+   * hard link to this absolute (root-confined) path instead of writing
+   * `data`.  The matching code has already verified the link target's content
+   * equals the incoming file, and `data` is kept as the cross-filesystem
+   * fallback (a local copy) if the hard link cannot be created. */
+  char* basis_link;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

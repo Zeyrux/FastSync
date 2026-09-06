@@ -214,7 +214,7 @@ static bool receiver_save_file(File* file, void* context_pointer) {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
   }
   if (result != FILE_SAVE_ERROR && context->config->remove_source_files && !file->is_dir &&
-      !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
+      !file->skip && !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
     file_destroy(file);
     return false;
   }

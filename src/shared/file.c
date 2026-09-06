@@ -83,6 +83,7 @@ File* file_create(const char* path) {
   file->metadata = NULL;
   file->skip = false;
   file->is_dir = false;
+  file->basis_link = NULL;
   return file;
 }
 
@@ -98,6 +99,8 @@ void file_destroy(void* item) {
   file->path = NULL;
   free(file->send_path);
   file->send_path = NULL;
+  free(file->basis_link);
+  file->basis_link = NULL;
   free(file);
 }
 
@@ -628,6 +631,106 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, metadata,
                                   preserve_executability, false, true, false, temp_dir);
+}
+
+/* Atomic --link-dest install.  The destination is replaced (via a temporary
+ * name and a final rename) with a hard link to `basis_path`.  When a hard
+ * link cannot be created (the basis lives on a different filesystem, the
+ * filesystem refuses hard links, ...) the install falls back to writing a
+ * local copy from `data`/`data_size`, which the caller has already verified is
+ * byte-identical to the basis file.  `metadata` is only applied on that copy
+ * fallback; a successful hard link keeps the basis inode's own attributes
+ * (applying metadata through the shared inode would mutate the basis file).
+ * Returns false only when both the link and the copy fallback fail. */
+bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
+                              unsigned long long data_size, const FileMetadata* metadata,
+                              bool preserve_executability, bool use_fsync, const char* temp_dir) {
+  if (!path || !basis_path)
+    return false;
+  char* leaf = NULL;
+  int dirfd = file_open_secure_parent(path, &leaf, true);
+  if (dirfd < 0)
+    return false;
+
+  int scratch_dirfd = -1;
+  if (temp_dir) {
+    scratch_dirfd = file_open_private_dir(temp_dir);
+    if (scratch_dirfd < 0) {
+      int saved_errno = errno;
+      log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s", temp_dir,
+                  strerror(saved_errno));
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
+  }
+
+  char* basis_leaf = NULL;
+  int basis_dirfd = file_open_secure_parent(basis_path, &basis_leaf, false);
+  bool linked = false;
+  if (basis_dirfd >= 0 && basis_leaf != NULL) {
+    int tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%llu", leaf, (long)getpid(), ~0ULL);
+    char* tmp = NULL;
+    if (tmp_size >= 0)
+      tmp = malloc((size_t)tmp_size + 1);
+    if (!tmp) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed while hard-linking basis file");
+    } else {
+      for (unsigned int i = 0; i < 100 && !linked; ++i) {
+        if (scratch_dirfd >= 0)
+          snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%llu", leaf, (long)getpid(),
+                   next_temp_sequence());
+        else
+          snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
+        if (linkat(basis_dirfd, basis_leaf, scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, 0) ==
+            0) {
+          linked = true;
+          break;
+        }
+        if (errno != EEXIST)
+          break; /* EXDEV / EPERM / ...: give up and fall back to a copy */
+      }
+      if (linked) {
+        int target_dirfd = scratch_dirfd >= 0 ? scratch_dirfd : dirfd;
+        if (use_fsync) {
+          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+          if (tfd < 0 || fsync(tfd) != 0) {
+            linked = false;
+            if (tfd >= 0)
+              close(tfd);
+          } else {
+            close(tfd);
+          }
+        }
+        if (linked && renameat(target_dirfd, tmp, dirfd, leaf) != 0)
+          linked = false;
+        if (!linked)
+          unlinkat(target_dirfd, tmp, 0);
+      }
+      free(tmp);
+    }
+  }
+  if (basis_dirfd >= 0)
+    close(basis_dirfd);
+  free(basis_leaf);
+  basis_leaf = NULL;
+
+  if (!linked) {
+    if (scratch_dirfd >= 0)
+      close(scratch_dirfd);
+    close(dirfd);
+    free(leaf);
+    /* The basis file could not be linked in (missing, cross-device, refused
+       by the filesystem).  Write a byte-identical local copy instead. */
+    return file_to_disk_secure_with_fsync(path, data, data_size, false, false, metadata,
+                                          preserve_executability, use_fsync, temp_dir);
+  }
+
+  if (scratch_dirfd >= 0)
+    close(scratch_dirfd);
+  close(dirfd);
+  free(leaf);
+  return true;
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

@@ -613,7 +613,10 @@ static int incremental_check(Client* client, File* file, const Config* config,
     return -1;
   if (!send_n_data(client->file_descriptor, &mtime_nsec, sizeof(mtime_nsec)))
     return -1;
-  if (config->checksum) {
+  /* With alternate basis directories the receiver must be able to verify the
+   * content of every candidate basis file, so the sender supplies its xxHash64
+   * for every file even when --checksum was not requested. */
+  if (config->checksum || config_has_basis(config)) {
     uint64_t checksum;
     if (!file_checksum(file, &checksum) ||
         !send_n_data(client->file_descriptor, &checksum, sizeof(checksum)))
