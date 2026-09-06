@@ -218,7 +218,7 @@ static void test_walker_hard_bound_all_or_nothing() {
   EXPECT_NOT_NULL(root);
   int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   EXPECT_TRUE(rootfd >= 0);
-  bool created = rootfd >= 0;
+  bool created = true;
   for (int i = 0; created && i < HARD_BOUND + 1; i++) {
     char name[32];
     snprintf(name, sizeof(name), "f%d", i);
