@@ -353,7 +353,9 @@ static int file_open_scratch_dir(const char* scratch_path) {
     return -1;
   int fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0 && errno == ENOENT) {
-    if (mkdirat(parent_fd, leaf, 0755) == 0 || errno == EEXIST)
+    /* A scratch directory holds transient working copies only; keep it
+       private (0700) so other users cannot race on temp names inside it. */
+    if (mkdirat(parent_fd, leaf, 0700) == 0 || errno == EEXIST)
       fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   }
   close(parent_fd);
@@ -410,41 +412,72 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       }
     }
   } else {
-    /* Scratch directory for the temporary working copy.  When NULL the temp
-       file is created in the destination directory, exactly as historically. */
-    int scratch_dirfd = temp_dir ? file_open_scratch_dir(temp_dir) : -1;
-    char tmp[NAME_MAX];
-    if (temp_dir && scratch_dirfd < 0) {
-      close(dirfd);
-      free(leaf);
-      return false;
-    }
+    /* The --update newer-destination check runs first so a skipped file never
+       creates an empty scratch directory behind it. */
     if (update && metadata) {
       /* This check protects the normal atomic path as far as possible.  A
          concurrent replacement can still occur before the final rename. */
       struct stat destination_stat;
       if (fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
           S_ISREG(destination_stat.st_mode) && stat_is_newer(&destination_stat, metadata)) {
-        if (scratch_dirfd >= 0)
-          close(scratch_dirfd);
         close(dirfd);
         free(leaf);
         return true;
       }
     }
-    for (unsigned int i = 0; i < 100 && !ok; ++i) {
+    /* Scratch directory for the temporary working copy.  When NULL the temp
+       file is created in the destination directory, exactly as historically. */
+    int scratch_dirfd = -1;
+    if (temp_dir) {
+      scratch_dirfd = file_open_scratch_dir(temp_dir);
+      if (scratch_dirfd < 0) {
+        int saved_errno = errno;
+        log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s",
+                    temp_dir, strerror(saved_errno));
+        close(dirfd);
+        free(leaf);
+        return false;
+      }
+    }
+    /* Temp names can exceed NAME_MAX for basenames near the limit (leaf plus
+       the ".tmp.<pid>.<n>" decoration); heap-size the buffer instead of
+       truncating into a fixed array, which would silently collide in a flat
+       scratch directory.  The sizing sentinel is the widest value of each
+       format. */
+    int tmp_size;
+    if (scratch_dirfd >= 0)
+      tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%llu", leaf, (long)getpid(), ULLONG_MAX);
+    else
+      tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%u", leaf, (long)getpid(), 999U);
+    if (tmp_size < 0) {
+      if (scratch_dirfd >= 0)
+        close(scratch_dirfd);
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
+    char* tmp = malloc((size_t)tmp_size + 1);
+    if (!tmp) {
+      if (scratch_dirfd >= 0)
+        close(scratch_dirfd);
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
+    for (unsigned int i = 0; i < 100; ++i) {
       /* The temp name is created inside the scratch directory (when one is
          configured) and, on success, atomically renamed into the destination
-         directory.  In a shared scratch directory the sequence number keeps
-         the name unique even for destinations with a common basename. */
+         directory.  In a shared scratch directory the atomic sequence number
+         keeps the name unique even for destinations with a common basename. */
       if (scratch_dirfd >= 0)
-        snprintf(tmp, sizeof(tmp), ".%s.tmp.%ld.%llu", leaf, (long)getpid(), next_temp_sequence());
+        snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%llu", leaf, (long)getpid(),
+                 next_temp_sequence());
       else
-        snprintf(tmp, sizeof(tmp), ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
+        snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
       fd = openat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp,
                   O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
       if (fd < 0)
-        continue;
+        continue; /* EEXIST (or a transient open error): try a fresh name. */
       if (sparse && data_size > 0)
         ok = ftruncate(fd, (off_t)data_size) == 0;
       if (ok || (!sparse || data_size == 0))
@@ -466,6 +499,10 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                 errno != ENOENT)
               ok = false;
           } else {
+            if (scratch_dirfd >= 0 && errno == EXDEV)
+              log_message(LOG_LEVEL_ERROR,
+                          "temp dir is on a different filesystem than the destination; cannot "
+                          "link file into place (EXDEV); no fallback copy is attempted");
             ok = false;
           }
         } else if (renameat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, dirfd, leaf) != 0) {
@@ -478,7 +515,13 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       }
       if (!ok)
         unlinkat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, 0);
+      /* Once the temp fd was created the outcome is permanent: a write,
+         metadata, fsync, close, linkat or renameat failure will not be fixed
+         by retrying under a fresh name, so stop here.  Only the open-failure
+         path above retries a new name. */
+      break;
     }
+    free(tmp);
     if (scratch_dirfd >= 0)
       close(scratch_dirfd);
   }

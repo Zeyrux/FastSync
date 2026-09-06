@@ -97,7 +97,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `--backup-dir=DIR` | Backup directory hierarchy | ✅ Implemented | `backup_dir` config field |
 | `--suffix=SUFFIX` | Backup suffix (default ~) | ✅ Implemented | `suffix` config field |
 | `--delay-updates` | Put updated files in place at end | ❌ Not Implemented | |
-| `-T`, `--temp-dir=DIR` | Create temporary files in DIR | ✅ Implemented | `--temp-dir` only; `-T` stays FastSync's `--timeout` alias. Scratch dir is resolved under the receive root; temp copies use a unique name there and are atomically renamed into place. If the scratch dir and destination are on different filesystems the atomic rename fails with EXDEV and the file is reported as failed (rsync's non-atomic copy fallback is deliberately not used). `--inplace` and `--partial-dir` writes bypass the scratch dir |
+| `-T`, `--temp-dir=DIR` | Create temporary files in DIR | ✅ Implemented | `--temp-dir` only; `-T` stays FastSync's `--timeout` alias. Scratch dir is resolved under the receive root; temp copies use a unique name there and are atomically renamed into place. If the scratch dir and destination are on different filesystems the atomic rename fails with EXDEV and the file save fails, which aborts the whole transfer (FastSync has no per-file skip/resume on a save error; rsync's non-atomic copy fallback is deliberately not used). `--inplace` and `--partial-dir` writes bypass the scratch dir |
 
 ## 7. Deletion
 

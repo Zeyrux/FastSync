@@ -1088,6 +1088,44 @@ class TestTempDir:
         assert not mismatches, f"Mismatch: {mismatches}"
         assert not os.path.exists(os.path.join(dest, "scratch"))
 
+    def test_temp_dir_ignored_with_inplace(self, shared_server):
+        """--inplace writes directly into the destination; --temp-dir must not
+        redirect those writes into a scratch dir."""
+        source = self._make_source("tempdir_inplace_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_inplace_dst")
+        clean_dir(dest)
+        result, _ = run_client(source, dest,
+                               flags=["--inplace", "--temp-dir=scratch"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"inplace+temp-dir sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+        assert not os.path.exists(os.path.join(dest, "scratch")), \
+            "--inplace wrote through the scratch dir"
+
+    def test_temp_dir_ignored_with_partial_dir(self, shared_server):
+        """--partial --partial-dir already stages in a separate directory;
+        --temp-dir must not be used on top of it."""
+        source = self._make_source("tempdir_partial_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_partial_dst")
+        clean_dir(dest)
+        result, _ = run_client(source, dest,
+                               flags=["--partial", "--partial-dir", ".partial",
+                                      "--temp-dir=scratch"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"partial+temp-dir sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+        partial = os.path.join(dest, ".partial",
+                               os.path.relpath(os.path.join(source, "top.txt"), os.path.sep))
+        assert not os.path.exists(partial), "completed file remained under the partial dir"
+        assert not os.path.exists(os.path.join(dest, "scratch")), \
+            "--partial-dir wrote through the scratch dir"
+
     def test_temp_dir_escape_rejected(self, shared_server):
         source = self._make_source("tempdir_escape_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_escape_dst")
