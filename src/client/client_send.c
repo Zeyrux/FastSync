@@ -628,7 +628,12 @@ static int send_list_only(const Config* config) {
 /* Send the delete manifest (keep-set paths plus the protected excluded
    prefixes) to the server. Returns 0 on success, -1 on failure.  When
    --delete-excluded is given `protected` is empty: excluded destination
-   mirrors are then ordinary extras and are removed. */
+   mirrors are then ordinary extras and are removed.  Both sections are
+   unbounded on the sender; the receiver enforces MAX_MANIFEST_ENTRIES per
+   section and a single MAX_MANIFEST_BYTES budget shared across the two
+   sections, rejecting (with STATUS_ERROR) an over-budget frame.  A heavily
+   filtered source whose exclusion list is large therefore fails the run
+   cleanly on the receiver rather than being truncated. */
 static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes) {
   if (!manifest)
     return -1;
@@ -1048,6 +1053,18 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         return thrd_error;
       }
       if (context->config->use_delete && !context->early_delete) {
+        /* Empty keep-set + scan I/O error must not delete the whole destination
+           (the source may not be genuinely empty -- see send_files). */
+        bool empty_io;
+        mtx_lock(&context->mutex_scanner);
+        empty_io = context->scan_had_io_error && context->manifest && context->manifest->size == 0;
+        mtx_unlock(&context->mutex_scanner);
+        if (empty_io) {
+          log_message(LOG_LEVEL_ERROR,
+                      "source scan hit an I/O error before finding any file; refusing to delete "
+                      "with an empty keep-set (--delete)");
+          goto send_fail;
+        }
         if (send_delete_manifest(client->file_descriptor, context->manifest,
                                  context->excluded_paths) != 0)
           goto send_fail;
@@ -1171,6 +1188,11 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       break;
     }
   }
+  /* Capture the scanner results BEFORE destroying the scanner objects (the
+     io_error flag lives on the scanner, so reading it after destroy would be a
+     use-after-free). */
+  bool had_io =
+      dirs_mode ? directory_scanner_had_io_error(dscanner) : parallel_scanner_had_io_error(scanner);
   if (dirs_mode)
     directory_scanner_destroy(dscanner);
   else
@@ -1188,8 +1210,6 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   }
   /* --ignore-errors: an unreadable subdirectory was skipped (workers recorded
      io_error, not failure); the deletion still runs but the run reports it. */
-  bool had_io =
-      dirs_mode ? directory_scanner_had_io_error(dscanner) : parallel_scanner_had_io_error(scanner);
   if (had_io) {
     mtx_lock(&context->mutex_scanner);
     context->scan_had_io_error = true;
@@ -1360,8 +1380,21 @@ int send_files(Config* config) {
       goto send_fail;
     bool prescan_ok = scan_paths_only(config, &prepared.options, early_manifest, &had_scan_io);
     bool early_ok = false;
-    if (prescan_ok)
-      early_ok = send_delete_manifest_early(client, early_manifest, excluded);
+    if (prescan_ok) {
+      /* A scan that hit an I/O error and produced NO keep entries is ambiguous
+         (the source may not be genuinely empty -- part of it was unreadable),
+         and an empty keep-set would delete the whole destination.  Refuse to
+         delete; the genuine-empty-source case has no io_error and still sends
+         its (empty) keep-set. */
+      if (had_scan_io && early_manifest->size == 0) {
+        log_message(LOG_LEVEL_ERROR,
+                    "source scan hit an I/O error before finding any file; refusing to delete "
+                    "with an empty keep-set (--delete)");
+        prescan_ok = false;
+      } else {
+        early_ok = send_delete_manifest_early(client, early_manifest, excluded);
+      }
+    }
     array_list_delete(early_manifest);
     /* The keep-set (and its protected prefixes) are already on the wire; the
        data pass must not append to the exclusion list again. */
@@ -1436,6 +1469,15 @@ int send_files(Config* config) {
     goto send_fail;
   if (directory_scanner_had_io_error(scanner))
     had_scan_io = true;
+  if (had_scan_io && manifest && manifest->size == 0) {
+    /* A scan that hit an I/O error and produced no keep entries is ambiguous;
+       an empty keep-set would delete the whole destination.  Refuse to delete
+       (see the early-timing comment above). */
+    log_message(LOG_LEVEL_ERROR,
+                "source scan hit an I/O error before finding any file; refusing to delete with "
+                "an empty keep-set (--delete)");
+    goto send_fail;
+  }
   if (manifest) {
     /* Late (commit) ordering: all file data is out; transmit the keep-set
        manifest so the receiver deletes only after the transfer succeeds. */
@@ -1562,6 +1604,14 @@ int send_files_multithreaded(Config** config_ptr) {
       bool prebuilt = prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
                                                      &context->scan_had_io_error);
       prepared_scanner_destroy(&prepared);
+      if (prebuilt && context->scan_had_io_error && context->manifest->size == 0) {
+        /* Empty keep-set + scan I/O error: refusing an empty keep-set manifest
+           would have deleted the whole destination (see send_files). */
+        log_message(LOG_LEVEL_ERROR,
+                    "source scan hit an I/O error before finding any file; refusing to delete "
+                    "with an empty keep-set (--delete)");
+        prebuilt = false;
+      }
       if (!prebuilt) {
         pipeline_context_sender_destroy(context);
         return 1;
