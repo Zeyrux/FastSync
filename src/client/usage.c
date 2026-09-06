@@ -25,6 +25,7 @@ void print_usage(void) {
   printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
+  printf("  --delay-updates    Put updated files into place only at the end of transfer\n");
   printf(
       "  --dirs, --old-dirs, --old-d  Transfer directories without recursing (not implemented)\n");
   printf("  --del               Alias for --delete-during (not implemented)\n");

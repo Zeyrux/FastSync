@@ -1,4 +1,5 @@
 #include "config.h"
+#include "delay_updates.h"
 #include "file.h"
 #include "log.h"
 #include "multiprocessing.h"
@@ -164,6 +165,20 @@ void handler(int file_descriptor) {
     return;
   }
   config->use_delete = config->use_delete && allow_delete;
+  /* A --delay-updates transfer stages under a private 0700 directory inside
+     the receive root.  Create it up front (wiping leftovers of any previously
+     interrupted delayed transfer) so a fully-skipped run also starts clean. */
+  if (config->delay_updates) {
+    config->delay_context = delay_updates_context_create(config->receive_root_directory);
+    if (!config->delay_context || !delay_updates_prepare(config->delay_context)) {
+      log_message(LOG_LEVEL_ERROR, "Failed to initialize --delay-updates staging area");
+      delay_updates_cleanup(config->delay_context);
+      config_delete(config);
+      close(file_descriptor);
+      protocol_session_unbind();
+      return;
+    }
+  }
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {
@@ -215,13 +230,27 @@ void handler(int file_descriptor) {
     thrd_join(writer, &writer_result);
     bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
     if (transfer_ok) {
+      /* --delay-updates: receive_thread has finished the whole protocol stream
+         (including manifest/delete handling) and write_thread has drained its
+         queue, so every staged file is complete.  Publish atomically before the
+         success/outcome frame so a --remove-source-files sender only learns of
+         files that were actually installed. */
+      if (config->delay_updates && config->delay_context &&
+          !delay_updates_publish(config->delay_context, config)) {
+        transfer_ok = false;
+      }
+    }
+    if (transfer_ok) {
       if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
         transfer_ok = false;
     } else {
       send_status(file_descriptor, STATUS_ERROR);
     }
-    if (!transfer_ok)
+    if (!transfer_ok) {
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
+      if (config->delay_updates && config->delay_context)
+        delay_updates_cleanup(config->delay_context);
+    }
     pipeline_context_receiver_destroy(context);
   } else {
     if (receiver_receive_files(config, file_descriptor) != 0)

@@ -1265,6 +1265,28 @@ static void test_parse_args_log_file_format() {
   config_delete(cfg);
 }
 
+/* --delay-updates is a plain boolean receiver option. */
+static void test_parse_args_delay_updates() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delay-updates", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->delay_updates);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+/* rsync rejects --delay-updates with --inplace; FastSync must too. */
+static void test_validate_config_delay_updates_rejects_inplace() {
+  Config* cfg = valid_client_config();
+  cfg->delay_updates = true;
+  cfg->inplace = true;
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -1344,4 +1366,6 @@ void test_client_cli() {
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
   test_parse_args_temp_dir();
+  test_parse_args_delay_updates();
+  test_validate_config_delay_updates_rejects_inplace();
 }

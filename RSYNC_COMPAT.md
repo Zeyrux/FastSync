@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 57 | Feature works end-to-end |
+| ✅ Implemented | 58 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 5 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 1 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 81 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 80 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
@@ -96,7 +96,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-b`, `--backup` | Make backups of overwritten files | ✅ Implemented | Backup before overwrite |
 | `--backup-dir=DIR` | Backup directory hierarchy | ✅ Implemented | `backup_dir` config field |
 | `--suffix=SUFFIX` | Backup suffix (default ~) | ✅ Implemented | `suffix` config field |
-| `--delay-updates` | Put updated files in place at end | ❌ Not Implemented | |
+| `--delay-updates` | Put updated files in place at end | ✅ Implemented | Successfully received files are staged under a private 0700 `.fastsync-stage` dir inside the receive root and atomically renamed into their final destinations only after the whole transfer (manifest/delete handling included) succeeds, just before the success/outcome frame is sent. `--existing`/`--ignore-existing`/`--update` decide against the final destination path at stage time; `--backup` moves the old file aside at publication. Incompatible with `--inplace` (rejected). Aborting or failing before publication installs nothing and removes the staging tree; a crash between stage and publish leaves staged leftovers that the next delayed run wipes at start. A stage→publish failure aborts the transfer (best-effort cleanup of the not-yet-published staged files; already-published files are not rolled back). Works in single-threaded and `-m` modes |
 | `-T`, `--temp-dir=DIR` | Create temporary files in DIR | ✅ Implemented | `--temp-dir` only; `-T` stays FastSync's `--timeout` alias. Scratch dir is resolved under the receive root; temp copies use a unique name there and are atomically renamed into place. If the scratch dir and destination are on different filesystems the atomic rename fails with EXDEV and the file save fails, which aborts the whole transfer (FastSync has no per-file skip/resume on a save error; rsync's non-atomic copy fallback is deliberately not used). `--inplace` and `--partial-dir` writes bypass the scratch dir |
 
 ## 7. Deletion

@@ -60,5 +60,9 @@ bool validate_config(const Config* config) {
       return false;
     }
   }
+  if (config->delay_updates && config->inplace) {
+    log_message(LOG_LEVEL_ERROR, "--delay-updates does not work with --inplace");
+    return false;
+  }
   return true;
 }
