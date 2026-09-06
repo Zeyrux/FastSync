@@ -985,6 +985,35 @@ static void test_parse_args_whole_file() {
   config_delete(cfg);
 }
 
+/* -x and --one-file-system enable client-side single-filesystem scanning. */
+static void test_parse_args_one_file_system() {
+  Config* cfg = config_create();
+  EXPECT_FALSE(cfg->one_file_system);
+
+  char* argv[] = {"fastsync", "-x", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->one_file_system);
+  EXPECT_EQ_INT(positional_count, 2);
+
+  config_delete(cfg);
+  cfg = config_create();
+  char* long_argv[] = {"fastsync", "--one-file-system", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, long_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->one_file_system);
+
+  config_delete(cfg);
+  cfg = config_create();
+  /* Flags never take a value: the "=value" form must be rejected. */
+  char* bad_argv[] = {"fastsync", "--one-file-system=yes", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, bad_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
 /* Test rsync-compatible compression-choice and compression-level aliases. */
 static void test_parse_args_compression_aliases() {
   Config* cfg = config_create();
@@ -1213,6 +1242,7 @@ void test_client_cli() {
   test_parse_args_secluded_args();
   test_parse_args_short_s_remains_chunk_serialization();
   test_parse_args_whole_file();
+  test_parse_args_one_file_system();
   test_parse_args_compression_aliases();
   test_parse_args_compression_equals_and_none();
   test_parse_args_compression_canonical_equals();

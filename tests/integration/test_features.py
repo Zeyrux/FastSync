@@ -2,6 +2,7 @@
 import filecmp
 import os
 import shutil
+import subprocess
 import sys
 import time
 import pytest
@@ -1021,3 +1022,75 @@ class TestLargeFile:
         assert result.returncode == 0, f"Large-file sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
         assert filecmp.cmp(source_file, os.path.join(received, "big.bin"), shallow=False)
+
+
+class TestOneFileSystem:
+    def _make_tree(self, source):
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "nested", "deeper"))
+        with open(os.path.join(source, "root.txt"), "wb") as f:
+            f.write(b"root")
+        with open(os.path.join(source, "nested", "inner.txt"), "wb") as f:
+            f.write(b"inner")
+        with open(os.path.join(source, "nested", "deeper", "deep.txt"), "wb") as f:
+            f.write(b"deep")
+
+    def _assert_full_tree_transferred(self, source, dest, port, flags):
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=flags, port=port)
+        assert result.returncode == 0, f"Sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    def test_x_transfer_matches_plain_over_single_filesystem(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "ofs_src")
+        self._make_tree(source)
+        self._assert_full_tree_transferred(source, os.path.join(TEST_DATA_DIR, "ofs_dst"),
+                                           shared_server.port, ["-x"])
+
+    def test_x_multithreaded_transfer_matches_plain_over_single_filesystem(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "ofs_m_src")
+        self._make_tree(source)
+        self._assert_full_tree_transferred(source, os.path.join(TEST_DATA_DIR, "ofs_m_dst"),
+                                           shared_server.port, ["-m", "--one-file-system"])
+
+    def test_x_skips_other_device_mountpoint(self, shared_server):
+        if os.geteuid() != 0 or shutil.which("mount") is None or shutil.which("umount") is None:
+            pytest.skip("cross-device test requires root and mount(8)")
+        source = os.path.join(TEST_DATA_DIR, "ofs_mnt_src")
+        dest = os.path.join(TEST_DATA_DIR, "ofs_mnt_dst")
+        dest_plain = os.path.join(TEST_DATA_DIR, "ofs_mnt_plain_dst")
+        mountpoint = os.path.join(source, "external")
+        clean_dir(source)
+        os.makedirs(mountpoint)
+        os.makedirs(os.path.join(source, "nested"))
+        with open(os.path.join(source, "root.txt"), "wb") as f:
+            f.write(b"root")
+        with open(os.path.join(source, "nested", "inner.txt"), "wb") as f:
+            f.write(b"inner")
+        mounted = False
+        try:
+            mount = subprocess.run(["mount", "-t", "tmpfs", "tmpfs", mountpoint],
+                                   capture_output=True, text=True)
+            if mount.returncode != 0:
+                pytest.skip(f"cannot mount tmpfs: {mount.stderr.strip()}")
+            mounted = True
+            with open(os.path.join(mountpoint, "away.txt"), "wb") as f:
+                f.write(b"cross device")
+            result, _ = run_client(source, dest, flags=["-x"], port=shared_server.port)
+            assert result.returncode == 0, f"-x sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            assert os.path.isfile(os.path.join(received, "root.txt"))
+            assert os.path.isfile(os.path.join(received, "nested", "inner.txt"))
+            assert not os.path.exists(os.path.join(received, "external", "away.txt")), \
+                "-x must not cross into the mounted filesystem"
+            result, _ = run_client(source, dest_plain, port=shared_server.port)
+            assert result.returncode == 0, f"plain sync failed: {result.stderr[:200]}"
+            received_plain = get_dest_received_dir(dest_plain, source)
+            assert os.path.isfile(os.path.join(received_plain, "external", "away.txt")), \
+                "without -x the mounted subtree must be transferred"
+        finally:
+            if mounted:
+                subprocess.run(["umount", mountpoint], capture_output=True, text=True)

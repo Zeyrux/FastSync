@@ -93,6 +93,7 @@ static void config_set_defaults(Config* config) {
   config->files_from = NULL;
   config->cvs_exclude = false;
   config->prune_empty_dirs = false;
+  config->one_file_system = false;
   config->relative = false;
   config->rsh_command = NULL;
   config->rsync_path = NULL;

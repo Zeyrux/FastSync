@@ -416,6 +416,7 @@ static const OptionEntry OPTION_TABLE[] = {
 
     {"--max-size", NULL, OPT_ULL, offsetof(Config, max_size)},
     {"--min-size", NULL, OPT_ULL, offsetof(Config, min_size)},
+    {"--one-file-system", "-x", OPT_FLAG, offsetof(Config, one_file_system)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
