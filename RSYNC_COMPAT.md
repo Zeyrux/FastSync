@@ -41,9 +41,9 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-i`, `--itemize-changes` | Per-file change summary | ✅ Implemented | Prints rsync-style `>f+++++++++` lines to stdout only for files actually sent (also under `-m`); unchanged files print nothing, matching single-`-i` behavior |
 | `--progress` | Show progress | ✅ Implemented | Progress callback in sender |
 | `-P` | Same as --partial --progress | ⚠️ Partial | Parses and enables progress, but interrupted files are not retained for resumable transfers |
-| `--out-format=FORMAT` | Custom output format | ✅ Implemented | Per-transfer template on stdout; tokens `%f` `%n` `%l` `%b` `%M` `%%`; unknown escapes preserved |
+| `--out-format=FORMAT` | Custom output format | ✅ Implemented | Per-transfer template on stdout; tokens `%f` `%n` `%l` `%b` `%M` `%%` (`%b` is the source length, always `== %l`; post-compression/delta wire bytes are not counted); unknown escapes preserved |
 | `--log-file=FILE` | Log to file | ✅ Implemented | `log_file` config field |
-| `--log-file-format=FMT` | Log format | ✅ Implemented | Requires `--log-file`; writes one template line per transferred file using the same token set as `--out-format` |
+| `--log-file-format=FMT` | Log format | ✅ Implemented | Requires `--log-file`; writes one template line per transferred file using the same token set as `--out-format` (including `%b` `==` source length) |
 | `--8-bit-output`, `-8` | Leave high-bit chars unescaped | ✅ Implemented | Applies to displayed paths and protocol debug output |
 | `--list-only` | List files instead of copying | ✅ Implemented | `ls -l`-style listing of files that would be transferred; scans the source only, contacts no server, writes nothing; also works with `-n` |
 

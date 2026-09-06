@@ -1051,6 +1051,15 @@ class TestListOnly:
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert not os.path.exists(received)
 
+    def test_list_only_multithreaded(self):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "-m"])
+        assert result.returncode == 0, f"list-only -m failed: {result.stderr[:200]}"
+        for full_path in _source_files():
+            assert full_path in result.stdout, f"list-only -m omitted {full_path}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        assert not os.path.exists(received), "list-only -m wrote to the destination"
+
 
 class TestItemizeChanges:
     """-i/--itemize-changes prints rsync-style lines only for files sent."""
@@ -1090,6 +1099,38 @@ class TestItemizeChanges:
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-i", "--dry-run"])
         assert result.returncode == 0, f"dry-run -i failed: {result.stderr[:200]}"
+
+    def test_changed_file_on_second_incremental_run_prints_exactly_one_line(self, shared_server):
+        """A changed file itemizes exactly once on an incremental rerun while
+        unchanged files print nothing (no double emission)."""
+        source = os.path.join(TEST_DATA_DIR, "itemize_change_src")
+        dest = os.path.join(TEST_DATA_DIR, "itemize_change_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        changed = os.path.join(source, "changed.txt")
+        untouched = os.path.join(source, "untouched.txt")
+        with open(changed, "wb") as fh:
+            fh.write(b"original\n")
+        with open(untouched, "wb") as fh:
+            fh.write(b"stable\n")
+
+        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+
+        with open(changed, "wb") as fh:
+            fh.write(b"edited payload\n")
+
+        result, _ = run_client(source, dest,
+                               flags=["-M", "-i", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
+        itemized = [line for line in result.stdout.splitlines() if line.startswith(">f")]
+        assert itemized == [">f+++++++++ " + changed], (
+            f"expected exactly one itemize line for {changed}, got {itemized}"
+        )
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "changed.txt")) == b"edited payload\n"
+        assert _read_file(os.path.join(received, "untouched.txt")) == b"stable\n"
 
 
 class TestOutFormat:
@@ -1134,4 +1175,30 @@ class TestLogFileFormat:
         expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
         for line in expected:
             assert line in content, f"log file missing {line!r}"
+
+    def test_log_file_format_multithreaded_writes_transferred_files(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "itemize_log_mt_src")
+        dest = os.path.join(TEST_DATA_DIR, "itemize_log_mt_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        files = {"a.txt": b"alpha\n", "b.txt": b"beta\n"}
+        for rel, data in files.items():
+            with open(os.path.join(source, rel), "wb") as fh:
+                fh.write(data)
+        log_path = os.path.join(TEST_DATA_DIR, "itemize_mt.log")
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+        result, _ = run_client(
+            source,
+            dest,
+            flags=["--log-file", log_path, "--log-file-format=%f %l", "-m"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"log-file -m sync failed: {result.stderr[:200]}"
+        assert os.path.exists(log_path), "--log-file created no log"
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        expected = {f"{os.path.join(source, rel)} {len(data)}" for rel, data in files.items()}
+        for line in expected:
+            assert line in content, f"log file (-m) missing {line!r}"
 

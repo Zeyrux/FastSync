@@ -14,8 +14,10 @@
  * FastSync is a push-style tool: the client sends files from the source tree
  * to a server that writes them under the destination root.  Events are
  * emitted by whichever code path decides a file's fate (the single-threaded
- * send loop and the `-m` sender thread both call the same per-file sender, so
- * only that one thread ever reports events - no cross-thread printing races).
+ * send loop and the `-m` sender thread both call the same per-file sender), so
+ * all change events are emitted by exactly one thread and itemize/out-format
+ * lines never interleave with each other.  They may still interleave with
+ * legacy log messages (log.c) that share the same stdout/log-file stream.
  */
 
 typedef enum {
@@ -27,9 +29,12 @@ typedef struct {
   const char* path; /* full source path */
   ChangeDecision decision;
   bool is_directory;
-  unsigned long long size;       /* source file length in bytes */
-  unsigned long long bytes_sent; /* payload bytes sent (best effort) */
-  time_t mtime_sec;              /* 0 when unknown */
+  unsigned long long size; /* source file length in bytes */
+  /* The number of bytes reported for a sent file. FastSync has no wire-byte
+   * counter, so this is always the source length (== size / %l); actual
+   * post-compression/delta bytes on the wire are not counted. */
+  unsigned long long bytes_sent;
+  time_t mtime_sec; /* 0 when unknown */
 } ChangeEvent;
 
 /* True when any output mode is active and per-file events matter. */
@@ -46,9 +51,10 @@ bool change_list_enabled(const Config* config);
 char* change_render_itemize(const ChangeEvent* event);
 
 /* Expand an --out-format/--log-file-format template.  Tokens:
- *   %f  full source path        %b  bytes sent (== %l for a whole file)
- *   %n  leaf (base) name        %M  mtime in whole seconds since the epoch
- *   %l  file length in bytes    %%  a literal percent sign
+ *   %f  full source path        %b  "bytes sent" == the source length (%l);
+ *   %n  leaf (base) name            actual post-compression/delta wire bytes
+ *   %l  file length in bytes        are not counted
+ *   %M  mtime in whole seconds      %%  a literal percent sign
  * Unknown %X sequences are preserved verbatim.  Caller frees the result. */
 char* change_render_format(const char* format, const ChangeEvent* event);
 

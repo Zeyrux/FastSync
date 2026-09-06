@@ -266,9 +266,20 @@ void change_emit(const Config* config, const ChangeEvent* event) {
 static bool format_uses_mtime(const char* format) {
   if (format == NULL)
     return false;
-  for (const char* p = format; *p != '\0'; p++) {
-    if (p[0] == '%' && p[1] == 'M')
+  /* Mirror change_render_format's tokenizer: "%%" is a literal percent (so
+   * "%%M" does NOT expand %M) and unknown "%X" escapes consume both chars.
+   * This keeps the optional stat() fallback below in step with the renderer. */
+  for (const char* p = format; *p != '\0';) {
+    if (*p != '%') {
+      p++;
+      continue;
+    }
+    char token = p[1];
+    if (token == '\0')
+      break;
+    if (token == 'M')
       return true;
+    p += 2;
   }
   return false;
 }
@@ -282,12 +293,15 @@ void change_emit_file_sent(const Config* config, const File* file) {
   event.decision = CHANGE_SENT;
   event.is_directory = false;
   event.size = file->data != NULL ? file->data->size : 0;
-  /* FastSync does not currently count post-compression/delta wire bytes, so
-   * the reported value is the source length that had to be delivered. */
+  /* FastSync has no wire-byte counter yet, so %b reports the source length
+   * that had to be delivered (always equal to %l); the actual bytes written
+   * to the socket (compressed/delta) are not measured. */
   event.bytes_sent = event.size;
   if (file->metadata != NULL) {
     event.mtime_sec = file->metadata->mtime_sec;
   } else if (format_uses_mtime(config->out_format) || format_uses_mtime(config->log_file_format)) {
+    /* Best-effort fallback for %M when no metadata was captured (no -M): the
+     * path is stat()ed just to fill the field, and any failure leaves 0. */
     struct stat st;
     if (file->path != NULL && stat(file->path, &st) == 0)
       event.mtime_sec = st.st_mtime;
