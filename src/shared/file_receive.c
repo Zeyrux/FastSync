@@ -1590,13 +1590,21 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
     char* leaf = NULL;
     int parent_fd = file_open_secure_parent(full, &leaf, false);
     if (parent_fd < 0) {
+      /* The mirror's parent directory may itself not exist on the destination
+         (a deeper missing entry whose leading directories were never created).
+         That is a no-op -- there is nothing to delete -- matching
+         file_remove_tree_secure's absent-path handling; only a genuine I/O
+         error (EACCES, a symlink loop, ...) fails the run. */
+      bool absent = errno == ENOENT || errno == ENOTDIR;
       free(full);
       free(leaf);
-      ok = false;
+      if (!absent)
+        ok = false;
       continue;
     }
     struct stat st;
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      /* Already absent: nothing to delete (a no-op, not a deletion). */
       if (errno != ENOENT)
         ok = false;
       close(parent_fd);
@@ -1604,24 +1612,20 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       free(full);
       continue;
     }
+    bool removed = false;
     if (S_ISDIR(st.st_mode)) {
-      if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0 || errno == ENOENT) {
-        char* escaped = output_escape(rel, log_get_8_bit_output());
-        fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
-        free(escaped);
+      if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0) {
+        removed = true;
       } else if (errno == ENOTEMPTY || errno == EEXIST) {
         close(parent_fd);
         parent_fd = -1;
         free(leaf);
         leaf = NULL;
         if (config->use_delete || config->force_delete) {
-          if (file_remove_tree_secure(full)) {
-            char* escaped = output_escape(rel, log_get_8_bit_output());
-            fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
-            free(escaped);
-          } else {
+          if (!file_remove_tree_secure(full))
             ok = false;
-          }
+          else
+            removed = true;
         } else {
           char* escaped = output_escape(rel, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING,
@@ -1630,17 +1634,20 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
                       escaped ? escaped : "<allocation failed>");
           free(escaped);
         }
-      } else {
+      } else if (errno != ENOENT) {
         ok = false;
       }
     } else {
-      if (unlinkat(parent_fd, leaf, 0) == 0 || errno == ENOENT) {
-        char* escaped = output_escape(rel, log_get_8_bit_output());
-        fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
-        free(escaped);
-      } else {
+      if (unlinkat(parent_fd, leaf, 0) == 0) {
+        removed = true;
+      } else if (errno != ENOENT) {
         ok = false;
       }
+    }
+    if (removed) {
+      char* escaped = output_escape(rel, log_get_8_bit_output());
+      fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
+      free(escaped);
     }
     if (parent_fd >= 0)
       close(parent_fd);

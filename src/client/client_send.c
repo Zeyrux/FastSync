@@ -262,12 +262,26 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
     free(full);
   }
   if (*skipped_out > 0) {
-    if (config->delete_missing_args)
-      log_message(LOG_LEVEL_WARNING,
-                  "--delete-missing-args: %d missing --files-from entr%s will be deleted from the "
-                  "destination",
-                  *skipped_out, *skipped_out == 1 ? "y" : "ies");
-    else if (config->ignore_missing_args)
+    if (config->delete_missing_args) {
+      /* --list-only never deletes and a --dry-run only shows intent, so the
+         summary must not claim a real deletion happened in those modes. */
+      if (config->list_only)
+        log_message(LOG_LEVEL_WARNING,
+                    "--delete-missing-args: %d missing --files-from entr%s skipped (--list-only "
+                    "never deletes)",
+                    *skipped_out, *skipped_out == 1 ? "y" : "ies");
+      else if (config->dry_run)
+        log_message(LOG_LEVEL_WARNING,
+                    "--delete-missing-args: %d missing --files-from entr%s would be deleted from "
+                    "the destination (dry run)",
+                    *skipped_out, *skipped_out == 1 ? "y" : "ies");
+      else
+        log_message(
+            LOG_LEVEL_WARNING,
+            "--delete-missing-args: %d missing --files-from entr%s will be deleted from the "
+            "destination",
+            *skipped_out, *skipped_out == 1 ? "y" : "ies");
+    } else if (config->ignore_missing_args)
       log_message(LOG_LEVEL_WARNING,
                   "--ignore-missing-args: ignored %d missing --files-from entr%s", *skipped_out,
                   *skipped_out == 1 ? "y" : "ies");
