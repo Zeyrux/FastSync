@@ -717,8 +717,10 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
 }
 
 static int incremental_check(Client* client, File* file, const Config* config,
-                             DeltaSignature** out_sig) {
+                             DeltaSignature** out_sig, unsigned long long* resume_offset) {
   *out_sig = NULL;
+  if (resume_offset)
+    *resume_offset = 0;
   if (!send_status(client->file_descriptor, STATUS_CHECK))
     return -1;
   if (!send_str(client->file_descriptor, file_wire_path(file)))
@@ -765,6 +767,19 @@ static int incremental_check(Client* client, File* file, const Config* config,
     *out_sig = sig;
     return 2;
   }
+  if (s == STATUS_APPEND) {
+    /* --append / --append-verify tail resume: the receiver found an existing
+       destination SHORTER than the source and wants only the tail from this
+       offset (the bytes it already holds). */
+    unsigned long long offset;
+    if (!receive_n_data(client->file_descriptor, &offset, sizeof(offset))) {
+      send_status(client->file_descriptor, STATUS_ERROR);
+      return -1;
+    }
+    if (resume_offset)
+      *resume_offset = offset;
+    return 3;
+  }
   if (s != STATUS_NEXT) {
     log_message(LOG_LEVEL_ERROR, "Unexpected server status");
     send_status(client->file_descriptor, STATUS_ERROR);
@@ -810,6 +825,89 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
     ok = metadata_send(client->file_descriptor, file->metadata);
 
   data_destroy(to_send);
+  return ok ? 0 : -1;
+}
+
+/* --append / --append-verify tail resume.  The receiver learned the existing
+ * destination is SHORTER than the source and replied STATUS_APPEND with the
+ * resume offset (prefix bytes it already holds).  For plain --append we send
+ * the tail immediately (the prefix is not content-verified, matching rsync).
+ * For --append-verify we first send the source prefix xxHash64; the receiver
+ * compares it to the retained prefix and replies STATUS_APPEND_OK (send the
+ * tail) or STATUS_NEXT (prefix mismatch -> full transfer, never corrupt).
+ * Returns 0 on success, 1 when a full transfer was done instead, -1 on error. */
+static int send_append(const Client* client, File* file, Config* config,
+                       unsigned long long offset) {
+  int fd = client->file_descriptor;
+  const unsigned long long fsize = file->data->size;
+  if (offset >= fsize) {
+    send_status(fd, STATUS_ERROR);
+    return -1;
+  }
+  size_t off = (size_t)offset;
+  size_t tail_len = (size_t)(fsize - off);
+  int compression_level = config->use_compression ? config->compression_level : 0;
+  int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
+  bool compress = compression_level > 0 &&
+                  !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
+                                                         skip_count);
+
+  /* --append-verify: exchange the source prefix checksum and await the verdict. */
+  if (config->append_verify) {
+    uint64_t prefix_hash = delta_xxhash64(file->data->data, off);
+    if (!send_status(fd, STATUS_APPEND_SIG) || !send_n_data(fd, &prefix_hash, sizeof(prefix_hash)))
+      return -1;
+    Status resp;
+    if (!receive_status(fd, &resp))
+      return -1;
+    if (resp == STATUS_NEXT) {
+      /* Retained prefix does not match the source: fall back to the atomic full
+         transfer (byte-identical, never a corrupt prefix+tail blend). */
+      int rc = file_send_single_calls_with_skip(file, fd, config->use_metadata, compression_level,
+                                                false, config->skip_compress_suffixes, skip_count,
+                                                config->compression_threads)
+                   ? 1
+                   : -1;
+      return rc;
+    }
+    if (resp != STATUS_APPEND_OK) {
+      send_status(fd, STATUS_ERROR);
+      return -1;
+    }
+  }
+
+  if (!send_status(fd, STATUS_APPEND_DATA)) {
+    return -1;
+  }
+  if (config->use_metadata && !metadata_send(fd, file->metadata)) {
+    return -1;
+  }
+  bool ok;
+  if (compress) {
+    /* Compression needs an owned copy of the tail to compress. */
+    Data* tail = data_create_empty(tail_len);
+    if (!tail) {
+      send_status(fd, STATUS_ERROR);
+      return -1;
+    }
+    memcpy(tail->data, (const char*)file->data->data + off, tail_len);
+    Data* comp = data_compress_with_threads(tail, compression_level, config->compression_threads);
+    data_destroy(tail);
+    if (!comp) {
+      send_status(fd, STATUS_ERROR);
+      return -1;
+    }
+    ok = send_data(fd, comp);
+    data_destroy(comp);
+  } else {
+    /* Uncompressed: send directly from the source buffer (no per-file copy;
+       send_data is synchronous, so the view outlives the call). */
+    Data tail_view;
+    tail_view.data = (char*)file->data->data + off;
+    tail_view.size = tail_len;
+    tail_view.protocol_charge = 0;
+    ok = send_data(fd, &tail_view);
+  }
   return ok ? 0 : -1;
 }
 
@@ -867,7 +965,8 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   // Incremental path: use sendfile for the actual data if enabled and no compression
   if (use_sendfile) {
     DeltaSignature* sig = NULL;
-    int rc = incremental_check(client, file, config, &sig);
+    unsigned long long resume_offset = 0;
+    int rc = incremental_check(client, file, config, &sig, &resume_offset);
     if (rc == 1) {
       log_info_message(LOG_INFO_SKIP, "Skipping unchanged %s", file->path);
       delta_signature_destroy(sig);
@@ -876,6 +975,16 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     if (rc < 0) {
       delta_signature_destroy(sig);
       return -1;
+    }
+    // rc == 3: append resume (tail-only) -- send_append uses the data path.
+    if (rc == 3) {
+      delta_signature_destroy(sig);
+      int arc = send_append(client, file, config, resume_offset);
+      if (arc == 1) {
+        log_info_message(LOG_INFO_COPY, "Append prefix mismatch; full transfer of %s", file->path);
+        return 0;
+      }
+      return arc == 0 ? 0 : -1;
     }
     // rc == 0: unchanged file, skip
     // rc == 2: server sent delta signature but sendfile doesn't support delta
@@ -896,7 +1005,8 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
 
   // Incremental path with single_calls (supports compression and delta)
   DeltaSignature* sig = NULL;
-  int rc = incremental_check(client, file, config, &sig);
+  unsigned long long resume_offset = 0;
+  int rc = incremental_check(client, file, config, &sig, &resume_offset);
   if (rc < 0) {
     delta_signature_destroy(sig);
     return -1;
@@ -905,6 +1015,17 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     log_info_message(LOG_INFO_SKIP, "Skipping unchanged %s", file->path);
     delta_signature_destroy(sig);
     return 1;
+  }
+  if (rc == 3) {
+    /* --append / --append-verify tail resume.  send_append reports 1 when the
+       verified prefix mismatched and a full transfer was sent instead. */
+    delta_signature_destroy(sig);
+    int arc = send_append(client, file, config, resume_offset);
+    if (arc == 1) {
+      log_info_message(LOG_INFO_COPY, "Append prefix mismatch; full transfer of %s", file->path);
+      return 0;
+    }
+    return arc == 0 ? 0 : -1;
   }
   if (rc == 2 && config->use_delta && !config->whole_file) {
     int drc = send_delta(client, file, sig, config);

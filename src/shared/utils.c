@@ -531,3 +531,15 @@ char* path_cat(const char* path1, const char* path2) {
   new_path[path1_len + path2_len + 1] = '\0';
   return new_path;
 }
+
+bool append_resume_eligible(unsigned long long old_size, unsigned long long check_size) {
+  return old_size < check_size;
+}
+
+bool append_tail_length(unsigned long long old_size, unsigned long long check_size,
+                        unsigned long long* tail_out) {
+  if (!tail_out || !append_resume_eligible(old_size, check_size))
+    return false;
+  *tail_out = check_size - old_size;
+  return true;
+}

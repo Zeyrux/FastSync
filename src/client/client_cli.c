@@ -435,6 +435,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--copy-unsafe-links", NULL, OPT_FLAG, offsetof(Config, copy_unsafe_links)},
     {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
     {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
+    {"--append", NULL, OPT_FLAG, offsetof(Config, append)},
+    {"--append-verify", NULL, OPT_FLAG, offsetof(Config, append_verify)},
     {"--fsync", NULL, OPT_FLAG, offsetof(Config, use_fsync)},
     {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
     {"--8-bit-output", "-8", OPT_FLAG, offsetof(Config, eight_bit_output)},
@@ -1100,6 +1102,17 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
      * --no-incremental also suppresses the delta implication. */
     if (!config->whole_file && !no_delta && !no_incremental)
       config->use_delta = true;
+  }
+
+  /* --append / --append-verify resume a shorter existing destination file.
+   * The receiver must run the per-file STATUS_CHECK handshake to learn the
+   * destination length and reply STATUS_APPEND, so an append mode forces
+   * --incremental on (exactly like the basis-dir options: the handshake is
+   * required, not optional).  The resume itself is a dedicated tail-only
+   * exchange, not the block delta, so no delta implication is made.  When both
+   * spelling are given the safer --append-verify semantics win. */
+  if (config->append || config->append_verify) {
+    config->use_incremental = true;
   }
 
   /* Incremental and delta transfers need metadata unless the user disabled it. */

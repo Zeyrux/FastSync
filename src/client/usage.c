@@ -159,6 +159,10 @@ void print_usage(void) {
   printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
+  printf("  --append            Resume a shorter destination by appending only its tail\n");
+  printf("                    (prefix is not verified; requires --incremental)\n");
+  printf("  --append-verify     Like --append, but verifies the retained prefix checksum\n");
+  printf("                    before appending (falls back to a full transfer on mismatch)\n");
   printf("  --fsync             Fsync every written file before publication\n");
   printf("  --compress-level <n>    Compression level (default: 5)\n");
   printf("  --zl <n>             Alias for --compress-level\n");

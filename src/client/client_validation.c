@@ -51,14 +51,26 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "--delta cannot be combined with -f (sendfile)");
     return false;
   }
-  if (config->log_file_format && !config->log_file) {
-    log_message(LOG_LEVEL_ERROR, "--log-file-format requires --log-file");
+  /* --append / --append-verify resume a shorter existing destination by
+     transmitting only the tail.  The resume needs the per-file STATUS_CHECK
+     handshake (so the dest length is learned), which chunk serialization -s
+     disables; and whole-file is the opposite intent (send everything), so the
+     two would silently make the resume pointless.  Both are rejected up front
+     rather than silently degrading to a full transfer. */
+  if ((config->append || config->append_verify) && config->use_chunk_serialization) {
+    log_message(LOG_LEVEL_ERROR,
+                "--append/--append-verify require the per-file incremental check and cannot be "
+                "combined with -s (chunk serialization)");
     return false;
   }
-  if (config->append || config->append_verify) {
-    fprintf(
-        stderr,
-        "Error: --append and --append-verify are not supported yet; refusing to ignore option\n");
+  if ((config->append || config->append_verify) && config->whole_file) {
+    log_message(LOG_LEVEL_ERROR,
+                "--append/--append-verify are incompatible with --whole-file (which forces a "
+                "full transfer)");
+    return false;
+  }
+  if (config->log_file_format && !config->log_file) {
+    log_message(LOG_LEVEL_ERROR, "--log-file-format requires --log-file");
     return false;
   }
   if (config->use_tls) {

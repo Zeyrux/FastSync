@@ -174,6 +174,10 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          config_has_valid_delete_timing(config) &&
          !(config->skip_compress_set && config->use_chunk_serialization) &&
+         /* --append / --append-verify tail resume needs the per-file check,
+            which chunk serialization -s disables: reject on the receiver too
+            so a -s sender cannot negotiate an inert append mode. */
+         !((config->append || config->append_verify) && config->use_chunk_serialization) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&

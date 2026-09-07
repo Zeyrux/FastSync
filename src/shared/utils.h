@@ -53,5 +53,13 @@ void utils_set_authorized_root_fd(int fd);
 bool has_path_traversal(const char* path);
 bool utils_valid_batch_path(const char* path);
 bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_size);
+/* --append / --append-verify tail-resume math (pure).  A resume is eligible only
+   when an existing destination file is SHORTER than the source; the tail length
+   is then the difference.  append_resume_eligible answers whether the shorter
+   file makes a resume possible; append_tail_length additionally returns that
+   tail length, refusing (false) the degenerate old_size >= check_size case. */
+bool append_resume_eligible(unsigned long long old_size, unsigned long long check_size);
+bool append_tail_length(unsigned long long old_size, unsigned long long check_size,
+                        unsigned long long* tail_out);
 
 #endif
