@@ -1955,6 +1955,64 @@ class TestMissingArgs:
             assert not os.path.exists(os.path.join(dest, "extra.txt")), \
                 "--delete-before implies --delete: unrelated extras must go"
 
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_delete_missing_deep_entry_with_absent_parent(self, mt, relative):
+        """A missing entry whose destination mirror's parent directory does not
+        exist is a no-op (nothing to delete), never a run failure: the
+        exact-path deletions must not abort the --delete extras walk.  Covers
+        the -R bare-relative layout and the full source-mirror layout."""
+        source = self._make_source("mg_deep_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_deep_dst")
+        clean_dir(dest)
+        rel_flags = ["-R"] if relative else []
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            if relative:
+                target_root = dest
+            else:
+                # Non-relative layout: seed a.txt so the receive-root mirror
+                # tree exists (its sub/ sibling deliberately does not).
+                seed = _write_rel_list(b"a.txt\n")
+                result, _ = run_client(source, dest,
+                                       flags=["--files-from", seed] + rel_flags,
+                                       port=server.port)
+                assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+                target_root = get_dest_received_dir(dest, source)
+                assert os.path.isfile(os.path.join(target_root, "a.txt"))
+            with open(os.path.join(target_root, "extra.txt"), "w") as fh:
+                fh.write("extra")
+
+            lst = _write_rel_list(b"a.txt\nsub/gone.txt\n")
+            flags = ["--files-from", lst, "--delete-missing-args", "--delete"] + rel_flags + \
+                    (["-m"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"deep missing-entry sync failed: {result.stderr[:300]}"
+            assert _read_file(os.path.join(target_root, "a.txt")) == b"a\n"
+            assert not os.path.exists(os.path.join(target_root, "extra.txt")), \
+                "--delete extras walk was aborted by the absent-parent missing entry"
+            assert not os.path.exists(os.path.join(target_root, "sub")), \
+                "the absent parent directory of the missing entry was created"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_missing_entry_skipped_in_scanner(self, shared_server, mt):
+        """--dirs + --files-from: a listed-but-missing entry is skipped in the
+        --dirs generator (which would otherwise hard-fail), transferring the
+        rest of the list."""
+        source = self._make_source("mg_dirs_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_dirs_dst")
+        clean_dir(dest)
+        lst = _write_rel_list(b"a.txt\ngone.txt\n")
+        flags = ["--files-from", lst, "--dirs", "-R", "--ignore-missing-args"] + \
+                (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"--dirs ignore-missing sync failed: {result.stderr[:300]}"
+        assert _read_file(os.path.join(dest, "a.txt")) == b"a\n", \
+            "the listed present file was not transferred"
+        assert not os.path.exists(os.path.join(dest, "gone.txt")), \
+            "a directory/file was created for the missing --dirs entry"
+
 
 class TestNoImpliedDirs:
     """--no-implied-dirs (only meaningful with -R + --files-from) refuses to

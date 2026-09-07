@@ -638,6 +638,9 @@ static void test_manifest_delete_missing_args() {
   EXPECT_TRUE(array_list_add(manifest->missing, str_dup("empty_dir")));
   EXPECT_TRUE(array_list_add(manifest->missing, str_dup("full_dir")));
   EXPECT_TRUE(array_list_add(manifest->missing, str_dup("never_here.txt")));
+  /* A deeper entry whose destination parent directory does not exist is a
+     no-op (nothing to delete), never a failure. */
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("no_parent_here/gone.txt")));
 
   /* Without --delete/--force the non-empty directory survives (rsync parity). */
   EXPECT_TRUE(manifest_delete_missing_args(cfg, manifest));
@@ -655,6 +658,8 @@ static void test_manifest_delete_missing_args() {
   EXPECT_TRUE(array_list_add(manifest->missing, str_dup("full_dir")));
   EXPECT_TRUE(manifest_delete_missing_args(cfg, manifest));
   EXPECT_EQ_INT(access(full_dir, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/no_parent_here", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
 
   delete_manifest_free(manifest);
   config_delete(cfg);
