@@ -104,6 +104,7 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->relative = config->relative;
   options->prune_empty_dirs = config->prune_empty_dirs;
   options->ignore_io_errors = config->ignore_errors;
+  options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
   return true;
@@ -182,13 +183,40 @@ static bool no_implied_dirs_files_from_valid(const Config* config) {
   return true;
 }
 
+/* The destination-relative mirror path for a missing --files-from entry: where
+   a PRESENT entry with the same name would have been written.  With -R that is
+   the entry's bare relative path (the bare wire path the receiver uses);
+   otherwise it is the full source mirror below the destination root
+   (`send_directory` joined to the entry, leading '/' stripped), exactly the
+   path the manifest records for a present sibling.  Returns an owned string, or
+   NULL on allocation failure. */
+static char* files_from_missing_dest_path(const Config* config, const char* entry) {
+  if (config->relative)
+    return str_dup(entry);
+  char* joined = path_cat(config->send_directory, entry);
+  if (!joined)
+    return NULL;
+  const char* rel = *joined == '/' ? joined + 1 : joined;
+  char* dup = str_dup(rel);
+  free(joined);
+  return dup;
+}
+
 /* --files-from semantics: every listed entry must resolve under the source
  * root, otherwise rsync reports a hard error instead of silently transferring
  * nothing. An empty list is also an error. An entry of "." (the whole tree)
- * and listed-but-empty directories are valid. Runs before any transfer so the
- * failure is surfaced uniformly in the single-threaded, -m, dry-run and
- * --list-only paths. */
-static bool files_from_list_valid(const Config* config) {
+ * and listed-but-empty directories are valid.  With --ignore-missing-args
+ * (implied by --delete-missing-args) a listed-but-missing entry is instead
+ * skipped: nothing is transferred for it, it never enters the keep-set and the
+ * run succeeds for the rest (an all-missing non-empty list succeeds
+ * transferring nothing, matching rsync).  With --delete-missing-args
+ * `missing_dest` (when non-NULL) collects the entry's destination-relative
+ * mirror for the receiver's exact-deletion request.  An empty list stays a
+ * hard error in every mode (nothing was requested at all).  Runs before any
+ * transfer so the failure/skip is surfaced uniformly in the single-threaded,
+ * -m, dry-run and --list-only paths. */
+static bool files_from_list_check(const Config* config, ArrayList* missing_dest, int* skipped_out) {
+  *skipped_out = 0;
   const FileListSet* set = (const FileListSet*)config->files_from_set;
   if (!set)
     return true;
@@ -201,6 +229,7 @@ static bool files_from_list_valid(const Config* config) {
                 config->files_from ? config->files_from : "");
     return false;
   }
+  bool ignore = config->ignore_missing_args || config->delete_missing_args;
   for (int i = 0; i < set->count; i++) {
     const char* entry = set->entries[i];
     if (entry[0] == '\0')
@@ -212,12 +241,36 @@ static bool files_from_list_valid(const Config* config) {
     }
     struct stat st;
     if (lstat(full, &st) != 0) {
+      free(full);
+      if (ignore) {
+        (*skipped_out)++;
+        log_info_message(LOG_INFO_MISC, "skipping missing --files-from entry '%s'", entry);
+        if (config->delete_missing_args && missing_dest) {
+          char* mirror = files_from_missing_dest_path(config, entry);
+          if (!mirror || !array_list_add(missing_dest, mirror)) {
+            free(mirror);
+            log_message(LOG_LEVEL_ERROR, "memory allocation failed while validating --files-from");
+            return false;
+          }
+        }
+        continue;
+      }
       log_message(LOG_LEVEL_ERROR, "--files-from entry '%s' not found in source '%s'", entry,
                   config->send_directory);
-      free(full);
       return false;
     }
     free(full);
+  }
+  if (*skipped_out > 0) {
+    if (config->delete_missing_args)
+      log_message(LOG_LEVEL_WARNING,
+                  "--delete-missing-args: %d missing --files-from entr%s will be deleted from the "
+                  "destination",
+                  *skipped_out, *skipped_out == 1 ? "y" : "ies");
+    else if (config->ignore_missing_args)
+      log_message(LOG_LEVEL_WARNING,
+                  "--ignore-missing-args: ignored %d missing --files-from entr%s", *skipped_out,
+                  *skipped_out == 1 ? "y" : "ies");
   }
   return no_implied_dirs_files_from_valid(config);
 }
@@ -458,15 +511,30 @@ static void pipeline_cancel(PipelineContextSender* context) {
 
 /* Print dry-run manifest showing files that would be transferred. Returns 0 on success. */
 static int send_dry_run_manifest(const Config* config) {
-  if (!files_from_list_valid(config))
+  int skipped = 0;
+  ArrayList* missing_dest = NULL;
+  if (config->delete_missing_args) {
+    missing_dest = array_list_create(free);
+    if (!missing_dest)
+      return -1;
+  }
+  if (!files_from_list_check(config, missing_dest, &skipped)) {
+    if (missing_dest)
+      array_list_delete(missing_dest);
     return -1;
+  }
   PreparedScanner prepared;
-  if (!prepare_scanner(config, 0, &prepared))
+  if (!prepare_scanner(config, 0, &prepared)) {
+    if (missing_dest)
+      array_list_delete(missing_dest);
     return -1;
+  }
   DirectoryScanner* scanner =
       directory_scanner_create_with_options(config->send_directory, &prepared.options);
   if (!scanner) {
     prepared_scanner_destroy(&prepared);
+    if (missing_dest)
+      array_list_delete(missing_dest);
     return -1;
   }
   Chunk* chunk;
@@ -484,6 +552,8 @@ static int send_dry_run_manifest(const Config* config) {
           chunk_destroy(chunk);
           directory_scanner_destroy(scanner);
           prepared_scanner_destroy(&prepared);
+          if (missing_dest)
+            array_list_delete(missing_dest);
           return -1;
         }
         if (config->human_readable)
@@ -501,6 +571,17 @@ static int send_dry_run_manifest(const Config* config) {
   }
   directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);
+  /* --delete-missing-args: the missing entries' destination mirrors render as
+     would-be deletions (rsync's dry-run also lists its *deleting lines). */
+  if (missing_dest && !config->quiet) {
+    for (int i = 0; i < missing_dest->size; i++) {
+      char* escaped = output_escape((char*)missing_dest->items[i], config->eight_bit_output);
+      printf("  %s (missing; would be deleted)\n", escaped ? escaped : "<allocation failed>");
+      free(escaped);
+    }
+  }
+  if (missing_dest)
+    array_list_delete(missing_dest);
   if (!config->quiet) {
     if (config->human_readable)
       printf("Total: %d files, %s\n", file_count,
@@ -537,7 +618,8 @@ static int compare_list_entries(const void* left, const void* right) {
  * Directory lines are not printed because the scanner only yields regular
  * transfer candidates. Returns 0 on success, 1 on error. */
 static int send_list_only(const Config* config) {
-  if (!files_from_list_valid(config))
+  int skipped = 0;
+  if (!files_from_list_check(config, NULL, &skipped))
     return 1;
   PreparedScanner prepared;
   if (!prepare_scanner(config, 0, &prepared))
@@ -626,22 +708,26 @@ static int send_list_only(const Config* config) {
 }
 
 /* Send the delete manifest (keep-set paths plus the protected excluded
-   prefixes) to the server. Returns 0 on success, -1 on failure.  When
-   --delete-excluded is given `protected` is empty: excluded destination
-   mirrors are then ordinary extras and are removed.  Both sections are
-   unbounded on the sender; the receiver enforces MAX_MANIFEST_ENTRIES per
-   section and a single MAX_MANIFEST_BYTES budget shared across the two
-   sections, rejecting (with STATUS_ERROR) an over-budget frame.  A heavily
-   filtered source whose exclusion list is large therefore fails the run
-   cleanly on the receiver rather than being truncated. */
-static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes) {
-  if (!manifest)
-    return -1;
+   prefixes and the --delete-missing-args exact-delete paths) to the server.
+   Returns 0 on success, -1 on failure.  When --delete-excluded is given
+   `protected` is empty: excluded destination mirrors are then ordinary extras
+   and are removed.  When --delete-missing-args is active `missing_args` holds
+   the destination mirrors of missing --files-from entries: each is an explicit
+   receiver-side deletion request, independent of the extras walk.  A NULL
+   keep-set / protected / missing list transmits an empty section.  All three
+   sections are unbounded on the sender; the receiver enforces
+   MAX_MANIFEST_ENTRIES per section and a single MAX_MANIFEST_BYTES budget
+   shared across the sections, rejecting (with STATUS_ERROR) an over-budget
+   frame.  A heavily filtered source whose exclusion list is large therefore
+   fails the run cleanly on the receiver rather than being truncated. */
+static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes,
+                                ArrayList* missing_args) {
   if (!send_status(fd, STATUS_MANIFEST))
     return -1;
-  if (!send_int(fd, manifest->size))
+  int keep_count = manifest ? manifest->size : 0;
+  if (!send_int(fd, keep_count))
     return -1;
-  for (int i = 0; i < manifest->size; i++) {
+  for (int i = 0; i < keep_count; i++) {
     if (!send_str(fd, (char*)manifest->items[i]))
       return -1;
   }
@@ -650,6 +736,13 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
     return -1;
   for (int i = 0; i < protected_count; i++) {
     if (!send_str(fd, (char*)protected_prefixes->items[i]))
+      return -1;
+  }
+  int missing_count = missing_args ? missing_args->size : 0;
+  if (!send_int(fd, missing_count))
+    return -1;
+  for (int i = 0; i < missing_count; i++) {
+    if (!send_str(fd, (char*)missing_args->items[i]))
       return -1;
   }
   return 0;
@@ -667,10 +760,11 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
 #define DELETE_ACK_TIMEOUT_SEC 3600
 
 static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
-                                       ArrayList* protected_prefixes) {
+                                       ArrayList* protected_prefixes, ArrayList* missing_args) {
   if (!client || !manifest)
     return false;
-  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes) != 0)
+  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes, missing_args) !=
+      0)
     return false;
   Status ack;
   if (!receive_status_timed(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC))
@@ -1031,7 +1125,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   if (context->early_delete) {
     /* The keep-set manifest was prebuilt by a path-only pre-scan.  Transmit it
        and wait for the receiver to delete extras before streaming any data. */
-    if (!send_delete_manifest_early(client, context->manifest, context->excluded_paths)) {
+    if (!send_delete_manifest_early(client, context->manifest, context->excluded_paths,
+                                    context->missing_args)) {
       pipeline_cancel(context);
       disconnect_transfer_client(client);
       mark_sender_done(context);
@@ -1066,7 +1161,13 @@ static int send_chunks_multithreaded(void* pipeline_context) {
           goto send_fail;
         }
         if (send_delete_manifest(client->file_descriptor, context->manifest,
-                                 context->excluded_paths) != 0)
+                                 context->excluded_paths, context->missing_args) != 0)
+          goto send_fail;
+      } else if (context->config->delete_missing_args && !context->early_delete) {
+        /* --delete-missing-args without --delete: no keep-set is built, but the
+           exact-delete paths still ride the same manifest frame (commit once the
+           transfer succeeded). */
+        if (send_delete_manifest(client->file_descriptor, NULL, NULL, context->missing_args) != 0)
           goto send_fail;
       }
       bool ok = finalize_transfer(client, context->config, context->remove_source_files);
@@ -1322,10 +1423,23 @@ int send_files(Config* config) {
     return send_list_only(config);
   if (config->dry_run)
     return send_dry_run_manifest(config);
-  if (!files_from_list_valid(config))
+  ArrayList* missing_args = NULL;
+  int skipped = 0;
+  if (config->delete_missing_args) {
+    missing_args = array_list_create(free);
+    if (!missing_args)
+      return 1;
+  }
+  if (!files_from_list_check(config, missing_args, &skipped)) {
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
-  if (config_has_basis(config) && !basis_oversize_preflight(config))
+  }
+  if (config_has_basis(config) && !basis_oversize_preflight(config)) {
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
+  }
 
   Client* client = connect_transfer_client(config);
   if (!client) {
@@ -1392,7 +1506,7 @@ int send_files(Config* config) {
                     "with an empty keep-set (--delete)");
         prescan_ok = false;
       } else {
-        early_ok = send_delete_manifest_early(client, early_manifest, excluded);
+        early_ok = send_delete_manifest_early(client, early_manifest, excluded, missing_args);
       }
     }
     array_list_delete(early_manifest);
@@ -1478,16 +1592,23 @@ int send_files(Config* config) {
                 "an empty keep-set (--delete)");
     goto send_fail;
   }
-  if (manifest) {
-    /* Late (commit) ordering: all file data is out; transmit the keep-set
-       manifest so the receiver deletes only after the transfer succeeds. */
-    if (send_delete_manifest(client->file_descriptor, manifest, excluded) != 0) {
-      array_list_delete(manifest);
-      manifest = NULL;
+  if ((manifest || config->delete_missing_args) && !delete_early) {
+    /* Late (commit) ordering: all file data is out; transmit the manifest so
+       the receiver commits the extras walk (--delete) and/or the
+       --delete-missing-args exact-path deletions only after the transfer
+       succeeds.  In the early modes (--delete-before/--delete-during) the
+       manifest already went out up front, so nothing is re-sent here. */
+    if (send_delete_manifest(client->file_descriptor, manifest, excluded, missing_args) != 0) {
+      if (manifest) {
+        array_list_delete(manifest);
+        manifest = NULL;
+      }
       goto send_fail;
     }
-    array_list_delete(manifest);
-    manifest = NULL;
+    if (manifest) {
+      array_list_delete(manifest);
+      manifest = NULL;
+    }
   }
   bool ok = finalize_transfer(client, config, remove_sources);
   if (!ok && config->use_delete)
@@ -1526,6 +1647,8 @@ send_fail:
     array_list_delete(manifest);
   if (excluded)
     array_list_delete(excluded);
+  if (missing_args)
+    array_list_delete(missing_args);
   if (remove_sources)
     array_list_delete(remove_sources);
   if (scanner)
@@ -1544,10 +1667,23 @@ int send_files_multithreaded(Config** config_ptr) {
     return send_list_only(config);
   if (config->dry_run)
     return send_dry_run_manifest(config);
-  if (!files_from_list_valid(config))
+  ArrayList* missing_args = NULL;
+  int skipped = 0;
+  if (config->delete_missing_args) {
+    missing_args = array_list_create(free);
+    if (!missing_args)
+      return 1;
+  }
+  if (!files_from_list_check(config, missing_args, &skipped)) {
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
-  if (config_has_basis(config) && !basis_oversize_preflight(config))
+  }
+  if (config_has_basis(config) && !basis_oversize_preflight(config)) {
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
+  }
 
   long pages = sysconf(_SC_AVPHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);
@@ -1574,9 +1710,13 @@ int send_files_multithreaded(Config** config_ptr) {
   if (!context) {
     queue_destroy(q1);
     queue_destroy(q2);
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
   }
-  *config_ptr = NULL; /* context now owns config through all remaining paths */
+  context->missing_args = missing_args;
+  missing_args = NULL; /* owned by the context from here on */
+  *config_ptr = NULL;  /* context now owns config through all remaining paths */
   bool collect_excluded = config->use_delete && !config->delete_excluded;
   if (config->use_delete) {
     context->manifest = array_list_create(free);

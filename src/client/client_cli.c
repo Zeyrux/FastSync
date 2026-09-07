@@ -460,6 +460,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
     {"--force", NULL, OPT_FLAG, offsetof(Config, force_delete)},
     {"--prune-empty-dirs", NULL, OPT_FLAG, offsetof(Config, prune_empty_dirs)},
+    {"--ignore-missing-args", NULL, OPT_FLAG, offsetof(Config, ignore_missing_args)},
+    {"--delete-missing-args", NULL, OPT_FLAG, offsetof(Config, delete_missing_args)},
 
     {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
     {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
@@ -739,6 +741,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
           entry->offset == offsetof(Config, delete_delay) ||
           entry->offset == offsetof(Config, delete_after))
         config->use_delete = true;
+      /* --delete-missing-args implies --ignore-missing-args (missing entries
+         are skipped for deletion instead of failing the run).  The implication
+         is order-independent because it is applied over the final parsed
+         config. */
+      if (entry->offset == offsetof(Config, delete_missing_args))
+        config->ignore_missing_args = true;
       continue;
     }
 

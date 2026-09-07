@@ -352,6 +352,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->excluded_paths = options->excluded_paths;
   scanner->excluded_mutex = options->excluded_mutex;
   scanner->ignore_io_errors = options->ignore_io_errors;
+  scanner->ignore_missing_args = options->ignore_missing_args;
   scanner->io_error = false;
   scanner->dirs_mode = options->dirs;
   scanner->relative_mode = options->relative && options->file_list != NULL;
@@ -591,6 +592,16 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
   }
   struct stat link_stats;
   if (lstat(abs_path, &link_stats) != 0) {
+    /* --ignore-missing-args (implied by --delete-missing-args): an explicitly
+       listed entry that does not exist under the source is a preflight-detected
+       missing argument and is skipped here, exactly as the recursive scan skips
+       nothing (missing entries never appear there).  Without the flags it stays
+       a hard pre-transfer error. */
+    if (scanner->ignore_missing_args) {
+      log_info_message(LOG_INFO_MISC, "skipping missing --files-from entry '%s'", entry);
+      free(abs_path);
+      return NULL;
+    }
     log_message(LOG_LEVEL_ERROR, "--dirs listed entry is not present under the source: %s", entry);
     free(abs_path);
     scanner->failed = true;
