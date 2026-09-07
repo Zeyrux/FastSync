@@ -94,6 +94,47 @@ static int set_compression_choice(Config* config, const char* value) {
   return 0;
 }
 
+/* Validate and store the --checksum-choice/--cc algorithm.  Only the algorithms
+ * the engine genuinely supports are accepted (xxHash64 and md5); anything else
+ * is a clear error, never a silent no-op.  "xxhash" is accepted as rsync's
+ * spelling of xxHash64. */
+static int set_checksum_choice(Config* config, const char* value) {
+  int algo = checksum_algo_from_name(value);
+  if (algo < 0) {
+    log_message(LOG_LEVEL_ERROR, "--checksum-choice must be xxh64 (or xxhash) or md5 (got '%s')",
+                value);
+    return -1;
+  }
+  config->checksum_algo = algo;
+  return 0;
+}
+
+/* parse_ull_arg is defined later in this file; declared here for the seed
+   parser below. */
+static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname);
+
+/* Parse --checksum-seed=NUM as a strict decimal 0..UINT64_MAX.  A blank value,
+ * a sign, or any non-digit (which parse_ull_arg's strtoull would silently
+ * coerce) is rejected: an explicit seed must be an exact unsigned integer or
+ * the run fails with a clear error rather than quietly ignoring the value. */
+static int set_checksum_seed(Config* config, const char* value) {
+  if (!value || *value == '\0') {
+    log_message(LOG_LEVEL_ERROR, "--checksum-seed must be a non-negative integer");
+    return -1;
+  }
+  for (const char* p = value; *p; p++) {
+    if (*p < '0' || *p > '9') {
+      log_message(LOG_LEVEL_ERROR, "--checksum-seed must be a non-negative integer");
+      return -1;
+    }
+  }
+  unsigned long long seed;
+  if (parse_ull_arg(value, &seed, "--checksum-seed") != 0)
+    return -1;
+  config->checksum_seed = seed;
+  return 0;
+}
+
 static int set_compression_threads_option(int* dest, const char* value) {
   if (set_positive_int_option(dest, value, "--compress-threads") != 0)
     return -1;
@@ -1019,8 +1060,24 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      log_message(LOG_LEVEL_ERROR, "%s is not supported yet (xxHash64 is used)", argv[i]);
-      return -1;
+      if (set_checksum_choice(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--checksum-choice=", 18) == 0) {
+      if (set_checksum_choice(config, argv[i] + 18) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--cc=", 5) == 0) {
+      if (set_checksum_choice(config, argv[i] + 5) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--checksum-seed=", 16) == 0) {
+      if (set_checksum_seed(config, argv[i] + 16) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--checksum-seed", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --checksum-seed");
+        return -1;
+      }
+      if (set_checksum_seed(config, argv[++i]) != 0)
+        return -1;
     } else if (strncmp(argv[i], "--compare-dest=", 15) == 0) {
       if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[i] + 15, "--compare-dest") != 0)
         return -1;

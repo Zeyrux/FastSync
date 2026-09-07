@@ -2,6 +2,7 @@
 #define CONFIG_H
 
 #include "array_list.h"
+#include "checksum.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -234,6 +235,18 @@ typedef struct Config {
   // PR #184: Compression algorithm negotiation
   char* compress_choice;
   char* chmod_spec;
+
+  /* --checksum-choice / --cc and --checksum-seed.  checksum_algo is the id of
+   * the whole-file content-digest algorithm used by the per-file --incremental
+   * handshake (sender computes it, receiver compares it to skip unchanged
+   * files) and by the basis-dir content verification.  checksum_seed is passed
+   * to xxHash64 (and to the delta block strong hash, low 32 bits); md5 has no
+   * seed so it is ignored there.  Both cross the wire: the receiver MUST hash
+   * the on-disk old file with the same algorithm and seed to reach a matching
+   * digest.  Defaults (XXH64 / seed 0) reproduce the pre-existing behavior
+   * byte-for-byte. */
+  int checksum_algo;      /* ChecksumAlgo, default CHECKSUM_ALGO_XXH64 */
+  uint64_t checksum_seed; /* default 0 */
 
   char** skip_compress_suffixes;
   int skip_compress_count;

@@ -355,7 +355,8 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
     return NULL;
   }
 
-  DeltaSignature* sig = delta_signature_create(old_data, old_size, config->delta_block_size);
+  DeltaSignature* sig = delta_signature_create_seeded(old_data, old_size, config->delta_block_size,
+                                                      (uint32_t)config->checksum_seed);
   if (!sig) {
     free(old_data);
     *failed = true;
@@ -630,8 +631,8 @@ static bool basis_quick_matches(const Config* config, const struct stat* st, tim
    so the caller can materialize the file without re-reading it. */
 static bool basis_match_find(const Config* config, const char* check_path,
                              unsigned long long check_size, time_t check_mtime,
-                             long check_mtime_nsec, uint64_t check_checksum, bool load_content,
-                             BasisMatch* out) {
+                             long check_mtime_nsec, const uint8_t* check_digest,
+                             size_t check_digest_len, bool load_content, BasisMatch* out) {
   memset(out, 0, sizeof(*out));
   if (!config || !config_has_basis(config) || config->ignore_times)
     return false;
@@ -651,10 +652,13 @@ static bool basis_match_find(const Config* config, const char* check_path,
       if (basis_quick_matches(config, &st, check_mtime, check_mtime_nsec)) {
         Data* content = basis_read_content(fd, check_size);
         if (content) {
-          uint64_t basis_hash = check_size == 0 ? delta_xxhash64("", 0)
-                                : content->data ? delta_xxhash64(content->data, content->size)
-                                                : 0;
-          if (basis_hash == check_checksum) {
+          uint8_t basis_digest[CHECKSUM_MAX_DIGEST_LEN];
+          size_t basis_len = 0;
+          bool hashed = checksum_digest((ChecksumAlgo)config->checksum_algo, config->checksum_seed,
+                                        content->data, content->size, basis_digest,
+                                        sizeof(basis_digest), &basis_len);
+          if (hashed && basis_len == check_digest_len && check_digest_len > 0 &&
+              memcmp(basis_digest, check_digest, check_digest_len) == 0) {
             out->hit = true;
             out->type = entry->type;
             out->basis_path = candidate;
@@ -1041,7 +1045,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   unsigned long long check_size;
   long long check_mtime;
   long long check_mtime_nsec;
-  uint64_t check_checksum = 0;
+  uint8_t check_digest[CHECKSUM_MAX_DIGEST_LEN];
+  size_t check_digest_len = 0;
   if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
       !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
     free(check_path);
@@ -1053,10 +1058,20 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     send_status(fd, STATUS_ERROR);
     return NULL;
   }
-  if ((config->checksum || config_has_basis(config)) &&
-      !receive_n_data(fd, &check_checksum, sizeof(check_checksum))) {
-    free(check_path);
-    return NULL;
+  if ((config->checksum || config_has_basis(config))) {
+    uint8_t wire_len;
+    if (!receive_n_data(fd, &wire_len, sizeof(wire_len)) || wire_len == 0 ||
+        wire_len > CHECKSUM_MAX_DIGEST_LEN ||
+        wire_len != checksum_digest_len((ChecksumAlgo)config->checksum_algo)) {
+      free(check_path);
+      send_status(fd, STATUS_ERROR);
+      return NULL;
+    }
+    check_digest_len = wire_len;
+    if (!receive_n_data(fd, check_digest, check_digest_len)) {
+      free(check_path);
+      return NULL;
+    }
   }
 
   if (check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
@@ -1142,10 +1157,13 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
      skipped and the transfer proceeds with the full new contents. */
   bool match = false;
   if (checksum_needs_read) {
-    if (old_size == 0)
-      match = delta_xxhash64("", 0) == check_checksum;
-    else
-      match = old_data != NULL && delta_xxhash64(old_data, (size_t)old_size) == check_checksum;
+    uint8_t old_digest[CHECKSUM_MAX_DIGEST_LEN];
+    size_t old_len = 0;
+    bool hashed = checksum_digest((ChecksumAlgo)config->checksum_algo, config->checksum_seed,
+                                  old_size == 0 ? "" : old_data, (size_t)old_size, old_digest,
+                                  sizeof(old_digest), &old_len);
+    match = hashed && old_len == check_digest_len && check_digest_len > 0 &&
+            memcmp(old_digest, check_digest, check_digest_len) == 0;
   } else if (size_equal && !config->ignore_times) {
     match = config->size_only || match_by_metadata;
   }
@@ -1169,7 +1187,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (config_has_basis(config)) {
     BasisMatch basis;
     basis_match_find(config, check_path, check_size, (time_t)check_mtime, (long)check_mtime_nsec,
-                     check_checksum, true, &basis);
+                     check_digest, check_digest_len, true, &basis);
     if (basis.hit) {
       if (basis.type == BASIS_DEST_COMPARE) {
         /* compare-dest never copies: an exact match only suppresses the data

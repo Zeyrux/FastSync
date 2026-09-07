@@ -43,17 +43,17 @@ static unsigned long long next_temp_sequence(void) {
   return atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
 }
 
-bool file_checksum(File* file, uint64_t* checksum) {
-  if (!file || !checksum || !file->data)
+bool file_checksum(File* file, ChecksumAlgo algo, uint64_t seed, uint8_t* out, size_t out_capacity,
+                   size_t* out_len) {
+  if (!file || !out || !out_len || !file->data)
     return false;
   if (file->data->size == 0) {
-    *checksum = delta_xxhash64("", 0);
-    return true;
+    return checksum_digest(algo, seed, "", 0, out, out_capacity, out_len);
   }
   if (!file->data->data && !file_load_data(file))
     return false;
-  *checksum = delta_xxhash64(file->data->data, file->data->size);
-  return true;
+  return checksum_digest(algo, seed, file->data->data, file->data->size, out, out_capacity,
+                         out_len);
 }
 
 File* file_create(const char* path) {

@@ -634,12 +634,65 @@ static void test_delta_hash_index_large_mostly_matching() {
   free(new_data);
 }
 
+/* --checksum-seed: the delta strong (block) hash is genuinely seed-aware.  A
+ * nonzero seed changes the per-block xxHash32, and a signature + delta computed
+ * with the same seed still reconstruct the file exactly (symmetric), while a
+ * mismatched seed produces a delta that does not match the signature blocks. */
+static void test_delta_xxhash32_seeded() {
+  const char* data = "seedme";
+  uint32_t a = delta_xxhash32(data, 6);
+  uint32_t b = delta_xxhash32_seeded(data, 6, 42);
+  uint32_t c = delta_xxhash32_seeded(data, 6, 42);
+  EXPECT_TRUE(a != b);
+  EXPECT_EQ_INT((int)b, (int)c);
+  /* Unseeded == seeded with 0 (default reproduces today's behavior). */
+  EXPECT_EQ_INT((int)delta_xxhash32(data, 6), (int)delta_xxhash32_seeded(data, 6, 0));
+}
+
+static void test_delta_seeded_signature_compute_matches() {
+  uint32_t block_size = 1024;
+  /* Identical old/new data with a non-zero seed: the receiver builds a seeded
+     signature and the sender computes a seeded delta over the same bytes, so
+     every block matches and applying the delta rebuilds the file exactly. */
+  char data[4096];
+  for (int i = 0; i < 4096; i++)
+    data[i] = (char)(i % 256);
+
+  DeltaSignature* sig = delta_signature_create_seeded(data, 4096, block_size, 99);
+  EXPECT_NOT_NULL(sig);
+  Delta* delta = delta_compute_seeded(data, 4096, sig, block_size, 99);
+  EXPECT_NOT_NULL(delta);
+  void* rebuilt = delta_apply(data, 4096, delta, block_size);
+  EXPECT_NOT_NULL(rebuilt);
+  EXPECT_TRUE(memcmp(rebuilt, data, 4096) == 0);
+  free(rebuilt);
+  delta_destroy(delta);
+  delta_signature_destroy(sig);
+
+  /* A MISMATCHED seed means the sender's window xxHash32 never equals the
+     receiver's signature-block xxHash32: no block can match, so the delta is
+     not worthwhile / has no block matches.  This proves the seed really gates
+     the block comparison rather than being an inert parameter. */
+  sig = delta_signature_create_seeded(data, 4096, block_size, 99);
+  EXPECT_NOT_NULL(sig);
+  delta = delta_compute_seeded(data, 4096, sig, block_size, 7);
+  EXPECT_NOT_NULL(delta);
+  bool any_match = false;
+  for (uint32_t i = 0; i < delta->instruction_count; i++)
+    if (delta->instructions[i].type == DELTA_INSTR_BLOCK_MATCH)
+      any_match = true;
+  EXPECT_FALSE(any_match);
+  delta_destroy(delta);
+  delta_signature_destroy(sig);
+}
+
 void test_delta() {
   test_adler32_basic();
   test_adler32_different_data();
   test_xxhash32_basic();
   test_xxhash32_different_data();
   test_xxhash64_different_data();
+  test_delta_xxhash32_seeded();
   test_signature_roundtrip();
   test_delta_identical_files();
   test_delta_small_edit();
@@ -653,4 +706,5 @@ void test_delta() {
   test_delta_apply_rejects_output_overflow();
   test_delta_hash_index_matches_linear_reference();
   test_delta_hash_index_large_mostly_matching();
+  test_delta_seeded_signature_compute_matches();
 }
