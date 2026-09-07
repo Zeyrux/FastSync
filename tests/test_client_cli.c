@@ -1,4 +1,5 @@
 #include "test_client_cli.h"
+#include "checksum.h"
 #include "client_validation.h"
 #include "chmod.h"
 #include "config.h"
@@ -787,8 +788,7 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--ipv4",
                                         "--daemon",
                                         "--config",
-                                        "--server",
-                                        "--checksum-choice"};
+                                        "--server"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
@@ -953,7 +953,8 @@ static void test_parse_args_no_preserve_blocks_implicit_metadata() {
   }
 }
 
-/* Checksum-choice spellings are recognized and rejected until algorithms are implemented. */
+/* --checksum-choice and its --cc alias select the whole-file digest algorithm
+   (default xxh64; both "xxh64" and the rsync "xxhash" spelling accepted). */
 static void test_parse_args_checksum_choice_aliases() {
   static const char* const options[] = {"--checksum-choice", "--cc"};
 
@@ -962,10 +963,86 @@ static void test_parse_args_checksum_choice_aliases() {
     char* argv[] = {"fastsync", (char*)options[i], "xxh64", "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH64);
+    config_delete(cfg);
+  }
+}
 
+/* Both the "--checksum-choice=ALG" and "--cc=ALG" inline forms parse. */
+static void test_parse_args_checksum_choice_equals_forms() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum-choice=md5", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--cc=xxhash", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH64);
+  config_delete(cfg);
+}
+
+/* An algorithm FastSync does not support must be rejected, never a silent
+   no-op. */
+static void test_parse_args_checksum_choice_rejects_unsupported() {
+  static const char* const bad[] = {"md4", "sha256", "crc32", "none", "bogus"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--checksum-choice", (char*)bad[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+}
+
+/* --checksum-seed parses as a 64-bit non-negative integer (space and = forms);
+   invalid values are rejected. */
+static void test_parse_args_checksum_seed() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum-seed=42", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->checksum_seed == 42ULL);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--checksum-seed", "12345", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->checksum_seed == 12345ULL);
+  config_delete(cfg);
+
+  /* 0 is a valid (and default) seed. */
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--checksum-seed=0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->checksum_seed == 0ULL);
+  config_delete(cfg);
+
+  /* Non-numeric and negative seeds are rejected. */
+  static const char* const bad[] = {"abc", "-5", "1.5", ""};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    cfg = config_create();
+    char* argv4[] = {"fastsync", "--checksum-seed", (char*)bad[i], "/src", "/dst"};
+    positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  /* Missing value is rejected. */
+  cfg = config_create();
+  char* argv5[] = {"fastsync", "--checksum-seed"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 2, argv5, positional_args, &positional_count), -1);
+  config_delete(cfg);
 }
 
 static void test_parse_args_rejects_unsafe_negation() {
@@ -1943,6 +2020,9 @@ void test_client_cli() {
   test_parse_args_log_file_format();
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
+  test_parse_args_checksum_choice_equals_forms();
+  test_parse_args_checksum_choice_rejects_unsupported();
+  test_parse_args_checksum_seed();
   test_parse_args_temp_dir();
   test_parse_args_delay_updates();
   test_validate_config_delay_updates_rejects_inplace();

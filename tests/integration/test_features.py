@@ -550,6 +550,147 @@ class TestIncremental:
         assert not mismatches, f"Mismatch: {mismatches}"
 
 
+class TestChecksumChoice:
+    """--checksum-choice/--cc and --checksum-seed: the whole-file digest used by
+    the --incremental/--checksum handshake is selectable and seedable.  The
+    receiver hashes the on-disk old file with the SAME algorithm+seed, so an
+    unchanged file is skipped and a changed file (even with identical size and
+    mtime) is transferred -- and the transfer always lands byte-exact.
+    FastSync accepts xxh64 (default, seed-aware) and md5; names it does not
+    implement are rejected, never silently ignored."""
+
+    def test_unsupported_algorithm_is_rejected(self, shared_server):
+        result, _ = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--checksum", "--checksum-choice=sha256"],
+            port=shared_server.port,
+        )
+        assert result.returncode != 0, "sha256 must be rejected, not silently ignored"
+
+    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_unchanged_skipped_and_bytes_preserved(self, shared_server, algo, mt):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+
+        flags = (["-M", "--incremental", "--checksum", f"--checksum-choice={algo}"] +
+                 (["-m"] if mt else []))
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"checksum {algo} run failed: {result.stderr[:200]}"
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    # A changed source file with the SAME size and mtime must still be
+    # detected (and re-transferred byte-exactly) because the whole-file digest
+    # differs -- the explicit reason --checksum exists.  This exercises the
+    # sender/receiver digest agreement for a non-default algorithm.
+    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_changed_same_size_mtime_redetected(self, shared_server, algo, mt):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        source_file = os.path.join(SOURCE_DIR, "small.txt")  # "hello world\n" (12 bytes)
+        received_file = os.path.join(received, "small.txt")
+        source_stat = os.stat(source_file)
+        with open(received_file, "wb") as f:
+            f.write(b"DDDDDDDDDDDD")  # same size, different content
+        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
+
+        flags = (["-M", "--incremental", "--checksum", f"--checksum-choice={algo}"] +
+                 (["-m"] if mt else []))
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"checksum {algo} redetect failed: {result.stderr[:200]}"
+        with open(received_file, "rb") as f:
+            assert f.read() == b"hello world\n"
+
+    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    def test_unchanged_run_transfers_almost_no_data(self, shared_server, algo):
+        # A fully-unchanged --checksum run skips every file: only the config + a
+        # small handshake travels, not the payloads.  Proxy byte counts are not
+        # available for -m (multithreaded connections), so single-thread only.
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0
+
+        flags = ["-M", "--incremental", "--checksum", f"--checksum-choice={algo}"]
+        proxy = CountingProxy(shared_server.port)
+        cmd = (CLIENT_CMD + ["--source-dir", SOURCE_DIR, "--dest-dir", DEST_DIR,
+                             "--save-to-disk", "--server-port", str(proxy.port)] + flags)
+        result = proxy.run(cmd)
+        assert result.returncode == 0, f"checksum {algo} skip run failed: {result.stderr[:200]}"
+        assert proxy.client_to_server < 100000, \
+            f"unchanged --checksum run sent {proxy.client_to_server} bytes; expected a skip"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_seed_is_deterministic_and_preserves_content(self, shared_server, mt):
+        clean_dir(DEST_DIR)
+        flags = ["-M", "--incremental", "--checksum",
+                 "--checksum-choice=xxh64", "--checksum-seed=987654"] + (["-m"] if mt else [])
+        first, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert first.returncode == 0, f"seeded run failed: {first.stderr[:200]}"
+
+        # A second run with the SAME seed and unchanged content skips everything
+        # deterministically (same digests both sides).
+        second, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert second.returncode == 0, f"deterministic rerun failed: {second.stderr[:200]}"
+
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+        # A changed file with the same size and mtime is still caught and fixed
+        # (a non-zero seed does not weaken the comparison).
+        source_file = os.path.join(SOURCE_DIR, "medium.txt")
+        received_file = os.path.join(received, "medium.txt")
+        source_stat = os.stat(source_file)
+        with open(received_file, "wb") as f:
+            f.write(b"z" * os.path.getsize(source_file))
+        os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
+        third, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert third.returncode == 0, f"seeded redetect failed: {third.stderr[:200]}"
+        with open(received_file, "rb") as f:
+            assert f.read() == open(source_file, "rb").read()
+
+    # --checksum-seed also feeds the delta path's per-block strong checksum on
+    # both ends (receiver signature and sender window hash use the same seed),
+    # so a seeded delta transfer still lands byte-exact.
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_seed_delta_block_hash_transfers_byte_exact(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, f"ccseed_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"ccseed_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        big = os.path.join(source, "big.bin")
+        with open(big, "wb") as f:
+            f.write(bytes(range(256)) * 200)  # 51200 bytes > delta 16K floor
+        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
+        assert result.returncode == 0, f"seed delta seed failed: {result.stderr[:200]}"
+
+        # Edit a region so the receiver must match a changed block with the seed.
+        with open(big, "r+b") as f:
+            f.seek(1000)
+            f.write(b"\x00" * 64)
+        # Force an mtime mismatch: the incremental quick-check skips files whose
+        # stored mtime second equals the source's, which can collide when the
+        # edit and the prior sync share a second.  Setting an old dest mtime
+        # guarantees the delta path is exercised deterministically.
+        os.utime(os.path.join(get_dest_received_dir(dest, source), "big.bin"), (0, 0))
+        flags = (["-M", "--incremental", "--delta", "--checksum-seed=314159"] +
+                 (["-m"] if mt else []))
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"seed delta run failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, "big.bin")) == _read_file(big), \
+            "seeded delta transfer is not byte-exact"
+
+
 class TestUpdate:
     def test_update_skips_older_destination_and_allows_equal_or_newer_source(self, shared_server):
         clean_dir(DEST_DIR)

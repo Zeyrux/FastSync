@@ -1,6 +1,7 @@
 #include "test_array_list.h"
 #include "test_chunk.h"
 #include "test_change_list.h"
+#include "test_checksum.h"
 #include "test_client_cli.h"
 #include "test_compression.h"
 #include "test_config.h"
@@ -46,6 +47,7 @@ int main() {
   RUN_TEST(test_config);
   RUN_TEST(test_compression);
   RUN_TEST(test_scanner);
+  RUN_TEST(test_checksum);
   RUN_TEST(test_delta);
   RUN_TEST(test_data);
   RUN_TEST(test_protocol);
