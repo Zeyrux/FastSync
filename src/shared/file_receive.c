@@ -1380,12 +1380,16 @@ File* file_receive_directory(int file_descriptor) {
 /* Read a delete-manifest frame (the STATUS_MANIFEST leading code has already
    been consumed): a keep-set entry count followed by that many
    destination-relative paths, then a protected-prefix count followed by that
-   many destination-relative prefixes.  The frame is self-delimiting (the counts
-   are authoritative), so the caller decides what to do next and continues
-   reading the following STATUS_* frame.  Returns an owned DeleteManifest, or
-   NULL after sending STATUS_ERROR when the frame is malformed (bad count,
-   empty/absolute path, path traversal, or an aggregate size beyond
-   MAX_MANIFEST_BYTES). */
+   many destination-relative prefixes, then (protocol 2.10.0+) a missing-args
+   count followed by that many destination-relative delete paths.  The frame is
+   self-delimiting (the counts are authoritative), so the caller decides what to
+   do next and continues reading the following STATUS_* frame.  Every section is
+   validated identically: an entry must be non-empty, relative and traversal-free
+   and the aggregate length across ALL sections is capped by MAX_MANIFEST_BYTES
+   (so the missing-args deletion requests are confined like the rest of the
+   manifest).  Returns an owned DeleteManifest, or NULL after sending STATUS_ERROR
+   when the frame is malformed (bad count, empty/absolute path, path traversal,
+   or an aggregate size beyond MAX_MANIFEST_BYTES). */
 static bool receive_manifest_section(int fd, ArrayList* list, size_t* manifest_bytes) {
   int count;
   if (!receive_int(fd, &count)) {
@@ -1418,14 +1422,16 @@ DeleteManifest* receive_manifest_entries(int fd) {
   }
   manifest->keeps = array_list_create(free);
   manifest->protected = array_list_create(free);
-  if (!manifest->keeps || !manifest->protected) {
+  manifest->missing = array_list_create(free);
+  if (!manifest->keeps || !manifest->protected || !manifest->missing) {
     delete_manifest_free(manifest);
     send_status(fd, STATUS_ERROR);
     return NULL;
   }
   size_t manifest_bytes = 0;
   if (!receive_manifest_section(fd, manifest->keeps, &manifest_bytes) ||
-      !receive_manifest_section(fd, manifest->protected, &manifest_bytes)) {
+      !receive_manifest_section(fd, manifest->protected, &manifest_bytes) ||
+      !receive_manifest_section(fd, manifest->missing, &manifest_bytes)) {
     delete_manifest_free(manifest);
     return NULL;
   }
@@ -1437,6 +1443,7 @@ void delete_manifest_free(DeleteManifest* manifest) {
     return;
   array_list_delete(manifest->keeps);
   array_list_delete(manifest->protected);
+  array_list_delete(manifest->missing);
   free(manifest);
 }
 
@@ -1516,5 +1523,149 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
     log_message(LOG_LEVEL_ERROR, "deletion failed while removing extraneous files");
     return false;
   }
+  return true;
+}
+
+/* --delete-missing-args exact-path deletions: each destination mirror in
+   manifest->missing is an explicit user request, so it is removed even when the
+   ordinary extras walk (with its protected prefixes) would leave it alone.  The
+   --delay-updates staging directory and basis snapshots are receiver artifacts
+   and stay protected exactly as in the extras walker.  A regular file or
+   symlink is unlinked, an empty directory removed, and a NON-empty directory is
+   removed recursively only when --delete or --force is in effect (rsync parity:
+   the man page says a non-empty directory mirror is only deleted with --force
+   or --delete); otherwise it is left with a warning and the run continues.  A
+   mirror that does not exist is a no-op.  Returns false only on a genuine error
+   (a confinement failure on a validated path or an I/O error), which fails the
+   run. */
+bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
+  if (!config || !manifest)
+    return false;
+  if (!manifest->missing || manifest->missing->size == 0)
+    return true;
+  fprintf(stderr, "Deleting destination mirrors of missing source arguments...\n");
+  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
+  DeleteSkipEntry* skips = NULL;
+  if (skip_count > 0) {
+    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
+    if (!skips)
+      return false;
+    int idx = 0;
+    if (config->delay_updates) {
+      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
+      skips[idx].top_level_only = true;
+      idx++;
+    }
+    for (int i = 0; i < config->basis_count; i++) {
+      skips[idx].prefix = config->basis_dirs[i].path;
+      skips[idx].top_level_only = false;
+      idx++;
+    }
+  }
+  bool ok = true;
+  for (int i = 0; i < manifest->missing->size; i++) {
+    const char* rel = (const char*)manifest->missing->items[i];
+    if (!rel || *rel == '\0' || *rel == '/' || has_path_traversal(rel)) {
+      /* Defensive only: receive_manifest_entries already validated every
+         section identically, so a controlled peer never reaches this branch. */
+      log_message(LOG_LEVEL_ERROR, "invalid missing-args delete path");
+      ok = false;
+      continue;
+    }
+    bool at_root = strchr(rel, '/') == NULL;
+    if (path_under_skip_prefix(rel, at_root, skips, skip_count)) {
+      char* escaped = output_escape(rel, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING,
+                  "missing-args path '%s' is protected (staging directory or basis snapshot); "
+                  "not deleting",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
+      continue;
+    }
+    char* full = path_cat(config->receive_root_directory, rel);
+    if (!full) {
+      ok = false;
+      continue;
+    }
+    char* leaf = NULL;
+    int parent_fd = file_open_secure_parent(full, &leaf, false);
+    if (parent_fd < 0) {
+      free(full);
+      free(leaf);
+      ok = false;
+      continue;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno != ENOENT)
+        ok = false;
+      close(parent_fd);
+      free(leaf);
+      free(full);
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0 || errno == ENOENT) {
+        char* escaped = output_escape(rel, log_get_8_bit_output());
+        fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
+        free(escaped);
+      } else if (errno == ENOTEMPTY || errno == EEXIST) {
+        close(parent_fd);
+        parent_fd = -1;
+        free(leaf);
+        leaf = NULL;
+        if (config->use_delete || config->force_delete) {
+          if (file_remove_tree_secure(full)) {
+            char* escaped = output_escape(rel, log_get_8_bit_output());
+            fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
+            free(escaped);
+          } else {
+            ok = false;
+          }
+        } else {
+          char* escaped = output_escape(rel, log_get_8_bit_output());
+          log_message(LOG_LEVEL_WARNING,
+                      "missing-args destination '%s' is a non-empty directory; use --force or "
+                      "--delete to remove it",
+                      escaped ? escaped : "<allocation failed>");
+          free(escaped);
+        }
+      } else {
+        ok = false;
+      }
+    } else {
+      if (unlinkat(parent_fd, leaf, 0) == 0 || errno == ENOENT) {
+        char* escaped = output_escape(rel, log_get_8_bit_output());
+        fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
+        free(escaped);
+      } else {
+        ok = false;
+      }
+    }
+    if (parent_fd >= 0)
+      close(parent_fd);
+    free(leaf);
+    free(full);
+    if (!ok)
+      break;
+  }
+  free(skips);
+  return ok;
+}
+
+/* Commit every deletion family the manifest carries.  The --delete-missing-args
+   exact-path deletions run FIRST: they are explicit user requests and must not
+   be blocked by the extras walker's filter-exclusion protection (a protected
+   leftover inside a missing-argument directory must not make that user-requested
+   removal fail).  The ordinary extras walk then runs when --delete is active.
+   Returns true when there was nothing to do or every requested deletion
+   committed. */
+bool manifest_delete_all(const Config* config, DeleteManifest* manifest) {
+  if (!config || !manifest)
+    return false;
+  if (config->delete_missing_args && !manifest_delete_missing_args(config, manifest))
+    return false;
+  if (config->use_delete && !manifest_delete_extras(config, manifest))
+    return false;
   return true;
 }

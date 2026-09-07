@@ -145,6 +145,19 @@ typedef struct Config {
    * directory by removing that (possibly non-empty, symlink-safe) directory
    * tree first, instead of failing the write.  Crosses the wire. */
   bool force_delete;
+  /* --ignore-missing-args (client-only, never serialized): a --files-from
+   * entry that does not exist under the source is silently skipped instead of
+   * failing the run.  Sender-side only: nothing is sent for it and it never
+   * enters the keep-set.  Implied by --delete-missing-args. */
+  bool ignore_missing_args;
+  /* --delete-missing-args: implies --ignore-missing-args; additionally each
+   * missing entry's destination mirror (computed like a present entry's wire
+   * path) is deleted receiver-side.  Crosses the wire and is gated by the
+   * server's --allow-delete policy like --delete.  rsync-parity: independent
+   * of ordinary --delete processing (it does not imply --delete); a non-empty
+   * directory mirror is only removed with --force or --delete in effect, and
+   * the missing-args deletions are not counted toward --max-delete. */
+  bool delete_missing_args;
 
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).
@@ -231,7 +244,7 @@ typedef struct Config {
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.9.0"
+#define PROTOCOL_VERSION "2.10.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

@@ -180,6 +180,11 @@ void handler(int file_descriptor) {
     return;
   }
   config->use_delete = config->use_delete && allow_delete;
+  /* --delete-missing-args deletes destination mirrors receiver-side, so it is
+     deletion and stays gated by the same --allow-delete server policy.  When
+     the server policy is off the flag is inert (the missing entries are still
+     skipped via its implied --ignore-missing-args, but nothing is deleted). */
+  config->delete_missing_args = config->delete_missing_args && allow_delete;
   /* --mkpath: create the destination root (and its missing leading components)
      before anything else; without it the root must pre-exist.  A failure here
      aborts the connection cleanly before any file data is exchanged. */
@@ -262,7 +267,7 @@ void handler(int file_descriptor) {
          known to have succeeded.  Remove the extras before publishing a
          --delay-updates run; the walker skips the staging directory. */
       if (context->deferred_manifest) {
-        if (!manifest_delete_extras(config, context->deferred_manifest)) {
+        if (!manifest_delete_all(config, context->deferred_manifest)) {
           transfer_ok = false;
         }
         delete_manifest_free(context->deferred_manifest);

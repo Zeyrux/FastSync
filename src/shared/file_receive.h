@@ -16,17 +16,22 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped);
    prefixes the sender asks the receiver never to delete (paths excluded on the
    source, protected at any depth).  When --delete-excluded is given the sender
    transmits an empty protected list so excluded destination mirrors are treated
-   as ordinary extras. */
+   as ordinary extras.  With --delete-missing-args a third section (`missing`)
+   carries the destination mirrors of explicitly-listed source entries that do
+   not exist: each is an exact deletion request, independent of the ordinary
+   extras walk (never blocked by the protected prefixes) and processed when the
+   manifest is committed. */
 typedef struct DeleteManifest {
   ArrayList* keeps;
   ArrayList* protected;
+  ArrayList* missing;
 } DeleteManifest;
 
 void delete_manifest_free(DeleteManifest* manifest);
 /* Read a delete-manifest frame: keep count + keeps, then protected count +
-   protected prefixes (self-delimiting; the leading STATUS_MANIFEST code has been
-   consumed).  Returns an owned DeleteManifest, or NULL after signalling
-   STATUS_ERROR on a malformed frame. */
+   protected prefixes, then missing count + missing paths (self-delimiting; the
+   leading STATUS_MANIFEST code has been consumed).  Returns an owned
+   DeleteManifest, or NULL after signalling STATUS_ERROR on a malformed frame. */
 DeleteManifest* receive_manifest_entries(int fd);
 /* Remove destination entries under config->receive_root_directory that are not
    in `manifest` (bounded, all-or-nothing walk; staging-dir, basis-dir and
@@ -34,6 +39,20 @@ DeleteManifest* receive_manifest_entries(int fd);
    caller decides WHEN to run it based on the negotiated delete timing.  Returns
    false (and the transfer fails) when the deletion cannot be committed. */
 bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
+/* --delete-missing-args exact-path deletions: remove each destination mirror
+   in `manifest->missing` (never blocked by the protected prefixes, staging dir
+   and basis dirs excluded).  A regular file/symlink is unlinked; an empty
+   directory is removed; a NON-empty directory is removed recursively only when
+   --delete or --force is in effect, otherwise it is left with a warning (rsync
+   parity).  A missing path is a no-op.  Returns false only on a genuine
+   confinement or I/O error (the run then fails); tolerated per-path cases are
+   reported and skipped. */
+bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest);
+/* Run every deletion family the manifest carries: the --delete-missing-args
+   exact-path deletions first (user requests are not blocked by exclusion
+   protection), then the ordinary extras walk when --delete is active.  Returns
+   true when nothing to do or everything committed. */
+bool manifest_delete_all(const Config* config, DeleteManifest* manifest);
 
 /* Outcome of a single file_save_to_disk operation.  The receiver needs to
    distinguish "written" from "skipped" so --remove-source-files can be told

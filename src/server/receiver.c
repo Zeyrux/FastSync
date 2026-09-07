@@ -191,7 +191,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            so the sender only starts streaming once the deletion committed (or
            failed).  This is the rsync delete-before/delete-during window: a
            later transfer failure does not restore these deletions. */
-        bool deletion_ok = config->use_delete ? manifest_delete_extras(config, manifest) : true;
+        bool deletion_ok = (config->use_delete || config->delete_missing_args)
+                               ? manifest_delete_all(config, manifest)
+                               : true;
         delete_manifest_free(manifest);
         if (!deletion_ok) {
           send_status(file_descriptor, STATUS_ERROR);
@@ -199,9 +201,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         }
         if (!send_status(file_descriptor, STATUS_OK))
           goto fail;
-      } else if (config->use_delete) {
-        /* Plain --delete / --delete-after / --delete-delay: hold the keep-set
-           and commit the deletion only after STATUS_FINISHED. */
+      } else if (config->use_delete || config->delete_missing_args) {
+        /* Plain --delete / --delete-after / --delete-delay and the
+           --delete-missing-args exact-path deletions: hold the manifest and
+           commit it only after STATUS_FINISHED. */
         if (deferred_manifest) {
           log_message(LOG_LEVEL_ERROR, "Received a second delete manifest");
           delete_manifest_free(deferred_manifest);
@@ -246,7 +249,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       *pending_manifest = deferred_manifest;
       deferred_manifest = NULL;
     } else {
-      bool deletion_ok = manifest_delete_extras(config, deferred_manifest);
+      bool deletion_ok = manifest_delete_all(config, deferred_manifest);
       delete_manifest_free(deferred_manifest);
       deferred_manifest = NULL;
       if (!deletion_ok) {

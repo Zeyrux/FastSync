@@ -208,8 +208,8 @@ static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
    therefore protects "a" and "a/b/c" but not "ab".  Entries with top_level_only
    set only protect DIRECT children of the receive root (at_root); nested
    directories that share such a name stay ordinary destination content. */
-static bool path_under_skip_prefix(const char* child_rel, bool at_root,
-                                   const DeleteSkipEntry* skips, int skip_count) {
+bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSkipEntry* skips,
+                            int skip_count) {
   for (int i = 0; i < skip_count; i++) {
     if (skips[i].top_level_only && !at_root)
       continue;
