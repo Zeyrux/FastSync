@@ -619,6 +619,57 @@ static void test_config_delete_policy_wire_roundtrip() {
   }
 }
 
+/* --delete-missing-args crosses the wire (the receiver executes the exact-path
+   deletions) while --ignore-missing-args is client-only: the receiver must
+   observe delete_missing_args unchanged and ignore_missing_args always false. */
+static void test_config_delete_missing_args_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+
+  struct {
+    bool delete_missing_args, ignore_missing_args;
+  } cases[] = {
+      {false, false},
+      {true, false},
+      {true, true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL;
+      if (ok) {
+        ok = recv->delete_missing_args == cases[i].delete_missing_args &&
+             /* ignore_missing_args never crosses the wire. */
+             recv->ignore_missing_args == false;
+      }
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->delete_missing_args = cases[i].delete_missing_args;
+      send_cfg->ignore_missing_args = cases[i].ignore_missing_args;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
 /* Basis-dir lists survive the config wire: each entry's type and path must
    round-trip unchanged. */
 static void test_config_basis_roundtrip() {
@@ -771,6 +822,7 @@ void test_config() {
     test_config_delete_timing_wire_roundtrip();
     test_config_delete_timing_conflict_rejected();
     test_config_delete_policy_wire_roundtrip();
+    test_config_delete_missing_args_wire_roundtrip();
     test_config_basis_roundtrip();
     test_config_basis_wire_rejects_escaping();
     test_config_basis_normalization();

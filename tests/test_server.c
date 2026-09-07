@@ -231,7 +231,10 @@ static char* make_check_root(const char* tag) {
 }
 
 static void write_check_file(const char* dir, const char* name, const char* content) {
-  char path[1024];
+  /* Sized so a caller that passes a PATH_MAX-bounded `dir` (e.g. one of the
+     test's own char[1024] stack buffers) still provably fits with the joined
+     name, keeping -Werror=format-truncation quiet. */
+  char path[4096];
   snprintf(path, sizeof(path), "%s/%s", dir, name);
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
@@ -493,6 +496,7 @@ static void test_late_manifest_abort_frees_keepset() {
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "keep.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_ABORT));
 
   DeleteManifest* pending = NULL;
@@ -516,6 +520,7 @@ static void test_late_manifest_eof_frees_keepset() {
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "keep.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   shutdown(p[1], SHUT_WR);
 
   DeleteManifest* pending = NULL;
@@ -539,10 +544,12 @@ static void test_late_second_manifest_frees_both() {
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "first.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "second.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
 
   DeleteManifest* pending = NULL;
   EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
@@ -551,6 +558,165 @@ static void test_late_second_manifest_frees_both() {
   close(p[0]);
   close(p[1]);
   config_delete(cfg);
+}
+
+/* A delete-manifest frame with a third (missing-args) section round-trips: the
+   receiver keeps all three sections and the missing paths are confined exactly
+   like the keep-set (a traversal entry in the missing section is rejected).
+   receive_manifest_entries() reads the counts directly (the leading
+   STATUS_MANIFEST code is consumed by the caller, so these frames do not send
+   it). */
+static void test_receive_manifest_three_sections() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "protected.txt"));
+  EXPECT_TRUE(send_int(p[1], 2));
+  EXPECT_TRUE(send_str(p[1], "gone.txt"));
+  EXPECT_TRUE(send_str(p[1], "dir/gone.bin"));
+
+  DeleteManifest* manifest = receive_manifest_entries(p[0]);
+  EXPECT_NOT_NULL(manifest);
+  EXPECT_EQ_INT(manifest->keeps->size, 1);
+  EXPECT_EQ_STR((char*)manifest->keeps->items[0], "keep.txt");
+  EXPECT_EQ_INT(manifest->protected->size, 1);
+  EXPECT_EQ_STR((char*)manifest->protected->items[0], "protected.txt");
+  EXPECT_EQ_INT(manifest->missing->size, 2);
+  EXPECT_EQ_STR((char*)manifest->missing->items[0], "gone.txt");
+  EXPECT_EQ_STR((char*)manifest->missing->items[1], "dir/gone.bin");
+  delete_manifest_free(manifest);
+
+  /* A traversal entry in the third section is rejected like every other. */
+  EXPECT_TRUE(send_int(p[1], 0));
+  EXPECT_TRUE(send_int(p[1], 0));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "../escape"));
+  EXPECT_NULL(receive_manifest_entries(p[0]));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+/* --delete-missing-args exact-path deletions: regular files and empty
+   directories are removed, a non-empty directory survives without
+   --force/--delete and is recursively removed with --force or --delete, and a
+   missing mirror is a no-op. */
+static void test_manifest_delete_missing_args() {
+  char* root = make_check_root("qmissing");
+  EXPECT_NOT_NULL(root);
+  write_check_file(root, "gone.txt", "stale");
+  char empty_dir[1024], full_dir[1024], inner[1024];
+  snprintf(empty_dir, sizeof(empty_dir), "%s/empty_dir", root);
+  snprintf(full_dir, sizeof(full_dir), "%s/full_dir", root);
+  snprintf(inner, sizeof(inner), "%s/full_dir/inner.txt", root);
+  EXPECT_EQ_INT(mkdir(empty_dir, 0755), 0);
+  EXPECT_EQ_INT(mkdir(full_dir, 0755), 0);
+  write_check_file(full_dir, "inner.txt", "content");
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->delete_missing_args = true;
+
+  DeleteManifest* manifest = calloc(1, sizeof(DeleteManifest));
+  EXPECT_NOT_NULL(manifest);
+  manifest->keeps = array_list_create(free);
+  manifest->protected = array_list_create(free);
+  manifest->missing = array_list_create(free);
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("gone.txt")));
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("empty_dir")));
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("full_dir")));
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("never_here.txt")));
+
+  /* Without --delete/--force the non-empty directory survives (rsync parity). */
+  EXPECT_TRUE(manifest_delete_missing_args(cfg, manifest));
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/gone.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/empty_dir", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/full_dir", root);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+  EXPECT_EQ_INT(access(inner, F_OK), 0);
+
+  /* With --force the non-empty directory mirror is removed recursively. */
+  cfg->force_delete = true;
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("full_dir")));
+  EXPECT_TRUE(manifest_delete_missing_args(cfg, manifest));
+  EXPECT_EQ_INT(access(full_dir, F_OK), -1);
+
+  delete_manifest_free(manifest);
+  config_delete(cfg);
+  remove(full_dir);
+  rmdir(empty_dir);
+  rmdir(root);
+  free(root);
+}
+
+/* A delete-missing-args manifest parked by the commit path is committed after
+   STATUS_FINISHED: the mirror that exists is removed, a missing mirror is a
+   no-op, and unrelated destination content is untouched (no --delete). */
+static void test_receiver_pending_commits_missing_args() {
+  char* root = make_check_root("qmisscomm");
+  EXPECT_NOT_NULL(root);
+  write_check_file(root, "gone.txt", "stale");
+  write_check_file(root, "extra.txt", "unrelated");
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->delete_missing_args = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 0)); /* keep-set empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected empty */
+  EXPECT_TRUE(send_int(p[1], 2));
+  EXPECT_TRUE(send_str(p[1], "gone.txt"));
+  EXPECT_TRUE(send_str(p[1], "never_here.txt"));
+  EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
+
+  /* NULL pending: the single-threaded commit path deletes at FINISHED.  The
+     sink sends the terminal STATUS_OK success frame. */
+  ReceiverSink sink = {.send_success = true};
+  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL), 0);
+  Status ack;
+  EXPECT_TRUE(receive_status(p[1], &ack));
+  EXPECT_EQ_INT(ack, STATUS_OK);
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/gone.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/extra.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+  {
+    /* remove fixtures */
+    char pth[1024];
+    snprintf(pth, sizeof(pth), "%s/extra.txt", root);
+    remove(pth);
+    rmdir(root);
+  }
+  free(root);
 }
 
 void test_server() {
@@ -566,5 +732,8 @@ void test_server() {
     test_late_manifest_abort_frees_keepset();
     test_late_manifest_eof_frees_keepset();
     test_late_second_manifest_frees_both();
+    test_receive_manifest_three_sections();
+    test_manifest_delete_missing_args();
+    test_receiver_pending_commits_missing_args();
   }
 }
