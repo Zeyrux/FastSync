@@ -14,7 +14,7 @@ static void test_checksum_xxh64_seed0() {
   EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH64, 0, "hello", 5, out, sizeof(out), &len));
   EXPECT_TRUE(len == (size_t)8);
   /* Hard-coded: XXH64("hello", 5, 0). */
-  uint8_t expect[8] = {0xa3, 0x6d, 0x9f, 0x88, 0x7d, 0x82, 0xc7, 0x26};
+  const uint8_t expect[8] = {0xa3, 0x6d, 0x9f, 0x88, 0x7d, 0x82, 0xc7, 0x26};
   for (int i = 0; i < 8; i++)
     EXPECT_EQ_INT(out[i], expect[i]);
 }
@@ -25,7 +25,7 @@ static void test_checksum_xxh64_empty() {
   EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH64, 0, "", 0, out, sizeof(out), &len));
   EXPECT_TRUE(len == (size_t)8);
   /* XXH64("", 0, 0). */
-  uint8_t expect[8] = {0x99, 0xe9, 0xd8, 0x51, 0x37, 0xdb, 0x46, 0xef};
+  const uint8_t expect[8] = {0x99, 0xe9, 0xd8, 0x51, 0x37, 0xdb, 0x46, 0xef};
   for (int i = 0; i < 8; i++)
     EXPECT_EQ_INT(out[i], expect[i]);
 }
@@ -55,14 +55,14 @@ static void test_checksum_md5_vectors() {
   size_t len = 0;
   EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_MD5, 0, "", 0, out, sizeof(out), &len));
   EXPECT_TRUE(len == (size_t)16);
-  uint8_t expect_empty[16] = {0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04,
-                              0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e};
+  const uint8_t expect_empty[16] = {0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04,
+                                    0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e};
   EXPECT_TRUE(memcmp(out, expect_empty, 16) == 0);
 
   /* MD5("abc") */
   EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_MD5, 0, "abc", 3, out, sizeof(out), &len));
-  uint8_t expect_abc[16] = {0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
-                            0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72};
+  const uint8_t expect_abc[16] = {0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0,
+                                  0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72};
   EXPECT_TRUE(memcmp(out, expect_abc, 16) == 0);
 }
 
