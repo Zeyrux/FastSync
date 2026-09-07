@@ -83,8 +83,8 @@ This document maps rsync's full feature set to FastSync's current implementation
 |------|-------------------|-----------------|-------|
 | `-u`, `--update` | Skip files newer on receiver | ❌ Not Implemented | Removed because it had no effect |
 | `--inplace` | Update files in-place | ✅ Implemented | Direct write mode |
-| `--append` | Append data to shorter files | ❌ Not Implemented | Removed because it had no effect |
-| `--append-verify` | Append with old-data checksum | ❌ Not Implemented | Removed because it had no effect |
+| `--append` | Append data to shorter files | ✅ Implemented | Tail-only resume. When an existing destination file is SHORTER than the source, the receiver negotiates a resume offset with the sender and only the tail is transferred; the receiver rebuilds the full file (retained prefix + tail) and installs it through the normal atomic store path, so the result is byte-identical to the source whenever the retained prefix matches. Plain `--append` does NOT content-verify that prefix (rsync parity): a destination whose prefix differs from the source is resumed anyway, so the result (wrong prefix + correct tail) is NOT byte-identical and the file is effectively left corrupt — the documented rsync-parity risk (use `--append-verify` when the prefix cannot be trusted). Non-content attributes (permissions/ownership/mtime, via `-M`) are still applied. Requires the per-file `STATUS_CHECK` handshake, so it implies `--incremental`; it takes precedence over block delta for a growing file and falls back to delta/full when the destination is not shorter. Incompatible with `-s` (chunk serialization) and `--whole-file` (both rejected up front so the mode never silently degrades to a full transfer). Combines with `--inplace`, `--partial`/`--partial-dir`, and `--delay-updates` (the reconstructed full file flows through those paths unchanged). Divergence: rsync appends in place; FastSync reconstructs and atomically installs, so an interrupted or failed resume never leaves a half-written file at the destination (no corruption window), and `--append` is thus safe to use with the normal atomic path — not only with in-place writes |
+| `--append-verify` | Append with old-data checksum | ✅ Implemented | Like `--append`, but the retained prefix IS verified before resuming: the sender transmits the source prefix checksum and the receiver compares it to the xxHash64 of the retained destination prefix; on a match only the tail is transferred, on a MISMATCH the run falls back to a clean full transfer so the result is always a byte-identical source copy (never a corrupt prefix+tail blend). Wire/protocol: the append handshake adds `STATUS_APPEND` / `STATUS_APPEND_SIG` / `STATUS_APPEND_OK` / `STATUS_APPEND_DATA` frames and `PROTOCOL_VERSION` was bumped **2.9.0 → 2.10.0** (peers must match, and both must be 2.10.0 or the run fails the version check). Same implications/incompatibilities as `--append`; when both spellings are given `--append-verify` wins (the safer semantics). See the Phase-3 append notes below |
 | `-W`, `--whole-file` | Copy whole file (no delta) | ❌ Not Implemented | |
 | `--block-size=SIZE` | Force checksum block-size | ⚠️ Partial | Parsed as `--delta-block`; controls delta transfer block size |
 
@@ -188,6 +188,32 @@ configuration error rather than silently resolved. Note the check is
 order-independent because it runs over the fully parsed config. The deletion
 POLICY flags (`--delete-excluded`, `--max-delete`, `--ignore-errors`, `--force`)
 do NOT imply `--delete`; without `--delete` they are inert (matching rsync).
+
+**Append-resume notes (Phase 3, append wave):** `--append` and `--append-verify`
+are real. Both are negotiated when an existing destination file is found to be
+**shorter** than the source during the per-file `STATUS_CHECK`; the receiver
+replies with a new `STATUS_APPEND` frame carrying the resume offset (the prefix
+length it already holds) instead of `STATUS_NEXT`/`STATUS_DELTA_SIGNATURE`.
+The sender transmits ONLY the tail. For `--append-verify` it first sends the
+source's prefix xxHash64 in a `STATUS_APPEND_SIG` frame; the receiver compares
+it to the retained prefix and answers `STATUS_APPEND_OK` (transfer the tail) or
+`STATUS_NEXT` (prefix mismatch → the sender falls back to a byte-exact full
+transfer). The tail arrives in a `STATUS_APPEND_DATA` frame (compression and
+metadata still apply). The receiver then rebuilds the full file in memory
+(prefix + tail) and routes it through the existing atomic store engine, so all
+of `--inplace`, `--partial`/`--partial-dir`, `--delay-updates`, `--backup`,
+`--existing`/`--ignore-existing`/`--update` and delete-manifest behaviour is
+unchanged and the result is a byte-identical source copy (given a matching
+prefix). These new frames changed the wire, so `PROTOCOL_VERSION` was bumped
+**2.9.0 → 2.10.0** (peers must match; the pre-existing `append`/`append_verify`
+config booleans already crossed the wire). CLI: both flags imply `--incremental`
+(the handshake needs it); they are incompatible with `-s` (chunk serialization)
+and `--whole-file` (both rejected up front, never a silent full transfer); when
+both spellings are given `--append-verify` wins. The FastSync divergence from
+rsync is intentional and safer: rsync appends in place, whereas FastSync
+reconstructs the whole file and atomically installs it, so an interrupted or
+failed resume never leaves a partial/corrupt file at the destination — this is
+why plain `--append` works on the normal atomic path, not only with `--inplace`.
 
 ## 8. Metadata Preservation
 
