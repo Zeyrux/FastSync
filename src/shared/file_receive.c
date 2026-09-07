@@ -1017,7 +1017,8 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if ((config->checksum || config_has_basis(config))) {
     uint8_t wire_len;
     if (!receive_n_data(fd, &wire_len, sizeof(wire_len)) || wire_len == 0 ||
-        wire_len > CHECKSUM_MAX_DIGEST_LEN) {
+        wire_len > CHECKSUM_MAX_DIGEST_LEN ||
+        wire_len != checksum_digest_len((ChecksumAlgo)config->checksum_algo)) {
       free(check_path);
       send_status(fd, STATUS_ERROR);
       return NULL;

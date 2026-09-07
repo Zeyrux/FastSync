@@ -101,6 +101,7 @@ static void test_checksum_algo_name_mapping() {
   EXPECT_TRUE(checksum_algo_from_name("sha256") < 0);
   EXPECT_TRUE(checksum_algo_from_name("crc32") < 0);
   EXPECT_TRUE(checksum_algo_from_name("none") < 0);
+  EXPECT_TRUE(checksum_algo_from_name("xxh3") < 0);
   EXPECT_TRUE(checksum_algo_from_name("") < 0);
   EXPECT_TRUE(checksum_algo_from_name(NULL) < 0);
 

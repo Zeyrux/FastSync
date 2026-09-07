@@ -16,9 +16,7 @@ bool checksum_digest(ChecksumAlgo algo, uint64_t seed, const void* data, size_t 
 
   if (algo == CHECKSUM_ALGO_XXH64) {
     uint64_t digest = XXH64(data, size, seed);
-    uint8_t buf[CHECKSUM_MAX_DIGEST_LEN];
-    memcpy(buf, &digest, sizeof(digest));
-    memcpy(out, buf, sizeof(digest));
+    memcpy(out, &digest, sizeof(digest));
     *out_len = sizeof(digest);
     return true;
   }
@@ -45,8 +43,7 @@ bool checksum_digest(ChecksumAlgo algo, uint64_t seed, const void* data, size_t 
 int checksum_algo_from_name(const char* name) {
   if (!name)
     return -1;
-  if (strcasecmp(name, "xxh64") == 0 || strcasecmp(name, "xxhash") == 0 ||
-      strcasecmp(name, "xxh3") == 0)
+  if (strcasecmp(name, "xxh64") == 0 || strcasecmp(name, "xxhash") == 0)
     return (int)CHECKSUM_ALGO_XXH64;
   if (strcasecmp(name, "md5") == 0)
     return (int)CHECKSUM_ALGO_MD5;
