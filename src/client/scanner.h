@@ -59,6 +59,11 @@ typedef struct {
   /* --ignore-errors: an unreadable directory during the scan is recorded as an
    * I/O error and skipped instead of aborting the scan.  Client-only. */
   bool ignore_io_errors;
+  /* --ignore-missing-args (implied by --delete-missing-args): an explicitly
+   * --files-from-listed entry that does not exist under the source is skipped
+   * instead of failing (the --dirs generator is the only scanner path that
+   * observes a listed-but-missing entry). */
+  bool ignore_missing_args;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -112,6 +117,9 @@ typedef struct {
   mtx_t* excluded_mutex;
   /* --ignore-errors: continue past unreadable directories (records io_error). */
   bool ignore_io_errors;
+  /* --ignore-missing-args: --dirs listed-but-missing entries are skipped, not
+     fatal (see ScannerOptions.ignore_missing_args). */
+  bool ignore_missing_args;
   /* A directory could not be opened (I/O error, e.g. EACCES).  With
      --ignore-errors the scan continues past it and the caller decides what to
      do; `failed` is reserved for fatal errors that always abort the scan. */

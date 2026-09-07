@@ -27,6 +27,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->loader_done = false;
   context->manifest = NULL;
   context->excluded_paths = NULL;
+  context->missing_args = NULL;
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
   context->early_delete = false;
@@ -86,6 +87,8 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   }
   if (context->excluded_paths)
     array_list_delete(context->excluded_paths);
+  if (context->missing_args)
+    array_list_delete(context->missing_args);
   if (context->remove_source_files)
     array_list_delete(context->remove_source_files);
   config_delete(context->config);

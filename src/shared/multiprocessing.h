@@ -32,6 +32,12 @@ typedef struct {
      scanner's exclusion sink) or, in the early modes, by the path-only pre-scan
      on the calling thread before the pipeline starts. */
   ArrayList* excluded_paths;
+  /* --delete-missing-args: the destination-relative mirrors of the --files-from
+     entries that are missing under the source.  Computed by the preflight on
+     the calling thread before the pipeline starts; the sender thread transmits
+     them in the manifest frame's third section and the receiver deletes each as
+     an explicit request. */
+  ArrayList* missing_args;
   /* A source I/O error (unreadable directory) was recorded during the scan.
      Set by the pre-scan (before the threads start) or by the scanner thread
      under mutex_scanner; the caller turns it into a non-zero exit when

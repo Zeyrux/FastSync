@@ -32,6 +32,11 @@ typedef struct {
   const char* prefix;
   bool top_level_only;
 } DeleteSkipEntry;
+/* True when child_rel is, or lies below, one of the protected entries (a prefix
+   "a" protects "a" and "a/b/c" but not "ab"; top_level_only entries protect
+   only DIRECT children of the destination root, i.e. child_rel has no '/'). */
+bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSkipEntry* skips,
+                            int skip_count);
 /* Remove files/dirs under dest_root that are not listed in manifest without
    ever descending into a protected prefix (see DeleteSkipEntry).  When
    max_delete is not SIZE_MAX the run is all-or-nothing: extras are counted

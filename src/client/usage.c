@@ -46,6 +46,12 @@ void print_usage(void) {
   printf("                      deletion\n");
   printf("  --force             A file may replace a destination directory by removing\n");
   printf("                      that (non-empty) directory first\n");
+  printf("  --ignore-missing-args  A --files-from entry that does not exist under the\n");
+  printf("                      source is silently skipped instead of failing the run\n");
+  printf("  --delete-missing-args  Implies --ignore-missing-args; also deletes each missing\n");
+  printf("                      entry's destination mirror receiver-side.  Independent of\n");
+  printf("                      --delete (it does not imply --delete; a non-empty directory\n");
+  printf("                      mirror is removed only with --force or --delete)\n");
   printf("  --prune-empty-dirs  Do not transfer empty directory entries (--dirs mode);\n");
   printf("                      recursive transfers never send empty dirs.  rsync's -m\n");
   printf("                      short form stays FastSync multithreading\n");

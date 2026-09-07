@@ -1855,6 +1855,72 @@ static void test_parse_args_max_delete_inert_without_delete() {
   config_delete(cfg);
 }
 
+/* --ignore-missing-args / --delete-missing-args parse onto their config fields.
+ * --delete-missing-args implies --ignore-missing-args (order-independent),
+ * does NOT imply --delete (rsync: independent of other delete processing), and
+ * the config stays valid in every combination. */
+static void test_parse_args_missing_args_flags() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--ignore-missing-args", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->ignore_missing_args);
+  EXPECT_FALSE(cfg->delete_missing_args);
+  EXPECT_FALSE(cfg->use_delete);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--delete-missing-args", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->delete_missing_args);
+  EXPECT_TRUE(cfg->ignore_missing_args);
+  EXPECT_FALSE(cfg->use_delete);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* The implication is order-independent: even with the explicit flag first. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--ignore-missing-args", "--delete-missing-args", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv3, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->ignore_missing_args);
+  EXPECT_TRUE(cfg->delete_missing_args);
+  config_delete(cfg);
+
+  /* --delete-missing-args composes with --delete (both active) and with a
+     delete-timing flag (which implies --delete); timing stays valid. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--delete", "--delete-missing-args", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_missing_args);
+  EXPECT_TRUE(cfg->ignore_missing_args);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv5[] = {"fastsync", "--delete-before", "--delete-missing-args", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv5, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_before);
+  EXPECT_TRUE(cfg->delete_missing_args);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_validate_config_incompatible_options();
@@ -1956,4 +2022,5 @@ void test_client_cli() {
   test_parse_args_delete_policy_flags();
   test_parse_args_delete_policy_invalid_values();
   test_parse_args_max_delete_inert_without_delete();
+  test_parse_args_missing_args_flags();
 }
