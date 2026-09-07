@@ -4,6 +4,7 @@
 #include "file_send.h"
 #include "file_receive.h"
 #include "file_types.h"
+#include "checksum.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -14,7 +15,12 @@
 File* file_create(const char* path);
 void file_destroy(void* item);
 bool file_load_data(File* file);
-bool file_checksum(File* file, uint64_t* checksum);
+/* Compute the whole-file content digest of `file` with the negotiated
+ * --checksum-choice algorithm and --checksum-seed.  Writes the digest into
+ * `out` (capacity `out_capacity`) and its length into `*out_len`.  Returns
+ * false on read/allocation failure or when the digest would not fit. */
+bool file_checksum(File* file, ChecksumAlgo algo, uint64_t seed, uint8_t* out, size_t out_capacity,
+                   size_t* out_len);
 size_t file_content_to_buffer(File* file);
 FileMetadata* file_metadata_create(const struct stat* stats);
 void file_metadata_destroy(void* metadata);

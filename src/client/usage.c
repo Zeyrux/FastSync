@@ -91,8 +91,12 @@ void print_usage(void) {
   printf("                    into the destination instead of transferring its data\n");
   printf("  --link-dest <dir>   Like --copy-dest, but hard-links the unchanged file from DIR\n");
   printf("                    into the destination (repeatable; earlier DIRs win)\n");
-  printf("  --checksum-choice, --cc <alg>  Checksum algorithm (not supported yet; xxHash64 is "
-         "used)\n");
+  printf("  --checksum-choice, --cc <alg>  Whole-file checksum algorithm for --incremental/\n");
+  printf("                    --checksum compares (xxh64/xxhash or md5; default xxh64 with\n");
+  printf("                    seed 0).  The seed comes from --checksum-seed\n");
+  printf("  --checksum-seed <num>  Seed for the whole-file xxHash64 digest (and the delta\n");
+  printf("                    block strong hash, low 32 bits); md5 ignores the seed.  The\n");
+  printf("                    digest algorithm and seed must match on sender and receiver\n");
   printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
   printf("  -W, --whole-file    Transfer changed files without delta processing\n");
   printf("  -y, --fuzzy         Use a similar-named file already in the destination\n");

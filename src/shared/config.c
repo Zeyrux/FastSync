@@ -127,6 +127,8 @@ static void config_set_defaults(Config* config) {
   config->daemon_config = NULL;
   config->server_mode = false;
   config->checksum = false;
+  config->checksum_algo = CHECKSUM_ALGO_XXH64;
+  config->checksum_seed = 0;
   config->compress_choice = NULL;
   config->chmod_spec = NULL;
   config->skip_compress_suffixes = NULL;
@@ -172,7 +174,7 @@ static bool validate_received_config(const Config* config) {
          !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
-         config_has_valid_delete_timing(config) &&
+         checksum_algo_valid(config->checksum_algo) && config_has_valid_delete_timing(config) &&
          !(config->skip_compress_set && config->use_chunk_serialization) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
@@ -462,6 +464,15 @@ static bool send_fuzzy_option(int fd, const Config* c) {
   return send_int(fd, c->fuzzy);
 }
 
+/* --checksum-choice/--cc + --checksum-seed.  The algorithm id and seed travel
+ * with the config so the receiver hashes the on-disk old file with the same
+ * parameters the sender used for its digest (see checksum.h).  Trailing fields
+ * on the config frame; protocol 2.10.0. */
+static bool send_checksum_options(int fd, const Config* c) {
+  return send_int(fd, c->checksum_algo) &&
+         send_n_data(fd, &c->checksum_seed, sizeof(c->checksum_seed));
+}
+
 static bool receive_core_fields(int fd, Config* c) {
   int value;
   if (!receive_wire_bool(fd, &c->eight_bit_output))
@@ -637,13 +648,22 @@ static bool receive_fuzzy_option(int fd, Config* c) {
   return receive_wire_bool(fd, &c->fuzzy);
 }
 
+static bool receive_checksum_options(int fd, Config* c) {
+  int algo;
+  if (!receive_int(fd, &algo) || !checksum_algo_valid(algo))
+    return false;
+  c->checksum_algo = algo;
+  return receive_n_data(fd, &c->checksum_seed, sizeof(c->checksum_seed));
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
       !send_file_options(file_descriptor, config) ||
       !send_selection_options(file_descriptor, config) ||
       !send_resume_options(file_descriptor, config) ||
-      !send_basis_options(file_descriptor, config) || !send_fuzzy_option(file_descriptor, config))
+      !send_basis_options(file_descriptor, config) || !send_fuzzy_option(file_descriptor, config) ||
+      !send_checksum_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -677,7 +697,8 @@ Config* config_receive(int file_descriptor) {
       !receive_selection_options(file_descriptor, config) ||
       !receive_resume_options(file_descriptor, config) ||
       !receive_basis_options(file_descriptor, config) ||
-      !receive_fuzzy_option(file_descriptor, config))
+      !receive_fuzzy_option(file_descriptor, config) ||
+      !receive_checksum_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

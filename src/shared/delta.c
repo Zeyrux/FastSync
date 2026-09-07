@@ -29,12 +29,21 @@ uint32_t delta_xxhash32(const void* data, uint32_t len) {
   return XXH32(data, len, 0);
 }
 
+uint32_t delta_xxhash32_seeded(const void* data, uint32_t len, uint32_t seed) {
+  return XXH32(data, len, seed);
+}
+
 uint64_t delta_xxhash64(const void* data, size_t len) {
   return XXH64(data, len, 0);
 }
 
 DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_file_size,
                                        uint32_t block_size) {
+  return delta_signature_create_seeded(old_file_data, old_file_size, block_size, 0);
+}
+
+DeltaSignature* delta_signature_create_seeded(const void* old_file_data, uint64_t old_file_size,
+                                              uint32_t block_size, uint32_t seed) {
   if (old_file_data == NULL || old_file_size == 0 || block_size == 0)
     return NULL;
 
@@ -67,7 +76,7 @@ DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_f
     uint32_t len =
         (uint32_t)((old_file_size - offset < block_size) ? (old_file_size - offset) : block_size);
     sig->blocks[i].adler32 = delta_adler32(data + offset, len);
-    sig->blocks[i].xxhash = delta_xxhash32(data + offset, len);
+    sig->blocks[i].xxhash = delta_xxhash32_seeded(data + offset, len, seed);
   }
 
   return sig;
@@ -297,7 +306,7 @@ static uint32_t* delta_build_index(const DeltaSignature* sig, uint32_t bucket_co
  * O(1) per window); otherwise an exact linear scan is used. */
 static uint32_t delta_find_match(const uint8_t* window, uint32_t window_len, uint32_t adler,
                                  bool full_window, const DeltaSignature* sig, const uint32_t* heads,
-                                 const uint32_t* next, uint32_t mask) {
+                                 const uint32_t* next, uint32_t mask, uint32_t seed) {
   if (!full_window || sig->block_count == 0)
     return DELTA_NO_BLOCK;
 
@@ -309,7 +318,7 @@ static uint32_t delta_find_match(const uint8_t* window, uint32_t window_len, uin
       if (sig->blocks[j].adler32 != adler)
         continue;
       if (!have_xxh) {
-        window_xxh = delta_xxhash32(window, window_len);
+        window_xxh = delta_xxhash32_seeded(window, window_len, seed);
         have_xxh = true;
       }
       if (window_xxh == sig->blocks[j].xxhash)
@@ -321,7 +330,7 @@ static uint32_t delta_find_match(const uint8_t* window, uint32_t window_len, uin
   /* Fallback used when the index could not be allocated. */
   for (uint32_t j = 0; j < sig->block_count; j++) {
     if (sig->blocks[j].adler32 == adler) {
-      uint32_t window_xxh = delta_xxhash32(window, window_len);
+      uint32_t window_xxh = delta_xxhash32_seeded(window, window_len, seed);
       if (window_xxh == sig->blocks[j].xxhash)
         return j;
     }
@@ -331,6 +340,11 @@ static uint32_t delta_find_match(const uint8_t* window, uint32_t window_len, uin
 
 Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const DeltaSignature* sig,
                      uint32_t block_size) {
+  return delta_compute_seeded(new_file_data, new_file_size, sig, block_size, 0);
+}
+
+Delta* delta_compute_seeded(const void* new_file_data, uint64_t new_file_size,
+                            const DeltaSignature* sig, uint32_t block_size, uint32_t seed) {
   if (!new_file_data || !sig || !sig->blocks || new_file_size == 0 || block_size == 0 ||
       block_size > DELTA_BLOCK_SIZE_MAX || sig->block_size != block_size)
     return NULL;
@@ -397,7 +411,7 @@ Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const De
 
     bool matched = false;
     uint32_t match_block = delta_find_match(new_data + i, window_len, adler, full_window, sig,
-                                            index, chain_next, mask);
+                                            index, chain_next, mask, seed);
     if (match_block != DELTA_NO_BLOCK) {
       if (has_literal) {
         if (!flush_literal(&instrs, &capacity, &count, new_data, literal_start, i)) {

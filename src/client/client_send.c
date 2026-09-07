@@ -733,12 +733,18 @@ static int incremental_check(Client* client, File* file, const Config* config,
   if (!send_n_data(client->file_descriptor, &mtime_nsec, sizeof(mtime_nsec)))
     return -1;
   /* With alternate basis directories the receiver must be able to verify the
-   * content of every candidate basis file, so the sender supplies its xxHash64
-   * for every file even when --checksum was not requested. */
+   * content of every candidate basis file, so the sender supplies its whole-file
+   * digest (computed with the negotiated --checksum-choice algorithm and
+   * --checksum-seed) for every file even when --checksum was not requested. */
   if (config->checksum || config_has_basis(config)) {
-    uint64_t checksum;
-    if (!file_checksum(file, &checksum) ||
-        !send_n_data(client->file_descriptor, &checksum, sizeof(checksum)))
+    uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
+    size_t digest_len = 0;
+    if (!file_checksum(file, (ChecksumAlgo)config->checksum_algo, config->checksum_seed, digest,
+                       sizeof(digest), &digest_len))
+      return -1;
+    uint8_t wire_len = (uint8_t)digest_len;
+    if (!send_n_data(client->file_descriptor, &wire_len, sizeof(wire_len)) ||
+        !send_n_data(client->file_descriptor, digest, wire_len))
       return -1;
   }
   Status s;
@@ -774,7 +780,8 @@ static int incremental_check(Client* client, File* file, const Config* config,
 }
 
 static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* config) {
-  Delta* delta = delta_compute(file->data->data, file->data->size, sig, config->delta_block_size);
+  Delta* delta = delta_compute_seeded(file->data->data, file->data->size, sig,
+                                      config->delta_block_size, (uint32_t)config->checksum_seed);
   /* The receiver is blocked after sending the signature.  Every local
      fallback therefore needs the explicit NEXT response before full data. */
   if (!delta)
