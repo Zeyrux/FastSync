@@ -773,8 +773,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--xattrs",
                                         "-D",
                                         "--devices",
-                                        "--append",
-                                        "--append-verify",
                                         "--delete-excluded",
                                         "--max-delete",
                                         "--prune-empty-dirs",
@@ -1920,9 +1918,103 @@ static void test_parse_args_missing_args_flags() {
   EXPECT_TRUE(validate_config(cfg));
   config_delete(cfg);
 }
+/* --append is accepted and implies the per-file incremental check a tail resume
+ * needs; it validates cleanly on its own. */
+static void test_parse_args_append() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--append", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->append);
+  EXPECT_FALSE(cfg->append_verify);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
 
+static void test_parse_args_append_verify() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--append-verify", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->append_verify);
+  EXPECT_FALSE(cfg->append);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+/* Both spellings are accepted; the safer --append-verify semantics win on the
+ * wire (the sender checks append_verify first), so neither flag is silently
+ * dropped but the run is still valid. */
+static void test_parse_args_append_both() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--append", "--append-verify", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->append);
+  EXPECT_TRUE(cfg->append_verify);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_append_rejects_chunk_serialization() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--append", "-s", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_append_verify_rejects_chunk_serialization() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--append-verify", "-s", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_append_rejects_whole_file() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--append", "-W", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_validate_config_append_verify_rejects_whole_file() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--append-verify", "-W", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
 void test_client_cli() {
   test_validate_config_required_paths();
+  test_parse_args_append();
+  test_parse_args_append_verify();
+  test_parse_args_append_both();
+  test_validate_config_append_rejects_chunk_serialization();
+  test_validate_config_append_verify_rejects_chunk_serialization();
+  test_validate_config_append_rejects_whole_file();
+  test_validate_config_append_verify_rejects_whole_file();
   test_validate_config_incompatible_options();
   test_validate_config_tls_requirements();
   test_validate_config_delta_sendfile_constraints();

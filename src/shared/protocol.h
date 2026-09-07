@@ -70,7 +70,21 @@ enum NET_STATUS {
   STATUS_CHECK_BATCH,
   /* An explicit directory entry (--dirs): the sender transmits only the path;
    * the receiver creates the directory below the receive root. */
-  STATUS_MKDIR
+  STATUS_MKDIR,
+  /* --append / --append-verify tail resume.  STATUS_APPEND is sent by the
+   * receiver after a per-file STATUS_CHECK when the existing destination file
+   * is SHORTER than the source and an append mode is negotiated: its payload is
+   * the resume offset (the number of prefix bytes already present), after which
+   * the sender answers either directly with STATUS_APPEND_DATA (plain --append,
+   * prefix not verified) or, for --append-verify, first with STATUS_APPEND_SIG
+   * carrying the xxHash64 of the source prefix; the receiver then replies
+   * STATUS_APPEND_OK (prefix matched -> sender transmits the tail) or
+   * STATUS_NEXT (prefix mismatch -> sender falls back to a full transfer).
+   * STATUS_APPEND_DATA carries the tail bytes (compressed data frame). */
+  STATUS_APPEND,
+  STATUS_APPEND_SIG,
+  STATUS_APPEND_OK,
+  STATUS_APPEND_DATA
 };
 
 void io_set_fds(int read_fd, int write_fd);

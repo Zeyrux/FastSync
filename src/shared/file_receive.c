@@ -983,6 +983,50 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
   return basis;
 }
 
+/* Read the remainder of a full-file transfer after the receiver has already
+ * sent STATUS_NEXT: receive the metadata frame (when enabled) followed by the
+ * data frame, and return an owned File.  Shared by the plain full-transfer path
+ * and the --append-verify prefix-mismatch fallback (a clean full transfer
+ * instead of a corrupt prefix+tail blend). */
+static File* receive_full_file(int fd, const Config* config, const char* path) {
+  File* file = file_create(path);
+  if (!file)
+    return NULL;
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok) {
+      file_destroy(file);
+      return NULL;
+    }
+  }
+  Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
+  if (file_data == NULL) {
+    file_destroy(file);
+    return NULL;
+  }
+  if (config->use_compression &&
+      !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
+                                             config->skip_compress_set ? config->skip_compress_count
+                                                                       : -1)) {
+    Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
+    data_destroy(file_data);
+    if (uncompressed == NULL) {
+      file_destroy(file);
+      return NULL;
+    }
+    if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+      data_destroy(uncompressed);
+      file_destroy(file);
+      return NULL;
+    }
+    file_data = uncompressed;
+  }
+  data_destroy(file->data);
+  file->data = file_data;
+  return file;
+}
+
 File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   if (!config || !skipped) {
     send_status(fd, STATUS_ERROR);
@@ -1193,6 +1237,224 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     basis_match_free(&basis);
   }
 
+  /* ---- --append / --append-verify tail resume ----
+   * When the existing destination file is SHORTER than the source, an append
+   * mode resumes it by negotiating a resume offset (the prefix length already
+   * present) from the receiver and transferring ONLY the tail.  The receiver
+   * then reconstructs the full file (prefix + tail) and installs it through the
+   * normal atomic store path, so the result is byte-identical to the source.
+   * This takes precedence over block delta (a growing file is cheapest as a
+   * pure tail), and falls through to delta/full only when no shorter old file
+   * makes a resume possible. */
+  bool append_resume = (config->append || config->append_verify) && has_old_file &&
+                       append_resume_eligible(old_size, check_size);
+  if (append_resume) {
+    /* Ensure the retained prefix (== the whole, shorter destination file) is
+       in memory; it is needed both to rebuild the full file and, for
+       --append-verify, to checksum it.  A load failure is not fatal: the
+       resume is simply not possible and we fall through to the other paths. */
+    if (old_data == NULL && old_size > 0 && old_size <= MAX_RECEIVE_WHOLE_FILE_SIZE &&
+        old_size <= SIZE_MAX) {
+      old_data = protocol_alloc((size_t)old_size);
+      if (old_data) {
+        size_t got = 0;
+        while (got < (size_t)old_size) {
+          ssize_t n = read(old_fd, (char*)old_data + got, (size_t)old_size - got);
+          if (n <= 0) {
+            free(old_data);
+            old_data = NULL;
+            break;
+          }
+          got += (size_t)n;
+        }
+      }
+    }
+    if (old_data != NULL || old_size == 0) {
+      if (!send_status(fd, STATUS_APPEND) || !send_n_data(fd, &old_size, sizeof(old_size))) {
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        free(old_data);
+        return NULL;
+      }
+      bool verify = config->append_verify;
+      bool full_fallback = false;
+      if (verify) {
+        Status sig_status;
+        if (!receive_status(fd, &sig_status)) {
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+        if (sig_status != STATUS_APPEND_SIG) {
+          send_status(fd, STATUS_ERROR);
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+        uint64_t src_prefix_hash;
+        if (!receive_n_data(fd, &src_prefix_hash, sizeof(src_prefix_hash))) {
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+        /* Compare the retained prefix against the source prefix.  A mismatch
+           must never be silently appended to: fall back to a full transfer so
+           the result is a byte-identical source copy. */
+        uint64_t dst_prefix_hash =
+            old_size == 0 ? delta_xxhash64("", 0) : delta_xxhash64(old_data, (size_t)old_size);
+        if (dst_prefix_hash == src_prefix_hash) {
+          if (!send_status(fd, STATUS_APPEND_OK)) {
+            close(old_fd);
+            free(full_path);
+            free(check_path);
+            free(old_data);
+            return NULL;
+          }
+        } else {
+          if (!send_status(fd, STATUS_NEXT)) {
+            close(old_fd);
+            free(full_path);
+            free(check_path);
+            free(old_data);
+            return NULL;
+          }
+          full_fallback = true;
+        }
+      }
+
+      if (full_fallback) {
+        /* Retained prefix differed: receive the sender's full transfer. */
+        free(old_data);
+        old_data = NULL;
+        close(old_fd);
+        File* file = receive_full_file(fd, config, check_path);
+        free(check_path);
+        free(full_path);
+        return file;
+      }
+
+      /* Receive the tail (STATUS_APPEND_DATA + metadata + tail bytes). */
+      Status tail_status;
+      if (!receive_status(fd, &tail_status)) {
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        free(old_data);
+        return NULL;
+      }
+      if (tail_status != STATUS_APPEND_DATA) {
+        send_status(fd, STATUS_ERROR);
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        free(old_data);
+        return NULL;
+      }
+      FileMetadata* meta = NULL;
+      if (config->use_metadata) {
+        int meta_ok = 1;
+        meta = metadata_receive(fd, &meta_ok);
+        if (!meta_ok) {
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+      }
+      Data* tail = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
+      if (tail == NULL) {
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        free(old_data);
+        return NULL;
+      }
+      if (config->use_compression &&
+          !compression_should_skip_with_suffixes(
+              check_path, config->skip_compress_suffixes,
+              config->skip_compress_set ? config->skip_compress_count : -1)) {
+        Data* uncompressed = data_decompress_limited(tail, MAX_RECEIVE_WHOLE_FILE_SIZE);
+        data_destroy(tail);
+        if (uncompressed == NULL) {
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+        if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+          data_destroy(uncompressed);
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+        tail = uncompressed;
+      }
+      /* The tail must complete the file exactly; anything else is a protocol
+         violation (never a truncated or overrun file). */
+      unsigned long long expected_tail;
+      if (!append_tail_length(old_size, check_size, &expected_tail) ||
+          tail->size != (size_t)expected_tail) {
+        send_status(fd, STATUS_ERROR);
+        data_destroy(tail);
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        free(old_data);
+        return NULL;
+      }
+      size_t full_size = (size_t)check_size;
+      void* full = protocol_alloc(full_size ? full_size : 1);
+      if (!full) {
+        data_destroy(tail);
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        free(old_data);
+        return NULL;
+      }
+      if (old_size > 0 && old_data)
+        memcpy(full, old_data, (size_t)old_size);
+      if (tail->size > 0)
+        memcpy((char*)full + old_size, tail->data, tail->size);
+      data_destroy(tail);
+      free(old_data);
+      old_data = NULL;
+
+      File* file = file_create(check_path);
+      if (!file) {
+        free(full);
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        return NULL;
+      }
+      file->metadata = meta;
+      file->data = data_create(full, full_size);
+      if (!file->data) { /* data_create already freed full on failure */
+        file_destroy(file);
+        close(old_fd);
+        free(full_path);
+        free(check_path);
+        return NULL;
+      }
+      close(old_fd);
+      free(full_path);
+      free(check_path);
+      return file;
+    }
+  }
+
   if (try_delta && old_data != NULL) {
     bool delta_failed = false;
     File* delta_file =
@@ -1256,48 +1518,9 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   }
   close(old_fd);
 
-  File* file = file_create(check_path);
+  File* file = receive_full_file(fd, config, check_path);
   free(check_path);
   free(full_path);
-  if (file == NULL) {
-    return NULL;
-  }
-
-  if (config->use_metadata) {
-    int meta_ok = 1;
-    file->metadata = metadata_receive(fd, &meta_ok);
-    if (!meta_ok) {
-      file_destroy(file);
-      return NULL;
-    }
-  }
-
-  Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
-  if (file_data == NULL) {
-    file_destroy(file);
-    return NULL;
-  }
-
-  if (config->use_compression &&
-      !compression_should_skip_with_suffixes(file->path, config->skip_compress_suffixes,
-                                             config->skip_compress_set ? config->skip_compress_count
-                                                                       : -1)) {
-    Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
-    data_destroy(file_data);
-    if (uncompressed == NULL) {
-      file_destroy(file);
-      return NULL;
-    }
-    if (uncompressed->size > MAX_FILE_DATA_SIZE) {
-      data_destroy(uncompressed);
-      file_destroy(file);
-      return NULL;
-    }
-    file_data = uncompressed;
-  }
-
-  data_destroy(file->data);
-  file->data = file_data;
   return file;
 }
 

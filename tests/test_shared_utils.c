@@ -276,6 +276,22 @@ void test_shared_utils() {
   test_walker_unlimited_deletes_all();
   test_walker_hard_bound_all_or_nothing();
 
+  /* --append / --append-verify tail-resume math: a resume is eligible only for
+     a shorter existing destination, and the tail length is then the difference. */
+  EXPECT_TRUE(append_resume_eligible(0, 10));
+  EXPECT_TRUE(append_resume_eligible(7, 10));
+  EXPECT_FALSE(append_resume_eligible(10, 10));
+  EXPECT_FALSE(append_resume_eligible(11, 10));
+
+  unsigned long long tail;
+  EXPECT_TRUE(append_tail_length(0, 10, &tail));
+  EXPECT_EQ_INT((int)tail, 10);
+  EXPECT_TRUE(append_tail_length(7, 10, &tail));
+  EXPECT_EQ_INT((int)tail, 3);
+  EXPECT_FALSE(append_tail_length(10, 10, &tail));
+  EXPECT_FALSE(append_tail_length(11, 10, &tail));
+  EXPECT_FALSE(append_tail_length(7, 10, NULL));
+
   char formatted[32];
   EXPECT_TRUE(format_human_bytes(0, formatted, sizeof(formatted)));
   EXPECT_EQ_STR(formatted, "0 B");

@@ -397,6 +397,14 @@ static const char* status_to_string(Status status) {
     return "CHECK_BATCH";
   case STATUS_MKDIR:
     return "MKDIR";
+  case STATUS_APPEND:
+    return "APPEND";
+  case STATUS_APPEND_SIG:
+    return "APPEND_SIG";
+  case STATUS_APPEND_OK:
+    return "APPEND_OK";
+  case STATUS_APPEND_DATA:
+    return "APPEND_DATA";
   default:
     return "UNKNOWN";
   }
