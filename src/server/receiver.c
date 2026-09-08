@@ -154,7 +154,8 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   DeleteManifest* deferred_manifest = NULL;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
-         status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK) {
+         status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK ||
+         status == STATUS_SPECIAL) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
         goto fail;
@@ -183,6 +184,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         goto receive_error;
     } else if (status == STATUS_HARDLINK) {
       File* file = file_receive_hardlink(file_descriptor);
+      if (!file || !sink->store_file(file, sink->context))
+        goto receive_error;
+    } else if (status == STATUS_SPECIAL) {
+      File* file = file_receive_special(file_descriptor);
       if (!file || !sink->store_file(file, sink->context))
         goto receive_error;
     } else if (status == STATUS_MANIFEST) {
@@ -309,7 +314,8 @@ static bool receiver_save_file(File* file, void* context_pointer) {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
   }
   if (result != FILE_SAVE_ERROR && context->config->remove_source_files && !file->is_dir &&
-      !file->skip && !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
+      !file->is_special && !file->skip &&
+      !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
     file_destroy(file);
     return false;
   }

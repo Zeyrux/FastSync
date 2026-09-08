@@ -76,6 +76,9 @@ static void config_set_defaults(Config* config) {
   config->preserve_xattrs = false;
   config->preserve_devices = false;
   config->preserve_sparse = false;
+  config->preserve_specials = false;
+  config->copy_devices = false;
+  config->write_devices = false;
   config->itemize_changes = false;
   config->out_format = NULL;
   config->log_file_format = NULL;
@@ -180,16 +183,18 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->safe_links) && valid_wire_bool(config->copy_unsafe_links) &&
          valid_wire_bool(config->preserve_hard_links) && valid_wire_bool(config->preserve_acls) &&
          valid_wire_bool(config->preserve_xattrs) && valid_wire_bool(config->preserve_devices) &&
-         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->ignore_existing) &&
-         valid_wire_bool(config->existing) && valid_wire_bool(config->update) &&
-         valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
-         valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
-         valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->force_delete) &&
-         valid_wire_bool(config->delete_missing_args) && valid_wire_bool(config->delete_after) &&
-         valid_wire_bool(config->preallocate) && valid_wire_bool(config->delete_delay) &&
-         valid_wire_bool(config->delete_during) && valid_wire_bool(config->relative) &&
-         valid_wire_bool(config->prune_empty_dirs) && valid_wire_bool(config->delay_updates) &&
-         valid_wire_bool(config->mkpath) && !(config->delay_updates && config->inplace) &&
+         valid_wire_bool(config->preserve_sparse) && valid_wire_bool(config->preserve_specials) &&
+         valid_wire_bool(config->copy_devices) && valid_wire_bool(config->write_devices) &&
+         valid_wire_bool(config->ignore_existing) && valid_wire_bool(config->existing) &&
+         valid_wire_bool(config->update) && valid_wire_bool(config->inplace) &&
+         valid_wire_bool(config->append) && valid_wire_bool(config->use_fsync) &&
+         valid_wire_bool(config->append_verify) && valid_wire_bool(config->delete_excluded) &&
+         valid_wire_bool(config->force_delete) && valid_wire_bool(config->delete_missing_args) &&
+         valid_wire_bool(config->delete_after) && valid_wire_bool(config->preallocate) &&
+         valid_wire_bool(config->delete_delay) && valid_wire_bool(config->delete_during) &&
+         valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
+         valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
+         !(config->delay_updates && config->inplace) &&
          !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
@@ -444,12 +449,16 @@ static bool send_delta_fields(int fd, const Config* c) {
 }
 
 static bool send_file_options(int fd, const Config* c) {
+  /* Device/special preservation flags cross the wire so the receiver knows a
+   * special/device entry must be recreated.  Trailing fields; protocol 2.13.0. */
   return send_int(fd, c->backup) && send_str(fd, c->backup_dir ? c->backup_dir : "") &&
          send_int(fd, c->remove_source_files) && send_int(fd, c->follow_symlinks) &&
          send_int(fd, c->copy_links) && send_int(fd, c->safe_links) &&
          send_int(fd, c->copy_unsafe_links) && send_int(fd, c->preserve_hard_links) &&
          send_int(fd, c->preserve_acls) && send_int(fd, c->preserve_xattrs) &&
-         send_int(fd, c->preserve_devices) && send_int(fd, c->preserve_sparse);
+         send_int(fd, c->preserve_devices) && send_int(fd, c->preserve_sparse) &&
+         send_int(fd, c->preserve_specials) && send_int(fd, c->copy_devices) &&
+         send_int(fd, c->write_devices);
 }
 
 static bool send_selection_options(int fd, const Config* c) {
@@ -569,7 +578,8 @@ static bool receive_file_options(int fd, Config* c) {
     return false;
   bool* flags[] = {&c->follow_symlinks,   &c->copy_links,          &c->safe_links,
                    &c->copy_unsafe_links, &c->preserve_hard_links, &c->preserve_acls,
-                   &c->preserve_xattrs,   &c->preserve_devices,    &c->preserve_sparse};
+                   &c->preserve_xattrs,   &c->preserve_devices,    &c->preserve_sparse,
+                   &c->preserve_specials, &c->copy_devices,        &c->write_devices};
   for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
     if (!receive_wire_bool(fd, flags[i]))
       return false;

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "array_list.h"
@@ -288,6 +289,231 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
   return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
 }
 
+/* Validate a transmitted special rdev against the node kind implied by `mode`'s
+ * S_IFMT bits.  Char/block devices require a legal major/minor pair (non-negative,
+ * range-checked); a non-device special (FIFO/socket) must carry an empty rdev.
+ * Used identically on the wire path and at the secure recreation site so a
+ * malicious/bogus rdev can never drive a dangerous node. */
+bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode) {
+  bool is_device = S_ISCHR(mode) || S_ISBLK(mode);
+  if (is_device)
+    return major >= 0 && minor >= 0 && major <= 0xffff && minor <= 0x00ffffff;
+  /* A non-device entry must actually be a special (FIFO/socket) and carry no
+     rdev; a regular/dir mode is never a valid special node. */
+  return (S_ISFIFO(mode) || S_ISSOCK(mode)) && major == 0 && minor == 0;
+}
+
+/* ---- Device/special node RECREATION (--devices/--specials), receiver side ----
+ *
+ * Privilege gating: making a real device node requires CAP_MKNOD (root); making
+ * a FIFO works unprivileged (mkfifo).  When the receiver lacks the capability,
+ * mknodat() fails with EPERM and the entry is SKIPPED with a warning -- the
+ * whole transfer must NOT abort just because the environment cannot make the
+ * node.  CI runs non-root, so device creation is expected to skip there and
+ * only a FIFO is honestly assertable unprivileged.
+ *
+ * Confinement: the parent directory is opened fd-relative below the receive
+ * root (file_open_secure_parent: O_NOFOLLOW, no "..", root-checked) and the
+ * node is created with mknodat()/mkfifoat(), so it can never be placed outside
+ * the confined root and never follows a symlink.
+ *
+ * rdev validation: a malicious/bogus rdev (negative, out-of-range) is rejected
+ * here as well as on the wire (file_receive_special / chunk_deserialize), and a
+ * non-device entry must carry an empty rdev.
+ */
+static FileSaveResult file_save_special_to_disk(const char* root_directory, const File* file,
+                                                const Config* config) {
+  if (!root_directory || !file || !file->path || file->path[0] == '\0' ||
+      has_path_traversal(file->path) || !file->metadata)
+    return FILE_SAVE_ERROR;
+
+  mode_t mode = file->metadata->mode;
+  bool is_char = S_ISCHR(mode);
+  bool is_blk = S_ISBLK(mode);
+  bool is_fifo = S_ISFIFO(mode);
+  bool is_sock = S_ISSOCK(mode);
+  if (!is_char && !is_blk && !is_fifo && !is_sock) {
+    log_message(LOG_LEVEL_ERROR, "Special node has no device/FIFO/socket mode");
+    return FILE_SAVE_ERROR;
+  }
+  if (is_sock) {
+    /* No standard filesystem call recreates a socket; best-effort unsupported. */
+    log_message(LOG_LEVEL_WARNING, "socket not recreated: %s (unsupported; skipped)", file->path);
+    return FILE_SAVE_SKIPPED;
+  }
+  if (is_char || is_blk) {
+    if (!config || !config->preserve_devices)
+      return FILE_SAVE_SKIPPED;
+  } else if (is_fifo) {
+    if (!config || !config->preserve_specials)
+      return FILE_SAVE_SKIPPED;
+  }
+  /* Defense-in-depth rdev/type validation (also done on the wire path). */
+  if (!file_special_rdev_valid(file->rdev_major, file->rdev_minor, mode)) {
+    log_message(LOG_LEVEL_ERROR, "Rejected out-of-range device rdev %d:%d", file->rdev_major,
+                file->rdev_minor);
+    return FILE_SAVE_ERROR;
+  }
+
+  char* destination = path_cat(root_directory, file->path);
+  if (!destination)
+    return FILE_SAVE_ERROR;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(destination, &leaf, true);
+  if (parent_fd < 0) {
+    free(destination);
+    return FILE_SAVE_ERROR;
+  }
+
+  /* --existing / --ignore-existing / --update decide against the node that
+     would be replaced, mirroring the regular-file path. */
+  if (config->existing && !file_path_exists_secure(destination)) {
+    close(parent_fd);
+    free(leaf);
+    free(destination);
+    return FILE_SAVE_SKIPPED;
+  }
+  if (config->ignore_existing && file_path_exists_secure(destination)) {
+    close(parent_fd);
+    free(leaf);
+    free(destination);
+    return FILE_SAVE_SKIPPED;
+  }
+  if (config->update && file_destination_is_newer_secure(destination, file->metadata)) {
+    close(parent_fd);
+    free(leaf);
+    free(destination);
+    return FILE_SAVE_SKIPPED;
+  }
+
+  dev_t rdev = 0;
+  mode_t create_mode;
+  if (is_char) {
+    create_mode = S_IFCHR;
+    rdev = makedev((unsigned)file->rdev_major, (unsigned)file->rdev_minor);
+  } else if (is_blk) {
+    create_mode = S_IFBLK;
+    rdev = makedev((unsigned)file->rdev_major, (unsigned)file->rdev_minor);
+  } else {
+    create_mode = S_IFIFO;
+  }
+  mode_t perms = mode & 0777;
+
+  int rc = is_fifo ? mkfifoat(parent_fd, leaf, perms)
+                   : mknodat(parent_fd, leaf, create_mode | perms, rdev);
+  if (rc != 0) {
+    if (errno == EEXIST) {
+      /* An entry already exists: only skip when it already is a matching node;
+         never replace an existing directory or unrelated entry with the node. */
+      struct stat st;
+      if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+          ((is_char && S_ISCHR(st.st_mode)) || (is_blk && S_ISBLK(st.st_mode)) ||
+           (is_fifo && S_ISFIFO(st.st_mode)))) {
+        close(parent_fd);
+        free(leaf);
+        free(destination);
+        return FILE_SAVE_SKIPPED;
+      }
+      log_message(LOG_LEVEL_WARNING, "refusing to replace existing entry with %s: %s (skipped)",
+                  is_fifo ? "FIFO" : "device", file->path);
+    } else if (errno == EPERM || errno == EACCES) {
+      /* Missing CAP_MKNOD / parent write permission: the environment cannot
+         create the node, so skip instead of failing the whole run. */
+      log_message(LOG_LEVEL_WARNING,
+                  "skipping %s: cannot create %s node (%s)\n"
+                  "  --devices/--specials node creation needs privilege (CAP_MKNOD)",
+                  file->path, is_fifo ? "FIFO" : "device", strerror(errno));
+    } else {
+      log_message(LOG_LEVEL_WARNING, "failed to create %s %s: %s (skipped)",
+                  is_fifo ? "FIFO" : "device", file->path, strerror(errno));
+    }
+    close(parent_fd);
+    free(leaf);
+    free(destination);
+    return FILE_SAVE_SKIPPED;
+  }
+
+  /* Apply mtime on the fresh node (utimensat, no-follow).  Ownership is not
+     applied -- identity fchown needs an fd and would require opening the node. */
+  struct timespec times[2] = {
+      {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+      {.tv_sec = file->metadata->mtime_sec, .tv_nsec = file->metadata->mtime_nsec}};
+  utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
+  close(parent_fd);
+  free(leaf);
+  free(destination);
+  return FILE_SAVE_WRITTEN;
+}
+
+/* --write-devices (receiver): write the received data directly into an EXISTING
+ * device node on the destination instead of creating a regular file.  The node
+ * must already exist and be a char/block device (the device itself is opened and
+ * followed); it is confined to the receive root via file_open_secure_parent.
+ * Dangerous by nature, so deliberately restricted: a missing/non-device
+ * destination, or a write failure, is SKIPPED with a warning rather than
+ * allowed.  On environments without device access the run still succeeds (the
+ * entry is skipped), never aborts. */
+static FileSaveResult file_save_write_device(const char* root_directory, const File* file) {
+  if (!root_directory || !file || !file->path || file->path[0] == '\0' ||
+      has_path_traversal(file->path))
+    return FILE_SAVE_ERROR;
+  if (!file->data)
+    return FILE_SAVE_ERROR;
+  char* destination = path_cat(root_directory, file->path);
+  if (!destination)
+    return FILE_SAVE_ERROR;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(destination, &leaf, false);
+  if (parent_fd < 0) {
+    free(destination);
+    return FILE_SAVE_SKIPPED;
+  }
+  /* O_NONBLOCK: a pre-existing FIFO at the target would otherwise block the
+       receive thread forever on open(2).  With it the open only succeeds for a
+       readerless FIFO with O_RDWR (which the device fstat gate rejects anyway)
+       or fails with ENXIO/EAGAIN, both treated as a normal skip below. */
+  int fd = openat(parent_fd, leaf, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  int saved_errno = errno;
+  free(leaf);
+  close(parent_fd);
+  if (fd < 0) {
+    free(destination);
+    if (saved_errno == ENXIO || saved_errno == EAGAIN) {
+      /* A FIFO with no reader / an unreadable special: skip like every other
+         unusable write-devices target instead of blocking or failing. */
+      log_message(LOG_LEVEL_WARNING, "write-devices: %s not writable (%s); skipped", file->path,
+                  strerror(saved_errno));
+    } else {
+      log_message(LOG_LEVEL_WARNING, "write-devices: cannot open %s (%s); skipped", file->path,
+                  strerror(saved_errno));
+    }
+    return FILE_SAVE_SKIPPED;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !(S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {
+    close(fd);
+    free(destination);
+    log_message(LOG_LEVEL_WARNING, "write-devices: %s is not a device node; skipped", file->path);
+    return FILE_SAVE_SKIPPED;
+  }
+  bool ok = true;
+  if (file->data->size > 0) {
+    size_t total = (size_t)file->data->size;
+    size_t written = 0;
+    while (written < total) {
+      ssize_t n = write(fd, (char*)file->data->data + written, total - written);
+      if (n <= 0) {
+        ok = false;
+        break;
+      }
+      written += (size_t)n;
+    }
+  }
+  close(fd);
+  free(destination);
+  return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_SKIPPED;
+}
+
 FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
                                       const Config* config) {
   /* Backups are incompatible with ignore-existing: moving the entry first
@@ -313,6 +539,14 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     log_message(LOG_LEVEL_ERROR, "Invalid file or path received");
     return FILE_SAVE_ERROR;
   }
+
+  /* Device/special node (--devices/--specials): recreate the node instead of
+     writing content (privilege-gated, confined, rdev-validated). */
+  if (file->is_special)
+    return file_save_special_to_disk(root_directory, file, config);
+  /* --write-devices: write straight into an existing device node. */
+  if (config && config->write_devices)
+    return file_save_write_device(root_directory, file);
 
   /* Explicit directory entries (--dirs) carry an empty payload; the entry is
      created as a directory under the receive root, applying the same secure
@@ -1865,6 +2099,70 @@ File* file_receive_hardlink(int file_descriptor) {
   file->link_group = gid;
   file->link_first = false;
   file->hardlink_target = target;
+  return file;
+}
+
+/* Receive a device/special node frame (--devices/--specials): the leading
+ * STATUS_SPECIAL code has already been consumed.  Payload: the destination path,
+ * the metadata frame (whose mode's S_IFMT bits carry the node kind), and two
+ * int32 rdev major/minor fields.  The created File carries no payload and is
+ * recreated by file_save_to_disk_full (mknod/mkfifo, privilege-gated and
+ * confined).  rdev is validated here (non-negative, range-checked) so a bogus
+ * value cannot drive a dangerous node on the receiver. */
+File* file_receive_special(int file_descriptor) {
+  char* path = receive_str(file_descriptor);
+  if (path == NULL)
+    return NULL;
+  if (path[0] == '\0' || has_path_traversal(path)) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received special path: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  int meta_ok = 1;
+  FileMetadata* metadata = metadata_receive(file_descriptor, &meta_ok);
+  if (!meta_ok) {
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  int32_t major = 0;
+  int32_t minor = 0;
+  if (!receive_n_data(file_descriptor, &major, sizeof(major)) ||
+      !receive_n_data(file_descriptor, &minor, sizeof(minor))) {
+    free(path);
+    file_metadata_destroy(metadata);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  /* A node kind must be present; without metadata mode there is no S_IFMT to
+     recreate from. */
+  if (!metadata) {
+    log_message(LOG_LEVEL_ERROR, "Special node sent without metadata (mode)");
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  if (!file_special_rdev_valid(major, minor, metadata->mode)) {
+    log_message(LOG_LEVEL_ERROR, "Invalid special rdev received (%d:%d)", (int)major, (int)minor);
+    free(path);
+    file_metadata_destroy(metadata);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  File* file = file_create(path);
+  free(path);
+  if (file == NULL) {
+    file_metadata_destroy(metadata);
+    return NULL;
+  }
+  file->metadata = metadata;
+  file->is_special = true;
+  file->rdev_major = major;
+  file->rdev_minor = minor;
   return file;
 }
 

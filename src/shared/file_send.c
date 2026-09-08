@@ -17,6 +17,25 @@
 #include "metadata.h"
 #include "protocol.h"
 
+/* Transmit a device/special node (--devices / --specials) as a STATUS_SPECIAL
+ * frame: the destination path, the metadata frame (whose mode's S_IFMT bits
+ * carry the node kind) and the device rdev major/minor.  The receiver validates
+ * the kind and rdev and recreates the node (privilege-gating the mknod). */
+bool file_send_special(File* file, int file_descriptor, bool use_metadata) {
+  if (!file || !file_wire_path(file))
+    return false;
+  if (!send_status(file_descriptor, STATUS_SPECIAL))
+    return false;
+  if (!send_str(file_descriptor, file_wire_path(file)))
+    return false;
+  if (use_metadata && !metadata_send(file_descriptor, file->metadata))
+    return false;
+  int32_t major = file->rdev_major;
+  int32_t minor = file->rdev_minor;
+  return send_n_data(file_descriptor, &major, sizeof(major)) &&
+         send_n_data(file_descriptor, &minor, sizeof(minor));
+}
+
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
   return file_send_single_calls_with_skip(file, file_descriptor, use_metadata, compression_level,

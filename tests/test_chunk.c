@@ -159,8 +159,74 @@ static void test_chunk_dir_entry_roundtrip() {
   rmdir(dir_path);
 }
 
+/* A --devices/--specials special entry (is_special + rdev) must round-trip
+ * through the chunk wire with a legal rdev. */
+static void test_chunk_special_rdev_roundtrip() {
+  const char* path = "temp_chunk_special_node";
+  unlink(path);
+  File* special = file_create(path);
+  EXPECT_NOT_NULL(special);
+  special->is_special = true;
+  special->rdev_major = 1;
+  special->rdev_minor = 3;
+  struct stat st;
+  EXPECT_EQ_INT(stat("/dev/null", &st), 0);
+  special->metadata = file_metadata_create(path, &st, false, false);
+  EXPECT_NOT_NULL(special->metadata);
+
+  File* files[1] = {special};
+  Chunk* chunk = chunk_create(files, 1);
+  EXPECT_NOT_NULL(chunk);
+  Data* serialized = chunk_serialize(chunk, true);
+  EXPECT_NOT_NULL(serialized);
+  Chunk* deserialized = chunk_deserialize(serialized, true);
+  EXPECT_NOT_NULL(deserialized);
+  EXPECT_EQ_INT(deserialized->element_count, 1);
+  EXPECT_TRUE(deserialized->items[0]->is_special);
+  EXPECT_FALSE(deserialized->items[0]->is_dir);
+  EXPECT_EQ_INT((int)deserialized->items[0]->data->size, 0);
+  EXPECT_EQ_INT(deserialized->items[0]->rdev_major, 1);
+  EXPECT_EQ_INT(deserialized->items[0]->rdev_minor, 3);
+  EXPECT_NOT_NULL(deserialized->items[0]->metadata);
+
+  data_destroy(serialized);
+  chunk_destroy(deserialized);
+  chunk_destroy(chunk);
+}
+
+/* A special entry carrying an out-of-range rdev is a malformed chunk and must be
+ * rejected at deserialize (bounded by the same 0xffff / 0x00ffffff limits
+ * file_special_rdev_valid uses on the per-file wire), not deferred to the
+ * creation site. */
+static void test_chunk_special_rdev_out_of_range_rejected() {
+  const char* path = "temp_chunk_special_bad_rdev";
+  unlink(path);
+  File* special = file_create(path);
+  EXPECT_NOT_NULL(special);
+  special->is_special = true;
+  special->rdev_major = 0x10000; /* > 0xffff */
+  special->rdev_minor = 3;
+  struct stat st;
+  EXPECT_EQ_INT(stat("/dev/null", &st), 0);
+  special->metadata = file_metadata_create(path, &st, false, false);
+  EXPECT_NOT_NULL(special->metadata);
+
+  File* files[1] = {special};
+  Chunk* chunk = chunk_create(files, 1);
+  EXPECT_NOT_NULL(chunk);
+  Data* serialized = chunk_serialize(chunk, true);
+  EXPECT_NOT_NULL(serialized);
+  Chunk* deserialized = chunk_deserialize(serialized, true);
+  EXPECT_NULL(deserialized);
+
+  data_destroy(serialized);
+  chunk_destroy(chunk);
+}
+
 void test_chunk() {
   test_file_operations();
   test_chunk_operations();
   test_chunk_dir_entry_roundtrip();
+  test_chunk_special_rdev_roundtrip();
+  test_chunk_special_rdev_out_of_range_rejected();
 }

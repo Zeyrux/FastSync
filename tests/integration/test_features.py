@@ -3,6 +3,7 @@ import filecmp
 import os
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -18,6 +19,159 @@ from common import (
 
 SOURCE_DIR = os.path.join(TEST_DATA_DIR, "feature_source")
 DEST_DIR = os.path.join(TEST_DATA_DIR, "feature_dest")
+DEVICE_SOURCE = os.path.join(TEST_DATA_DIR, "device_source")
+DEVICE_DEST = os.path.join(TEST_DATA_DIR, "device_dest")
+
+
+class TestDeviceSpecial:
+    """Phase 4: --devices / --specials / -D / --copy-devices / --write-devices.
+
+    Device node CREATION (mknod) is privileged (CAP_MKNOD); CI runs non-root, so
+    only the FIFO path (mkfifo, unprivileged) is asserted unconditionally.  The
+    real-device-created assertions are guarded to run only as root.  Everything
+    else must simply succeed / skip without aborting.
+    """
+
+    def _setup(self):
+        clean_dir(DEVICE_SOURCE)
+        clean_dir(DEVICE_DEST)
+        with open(os.path.join(DEVICE_SOURCE, "plain.txt"), "wb") as f:
+            f.write(b"regular content\n")
+
+    def test_specials_recreates_fifo(self, shared_server):
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "pipe.fifo"))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["--specials"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        fifo = os.path.join(received, "pipe.fifo")
+        assert os.path.exists(fifo) and stat.S_ISFIFO(os.stat(fifo).st_mode), (
+            "source FIFO was not recreated as a FIFO on the destination"
+        )
+        # The regular file alongside it still transferred normally.
+        with open(os.path.join(received, "plain.txt")) as f:
+            assert f.read() == "regular content\n"
+
+    def test_D_implies_devices_and_specials_fifo(self, shared_server):
+        """-D implies --devices --specials; a FIFO is preserved without a crash
+        even though no device mknod is attempted on the (non-root) receiver."""
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "pipe.fifo"))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["-D"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        assert stat.S_ISFIFO(os.stat(os.path.join(received, "pipe.fifo")).st_mode)
+
+    def test_copy_devices_non_crash(self, shared_server):
+        """--copy-devices treats a special/device source as a regular-file copy;
+        a FIFO (st_size 0) must transfer without hanging or crashing."""
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "device_copy.fifo"))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["--copy-devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+
+    def test_write_devices_non_crash(self, shared_server):
+        """--write-devices writes into an existing device only; when the
+        destination holds no device node the entry is skipped safely and the
+        run still succeeds (never aborts)."""
+        self._setup()
+        # Destination already holds a regular file at the source FIFO's path:
+        # the receiver must not clobber it and must not crash.
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "target.fifo"))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["--write-devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
+    def test_devices_recreates_real_char_device(self, shared_server):
+        """Root-only: a source char device node is recreated on the destination
+        with the same type and rdev (privilege-gated mknod path)."""
+        self._setup()
+        src_dev = os.path.join(DEVICE_SOURCE, "realdev")
+        os.mknod(src_dev, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["--devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        st = os.lstat(os.path.join(received, "realdev"))
+        assert stat.S_ISCHR(st.st_mode)
+        assert os.major(st.st_rdev) == 1 and os.minor(st.st_rdev) == 3
+
+    def test_m_remove_source_files_keeps_recreated_fifo(self, shared_server):
+        """-m --remove-source-files --specials: a recreated FIFO must NOT be
+        acknowledged as a removable source (its outcome must not shift the
+        per-file status stream, which would break the run and mis-remove the
+        adjacent regular file).  The regular file is removed; the FIFO stays."""
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "pipe.fifo"))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["-m", "--remove-source-files", "--specials"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"Exit {result.returncode}: {result.stderr[:300]}"
+        )
+        assert not os.path.exists(os.path.join(DEVICE_SOURCE, "plain.txt")), (
+            "regular source file should have been removed"
+        )
+        assert os.path.exists(os.path.join(DEVICE_SOURCE, "pipe.fifo")), (
+            "recreated FIFO source must never be removed"
+        )
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
+    def test_m_remove_source_files_keeps_recreated_device(self, shared_server):
+        """Root-only: -m --remove-source-files --devices must not remove a
+        source device node the receiver recreated (mirrors the single-threaded
+        behavior; the special is never acknowledged as a removable source)."""
+        self._setup()
+        src_dev = os.path.join(DEVICE_SOURCE, "realdev")
+        os.mknod(src_dev, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["-m", "--remove-source-files", "--devices"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"Exit {result.returncode}: {result.stderr[:300]}"
+        )
+        assert not os.path.exists(os.path.join(DEVICE_SOURCE, "plain.txt")), (
+            "regular source file should have been removed"
+        )
+        assert os.path.exists(src_dev) and stat.S_ISCHR(os.lstat(src_dev).st_mode), (
+            "recreated device source must never be removed"
+        )
+
+    def test_write_devices_fifo_target_skips_not_hangs(self, shared_server):
+        """--write-devices must never block on a pre-existing FIFO at the
+        destination mirror: opening with O_NONBLOCK fails with ENXIO and the
+        entry is skipped (the FIFO is left untouched and the run succeeds)."""
+        self._setup()
+        # Pre-plant a FIFO at the destination mirror of the source file's path.
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        os.makedirs(received, exist_ok=True)
+        target = os.path.join(received, "plain.txt")
+        os.mkfifo(target)
+        result, dur = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                                 flags=["--write-devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        assert stat.S_ISFIFO(os.lstat(target).st_mode), "FIFO target was clobbered"
+        assert dur < 60, "write-devices hung on a FIFO target"
+
+    def test_special_confined_to_receive_root(self, shared_server):
+        """A special node is created only under the receive root; nothing is
+        ever materialized outside it (the receiver is confined to its
+        authorized root)."""
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "confined.fifo"))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["--specials"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        # The only new FIFO is under the receive tree; its sibling watchers
+        # confirm the confined dest layout (no stray node at the source root).
+        source_fifo_escaped = os.path.join(DEVICE_DEST, "confined.fifo")
+        assert not os.path.lexists(source_fifo_escaped), "special escaped the receive root"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        assert stat.S_ISFIFO(os.stat(os.path.join(received, "confined.fifo")).st_mode)
 
 
 @pytest.fixture(scope="module", autouse=True)

@@ -114,6 +114,9 @@ File* file_create(const char* path) {
   file->link_group = 0;
   file->link_first = false;
   file->hardlink_target = NULL;
+  file->is_special = false;
+  file->rdev_major = 0;
+  file->rdev_minor = 0;
   return file;
 }
 

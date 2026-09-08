@@ -56,6 +56,15 @@ typedef struct {
   int link_group;
   bool link_first;
   char* hardlink_target;
+  /* Phase 4 special/devices: when `is_special` is true this entry is a device
+   * or special node to be RECREATED on the destination (mknod/mkfifo) rather
+   * than written from `data`.  The concrete node kind is derived from the
+   * metadata mode's S_IFMT bits (receiver-validated), and rdev_major/minor
+   * carry the device major/minor numbers for char/block devices.  CROSSES the
+   * wire (protocol 2.13.0). */
+  bool is_special;
+  int32_t rdev_major;
+  int32_t rdev_minor;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

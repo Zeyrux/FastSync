@@ -90,7 +90,14 @@ enum NET_STATUS {
    * first (data-carrying) member's destination-relative wire path; the receiver
    * creates this entry as a hard link to the first member's installed file
    * (falling back to a byte-identical copy if link() fails).  Protocol 2.12.0. */
-  STATUS_HARDLINK
+  STATUS_HARDLINK,
+  /* --devices / --specials (-D): a device or special node the sender wants
+   * recreated (not written from content).  Payload: destination path, the
+   * metadata frame (whose mode's S_IFMT bits carry the node kind), and two
+   * int32 rdev major/minor fields.  The receiver validates the kind and rdev,
+   * confines the node below the receive root, and recreates it (mknod/mkfifo),
+   * privilege-gating the mknod.  Protocol 2.13.0. */
+  STATUS_SPECIAL
 };
 
 void io_set_fds(int read_fd, int write_fd);

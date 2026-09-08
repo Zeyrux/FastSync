@@ -772,8 +772,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--acls",
                                         "-X",
                                         "--xattrs",
-                                        "-D",
-                                        "--devices",
                                         "--delete-excluded",
                                         "--max-delete",
                                         "--prune-empty-dirs",
@@ -2346,6 +2344,52 @@ static void test_parse_args_omit_link_times_long() {
   config_delete(cfg);
 }
 
+/* --devices / --specials / -D / --copy-devices / --write-devices parse into the
+   config, and the preserved flags imply metadata transmission. */
+static void test_parse_args_devices_specials() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--devices", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_FALSE(cfg->preserve_specials);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--specials", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_FALSE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "-D", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv4[] = {"fastsync", "--copy-devices", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->copy_devices);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv5[] = {"fastsync", "--write-devices", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->write_devices);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -2356,6 +2400,7 @@ void test_client_cli() {
   test_parse_args_rejects_malformed_identity();
   test_parse_args_preallocate();
   test_parse_args_metadata_times();
+  test_parse_args_devices_specials();
   test_parse_args_atimes_long_and_short();
   test_parse_args_omit_link_times_long();
   test_parse_args_append();

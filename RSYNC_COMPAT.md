@@ -247,11 +247,11 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `-A`, `--acls` | Preserve ACLs | ❌ Not Implemented | Removed because it had no effect |
 | `-X`, `--xattrs` | Preserve extended attributes | ❌ Not Implemented | Removed because it had no effect |
 | `-H`, `--hard-links` | Preserve hard links | ✅ Implemented | Files on the source that share an inode (`st_dev`+`st_ino`, e.g. a `cp -al` tree) are re-created as hard links to one another on the destination, so duplicate links stay deduplicated and only the first member's data is sent (later members are transmitted as payload-less `STATUS_HARDLINK` frames). The receiver links each sibling to the first member's installed file with an atomic link + rename; on `link()` failure it falls back to a byte-identical local copy of the first member, never a partial/corrupt file. Requires the sequential scan for ordering (the first member is always emitted and installed before any sibling is linked). Works single-threaded and under `-m`, `--inplace`, `--delay-updates` (links staged and published by rename) and `--partial`. Crosses the wire (`preserve_hard_links` bool; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0**, peers must match). Incompatible with `-s` (chunk serialization) and `--append`/`--append-verify`, rejected up front with a distinct error. See the Phase-4 hard-links notes below |
-| `-D` | Same as --devices --specials | ❌ Not Implemented | Removed because device-file handling is not implemented |
-| `--devices` | Preserve device files | ❌ Not Implemented | Removed because it had no effect |
-| `--specials` | Preserve special files | ❌ Not Implemented | |
-| `--copy-devices` | Copy device contents as file | ❌ Not Implemented | |
-| `--write-devices` | Write to devices as files | ❌ Not Implemented | |
+| `-D` | Same as --devices --specials | ✅ Implemented | Implies `--devices --specials`. `-D` was unassigned in FastSync (verified: no collision), so it is free to imply both device-node and special-file preservation. See the `--devices`/`--specials` rows and the Phase-4 devices notes below |
+| `--devices` | Preserve device files | ⚠️ Partial | Recreates char/block device nodes on the destination via `mknod` instead of transferring content. Type + rdev are validated strictly (S_IFMT from the transmitted mode; major/minor range-checked, non-negative), and creation is **privilege-gated**: `mknod` needs `CAP_MKNOD`, so a non-root receiver (CI runs via setpriv as non-root) logs a warning and **skips the device entry safely** — the whole transfer never aborts just because the node could not be made. The node is created fd-relative below the receive root (`mknodat` on the confined secure parent), so it can never be placed outside the authorized root, never follows a symlink, and never replaces an existing directory. Only a char/block mode is honored. Crosses the wire (a new `STATUS_SPECIAL` frame carries the path + metadata mode + rdev; `PROTOCOL_VERSION` bumped **2.12.0 → 2.13.0**). Divergence: per-entry skip (not a hard error) when the receiver lacks `CAP_MKNOD`, documented in the Phase-4 devices notes |
+| `--specials` | Preserve special files | ⚠️ Partial | Recreates **FIFOs** on the destination via `mkfifo` (unprivileged, so this is a real, assertable behavior under CI). Sockets cannot be recreated by any standard filesystem call and are skipped with an explicit note (best-effort / unsupported, matching the plan). FIFO creation is privileged-gated only in the sense of graceful skip on any permission failure. Node creation is confined below the receive root (`mkfifoat` on the secure fd-relative parent; no `..`, no symlink follow). Crosses the wire like `--devices` (the `STATUS_SPECIAL` frame; `PROTOCOL_VERSION` bumped **2.12.0 → 2.13.0**). See the Phase-4 devices notes |
+| `--copy-devices` | Copy device contents as file | ⚠️ Partial | Copy a device's CONTENT into an ordinary regular file on the destination instead of recreating the node — non-privileged and safe. FastSync scans a device/FIFO as a regular file: its reported size (`st_size`, typically 0 for char devices and FIFOs) is copied, so a FIFO or a non-readable device becomes an empty (or size-bounded) regular file without ever blocking or reading unbounded pseudo-device streams. The run always succeeds and never crashes on such input. **Deliberate, safe divergence from rsync's dd-like unbounded device read.** See the Phase-4 devices notes |
+| `--write-devices` | Write to devices as files | ⚠️ Partial | Write the received data directly into an **existing** device node on the destination instead of creating a regular file. Restricted and best-effort: the destination must already exist and be a char/block device (opened only under the confined receive root, with `O_NOFOLLOW` + `O_NONBLOCK`); a missing, symlinked, FIFO-with-no-reader (`ENXIO`), non-device destination, or any write failure is **skipped with a warning** rather than allowed, so a run can never clobber the system, never blocks on a special-file target, and never aborts on an unusable target. See the Phase-4 devices notes |
 | `-U`, `--atimes` | Preserve access times | ✅ Implemented | Captures the source access time (from the scanner's pre-read stat, so it is not clobbered by reading the file for transfer) and transmits it over the wire; the receiver restores it together with the mtime via `futimens`/`utimensat`. Implies metadata transmission (the times travel inside the `-M` metadata payload), but does not enable ownership application (that stays opt-in via the identity flags). Wire: new `atime` fields on the metadata frame + a `preserve_atimes` config boolean; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0** |
 | `-N`, `--crtimes` | Preserve create times | ⚠️ Partial | Captures the source birth time via `statx(STATX_BTIME)` on Linux and transmits it (recorded as a wire field), but there is **no portable way to set a birth time** (`utimensat` can only set atime/mtime), so the receiver explicitly does NOT apply it: it logs a debug note and continues — never failing the transfer and never pretending it worked. On platforms without `statx` it parses as a documented no-op (flag accepted; nothing is captured). Implies metadata transmission. Wire: new `crtime` fields + a `preserve_crtimes` config boolean; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0** (see the Phase-4 metadata-time notes) |
 | `-O`, `--omit-dir-times` | Omit dirs from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never preserves directory mtimes in the first place (directories are created via `mkdir` with no metadata, a documented divergence under `-d`/recursive), so there is nothing for an "omit" to suppress. It never breaks a normal run |
@@ -391,6 +391,56 @@ is the `STATUS_HARDLINK` frame described above. Incompatibilities (rejected up
 front with a distinct error on the client, and re-checked on receive): `-H` with
 `-s` chunk serialization (the chunk wire has no per-file hard-link info) and `-H`
 with `--append`/`--append-verify` (a payload-less sibling cannot be tail-resumed).
+
+**Phase-4 devices notes:** `--devices`, `--specials`, `-D`, `--copy-devices`,
+and `--write-devices` are new. They change the wire: the config frame grows three
+booleans — `preserve_specials`, `copy_devices`, `write_devices` — that CROSS the
+wire (`preserve_devices` already existed), and a new `STATUS_SPECIAL` frame (used
+by `--devices`/`--specials`/`-D`) carries a special/device entry: the destination
+path, the metadata frame (whose mode's S_IFMT bits carry the node kind, requiring
+the flags to imply metadata transmission), and two int32 `rdev` major/minor
+fields. The chunk-serialized wire (`-s`) grows a matching per-file special
+marker + rdev so `--devices/--specials` also work under `-s`. `PROTOCOL_VERSION`
+was bumped **2.12.0 → 2.13.0** (peers must match, exactly as prior phases did).
+
+**Privilege gating (the crux):** making a device node requires `CAP_MKNOD` (root).
+CI runs the integration suite as a NON-ROOT user (via setpriv), so `mknod` fails
+with `EPERM`. The receiver treats this as a graceful, logged *skip of the entry*
+returned as a success/skip outcome — the whole transfer NEVER aborts just because
+the environment cannot create the node. `mkfifo` (FIFOs) is unprivileged, so
+`--specials` FIFO creation is a real, assertable behavior under CI; sockets cannot
+be recreated by any standard filesystem call and are skipped with an explicit
+note. The "device actually created" integration assertions are guarded to run
+only as root. User-facing expectation: point `--devices` at devices and a
+non-root receiver will faithfully skip them while transferring everything else.
+
+**Confinement & validation:** a special/device node is created with
+`mknodat`/`mkfifoat` on the parent directory opened fd-relative below the receive
+root (`file_open_secure_parent`: `O_NOFOLLOW`, no `..` components, root-checked),
+so a node can never be created outside the authorized destination root and never
+through a symlinked parent. The transmitted type is derived ONLY from the
+validated S_IFMT bits of the metadata mode (char/block/FIFO honored, socket
+skipped, regular/dir rejected as an invalid special), and the transmitted rdev is
+validated both on the wire (`file_receive_special`, `chunk_deserialize`) and at
+the creation site (`file_special_rdev_valid`): a negative, oversize, or
+non-device-carrying rdev is rejected outright (receiver aborts the frame), and a
+node is never replaced over an existing directory or unrelated entry (a matching
+existing node is left in place). `--write-devices` is the deliberately restricted
+danger path: it only ever opens an existing char/block node under the confined
+root, and every failure mode (missing, non-device, write error, EPERM) is a
+warning + skip, never a system-clobbering write or an abort.
+
+**Documented divergences (honest subset):**
+- A device entry the receiver cannot create (missing `CAP_MKNOD`) is *skipped*,
+  not a transfer failure — rsync under the same conditions would error.
+- `--copy-devices` copies the device's *reported size* (typically 0 for char
+  devices/FIFOs) into a regular file and never reads an unbounded pseudo-device;
+  this is the safe, non-hanging alternative to rsync's dd-like read.
+- `--write-devices` requires the device to already exist at the destination and
+  never creates it; unsupported/inaccessible targets are skipped, not written.
+- Ownership is not applied to recreated nodes (identity `fchown` needs an fd and
+  would require opening the node); permissions and mtime are applied at
+  creation / via `utimensat`.
 
 ## 9. Symlink Handling
 
