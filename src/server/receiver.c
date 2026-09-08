@@ -186,7 +186,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       File* file = file_receive_hardlink(file_descriptor);
       if (!file || !sink->store_file(file, sink->context))
         goto receive_error;
-} else if (status == STATUS_SYMLINK) {
+    } else if (status == STATUS_SYMLINK) {
       File* sym = file_receive_symlink(file_descriptor, config);
       if (!sym || !sink->store_file(sym, sink->context))
         goto receive_error;

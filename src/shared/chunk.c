@@ -135,7 +135,7 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
     memcpy(data_pointer, wire_path, path_len);
     data_pointer += path_len;
 
-int entry_type = file->is_dir ? 1 : (file->is_symlink ? 2 : (file->is_special ? 3 : 0));
+    int entry_type = file->is_dir ? 1 : (file->is_symlink ? 2 : (file->is_special ? 3 : 0));
     memcpy(data_pointer, &entry_type, sizeof(int));
     data_pointer += sizeof(int);
 

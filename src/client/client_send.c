@@ -1277,7 +1277,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       change_emit_file_sent(config, f);
       continue;
     }
-/* Symlink entry (-l / -k keep-as-symlink): only the target rides the wire. */
+    /* Symlink entry (-l / -k keep-as-symlink): only the target rides the wire. */
     if (f->is_symlink) {
       if (!send_symlink_entry(client, f, config))
         return -1;
