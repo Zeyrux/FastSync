@@ -6,6 +6,7 @@
 #include "delta.h"
 #include "file_list.h"
 #include "filter.h"
+#include "identity.h"
 #include "log.h"
 #include "protocol.h"
 #include "transport_tcp.h"
@@ -530,6 +531,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--from0", "-0", OPT_FLAG, offsetof(Config, from0)},
     {"--cvs-exclude", "-C", OPT_FLAG, offsetof(Config, cvs_exclude)},
     {"-F", NULL, OPT_FLAG, offsetof(Config, per_dir_filter)},
+    {"--numeric-ids", NULL, OPT_FLAG, offsetof(Config, numeric_ids)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -1108,6 +1110,42 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       if (set_basis_dest_option(config, BASIS_DEST_LINK, argv[++i], "--link-dest") != 0)
         return -1;
+    } else if (strncmp(argv[i], "--usermap=", 10) == 0) {
+      if (identity_parse_map(config, argv[i] + 10, false) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--usermap", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_map(config, argv[++i], false) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (strncmp(argv[i], "--groupmap=", 11) == 0) {
+      if (identity_parse_map(config, argv[i] + 11, true) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--groupmap", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_map(config, argv[++i], true) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (strncmp(argv[i], "--chown=", 8) == 0) {
+      if (identity_parse_chown(config, argv[i] + 8) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--chown", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_chown(config, argv[++i]) != 0)
+        return -1;
+      config->use_metadata = true;
     } else if (argv[i][0] == '-') {
       char* escaped = output_escape(argv[i], false);
       fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");

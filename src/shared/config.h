@@ -29,6 +29,17 @@ typedef struct BasisDest {
   char* path; /* relative to the destination root (receiver-confined) */
 } BasisDest;
 
+/* One resolved FROM:TO identity-mapping rule (--usermap / --groupmap).  Both
+ * fields are numeric ids.  IDENTITY_MATCH_ANY (-1) in `from` is rsync's '*'
+ * wildcard (matches any transmitted id); IDENTITY_CURRENT (-1) in `to` makes
+ * the receiver resolve the receiving process's own current euid/egid at apply
+ * time.  Names are resolved to numbers at parse time on the client (see
+ * identity.h for the exact subset). */
+typedef struct {
+  int32_t from;
+  int32_t to;
+} IdentityMap;
+
 typedef struct Config {
   char* version;
   char* send_directory;
@@ -252,15 +263,43 @@ typedef struct Config {
   int skip_compress_count;
   bool skip_compress_set;
 
+  // Issue #131: Identity mapping.  These configure whether and how the receiver
+  // applies ownership when it is actually preserved/applied.  ALL of them cross
+  // the wire (protocol 2.11.0) so the receiver resolves and applies ownership
+  // with the exact policy the client requested.  Plain -M/--preserve still does
+  // NOT apply ownership (FastSync's deliberate conservative default); it is
+  // only attempted when at least one of these is set (see identity.h).
+  /* --numeric-ids: no name lookup, use the transmitted numeric ids raw. */
+  bool numeric_ids;
+  /* --chown USER (owner) override; IDENTITY_CURRENT = the receiver's euid. */
+  bool chown_uid_set;
+  int32_t chown_uid;
+  /* --chown :GROUP (group) override; IDENTITY_CURRENT = the receiver's egid. */
+  bool chown_gid_set;
+  int32_t chown_gid;
+  /* --usermap / --groupmap entries, in order (first match wins). */
+  IdentityMap* usermap;
+  int usermap_count;
+  IdentityMap* groupmap;
+  int groupmap_count;
+
   // Receiver-side runtime staging registry for --delay-updates.  Never sent
   // over the wire and never set on the sender side.
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.10.0"
+#define PROTOCOL_VERSION "2.11.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
+
+/* Identity-mapping sentinels and bounds (see identity.h for semantics).
+ * IDENTITY_MATCH_ANY is a usermap/groupmap FROM '*' (matches any id);
+ * IDENTITY_CURRENT is a chown / map TO '*' (resolve to the receiver's current
+ * euid/egid at apply time). */
+#define IDENTITY_MATCH_ANY (-1)
+#define IDENTITY_CURRENT (-1)
+#define MAX_IDENTITY_MAP 128
 
 Config* config_create(void);
 void config_delete(Config* config);

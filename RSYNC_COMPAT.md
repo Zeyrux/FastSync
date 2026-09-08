@@ -259,11 +259,52 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `--super` | Receiver attempts super-user activities | ❌ Not Implemented | |
 | `--fake-super` | Store/recover privileged attrs via xattrs | ❌ Not Implemented | |
 | `--open-noatime` | Avoid changing access time when opening files | ❌ Not Implemented | |
-| `--numeric-ids` | Do not map uid/gid by name | ❌ Not Implemented | |
-| `--usermap=STRING` | Map usernames | ❌ Not Implemented | |
-| `--groupmap=STRING` | Map group names | ❌ Not Implemented | |
-| `--chown=USER:GROUP` | Map owner and group | ❌ Not Implemented | |
+| `--numeric-ids` | Do not map uid/gid by name | ✅ Implemented | Ownership is applied through FastSync's opt-in identity path (see the Phase-4 identity notes below). `--numeric-ids` is a mapping-policy modifier: when applying ownership it uses the transmitted numeric uid/gid directly, skipping the name lookup. Without an ownership-affecting option it is inert (FastSync only applies ownership when the user opts in). It does not need `-M` to be parsed, but ownership is only applied when metadata (hence the source uid/gid) is actually transmitted (see the notes) |
+| `--usermap=STRING` | Map usernames | ✅ Implemented | Opt-in ownership application. rsync subset implemented: comma-separated `FROM:TO` rules evaluated in order, first match wins; `FROM`/`TO` are group/user names (resolved on the SOURCE machine at parse time), `*` (FROM matches any id / TO = the receiving process's current euid), and an `@N` or bare `N` numeric id. Rules are carried over the wire as resolved numeric id pairs; the receiver applies a matching rule (else falls back to `--chown`, `--numeric-ids`, then a best-effort name lookup) via an fd-relative `fchown`. Malformed/unresolvable specs are rejected with a clear error, never a silent no-op. Implies metadata preservation so the source uid/gid travel. Only effective when the receiver can actually change ownership (root or membership); otherwise it warns and continues |
+| `--groupmap=STRING` | Map group names | ✅ Implemented | Same rsync subset and semantics as `--usermap` but for the group (gid) side and the group databases. See the Phase-4 identity notes |
+| `--chown=USER:GROUP` | Map owner and group | ✅ Implemented | Opt-in ownership override applied receiver-side. Forms: `USER:GROUP`, `USER` (owner only), `:GROUP` (group only); a `*` for USER/GROUP means the current/root user or group as appropriate; an `@N`/bare `N` numeric id is accepted. A `:` inside a name may be escaped as `\:`. Equivalent to a trailing `*:*` usermap+groupmap rule (so an explicit `--usermap`/`--groupmap` match wins). Malformed or unresolvable specs are clear parse errors. Implies metadata preservation. Only effective when the receiver has permission to chown; otherwise it warns and continues (rsync parity) |
 | `--copy-as=USER[:GROUP]` | Perform the copy as another user/group | ❌ Not Implemented | |
+
+**Phase-4 identity notes:** `--numeric-ids`, `--usermap`, `--groupmap`, and
+`--chown` are real. They introduce a **controlled, opt-in, privilege-gated**
+ownership-application path on the receiver: plain `-M`/`--preserve` still does
+NOT apply client-supplied ownership (FastSync's deliberate conservative
+default, byte-for-byte backward compatible); ownership is only attempted once a
+client explicitly requests an ownership-affecting option. Application goes
+through an fd-relative `fchown()` in the receiver's metadata-restore path (after
+the file is fully written, before timestamps are set), so it is confined and
+symlink-safe — never a path-based `chown`. When the receiver lacks permission
+(typically non-root, e.g. the CI `nobody` user) `EPERM`/`EACCES` is logged as a
+warning and the transfer CONTINUES with exit status success, matching rsync.
+A no-op default means existing transfers are unaffected.
+
+Resolution of the destination uid/gid on the receiver: a matching
+`--usermap`/`--groupmap` rule wins; else the matching `--chown` side; else, with
+`--numeric-ids`, the transmitted numeric id is used raw (no name lookup); else a
+best-effort name lookup on the receiver's own account databases (skipped when
+the transmitted id has no name present there). `--chown` enforces the receiver
+side and is validated at parse time (malformed specs are clear errors, never a
+silent no-op).
+
+Wire/version: the config frame gained `numeric_ids`, `chown_uid_set`,
+`chown_uid`, `chown_gid_set`, `chown_gid`, and the `usermap`/`groupmap` tables
+(count-delimited lists of resolved int32 FROM/TO id pairs), so
+`PROTOCOL_VERSION` was bumped **2.10.0 → 2.11.0** (peers must match). All new
+fields cross `config_send`/`config_receive` with full symmetry and are validated
+on receive (bounded map sizes below `MAX_IDENTITY_MAP`, ids `>=` the `-1`
+sentinels).
+
+Documented divergences from rsync: because FastSync transmits only numeric
+uid/gid (not names) on the wire, name-based values (`--usermap`/`--groupmap`
+names, `--chown` names) are resolved to numbers at CLI parse time against the
+**client (sender) machine's** account databases; this reproduces rsync's
+semantics on a shared-account source/destination and is documented for a
+genuinely different destination. The interesting named-value subset is
+supported (`*` FROM wildcard, `*` TO = current user, `@N`/bare-`N` numerics); a
+lone-`@` "use the FROM value unchanged" rsync form is not implemented. Also
+unlike rsync, plain `-M` never applies ownership and `--usermap`/`--groupmap`/
+`--chown` each imply metadata preservation so the source uid/gid actually travel
+(the flags only take effect where ownership is being preserved/applied).
 
 ## 9. Symlink Handling
 
