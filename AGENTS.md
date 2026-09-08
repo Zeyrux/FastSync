@@ -4,28 +4,28 @@ FastSync is a high-performance file synchronization system written in C11. It su
 
 ## Dependency installation
 
-**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v7`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest, openssh-client, and Node.js.
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v10`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest + pytest-xdist, openssh-client, and Node.js.
 
 **Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. The Docker image can also be used locally for CI parity.
 
 ```bash
 # Use the prebuilt CI image directly (faster, guaranteed CI parity)
-docker pull gitea.tap-tap.win/taptap/fastsync-ci:v7
-docker tag gitea.tap-tap.win/taptap/fastsync-ci:v7 fastsync-ci:local
+docker pull gitea.tap-tap.win/taptap/fastsync-ci:v10
+docker tag gitea.tap-tap.win/taptap/fastsync-ci:v10 fastsync-ci:local
 
 # Or build the image from the repo-root Dockerfile
-# (Note: the prebuilt :v7 image reflects the previous Dockerfile state;
+# (Note: the prebuilt :v10 image reflects the previous Dockerfile state;
 #  rebuild from source to pick up any newly added packages like lcov/valgrind.)
 docker build -t fastsync-ci:local .
 
 # Build, run unit tests, and run integration tests inside the container
 docker run --rm -v "$PWD:/workspace" -w /workspace fastsync-ci:local \
-  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/'
+  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=loadgroup'
 
 # Avoid root-owned build/ artifacts by matching your host UID/GID
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" \
   -w /workspace fastsync-ci:local \
-  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/'
+  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=loadgroup'
 ```
 
 > **Note:** The first `cmake configure` (`cmake -B build -S .`) fetches xxHash from GitHub via `FetchContent` — network access is required. Subsequent reconfigures reuse the cached source.
@@ -41,7 +41,7 @@ cmake -B build -S . -DSANITIZER=address           # AddressSanitizer (ASan)
 cmake -B build -S . -DSANITIZER=thread            # ThreadSanitizer (TSan)
 ```
 
-The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), build + test (unit + integration), and sanitizer (currently only `address`) jobs sequentially.
+The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4`). The full coverage jobs (full integration suite, sanitizer, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes.
 
 ## Build
 
@@ -53,7 +53,8 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 
 ```bash
 ./build/tests                # unit tests
-python3 -m pytest tests/     # integration tests
+python3 -m pytest tests/integration/ -n 4 --dist=loadgroup   # full integration suite
+python3 -m pytest tests/integration/ -n 4 --dist=loadgroup -m ci   # PR-gate subset only
 ```
 
 ## CI Workflow — Waiting for Results
@@ -65,14 +66,14 @@ When running the CI workflow via `tea` (the task execution agent), always set a 
 ### If lint (clang-format) fails
 Run clang-format in the CI Docker image to match the exact CI version:
 ```bash
-docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v9 \
+docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v10 \
   sh -c 'find src/ tests/ -name "*.c" -o -name "*.h" | xargs clang-format -i'
 ```
 
 ### If cppcheck fails
 Fix reported issues locally, then verify with:
 ```bash
-docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v9 \
+docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v10 \
   sh -c 'cppcheck --enable=warning,style,performance,portability --suppress=missingIncludeSystem --error-exitcode=1 --inline-suppr src/ tests/'
 ```
 

@@ -10,6 +10,8 @@ import os
 import random
 import shutil
 
+import pytest
+
 from common import (
     TEST_DATA_DIR,
     run_client, CountingProxy, clean_dir,
@@ -46,6 +48,7 @@ class TestAppend:
     def _dest_file(self, source, dest, rel):
         return os.path.join(get_dest_received_dir(dest, source), rel)
 
+    @pytest.mark.ci
     def test_append_resumes_short_dest_atomically(self, shared_server):
         """A shorter dest with a MATCHING prefix is resumed; the reconstructed
         file is byte-identical to the source."""

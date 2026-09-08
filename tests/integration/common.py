@@ -13,7 +13,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 SERVER_CMD = [os.path.join(BUILD_DIR, "server")]
 CLIENT_CMD = [os.path.join(BUILD_DIR, "client")]
-TEST_DATA_DIR = os.path.join(PROJECT_ROOT, "test_data")
+# Under pytest-xdist each worker process gets its own PYTEST_XDIST_WORKER id
+# ('gw0', 'gw1', ...).  Worker-key the transient working dir so concurrent
+# workers on the shared filesystem never collide on fixtures.  Outside xdist
+# (or with -n1) this stays the historical 'test_data' path.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
+TEST_DATA_DIR = os.path.join(PROJECT_ROOT, f"test_data-{_WORKER}" if _WORKER else "test_data")
 
 
 class ServerManager:

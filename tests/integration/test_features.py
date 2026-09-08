@@ -161,6 +161,7 @@ class TestRemoveSourceFiles:
 
 
 class TestArchiveMode:
+    @pytest.mark.ci
     def test_archive_mode(self, shared_server):
         clean_dir(DEST_DIR)
         result, dur = run_client(
@@ -191,6 +192,7 @@ class TestArchiveMode:
 
 
 class TestExecutability:
+    @pytest.mark.ci
     def test_preserves_only_executable_bits(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "executability_source")
         dest = os.path.join(TEST_DATA_DIR, "executability_dest")
@@ -211,6 +213,7 @@ class TestExecutability:
 
 
 class TestChmod:
+    @pytest.mark.ci
     def test_chmod_applies_to_transferred_files(self, shared_server):
         clean_dir(DEST_DIR)
         source_file = os.path.join(SOURCE_DIR, "small.txt")
@@ -227,6 +230,7 @@ class TestChmod:
 
 
 class TestCompressionChoice:
+    @pytest.mark.ci
     def test_zstd_choice_compresses(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--zc", "zstd"],
@@ -249,6 +253,7 @@ class TestCompressionChoice:
 
 
 class TestSkipCompress:
+    @pytest.mark.ci
     def test_skip_compress_case_insensitive(self, shared_server):
         clean_dir(DEST_DIR)
         with open(os.path.join(SOURCE_DIR, "skip-case.TXT"), "wb") as f:
@@ -393,6 +398,7 @@ class TestSizeFilters:
 
 
 class TestIncremental:
+    @pytest.mark.ci
     def test_incremental_skips_unchanged(self, shared_server):
         clean_dir(DEST_DIR)
         result, dur = run_client(
@@ -417,6 +423,7 @@ class TestIncremental:
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
 
+    @pytest.mark.ci
     def test_incremental_detects_changes(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(
@@ -692,6 +699,7 @@ class TestChecksumChoice:
 
 
 class TestUpdate:
+    @pytest.mark.ci
     def test_update_skips_older_destination_and_allows_equal_or_newer_source(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-u"], port=shared_server.port)
@@ -747,6 +755,7 @@ class TestUpdate:
 
 
 class TestExisting:
+    @pytest.mark.ci
     def test_existing_updates_existing_and_skips_new(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
@@ -829,6 +838,7 @@ class TestIgnoreExisting:
 
 
 class TestDelete:
+    @pytest.mark.ci
     def test_delete_removes_extra_files(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(
@@ -2413,6 +2423,7 @@ class TestDeleteTiming:
     @pytest.mark.parametrize("flag", ["--delete-before", "--delete-during", "--del",
                                       "--delete-after", "--delete-delay"])
     @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
     def test_flag_removes_extras_on_success(self, flag, mt):
         """Every timing flag is accepted, implies --delete, and on a successful
         transfer removes the destination extras exactly like plain --delete."""
@@ -3045,6 +3056,7 @@ class TestBasisDestDirs:
                 assert os.stat(dest_file).st_ino != os.stat(basis_file).st_ino, \
                     f"{flag}: linked/copied from a content-mismatched basis file"
 
+    @pytest.mark.ci
     def test_compare_dest_skips_matching_and_transfers_missing(self, shared_server):
         source = self._make_source("basis_compare_src", self._source_tree("c"))
         dest = os.path.join(TEST_DATA_DIR, "basis_compare_dst")
@@ -3286,6 +3298,7 @@ class TestBasisDestDirs:
         assert os.stat(os.path.join(received, "f.txt")).st_ino == os.stat(basis_file).st_ino, \
             "--size-only should link a basis file whose mtime differs"
 
+    @pytest.mark.ci
     def test_link_dest_ignore_times_never_links(self, shared_server):
         # -I/--ignore-times forces every file to be updated, so a basis dir is
         # never used to hard-link (rsync parity).  The file is transferred and
