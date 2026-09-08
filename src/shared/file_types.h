@@ -13,6 +13,18 @@ typedef struct {
   gid_t gid;
   time_t mtime_sec;
   long mtime_nsec;
+  /* Optional access time (-U/--atimes) and creation/birth time (-N/--crtimes),
+   * appended for protocol 2.12.0.  The SENDER sets the corresponding *_valid
+   * flag only when the preserve option is active (and, for crtime, only when
+   * the source platform exposed a birth time via statx STATX_BTIME).  The wire
+   * always carries the fields and the flags; a false flag tells the receiver to
+   * ignore the value. */
+  bool atime_valid;
+  time_t atime_sec;
+  long atime_nsec;
+  bool crtime_valid;
+  time_t crtime_sec;
+  long crtime_nsec;
 } FileMetadata;
 
 typedef struct {

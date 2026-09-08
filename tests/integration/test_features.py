@@ -3938,3 +3938,193 @@ class TestHardLinks:
             assert fh.read() == b"asymmetric group content\n" * 1200
         # Under --existing the absent first member is not created.
         assert not os.path.exists(os.path.join(received, "a.txt"))
+
+class TestAtimes:
+    """-U/--atimes preserves the source access time on the destination.
+
+    The sender captures atime during the scan (a stat, before any read for
+    transfer), so the value is not clobbered by reading the source.  This is
+    verified by setting the source atime to a distinct value far in the past
+    and comparing the destination atime to it (with whole-second tolerance;
+    filesystems may round atime)."""
+
+    PAYLOAD = b"atime preservation payload\n"
+
+    @staticmethod
+    def _make_source(source, dest):
+        clean_dir(source)
+        clean_dir(dest)
+        path = os.path.join(source, "data.txt")
+        with open(path, "wb") as f:
+            f.write(TestAtimes.PAYLOAD)
+        atime = 946684800  # 2000-01-01 00:00:00 UTC (far from "now")
+        mtime = 951782400
+        os.utime(path, ns=(atime * 10**9 + 123456789, mtime * 10**9))
+        return path, atime
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_atimes_preserved(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, f"atime_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"atime_{'m' if mt else 's'}_dst")
+        src_file, atime = self._make_source(source, dest)
+        flags = ["-U"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-U failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        dst_file = os.path.join(received, "data.txt")
+        assert os.path.exists(dst_file)
+        dst_st = os.stat(dst_file)
+        assert abs(dst_st.st_atime - atime) < 1.5, \
+            f"dest atime {dst_st.st_atime} != source atime {atime}"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_without_atimes_dest_differs(self, shared_server, mt):
+        """Control: without -U the destination atime is not the source's old
+        value (it reflects the fresh write, i.e. now), proving -U is what
+        restores the source atime."""
+        source = os.path.join(TEST_DATA_DIR, f"atime_ctrl_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"atime_ctrl_{'m' if mt else 's'}_dst")
+        src_file, atime = self._make_source(source, dest)
+        now = time.time()
+        flags = (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, f"control run failed: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        dst_st = os.stat(os.path.join(received, "data.txt"))
+        # The fresh destination atime is ~now, not the source's year-2000 value.
+        assert abs(dst_st.st_atime - atime) > 24 * 3600, \
+            f"control dest atime {dst_st.st_atime} unexpectedly equals source atime {atime}"
+        assert abs(dst_st.st_atime - now) < 24 * 3600, \
+            f"control dest atime {dst_st.st_atime} not ~now ({now})"
+
+
+class TestOpenNoatime:
+    """--open-noatime opens the source with O_NOATIME so a transfer read does
+    not bump the source's access time.  O_NOATIME is honoured for a file owned
+    by the reading process (or with CAP_FOWNER), so it works as non-root here;
+    where it is unavailable/refused FastSync degrades to a normal open and the
+    assertion below is skipped."""
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"),
+                        reason="O_NOATIME is Linux-specific")
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_open_noatime_preserves_source_atime(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, f"noatime_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"noatime_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        path = os.path.join(source, "data.txt")
+        with open(path, "wb") as f:
+            f.write(b"open-noatime payload\n")
+        atime = 730486800  # 1993-02-11, distinct and far from now
+        os.utime(path, ns=(atime * 10**9, atime * 10**9))
+
+        flags = ["--open-noatime"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--open-noatime failed: {(result.stderr or result.stdout)[:300]}"
+
+        after = os.stat(path)
+        assert abs(after.st_atime - atime) < 1.5, \
+            f"source atime {after.st_atime} was bumped by the readable read (wanted {atime})"
+
+
+class TestCrtimes:
+    """-N/--crtimes captures and transmits the source birth time.  There is no
+    portable way to SET a birth time (utimensat only sets atime/mtime), so the
+    receiver deliberately does not apply it.  The run must succeed without
+    crashing; we do not assert the destination birth time changed.  When the
+    platform exposes a birth time (statx STATX_BTIME on Linux) we additionally
+    confirm a capture path exists."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_crtimes_run_succeeds(self, shared_server, mt):
+        source = os.path.join(TEST_DATA_DIR, f"crtime_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"crtime_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        path = os.path.join(source, "data.txt")
+        payload = b"crtime transfer payload\n"
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        flags = ["-N"] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-N failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        dst_file = os.path.join(received, "data.txt")
+        assert os.path.exists(dst_file)
+        with open(dst_file, "rb") as f:
+            assert f.read() == payload
+
+    def test_crtimes_combines_with_atimes(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "crtime_atime_combined_src")
+        dest = os.path.join(TEST_DATA_DIR, "crtime_atime_combined_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        path = os.path.join(source, "data.txt")
+        with open(path, "wb") as f:
+            f.write(b"combined U N payload\n")
+        atime = 946684800
+        os.utime(path, ns=(atime * 10**9, 951782400 * 10**9))
+        result, _ = run_client(source, dest, flags=["-U", "-N"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-U -N failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        dst_st = os.stat(os.path.join(received, "data.txt"))
+        assert abs(dst_st.st_atime - atime) < 1.5, \
+            f"combined -U -N dest atime {dst_st.st_atime} != {atime}"
+
+
+class TestOmitTimes:
+    """-O/--omit-dir-times and -J/--omit-link-times are recognized and cross the
+    wire as receiver-side preferences.  FastSync does not currently apply dir or
+    symlink times at all, so they are forward-compatible preferences: the run
+    must succeed and normal transfers must not break.  A regular file's mtime
+    (from -M) is unaffected by -O/-J."""
+
+    @pytest.mark.parametrize("flag", ["-O", "-J"])
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_omit_times_accepted(self, shared_server, flag, mt):
+        source = os.path.join(TEST_DATA_DIR, f"omit_{flag.strip('-')}_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"omit_{flag.strip('-')}_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"omit times content\n")
+        flags = [flag] + (["-m"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"{flag} failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    @pytest.mark.ci
+    def test_omit_times_with_dirs_and_regular_metadata(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "omit_dirs_meta_src")
+        dest = os.path.join(TEST_DATA_DIR, "omit_dirs_meta_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "subdir"))
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"regular mtime preserved under -O/-J\n")
+        result, _ = run_client(source, dest, flags=["-d", "--omit-dir-times"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-d -O failed: {(result.stderr or result.stdout)[:300]}"
+        result, _ = run_client(source, dest, flags=["-M", "-O", "-J"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-M -O -J failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"

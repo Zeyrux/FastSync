@@ -596,7 +596,7 @@ static void test_file_metadata_create() {
   struct stat st;
   EXPECT_EQ_INT(stat("test_meta_file.txt", &st), 0);
 
-  FileMetadata* m = file_metadata_create(&st);
+  FileMetadata* m = file_metadata_create("test_meta_file.txt", &st, false, false);
   EXPECT_NOT_NULL(m);
   EXPECT_EQ_INT(m->mode, st.st_mode);
   EXPECT_EQ_INT(m->uid, st.st_uid);
@@ -712,7 +712,7 @@ static void test_file_send_single_calls_metadata_and_path() {
   file->data->data = malloc(len);
   EXPECT_NOT_NULL(file->data->data);
   memcpy(file->data->data, content, len);
-  file->metadata = file_metadata_create(&st);
+  file->metadata = file_metadata_create("test_meta_send.txt", &st, false, false);
   EXPECT_NOT_NULL(file->metadata);
 
   Config* cfg = config_create();
@@ -857,7 +857,7 @@ static void test_inplace_overwrite_metadata_strips_special_bits() {
   EXPECT_NOT_NULL(f->data->data);
   memcpy(f->data->data, new_content, strlen(new_content));
   f->data->size = strlen(new_content);
-  f->metadata = file_metadata_create(&source_st);
+  f->metadata = file_metadata_create(source, &source_st, false, false);
   EXPECT_NOT_NULL(f->metadata);
 
   Config* cfg = config_create();

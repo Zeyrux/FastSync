@@ -118,11 +118,11 @@ static void test_chunk_dir_entry_roundtrip() {
     dir->is_dir = true;
 
     if (use_metadata) {
-      reg->metadata = file_metadata_create(&st);
+      reg->metadata = file_metadata_create(file_path, &st, false, false);
       EXPECT_NOT_NULL(reg->metadata);
       struct stat dst;
       EXPECT_EQ_INT(stat(dir_path, &dst), 0);
-      dir->metadata = file_metadata_create(&dst);
+      dir->metadata = file_metadata_create(dir_path, &dst, false, false);
       EXPECT_NOT_NULL(dir->metadata);
     }
 

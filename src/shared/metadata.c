@@ -70,6 +70,24 @@ void metadata_to_buf(char** buf, const FileMetadata* m) {
   int64_t mtime_nsec = (int64_t)m->mtime_nsec;
   memcpy(*buf, &mtime_nsec, sizeof(mtime_nsec));
   *buf += sizeof(mtime_nsec);
+  int32_t atime_valid = m->atime_valid ? 1 : 0;
+  memcpy(*buf, &atime_valid, sizeof(atime_valid));
+  *buf += sizeof(atime_valid);
+  int64_t atime_sec = (int64_t)m->atime_sec;
+  memcpy(*buf, &atime_sec, sizeof(atime_sec));
+  *buf += sizeof(atime_sec);
+  int64_t atime_nsec = (int64_t)m->atime_nsec;
+  memcpy(*buf, &atime_nsec, sizeof(atime_nsec));
+  *buf += sizeof(atime_nsec);
+  int32_t crtime_valid = m->crtime_valid ? 1 : 0;
+  memcpy(*buf, &crtime_valid, sizeof(crtime_valid));
+  *buf += sizeof(crtime_valid);
+  int64_t crtime_sec = (int64_t)m->crtime_sec;
+  memcpy(*buf, &crtime_sec, sizeof(crtime_sec));
+  *buf += sizeof(crtime_sec);
+  int64_t crtime_nsec = (int64_t)m->crtime_nsec;
+  memcpy(*buf, &crtime_nsec, sizeof(crtime_nsec));
+  *buf += sizeof(crtime_nsec);
 }
 
 FileMetadata* metadata_from_buf(char** buf) {
@@ -103,8 +121,34 @@ FileMetadata* metadata_from_buf(char** buf) {
   memcpy(&mtime_nsec, *buf, sizeof(mtime_nsec));
   *buf += sizeof(mtime_nsec);
   m->mtime_nsec = (long)mtime_nsec;
+  int32_t atime_valid;
+  memcpy(&atime_valid, *buf, sizeof(atime_valid));
+  *buf += sizeof(atime_valid);
+  int64_t atime_sec;
+  memcpy(&atime_sec, *buf, sizeof(atime_sec));
+  *buf += sizeof(atime_sec);
+  int64_t atime_nsec;
+  memcpy(&atime_nsec, *buf, sizeof(atime_nsec));
+  *buf += sizeof(atime_nsec);
+  int32_t crtime_valid;
+  memcpy(&crtime_valid, *buf, sizeof(crtime_valid));
+  *buf += sizeof(crtime_valid);
+  int64_t crtime_sec;
+  memcpy(&crtime_sec, *buf, sizeof(crtime_sec));
+  *buf += sizeof(crtime_sec);
+  int64_t crtime_nsec;
+  memcpy(&crtime_nsec, *buf, sizeof(crtime_nsec));
+  *buf += sizeof(crtime_nsec);
+  m->atime_valid = atime_valid != 0;
+  m->atime_sec = (time_t)atime_sec;
+  m->atime_nsec = (long)atime_nsec;
+  m->crtime_valid = crtime_valid != 0;
+  m->crtime_sec = (time_t)crtime_sec;
+  m->crtime_nsec = (long)crtime_nsec;
   if (present != 1 || mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 ||
-      gid < 0) {
+      gid < 0 || atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
+      (atime_valid && (atime_nsec < 0 || atime_nsec >= 1000000000LL)) ||
+      (crtime_valid && (crtime_nsec < 0 || crtime_nsec >= 1000000000LL))) {
     free(m);
     return NULL;
   }
@@ -122,12 +166,24 @@ bool metadata_send(int file_descriptor, const FileMetadata* m) {
   int32_t gid = (int32_t)m->gid;
   int64_t mtime_sec = (int64_t)m->mtime_sec;
   int64_t mtime_nsec = (int64_t)m->mtime_nsec;
+  int32_t atime_valid = m->atime_valid ? 1 : 0;
+  int64_t atime_sec = (int64_t)m->atime_sec;
+  int64_t atime_nsec = (int64_t)m->atime_nsec;
+  int32_t crtime_valid = m->crtime_valid ? 1 : 0;
+  int64_t crtime_sec = (int64_t)m->crtime_sec;
+  int64_t crtime_nsec = (int64_t)m->crtime_nsec;
   return send_n_data(file_descriptor, &present, sizeof(present)) &&
          send_n_data(file_descriptor, &mode, sizeof(mode)) &&
          send_n_data(file_descriptor, &uid, sizeof(uid)) &&
          send_n_data(file_descriptor, &gid, sizeof(gid)) &&
          send_n_data(file_descriptor, &mtime_sec, sizeof(mtime_sec)) &&
-         send_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec));
+         send_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec)) &&
+         send_n_data(file_descriptor, &atime_valid, sizeof(atime_valid)) &&
+         send_n_data(file_descriptor, &atime_sec, sizeof(atime_sec)) &&
+         send_n_data(file_descriptor, &atime_nsec, sizeof(atime_nsec)) &&
+         send_n_data(file_descriptor, &crtime_valid, sizeof(crtime_valid)) &&
+         send_n_data(file_descriptor, &crtime_sec, sizeof(crtime_sec)) &&
+         send_n_data(file_descriptor, &crtime_nsec, sizeof(crtime_nsec));
 }
 
 FileMetadata* metadata_receive(int file_descriptor, int* ok) {
@@ -193,7 +249,58 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
     return NULL;
   }
   m->mtime_nsec = (long)mtime_nsec;
-  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0) {
+  int32_t atime_valid;
+  if (!receive_n_data(file_descriptor, &atime_valid, sizeof(atime_valid))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t atime_sec;
+  if (!receive_n_data(file_descriptor, &atime_sec, sizeof(atime_sec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t atime_nsec;
+  if (!receive_n_data(file_descriptor, &atime_nsec, sizeof(atime_nsec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int32_t crtime_valid;
+  if (!receive_n_data(file_descriptor, &crtime_valid, sizeof(crtime_valid))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t crtime_sec;
+  if (!receive_n_data(file_descriptor, &crtime_sec, sizeof(crtime_sec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t crtime_nsec;
+  if (!receive_n_data(file_descriptor, &crtime_nsec, sizeof(crtime_nsec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  m->atime_valid = atime_valid != 0;
+  m->atime_sec = (time_t)atime_sec;
+  m->atime_nsec = (long)atime_nsec;
+  m->crtime_valid = crtime_valid != 0;
+  m->crtime_sec = (time_t)crtime_sec;
+  m->crtime_nsec = (long)crtime_nsec;
+  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0 ||
+      atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
+      (atime_valid && (atime_nsec < 0 || atime_nsec >= 1000000000LL)) ||
+      (crtime_valid && (crtime_nsec < 0 || crtime_nsec >= 1000000000LL))) {
     free(m);
     if (ok)
       *ok = 0;
@@ -232,6 +339,16 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
   times[0].tv_nsec = UTIME_OMIT;
   times[1].tv_sec = metadata->mtime_sec;
   times[1].tv_nsec = metadata->mtime_nsec;
+  if (metadata->atime_valid) {
+    times[0].tv_sec = metadata->atime_sec;
+    times[0].tv_nsec = metadata->atime_nsec;
+  }
+  if (metadata->crtime_valid) {
+    log_message(LOG_LEVEL_DEBUG,
+                "crtime (birth time) %lld.%09ld transmitted for %s but not applied: no portable "
+                "setter exists",
+                (long long)metadata->crtime_sec, metadata->crtime_nsec, path);
+  }
   if (utimensat(AT_FDCWD, path, times, 0) != 0) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s",
@@ -261,6 +378,20 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
   identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid);
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
                               {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
+  if (metadata->atime_valid) {
+    times[0].tv_sec = metadata->atime_sec;
+    times[0].tv_nsec = metadata->atime_nsec;
+  }
+  /* --crtimes captures and transmits the source birth time, but there is no
+   * portable way to set a birth time (utimensat can only set atime/mtime), so
+   * the receiver deliberately does NOT apply it.  This is explicit, honest
+   * unsupported-attribute handling: log a debug note and continue — never fail
+   * the transfer and never pretend the crtime was applied. */
+  if (metadata->crtime_valid) {
+    log_message(LOG_LEVEL_DEBUG,
+                "crtime (birth time) %lld.%09ld transmitted but not applied: no portable setter",
+                (long long)metadata->crtime_sec, metadata->crtime_nsec);
+  }
   if (futimens(fd, times) != 0)
     ok = false;
   return ok;

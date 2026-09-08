@@ -4,6 +4,7 @@
 #include "compression.h"
 #include "config.h"
 #include "delta.h"
+#include "file.h"
 #include "file_list.h"
 #include "filter.h"
 #include "identity.h"
@@ -534,6 +535,11 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--cvs-exclude", "-C", OPT_FLAG, offsetof(Config, cvs_exclude)},
     {"-F", NULL, OPT_FLAG, offsetof(Config, per_dir_filter)},
     {"--numeric-ids", NULL, OPT_FLAG, offsetof(Config, numeric_ids)},
+    {"--atimes", "-U", OPT_FLAG, offsetof(Config, preserve_atimes)},
+    {"--crtimes", "-N", OPT_FLAG, offsetof(Config, preserve_crtimes)},
+    {"--omit-dir-times", "-O", OPT_FLAG, offsetof(Config, omit_dir_times)},
+    {"--omit-link-times", "-J", OPT_FLAG, offsetof(Config, omit_link_times)},
+    {"--open-noatime", NULL, OPT_FLAG, offsetof(Config, open_noatime)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -796,6 +802,14 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
          config. */
       if (entry->offset == offsetof(Config, delete_missing_args))
         config->ignore_missing_args = true;
+      /* -U/--atimes and -N/--crtimes carry their times inside the metadata
+         payload, which is only transmitted when use_metadata is set, so either
+         one implies metadata transmission.  This is FastSync's broad -M bundle
+         (mode/mtime travel too); it does NOT enable ownership application,
+         which stays opt-in via the identity flags. */
+      if (entry->offset == offsetof(Config, preserve_atimes) ||
+          entry->offset == offsetof(Config, preserve_crtimes))
+        config->use_metadata = true;
       continue;
     }
 
@@ -1340,6 +1354,10 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto cleanup;
   }
+
+  /* --open-noatime is a sender-side policy: install it for every source read
+     (scan + data path) without touching the receiver. */
+  file_set_open_noatime(config->open_noatime);
 
   /* Initialize TLS if needed */
   if (config->use_tls)

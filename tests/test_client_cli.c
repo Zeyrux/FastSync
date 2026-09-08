@@ -2298,6 +2298,54 @@ static void test_parse_args_preallocate() {
   config_delete(cfg);
 }
 
+/* Phase 4 metadata-time flags parse and set the expected config fields.  -U and
+ * -N imply metadata transmission (they carry their times inside the metadata
+ * payload); -O/-J and --open-noatime do not. */
+static void test_parse_args_metadata_times() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "-U", "-N", "-O", "-J", "--open-noatime", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 8, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_atimes);
+  EXPECT_TRUE(cfg->preserve_crtimes);
+  EXPECT_TRUE(cfg->omit_dir_times);
+  EXPECT_TRUE(cfg->omit_link_times);
+  EXPECT_TRUE(cfg->open_noatime);
+  /* -U/-N carry their times inside the metadata payload, so they imply it. */
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+static void test_parse_args_atimes_long_and_short() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--atimes", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_atimes);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+static void test_parse_args_omit_link_times_long() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--omit-link-times", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->omit_link_times);
+  EXPECT_FALSE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -2307,6 +2355,9 @@ void test_client_cli() {
   test_parse_args_chown();
   test_parse_args_rejects_malformed_identity();
   test_parse_args_preallocate();
+  test_parse_args_metadata_times();
+  test_parse_args_atimes_long_and_short();
+  test_parse_args_omit_link_times_long();
   test_parse_args_append();
   test_parse_args_append_verify();
   test_parse_args_append_both();

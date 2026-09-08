@@ -78,7 +78,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
     return false;
 
-  int fd = open(file->path, O_RDONLY);
+  int fd = file_open_for_read(file->path);
   if (fd == -1) {
     log_perror("Could not open file for sendfile");
     return false;

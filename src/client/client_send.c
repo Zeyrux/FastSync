@@ -87,6 +87,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
 
   ScannerOptions* options = &out->options;
   options->use_metadata = config->use_metadata;
+  options->preserve_atimes = config->preserve_atimes;
+  options->preserve_crtimes = config->preserve_crtimes;
   options->chunk_size = config->chunk_size;
   options->exclude_patterns = config->exclude_patterns;
   options->exclude_count = config->exclude_count;

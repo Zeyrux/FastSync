@@ -106,7 +106,7 @@ static void test_fuzz_metadata_from_buf() {
   struct stat st;
   EXPECT_EQ_INT(stat("fuzz_meta_test.txt", &st), 0);
 
-  FileMetadata* meta = file_metadata_create(&st);
+  FileMetadata* meta = file_metadata_create("fuzz_meta_test.txt", &st, false, false);
   EXPECT_NOT_NULL(meta);
   EXPECT_EQ_INT((int)meta->mode, (int)st.st_mode);
   EXPECT_EQ_INT((int)meta->mtime_sec, (int)st.st_mtime);

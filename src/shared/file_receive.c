@@ -1416,7 +1416,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
         if (materialized && basis.content) {
           materialized->data = basis.content;
           basis.content = NULL;
-          materialized->metadata = file_metadata_create(&basis.st);
+          materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
           materialized->skip = true; /* receiver must not ack this as a data file */
           if (basis.type == BASIS_DEST_LINK) {
             materialized->basis_link = basis.basis_path;

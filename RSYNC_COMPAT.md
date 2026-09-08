@@ -252,18 +252,69 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `--specials` | Preserve special files | ❌ Not Implemented | |
 | `--copy-devices` | Copy device contents as file | ❌ Not Implemented | |
 | `--write-devices` | Write to devices as files | ❌ Not Implemented | |
-| `-U`, `--atimes` | Preserve access times | ❌ Not Implemented | |
-| `-N`, `--crtimes` | Preserve create times | ❌ Not Implemented | |
-| `-O`, `--omit-dir-times` | Omit dirs from --times | ❌ Not Implemented | |
-| `-J`, `--omit-link-times` | Omit symlinks from --times | ❌ Not Implemented | |
+| `-U`, `--atimes` | Preserve access times | ✅ Implemented | Captures the source access time (from the scanner's pre-read stat, so it is not clobbered by reading the file for transfer) and transmits it over the wire; the receiver restores it together with the mtime via `futimens`/`utimensat`. Implies metadata transmission (the times travel inside the `-M` metadata payload), but does not enable ownership application (that stays opt-in via the identity flags). Wire: new `atime` fields on the metadata frame + a `preserve_atimes` config boolean; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0** |
+| `-N`, `--crtimes` | Preserve create times | ⚠️ Partial | Captures the source birth time via `statx(STATX_BTIME)` on Linux and transmits it (recorded as a wire field), but there is **no portable way to set a birth time** (`utimensat` can only set atime/mtime), so the receiver explicitly does NOT apply it: it logs a debug note and continues — never failing the transfer and never pretending it worked. On platforms without `statx` it parses as a documented no-op (flag accepted; nothing is captured). Implies metadata transmission. Wire: new `crtime` fields + a `preserve_crtimes` config boolean; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0** (see the Phase-4 metadata-time notes) |
+| `-O`, `--omit-dir-times` | Omit dirs from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never preserves directory mtimes in the first place (directories are created via `mkdir` with no metadata, a documented divergence under `-d`/recursive), so there is nothing for an "omit" to suppress. It never breaks a normal run |
+| `-J`, `--omit-link-times` | Omit symlinks from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never sets symlink times (`-l`/`--links` still only includes symlinks without transmitting a target; `--copy-links` dereferences), so there is nothing for an "omit" to suppress. It never breaks a normal run |
 | `--super` | Receiver attempts super-user activities | ❌ Not Implemented | |
 | `--fake-super` | Store/recover privileged attrs via xattrs | ❌ Not Implemented | |
-| `--open-noatime` | Avoid changing access time when opening files | ❌ Not Implemented | |
+| `--open-noatime` | Avoid changing access time when opening files | ✅ Implemented | Sender-side policy: the sender opens source files with `O_NOATIME` (Linux) when reading them for transfer, so the open/read does NOT bump the source's on-disk access time. Degrades safely when `O_NOATIME` is unavailable (not defined) or refused (`EPERM`, since it needs `CAP_FOWNER` or file ownership): the code falls back to a normal open, so the data always transfers — only the atime-bump is skipped. It does not itself capture/preserve atime; it only avoids modifying it. **Client-only, never crosses the wire.** Exposed as `file_open_for_read()` and applied to both the buffered data path and the sendfile path |
 | `--numeric-ids` | Do not map uid/gid by name | ✅ Implemented | Ownership is applied through FastSync's opt-in identity path (see the Phase-4 identity notes below). `--numeric-ids` is a mapping-policy modifier: when applying ownership it uses the transmitted numeric uid/gid directly, skipping the name lookup. Without an ownership-affecting option it is inert (FastSync only applies ownership when the user opts in). It does not need `-M` to be parsed, but ownership is only applied when metadata (hence the source uid/gid) is actually transmitted (see the notes) |
 | `--usermap=STRING` | Map usernames | ✅ Implemented | Opt-in ownership application. rsync subset implemented: comma-separated `FROM:TO` rules evaluated in order, first match wins; `FROM`/`TO` are group/user names (resolved on the SOURCE machine at parse time), `*` (FROM matches any id / TO = the receiving process's current euid), and an `@N` or bare `N` numeric id. Rules are carried over the wire as resolved numeric id pairs; the receiver applies a matching rule (else falls back to `--chown`, `--numeric-ids`, then a best-effort name lookup) via an fd-relative `fchown`. Malformed/unresolvable specs are rejected with a clear error, never a silent no-op. Implies metadata preservation so the source uid/gid travel. Only effective when the receiver can actually change ownership (root or membership); otherwise it warns and continues |
 | `--groupmap=STRING` | Map group names | ✅ Implemented | Same rsync subset and semantics as `--usermap` but for the group (gid) side and the group databases. See the Phase-4 identity notes |
 | `--chown=USER:GROUP` | Map owner and group | ✅ Implemented | Opt-in ownership override applied receiver-side. Forms: `USER:GROUP`, `USER` (owner only), `:GROUP` (group only); a `*` for USER/GROUP means the current/root user or group as appropriate; an `@N`/bare `N` numeric id is accepted. A `:` inside a name may be escaped as `\:`. Equivalent to a trailing `*:*` usermap+groupmap rule (so an explicit `--usermap`/`--groupmap` match wins). Malformed or unresolvable specs are clear parse errors. Implies metadata preservation. Only effective when the receiver has permission to chown; otherwise it warns and continues (rsync parity) |
 | `--copy-as=USER[:GROUP]` | Perform the copy as another user/group | ❌ Not Implemented | |
+
+**Phase-4 metadata-time notes:** `-U/--atimes`, `-N/--crtimes`,
+`-O/--omit-dir-times`, `-J/--omit-link-times`, and `--open-noatime` are new.
+They change the wire: the per-file metadata frame grows `atime_valid` +
+`atime_sec` + `atime_nsec` and `crtime_valid` + `crtime_sec` + `crtime_nsec`
+(appended after the existing mode/uid/gid/mtime fields, preserving the exact
+positions of every pre-existing field), and the config frame grows four
+booleans — `preserve_atimes`, `preserve_crtimes`, `omit_dir_times`,
+`omit_link_times` — that CROSS the wire so the receiver knows what to apply /
+suppress. `--open-noatime` is **client-only** and is never serialized (it only
+governs the sender's source reads). `PROTOCOL_VERSION` was bumped **2.11.0 →
+2.12.0** (peers must match, exactly as prior phases did).
+
+**Client-vs-wire split:** `-U` and `-N` affect both the sender (capture) and the
+receiver (apply), so they and their metadata fields cross the wire;
+`-O`/`-J` are receiver-side preferences and cross as config booleans;
+`--open-noatime` is purely a client/sender open flag and stays off the wire
+(mirroring the existing convention where `ignore_errors` is client-only while
+`force_delete` crosses the wire).
+
+**atime capture does not clobber the source atime:** the sender records the
+access time from the **same pre-read stat the scanner already took** (inside
+`file_metadata_create`), before any file data is read for transfer. So `-U`
+alone captures the correct atime even without `--open-noatime`. `--open-noatime`
+is orthogonal: it keeps the source's on-disk atime from being bumped by the read
+that actually ships the data (only honoured where `O_NOATIME` works; it degrades
+to a normal open otherwise, so the data always transfers).
+
+**crtime handling:** `-N` captures the source birth time via `statx`/`STATX_BTIME`
+(guarded `#ifdef STATX_BTIME` on Linux) and transmits it. On the receiver, **no
+portable setter exists** (`utimensat` can only set atime/mtime), so the receiver
+deliberately does **not** apply it: it logs a debug note and continues — it never
+fails the transfer and never pretends the crtime was applied. This is the
+explicit, documented unsupported-attribute handling. On platforms without
+`statx` the flag is accepted but nothing is captured (a documented no-op).
+
+**omit-dir-times / omit-link-times:** `-O` and `-J` are **accepted and parsed
+for CLI compatibility** and their config booleans cross the wire, but they are
+genuine **no-ops**: FastSync does not apply directory or symlink times at all
+(directories are made via `mkdir` with no metadata; symlinks are dereferenced
+or skipped, never written with a target), so there is nothing for an "omit" to
+suppress. They never break a normal run. This is documented as a
+divergence — the flags recognize the rsync interface but have no filtering
+effect in FastSync.
+
+**-U/-N and -M interaction:** because FastSync carries all metadata (mode, uid,
+gid, mtime, and now atime/crtime) in one bounded payload that is only sent when
+metadata transmission is on, `-U` and `-N` imply metadata transmission (the
+times travel inside that payload). They do **not** enable ownership application,
+which remains opt-in strictly through the identity flags (`--numeric-ids` /
+`--usermap` / `--groupmap` / `--chown`).
 
 **Phase-4 identity notes:** `--numeric-ids`, `--usermap`, `--groupmap`, and
 `--chown` are real. They introduce a **controlled, opt-in, privilege-gated**

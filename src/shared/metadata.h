@@ -15,6 +15,12 @@
  *   int32_t gid     (was gid_t,  platform-dependent)
  *   int64_t mtime_sec (was time_t, platform-dependent)
  *   int64_t mtime_nsec (was long,  platform-dependent)
+ *   int32_t atime_valid   (-U/--atimes; protocol 2.12.0)
+ *   int64_t atime_sec
+ *   int64_t atime_nsec
+ *   int32_t crtime_valid  (-N/--crtimes; protocol 2.12.0)
+ *   int64_t crtime_sec
+ *   int64_t crtime_nsec
  *
  * Prior to 2.0.0 the wire format used the raw platform-dependent types,
  * which broke compatiblity across different systems.  All fields are now
@@ -23,8 +29,8 @@
 
 /* Size of metadata fields on wire, excluding the int32_t `present` field that
  * is always sent first. The total wire size for present metadata is
- * sizeof(int32_t) + FILE_METADATA_WIRE_SIZE (32 bytes on most platforms). */
-#define FILE_METADATA_WIRE_SIZE (sizeof(int32_t) * 3 + sizeof(int64_t) * 2)
+ * sizeof(int32_t) + FILE_METADATA_WIRE_SIZE (68 bytes on most platforms). */
+#define FILE_METADATA_WIRE_SIZE (sizeof(int32_t) * 5 + sizeof(int64_t) * 6)
 
 void metadata_to_buf(char** buf, const FileMetadata* m);
 FileMetadata* metadata_from_buf(char** buf);
