@@ -226,6 +226,51 @@ class TestChmod:
         assert (os.stat(os.path.join(received, "small.txt")).st_mode & 0o777) == 0o644
 
 
+class TestPreallocate:
+    """--preallocate allocates the destination file space up front; the final
+    destination content must be byte-identical to a normal run."""
+
+    def test_preallocate_transfer_succeeds(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "prealloc_source")
+        dest = os.path.join(TEST_DATA_DIR, "prealloc_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        payload = os.urandom(2 * 1024 * 1024 + 137)
+        with open(os.path.join(source, "data.bin"), "wb") as f:
+            f.write(payload)
+        with open(os.path.join(source, "small.txt"), "wb") as f:
+            f.write(b"hello\n")
+
+        result, _ = run_client(source, dest, flags=["--preallocate"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--preallocate failed: {(result.stderr or result.stdout)[:400]}"
+
+        received_dir = os.path.join(dest, os.path.abspath(source).lstrip(os.sep))
+        data_path = os.path.join(received_dir, "data.bin")
+        assert os.path.isfile(data_path), f"destination file not created: {data_path}"
+        with open(data_path, "rb") as f:
+            assert f.read() == payload, "destination content mismatch"
+        small_path = os.path.join(received_dir, "small.txt")
+        with open(small_path, "rb") as f:
+            assert f.read() == b"hello\n", "small file content mismatch"
+
+    def test_preallocate_combines_with_partial(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "prealloc_partial_src")
+        dest = os.path.join(TEST_DATA_DIR, "prealloc_partial_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"partial + preallocate\n")
+        result, _ = run_client(source, dest, flags=["--preallocate", "--partial"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--preallocate --partial failed: {(result.stderr or result.stdout)[:400]}"
+        received_dir = os.path.join(dest, os.path.abspath(source).lstrip(os.sep))
+        with open(os.path.join(received_dir, "f.txt"), "rb") as f:
+            assert f.read() == b"partial + preallocate\n"
+
+
 class TestCompressionChoice:
     def test_zstd_choice_compresses(self, shared_server):
         clean_dir(DEST_DIR)

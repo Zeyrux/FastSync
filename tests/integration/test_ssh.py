@@ -137,3 +137,7 @@ class TestSSHFeatures:
         r = _run_ssh_test("SSH Exclude (--exclude small.txt)",
                           ["--exclude", "small.txt"], expected_missing=["small.txt"])
         assert r["status"] == "Success", r["error"]
+
+    def test_preallocate(self):
+        r = _run_ssh_test("SSH Preallocate (--preallocate)", ["--preallocate"])
+        assert r["status"] == "Success", r["error"]

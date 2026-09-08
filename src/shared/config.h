@@ -124,6 +124,11 @@ typedef struct Config {
   bool use_fsync;
   bool append;
   bool append_verify;
+  /* --preallocate: allocates the destination file's full expected space up
+   * front (before any data is written) so a transfer that would overflow disk
+   * fails fast at allocation time and the file is laid out contiguously,
+   * avoiding fragmentation.  Receiver-side, crosses the wire. */
+  bool preallocate;
 
   // Issue #128: Extended delete options
   /* --delete-excluded: also delete destination entries that were excluded on
@@ -257,7 +262,7 @@ typedef struct Config {
   DelayUpdatesContext* delay_context;
 } Config;
 
-#define PROTOCOL_VERSION "2.10.0"
+#define PROTOCOL_VERSION "2.11.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

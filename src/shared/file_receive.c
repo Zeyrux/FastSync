@@ -81,11 +81,12 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
   bool ok;
   if (file->basis_link) {
     ok = file_to_disk_secure_link(staged_path, file->basis_link, file->data->data, file->data->size,
-                                  metadata, preserve_executability, config->use_fsync, NULL);
+                                  config->preallocate, metadata, preserve_executability,
+                                  config->use_fsync, NULL);
   } else {
     ok = file_to_disk_secure_with_fsync(staged_path, file->data->data, file->data->size, false,
-                                        sparse, metadata, preserve_executability, config->use_fsync,
-                                        NULL);
+                                        sparse, config->preallocate, metadata,
+                                        preserve_executability, config->use_fsync, NULL);
   }
   if (!ok) {
     free(staged_path);
@@ -302,17 +303,20 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   bool ok;
   if (config && file->basis_link) {
     ok = file_to_disk_secure_link(disk_path, file->basis_link, file->data->data, file->data->size,
-                                  metadata, preserve_executability, config->use_fsync,
-                                  confined_temp);
+                                  config->preallocate, metadata, preserve_executability,
+                                  config->use_fsync, confined_temp);
   } else {
     ok = config && config->ignore_existing
              ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size, sparse,
-                                              metadata, preserve_executability, confined_temp)
+                                              config && config->preallocate, metadata,
+                                              preserve_executability, confined_temp)
          : config && config->update
              ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
-                                          sparse, metadata, preserve_executability, confined_temp)
+                                          sparse, config && config->preallocate, metadata,
+                                          preserve_executability, confined_temp)
              : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
-                                              inplace, sparse, metadata, preserve_executability,
+                                              inplace, sparse, config && config->preallocate,
+                                              metadata, preserve_executability,
                                               config && config->use_fsync, confined_temp);
   }
   free(confined_temp);
