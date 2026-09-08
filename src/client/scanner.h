@@ -4,6 +4,7 @@
 #include "chunk.h"
 #include "file_list.h"
 #include "filter.h"
+#include "hardlink.h"
 #include "protocol.h"
 #include "queue.h"
 #include <dirent.h>
@@ -64,6 +65,11 @@ typedef struct {
    * instead of failing (the --dirs generator is the only scanner path that
    * observes a listed-but-missing entry). */
   bool ignore_missing_args;
+  /* --hard-links (-H): shared, mutable (mutex-guarded) link-group detection
+   * table, NULL when -H is off.  Owned by the caller (client_send), shared
+   * read-only here; the parallel scanner passes it unchanged to every worker so
+   * one table detects every group across all subdirectories. */
+  HardLinkTable* hardlinks;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -124,6 +130,9 @@ typedef struct {
      --ignore-errors the scan continues past it and the caller decides what to
      do; `failed` is reserved for fatal errors that always abort the scan. */
   bool io_error;
+  /* --hard-links (-H): shared link-group detection table (see ScannerOptions).
+     NULL when -H is off. */
+  HardLinkTable* hardlinks;
 } DirectoryScanner;
 
 typedef struct {

@@ -165,6 +165,34 @@ static bool entry_passes_selection(const FileListSet* file_list, const FilterRul
   return true;
 }
 
+/* Apply --hard-links (-H) detection to one regular File.  On a sibling (a
+ * later member of an already-seen source inode) the File keeps the group id
+ * and the first member's wire path but carries NO data payload (size 0); the
+ * first member is left untouched (data present, link_first).  Allocation
+ * failure is fatal: the scanner is marked failed. */
+static void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* table, File* file,
+                                    const struct stat* stats) {
+  if (!table || !file || !stats)
+    return;
+  int gid;
+  bool is_first;
+  char* first_path = NULL;
+  if (!hardlink_table_assign(table, file_wire_path(file), stats->st_dev, stats->st_ino, &gid,
+                             &is_first, &first_path)) {
+    if (scanner)
+      scanner->failed = true;
+    return;
+  }
+  file->link_group = gid;
+  file->link_first = is_first;
+  if (!is_first) {
+    file->hardlink_target = first_path;
+    file->data->size = 0;
+  } else {
+    free(first_path);
+  }
+}
+
 /* Append `rel` to the caller's exclusion sink, taking `mtx` when shared across
    parallel worker threads.  Returns false on allocation failure (list left
    unchanged). */
@@ -356,6 +384,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->io_error = false;
   scanner->dirs_mode = options->dirs;
   scanner->relative_mode = options->relative && options->file_list != NULL;
+  scanner->hardlinks = options->hardlinks;
   scanner->prune_empty_dirs = options->prune_empty_dirs;
   scanner->dirs_root_emitted = false;
   scanner->list_index = 0;
@@ -892,6 +921,8 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         file->send_path = rel_copy;
         rel_copy = NULL;
       }
+      if (scanner->hardlinks && S_ISREG(stats.st_mode))
+        scanner_assign_hardlink(scanner, scanner->hardlinks, file, &stats);
       if (scanner->use_metadata)
         file->metadata = file_metadata_create(&stats);
       if (scanner->use_metadata && !file->metadata) {
@@ -1206,6 +1237,24 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   if (use_rel) {
     file->send_path = rel;
     rel = NULL;
+  }
+  if (options->hardlinks && S_ISREG(st.st_mode)) {
+    int gid;
+    bool is_first;
+    char* first_path = NULL;
+    if (!hardlink_table_assign((HardLinkTable*)options->hardlinks, file_wire_path(file), st.st_dev,
+                               st.st_ino, &gid, &is_first, &first_path)) {
+      ps->failed = true;
+    } else {
+      file->link_group = gid;
+      file->link_first = is_first;
+      if (!is_first) {
+        file->hardlink_target = first_path;
+        file->data->size = 0;
+      } else {
+        free(first_path);
+      }
+    }
   }
   if (options->use_metadata)
     file->metadata = file_metadata_create(&st);

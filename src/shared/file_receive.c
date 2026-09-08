@@ -102,6 +102,192 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
   return FILE_SAVE_WRITTEN;
 }
 
+/* Read the whole content of a confined regular file (used to fall back to a
+   byte-identical copy when a hard-link sibling's link() fails).  Symlink-safe
+   (parent resolved via file_open_secure_parent + O_NOFOLLOW).  A zero-length
+   file yields *out_size 0 and *out_buf NULL as a SUCCESS.  Returns false only
+   on a real error/read failure, setting *source_absent to true when the reason
+   was that the path does not exist (ENOENT/ENOTDIR), so the caller can decide
+   between an abort and a graceful skip. */
+static bool hardlink_read_source(const char* path, void** out_buf, unsigned long long* out_size,
+                                 bool* source_absent) {
+  *out_buf = NULL;
+  *out_size = 0;
+  *source_absent = false;
+  if (!path)
+    return false;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0) {
+    *source_absent = errno == ENOENT || errno == ENOTDIR;
+    return false;
+  }
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  int saved_errno = errno;
+  free(leaf);
+  close(parent_fd);
+  if (fd < 0) {
+    *source_absent = saved_errno == ENOENT || saved_errno == ENOTDIR;
+    return false;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(fd);
+    return false;
+  }
+  unsigned long long size = (unsigned long long)st.st_size;
+  if (size > MAX_RECEIVE_WHOLE_FILE_SIZE || size > SIZE_MAX) {
+    close(fd);
+    return false;
+  }
+  if (size == 0) {
+    close(fd);
+    return true;
+  }
+  void* buf = protocol_alloc((size_t)size);
+  if (!buf) {
+    close(fd);
+    return false;
+  }
+  size_t got = 0;
+  while (got < (size_t)size) {
+    ssize_t n = read(fd, (char*)buf + got, (size_t)size - got);
+    if (n <= 0) {
+      free(buf);
+      close(fd);
+      return false;
+    }
+    got += (size_t)n;
+  }
+  close(fd);
+  *out_buf = buf;
+  *out_size = size;
+  return true;
+}
+
+/* The group's first member's installed file is absent, but its destination
+   path was validated (a sibling is only ever processed after its group's first
+   member).  When the sibling's OWN destination already exists it should be
+   left alone -- a clean skip -- rather than aborting the whole transfer (the
+   asymmetric --existing case: the first member was skipped because its
+   destination was missing, while the sibling already has one).  Only when the
+   sibling's destination is missing too is this a genuine failure to
+   link/copy, which aborts. */
+static FileSaveResult hardlink_sibling_absent_first(const char* destination_path) {
+  if (destination_path && file_path_exists_secure(destination_path))
+    return FILE_SAVE_SKIPPED;
+  return FILE_SAVE_ERROR;
+}
+
+/* Install a --hard-links/-H sibling: the destination entry is atomically
+   replaced (temp + rename) with a hard link to the group's first member.  The
+   first member is guaranteed already installed at `hardlink_target` under the
+   root because -H relies on the receiver's single-FIFO-writer pipeline (one
+   receive thread, one write thread, FIFO queue => wire order == write order)
+   plus the sender's forced sequential scan, so a sibling is always processed
+   after its group's first member.  When link() fails (different filesystem,
+   filesystem refuses links) a byte-identical copy of the first member is
+   written instead, so the result is never partial or corrupt.  With
+   --delay-updates the sibling is staged as a hard link to the first member's
+   STAGED file (publication's renames preserve the shared inode).  The final
+   --existing/--ignore-existing/--update policies are decided against the final
+   destination like every normal write. */
+static FileSaveResult file_save_hardlink_sibling(const char* root_directory, const File* file,
+                                                 const Config* config) {
+  Config* cfg = (Config*)config;
+  if (!root_directory || !file || !file->path || !file->hardlink_target)
+    return FILE_SAVE_ERROR;
+  char* destination_path = path_cat(root_directory, file->path);
+  if (!destination_path)
+    return FILE_SAVE_ERROR;
+
+  if (cfg->existing && !file_path_exists_secure(destination_path)) {
+    free(destination_path);
+    return FILE_SAVE_SKIPPED;
+  }
+  if (cfg->ignore_existing && file_path_exists_secure(destination_path)) {
+    free(destination_path);
+    return FILE_SAVE_SKIPPED;
+  }
+  if (cfg->update && file_destination_is_newer_secure(destination_path, file->metadata)) {
+    free(destination_path);
+    return FILE_SAVE_SKIPPED;
+  }
+
+  bool preallocate = cfg && cfg->preallocate;
+  bool preserve_executability = cfg && cfg->use_executability;
+  bool use_fsync = cfg && cfg->use_fsync;
+
+  if (cfg->delay_updates) {
+    if (!cfg->delay_context) {
+      cfg->delay_context = delay_updates_context_create(root_directory);
+      if (!cfg->delay_context) {
+        free(destination_path);
+        return FILE_SAVE_ERROR;
+      }
+    }
+    if (!delay_updates_prepare(cfg->delay_context)) {
+      free(destination_path);
+      return FILE_SAVE_ERROR;
+    }
+    char* staged_first = path_cat(cfg->delay_context->staging_root, file->hardlink_target);
+    char* staged_sibling = path_cat(cfg->delay_context->staging_root, file->path);
+    if (!staged_first || !staged_sibling) {
+      free(staged_first);
+      free(staged_sibling);
+      free(destination_path);
+      return FILE_SAVE_ERROR;
+    }
+    void* content = NULL;
+    unsigned long long content_size = 0;
+    bool source_absent = false;
+    if (!hardlink_read_source(staged_first, &content, &content_size, &source_absent)) {
+      FileSaveResult absent_result =
+          source_absent ? hardlink_sibling_absent_first(destination_path) : FILE_SAVE_ERROR;
+      free(staged_first);
+      free(staged_sibling);
+      free(destination_path);
+      return absent_result;
+    }
+    bool ok =
+        file_to_disk_secure_link(staged_sibling, staged_first, content, content_size, preallocate,
+                                 file->metadata, preserve_executability, use_fsync, NULL);
+    free(content);
+    if (ok)
+      ok = delay_updates_record(cfg->delay_context, staged_sibling, destination_path, file->path);
+    if (!ok)
+      unlink(staged_sibling);
+    free(staged_first);
+    free(staged_sibling);
+    free(destination_path);
+    return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
+  }
+
+  char* first_disk = path_cat(root_directory, file->hardlink_target);
+  if (!first_disk) {
+    free(destination_path);
+    return FILE_SAVE_ERROR;
+  }
+  void* content = NULL;
+  unsigned long long content_size = 0;
+  bool source_absent = false;
+  if (!hardlink_read_source(first_disk, &content, &content_size, &source_absent)) {
+    FileSaveResult absent_result =
+        source_absent ? hardlink_sibling_absent_first(destination_path) : FILE_SAVE_ERROR;
+    free(first_disk);
+    free(destination_path);
+    return absent_result;
+  }
+  const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
+  bool ok =
+      file_to_disk_secure_link(destination_path, first_disk, content, content_size, preallocate,
+                               file->metadata, preserve_executability, use_fsync, temp_dir);
+  free(content);
+  free(first_disk);
+  free(destination_path);
+  return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
+}
+
 FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
                                       const Config* config) {
   /* Backups are incompatible with ignore-existing: moving the entry first
@@ -144,6 +330,14 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     bool ok = file_ensure_directory_secure(dir_path);
     free(dir_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
+  }
+
+  /* --hard-links/-H sibling: a later member of a link group arrives with no
+     payload and is installed as a hard link to (or, on link() failure, a
+     byte-identical copy of) the group's first member.  Handled entirely here,
+     before the normal data-write paths (which would create an empty file). */
+  if (file->link_group != 0 && !file->link_first && file->hardlink_target != NULL) {
+    return file_save_hardlink_sibling(root_directory, file, config);
   }
 
   /* These options arrive from the client.  They are names below the server
@@ -1619,6 +1813,58 @@ File* file_receive_directory(int file_descriptor) {
   if (file == NULL)
     return NULL;
   file->is_dir = true;
+  return file;
+}
+
+/* Receive a --hard-links/-H sibling frame (the leading STATUS_HARDLINK code has
+   already been consumed): the destination path, the run-local link-group id,
+   and the first (data-carrying) member's destination-relative wire path.  The
+   created File carries no payload; it is installed beneath the receive root as
+   a hard link to (or, on link failure, a byte-identical copy of) the first
+   member.  All paths are validated like every other received path (non-empty,
+   relative, no traversal). */
+File* file_receive_hardlink(int file_descriptor) {
+  char* path = receive_str(file_descriptor);
+  if (path == NULL)
+    return NULL;
+  if (path[0] == '\0' || has_path_traversal(path)) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received hard-link path: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  int gid;
+  if (!receive_int(file_descriptor, &gid) || gid <= 0) {
+    free(path);
+    return NULL;
+  }
+  char* target = receive_str(file_descriptor);
+  if (!target) {
+    free(path);
+    return NULL;
+  }
+  if (target[0] == '\0' || has_path_traversal(target)) {
+    char* escaped = output_escape(target, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid hard-link target path: %s",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    free(target);
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  File* file = file_create(path);
+  free(path);
+  if (file == NULL) {
+    free(target);
+    return NULL;
+  }
+  file->link_group = gid;
+  file->link_first = false;
+  file->hardlink_target = target;
   return file;
 }
 

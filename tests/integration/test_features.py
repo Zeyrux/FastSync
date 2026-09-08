@@ -3826,3 +3826,115 @@ class TestIdentityMapping:
         st = os.stat(dst_file)
         assert st.st_uid == 12345 and st.st_gid == 54321, \
             f"--chown not applied: uid={st.st_uid} gid={st.st_gid}"
+
+
+class TestHardLinks:
+    """-H/--hard-links: source files sharing an inode are re-created as hard
+    links to one another on the destination (dedup preserved, first copy
+    transferred once, the rest linked/copied). No root required."""
+
+    STAGING = ".fastsync-stage"
+
+    def _make_source(self, name):
+        src = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(src)
+        with open(os.path.join(src, "a.txt"), "wb") as fh:
+            fh.write(b"shared content\n" * 2000)
+        os.link(os.path.join(src, "a.txt"), os.path.join(src, "b.txt"))
+        with open(os.path.join(src, "c.txt"), "wb") as fh:
+            fh.write(b"independent content\n" * 2000)
+        return src
+
+    @pytest.mark.parametrize("flags", [[], ["-m"], ["--delay-updates"]])
+    def test_hard_links_preserved(self, shared_server, flags):
+        src = self._make_source("hl_src")
+        dest = os.path.join(TEST_DATA_DIR, "hl_dst")
+        clean_dir(dest)
+        result, _ = run_client(src, dest, flags=["-H"] + flags, port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, src)
+        a = os.path.join(received, "a.txt")
+        b = os.path.join(received, "b.txt")
+        c = os.path.join(received, "c.txt")
+        assert os.path.isfile(a) and os.path.isfile(b) and os.path.isfile(c), \
+            "all three destination files exist"
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            assert fa.read() == fb.read(), "hard-linked pair content matches"
+        assert os.stat(a).st_ino == os.stat(b).st_ino, \
+            "source hard links were not preserved on the destination"
+        assert os.stat(a).st_ino != os.stat(c).st_ino, \
+            "independent files were incorrectly hard linked"
+        with open(a, "rb") as fa, open(c, "rb") as fc:
+            assert fa.read() != fc.read(), "independent files must differ in content"
+        assert not os.path.isdir(os.path.join(dest, self.STAGING)), \
+            "--delay-updates left a staging tree behind"
+
+    def test_hard_links_rejects_chunk_serialization(self, shared_server):
+        src = self._make_source("hl_reject_src")
+        dest = os.path.join(TEST_DATA_DIR, "hl_reject_dst")
+        clean_dir(dest)
+        result, _ = run_client(src, dest, flags=["-H", "-s"], port=shared_server.port)
+        assert result.returncode != 0, "-H with -s was accepted"
+
+    def test_hard_links_rejects_append(self, shared_server):
+        src = self._make_source("hl_reject_app_src")
+        dest = os.path.join(TEST_DATA_DIR, "hl_reject_app_dst")
+        clean_dir(dest)
+        result, _ = run_client(src, dest, flags=["-H", "--append"], port=shared_server.port)
+        assert result.returncode != 0, "-H with --append was accepted"
+
+    def test_hard_links_link_to_existing_first_member(self, shared_server):
+        """A sibling whose first member is already up-to-date at the destination
+        must still be created as a hard link to that existing file."""
+        src = os.path.join(TEST_DATA_DIR, "hl_exist_src")
+        dest = os.path.join(TEST_DATA_DIR, "hl_exist_dst")
+        clean_dir(src)
+        clean_dir(dest)
+        with open(os.path.join(src, "a.txt"), "wb") as fh:
+            fh.write(b"seed content\n" * 1500)
+        result, _ = run_client(src, dest, port=shared_server.port)
+        assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+        # Introduce a hard-link sibling to the already-transferred first member.
+        os.link(os.path.join(src, "a.txt"), os.path.join(src, "b.txt"))
+        result, _ = run_client(src, dest, flags=["-H"], port=shared_server.port)
+        assert result.returncode == 0, f"-H sync failed: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, src)
+        a = os.path.join(received, "a.txt")
+        b = os.path.join(received, "b.txt")
+        assert os.path.isfile(a) and os.path.isfile(b)
+        assert os.stat(a).st_ino == os.stat(b).st_ino, \
+            "new sibling was not linked to the existing first member"
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            assert fa.read() == fb.read()
+
+    def test_hard_links_existing_asymmetric_group(self, shared_server):
+        """-H --existing with an asymmetric link group must succeed: when the
+        first member's destination is absent (so it is skipped by --existing)
+        but a sibling's destination already exists, the existing sibling is left
+        in place instead of the whole transfer aborting on the absent first
+        member."""
+        src = os.path.join(TEST_DATA_DIR, "hl_existing_src")
+        dest = os.path.join(TEST_DATA_DIR, "hl_existing_dst")
+        clean_dir(src)
+        clean_dir(dest)
+        with open(os.path.join(src, "a.txt"), "wb") as fh:
+            fh.write(b"asymmetric group content\n" * 1200)
+        # b.txt is a hard-link sibling of a.txt on the source.
+        os.link(os.path.join(src, "a.txt"), os.path.join(src, "b.txt"))
+        with open(os.path.join(src, "c.txt"), "wb") as fh:
+            fh.write(b"independent\n" * 1200)
+        # Pre-seed the destination with ONLY the sibling's file (the first
+        # member has no destination entry).
+        received = get_dest_received_dir(dest, src)
+        os.makedirs(received, exist_ok=True)
+        with open(os.path.join(received, "b.txt"), "wb") as fh:
+            fh.write(b"asymmetric group content\n" * 1200)
+        result, _ = run_client(src, dest, flags=["-H", "--existing"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-H --existing asymmetric group failed: {result.stderr[:300]}"
+        # The existing sibling was preserved and its content is intact.
+        with open(os.path.join(received, "b.txt"), "rb") as fh:
+            assert fh.read() == b"asymmetric group content\n" * 1200
+        # Under --existing the absent first member is not created.
+        assert not os.path.exists(os.path.join(received, "a.txt"))

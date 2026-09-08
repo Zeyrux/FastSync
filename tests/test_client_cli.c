@@ -768,8 +768,6 @@ static void test_parse_args_delete_timing_without_delete_rejected() {
 static void test_parse_args_rejects_unimplemented_options() {
   static const char* const options[] = {"--silent",
                                         "--queue-size",
-                                        "-H",
-                                        "--hard-links",
                                         "-A",
                                         "--acls",
                                         "-X",
@@ -842,6 +840,52 @@ static void test_parse_args_update() {
   EXPECT_TRUE(cfg->use_metadata);
   EXPECT_EQ_INT(positional_count, 2);
 
+  config_delete(cfg);
+}
+
+static void test_parse_args_hard_links() {
+  Config* cfg = config_create();
+  char* argv_H[] = {"fastsync", "-H", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_H, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_hard_links);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_long[] = {"fastsync", "--hard-links", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_hard_links);
+  config_delete(cfg);
+
+  /* --no-hard-links clears the flag. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_neg[] = {"fastsync", "--hard-links", "--no-hard-links", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_neg, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->preserve_hard_links);
+  config_delete(cfg);
+}
+
+/* -H/--hard-links violates the per-file streaming requirement of -s and the
+ * payload-bearing tail-resume of --append: both combos are rejected up front. */
+static void test_validate_config_hard_links_incompatible_modes() {
+  Config* cfg = config_create();
+  char* argv_s[] = {"fastsync", "-H", "-s", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_s, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_hard_links);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_append[] = {"fastsync", "-H", "--append", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_append, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_hard_links);
+  EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
 
@@ -2314,6 +2358,8 @@ void test_client_cli() {
   test_parse_args_rejects_unimplemented_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();
+  test_parse_args_hard_links();
+  test_validate_config_hard_links_incompatible_modes();
   test_parse_args_update();
   test_parse_args_info_flags();
   test_parse_args_info_verbose_order();

@@ -9,6 +9,7 @@
 #include "file.h"
 #include "file_list.h"
 #include "filter.h"
+#include "hardlink.h"
 #include "metadata.h"
 #include "log.h"
 #include "multiprocessing.h"
@@ -44,10 +45,13 @@ static const char* display_bytes(unsigned long long bytes, bool human_readable, 
 
 /* Compiled scanner inputs that are shared read-only across scanner instances
  * and, in -m mode, across worker threads. `base_filters` owns the compiled
- * command-line + -C rules; the FileListSet allow-set lives in the Config. */
+ * command-line + -C rules; the FileListSet allow-set lives in the Config.
+ * `hardlinks` owns the --hard-links/-H link-group detection table (NULL when
+ * off) and is shared (mutex-guarded) across every scanner/worker of one scan. */
 typedef struct {
   ScannerOptions options;
   FilterRuleList* base_filters; /* owned; may be NULL */
+  HardLinkTable* hardlinks;     /* owned; may be NULL */
 } PreparedScanner;
 
 /* Build the scanner options for one scan. Returns false and logs on failure. */
@@ -55,6 +59,7 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   if (!out)
     return false;
   out->base_filters = NULL;
+  out->hardlinks = NULL;
   memset(&out->options, 0, sizeof(out->options));
 
   int rule_count = config->filters ? config->filters->size : 0;
@@ -107,6 +112,16 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
+  options->hardlinks = NULL;
+  if (config->preserve_hard_links) {
+    out->hardlinks = hardlink_table_create();
+    if (!out->hardlinks) {
+      filter_rule_list_free(out->base_filters);
+      out->base_filters = NULL;
+      return false;
+    }
+    options->hardlinks = out->hardlinks;
+  }
   return true;
 }
 
@@ -115,6 +130,8 @@ static void prepared_scanner_destroy(PreparedScanner* prepared) {
     return;
   filter_rule_list_free(prepared->base_filters);
   prepared->base_filters = NULL;
+  hardlink_table_destroy(prepared->hardlinks);
+  prepared->hardlinks = NULL;
 }
 
 /* True when some --files-from entry is an ancestor-or-equal directory of
@@ -1216,6 +1233,19 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       change_emit_dir_sent(config, f);
       continue;
     }
+    /* --hard-links/-H sibling: a later member of a hard-link group that has no
+       data (its payload lives in the first member).  Transmit a dedicated
+       STATUS_HARDLINK frame carrying the first member's destination-relative
+       wire path so the receiver links this entry to that installed file. */
+    if (f->link_group != 0 && !f->link_first && f->hardlink_target != NULL) {
+      if (!send_status(client->file_descriptor, STATUS_HARDLINK) ||
+          !send_str(client->file_descriptor, file_wire_path(f)) ||
+          !send_int(client->file_descriptor, f->link_group) ||
+          !send_str(client->file_descriptor, f->hardlink_target))
+        return -1;
+      change_emit_file_sent(config, f);
+      continue;
+    }
     bool stream = f->data->data == NULL && f->data->size > 0;
     bool use_sendfile =
         (config->use_sendfile && !config->use_compression) || (stream && !config->use_compression);
@@ -1385,9 +1415,18 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   if (!context->early_delete)
     prepared.options.excluded_paths = context->excluded_paths;
   bool dirs_mode = prepared.options.dirs;
+  /* -H also selects the sequential scanner (see the comment at the branch),
+   * so the loop below must choose the scanner by which object exists, not by
+   * --dirs alone. */
+  bool use_dscanner = dirs_mode || prepared.options.hardlinks;
   DirectoryScanner* dscanner = NULL;
   ParallelScanner* scanner = NULL;
-  if (dirs_mode) {
+  /* --hard-links/-H forces the sequential scanner even in -m mode: a hard-link
+     group's first member must be emitted before any of its siblings so the
+     receiver always links to an already-installed first member.  The parallel
+     scanner hands different subdirectories to different worker threads, which
+     can reorder a group whose members span directories. */
+  if (use_dscanner) {
     dscanner =
         directory_scanner_create_with_options(context->config->send_directory, &prepared.options);
   } else {
@@ -1404,12 +1443,12 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   bool failed = false;
   Chunk* current_chunk;
   while (1) {
-    if (dirs_mode)
+    if (use_dscanner)
       current_chunk = directory_scanner_next(dscanner);
     else
       current_chunk = parallel_scanner_next(scanner);
     if (current_chunk == NULL) {
-      failed = dirs_mode ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
+      failed = use_dscanner ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
       break;
     }
     if (context->config->use_delete && !context->early_delete) {
@@ -1434,9 +1473,9 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   /* Capture the scanner results BEFORE destroying the scanner objects (the
      io_error flag lives on the scanner, so reading it after destroy would be a
      use-after-free). */
-  bool had_io =
-      dirs_mode ? directory_scanner_had_io_error(dscanner) : parallel_scanner_had_io_error(scanner);
-  if (dirs_mode)
+  bool had_io = use_dscanner ? directory_scanner_had_io_error(dscanner)
+                             : parallel_scanner_had_io_error(scanner);
+  if (use_dscanner)
     directory_scanner_destroy(dscanner);
   else
     parallel_scanner_destroy(scanner);
