@@ -22,7 +22,7 @@
  * frame: the destination path, the metadata frame (whose mode's S_IFMT bits
  * carry the node kind) and the device rdev major/minor.  The receiver validates
  * the kind and rdev and recreates the node (privilege-gating the mknod). */
-bool file_send_special(File* file, int file_descriptor, bool use_metadata) {
+bool file_send_special(const File* file, int file_descriptor, bool use_metadata) {
   if (!file || !file_wire_path(file))
     return false;
   if (!send_status(file_descriptor, STATUS_SPECIAL))

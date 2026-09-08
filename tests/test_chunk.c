@@ -273,9 +273,8 @@ static void test_chunk_special_rdev_out_of_range_rejected() {
   EXPECT_NOT_NULL(chunk);
   Data* serialized = chunk_serialize(chunk, true);
   EXPECT_NOT_NULL(serialized);
-  Chunk* deserialized = chunk_deserialize(serialized, true);
+  const Chunk* deserialized = chunk_deserialize(serialized, true);
   EXPECT_NULL(deserialized);
-
   data_destroy(serialized);
   chunk_destroy(chunk);
 }
