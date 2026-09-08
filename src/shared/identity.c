@@ -88,12 +88,13 @@ void identity_set_active(const Config* config) {
 }
 
 bool identity_active_enabled(void) {
-  /* --numeric-ids alone is a policy modifier (how ids are resolved WHERE
-     ownership is otherwise preserved), not itself an ownership-application
-     trigger, so it is deliberately excluded from this set: standalone it stays
-     inert, matching its siblings only when combined with -M/--preserve. */
+  /* numeric_ids is included: this set only gates identity_apply_ownership,
+     which runs only when metadata is present (a -M/--preserve transfer).  A
+     standalone --numeric-ids (no ownership-affecting flag) carries no
+     metadata, never reaches identity_apply_ownership, and therefore correctly
+     stays inert; combined with -M it activates raw-id application. */
   return g_identity.set &&
-         (g_identity.chown_uid_set || g_identity.chown_gid_set ||
+         (g_identity.numeric_ids || g_identity.chown_uid_set || g_identity.chown_gid_set ||
           g_identity.usermap_count > 0 || g_identity.groupmap_count > 0);
 }
 
