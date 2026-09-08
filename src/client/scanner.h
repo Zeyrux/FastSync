@@ -19,6 +19,10 @@ typedef struct {
    * capture the source access / birth time into each entry's FileMetadata. */
   bool preserve_atimes;
   bool preserve_crtimes;
+  /* Phase 4 xattrs: when preserve_xattrs || preserve_acls is set the scanner
+   * captures each regular file's whitelisted xattr set onto the File. */
+  bool preserve_xattrs;
+  bool preserve_acls;
   unsigned long long chunk_size;
   char** exclude_patterns;
   int exclude_count;
@@ -101,6 +105,8 @@ typedef struct {
   bool use_metadata;
   bool preserve_atimes;
   bool preserve_crtimes;
+  bool preserve_xattrs;
+  bool preserve_acls;
   unsigned long long chunk_size;
   char** exclude_patterns;
   int exclude_count;

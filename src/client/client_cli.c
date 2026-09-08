@@ -548,6 +548,9 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--omit-dir-times", "-O", OPT_FLAG, offsetof(Config, omit_dir_times)},
     {"--omit-link-times", "-J", OPT_FLAG, offsetof(Config, omit_link_times)},
     {"--open-noatime", NULL, OPT_FLAG, offsetof(Config, open_noatime)},
+    {"--xattrs", "-X", OPT_FLAG, offsetof(Config, preserve_xattrs)},
+    {"--acls", "-A", OPT_FLAG, offsetof(Config, preserve_acls)},
+    {"--fake-super", NULL, OPT_FLAG, offsetof(Config, fake_super)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -582,6 +585,9 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"preserve", "M", offsetof(Config, use_metadata)},
     {"sendfile", "f", offsetof(Config, use_sendfile)},
     {"chunk-serialization", "s", offsetof(Config, use_chunk_serialization)},
+    {"xattrs", "X", offsetof(Config, preserve_xattrs)},
+    {"acls", "A", offsetof(Config, preserve_acls)},
+    {"fake-super", NULL, offsetof(Config, fake_super)},
 };
 
 static bool opt_is(const char* arg, const char* name, const char* alias) {
@@ -817,6 +823,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
          which stays opt-in via the identity flags. */
       if (entry->offset == offsetof(Config, preserve_atimes) ||
           entry->offset == offsetof(Config, preserve_crtimes))
+        config->use_metadata = true;
+      if (entry->offset == offsetof(Config, preserve_xattrs) ||
+          entry->offset == offsetof(Config, preserve_acls)) {
+        config->use_metadata = true;
+        config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
+      }
+      if (entry->offset == offsetof(Config, fake_super))
         config->use_metadata = true;
       continue;
     }
@@ -1265,6 +1278,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for incremental/delta transfer");
     config->use_metadata = true;
   }
+  /* Recompute the derived xattr flag from the FINAL preserve flags (after any
+   * --no-xattrs/--no-acls negation) so the sender's wire gate always matches
+   * the flags the receiver will recompute from the received config. */
+  config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
   return 0;
 }
 

@@ -27,6 +27,7 @@
 #include "test_transport_ssh.h"
 #include "test_transport_tls.h"
 #include "test_utils.h"
+#include "test_xattr.h"
 #include <stdio.h>
 #include <signal.h>
 
@@ -67,6 +68,7 @@ int main() {
   RUN_TEST(test_client_cli);
   RUN_TEST(test_server);
   RUN_TEST(test_fuzz_smoke);
+  RUN_TEST(test_xattr);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);

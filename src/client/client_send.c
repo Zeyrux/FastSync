@@ -20,6 +20,7 @@
 #include "transport_ssh.h"
 #include "transport_tls.h"
 #include "utils.h"
+#include "xattr.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -89,6 +90,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->use_metadata = config->use_metadata;
   options->preserve_atimes = config->preserve_atimes;
   options->preserve_crtimes = config->preserve_crtimes;
+  options->preserve_xattrs = config->preserve_xattrs;
+  options->preserve_acls = config->preserve_acls;
   options->chunk_size = config->chunk_size;
   options->exclude_patterns = config->exclude_patterns;
   options->exclude_count = config->exclude_count;
@@ -963,6 +966,9 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
   if (ok && config->use_metadata)
     ok = metadata_send(client->file_descriptor, file->metadata);
 
+  if (ok && config->use_xattrs)
+    ok = xattr_send(client->file_descriptor, file->xattrs);
+
   data_destroy(to_send);
   return ok ? 0 : -1;
 }
@@ -1004,7 +1010,7 @@ static int send_append(const Client* client, File* file, Config* config,
          transfer (byte-identical, never a corrupt prefix+tail blend). */
       int rc = file_send_single_calls_with_skip(file, fd, config->use_metadata, compression_level,
                                                 false, config->skip_compress_suffixes, skip_count,
-                                                config->compression_threads)
+                                                config->compression_threads, config->use_xattrs)
                    ? 1
                    : -1;
       return rc;
@@ -1019,6 +1025,9 @@ static int send_append(const Client* client, File* file, Config* config,
     return -1;
   }
   if (config->use_metadata && !metadata_send(fd, file->metadata)) {
+    return -1;
+  }
+  if (config->use_xattrs && !xattr_send(fd, file->xattrs)) {
     return -1;
   }
   bool ok;
@@ -1058,7 +1067,7 @@ static bool send_file_direct(File* file, int fd, bool use_metadata, int compress
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   return file_send_single_calls_with_skip(file, fd, use_metadata, compression_level, true,
                                           config->skip_compress_suffixes, skip_count,
-                                          config->compression_threads);
+                                          config->compression_threads, config->use_xattrs);
 }
 
 /* Transmit one explicit directory entry (--dirs): a STATUS_MKDIR frame whose
@@ -1093,7 +1102,7 @@ static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata, con
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   return file_send_sendfile_with_skip(file, fd, use_metadata, 0, true,
                                       config->skip_compress_suffixes, skip_count,
-                                      config->compression_threads);
+                                      config->compression_threads, config->use_xattrs);
 }
 
 // Process one file in a chunk: either via incremental check or direct send.
@@ -1151,7 +1160,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
     int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
     if (!file_send_sendfile_with_skip(file, client->file_descriptor, config->use_metadata, 0, false,
                                       config->skip_compress_suffixes, skip_count,
-                                      config->compression_threads))
+                                      config->compression_threads, config->use_xattrs))
       return -1;
     return 0;
   }
@@ -1200,7 +1209,8 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   int skip_count = config->skip_compress_set ? config->skip_compress_count : -1;
   if (!file_send_single_calls_with_skip(file, client->file_descriptor, config->use_metadata,
                                         compression_level, false, config->skip_compress_suffixes,
-                                        skip_count, config->compression_threads))
+                                        skip_count, config->compression_threads,
+                                        config->use_xattrs))
     return -1;
   return 0;
 }

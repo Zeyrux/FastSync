@@ -244,8 +244,8 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `-t`, `--times` | Preserve modification times | ✅ Implemented | Part of -M |
 | `-E`, `--executability` | Preserve executability | ✅ Implemented | Preserves executable permission bits (implies metadata preservation) |
 | `--chmod=CHMOD` | Affect file permissions | ✅ Implemented | Supports numeric and symbolic `ugo` `rwx` changes; retains receiver safety masking |
-| `-A`, `--acls` | Preserve ACLs | ❌ Not Implemented | Removed because it had no effect |
-| `-X`, `--xattrs` | Preserve extended attributes | ❌ Not Implemented | Removed because it had no effect |
+| `-A`, `--acls` | Preserve ACLs | ✅ Implemented | Implemented on Linux via the POSIX-ACL xattr representation: the sender captures the `system.posix_acl_access` / `system.posix_acl_default` xattrs into the same bounded whitelisted set as `-X`, transmits them per-file, and the receiver re-applies them fd-relative. Setting an ACL the receiver is not permitted to set (non-root on a file it does not own, unsupported filesystem) is logged and skipped, never fatal. libacl is **not** required. Only the `system.posix_acl_*` namespaces plus `user.*` are ever applied; privileged namespaces are never applied (see the Phase-4 xattr/ACL notes below). Implies metadata transmission |
+| `-X`, `--xattrs` | Preserve extended attributes | ✅ Implemented | Preserves unprivileged `user.*` extended attributes (Linux `listxattr`/`getxattr` on capture, `fsetxattr` on the written destination fd). Both capture (sender) and application (receiver) are restricted to the `user.*` namespace and the two POSIX ACL xattrs, so a client can **never** force a `security.*`/`trusted.*`/privileged attribute onto the destination; the receiver independently re-validates every incoming name against this whitelist and rejects anything else. Payloads are bounded (per-name ≤255B, per-value ≤1MiB, per-file count ≤256 total bytes ≤4MiB) on both ends, and an oversized/malformed frame is a clean protocol rejection (no OOM). Applied fd-relative to the exact written file. Implies metadata transmission. Incompatible with `-s` (chunk serialization), rejected up front (see the notes); a `--link-dest`/`-H` hard-link copy fallback re-applies the attributes so they are not dropped when a link is refused |
 | `-H`, `--hard-links` | Preserve hard links | ✅ Implemented | Files on the source that share an inode (`st_dev`+`st_ino`, e.g. a `cp -al` tree) are re-created as hard links to one another on the destination, so duplicate links stay deduplicated and only the first member's data is sent (later members are transmitted as payload-less `STATUS_HARDLINK` frames). The receiver links each sibling to the first member's installed file with an atomic link + rename; on `link()` failure it falls back to a byte-identical local copy of the first member, never a partial/corrupt file. Requires the sequential scan for ordering (the first member is always emitted and installed before any sibling is linked). Works single-threaded and under `-m`, `--inplace`, `--delay-updates` (links staged and published by rename) and `--partial`. Crosses the wire (`preserve_hard_links` bool; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0**, peers must match). Incompatible with `-s` (chunk serialization) and `--append`/`--append-verify`, rejected up front with a distinct error. See the Phase-4 hard-links notes below |
 | `-D` | Same as --devices --specials | ✅ Implemented | Implies `--devices --specials`. `-D` was unassigned in FastSync (verified: no collision), so it is free to imply both device-node and special-file preservation. See the `--devices`/`--specials` rows and the Phase-4 devices notes below |
 | `--devices` | Preserve device files | ⚠️ Partial | Recreates char/block device nodes on the destination via `mknod` instead of transferring content. Type + rdev are validated strictly (S_IFMT from the transmitted mode; major/minor range-checked, non-negative), and creation is **privilege-gated**: `mknod` needs `CAP_MKNOD`, so a non-root receiver (CI runs via setpriv as non-root) logs a warning and **skips the device entry safely** — the whole transfer never aborts just because the node could not be made. The node is created fd-relative below the receive root (`mknodat` on the confined secure parent), so it can never be placed outside the authorized root, never follows a symlink, and never replaces an existing directory. Only a char/block mode is honored. Crosses the wire (a new `STATUS_SPECIAL` frame carries the path + metadata mode + rdev; `PROTOCOL_VERSION` bumped **2.12.0 → 2.13.0**). Divergence: per-entry skip (not a hard error) when the receiver lacks `CAP_MKNOD`, documented in the Phase-4 devices notes |
@@ -257,7 +257,7 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `-O`, `--omit-dir-times` | Omit dirs from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never preserves directory mtimes in the first place (directories are created via `mkdir` with no metadata, a documented divergence under `-d`/recursive), so there is nothing for an "omit" to suppress. It never breaks a normal run |
 | `-J`, `--omit-link-times` | Omit symlinks from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never sets symlink times (`-l`/`--links` copies symlinks as symlinks but the receiver does not apply timestamps/owner to symlink entries), so there is nothing for an "omit" to suppress. It never breaks a normal run |
 | `--super` | Receiver attempts super-user activities | ❌ Not Implemented | |
-| `--fake-super` | Store/recover privileged attrs via xattrs | ❌ Not Implemented | |
+| `--fake-super` | Store/recover privileged attrs via xattrs | ⚠️ Partial | Honest, limited subset. The receiver records the source `uid:gid:mode:mtime_sec:mtime_nsec` into a reserved `user.fastsync.stat` xattr on each written file (best-effort, fd-relative), so a later privileged restore could re-apply them — without attempting the (typically failing as non-root) `chown`. Full rsync fake-super **replay** (parsing that xattr to actually re-apply ownership on a later privileged run) is out of scope and is **divergent** from rsync, which uses its own `user.rsync.%stat%` format; no cross-tool conversion is attempted. Implies metadata transmission so the source uid/gid/mode/mtime are available. Both it and `-X`/`-A` are incompatible with `-s` (chunk serialization), rejected up front |
 | `--open-noatime` | Avoid changing access time when opening files | ✅ Implemented | Sender-side policy: the sender opens source files with `O_NOATIME` (Linux) when reading them for transfer, so the open/read does NOT bump the source's on-disk access time. Degrades safely when `O_NOATIME` is unavailable (not defined) or refused (`EPERM`, since it needs `CAP_FOWNER` or file ownership): the code falls back to a normal open, so the data always transfers — only the atime-bump is skipped. It does not itself capture/preserve atime; it only avoids modifying it. **Client-only, never crosses the wire.** Exposed as `file_open_for_read()` and applied to both the buffered data path and the sendfile path |
 | `--numeric-ids` | Do not map uid/gid by name | ✅ Implemented | Ownership is applied through FastSync's opt-in identity path (see the Phase-4 identity notes below). `--numeric-ids` is a mapping-policy modifier: when applying ownership it uses the transmitted numeric uid/gid directly, skipping the name lookup. Without an ownership-affecting option it is inert (FastSync only applies ownership when the user opts in). It does not need `-M` to be parsed, but ownership is only applied when metadata (hence the source uid/gid) is actually transmitted (see the notes) |
 | `--usermap=STRING` | Map usernames | ✅ Implemented | Opt-in ownership application. rsync subset implemented: comma-separated `FROM:TO` rules evaluated in order, first match wins; `FROM`/`TO` are group/user names (resolved on the SOURCE machine at parse time), `*` (FROM matches any id / TO = the receiving process's current euid), and an `@N` or bare `N` numeric id. Rules are carried over the wire as resolved numeric id pairs; the receiver applies a matching rule (else falls back to `--chown`, `--numeric-ids`, then a best-effort name lookup) via an fd-relative `fchown`. Malformed/unresolvable specs are rejected with a clear error, never a silent no-op. Implies metadata preservation so the source uid/gid travel. Only effective when the receiver can actually change ownership (root or membership); otherwise it warns and continues |
@@ -283,6 +283,54 @@ receiver (apply), so they and their metadata fields cross the wire;
 `--open-noatime` is purely a client/sender open flag and stays off the wire
 (mirroring the existing convention where `ignore_errors` is client-only while
 `force_delete` crosses the wire).
+
+**Phase-4 xattr/ACL notes (`-X/--xattrs`, `-A/--acls`, `--fake-super`):** these
+are new in protocol 2.13.0 and add a bounded per-file xattr block to the
+per-file metadata frame (count + each `name`/`value`, sent only when xattr
+transport is enabled, i.e. with zero overhead on unaffected runs). The config
+frame carries `preserve_xattrs`, `preserve_acls` (in the existing file-options
+block) and a trailing `fake_super` boolean — all CROSS the wire so the receiver
+knows the negotiated behavior; the derived `use_xattrs` flag is recomputed on
+the receiver. `PROTOCOL_VERSION` was bumped **2.12.0 → 2.13.0** (peers must
+match, exactly as prior phases did).
+
+- **Security model (both `-X` and `-A`):** only `user.*` and the
+  `system.posix_acl_access` / `system.posix_acl_default` namespaces are ever
+  captured (sender) or applied (receiver). `security.*` (SELinux, capabilities,
+  ...), `trusted.*`, and all other `system.*` attributes are never transmitted
+  or applied, so a client can never compel the receiver to set a privileged
+  xattr. The receiver re-validates each incoming name against this whitelist
+  even though the sender already filtered, so a malicious/compromised sender's
+  `security.capability` payload is rejected outright (a clean protocol error),
+  never applied.
+- **Bounds / memory safety:** per-name length ≤ 255 B, per-value ≤ 1 MiB,
+  per-file count ≤ 256 names, per-file name+value total ≤ 4 MiB. Both the
+  sender (during capture) and the receiver (during receive) enforce these; an
+  oversized or malformed frame is rejected, never a large allocation.
+- **Confined application:** xattrs are applied with `fsetxattr` on the exact
+  just-written destination file fd (before the atomic rename), never on a
+  caller-controlled path; this is the same confinement as mode/time restore.
+  The `--link-dest` / `-H` hard-link copy fallback (a byte copy when `link()`
+  is refused) also re-applies the incoming (or, for `-H`, the first member's)
+  xattrs and the `--fake-super` stat, so attributes are preserved rather than
+  silently dropped when the link fails.
+- **Reserved fake-super key is receiver-only:** the `user.fastsync.stat` key is
+  excluded from sender capture AND from receiver application, so it can only be
+  written by the receiver's own `--fake-super` handling. A source file that
+  already carries such a record is never forwarded on a plain `-X` run, so it
+  cannot be spoofed to mislead a later privileged restore.
+- **`-A` requires no libacl** — ACLs travel as the `system.posix_acl_*` xattrs.
+  Applying an ACL is owner-privileged: `fsetxattr` failure (e.g. non-root,
+  unsupported filesystem) is logged (collapsed to one line per file) and never
+  fatal.
+- **`--fake-super`**: see the row above; the reserved key is `user.fastsync.stat`
+  with the documented `uid:gid:mode:mtime_sec:mtime_nsec` (mode octal) format.
+  It is honest but partial — there is no replay, and it does not interoperate
+  with rsync's `user.rsync.%stat%`.
+- **Chunk serialization (`-s`) incompatibility:** the per-file xattr block rides
+  the streaming per-file frame, which `-s` replaces with a fixed buffer format,
+  so `-X` / `-A` combined with `-s` is rejected up front on both ends (mirroring
+  the existing `-H` + `-s` rejection) rather than silently dropping attributes.
 
 **atime capture does not clobber the source atime:** the sender records the
 access time from the **same pre-read stat the scanner already took** (inside

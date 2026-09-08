@@ -159,6 +159,8 @@ static void config_set_defaults(Config* config) {
   config->omit_dir_times = false;
   config->omit_link_times = false;
   config->open_noatime = false;
+  config->use_xattrs = false;
+  config->fake_super = false;
 }
 
 static bool valid_wire_bool(int value) {
@@ -210,9 +212,12 @@ static bool validate_received_config(const Config* config) {
          !((config->append || config->append_verify) && config->use_chunk_serialization) &&
          !(config->preserve_hard_links && config->use_chunk_serialization) &&
          !(config->preserve_hard_links && (config->append || config->append_verify)) &&
+         /* The xattr block rides the per-file streaming frame, which -s drops. */
+         !((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization) &&
          valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
          valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
+         valid_wire_bool(config->fake_super) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -797,6 +802,21 @@ static bool receive_symlink_trust_options(int fd, Config* c) {
   return receive_wire_bool(fd, &c->munge_links) && receive_wire_bool(fd, &c->keep_dirlinks);
 }
 
+/* -X/--xattrs, -A/--acls, --fake-super (Phase-4).  The receiver learns
+ * preserve_xattrs/preserve_acls from the earlier file-options block and
+ * recomputes the derived use_xattrs there; only --fake-super (receiver-side
+ * behavior) needs an extra wire bit.  Trailing field; protocol 2.13.0. */
+static bool send_phase4_xattr_options(int fd, const Config* c) {
+  return send_int(fd, c->fake_super);
+}
+
+static bool receive_phase4_xattr_options(int fd, Config* c) {
+  if (!receive_wire_bool(fd, &c->fake_super))
+    return false;
+  c->use_xattrs = c->preserve_acls || c->preserve_xattrs;
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -807,7 +827,8 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_checksum_options(file_descriptor, config) ||
       !send_identity_options(file_descriptor, config) ||
       !send_metadata_times_options(file_descriptor, config) ||
-      !send_symlink_trust_options(file_descriptor, config))
+      !send_symlink_trust_options(file_descriptor, config) ||
+      !send_phase4_xattr_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -845,7 +866,8 @@ Config* config_receive(int file_descriptor) {
       !receive_checksum_options(file_descriptor, config) ||
       !receive_identity_options(file_descriptor, config) ||
       !receive_metadata_times_options(file_descriptor, config) ||
-      !receive_symlink_trust_options(file_descriptor, config))
+      !receive_symlink_trust_options(file_descriptor, config) ||
+      !receive_phase4_xattr_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

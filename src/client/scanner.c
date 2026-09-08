@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <limits.h>
 
+#include "xattr.h"
+
 typedef struct {
   char* path;
   int depth;
@@ -170,6 +172,14 @@ static bool entry_passes_selection(const FileListSet* file_list, const FilterRul
   if (base || per_dir_filters)
     return entry_allowed(base, node, rel, leaf, is_dir, per_dir_filters);
   return true;
+}
+
+/* Best-effort capture of the file's whitelisted xattrs (-X/-A).  A failure to
+ * read xattrs is non-fatal: the file is transferred without them. */
+static void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file) {
+  if (!scanner || !file || !(scanner->preserve_xattrs || scanner->preserve_acls))
+    return;
+  file->xattrs = xattr_capture_path(file->path);
 }
 
 /* Apply --hard-links (-H) detection to one regular File.  On a sibling (a
@@ -432,6 +442,8 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->use_metadata = options->use_metadata;
   scanner->preserve_atimes = options->preserve_atimes;
   scanner->preserve_crtimes = options->preserve_crtimes;
+  scanner->preserve_xattrs = options->preserve_xattrs;
+  scanner->preserve_acls = options->preserve_acls;
   scanner->chunk_size = options->chunk_size > 0 ? options->chunk_size : DESIRED_CHUNK_SIZE;
   scanner->exclude_patterns = options->exclude_patterns;
   scanner->exclude_count = options->exclude_count;
@@ -1036,6 +1048,8 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         scanner->failed = true;
         break;
       }
+      if (!(file->link_group != 0 && !file->link_first))
+        scanner_capture_xattrs(scanner, file);
       if (!array_list_add(chunk_data, file)) {
         free(rel_copy);
         file_destroy(file);
@@ -1379,6 +1393,9 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     ps->failed = true;
     return;
   }
+  if ((options->preserve_xattrs || options->preserve_acls) &&
+      !(file->link_group != 0 && !file->link_first))
+    file->xattrs = xattr_capture_path(file->path);
   if (!array_list_add(root_files, file)) {
     free(rel);
     file_destroy(file);

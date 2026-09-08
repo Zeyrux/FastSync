@@ -79,6 +79,14 @@ bool validate_config(const Config* config) {
                 "--hard-links/-H cannot be combined with -s (chunk serialization)");
     return false;
   }
+  /* -X/-A ride the per-file metadata frame; the buffer-based chunk-serialization
+     wire format does not carry the xattr block, so the pair is rejected up front
+     (mirroring -H + -s) rather than silently dropping attributes. */
+  if ((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization) {
+    log_message(LOG_LEVEL_ERROR,
+                "--xattrs/-X and --acls/-A cannot be combined with -s (chunk serialization)");
+    return false;
+  }
   if (config->preserve_hard_links && (config->append || config->append_verify)) {
     log_message(LOG_LEVEL_ERROR,
                 "--hard-links/-H cannot be combined with --append/--append-verify");

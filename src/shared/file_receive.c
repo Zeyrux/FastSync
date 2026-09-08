@@ -21,6 +21,7 @@
 #include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
+#include "xattr.h"
 
 #define MAX_SERVER_DELETE_COUNT 100000U
 #define MAX_FILE_DATA_SIZE MAX_RECEIVE_WHOLE_FILE_SIZE
@@ -85,9 +86,10 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
                                   config->preallocate, metadata, preserve_executability,
                                   config->use_fsync, NULL);
   } else {
-    ok = file_to_disk_secure_with_fsync(staged_path, file->data->data, file->data->size, false,
-                                        sparse, config->preallocate, metadata,
-                                        preserve_executability, config->use_fsync, NULL);
+    ok =
+        file_to_disk_secure_attrs(staged_path, file->data->data, file->data->size, false, sparse,
+                                  config->preallocate, metadata, preserve_executability, false,
+                                  false, config->use_fsync, file->xattrs, config->fake_super, NULL);
   }
   if (!ok) {
     free(staged_path);
@@ -250,9 +252,11 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
       free(destination_path);
       return absent_result;
     }
-    bool ok =
-        file_to_disk_secure_link(staged_sibling, staged_first, content, content_size, preallocate,
-                                 file->metadata, preserve_executability, use_fsync, NULL);
+    FileXattrList* sibling_xattrs = cfg->use_xattrs ? xattr_capture_path(staged_first) : NULL;
+    bool ok = file_to_disk_secure_link_attrs(
+        staged_sibling, staged_first, content, content_size, preallocate, file->metadata,
+        preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, NULL);
+    xattr_list_free(sibling_xattrs);
     free(content);
     if (ok)
       ok = delay_updates_record(cfg->delay_context, staged_sibling, destination_path, file->path);
@@ -280,9 +284,11 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     return absent_result;
   }
   const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
-  bool ok =
-      file_to_disk_secure_link(destination_path, first_disk, content, content_size, preallocate,
-                               file->metadata, preserve_executability, use_fsync, temp_dir);
+  FileXattrList* sibling_xattrs = cfg->use_xattrs ? xattr_capture_path(first_disk) : NULL;
+  bool ok = file_to_disk_secure_link_attrs(
+      destination_path, first_disk, content, content_size, preallocate, file->metadata,
+      preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
+  xattr_list_free(sibling_xattrs);
   free(content);
   free(first_disk);
   free(destination_path);
@@ -773,22 +779,18 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      policy decision. */
   bool ok;
   if (config && file->basis_link) {
-    ok = file_to_disk_secure_link(disk_path, file->basis_link, file->data->data, file->data->size,
-                                  config->preallocate, metadata, preserve_executability,
-                                  config->use_fsync, confined_temp);
+    ok = file_to_disk_secure_link_attrs(disk_path, file->basis_link, file->data->data,
+                                        file->data->size, config->preallocate, metadata,
+                                        preserve_executability, config->use_fsync, file->xattrs,
+                                        config->fake_super, confined_temp);
   } else {
-    ok = config && config->ignore_existing
-             ? file_to_disk_secure_no_replace(disk_path, file->data->data, file->data->size, sparse,
-                                              config && config->preallocate, metadata,
-                                              preserve_executability, confined_temp)
-         : config && config->update
-             ? file_to_disk_secure_update(disk_path, file->data->data, file->data->size, inplace,
-                                          sparse, config && config->preallocate, metadata,
-                                          preserve_executability, confined_temp)
-             : file_to_disk_secure_with_fsync(disk_path, file->data->data, file->data->size,
-                                              inplace, sparse, config && config->preallocate,
-                                              metadata, preserve_executability,
-                                              config && config->use_fsync, confined_temp);
+    /* The plain no-replace / update / with-fsync engines, plus per-file xattr
+       (-X/-A) and --fake-super application on the written fd. */
+    ok = file_to_disk_secure_attrs(disk_path, file->data->data, file->data->size, inplace, sparse,
+                                   config && config->preallocate, metadata, preserve_executability,
+                                   config && config->update, config && config->ignore_existing,
+                                   config && config->use_fsync, file->xattrs,
+                                   config ? config->fake_super : false, confined_temp);
   }
   free(confined_temp);
   confined_temp = NULL;
@@ -820,6 +822,21 @@ fail:
   free(destination_path);
   free(disk_path);
   return FILE_SAVE_ERROR;
+}
+
+/* Receive a file's xattr block (when the config enables xattr transport) and
+ * attach it to `file`.  Returns false on a malformed/oversized frame. */
+static bool receive_file_xattrs(File* file, int fd, const Config* config) {
+  if (!config->use_xattrs)
+    return true;
+  int xok = 0;
+  FileXattrList* list = xattr_receive(fd, &xok);
+  if (!xok) {
+    xattr_list_free(list);
+    return false;
+  }
+  file->xattrs = list;
+  return true;
 }
 
 static File* receive_delta_file(int fd, const Config* config, const char* check_path,
@@ -937,6 +954,14 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         return NULL;
       }
     }
+    if (!receive_file_xattrs(file, fd, config)) {
+      file_destroy(file);
+      free(new_data);
+      free(old_data);
+      delta_signature_destroy(sig);
+      *failed = true;
+      return NULL;
+    }
 
     Data* replacement = data_create(new_data, (size_t)new_size);
     if (replacement == NULL) {
@@ -973,6 +998,11 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         *failed = true;
         return NULL;
       }
+    }
+    if (!receive_file_xattrs(file, fd, config)) {
+      file_destroy(file);
+      *failed = true;
+      return NULL;
     }
 
     Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
@@ -1479,6 +1509,10 @@ static File* receive_full_file(int fd, const Config* config, const char* path) {
       return NULL;
     }
   }
+  if (!receive_file_xattrs(file, fd, config)) {
+    file_destroy(file);
+    return NULL;
+  }
   Data* file_data = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
   if (file_data == NULL) {
     file_destroy(file);
@@ -1851,6 +1885,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
         return NULL;
       }
       FileMetadata* meta = NULL;
+      FileXattrList* append_xattrs = NULL;
       if (config->use_metadata) {
         int meta_ok = 1;
         meta = metadata_receive(fd, &meta_ok);
@@ -1862,8 +1897,21 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
           return NULL;
         }
       }
+      if (config->use_xattrs) {
+        int xok = 0;
+        append_xattrs = xattr_receive(fd, &xok);
+        if (!xok) {
+          xattr_list_free(append_xattrs);
+          close(old_fd);
+          free(full_path);
+          free(check_path);
+          free(old_data);
+          return NULL;
+        }
+      }
       Data* tail = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
       if (tail == NULL) {
+        xattr_list_free(append_xattrs);
         close(old_fd);
         free(full_path);
         free(check_path);
@@ -1877,6 +1925,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
         Data* uncompressed = data_decompress_limited(tail, MAX_RECEIVE_WHOLE_FILE_SIZE);
         data_destroy(tail);
         if (uncompressed == NULL) {
+          xattr_list_free(append_xattrs);
           close(old_fd);
           free(full_path);
           free(check_path);
@@ -1885,6 +1934,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
         }
         if (uncompressed->size > MAX_FILE_DATA_SIZE) {
           data_destroy(uncompressed);
+          xattr_list_free(append_xattrs);
           close(old_fd);
           free(full_path);
           free(check_path);
@@ -1900,6 +1950,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
           tail->size != (size_t)expected_tail) {
         send_status(fd, STATUS_ERROR);
         data_destroy(tail);
+        xattr_list_free(append_xattrs);
         close(old_fd);
         free(full_path);
         free(check_path);
@@ -1910,6 +1961,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
       void* full = protocol_alloc(full_size ? full_size : 1);
       if (!full) {
         data_destroy(tail);
+        xattr_list_free(append_xattrs);
         close(old_fd);
         free(full_path);
         free(check_path);
@@ -1927,12 +1979,15 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
       File* file = file_create(check_path);
       if (!file) {
         free(full);
+        xattr_list_free(append_xattrs);
         close(old_fd);
         free(full_path);
         free(check_path);
         return NULL;
       }
       file->metadata = meta;
+      file->xattrs = append_xattrs;
+      append_xattrs = NULL;
       file->data = data_create(full, full_size);
       if (!file->data) { /* data_create already freed full on failure */
         file_destroy(file);
@@ -2040,6 +2095,10 @@ File* file_receive(const Config* config, int file_descriptor) {
       file_destroy(file);
       return NULL;
     }
+  }
+  if (!receive_file_xattrs(file, file_descriptor, config)) {
+    file_destroy(file);
+    return NULL;
   }
   Data* file_data = receive_data_limited(file_descriptor, MAX_RECEIVE_WHOLE_FILE_SIZE);
   if (file_data == NULL) {
