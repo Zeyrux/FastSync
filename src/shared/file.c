@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* statx + STATX_BTIME for --crtimes birth-time capture */
+#endif
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -128,7 +131,8 @@ void file_destroy(void* item) {
   free(file);
 }
 
-FileMetadata* file_metadata_create(const struct stat* stats) {
+FileMetadata* file_metadata_create(const char* path, const struct stat* stats, bool capture_atime,
+                                   bool capture_crtime) {
   FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL) {
     log_perror("ERROR: Could not allocate memory for file metadata");
@@ -143,11 +147,73 @@ FileMetadata* file_metadata_create(const struct stat* stats) {
 #else
   m->mtime_nsec = 0;
 #endif
+  /* -U/--atimes: capture the access time from the same pre-read stat the
+     scanner already took, so the value is not clobbered by a later read for
+     transfer.  The timestamp is populated (and atime_valid set) only on Linux,
+     where st_atim is populated; on other platforms the atime is left alone
+     rather than clobbered to the default 0/epoch by an unpopulated value. */
+#ifdef __linux__
+  m->atime_valid = capture_atime;
+  m->atime_sec = stats->st_atim.tv_sec;
+  m->atime_nsec = stats->st_atim.tv_nsec;
+#else
+  m->atime_valid = false;
+  m->atime_sec = 0;
+  m->atime_nsec = 0;
+#endif
+  /* -N/--crtimes: birth time is not available via struct stat in general; on
+     Linux it needs statx STATX_BTIME.  If unavailable it is captured as a
+     documented no-op (the flag stays accepted, crtime_valid stays false). */
+  m->crtime_valid = false;
+  m->crtime_sec = 0;
+  m->crtime_nsec = 0;
+  if (capture_crtime) {
+#ifdef STATX_BTIME
+    struct statx stx;
+    if (path != NULL && statx(AT_FDCWD, path, AT_STATX_SYNC_AS_STAT, STATX_BTIME, &stx) == 0 &&
+        (stx.stx_mask & STATX_BTIME) != 0) {
+      m->crtime_valid = true;
+      m->crtime_sec = (time_t)stx.stx_btime.tv_sec;
+      m->crtime_nsec = (long)stx.stx_btime.tv_nsec;
+    }
+#endif
+  }
   return m;
 }
 
 void file_metadata_destroy(void* metadata) {
   free(metadata);
+}
+
+/* --open-noatime: process-wide sender policy (client-only, never crosses the
+ * wire).  When enabled, opening a source file for transfer uses O_NOATIME so
+ * the read does not bump the source's on-disk access time.  It degrades safely
+ * to a normal open where O_NOATIME is unavailable (not defined) or refused
+ * (EPERM, because it needs CAP_FOWNER): the data path never silently changes,
+ * only the atime-bump is skipped. */
+static bool file_open_noatime = false;
+
+void file_set_open_noatime(bool enable) {
+  file_open_noatime = enable;
+}
+
+bool file_get_open_noatime(void) {
+  return file_open_noatime;
+}
+
+/* Open `path` read-only for transfer, honouring --open-noatime when set. */
+int file_open_for_read(const char* path) {
+  int flags = O_RDONLY;
+#ifdef O_NOATIME
+  if (file_get_open_noatime())
+    flags |= O_NOATIME;
+#endif
+  int fd = open(path, flags);
+#ifdef O_NOATIME
+  if (fd < 0 && (flags & O_NOATIME))
+    fd = open(path, O_RDONLY); /* degrade safely on EPERM / unsupported fs */
+#endif
+  return fd;
 }
 
 bool file_load_data(File* file) {
@@ -176,8 +242,14 @@ bool file_load_data(File* file) {
 size_t file_content_to_buffer(File* file) {
   if (!file || !file->path || !file->data || (!file->data->data && file->data->size != 0))
     return 0;
-  FILE* file_pointer = fopen(file->path, "rb");
+  int fd = file_open_for_read(file->path);
+  if (fd < 0) {
+    log_perror("Could not open the file!");
+    return 0;
+  }
+  FILE* file_pointer = fdopen(fd, "rb");
   if (file_pointer == NULL) {
+    close(fd);
     log_perror("Could not open the file!");
     return 0;
   }

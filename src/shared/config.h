@@ -291,9 +291,28 @@ typedef struct Config {
   // Receiver-side runtime staging registry for --delay-updates.  Never sent
   // over the wire and never set on the sender side.
   DelayUpdatesContext* delay_context;
+
+  // Phase 4: metadata time preservation.  -U/--atimes and -N/--crtimes capture
+  // and transmit the source access / birth time (both sender and receiver
+  // effect, so they CROSS the wire).  --omit-dir-times/-O and
+  // --omit-link-times/-J are receiver-side prefs (CROSS the wire).  Their
+  // exact capture/transmit/apply semantics are documented in RSYNC_COMPAT.md.
+  /* -U/--atimes: preserve source access times on the destination. */
+  bool preserve_atimes;
+  /* -N/--crtimes: capture+transmit source birth time; see RSYNC_COMPAT for the
+   * receiver not-applied divergence. */
+  bool preserve_crtimes;
+  /* -O/--omit-dir-times: do not apply mtimes to directories. */
+  bool omit_dir_times;
+  /* -J/--omit-link-times: do not apply times to symlinks. */
+  bool omit_link_times;
+  /* --open-noatime: CLIENT-ONLY (never crosses the wire).  The sender opens
+   * source files with O_NOATIME so reading for transfer does not bump the
+   * source access time. */
+  bool open_noatime;
 } Config;
 
-#define PROTOCOL_VERSION "2.11.0"
+#define PROTOCOL_VERSION "2.12.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

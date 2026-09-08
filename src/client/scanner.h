@@ -14,6 +14,10 @@
 
 typedef struct {
   bool use_metadata;
+  /* Phase 4 metadata capture: -U/--atimes and -N/--crtimes tell the scanner to
+   * capture the source access / birth time into each entry's FileMetadata. */
+  bool preserve_atimes;
+  bool preserve_crtimes;
   unsigned long long chunk_size;
   char** exclude_patterns;
   int exclude_count;
@@ -75,6 +79,8 @@ typedef struct {
   DIR* current_dir;
   char* current_path;
   bool use_metadata;
+  bool preserve_atimes;
+  bool preserve_crtimes;
   unsigned long long chunk_size;
   char** exclude_patterns;
   int exclude_count;

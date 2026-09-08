@@ -15,6 +15,12 @@ static void test_metadata_to_from_buf_roundtrip() {
   original.gid = 1000;
   original.mtime_sec = 1234567890;
   original.mtime_nsec = 500000000;
+  original.atime_valid = true;
+  original.atime_sec = 1234567000;
+  original.atime_nsec = 250000000;
+  original.crtime_valid = true;
+  original.crtime_sec = 1200000000;
+  original.crtime_nsec = 750000000;
 
   char* buf = malloc(FILE_METADATA_WIRE_SIZE + sizeof(int));
   EXPECT_NOT_NULL(buf);
@@ -30,6 +36,14 @@ static void test_metadata_to_from_buf_roundtrip() {
   EXPECT_EQ_INT(result->gid, 1000);
   EXPECT_EQ_INT(result->mtime_sec, 1234567890);
   EXPECT_EQ_INT(result->mtime_nsec, 500000000);
+  EXPECT_TRUE(result->atime_valid);
+  EXPECT_EQ_INT(result->atime_sec, 1234567000);
+  EXPECT_EQ_INT(result->atime_nsec, 250000000);
+  EXPECT_TRUE(result->crtime_valid);
+  EXPECT_EQ_INT(result->crtime_sec, 1200000000);
+  EXPECT_EQ_INT(result->crtime_nsec, 750000000);
+
+  EXPECT_EQ_INT((int)(read_ptr - buf), (int)FILE_METADATA_WIRE_SIZE + (int)sizeof(int));
 
   free(result);
   free(buf);
@@ -75,6 +89,12 @@ static void test_metadata_send_receive_roundtrip() {
   original.gid = 1000;
   original.mtime_sec = 1234567890;
   original.mtime_nsec = 500000000;
+  original.atime_valid = false;
+  original.atime_sec = 0;
+  original.atime_nsec = 0;
+  original.crtime_valid = true;
+  original.crtime_sec = 1200000000;
+  original.crtime_nsec = 750000000;
 
   EXPECT_TRUE(metadata_send(p[1], &original));
 
@@ -87,6 +107,10 @@ static void test_metadata_send_receive_roundtrip() {
   EXPECT_EQ_INT(received->gid, 1000);
   EXPECT_EQ_INT(received->mtime_sec, 1234567890);
   EXPECT_EQ_INT(received->mtime_nsec, 500000000);
+  EXPECT_FALSE(received->atime_valid);
+  EXPECT_TRUE(received->crtime_valid);
+  EXPECT_EQ_INT(received->crtime_sec, 1200000000);
+  EXPECT_EQ_INT(received->crtime_nsec, 750000000);
 
   free(received);
   close(p[0]);
@@ -121,6 +145,77 @@ static void test_metadata_rejects_invalid_values() {
   EXPECT_EQ_INT(ok, 0);
   close(p[0]);
   close(p[1]);
+}
+
+/* metadata_receive must reject an out-of-range atime/crtime nsec even when the
+ * flag would otherwise be valid (defense-in-depth on the -U/-N wire fields). */
+static void test_metadata_receive_rejects_bad_optional_times() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+
+  int32_t present = 1;
+  int32_t mode = 0644;
+  int32_t uid = 1000;
+  int32_t gid = 1000;
+  int64_t mtime_sec = 1;
+  int64_t mtime_nsec = 0;
+  int32_t atime_valid = 1;
+  int64_t atime_sec = 1;
+  int64_t atime_nsec = 2000000000; /* invalid: >= 1e9 */
+  EXPECT_TRUE(send_n_data(p[1], &present, sizeof(present)));
+  EXPECT_TRUE(send_n_data(p[1], &mode, sizeof(mode)));
+  EXPECT_TRUE(send_n_data(p[1], &uid, sizeof(uid)));
+  EXPECT_TRUE(send_n_data(p[1], &gid, sizeof(gid)));
+  EXPECT_TRUE(send_n_data(p[1], &mtime_sec, sizeof(mtime_sec)));
+  EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+  EXPECT_TRUE(send_n_data(p[1], &atime_valid, sizeof(atime_valid)));
+  EXPECT_TRUE(send_n_data(p[1], &atime_sec, sizeof(atime_sec)));
+  EXPECT_TRUE(send_n_data(p[1], &atime_nsec, sizeof(atime_nsec)));
+  int32_t crtime_valid = 0;
+  int64_t crtime_sec = 0;
+  int64_t crtime_nsec = 0;
+  EXPECT_TRUE(send_n_data(p[1], &crtime_valid, sizeof(crtime_valid)));
+  EXPECT_TRUE(send_n_data(p[1], &crtime_sec, sizeof(crtime_sec)));
+  EXPECT_TRUE(send_n_data(p[1], &crtime_nsec, sizeof(crtime_nsec)));
+  int ok = 1;
+  EXPECT_NULL(metadata_receive(p[0], &ok));
+  EXPECT_EQ_INT(ok, 0);
+  close(p[0]);
+  close(p[1]);
+}
+
+/* file_restore_metadata applies the source atime alongside mtime when -U
+ * captured it (atime_valid set). */
+static void test_file_restore_metadata_applies_atime() {
+  const char* path = "temp_meta_atime_test.txt";
+  EXPECT_TRUE(file_write_to_disk(path, "atime", 5, false, false));
+
+  FileMetadata m;
+  m.mode = 0644;
+  m.uid = getuid();
+  m.gid = getgid();
+  m.mtime_sec = 1234567890;
+  m.mtime_nsec = 0;
+  m.atime_valid = true;
+  m.atime_sec = 999999999;
+  m.atime_nsec = 123456789;
+  m.crtime_valid = false;
+  m.crtime_sec = 0;
+  m.crtime_nsec = 0;
+
+  file_restore_metadata(path, &m, false);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_mtime, 1234567890);
+#ifdef __linux__
+  EXPECT_EQ_INT((int)st.st_atime, 999999999);
+#else
+  EXPECT_EQ_INT((int)st.st_atime, 999999999);
+#endif
+
+  unlink(path);
 }
 
 static void test_metadata_mtime_window() {
@@ -214,8 +309,10 @@ void test_metadata() {
   test_metadata_send_receive_roundtrip();
   test_metadata_send_null();
   test_metadata_rejects_invalid_values();
+  test_metadata_receive_rejects_bad_optional_times();
   test_metadata_mtime_window();
   test_file_restore_metadata();
+  test_file_restore_metadata_applies_atime();
   test_file_restore_executability_only();
   test_directory_restore_executability_only();
   test_chmod_changes();

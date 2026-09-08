@@ -320,6 +320,8 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->use_metadata = options->use_metadata;
+  scanner->preserve_atimes = options->preserve_atimes;
+  scanner->preserve_crtimes = options->preserve_crtimes;
   scanner->chunk_size = options->chunk_size > 0 ? options->chunk_size : DESIRED_CHUNK_SIZE;
   scanner->exclude_patterns = options->exclude_patterns;
   scanner->exclude_count = options->exclude_count;
@@ -564,7 +566,8 @@ static File* dirs_root_dir_file(DirectoryScanner* scanner) {
   }
   file->is_dir = true;
   if (scanner->use_metadata) {
-    file->metadata = file_metadata_create(&st);
+    file->metadata = file_metadata_create(scanner->root_path, &st, scanner->preserve_atimes,
+                                          scanner->preserve_crtimes);
     if (!file->metadata) {
       file_destroy(file);
       scanner->failed = true;
@@ -641,7 +644,8 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
     }
   }
   if (scanner->use_metadata) {
-    file->metadata = file_metadata_create(&effective);
+    file->metadata = file_metadata_create(file->path, &effective, scanner->preserve_atimes,
+                                          scanner->preserve_crtimes);
     if (!file->metadata) {
       file_destroy(file);
       scanner->failed = true;
@@ -893,7 +897,8 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         rel_copy = NULL;
       }
       if (scanner->use_metadata)
-        file->metadata = file_metadata_create(&stats);
+        file->metadata = file_metadata_create(file->path, &stats, scanner->preserve_atimes,
+                                              scanner->preserve_crtimes);
       if (scanner->use_metadata && !file->metadata) {
         free(rel_copy);
         file_destroy(file);
@@ -1208,7 +1213,8 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     rel = NULL;
   }
   if (options->use_metadata)
-    file->metadata = file_metadata_create(&st);
+    file->metadata =
+        file_metadata_create(file->path, &st, options->preserve_atimes, options->preserve_crtimes);
   if (options->use_metadata && !file->metadata) {
     free(rel);
     file_destroy(file);

@@ -22,8 +22,14 @@ bool file_load_data(File* file);
 bool file_checksum(File* file, ChecksumAlgo algo, uint64_t seed, uint8_t* out, size_t out_capacity,
                    size_t* out_len);
 size_t file_content_to_buffer(File* file);
-FileMetadata* file_metadata_create(const struct stat* stats);
+FileMetadata* file_metadata_create(const char* path, const struct stat* stats, bool capture_atime,
+                                   bool capture_crtime);
 void file_metadata_destroy(void* metadata);
+/* --open-noatime process-wide sender policy; see file.c. */
+void file_set_open_noatime(bool enable);
+bool file_get_open_noatime(void);
+/* Open `path` read-only for transfer, honouring --open-noatime when set. */
+int file_open_for_read(const char* path);
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
                         bool inplace, bool sparse);
 
