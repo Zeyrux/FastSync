@@ -191,8 +191,9 @@ int identity_parse_map(Config* config, const char* value, bool is_group) {
   for (char* rule = strtok_r(list, ",", &saveptr); rule; rule = strtok_r(NULL, ",", &saveptr)) {
     char* colon = strchr(rule, ':');
     if (!colon || colon == rule) {
-      free(list);
+      /* Log before freeing: `rule` points into the str_dup'd list. */
       log_message(LOG_LEVEL_ERROR, "%s rules must be FROM:TO (got '%s')", optname, rule);
+      free(list);
       return -1;
     }
     *colon = '\0';
