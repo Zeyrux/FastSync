@@ -468,6 +468,50 @@ static void test_file_write_to_disk_does_not_follow_symlink() {
   unlink(link);
 }
 
+static void test_file_symlink_helpers() {
+  /* Munge/unmunge round-trip restores the original target. */
+  char* munged = file_symlink_munge("target.txt");
+  EXPECT_NOT_NULL(munged);
+  EXPECT_EQ_INT(memcmp(munged, SYMLINK_MUNGE_PREFIX, strlen(SYMLINK_MUNGE_PREFIX)), 0);
+  EXPECT_TRUE(file_symlink_unmunge(munged));
+  EXPECT_EQ_STR(munged, "target.txt");
+  free(munged);
+
+  char noop[] = "plain-target";
+  EXPECT_FALSE(file_symlink_unmunge(noop));
+  EXPECT_EQ_STR(noop, "plain-target");
+
+  /* Containment: relative targets without ".." are safe; absolute or
+     ".."-escaping targets are not. */
+  EXPECT_TRUE(file_symlink_target_contained("a.txt"));
+  EXPECT_TRUE(file_symlink_target_contained("sub/dir/file"));
+  EXPECT_FALSE(file_symlink_target_contained("/etc/passwd"));
+  EXPECT_FALSE(file_symlink_target_contained("../escape"));
+  EXPECT_FALSE(file_symlink_target_contained("a/../b"));
+  EXPECT_FALSE(file_symlink_target_contained(""));
+}
+
+static void test_file_symlink_at_secure() {
+  const char* link = "test_symlink_at_secure_link";
+  const char* outside = "test_symlink_at_secure_outside.txt";
+  unlink(link);
+  unlink(outside);
+  EXPECT_TRUE(file_write_to_disk(outside, "out", 3, false, false));
+
+  EXPECT_TRUE(file_symlink_at_secure(link, "outside.text"));
+  struct stat st;
+  EXPECT_EQ_INT(lstat(link, &st), 0);
+  EXPECT_TRUE(S_ISLNK(st.st_mode));
+
+  /* Replacing an existing non-directory entry is fine. */
+  EXPECT_TRUE(file_symlink_at_secure(link, "other.txt"));
+  EXPECT_EQ_INT(lstat(link, &st), 0);
+  EXPECT_TRUE(S_ISLNK(st.st_mode));
+
+  unlink(link);
+  unlink(outside);
+}
+
 static void test_file_content_to_buffer() {
   const char* content = "Buffer content test";
   EXPECT_TRUE(file_write_to_disk("test_buffer_file.txt", content, strlen(content), false, false));
@@ -978,6 +1022,8 @@ void test_file() {
   test_file_write_to_disk_creates_dirs();
   test_file_write_to_disk_does_not_follow_symlink();
   test_file_content_to_buffer();
+  test_file_symlink_helpers();
+  test_file_symlink_at_secure();
   test_file_save_to_disk_path_traversal();
   test_file_save_to_disk_deep_traversal();
   test_dir_entry_save_to_disk();

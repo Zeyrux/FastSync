@@ -74,7 +74,8 @@ static unsigned long long per_file_serialize_size(File* file, bool use_metadata)
   if (metadata_size > ULLONG_MAX - size)
     return 0;
   size += metadata_size;
-  /* Entry type marker: 0 = regular file, 1 = explicit directory entry. */
+  /* Entry type marker: 0 = regular file, 1 = explicit directory entry,
+     2 = symlink entry (carries its target string). */
   if (sizeof(int) > ULLONG_MAX - size)
     return 0;
   size += sizeof(int);
@@ -83,7 +84,18 @@ static unsigned long long per_file_serialize_size(File* file, bool use_metadata)
   size += sizeof(size_t);
   if ((unsigned long long)file->data->size > ULLONG_MAX - size)
     return 0;
-  return size + file->data->size;
+  size += file->data->size;
+  /* Symlink entries append the target string (length-prefixed). */
+  if (file->is_symlink) {
+    size_t target_len = file->symlink_target ? strlen(file->symlink_target) : 0;
+    if (sizeof(size_t) > ULLONG_MAX - size)
+      return 0;
+    size += sizeof(size_t);
+    if ((unsigned long long)target_len > ULLONG_MAX - size)
+      return 0;
+    size += target_len;
+  }
+  return size;
 }
 
 Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
@@ -116,7 +128,7 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
     memcpy(data_pointer, wire_path, path_len);
     data_pointer += path_len;
 
-    int entry_type = file->is_dir ? 1 : 0;
+    int entry_type = file->is_symlink ? 2 : (file->is_dir ? 1 : 0);
     memcpy(data_pointer, &entry_type, sizeof(int));
     data_pointer += sizeof(int);
 
@@ -129,6 +141,15 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
     if (file_data_size > 0)
       memcpy(data_pointer, file->data->data, file_data_size);
     data_pointer += file_data_size;
+
+    if (file->is_symlink) {
+      size_t target_len = file->symlink_target ? strlen(file->symlink_target) : 0;
+      memcpy(data_pointer, &target_len, sizeof(size_t));
+      data_pointer += sizeof(size_t);
+      if (target_len > 0)
+        memcpy(data_pointer, file->symlink_target, target_len);
+      data_pointer += target_len;
+    }
   }
   return data;
 }
@@ -206,13 +227,14 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     int entry_type;
     memcpy(&entry_type, data_pointer, sizeof(int));
-    if (entry_type != 0 && entry_type != 1) {
+    if (entry_type != 0 && entry_type != 1 && entry_type != 2) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: bad entry type");
       file_destroy(file);
       array_list_delete(files);
       return NULL;
     }
     file->is_dir = entry_type == 1;
+    file->is_symlink = entry_type == 2;
     data_pointer += sizeof(int);
     remaining_size -= sizeof(int);
 
@@ -292,6 +314,43 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     file->data = replacement;
     data_pointer += file_data_size;
     remaining_size -= file_data_size;
+
+    if (file->is_symlink) {
+      if (remaining_size < sizeof(size_t)) {
+        log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for symlink target");
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
+      size_t target_len;
+      memcpy(&target_len, data_pointer, sizeof(size_t));
+      data_pointer += sizeof(size_t);
+      remaining_size -= sizeof(size_t);
+      if (target_len == 0 || remaining_size < target_len) {
+        log_message(LOG_LEVEL_ERROR, "Invalid chunk format: bad symlink target");
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
+      char* target = protocol_alloc(target_len + 1);
+      if (!target) {
+        log_perror("Could not allocate memory for symlink target");
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
+      memcpy(target, data_pointer, target_len);
+      target[target_len] = '\0';
+      if (memchr(target, '\0', target_len) != NULL) {
+        free(target);
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
+      file->symlink_target = target;
+      data_pointer += target_len;
+      remaining_size -= target_len;
+    }
 
     if (!array_list_add(files, file)) {
       file_destroy(file);

@@ -56,6 +56,13 @@ typedef struct {
   int link_group;
   bool link_first;
   char* hardlink_target;
+  /* Symlink-type entry (-l/--links, or -k/--copy-dirlinks' keep-as-symlink
+   * branch).  When true, `symlink_target` holds the (sender-munged, if
+   * --munge-links) target string that is carried on the wire; the receiver
+   * creates a symlink to (an unmunged) target instead of writing regular-file
+   * data.  `data` is empty for a symlink entry.  Sender + receiver state. */
+  bool is_symlink;
+  char* symlink_target;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

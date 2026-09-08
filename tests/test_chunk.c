@@ -159,8 +159,66 @@ static void test_chunk_dir_entry_roundtrip() {
   rmdir(dir_path);
 }
 
+static void test_chunk_symlink_roundtrip() {
+  const char* file_path = "temp_chunk_symlink_file.txt";
+  const char* link_path = "temp_chunk_symlink";
+  const char* content = "regular payload";
+  const char* target = "temp_chunk_symlink_file.txt";
+
+  rmdir(link_path);
+  unlink(file_path);
+
+  file_write_to_disk(file_path, content, strlen(content), false, false);
+
+  for (int use_metadata = 0; use_metadata <= 1; use_metadata++) {
+    struct stat st;
+    EXPECT_EQ_INT(stat(file_path, &st), 0);
+
+    File* reg = file_create(file_path);
+    EXPECT_NOT_NULL(reg);
+    reg->data->size = (unsigned long long)st.st_size;
+    EXPECT_TRUE(file_load_data(reg));
+
+    File* link = file_create(link_path);
+    EXPECT_NOT_NULL(link);
+    link->is_symlink = true;
+    link->symlink_target = str_dup(target);
+    EXPECT_NOT_NULL(link->symlink_target);
+
+    if (use_metadata) {
+      reg->metadata = file_metadata_create(file_path, &st, false, false);
+      EXPECT_NOT_NULL(reg->metadata);
+      link->metadata = file_metadata_create(file_path, &st, false, false);
+      EXPECT_NOT_NULL(link->metadata);
+    }
+
+    File* files[2] = {reg, link};
+    Chunk* chunk = chunk_create(files, 2);
+    EXPECT_NOT_NULL(chunk);
+
+    Data* serialized = chunk_serialize(chunk, use_metadata != 0);
+    EXPECT_NOT_NULL(serialized);
+    Chunk* deserialized = chunk_deserialize(serialized, use_metadata != 0);
+    EXPECT_NOT_NULL(deserialized);
+    EXPECT_EQ_INT(deserialized->element_count, 2);
+    EXPECT_FALSE(deserialized->items[0]->is_symlink);
+    EXPECT_TRUE(deserialized->items[1]->is_symlink);
+    EXPECT_NULL(deserialized->items[0]->symlink_target);
+    EXPECT_EQ_STR(deserialized->items[1]->symlink_target, target);
+    EXPECT_EQ_INT((int)deserialized->items[1]->data->size, 0);
+
+    data_destroy(serialized);
+    chunk_destroy(deserialized);
+    chunk_destroy(chunk); /* frees reg and link */
+  }
+
+  unlink(file_path);
+  rmdir(link_path);
+}
+
 void test_chunk() {
   test_file_operations();
   test_chunk_operations();
   test_chunk_dir_entry_roundtrip();
+  test_chunk_symlink_roundtrip();
 }

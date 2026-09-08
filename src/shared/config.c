@@ -71,6 +71,9 @@ static void config_set_defaults(Config* config) {
   config->copy_links = false;
   config->safe_links = false;
   config->copy_unsafe_links = false;
+  config->copy_dirlinks = false;
+  config->munge_links = false;
+  config->keep_dirlinks = false;
   config->preserve_hard_links = false;
   config->preserve_acls = false;
   config->preserve_xattrs = false;
@@ -204,6 +207,7 @@ static bool validate_received_config(const Config* config) {
          !(config->preserve_hard_links && (config->append || config->append_verify)) &&
          valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
          valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
+         valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -771,6 +775,18 @@ static bool receive_metadata_times_options(int fd, Config* c) {
          receive_wire_bool(fd, &c->omit_link_times);
 }
 
+/* Phase 4 symlink-trust: --munge-links and -K/--keep-dirlinks.  Both CROSS the
+ * wire (the receiver unmunges symlink targets and, with -K, follows an in-root
+ * destination symlink-to-directory).  -k/--copy-dirlinks is sender-only and is
+ * never serialized.  Trailing fields; protocol 2.13.0. */
+static bool send_symlink_trust_options(int fd, const Config* c) {
+  return send_int(fd, c->munge_links) && send_int(fd, c->keep_dirlinks);
+}
+
+static bool receive_symlink_trust_options(int fd, Config* c) {
+  return receive_wire_bool(fd, &c->munge_links) && receive_wire_bool(fd, &c->keep_dirlinks);
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -780,7 +796,8 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_basis_options(file_descriptor, config) || !send_fuzzy_option(file_descriptor, config) ||
       !send_checksum_options(file_descriptor, config) ||
       !send_identity_options(file_descriptor, config) ||
-      !send_metadata_times_options(file_descriptor, config))
+      !send_metadata_times_options(file_descriptor, config) ||
+      !send_symlink_trust_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -817,7 +834,8 @@ Config* config_receive(int file_descriptor) {
       !receive_fuzzy_option(file_descriptor, config) ||
       !receive_checksum_options(file_descriptor, config) ||
       !receive_identity_options(file_descriptor, config) ||
-      !receive_metadata_times_options(file_descriptor, config))
+      !receive_metadata_times_options(file_descriptor, config) ||
+      !receive_symlink_trust_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

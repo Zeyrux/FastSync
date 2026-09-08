@@ -1219,6 +1219,40 @@ static void test_parse_args_short_s_remains_chunk_serialization() {
   config_delete(cfg);
 }
 
+/* Phase 4 symlink-trust flags: -k/--copy-dirlinks, -K/--keep-dirlinks and
+   --munge-links must parse into their Config fields. */
+static void test_parse_args_symlink_trust() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-k", "-K", "--munge-links", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->copy_dirlinks);
+  EXPECT_TRUE(cfg->keep_dirlinks);
+  EXPECT_TRUE(cfg->munge_links);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* long_argv[] = {"fastsync", "--copy-dirlinks", "--keep-dirlinks", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, long_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->copy_dirlinks);
+  EXPECT_TRUE(cfg->keep_dirlinks);
+  EXPECT_FALSE(cfg->munge_links);
+  config_delete(cfg);
+
+  /* Without any of the flags they stay off (additive, opt-in). */
+  cfg = config_create();
+  char* plain_argv[] = {"fastsync", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, plain_argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->copy_dirlinks);
+  EXPECT_FALSE(cfg->keep_dirlinks);
+  EXPECT_FALSE(cfg->munge_links);
+  config_delete(cfg);
+}
+
 static void test_parse_args_8_bit_output() {
   Config* cfg = config_create();
   char* long_argv[] = {"fastsync", "--8-bit-output", "/src", "/dst"};
@@ -2429,6 +2463,7 @@ void test_client_cli() {
   test_parse_args_rejects_unsupported_stderr_modes();
   test_parse_args_secluded_args();
   test_parse_args_short_s_remains_chunk_serialization();
+  test_parse_args_symlink_trust();
   test_parse_args_whole_file();
   test_parse_args_fuzzy_implies_delta();
   test_parse_args_fuzzy_negation();

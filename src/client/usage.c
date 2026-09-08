@@ -180,6 +180,9 @@ void print_usage(void) {
   printf("  --copy-links        Transform symlinks into referent files\n");
   printf("  --safe-links        Skip symlinks that point outside transfer tree\n");
   printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
+  printf("  -k, --copy-dirlinks Transform symlinks to directories into real dirs\n");
+  printf("  -K, --keep-dirlinks  Keep an existing symlink-to-dir as that dir\n");
+  printf("  --munge-links       Munge symlink targets on the wire (sender)\n");
   printf("  -H, --hard-links    Preserve hard-link relationships across the transfer\n");
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
