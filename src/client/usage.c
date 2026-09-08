@@ -185,6 +185,15 @@ void print_usage(void) {
   printf("  --munge-links       Munge symlink targets on the wire (sender)\n");
   printf("  -H, --hard-links    Preserve hard-link relationships across the transfer\n");
   printf("  -S, --sparse        Handle sparse files efficiently\n");
+  printf(
+      "  -D                  Preserve device and special files (implies --devices --specials)\n");
+  printf(
+      "  --devices           Recreate device nodes on the destination (privileged; skipped when\n");
+  printf("                      the receiver lacks CAP_MKNOD)\n");
+  printf("  --specials          Recreate special files (FIFOs) on the destination (sockets "
+         "skipped)\n");
+  printf("  --copy-devices      Copy a source device's content as a regular file instead\n");
+  printf("  --write-devices     Write received data into an existing destination device node\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
   printf(
       "  --preallocate       Allocate destination file space up front (fail-fast on full disk)\n");

@@ -540,6 +540,11 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--numeric-ids", NULL, OPT_FLAG, offsetof(Config, numeric_ids)},
     {"--atimes", "-U", OPT_FLAG, offsetof(Config, preserve_atimes)},
     {"--crtimes", "-N", OPT_FLAG, offsetof(Config, preserve_crtimes)},
+    /* -D is handled separately (it implies both --devices and --specials). */
+    {"--devices", NULL, OPT_FLAG, offsetof(Config, preserve_devices)},
+    {"--specials", NULL, OPT_FLAG, offsetof(Config, preserve_specials)},
+    {"--copy-devices", NULL, OPT_FLAG, offsetof(Config, copy_devices)},
+    {"--write-devices", NULL, OPT_FLAG, offsetof(Config, write_devices)},
     {"--omit-dir-times", "-O", OPT_FLAG, offsetof(Config, omit_dir_times)},
     {"--omit-link-times", "-J", OPT_FLAG, offsetof(Config, omit_link_times)},
     {"--open-noatime", NULL, OPT_FLAG, offsetof(Config, open_noatime)},
@@ -834,6 +839,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (opt_is(argv[i], "-V", "--version")) {
       printf("fastsync version %s\n", PROTOCOL_VERSION);
       return 1;
+    } else if (opt_is(argv[i], "-D", NULL)) {
+      /* rsync -D == --devices --specials.  -D is otherwise unassigned in
+         FastSync (verified: no collision), so it is free to imply both. */
+      config->preserve_devices = true;
+      config->preserve_specials = true;
+      log_info_message(LOG_INFO_MISC, "Enabled preservation of device and special files (-D)");
     } else if (opt_is(argv[i], "-a", "--archive")) {
       config->use_compression =
           !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
@@ -1202,6 +1213,15 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     file_list_destroy((FileListSet*)config->files_from_set);
     config->files_from_set = set;
   }
+
+  /* Device/special preservation recreates a node from its metadata mode (whose
+     S_IFMT bits carry the node kind), so --devices/--specials/-D imply metadata
+     transmission.  --copy-devices/--write-devices treat the entry as data but a
+     mtime/mode-preserving transfer still benefits from metadata, so all four
+     imply it (FastSync's broad -M bundle; ownership stays opt-in). */
+  if (config->preserve_devices || config->preserve_specials || config->copy_devices ||
+      config->write_devices)
+    config->use_metadata = true;
 
   /* The "unchanged" decision for --compare-dest/--copy-dest/--link-dest must
    * be made on the receiver against the basis directories, which requires the

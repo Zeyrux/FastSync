@@ -75,10 +75,17 @@ static unsigned long long per_file_serialize_size(File* file, bool use_metadata)
     return 0;
   size += metadata_size;
   /* Entry type marker: 0 = regular file, 1 = explicit directory entry,
-     2 = symlink entry (carries its target string). */
+     2 = symlink entry (carries its target string), 3 = special/device node
+     (recreated by the receiver). */
   if (sizeof(int) > ULLONG_MAX - size)
     return 0;
   size += sizeof(int);
+  /* A special node also carries its rdev major/minor. */
+  if (file->is_special) {
+    if (2 * sizeof(int32_t) > ULLONG_MAX - size)
+      return 0;
+    size += 2 * sizeof(int32_t);
+  }
   if (sizeof(size_t) > ULLONG_MAX - size)
     return 0;
   size += sizeof(size_t);
@@ -128,9 +135,18 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
     memcpy(data_pointer, wire_path, path_len);
     data_pointer += path_len;
 
-    int entry_type = file->is_symlink ? 2 : (file->is_dir ? 1 : 0);
+int entry_type = file->is_dir ? 1 : (file->is_symlink ? 2 : (file->is_special ? 3 : 0));
     memcpy(data_pointer, &entry_type, sizeof(int));
     data_pointer += sizeof(int);
+
+    if (file->is_special) {
+      int32_t special_major = file->rdev_major;
+      int32_t special_minor = file->rdev_minor;
+      memcpy(data_pointer, &special_major, sizeof(special_major));
+      data_pointer += sizeof(special_major);
+      memcpy(data_pointer, &special_minor, sizeof(special_minor));
+      data_pointer += sizeof(special_minor);
+    }
 
     if (use_metadata)
       metadata_to_buf(&data_pointer, file->metadata);
@@ -227,7 +243,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     int entry_type;
     memcpy(&entry_type, data_pointer, sizeof(int));
-    if (entry_type != 0 && entry_type != 1 && entry_type != 2) {
+    if (entry_type != 0 && entry_type != 1 && entry_type != 2 && entry_type != 3) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: bad entry type");
       file_destroy(file);
       array_list_delete(files);
@@ -235,8 +251,37 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     file->is_dir = entry_type == 1;
     file->is_symlink = entry_type == 2;
+    file->is_special = entry_type == 3;
     data_pointer += sizeof(int);
     remaining_size -= sizeof(int);
+
+    if (file->is_special) {
+      if (remaining_size < 2 * (int32_t)sizeof(int32_t)) {
+        log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for special rdev");
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
+      int32_t special_major, special_minor;
+      memcpy(&special_major, data_pointer, sizeof(special_major));
+      data_pointer += sizeof(special_major);
+      memcpy(&special_minor, data_pointer, sizeof(special_minor));
+      data_pointer += sizeof(special_minor);
+      remaining_size -= 2 * sizeof(int32_t);
+      /* Reject an out-of-range/negative rdev here as a malformed chunk (the
+         same 0xffff / 0x00ffffff bounds file_special_rdev_valid uses), so a
+         bogus large-but-positive rdev is refused cleanly instead of being
+         deferred to the creation site where it would abort after the frame. */
+      if (special_major < 0 || special_minor < 0 || special_major > 0xffff ||
+          special_minor > 0x00ffffff) {
+        log_message(LOG_LEVEL_ERROR, "Invalid chunk format: out-of-range special rdev");
+        file_destroy(file);
+        array_list_delete(files);
+        return NULL;
+      }
+      file->rdev_major = special_major;
+      file->rdev_minor = special_minor;
+    }
 
     if (use_metadata) {
       if (remaining_size < sizeof(int)) {

@@ -96,7 +96,14 @@ enum NET_STATUS {
    * if --munge-links) symlink target, and optional metadata; the receiver
    * creates a symlink to the unmunged target beneath the receive root (see
    * file_receive_symlink).  Protocol 2.13.0. */
-  STATUS_SYMLINK
+  STATUS_SYMLINK,
+  /* --devices / --specials (-D): a device or special node the sender wants
+   * recreated (not written from content).  Payload: destination path, the
+   * metadata frame (whose mode's S_IFMT bits carry the node kind), and two
+   * int32 rdev major/minor fields.  The receiver validates the kind and rdev,
+   * confines the node below the receive root, and recreates it (mknod/mkfifo),
+   * privilege-gating the mknod.  Protocol 2.13.0. */
+  STATUS_SPECIAL
 };
 
 void io_set_fds(int read_fd, int write_fd);

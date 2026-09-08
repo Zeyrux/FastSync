@@ -1141,6 +1141,48 @@ static void test_config_preallocate_wire_roundtrip() {
     }
   }
 }
+static void test_config_devices_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  send_cfg->preserve_devices = true;
+  send_cfg->preserve_specials = true;
+  send_cfg->copy_devices = true;
+  send_cfg->write_devices = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL;
+    if (ok) {
+      ok = recv->preserve_devices && recv->preserve_specials && recv->copy_devices &&
+           recv->write_devices;
+    }
+    config_delete(recv);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1169,6 +1211,7 @@ void test_config() {
     test_config_identity_wire_roundtrip();
     test_config_receive_rejects_invalid_identity();
     test_config_metadata_times_wire_roundtrip();
+    test_config_devices_wire_roundtrip();
     test_config_preallocate_wire_roundtrip();
   }
   test_config_delete_timing_early_helper();

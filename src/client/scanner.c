@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <threads.h>
 #include <unistd.h>
 #include <limits.h>
@@ -197,6 +198,34 @@ static void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* ta
   } else {
     free(first_path);
   }
+}
+
+/* Phase 4 special/devices: detect a device (char/block), FIFO or socket entry
+   and, when the matching --devices/--specials flag asks it be preserved,
+   convert the File into a node to recreate (is_special, empty payload) with its
+   device rdev captured from the source stat.  When the entry is not preserved
+   (or --copy-devices instead copies its content as an ordinary regular file)
+   the File is left as a normal data file.  Returns true when converted. */
+static bool scanner_prepare_special(bool preserve_devices, bool preserve_specials, File* file,
+                                    const struct stat* stats) {
+  if (!file || !stats)
+    return false;
+  bool is_device = S_ISCHR(stats->st_mode) || S_ISBLK(stats->st_mode);
+  bool is_fifo = S_ISFIFO(stats->st_mode);
+  bool is_socket = S_ISSOCK(stats->st_mode);
+  if (!is_device && !is_fifo && !is_socket)
+    return false;
+  bool preserve = is_device ? preserve_devices : preserve_specials;
+  if (!preserve)
+    return false;
+  file->is_special = true;
+  file->data->size = 0;
+  file->data->data = NULL;
+  if (is_device) {
+    file->rdev_major = (int32_t)major(stats->st_rdev);
+    file->rdev_minor = (int32_t)minor(stats->st_rdev);
+  }
+  return true;
 }
 
 /* Append `rel` to the caller's exclusion sink, taking `mtx` when shared across
@@ -420,6 +449,9 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->munge_links = options->munge_links;
   scanner->checksum = options->checksum;
   scanner->one_file_system = options->one_file_system;
+  scanner->preserve_devices = options->preserve_devices;
+  scanner->preserve_specials = options->preserve_specials;
+  scanner->copy_devices = options->copy_devices;
   scanner->failed = false;
   scanner->root_path = str_dup(root_directory);
   if (!scanner->root_path) {
@@ -990,6 +1022,9 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         file->send_path = rel_copy;
         rel_copy = NULL;
       }
+      /* --devices/--specials: a device/FIFO/socket entry marked for preservation
+         becomes a node to recreate (is_special, no data, rdev captured). */
+      scanner_prepare_special(scanner->preserve_devices, scanner->preserve_specials, file, &stats);
       if (scanner->hardlinks && S_ISREG(stats.st_mode))
         scanner_assign_hardlink(scanner, scanner->hardlinks, file, &stats);
       if (scanner->use_metadata)
@@ -1316,6 +1351,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     file->send_path = rel;
     rel = NULL;
   }
+  scanner_prepare_special(options->preserve_devices, options->preserve_specials, file, &st);
   if (options->hardlinks && S_ISREG(st.st_mode)) {
     int gid;
     bool is_first;

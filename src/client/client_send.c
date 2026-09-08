@@ -106,6 +106,9 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->munge_links = config->munge_links;
   options->checksum = config->checksum;
   options->one_file_system = config->one_file_system;
+  options->preserve_devices = config->preserve_devices;
+  options->preserve_specials = config->preserve_specials;
+  options->copy_devices = config->copy_devices;
   options->file_list = (const FileListSet*)config->files_from_set;
   options->base_filters = out->base_filters;
   options->per_dir_filters = config->per_dir_filter;
@@ -1264,9 +1267,17 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       change_emit_file_sent(config, f);
       continue;
     }
-    /* Symlink entry (-l / -k keep-as-symlink): only the target rides the wire. */
+/* Symlink entry (-l / -k keep-as-symlink): only the target rides the wire. */
     if (f->is_symlink) {
       if (!send_symlink_entry(client, f, config))
+        return -1;
+      change_emit_file_sent(config, f);
+      continue;
+    }
+    /* --devices/--specials: a device/special node is recreated on the receiver,
+       not transferred as content.  Send the dedicated STATUS_SPECIAL frame. */
+    if (f->is_special) {
+      if (!file_send_special(f, client->file_descriptor, config->use_metadata))
         return -1;
       change_emit_file_sent(config, f);
       continue;

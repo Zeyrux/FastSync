@@ -42,6 +42,12 @@ typedef struct {
   bool munge_links;
   bool checksum;
   bool one_file_system;
+  /* Phase 4 special/devices: whether device nodes (--devices) and special files
+   * (--specials) are preserved via recreation, and whether --copy-devices
+   * copies a device's content as an ordinary regular file. */
+  bool preserve_devices;
+  bool preserve_specials;
+  bool copy_devices;
   /* Phase 2 (files-from / filter layer). All pointers are shared read-only
    * across scanner instances and worker threads; ownership stays with the
    * caller (client_send). */
@@ -114,6 +120,10 @@ typedef struct {
   bool one_file_system;
   dev_t root_dev;
   bool failed;
+  /* Phase 4 special/devices (see ScannerOptions). */
+  bool preserve_devices;
+  bool preserve_specials;
+  bool copy_devices;
   /* Phase 2 (files-from / filter layer). */
   char* root_path;          /* transfer root (fs path) for rel computation */
   char* current_rel;        /* rel path of the open directory ("" == root) */

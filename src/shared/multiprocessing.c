@@ -308,8 +308,9 @@ int write_thread(void* pipeline_context) {
     }
     /* Record the per-file outcome so a --remove-source-files sender learns
        which sources were actually written versus skipped on the receiver.
-       Explicit directory entries have no source and are never acknowledged. */
-    if (context->config->remove_source_files && !file->is_dir && !file->skip &&
+       Explicit directory entries and recreated device/special nodes have no
+       source and are never acknowledged (mirrors receiver.c). */
+    if (context->config->remove_source_files && !file->is_dir && !file->is_special && !file->skip &&
         !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
       file_destroy(file);
       pipeline_context_receiver_note_bytes_released(context, file_bytes);

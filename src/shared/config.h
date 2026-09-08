@@ -124,6 +124,22 @@ typedef struct Config {
   bool preserve_xattrs;
   bool preserve_devices;
   bool preserve_sparse;
+  /* Phase 4 special/devices: preserve special files (FIFOs, sockets) and device
+   * nodes on the destination by recreating them (mknod/mkfifo) instead of
+   * transferring content.  preserve_specials mirrors rsync --specials (the
+   * special-file half of -D); preserve_devices mirrors --devices (the device
+   * half of -D); both CROSS the wire so the receiver knows a special/device
+   * entry must be recreated rather than written as a regular file. */
+  bool preserve_specials;
+  /* --copy-devices: copy the CONTENT of a source device as an ordinary regular
+   * file on the destination (rsync's non-privileged safe mode), instead of
+   * recreating the device node.  CROSSES the wire (receiver treats the entry as
+   * a regular file, which is the default, so this is belt-and-braces). */
+  bool copy_devices;
+  /* --write-devices: write the received data directly INTO an existing device
+   * node on the destination instead of creating a regular file.  Dangeroud;
+   * see RSYNC_COMPAT.md for the tight gating.  CROSSES the wire. */
+  bool write_devices;
 
   // Issue #122: Output/logging options
   bool itemize_changes;
