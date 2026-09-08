@@ -1,6 +1,7 @@
 #include "config.h"
 #include "delay_updates.h"
 #include "file.h"
+#include "identity.h"
 #include "log.h"
 #include "multiprocessing.h"
 #include "protocol.h"
@@ -210,6 +211,10 @@ void handler(int file_descriptor) {
       return;
     }
   }
+  /* Preserve the negotiated identity policy for the fd-relative ownership
+     apply path.  Each connection is its own forked process, so this
+     per-process snapshot never races another connection. */
+  identity_set_active(config);
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {
@@ -225,6 +230,7 @@ void handler(int file_descriptor) {
       config_delete(config);
       close(file_descriptor);
       protocol_session_unbind();
+      identity_clear_active();
       return;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
@@ -253,6 +259,7 @@ void handler(int file_descriptor) {
         thrd_join(writer, NULL);
       pipeline_context_receiver_destroy(context);
       protocol_session_unbind();
+      identity_clear_active();
       return;
     }
     int receiver_result;
@@ -303,6 +310,7 @@ void handler(int file_descriptor) {
     config_delete(config);
   }
   protocol_session_unbind();
+  identity_clear_active();
   close(file_descriptor);
 }
 

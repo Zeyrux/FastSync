@@ -3676,3 +3676,89 @@ class TestFuzzy:
         assert proxy.client_to_server > len(new_bytes) // 2, \
             "--no-fuzzy should leave the default whole-file behavior intact"
 
+
+
+class TestIdentityMapping:
+    """Ownership-application flags (--numeric-ids / --usermap / --groupmap /
+    --chown).  In CI the receiver usually runs unprivileged, so ownership apply
+    is expected to fail from lack of privilege: the transfer must STILL succeed
+    and exit 0 (the receiver warns and continues, rsync parity).  The only
+    assertion that requires the ownership to actually change is gated on
+    os.geteuid() == 0 so it is skipped (not failed) as a non-root user."""
+
+    def test_numeric_ids_transfer_succeeds_unprivileged(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "identity_num_source")
+        dest = os.path.join(TEST_DATA_DIR, "identity_num_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"hello identity")
+        result, _ = run_client(source, dest,
+                               flags=["-M", "--numeric-ids"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        with open(os.path.join(received, "f.txt"), "rb") as f:
+            assert f.read() == b"hello identity"
+
+    def test_usermap_and_groupmap_and_chown_succeed_unprivileged(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "identity_map_source")
+        dest = os.path.join(TEST_DATA_DIR, "identity_map_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"mapped")
+        result, _ = run_client(
+            source, dest,
+            flags=["-M", "--usermap=@1000:@1001", "--groupmap=@100:@101", "--chown=@2000:@2001"],
+            port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        with open(os.path.join(received, "f.txt"), "rb") as f:
+            assert f.read() == b"mapped"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_numeric_ids_applies_ownership_as_root(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "identity_root_source")
+        dest = os.path.join(TEST_DATA_DIR, "identity_root_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as f:
+            f.write(b"owner")
+        os.chown(src_file, 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["-M", "--numeric-ids"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        dst_file = os.path.join(received, "f.txt")
+        assert os.path.exists(dst_file)
+        st = os.stat(dst_file)
+        assert st.st_uid == 12345 and st.st_gid == 12346, \
+            f"owner not applied: uid={st.st_uid} gid={st.st_gid}"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_chown_overrides_ownership_as_root(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "identity_chown_root_source")
+        dest = os.path.join(TEST_DATA_DIR, "identity_chown_root_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as f:
+            f.write(b"root chown")
+        os.chown(src_file, 1, 1)
+        result, _ = run_client(source, dest,
+                               flags=["-M", "--chown=@12345:@54321"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        dst_file = os.path.join(received, "f.txt")
+        assert os.path.exists(dst_file)
+        st = os.stat(dst_file)
+        assert st.st_uid == 12345 and st.st_gid == 54321, \
+            f"--chown not applied: uid={st.st_uid} gid={st.st_gid}"

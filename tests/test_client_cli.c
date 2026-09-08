@@ -7,6 +7,8 @@
 #include "log.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <pwd.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2083,8 +2085,169 @@ static void test_validate_config_append_verify_rejects_whole_file() {
   EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
+/* --numeric-ids is a plain boolean flag. */
+static void test_parse_args_numeric_ids() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--numeric-ids", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->numeric_ids);
+  config_delete(cfg);
+}
+
+/* --usermap / --groupmap resolve an rsync subset into numeric FROM:TO pairs and
+ * imply metadata preservation (so the source uid/gid travel on the wire). */
+static void test_parse_args_usermap() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--usermap=@1000:@1001", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].from, 1000);
+  EXPECT_EQ_INT(cfg->usermap[0].to, 1001);
+  config_delete(cfg);
+
+  /* Space form, multiple rules, comma-separated. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--usermap", "@1:@2,@3:@4", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 2);
+  EXPECT_EQ_INT(cfg->usermap[0].from, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].to, 2);
+  EXPECT_EQ_INT(cfg->usermap[1].from, 3);
+  EXPECT_EQ_INT(cfg->usermap[1].to, 4);
+  config_delete(cfg);
+
+  /* '*' FROM means match any id; '*' TO means current user. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--usermap=*:@2000", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap[0].from, IDENTITY_MATCH_ANY);
+  EXPECT_EQ_INT(cfg->usermap[0].to, 2000);
+  config_delete(cfg);
+}
+
+static void test_parse_args_groupmap() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--groupmap=@100:@101", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_EQ_INT(cfg->groupmap_count, 1);
+  EXPECT_EQ_INT(cfg->groupmap[0].from, 100);
+  EXPECT_EQ_INT(cfg->groupmap[0].to, 101);
+  config_delete(cfg);
+}
+
+/* A name in a map can be resolved to a number via the local user database. */
+static void test_parse_args_usermap_name_resolution() {
+  struct passwd* self = getpwuid(geteuid());
+  if (!self)
+    return; /* cannot construct a resolvable name deterministically */
+  char map_value[128];
+  snprintf(map_value, sizeof(map_value), "%s:@0", self->pw_name);
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", (char*)"--usermap", map_value, "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].from, (int32_t)self->pw_uid);
+  config_delete(cfg);
+}
+
+/* --chown parses USER:GROUP / USER / :GROUP, numeric ids, and '*'. */
+static void test_parse_args_chown() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chown=@1000:@1001", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->chown_uid_set);
+  EXPECT_EQ_INT(cfg->chown_uid, 1000);
+  EXPECT_TRUE(cfg->chown_gid_set);
+  EXPECT_EQ_INT(cfg->chown_gid, 1001);
+  config_delete(cfg);
+
+  /* --chown=:GROUP sets only the group. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--chown=:@1001", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->chown_uid_set);
+  EXPECT_TRUE(cfg->chown_gid_set);
+  EXPECT_EQ_INT(cfg->chown_gid, 1001);
+  config_delete(cfg);
+
+  /* --chown=USER sets only the owner. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--chown=@1000", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->chown_uid_set);
+  EXPECT_EQ_INT(cfg->chown_uid, 1000);
+  EXPECT_FALSE(cfg->chown_gid_set);
+  config_delete(cfg);
+
+  /* '*' means current user/group. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--chown=*:*", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->chown_uid_set);
+  EXPECT_EQ_INT(cfg->chown_uid, IDENTITY_CURRENT);
+  EXPECT_TRUE(cfg->chown_gid_set);
+  EXPECT_EQ_INT(cfg->chown_gid, IDENTITY_CURRENT);
+  config_delete(cfg);
+}
+
+/* Malformed identity specs are rejected, never silently ignored. */
+static void test_parse_args_rejects_malformed_identity() {
+  struct {
+    const char* opt;
+    const char* val;
+  } bad[] = {
+      {"--usermap", "@1000"},
+      {"--usermap", ":1000"},
+      {"--usermap", "definitely_not_a_real_user_zzz:@1"},
+      {"--groupmap", "@1"},
+      {"--groupmap", "no_such_group_qqq:x"},
+      {"--chown", "a:b:c"},
+      {"--chown", "no_such_user_zzz:"},
+  };
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)bad[i].opt, (char*)bad[i].val, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  /* An option with a missing value fails at the CLI layer. */
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chown"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
+  test_parse_args_numeric_ids();
+  test_parse_args_usermap();
+  test_parse_args_groupmap();
+  test_parse_args_usermap_name_resolution();
+  test_parse_args_chown();
+  test_parse_args_rejects_malformed_identity();
   test_parse_args_append();
   test_parse_args_append_verify();
   test_parse_args_append_both();

@@ -3,6 +3,7 @@
 #include "delay_updates.h"
 #include "delta.h"
 #include "file_list.h"
+#include "identity.h"
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
@@ -136,6 +137,15 @@ static void config_set_defaults(Config* config) {
   config->skip_compress_suffixes = NULL;
   config->skip_compress_count = 0;
   config->skip_compress_set = false;
+  config->numeric_ids = false;
+  config->chown_uid_set = false;
+  config->chown_uid = 0;
+  config->chown_gid_set = false;
+  config->chown_gid = 0;
+  config->usermap = NULL;
+  config->usermap_count = 0;
+  config->groupmap = NULL;
+  config->groupmap_count = 0;
   config->delay_context = NULL;
 }
 
@@ -178,6 +188,7 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          checksum_algo_valid(config->checksum_algo) && config_has_valid_delete_timing(config) &&
+         identity_wire_valid(config) &&
          !(config->skip_compress_set && config->use_chunk_serialization) &&
          /* --append / --append-verify tail resume needs the per-file check,
             which chunk serialization -s disables: reject on the receiver too
@@ -379,6 +390,12 @@ void config_delete(Config* config) {
       free(config->skip_compress_suffixes[i]);
     free(config->skip_compress_suffixes);
   }
+  free(config->usermap);
+  config->usermap = NULL;
+  config->usermap_count = 0;
+  free(config->groupmap);
+  config->groupmap = NULL;
+  config->groupmap_count = 0;
   if (config->filters) {
     array_list_delete(config->filters);
   }
@@ -673,6 +690,60 @@ static bool receive_checksum_options(int fd, Config* c) {
   return receive_n_data(fd, &c->checksum_seed, sizeof(c->checksum_seed));
 }
 
+/* --numeric-ids / --usermap / --groupmap / --chown (identity mapping).  The
+ * receiver needs these to apply the ownership the client requested, so they
+ * cross the config frame.  Trailing fields; protocol 2.11.0. */
+static bool send_identity_map(int fd, const IdentityMap* map, int count) {
+  if (!send_int(fd, count))
+    return false;
+  for (int i = 0; i < count; i++) {
+    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].to))
+      return false;
+  }
+  return true;
+}
+
+static bool send_identity_options(int fd, const Config* c) {
+  return send_int(fd, c->numeric_ids) && send_int(fd, c->chown_uid_set) &&
+         send_int(fd, c->chown_uid) && send_int(fd, c->chown_gid_set) &&
+         send_int(fd, c->chown_gid) && send_identity_map(fd, c->usermap, c->usermap_count) &&
+         send_identity_map(fd, c->groupmap, c->groupmap_count);
+}
+
+static bool receive_identity_map(int fd, int* pcount, IdentityMap** pmap) {
+  int count;
+  if (!receive_int(fd, &count) || count < 0 || count > MAX_IDENTITY_MAP)
+    return false;
+  if (count > 0) {
+    IdentityMap* map = calloc((size_t)count, sizeof(IdentityMap));
+    if (!map)
+      return false;
+    for (int i = 0; i < count; i++) {
+      if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].to)) {
+        free(map);
+        return false;
+      }
+    }
+    *pmap = map;
+  }
+  *pcount = count;
+  return true;
+}
+
+static bool receive_identity_options(int fd, Config* c) {
+  int numeric_ids;
+  if (!receive_int(fd, &numeric_ids) || !valid_wire_bool(numeric_ids))
+    return false;
+  c->numeric_ids = numeric_ids != 0;
+  if (!receive_wire_bool(fd, &c->chown_uid_set) || !receive_int(fd, &c->chown_uid) ||
+      !receive_wire_bool(fd, &c->chown_gid_set) || !receive_int(fd, &c->chown_gid))
+    return false;
+  if (c->chown_uid < IDENTITY_MATCH_ANY || c->chown_gid < IDENTITY_MATCH_ANY)
+    return false;
+  return receive_identity_map(fd, &c->usermap_count, &c->usermap) &&
+         receive_identity_map(fd, &c->groupmap_count, &c->groupmap);
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -680,7 +751,8 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_selection_options(file_descriptor, config) ||
       !send_resume_options(file_descriptor, config) ||
       !send_basis_options(file_descriptor, config) || !send_fuzzy_option(file_descriptor, config) ||
-      !send_checksum_options(file_descriptor, config))
+      !send_checksum_options(file_descriptor, config) ||
+      !send_identity_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -715,7 +787,8 @@ Config* config_receive(int file_descriptor) {
       !receive_resume_options(file_descriptor, config) ||
       !receive_basis_options(file_descriptor, config) ||
       !receive_fuzzy_option(file_descriptor, config) ||
-      !receive_checksum_options(file_descriptor, config))
+      !receive_checksum_options(file_descriptor, config) ||
+      !receive_identity_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

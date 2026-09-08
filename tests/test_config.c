@@ -908,6 +908,102 @@ static void test_config_receive_rejects_invalid_checksum_algo() {
   EXPECT_FALSE(roundtrip_config_ok(c));
   config_delete(c);
 }
+/* The identity-mapping fields (--numeric-ids / --usermap / --groupmap /
+   --chown) cross the config wire unchanged: the receiver needs them to apply
+   ownership with the same policy the client requested. */
+static void test_config_identity_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  send_cfg->numeric_ids = true;
+  send_cfg->chown_uid_set = true;
+  send_cfg->chown_uid = 1001;
+  send_cfg->chown_gid_set = true;
+  send_cfg->chown_gid = IDENTITY_CURRENT;
+  send_cfg->usermap_count = 2;
+  send_cfg->usermap = calloc(2, sizeof(IdentityMap));
+  send_cfg->usermap[0].from = IDENTITY_MATCH_ANY;
+  send_cfg->usermap[0].to = 65534;
+  send_cfg->usermap[1].from = 1000;
+  send_cfg->usermap[1].to = 1000;
+  send_cfg->groupmap_count = 1;
+  send_cfg->groupmap = calloc(1, sizeof(IdentityMap));
+  send_cfg->groupmap[0].from = 0;
+  send_cfg->groupmap[0].to = IDENTITY_CURRENT;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL;
+    if (ok) {
+      ok = recv->numeric_ids && recv->chown_uid_set && recv->chown_uid == 1001 &&
+           recv->chown_gid_set && recv->chown_gid == IDENTITY_CURRENT && recv->usermap_count == 2 &&
+           recv->groupmap_count == 1 && recv->usermap[0].from == IDENTITY_MATCH_ANY &&
+           recv->usermap[0].to == 65534 && recv->usermap[1].from == 1000 &&
+           recv->usermap[1].to == 1000 && recv->groupmap[0].from == 0 &&
+           recv->groupmap[0].to == IDENTITY_CURRENT;
+    }
+    config_delete(recv);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* The receiver must reject an out-of-range identity-map count or id on the
+   wire (defense against a malicious/oversized table). */
+static void test_config_receive_rejects_invalid_identity() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->usermap_count = 1;
+  c->usermap = calloc(1, sizeof(IdentityMap));
+  c->usermap[0].from = -2; /* below IDENTITY_MATCH_ANY */
+  c->usermap[0].to = 0;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->chown_uid_set = true;
+  c->chown_uid = -5;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* A well-formed identity config still round-trips through the shared helper. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->numeric_ids = true;
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -932,6 +1028,8 @@ void test_config() {
     test_config_basis_normalization();
     test_config_checksum_options_wire_roundtrip();
     test_config_receive_rejects_invalid_checksum_algo();
+    test_config_identity_wire_roundtrip();
+    test_config_receive_rejects_invalid_identity();
   }
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

@@ -1,5 +1,6 @@
 #include "metadata.h"
 #include "file.h"
+#include "identity.h"
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
@@ -249,7 +250,15 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
   mode_t safe_mode = metadata_mode(metadata, current.st_mode, preserve_executability);
   if (fchmod(fd, safe_mode) != 0)
     ok = false;
-  /* Client uid/gid values are deliberately not authoritative. */
+  /* Client uid/gid values are deliberately not authoritative UNLESS the client
+     explicitly opted in with an identity flag (--numeric-ids / --usermap /
+     --groupmap / --chown).  identity_apply_ownership is the controlled,
+     privilege-gated path: it consults the negotiated policy, resolves the
+     target ids, and applies them via an fd-relative fchown() that is confined
+     to the just-written file (EPERM/EACCES are logged, never fatal).  With no
+     identity flag set it is a no-op, so a default or plain -M transfer keeps
+     FastSync's existing behavior of never applying client ownership. */
+  identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid);
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
                               {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
   if (futimens(fd, times) != 0)
