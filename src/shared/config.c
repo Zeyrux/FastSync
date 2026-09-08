@@ -92,6 +92,7 @@ static void config_set_defaults(Config* config) {
   config->use_fsync = false;
   config->append = false;
   config->append_verify = false;
+  config->preallocate = false;
   config->delete_excluded = false;
   config->delete_after = false;
   config->max_delete = -1;
@@ -178,8 +179,9 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->existing) && valid_wire_bool(config->update) &&
          valid_wire_bool(config->inplace) && valid_wire_bool(config->append) &&
          valid_wire_bool(config->use_fsync) && valid_wire_bool(config->append_verify) &&
-         valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->force_delete) &&
-         valid_wire_bool(config->delete_missing_args) && valid_wire_bool(config->delete_after) &&
+          valid_wire_bool(config->delete_excluded) && valid_wire_bool(config->force_delete) &&
+          valid_wire_bool(config->delete_missing_args) && valid_wire_bool(config->delete_after) &&
+          valid_wire_bool(config->preallocate) &&
          valid_wire_bool(config->delete_delay) && valid_wire_bool(config->delete_during) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
@@ -448,6 +450,7 @@ static bool send_selection_options(int fd, const Config* c) {
          send_int(fd, c->use_fsync) && send_int(fd, c->append_verify) &&
          send_int(fd, c->delete_excluded) && send_int(fd, c->force_delete) &&
          send_int(fd, c->delete_missing_args) && send_int(fd, c->delete_after) &&
+         send_int(fd, c->preallocate) &&
          send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) && send_int(fd, c->relative) &&
          send_int(fd, c->prune_empty_dirs) && send_int(fd, c->mkpath) &&
          send_int(fd, c->delete_during) && send_int(fd, c->delete_delay);
@@ -579,7 +582,8 @@ static bool receive_selection_options(int fd, Config* c) {
                    &c->delete_excluded,
                    &c->force_delete,
                    &c->delete_missing_args,
-                   &c->delete_after};
+                   &c->delete_after,
+                   &c->preallocate};
   for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
     if (!receive_wire_bool(fd, flags[i]))
       return false;

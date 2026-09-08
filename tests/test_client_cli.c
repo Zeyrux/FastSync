@@ -2237,6 +2237,18 @@ static void test_parse_args_rejects_malformed_identity() {
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
+
+/* --preallocate parses as a boolean flag and validates cleanly. */
+static void test_parse_args_preallocate() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  char* argv[] = {"fastsync", "--preallocate", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preallocate);
+  EXPECT_TRUE(validate_config(cfg));
   config_delete(cfg);
 }
 
@@ -2248,6 +2260,7 @@ void test_client_cli() {
   test_parse_args_usermap_name_resolution();
   test_parse_args_chown();
   test_parse_args_rejects_malformed_identity();
+  test_parse_args_preallocate();
   test_parse_args_append();
   test_parse_args_append_verify();
   test_parse_args_append_both();

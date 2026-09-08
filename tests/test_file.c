@@ -380,11 +380,47 @@ static void test_file_write_to_disk_basic() {
 static void test_file_write_to_disk_with_fsync() {
   const char* path = "test_file_write_to_disk_fsync.txt";
   const char* content = "fsync file content";
-  EXPECT_TRUE(file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, NULL,
-                                             false, true, NULL));
+  EXPECT_TRUE(file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, false,
+                                             NULL, false, true, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
+  unlink(path);
+}
+
+static void test_file_write_to_disk_preallocate_atomic() {
+  const char* path = "test_file_write_prealloc_atomic.txt";
+  const char* content = "prealloc atomic content";
+  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), false, false, true, NULL, false,
+                                  NULL));
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
+  FILE* fp = fopen(path, "rb");
+  EXPECT_NOT_NULL(fp);
+  char buf[100];
+  size_t nread = fread(buf, 1, sizeof(buf), fp);
+  fclose(fp);
+  EXPECT_EQ_INT((int)nread, (int)strlen(content));
+  EXPECT_EQ_INT(memcmp(buf, content, strlen(content)), 0);
+  unlink(path);
+}
+
+static void test_file_write_to_disk_preallocate_inplace() {
+  const char* path = "test_file_write_prealloc_inplace.txt";
+  const char* content = "prealloc inplace content";
+  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), true, false, true, NULL, false,
+                                  NULL));
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
+  FILE* fp = fopen(path, "rb");
+  EXPECT_NOT_NULL(fp);
+  char buf[100];
+  size_t nread = fread(buf, 1, sizeof(buf), fp);
+  fclose(fp);
+  EXPECT_EQ_INT((int)nread, (int)strlen(content));
+  EXPECT_EQ_INT(memcmp(buf, content, strlen(content)), 0);
   unlink(path);
 }
 
@@ -937,6 +973,8 @@ void test_file() {
   test_file_save_to_disk_reports_skips();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_with_fsync();
+  test_file_write_to_disk_preallocate_atomic();
+  test_file_write_to_disk_preallocate_inplace();
   test_file_write_to_disk_creates_dirs();
   test_file_write_to_disk_does_not_follow_symlink();
   test_file_content_to_buffer();

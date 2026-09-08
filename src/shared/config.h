@@ -135,6 +135,11 @@ typedef struct Config {
   bool use_fsync;
   bool append;
   bool append_verify;
+  /* --preallocate: allocates the destination file's full expected space up
+   * front (before any data is written) so a transfer that would overflow disk
+   * fails fast at allocation time and the file is laid out contiguously,
+   * avoiding fragmentation.  Receiver-side, crosses the wire. */
+  bool preallocate;
 
   // Issue #128: Extended delete options
   /* --delete-excluded: also delete destination entries that were excluded on

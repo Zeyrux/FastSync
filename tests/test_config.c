@@ -1004,6 +1004,44 @@ static void test_config_receive_rejects_invalid_identity() {
   config_delete(c);
 }
 
+/* --preallocate crosses the wire unchanged (receiver-side flag): the receiver
+   must learn to allocate the destination file's space before data flows. */
+static void test_config_preallocate_wire_roundtrip() {
+  struct {
+    bool preallocate;
+  } cases[] = {{false}, {true}};
+  if (is_running_under_valgrind())
+    return;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL && recv->preallocate == cases[i].preallocate;
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->preallocate = cases[i].preallocate;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1030,6 +1068,7 @@ void test_config() {
     test_config_receive_rejects_invalid_checksum_algo();
     test_config_identity_wire_roundtrip();
     test_config_receive_rejects_invalid_identity();
+    test_config_preallocate_wire_roundtrip();
   }
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

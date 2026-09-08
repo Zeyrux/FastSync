@@ -57,28 +57,33 @@ int file_open_private_dir(const char* dir_path);
    silently copied into place.  Pass NULL for the historical same-directory
    behavior.  --inplace writes never use temp_dir. */
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                         bool inplace, bool sparse, const FileMetadata* metadata,
+                         bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
                          bool preserve_executability, const char* temp_dir);
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
-                                    const FileMetadata* metadata, bool preserve_executability,
-                                    bool use_fsync, const char* temp_dir);
+                                    bool preallocate, const FileMetadata* metadata,
+                                    bool preserve_executability, bool use_fsync,
+                                    const char* temp_dir);
 /* With update enabled, an existing newer destination is left untouched.  The
    check is descriptor-based for inplace writes; atomic replacement still has
    an unavoidable final rename race without filesystem locking. */
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
-                                bool inplace, bool sparse, const FileMetadata* metadata,
-                                bool preserve_executability, const char* temp_dir);
+                                bool inplace, bool sparse, bool preallocate,
+                                const FileMetadata* metadata, bool preserve_executability,
+                                const char* temp_dir);
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
-                                    unsigned long long data_size, bool sparse,
+                                    unsigned long long data_size, bool sparse, bool preallocate,
                                     const FileMetadata* metadata, bool preserve_executability,
                                     const char* temp_dir);
 /* Atomic --link-dest install: replace `path` with a hard link to `basis_path`
    (via a temp name + rename); fall back to a byte-identical local copy from
    `data` when the link is impossible (EXDEV/EPERM/unsupported filesystem).
-   `metadata` is applied only on the copy fallback. */
+   `metadata` is applied only on the copy fallback.  `preallocate` applies to
+   that copy fallback only (a hard-linked file shares the basis inode and is
+   never re-allocated). */
 bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
-                              unsigned long long data_size, const FileMetadata* metadata,
-                              bool preserve_executability, bool use_fsync, const char* temp_dir);
+                              unsigned long long data_size, bool preallocate,
+                              const FileMetadata* metadata, bool preserve_executability,
+                              bool use_fsync, const char* temp_dir);
 
 #endif

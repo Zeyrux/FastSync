@@ -32,6 +32,29 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
   return true;
 }
 
+/* Preallocate `size` bytes on `fd` before any data is written (--preallocate).
+ * posix_fallocate reserves real disk blocks, so an out-of-space condition
+ * (ENOSPC/EDQUOT) surfaces up front instead of partway through a transfer;
+ * unavoidable fragmentation of a streamed file is also reduced.  Some
+ * filesystems (e.g. tmpfs, ZFS) do not support it and return EOPNOTSUPP/ENOSYS,
+ * where we fall back to ftruncate, which still extends the logical size so the
+ * fail-fast/contiguity intent degrades gracefully but never fails.  Genuine
+ * allocation failures are propagated as the error code (caller fails the write).
+ * posix_fallocate leaves the fd's file offset unchanged, so the subsequent
+ * write_all at offset 0 is unaffected.  Returns 0 on success (including the
+ * fallback) or a nonzero error code. */
+static int preallocate_fd(int fd, unsigned long long size) {
+  if (size == 0)
+    return 0;
+  int rc = posix_fallocate(fd, 0, (off_t)size);
+  if (rc == EOPNOTSUPP || rc == ENOSYS) {
+    if (ftruncate(fd, (off_t)size) == 0)
+      return 0;
+    return errno;
+  }
+  return rc;
+}
+
 /* Process-wide counter for scratch temp names.  A --temp-dir scratch directory
    is flat: different destinations that share a basename must never race onto
    the same temp name.  Deriving the trailing number from a global atomic
@@ -510,9 +533,9 @@ int file_open_private_dir(const char* dir_path) {
 
 static bool file_to_disk_secure_impl(const char* path, const void* data,
                                      unsigned long long data_size, bool inplace, bool sparse,
-                                     const FileMetadata* metadata, bool preserve_executability,
-                                     bool update, bool no_replace, bool use_fsync,
-                                     const char* temp_dir) {
+                                     bool preallocate, const FileMetadata* metadata,
+                                     bool preserve_executability, bool update, bool no_replace,
+                                     bool use_fsync, const char* temp_dir) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -533,27 +556,39 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (newer) {
         ok = true;
       } else {
-        /* In-place overwrites: pre-size sparse targets and always trim the
-           file to the new payload length afterwards so shorter payloads can
-           never leave stale trailing bytes from a previous version. */
-        if (sparse && data_size > 0)
-          ok = ftruncate(fd, (off_t)data_size) == 0;
-        if (ok || !sparse || data_size == 0)
-          ok = write_all(fd, data, data_size);
-        if (ok)
-          ok = ftruncate(fd, (off_t)data_size) == 0;
-        /* Normalize the mode: apply the metadata-derived safe mode when the
-           sender supplied metadata (setuid/setgid/sticky are never honored);
-           otherwise fall back to a safe default so dangerous bits on an
-           existing destination cannot survive an overwrite. */
-        if (ok) {
-          if (metadata)
-            ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
-          else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
-            ok = false;
+        /* Preallocate the expected payload size before writing so an
+           out-of-space condition fails cleanly up front (--preallocate). */
+        int prealloc_rc = 0;
+        if (preallocate && data_size > 0) {
+          prealloc_rc = preallocate_fd(fd, data_size);
+          if (prealloc_rc != 0)
+            log_message(LOG_LEVEL_ERROR,
+                        "preallocate failed for '%s' (%s); transfer aborted",
+                        path, strerror(prealloc_rc));
         }
-        if (ok && use_fsync)
-          ok = fsync(fd) == 0;
+        if (prealloc_rc == 0) {
+          /* posix_fallocate does not guarantee the fd's file offset is left
+             unchanged, so seek back to 0 before the data write. */
+          lseek(fd, 0, SEEK_SET);
+          if (sparse && data_size > 0)
+            ok = ftruncate(fd, (off_t)data_size) == 0;
+          if (ok || !sparse || data_size == 0)
+            ok = write_all(fd, data, data_size);
+          if (ok)
+            ok = ftruncate(fd, (off_t)data_size) == 0;
+          /* Normalize the mode: apply the metadata-derived safe mode when the
+             sender supplied metadata (setuid/setgid/sticky are never honored);
+             otherwise fall back to a safe default so dangerous bits on an
+             existing destination cannot survive an overwrite. */
+          if (ok) {
+            if (metadata)
+              ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+            else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
+              ok = false;
+          }
+          if (ok && use_fsync)
+            ok = fsync(fd) == 0;
+        }
       }
     }
   } else {
@@ -623,14 +658,24 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                   O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
       if (fd < 0)
         continue; /* EEXIST (or a transient open error): try a fresh name. */
-      if (sparse && data_size > 0)
-        ok = ftruncate(fd, (off_t)data_size) == 0;
-      if (ok || (!sparse || data_size == 0))
-        ok = write_all(fd, data, data_size);
-      if (ok && metadata)
-        ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
-      if (ok && use_fsync)
-        ok = fsync(fd) == 0;
+      int prealloc_rc = 0;
+      if (preallocate && data_size > 0) {
+        prealloc_rc = preallocate_fd(fd, data_size);
+        if (prealloc_rc != 0)
+          log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted",
+                      path, strerror(prealloc_rc));
+      }
+      if (prealloc_rc == 0) {
+        lseek(fd, 0, SEEK_SET);
+        if (sparse && data_size > 0)
+          ok = ftruncate(fd, (off_t)data_size) == 0;
+        if (ok || (!sparse || data_size == 0))
+          ok = write_all(fd, data, data_size);
+        if (ok && metadata)
+          ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+        if (ok && use_fsync)
+          ok = fsync(fd) == 0;
+      }
       if (close(fd) != 0)
         ok = false;
       fd = -1;
@@ -678,32 +723,34 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
 }
 
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
-                         bool inplace, bool sparse, const FileMetadata* metadata,
+                         bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
                          bool preserve_executability, const char* temp_dir) {
-  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   preserve_executability, false, false, false, temp_dir);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
-                                bool inplace, bool sparse, const FileMetadata* metadata,
-                                bool preserve_executability, const char* temp_dir) {
-  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
+                                bool inplace, bool sparse, bool preallocate,
+                                const FileMetadata* metadata, bool preserve_executability,
+                                const char* temp_dir) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   preserve_executability, true, false, false, temp_dir);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
-                                    const FileMetadata* metadata, bool preserve_executability,
-                                    bool use_fsync, const char* temp_dir) {
-  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, metadata,
+                                    bool preallocate, const FileMetadata* metadata,
+                                    bool preserve_executability, bool use_fsync,
+                                    const char* temp_dir) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   preserve_executability, false, false, use_fsync, temp_dir);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
-                                    unsigned long long data_size, bool sparse,
+                                    unsigned long long data_size, bool sparse, bool preallocate,
                                     const FileMetadata* metadata, bool preserve_executability,
                                     const char* temp_dir) {
-  return file_to_disk_secure_impl(path, data, data_size, false, sparse, metadata,
+  return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
                                   preserve_executability, false, true, false, temp_dir);
 }
 
@@ -717,8 +764,9 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
  * (applying metadata through the shared inode would mutate the basis file).
  * Returns false only when both the link and the copy fallback fail. */
 bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
-                              unsigned long long data_size, const FileMetadata* metadata,
-                              bool preserve_executability, bool use_fsync, const char* temp_dir) {
+                              unsigned long long data_size, bool preallocate,
+                              const FileMetadata* metadata, bool preserve_executability,
+                              bool use_fsync, const char* temp_dir) {
   if (!path || !basis_path)
     return false;
   char* leaf = NULL;
@@ -796,8 +844,8 @@ bool file_to_disk_secure_link(const char* path, const char* basis_path, const vo
     free(leaf);
     /* The basis file could not be linked in (missing, cross-device, refused
        by the filesystem).  Write a byte-identical local copy instead. */
-    return file_to_disk_secure_with_fsync(path, data, data_size, false, false, metadata,
-                                          preserve_executability, use_fsync, temp_dir);
+    return file_to_disk_secure_with_fsync(path, data, data_size, false, false, preallocate,
+                                          metadata, preserve_executability, use_fsync, temp_dir);
   }
 
   if (scratch_dirfd >= 0)
@@ -811,5 +859,5 @@ bool file_write_to_disk(const char* path, const void* data, unsigned long long d
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return file_to_disk_secure(path, data, data_size, inplace, sparse, NULL, false, NULL);
+  return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, false, NULL);
 }
