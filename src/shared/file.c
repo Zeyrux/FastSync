@@ -114,6 +114,8 @@ File* file_create(const char* path) {
   file->link_group = 0;
   file->link_first = false;
   file->hardlink_target = NULL;
+  file->is_symlink = false;
+  file->symlink_target = NULL;
   return file;
 }
 
@@ -133,6 +135,8 @@ void file_destroy(void* item) {
   file->basis_link = NULL;
   free(file->hardlink_target);
   file->hardlink_target = NULL;
+  free(file->symlink_target);
+  file->symlink_target = NULL;
   free(file);
 }
 
@@ -336,6 +340,108 @@ bool file_destination_is_newer_secure(const char* path, const FileMetadata* meta
   return file_stat_secure(path, &st) && stat_is_newer(&st, metadata);
 }
 
+/* --keep-dirlinks (-K) receiver process-wide policy: when set, a destination
+ * path component that is itself a symlink to an in-root directory is followed
+ * (used as that directory) instead of failing the O_NOFOLLOW walk.  Only ever
+ * honoured when the resolved target is a directory that stays beneath the
+ * authorized root, so a malicious symlink can never redirect the write outside
+ * it.  Client of record is the server's receiver. */
+static bool file_keep_dirlinks = false;
+
+void file_set_keep_dirlinks(bool enable) {
+  file_keep_dirlinks = enable;
+}
+
+bool file_get_keep_dirlinks(void) {
+  return file_keep_dirlinks;
+}
+
+/* True when `target` is a lexical symlink target that can never escape the
+ * receive root once created beneath it: relative (not absolute) and containing
+ * no ".." path component.  Used by --munge-links' sender-side containment: an
+ * escaping target is never transmitted (the entry is skipped/contained). */
+bool file_symlink_target_contained(const char* target) {
+  if (!target || target[0] == '\0' || target[0] == '/')
+    return false;
+  const char* p = target;
+  while (*p) {
+    const char* slash = strchr(p, '/');
+    size_t comp_len = slash ? (size_t)(slash - p) : strlen(p);
+    if (comp_len == 2 && p[0] == '.' && p[1] == '.')
+      return false;
+    if (!slash)
+      break;
+    p = slash + 1;
+  }
+  return true;
+}
+
+/* Remove a leading symlink munge marker (if present); returns true when the
+ * marker was stripped.  `target` is a mutable NUL-terminated buffer. */
+bool file_symlink_unmunge(char* target) {
+  if (!target)
+    return false;
+  static const char* const marker = SYMLINK_MUNGE_PREFIX;
+  size_t marker_len = strlen(marker);
+  if (strncmp(target, marker, marker_len) != 0)
+    return false;
+  size_t rest = strlen(target + marker_len) + 1;
+  memmove(target, target + marker_len, rest);
+  return true;
+}
+
+/* Owned copy of `target` prefixed with SYMLINK_MUNGE_PREFIX (the sender-side
+ * --munge-links rewriting).  Returns NULL on allocation failure. */
+char* file_symlink_munge(const char* target) {
+  if (!target)
+    return NULL;
+  static const char* const marker = SYMLINK_MUNGE_PREFIX;
+  size_t marker_len = strlen(marker);
+  size_t target_len = strlen(target);
+  char* out = malloc(marker_len + target_len + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, marker, marker_len);
+  memcpy(out + marker_len, target, target_len + 1);
+  return out;
+}
+
+/* Create a symlink at `path` pointing to `target`, confined below the
+ * authorized root: the parent directory is opened with an O_NOFOLLOW fd walk
+ * and the link is created with symlinkat so neither the destination chain nor
+ * the target is ever followed.  The final component is never dereferenced: an
+ * existing non-directory entry at `path` is unlinked by name before the link is
+ * placed; an existing directory there is left untouched (returns false, so a
+ * caller can treat it as a collision).  As a receiver-side trust-boundary
+ * invariant, `target` must be file_symlink_target_contained() (relative and
+ * ".."-free): an absolute or escaping target is rejected outright (returns
+ * false) so a malicious sender can never materialize a symlink that points
+ * outside the receive root. */
+bool file_symlink_at_secure(const char* path, const char* target) {
+  if (!path || !target || has_path_traversal(path) || !file_symlink_target_contained(target))
+    return false;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, true);
+  if (parent_fd < 0)
+    return false;
+  bool ok = false;
+  struct stat st;
+  bool exists = fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0;
+  if (exists && S_ISDIR(st.st_mode)) {
+    /* A directory already at this path cannot be replaced atomically with a
+       symlink without --force semantics; leave it and report the collision. */
+    ok = false;
+  } else {
+    if (exists && unlinkat(parent_fd, leaf, 0) != 0 && errno != ENOENT)
+      goto out;
+    ok = symlinkat(target, parent_fd, leaf) == 0;
+  }
+out:
+  close(parent_fd);
+  free(leaf);
+  return ok;
+}
+
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs) {
   char* copy = str_dup(path);
   if (!copy)
@@ -383,6 +489,7 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
   }
   char* save = NULL;
   char* component = strtok_r(parent, "/", &save);
+  char rel_buf[PATH_MAX] = "";
   while (component) {
     if (strcmp(component, "..") == 0) {
       close(fd);
@@ -392,9 +499,44 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
     }
     if (strcmp(component, ".") != 0) {
       int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (create_dirs && next < 0 && errno == ENOENT) {
+      if (next < 0 && create_dirs && errno == ENOENT) {
         if (mkdirat(fd, component, 0755) == 0 || errno == EEXIST)
           next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      }
+      /* --keep-dirlinks (-K): a path component that is an existing symlink to
+         an in-root directory is used as THAT directory rather than failing the
+         O_NOFOLLOW walk.  Only honoured when the symlink resolves to a
+         directory that stays beneath the authorized root, so a malicious link
+         can never redirect the write outside it. */
+      if (next < 0 && file_keep_dirlinks && authorized_root_path != NULL &&
+          (errno == ELOOP || errno == ENOTDIR || errno == EACCES)) {
+        struct stat lst;
+        if (fstatat(fd, component, &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode)) {
+          char candidate[PATH_MAX];
+          char root[PATH_MAX];
+          if (realpath(authorized_root_path, root) &&
+              snprintf(candidate, sizeof(candidate), "%s%s/%s", root, rel_buf, component) <
+                  (int)sizeof(candidate)) {
+            char resolved[PATH_MAX];
+            if (realpath(candidate, resolved) && strcmp(resolved, root) != 0 &&
+                strncmp(root, resolved, strlen(root)) == 0 &&
+                (resolved[strlen(root)] == '/' || resolved[strlen(root)] == '\0')) {
+              struct stat rst;
+              if (stat(resolved, &rst) == 0 && S_ISDIR(rst.st_mode)) {
+                /* Re-open the resolved directory WITHOUT following a symlink and
+                   re-verify it is still a directory inode, so a symlink swapped
+                   in between realpath() and open() (TOCTOU) cannot redirect this
+                   fd outside the root. */
+                next = open(resolved, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                struct stat ofst;
+                if (next >= 0 && (fstat(next, &ofst) != 0 || !S_ISDIR(ofst.st_mode))) {
+                  close(next);
+                  next = -1;
+                }
+              }
+            }
+          }
+        }
       }
       if (next < 0) {
         close(fd);
@@ -404,6 +546,20 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
       }
       close(fd);
       fd = next;
+      /* Track the walked relative prefix so the -K candidate path can be
+         reconstructed.  An overflow while building it means the whole path is
+         at the PATH_MAX edge, so fail hard rather than silently building a
+         wrong (truncated) candidate for a later -K follow. */
+      size_t need = strlen(rel_buf) + strlen(component) + 2;
+      if (need <= sizeof(rel_buf)) {
+        strcat(rel_buf, "/");
+        strcat(rel_buf, component);
+      } else if (file_keep_dirlinks) {
+        close(fd);
+        free(copy);
+        free(leaf);
+        return -1;
+      }
     }
     component = strtok_r(NULL, "/", &save);
   }

@@ -90,7 +90,13 @@ enum NET_STATUS {
    * first (data-carrying) member's destination-relative wire path; the receiver
    * creates this entry as a hard link to the first member's installed file
    * (falling back to a byte-identical copy if link() fails).  Protocol 2.12.0. */
-  STATUS_HARDLINK
+  STATUS_HARDLINK,
+  /* A symlink-type entry (-l/--links, -k/--copy-dirlinks' keep-as-symlink
+   * branch).  The sender transmits the destination path, the (sender-munged,
+   * if --munge-links) symlink target, and optional metadata; the receiver
+   * creates a symlink to the unmunged target beneath the receive root (see
+   * file_receive_symlink).  Protocol 2.13.0. */
+  STATUS_SYMLINK
 };
 
 void io_set_fds(int read_fd, int write_fd);

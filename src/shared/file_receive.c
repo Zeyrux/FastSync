@@ -332,6 +332,49 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
 
+  /* Symlink entry.  (The process-wide --keep-dirlinks policy is set once by the
+     connection handler from the negotiated config, before any receiver/writer
+     threads start, so it is stable throughout this walk.) */
+
+  if (file->is_symlink) {
+    if (!file->symlink_target || file->path[0] == '\0' || has_path_traversal(file->path)) {
+      log_message(LOG_LEVEL_ERROR, "Invalid symlink entry received");
+      return FILE_SAVE_ERROR;
+    }
+    char* link_path = path_cat(root_directory, file->path);
+    if (!link_path)
+      return FILE_SAVE_ERROR;
+    /* Restore the real target by stripping the sender's --munge-links marker.
+       Only unmunge when the policy was negotiated: a plain -l run must preserve
+       a source symlink whose target genuinely begins with the marker verbatim. */
+    char* target = str_dup(file->symlink_target);
+    bool ok = target != NULL;
+    if (ok && config && config->munge_links)
+      file_symlink_unmunge(target);
+    /* Receiver-side trust boundary (independent of the sender): a target that
+       could escape the receive root (absolute, or relative-with-"..") is never
+       materialized.  It is contained (the entry is skipped) rather than failing
+       the whole transfer, so a hostile sender can inject a broken symlink but
+       can never redirect it outside the root. */
+    if (ok && !file_symlink_target_contained(target))
+      ok = false;
+    if (!ok) {
+      /* Skip the escaping/empty target (contained) rather than abort. */
+      free(target);
+      free(link_path);
+      return FILE_SAVE_SKIPPED;
+    }
+    char* parent = str_dup(link_path);
+    if (parent) {
+      file_ensure_directory_secure(dirname(parent));
+      free(parent);
+    }
+    ok = file_symlink_at_secure(link_path, target);
+    free(target);
+    free(link_path);
+    return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
+  }
+
   /* --hard-links/-H sibling: a later member of a link group arrives with no
      payload and is installed as a hard link to (or, on link() failure, a
      byte-identical copy of) the group's first member.  Handled entirely here,
@@ -1865,6 +1908,59 @@ File* file_receive_hardlink(int file_descriptor) {
   file->link_group = gid;
   file->link_first = false;
   file->hardlink_target = target;
+  return file;
+}
+
+/* Receive a symlink entry (the leading STATUS_SYMLINK code has already been
+   consumed): the destination path and the (sender-munged, if --munge-links)
+   symlink target string, then metadata when negotiated.  The created File is
+   routed through the regular store_file sink, which creates the link beneath
+   the receive root (unmungeing the target first). */
+File* file_receive_symlink(int file_descriptor, const Config* config) {
+  char* path = receive_str(file_descriptor);
+  if (path == NULL)
+    return NULL;
+  if (path[0] == '\0' || has_path_traversal(path)) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received symlink path: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  char* target = receive_str(file_descriptor);
+  if (!target) {
+    free(path);
+    return NULL;
+  }
+  if (target[0] == '\0') {
+    char* escaped = output_escape(target, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received symlink target: %s",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    free(target);
+    free(path);
+    send_status(file_descriptor, STATUS_ERROR);
+    return NULL;
+  }
+  File* file = file_create(path);
+  free(path);
+  if (!file) {
+    free(target);
+    return NULL;
+  }
+  if (config && config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(file_descriptor, &meta_ok);
+    if (!meta_ok) {
+      file_destroy(file);
+      free(target);
+      return NULL;
+    }
+  }
+  file->is_symlink = true;
+  file->symlink_target = target;
   return file;
 }
 

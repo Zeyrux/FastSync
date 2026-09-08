@@ -4128,3 +4128,153 @@ class TestOmitTimes:
         received = get_dest_received_dir(dest, source)
         mismatches, missing = verify_transfer(source, received)
         assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+
+class TestSymlinkTrust:
+    """Phase-4 symlink trust boundaries: -k/--copy-dirlinks, -K/--keep-dirlinks
+    and --munge-links.  Destination paths mirror the absolute source path below
+    the destination root (run_client uses absolute --source-dir/--dest-dir)."""
+
+    def test_copy_dirlinks_dereferences_dir_symlink(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "symlink_trust_copy_dirlinks")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_copy_dirlinks_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "realdir"))
+        with open(os.path.join(source, "realfile.txt"), "wb") as f:
+            f.write(b"real file\n")
+        with open(os.path.join(source, "realdir", "inside.txt"), "wb") as f:
+            f.write(b"inside dir\n")
+        os.symlink("realfile.txt", os.path.join(source, "link_file"))
+        os.symlink("realdir", os.path.join(source, "link_dir"))
+
+        result, _ = run_client(source, dest, flags=["-k"], port=shared_server.port)
+        assert result.returncode == 0, f"-k failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        # link -> realdir dereferences into a real directory tree...
+        link_dir = os.path.join(received, "link_dir")
+        assert os.path.isdir(link_dir)
+        assert not os.path.islink(link_dir)
+        assert os.path.isfile(os.path.join(link_dir, "inside.txt"))
+        # ... while a symlink to a regular file stays a symlink.
+        link_file = os.path.join(received, "link_file")
+        assert os.path.islink(link_file)
+        assert os.readlink(link_file) == "realfile.txt"
+
+    def test_keep_dirlinks_keeps_dest_symlink_to_dir(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "symlink_trust_keep_dirlinks")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_keep_dirlinks_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "sub"))
+        with open(os.path.join(source, "sub", "file.txt"), "wb") as f:
+            f.write(b"under the kept symlinked dir\n")
+
+        # Plant the destination's symlink-to-directory at the exact mirror path:
+        #  sub -> realdir (relative, both siblings under the mirror parent).
+        parent = os.path.join(dest, os.path.abspath(source).lstrip(os.sep))
+        os.makedirs(parent)
+        os.makedirs(os.path.join(parent, "realdir"))
+        os.symlink("realdir", os.path.join(parent, "sub"))
+
+        result, _ = run_client(source, dest, flags=["-K"], port=shared_server.port)
+        assert result.returncode == 0, f"-K failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        sub = os.path.join(received, "sub")
+        # sub stays a symlink to the directory rather than being replaced...
+        assert os.path.islink(sub)
+        assert os.readlink(sub) == "realdir"
+        # ... and the file is written beneath it, through to the referent dir.
+        assert os.path.isfile(os.path.join(parent, "realdir", "file.txt"))
+
+    def test_munge_links_unmunged_target_and_containment(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "symlink_trust_munge")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_munge_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        os.symlink("a.txt", os.path.join(source, "good"))
+        os.symlink("/etc/passwd", os.path.join(source, "abs_escape"))
+        os.symlink("../../escape", os.path.join(source, "dotdot_escape"))
+
+        result, _ = run_client(source, dest, flags=["-l", "--munge-links"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"--munge-links failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        # The safe symlink is created with its correct (unmunged) target.
+        good = os.path.join(received, "good")
+        assert os.path.islink(good)
+        assert os.readlink(good) == "a.txt"
+        # A target that would escape the receive root is contained (skip: never
+        # transmitted, so nothing is created at the destination).
+        assert not os.path.lexists(os.path.join(received, "abs_escape"))
+        assert not os.path.lexists(os.path.join(received, "dotdot_escape"))
+        assert os.path.isfile(os.path.join(received, "a.txt"))
+
+    def test_links_copies_symlinks_as_symlinks(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "symlink_trust_links")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_links_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "realdir"))
+        with open(os.path.join(source, "realfile.txt"), "wb") as f:
+            f.write(b"real\n")
+        with open(os.path.join(source, "realdir", "x.txt"), "wb") as f:
+            f.write(b"x\n")
+        os.symlink("realfile.txt", os.path.join(source, "lf"))
+        os.symlink("realdir", os.path.join(source, "ld"))
+
+        result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
+        assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.path.islink(os.path.join(received, "lf"))
+        assert os.readlink(os.path.join(received, "lf")) == "realfile.txt"
+        assert os.path.islink(os.path.join(received, "ld"))
+        assert os.readlink(os.path.join(received, "ld")) == "realdir"
+
+    def test_receiver_contains_absolute_target_even_without_munge(self, shared_server):
+        # The trust boundary is symmetric and enforced receiver-side: a plain -l
+        # (no --munge-links) run must refuse to materialize an out-of-root
+        # absolute symlink target, while still copying a legitimate in-root one.
+        source = os.path.join(TEST_DATA_DIR, "symlink_trust_abs")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_abs_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        os.symlink("a.txt", os.path.join(source, "good"))
+        os.symlink("/etc/passwd", os.path.join(source, "unsafe_abs"))
+
+        result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
+        assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        good = os.path.join(received, "good")
+        assert os.path.islink(good)
+        assert os.readlink(good) == "a.txt"
+        # The absolute (non-contained) target was not materialized at the dest.
+        assert not os.path.lexists(os.path.join(received, "unsafe_abs"))
+
+    def test_links_does_not_strip_munge_prefix_without_munge(self, shared_server):
+        # A source symlink whose target genuinely begins with the #SYMLINK/ marker
+        # must round-trip verbatim under plain -l: the receiver only unmunges when
+        # the negotiated --munge-links policy is on, never unconditionally.
+        source = os.path.join(TEST_DATA_DIR, "symlink_trust_prefix")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_prefix_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "realfile.txt"), "wb") as f:
+            f.write(b"real\n")
+        os.symlink("#SYMLINK/realfile.txt", os.path.join(source, "prefixed"))
+
+        result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
+        assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        prefixed = os.path.join(received, "prefixed")
+        assert os.path.islink(prefixed)
+        assert os.readlink(prefixed) == "#SYMLINK/realfile.txt"

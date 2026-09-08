@@ -622,9 +622,60 @@ static void test_config_delete_policy_wire_roundtrip() {
   }
 }
 
-/* --delete-missing-args crosses the wire (the receiver executes the exact-path
-   deletions) while --ignore-missing-args is client-only: the receiver must
-   observe delete_missing_args unchanged and ignore_missing_args always false. */
+/* Phase 4 symlink-trust wire split: --munge-links and -K/--keep-dirlinks CROSS
+   the wire (the receiver unmunges targets and follows an in-root dir-link),
+   while -k/--copy-dirlinks is client/sender-only and must NOT reach the
+   receiver (it would observe it false). */
+static void test_config_symlink_trust_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+
+  struct {
+    bool munge_links, keep_dirlinks, copy_dirlinks;
+  } cases[] = {
+      {false, false, false},
+      {true, false, false},
+      {false, true, false},
+      {true, true, true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL;
+      if (ok) {
+        ok = recv->munge_links == cases[i].munge_links &&
+             recv->keep_dirlinks == cases[i].keep_dirlinks &&
+             /* copy_dirlinks never crosses the wire. */
+             recv->copy_dirlinks == false;
+      }
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->munge_links = cases[i].munge_links;
+      send_cfg->keep_dirlinks = cases[i].keep_dirlinks;
+      send_cfg->copy_dirlinks = cases[i].copy_dirlinks;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
 static void test_config_delete_missing_args_wire_roundtrip() {
   if (is_running_under_valgrind())
     return;
@@ -1107,6 +1158,7 @@ void test_config() {
     test_config_delete_timing_wire_roundtrip();
     test_config_delete_timing_conflict_rejected();
     test_config_delete_policy_wire_roundtrip();
+    test_config_symlink_trust_wire_roundtrip();
     test_config_delete_missing_args_wire_roundtrip();
     test_config_append_wire_roundtrip();
     test_config_basis_roundtrip();

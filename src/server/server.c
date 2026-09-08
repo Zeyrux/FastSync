@@ -215,6 +215,11 @@ void handler(int file_descriptor) {
      apply path.  Each connection is its own forked process, so this
      per-process snapshot never races another connection. */
   identity_set_active(config);
+  /* Persist the negotiated --keep-dirlinks policy once, here at config-accept,
+     before any multithreaded receiver/writer threads are spawned, so the
+     fd-walk reads a stable value during the whole transfer (and never bleeds
+     across the per-connection forked processes). */
+  file_set_keep_dirlinks(config->keep_dirlinks);
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {

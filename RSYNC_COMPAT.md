@@ -255,7 +255,7 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `-U`, `--atimes` | Preserve access times | ✅ Implemented | Captures the source access time (from the scanner's pre-read stat, so it is not clobbered by reading the file for transfer) and transmits it over the wire; the receiver restores it together with the mtime via `futimens`/`utimensat`. Implies metadata transmission (the times travel inside the `-M` metadata payload), but does not enable ownership application (that stays opt-in via the identity flags). Wire: new `atime` fields on the metadata frame + a `preserve_atimes` config boolean; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0** |
 | `-N`, `--crtimes` | Preserve create times | ⚠️ Partial | Captures the source birth time via `statx(STATX_BTIME)` on Linux and transmits it (recorded as a wire field), but there is **no portable way to set a birth time** (`utimensat` can only set atime/mtime), so the receiver explicitly does NOT apply it: it logs a debug note and continues — never failing the transfer and never pretending it worked. On platforms without `statx` it parses as a documented no-op (flag accepted; nothing is captured). Implies metadata transmission. Wire: new `crtime` fields + a `preserve_crtimes` config boolean; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0** (see the Phase-4 metadata-time notes) |
 | `-O`, `--omit-dir-times` | Omit dirs from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never preserves directory mtimes in the first place (directories are created via `mkdir` with no metadata, a documented divergence under `-d`/recursive), so there is nothing for an "omit" to suppress. It never breaks a normal run |
-| `-J`, `--omit-link-times` | Omit symlinks from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never sets symlink times (`-l`/`--links` still only includes symlinks without transmitting a target; `--copy-links` dereferences), so there is nothing for an "omit" to suppress. It never breaks a normal run |
+| `-J`, `--omit-link-times` | Omit symlinks from --times | 🔄 Compatibility No-op | Accepted and parsed for CLI compatibility, and the config boolean crosses the wire, but it has **no effect**: FastSync never sets symlink times (`-l`/`--links` copies symlinks as symlinks but the receiver does not apply timestamps/owner to symlink entries), so there is nothing for an "omit" to suppress. It never breaks a normal run |
 | `--super` | Receiver attempts super-user activities | ❌ Not Implemented | |
 | `--fake-super` | Store/recover privileged attrs via xattrs | ❌ Not Implemented | |
 | `--open-noatime` | Avoid changing access time when opening files | ✅ Implemented | Sender-side policy: the sender opens source files with `O_NOATIME` (Linux) when reading them for transfer, so the open/read does NOT bump the source's on-disk access time. Degrades safely when `O_NOATIME` is unavailable (not defined) or refused (`EPERM`, since it needs `CAP_FOWNER` or file ownership): the code falls back to a normal open, so the data always transfers — only the atime-bump is skipped. It does not itself capture/preserve atime; it only avoids modifying it. **Client-only, never crosses the wire.** Exposed as `file_open_for_read()` and applied to both the buffered data path and the sendfile path |
@@ -396,13 +396,83 @@ with `--append`/`--append-verify` (a payload-less sibling cannot be tail-resumed
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-l`, `--links` | Copy symlinks as symlinks | ⚠️ Partial | Scanner includes symlinks; target path not transmitted |
+| `-l`, `--links` | Copy symlinks as symlinks | ✅ Implemented | A symlink is transmitted as a real symlink: its target string crosses the wire (a new `STATUS_SYMLINK` frame / chunk entry type) and the receiver creates it with `symlinkat` beneath the receive root. This makes the previously-`-l`-included-but-targetless symlink handling complete. See the Phase-4 symlink-trust notes |
 | `-L`, `--copy-links` | Transform symlink to referent | ✅ Implemented | `copy_links` config field |
 | `--copy-unsafe-links` | Transform unsafe symlinks | ✅ Implemented | `copy_unsafe_links` config field |
 | `--safe-links` | Ignore symlinks outside tree | ✅ Implemented | `safe_links` config field |
-| `--munge-links` | Munge symlinks for safety | ❌ Not Implemented | |
-| `-k`, `--copy-dirlinks` | Transform symlink to dir | ❌ Not Implemented | |
-| `-K`, `--keep-dirlinks` | Treat symlinked dir as dir | ❌ Not Implemented | |
+| `--munge-links` | Munge symlinks for safety | ✅ Implemented | Sender rewrites each transmitted symlink target with a `#SYMLINK/` marker; a target that could escape the receive root (absolute or containing `..`) is never transmitted (contained/skipped); the receiver strips the marker to restore the real target. See the Phase-4 symlink-trust notes |
+| `-k`, `--copy-dirlinks` | Transform symlink to dir | ✅ Implemented | A symlink whose referent is a directory is dereferenced and recursed as a real directory; a symlink to a regular file stays a symlink. Sender-side only. See the Phase-4 symlink-trust notes |
+| `-K`, `--keep-dirlinks` | Treat symlinked dir as dir | ✅ Implemented | On the receiver, an existing destination symlink-to-a-directory is used as that directory (followed) instead of being replaced; it is followed only when it resolves to a directory that stays beneath the receive root. See the Phase-4 symlink-trust notes |
+
+**Phase-4 symlink-trust notes:** `-l/--links`, `-k/--copy-dirlinks`,
+`-K/--keep-dirlinks`, and `--munge-links` form the "symlink trust boundaries"
+row. Making all three new flags have an observable, security-sane effect
+required transmitting symlink targets, so FastSync's `-l/--links` is now real:
+a symlink-type entry carries its target on the wire (a new `STATUS_SYMLINK`
+frame for the per-file path, and a new entry type `2` in the `-s` chunk
+serializer) and the receiver creates it with `symlinkat` under an `O_NOFOLLOW`
+parent walk, never following the target. Wire changes: `STATUS_SYMLINK`,
+the chunk entry type `2`, a per-entry symlink-target string, and two new config
+booleans that CROSS the wire — `munge_links` and `keep_dirlinks`; `PROTOCOL_VERSION`
+was bumped **2.12.0 → 2.13.0** (peers must match, exactly as prior phases did).
+
+**Per-flag semantics and divergences.**
+- **`-l/--links`** copies a symlink as a symlink: the scanner `readlink`s the
+  target, the sender transmits it, and the receiver `symlinkat`s it. FastSync
+  `-l` never preserved symlink targets before (the flag was documented partial
+  and, in fact, tried to read the referent as file data); it now does, matching
+  rsync. Divergences: because the receiver enforces the symlink containment
+  predicate unconditionally, a plain `-l` sync **refuses to round-trip a
+  legitimate absolute symlink target** (it is dropped, never created pointing
+  outside the root — see the `--munge-links` note for the symmetric trust
+  boundary); a relative in-root target is copied as-is. FastSync also does not
+  set timestamps/owner on symlinks (no symlink-mode metadata application),
+  matching its existing no-op `--omit-link-times`.
+- **`-k/--copy-dirlinks`** (sender): a symlink whose referent is a directory is
+  dereferenced and recursed into as a real directory; a symlink to a regular
+  file (or any non-directory) is kept as a symlink. This is rsync's `-k`. When
+  `-L/--copy-links` or `--safe-links`/`--copy-unsafe-links` are active, their
+  (dereference) semantics take precedence, so `-k` is subsumed exactly as in
+  rsync.
+- **`-K/--keep-dirlinks`** (receiver, crosses the wire): when a directory is to
+  be created (on-demand parent creation for a child write) and the destination
+  path is already an existing symlink that resolves to a directory *within* the
+  receive root, that symlinked directory is used (followed) instead of being
+  replaced by a real directory; new entries are written beneath it. The follow
+  is confined: it only happens where `realpath` of the symlink resolves to a
+  still-within-root real directory, so a malicious link pointing outside the
+  root is never followed. Scope: `-K` acts on the write path (parent/`mkdir`
+  creation); the delete walker still never follows symlinks (a documented
+  divergence for `--delete` over an existing symlinked dir). Without `-K` the
+  destination symlink is not followed (the O_NOFOLLOW walk fails the write),
+  which is the safe default.
+- **`--munge-links`** (sender security rewrite; crosses the wire so the receiver
+  unmunges): every transmitted symlink target is prefixed with the marker
+  `#SYMLINK/`; the receiver strips the marker (only when the negotiated
+  `munge_links` policy is on — a plain `-l` run never strips the prefix, so a
+  source symlink that genuinely begins with `#SYMLINK/` round-trips verbatim)
+  and restores the exact real target. The trust boundary is **symmetric and
+  enforced receiver-side**, independent of the sender: `file_symlink_at_secure`
+  refuses any target that `file_symlink_target_contained` rejects (absolute
+  `/...` or relative with a `..` component), and `file_save_to_disk_full`
+  contains such an entry (skipped) rather than materializing it. A deliberate confinement trade-off: because the receiver
+  enforces containment unconditionally, a plain `-l` (no `--munge-links`) sync
+  *refuses to round-trip a legitimate absolute symlink target* — such target is
+  dropped, never created pointing outside the root. This is a stricter subset of
+  rsync: rsync stores munged targets on the RECEIVING side and depends on both
+  ends running `--munge-links`; FastSync additionally enforces the containment
+  predicate at the receiver regardless of what the sender transmitted. When no
+  symlink is being transmitted (`-l`/`-k`/`-a` off) `--munge-links` has nothing
+  to rewrite and is inert. -*K/`--keep-dirlinks` policy is installed per
+  connection at config-accept (stable for the whole transfer, never racy under
+  `-m`), and only ever follows an in-root symlink-to-directory.*
+
+**Compatibility (byte-identical when all three are absent):** `-k`, `-K` and
+`--munge-links` are opt-in. Without them the scanner's link handling, the wire
+frames, and the receiver's writes are unchanged for every other option set, so a
+run that previously worked continues to behave identically. `-l/--links` itself
+now transmits targets (the prior behavior was broken/partial); its status moved
+`⚠️ Partial → ✅ Implemented`.
 
 ## 10. Sparse & Device
 

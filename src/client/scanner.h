@@ -32,6 +32,14 @@ typedef struct {
   bool copy_links;
   bool safe_links;
   bool copy_unsafe_links;
+  /* Phase 4 symlink-trust sender options: -k/--copy-dirlinks (dereference a
+   * symlink to a directory as a directory, keeping symlinks-to-files as
+   * symlinks) and --munge-links (rewrite each transmitted symlink target with a
+   * marker; escaping targets are never transmitted).  Both are client/sender
+   * side only and never serialized to the wire (keep_dirlinks is the
+   * receiver-side counterpart). */
+  bool copy_dirlinks;
+  bool munge_links;
   bool checksum;
   bool one_file_system;
   /* Phase 2 (files-from / filter layer). All pointers are shared read-only
@@ -100,6 +108,8 @@ typedef struct {
   bool copy_links;
   bool safe_links;
   bool copy_unsafe_links;
+  bool copy_dirlinks;
+  bool munge_links;
   bool checksum;
   bool one_file_system;
   dev_t root_dev;

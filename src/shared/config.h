@@ -108,6 +108,15 @@ typedef struct Config {
   bool copy_links;
   bool safe_links;
   bool copy_unsafe_links;
+  /* Phase 4 symlink-trust.  -k/--copy-dirlinks and --munge-links are
+   * CLIENT/sender-side only (they decide how the SENDER scans and rewrites
+   * symlinks; the receiver never reads them), so they never cross the wire.
+   * -K/--keep-dirlinks is a RECEIVER-side policy (follow an in-root destination
+   * symlink-to-directory as a directory) and CROSSES the wire along with
+   * --munge-links (so the receiver knows to unmunge). */
+  bool copy_dirlinks; /* client-only, sender-side (-k) */
+  bool munge_links;   /* crosses the wire */
+  bool keep_dirlinks; /* crosses the wire (-K) */
 
   // Issue #121: Extended metadata preservation
   bool preserve_hard_links;
@@ -312,7 +321,7 @@ typedef struct Config {
   bool open_noatime;
 } Config;
 
-#define PROTOCOL_VERSION "2.12.0"
+#define PROTOCOL_VERSION "2.13.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

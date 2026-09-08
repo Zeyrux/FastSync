@@ -112,6 +112,12 @@ typedef struct {
   char* path;
   struct stat stats;
   bool is_directory;
+  /* True when the entry should be carried through as a SYMLINK (is_symlink)
+     rather than a dereferenced file/directory.  When true, `link_target` holds
+     the owned target string to transmit (sender-munged under --munge-links);
+     ownership transfers to the File built from this entry. */
+  bool is_symlink;
+  char* link_target;
   /* True when the entry was pruned by a user selection rule (--filter/-C/per-dir
      rules, the --exclude/--include layer, or --max-size/--min-size) rather than
      skipped for another reason (unreadable, symlink policy, not applicable). */
@@ -263,6 +269,8 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
                                  const char* containing_dir, const char* name,
                                  ScannerEntry* entry) {
   entry->excluded = false;
+  entry->is_symlink = false;
+  entry->link_target = NULL;
   entry->path = path_cat(containing_dir, name);
   if (!entry->path)
     return -1;
@@ -273,38 +281,81 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
     return 0;
   }
   bool is_symlink = S_ISLNK(link_stats.st_mode);
-  if (is_symlink && !options->follow_symlinks && !options->copy_links && !options->safe_links &&
-      !options->copy_unsafe_links)
+  if (!is_symlink)
+    goto regular;
+
+  /* Symlink: choose between dereferencing (---copy-links / --safe-links /
+     --copy-unsafe-links, plus -k for symlinks-to-directories) and carrying the
+     link through as a symlink (-l, and -k for symlinks-to-files).  No link
+     option means the symlink is skipped entirely (pre-existing behavior). */
+  const bool any_link_option = options->follow_symlinks || options->copy_links ||
+                               options->safe_links || options->copy_unsafe_links ||
+                               options->copy_dirlinks;
+  if (!any_link_option)
     goto skip;
 
-  if (is_symlink && options->safe_links) {
-    char link_target[4096];
-    ssize_t length = readlink(entry->path, link_target, sizeof(link_target) - 1);
-    if (length < 0)
-      goto skip;
-    link_target[length] = '\0';
+  char link_target[4096];
+  ssize_t length = readlink(entry->path, link_target, sizeof(link_target) - 1);
+  if (length < 0)
+    goto skip;
+  link_target[length] = '\0';
+
+  if (options->safe_links) {
     if (link_target[0] == '/' || !safe_relative_link(source_root, containing_dir, link_target))
       goto skip;
   }
-
-  if (is_symlink && options->copy_unsafe_links && !options->copy_links) {
-    char link_target[4096];
-    ssize_t length = readlink(entry->path, link_target, sizeof(link_target) - 1);
-    if (length < 0)
-      goto skip;
-    link_target[length] = '\0';
+  if (options->copy_unsafe_links && !options->copy_links) {
     if (link_target[0] != '/')
       goto skip;
   }
 
-  if (is_symlink && options->follow_symlinks && !options->copy_links)
-    entry->stats = link_stats;
-  else if (stat(entry->path, &entry->stats) != 0)
-    goto skip;
+  bool emit_symlink = false;
+  if (options->copy_links) {
+    emit_symlink = false; /* --copy-links dereferences every referent */
+  } else if (options->safe_links || options->copy_unsafe_links) {
+    emit_symlink = false; /* preserve pre-existing dereference behavior */
+  } else if (options->copy_dirlinks) {
+    struct stat ref;
+    if (stat(entry->path, &ref) == 0 && S_ISDIR(ref.st_mode))
+      emit_symlink = false; /* -k: symlink to a directory recurses as a dir */
+    else
+      emit_symlink = true; /* -k: symlink to a file stays a symlink */
+  } else if (options->follow_symlinks) {
+    emit_symlink = true; /* -l: copy symlink as symlink */
+  }
 
+  if (!emit_symlink) {
+    if (stat(entry->path, &entry->stats) != 0)
+      goto skip;
+    entry->is_directory = S_ISDIR(entry->stats.st_mode);
+    if (entry->is_directory)
+      return 1;
+    goto apply_filters;
+  }
+
+  /* Carry the link as a symlink.  --munge-links containment: a target that
+     could escape the receive root (absolute or containing "..") is never
+     transmitted -- the entry is merely skipped ("contained"). */
+  if (link_target[0] == '\0' ||
+      (options->munge_links && !file_symlink_target_contained(link_target)))
+    goto skip;
+  entry->is_symlink = true;
+  entry->stats = link_stats;
+  entry->is_directory = false;
+  entry->link_target =
+      options->munge_links ? file_symlink_munge(link_target) : str_dup(link_target);
+  if (!entry->link_target)
+    goto skip;
+  goto apply_filters;
+
+regular:
+  if (stat(entry->path, &entry->stats) != 0)
+    goto skip;
   entry->is_directory = S_ISDIR(entry->stats.st_mode);
   if (entry->is_directory)
     return 1;
+
+apply_filters:
   for (int i = 0; i < options->exclude_count; i++)
     if (glob_match(options->exclude_patterns[i], name)) {
       entry->excluded = true;
@@ -330,6 +381,8 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
 skip:
   free(entry->path);
   entry->path = NULL;
+  free(entry->link_target);
+  entry->link_target = NULL;
   return 0;
 }
 
@@ -363,6 +416,8 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->copy_links = options->copy_links;
   scanner->safe_links = options->safe_links;
   scanner->copy_unsafe_links = options->copy_unsafe_links;
+  scanner->copy_dirlinks = options->copy_dirlinks;
+  scanner->munge_links = options->munge_links;
   scanner->checksum = options->checksum;
   scanner->one_file_system = options->one_file_system;
   scanner->failed = false;
@@ -822,6 +877,8 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         .copy_links = scanner->copy_links,
         .safe_links = scanner->safe_links,
         .copy_unsafe_links = scanner->copy_unsafe_links,
+        .copy_dirlinks = scanner->copy_dirlinks,
+        .munge_links = scanner->munge_links,
         .checksum = scanner->checksum,
         .one_file_system = scanner->one_file_system,
         .file_list = scanner->file_list,
@@ -917,10 +974,18 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       free(cur_path);
       if (file == NULL) {
         free(rel_copy);
+        free(inspected.link_target);
+        inspected.link_target = NULL;
         scanner->failed = true;
         continue;
       }
-      file->data->size = stats.st_size;
+      if (inspected.is_symlink) {
+        file->is_symlink = true;
+        file->symlink_target = inspected.link_target;
+        inspected.link_target = NULL;
+      } else {
+        file->data->size = stats.st_size;
+      }
       if (scanner->relative_mode) {
         file->send_path = rel_copy;
         rel_copy = NULL;
@@ -1235,10 +1300,18 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   free(cur_path);
   if (!file) {
     free(rel);
+    free(inspected.link_target);
+    inspected.link_target = NULL;
     ps->failed = true;
     return;
   }
-  file->data->size = st.st_size;
+  if (inspected.is_symlink) {
+    file->is_symlink = true;
+    file->symlink_target = inspected.link_target;
+    inspected.link_target = NULL;
+  } else {
+    file->data->size = st.st_size;
+  }
   if (use_rel) {
     file->send_path = rel;
     rel = NULL;

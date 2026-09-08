@@ -102,6 +102,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->copy_links = config->copy_links;
   options->safe_links = config->safe_links;
   options->copy_unsafe_links = config->copy_unsafe_links;
+  options->copy_dirlinks = config->copy_dirlinks;
+  options->munge_links = config->munge_links;
   options->checksum = config->checksum;
   options->one_file_system = config->one_file_system;
   options->file_list = (const FileListSet*)config->files_from_set;
@@ -1067,6 +1069,20 @@ static bool send_directory_entry(Client* client, File* file) {
   return send_str(client->file_descriptor, file_wire_path(file));
 }
 
+/* Transmit one symlink entry: a STATUS_SYMLINK frame carrying the destination
+ * path, the (sender-munged, if --munge-links) target string, and metadata when
+ * negotiated.  The receiver unmunges the target and creates the symlink beneath
+ * its root.  Symlinks never need an incremental check or data payload. */
+static bool send_symlink_entry(const Client* client, File* file, const Config* config) {
+  if (!file || !file_wire_path(file) || !file->symlink_target)
+    return false;
+  int fd = client->file_descriptor;
+  if (!send_status(fd, STATUS_SYMLINK) || !send_str(fd, file_wire_path(file)) ||
+      !send_str(fd, file->symlink_target))
+    return false;
+  return !config->use_metadata || metadata_send(fd, file->metadata);
+}
+
 // Send a single file directly via sendfile (non-incremental path).
 static bool send_file_direct_sendfile(File* file, int fd, bool use_metadata, const Config* config) {
   if (!send_status(fd, STATUS_NEXT))
@@ -1244,6 +1260,13 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
           !send_str(client->file_descriptor, file_wire_path(f)) ||
           !send_int(client->file_descriptor, f->link_group) ||
           !send_str(client->file_descriptor, f->hardlink_target))
+        return -1;
+      change_emit_file_sent(config, f);
+      continue;
+    }
+    /* Symlink entry (-l / -k keep-as-symlink): only the target rides the wire. */
+    if (f->is_symlink) {
+      if (!send_symlink_entry(client, f, config))
         return -1;
       change_emit_file_sent(config, f);
       continue;
