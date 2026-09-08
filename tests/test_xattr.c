@@ -203,14 +203,12 @@ static void test_link_copy_fallback_preserves_xattrs() {
   /* Content landed (the copy fallback wrote the caller's bytes). */
   int fd = open(dest, O_RDONLY);
   EXPECT_TRUE(fd >= 0);
-  if (fd >= 0) {
-    char buf[16];
-    ssize_t n = read(fd, buf, sizeof(buf));
-    close(fd);
-    EXPECT_EQ_INT((int)strlen("payload"), (int)n);
-    if (n == 7)
-      EXPECT_TRUE(memcmp(buf, "payload", 7) == 0);
-  }
+  char buf[16];
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+  EXPECT_EQ_INT((int)strlen("payload"), (int)n);
+  if (n == 7)
+    EXPECT_TRUE(memcmp(buf, "payload", 7) == 0);
   /* Per-file xattr applied on the copy. */
   char vbuf[16];
   ssize_t vlen = getxattr(dest, "user.fallback", vbuf, sizeof(vbuf));
