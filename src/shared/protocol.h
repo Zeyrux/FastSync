@@ -84,7 +84,13 @@ enum NET_STATUS {
   STATUS_APPEND,
   STATUS_APPEND_SIG,
   STATUS_APPEND_OK,
-  STATUS_APPEND_DATA
+  STATUS_APPEND_DATA,
+  /* --hard-links/-H: a sibling (later member) of a source hard-link group.
+   * The sender transmits only the path, the run-local link-group id, and the
+   * first (data-carrying) member's destination-relative wire path; the receiver
+   * creates this entry as a hard link to the first member's installed file
+   * (falling back to a byte-identical copy if link() fails).  Protocol 2.12.0. */
+  STATUS_HARDLINK
 };
 
 void io_set_fds(int read_fd, int write_fd);

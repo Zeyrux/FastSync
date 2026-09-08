@@ -69,6 +69,21 @@ bool validate_config(const Config* config) {
                 "full transfer)");
     return false;
   }
+  /* --hard-links/-H transmits each later group member as a dedicated per-file
+     STATUS_HARDLINK frame, which chunk serialization -s does not support; and a
+     hard-links sibling carries no payload, so the tail-resume of --append is
+     meaningless for it.  Both combinations are rejected up front rather than
+     silently degrading. */
+  if (config->preserve_hard_links && config->use_chunk_serialization) {
+    log_message(LOG_LEVEL_ERROR,
+                "--hard-links/-H cannot be combined with -s (chunk serialization)");
+    return false;
+  }
+  if (config->preserve_hard_links && (config->append || config->append_verify)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--hard-links/-H cannot be combined with --append/--append-verify");
+    return false;
+  }
   if (config->log_file_format && !config->log_file) {
     log_message(LOG_LEVEL_ERROR, "--log-file-format requires --log-file");
     return false;

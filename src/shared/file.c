@@ -108,6 +108,9 @@ File* file_create(const char* path) {
   file->skip = false;
   file->is_dir = false;
   file->basis_link = NULL;
+  file->link_group = 0;
+  file->link_first = false;
+  file->hardlink_target = NULL;
   return file;
 }
 
@@ -125,6 +128,8 @@ void file_destroy(void* item) {
   file->send_path = NULL;
   free(file->basis_link);
   file->basis_link = NULL;
+  free(file->hardlink_target);
+  file->hardlink_target = NULL;
   free(file);
 }
 

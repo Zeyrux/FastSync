@@ -126,6 +126,7 @@ static void test_config_send_receive() {
   send_cfg->use_compression = true;
   send_cfg->use_metadata = true;
   send_cfg->use_executability = true;
+  send_cfg->preserve_hard_links = true;
   send_cfg->use_delta = true;
   send_cfg->whole_file = true;
   send_cfg->fuzzy = true;
@@ -180,6 +181,8 @@ static void test_config_send_receive() {
       if (recv_cfg->chunk_size != 1024)
         ok = false;
       if (!recv_cfg->use_executability)
+        ok = false;
+      if (!recv_cfg->preserve_hard_links)
         ok = false;
       if (!recv_cfg->size_only)
         ok = false;

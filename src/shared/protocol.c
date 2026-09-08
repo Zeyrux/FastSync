@@ -405,6 +405,8 @@ static const char* status_to_string(Status status) {
     return "APPEND_OK";
   case STATUS_APPEND_DATA:
     return "APPEND_DATA";
+  case STATUS_HARDLINK:
+    return "HARDLINK";
   default:
     return "UNKNOWN";
   }

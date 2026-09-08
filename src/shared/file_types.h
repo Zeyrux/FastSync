@@ -35,6 +35,15 @@ typedef struct {
    * equals the incoming file, and `data` is kept as the cross-filesystem
    * fallback (a local copy) if the hard link cannot be created. */
   char* basis_link;
+  /* --hard-links (-H), sender + receiver wire state.  link_group is a run-local
+   * id shared by every member of one source inode (0 = not part of a group).
+   * The FIRST member (link_first == true) carries its data on the wire and is
+   * written normally; every sibling (link_first == false) carries NO data and
+   * hardlink_target holds the first member's wire path so the receiver can link
+   * to (or copy from) the already-installed first member. */
+  int link_group;
+  bool link_first;
+  char* hardlink_target;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

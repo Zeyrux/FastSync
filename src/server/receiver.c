@@ -154,7 +154,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   DeleteManifest* deferred_manifest = NULL;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
-         status == STATUS_MKDIR || status == STATUS_MANIFEST) {
+         status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
         goto fail;
@@ -180,6 +180,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
     } else if (status == STATUS_MKDIR) {
       File* dir = file_receive_directory(file_descriptor);
       if (!dir || !sink->store_file(dir, sink->context))
+        goto receive_error;
+    } else if (status == STATUS_HARDLINK) {
+      File* file = file_receive_hardlink(file_descriptor);
+      if (!file || !sink->store_file(file, sink->context))
         goto receive_error;
     } else if (status == STATUS_MANIFEST) {
       DeleteManifest* manifest = receive_manifest_entries(file_descriptor);

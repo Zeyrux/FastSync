@@ -246,7 +246,7 @@ why plain `--append` works on the normal atomic path, not only with `--inplace`.
 | `--chmod=CHMOD` | Affect file permissions | ✅ Implemented | Supports numeric and symbolic `ugo` `rwx` changes; retains receiver safety masking |
 | `-A`, `--acls` | Preserve ACLs | ❌ Not Implemented | Removed because it had no effect |
 | `-X`, `--xattrs` | Preserve extended attributes | ❌ Not Implemented | Removed because it had no effect |
-| `-H`, `--hard-links` | Preserve hard links | ❌ Not Implemented | Removed because it had no effect |
+| `-H`, `--hard-links` | Preserve hard links | ✅ Implemented | Files on the source that share an inode (`st_dev`+`st_ino`, e.g. a `cp -al` tree) are re-created as hard links to one another on the destination, so duplicate links stay deduplicated and only the first member's data is sent (later members are transmitted as payload-less `STATUS_HARDLINK` frames). The receiver links each sibling to the first member's installed file with an atomic link + rename; on `link()` failure it falls back to a byte-identical local copy of the first member, never a partial/corrupt file. Requires the sequential scan for ordering (the first member is always emitted and installed before any sibling is linked). Works single-threaded and under `-m`, `--inplace`, `--delay-updates` (links staged and published by rename) and `--partial`. Crosses the wire (`preserve_hard_links` bool; `PROTOCOL_VERSION` bumped **2.11.0 → 2.12.0**, peers must match). Incompatible with `-s` (chunk serialization) and `--append`/`--append-verify`, rejected up front with a distinct error. See the Phase-4 hard-links notes below |
 | `-D` | Same as --devices --specials | ❌ Not Implemented | Removed because device-file handling is not implemented |
 | `--devices` | Preserve device files | ❌ Not Implemented | Removed because it had no effect |
 | `--specials` | Preserve special files | ❌ Not Implemented | |
@@ -305,6 +305,41 @@ lone-`@` "use the FROM value unchanged" rsync form is not implemented. Also
 unlike rsync, plain `-M` never applies ownership and `--usermap`/`--groupmap`/
 `--chown` each imply metadata preservation so the source uid/gid actually travel
 (the flags only take effect where ownership is being preserved/applied).
+
+**Phase-4 hard-links notes:** `-H`/`--hard-links` is real and introduces a
+deduplicating wire path for files whose source entries share a filesystem inode.
+On the sender, the scanner records each distinct `(st_dev, st_ino)` encounter and
+assigns it a stable, run-local link-group id (`HardLinkTable`, mutex-guarded so a
+multi-threaded scan could share one instance). The FIRST member of a group is
+transferred normally and carries the data; each later (sibling) member is
+transmitted as a payload-less `STATUS_HARDLINK` frame carrying its destination
+path, the group id, and the first member's destination-relative wire path.
+Ordering is guaranteed by forcing the sequential scanner whenever `-H` is on
+(even under `-m`), so the first member is always emitted — and, on the receiver's
+single write thread, installed — before any of its siblings; the receiver is
+therefore always able to link to an already-present first member, including the
+"first member already up-to-date/skipped" case (the sibling links to or copies
+the existing file). Asymmetric existence policies are handled gracefully: under
+`--existing`, if the first member's destination is absent (so it is skipped) but
+a sibling's own destination already exists, that existing sibling is left in
+place rather than the transfer aborting on the missing first member. The receiver
+installs each sibling beneath its confined root
+as an atomic hard link (temp link + rename); when `link()` fails (cross-device,
+filesystem refuses links) it falls back to a byte-identical local copy of the
+first member, never a partial/corrupt file. `--delay-updates` stages each sibling
+as a hard link to the first member's STAGED file, so publication's renames
+preserve the shared inode; `--inplace` and `--partial` are unaffected (a sibling
+is a fresh link/copy). Because a hard link shares an inode, metadata is applied
+exactly once on the first member and never re-written through the sibling (whose
+members are byte-identical by construction), so all members agree.
+
+Wire/version: `PROTOCOL_VERSION` was bumped **2.11.0 → 2.12.0** (peers must
+match). The config frame already carried the `preserve_hard_links` boolean
+(round-trips through `config_send`/`config_receive`); the only new wire element
+is the `STATUS_HARDLINK` frame described above. Incompatibilities (rejected up
+front with a distinct error on the client, and re-checked on receive): `-H` with
+`-s` chunk serialization (the chunk wire has no per-file hard-link info) and `-H`
+with `--append`/`--append-verify` (a payload-less sibling cannot be tail-resumed).
 
 ## 9. Symlink Handling
 
