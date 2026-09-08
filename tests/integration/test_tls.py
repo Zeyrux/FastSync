@@ -92,10 +92,12 @@ def setup_test_data():
     generate_test_files(SOURCE_DIR, full=False)
     clean_dir(DEST_DIR)
     yield
-    shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+    shutil.rmtree(DEST_DIR, ignore_errors=True)
 
 
 class TestTLSBasic:
+    @pytest.mark.ci
     def test_tls_server_client(self, certs):
         """Basic TLS: server with cert/key, client with cert/key + CA."""
         clean_dir(DEST_DIR)

@@ -60,7 +60,8 @@ def setup_test_data():
         generate_test_files(SOURCE_DIR, full=False)
         clean_dir(DEST_DIR)
     yield
-    shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+    shutil.rmtree(DEST_DIR, ignore_errors=True)
 
 
 def _run_ssh_test(name, flags, expected_missing=None):

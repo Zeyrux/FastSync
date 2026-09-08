@@ -21,7 +21,8 @@ def setup_test_data():
     generate_test_files(SOURCE_DIR, full=False)
     clean_dir(DEST_DIR)
     yield
-    shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+    shutil.rmtree(DEST_DIR, ignore_errors=True)
 
 
 def _run_tcp_test(name, port, flags, use_metadata=True, posix=False):
@@ -49,10 +50,12 @@ def _run_tcp_test(name, port, flags, use_metadata=True, posix=False):
 
 
 class TestTCPStandard:
+    @pytest.mark.ci
     def test_standard(self, shared_server):
         r = _run_tcp_test("Standard", shared_server.port, [])
         assert r["status"] == "Success", r["error"]
 
+    @pytest.mark.ci
     def test_posix_args(self, shared_server):
         r = _run_tcp_test("Posix Args", shared_server.port, [], posix=True)
         assert r["status"] == "Success", r["error"]
@@ -63,10 +66,12 @@ class TestTCPStandard:
 
 
 class TestTCPFlags:
+    @pytest.mark.ci
     def test_multithreading(self, shared_server):
         r = _run_tcp_test("Multithreading (-m)", shared_server.port, ["-m"])
         assert r["status"] == "Success", r["error"]
 
+    @pytest.mark.ci
     def test_compression(self, shared_server):
         r = _run_tcp_test("Compression (-c)", shared_server.port, ["-c"])
         assert r["status"] == "Success", r["error"]
