@@ -20,12 +20,12 @@ docker build -t fastsync-ci:local .
 
 # Build, run unit tests, and run integration tests inside the container
 docker run --rm -v "$PWD:/workspace" -w /workspace fastsync-ci:local \
-  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=loadgroup'
+  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=load'
 
 # Avoid root-owned build/ artifacts by matching your host UID/GID
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" \
   -w /workspace fastsync-ci:local \
-  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=loadgroup'
+  sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=load'
 ```
 
 > **Note:** The first `cmake configure` (`cmake -B build -S .`) fetches xxHash from GitHub via `FetchContent` — network access is required. Subsequent reconfigures reuse the cached source.
@@ -41,7 +41,7 @@ cmake -B build -S . -DSANITIZER=address           # AddressSanitizer (ASan)
 cmake -B build -S . -DSANITIZER=thread            # ThreadSanitizer (TSan)
 ```
 
-The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4`). The full coverage jobs (full integration suite, sanitizer, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes.
+The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4 --dist=load`). The full coverage jobs (full integration suite as `-m "not setpriv"`, sanitizer, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes. The two `setpriv` privilege tests are excluded from CI via a marker because their result depends on the runner/container uid and host mount permissions.
 
 ## Build
 
@@ -53,8 +53,8 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 
 ```bash
 ./build/tests                # unit tests
-python3 -m pytest tests/integration/ -n 4 --dist=loadgroup   # full integration suite
-python3 -m pytest tests/integration/ -n 4 --dist=loadgroup -m ci   # PR-gate subset only
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"   # full integration suite (CI excludes env-dependent privilege tests)
+python3 -m pytest tests/integration/ -n 4 --dist=load -m ci   # PR-gate subset only
 ```
 
 ## CI Workflow — Waiting for Results

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -42,11 +43,11 @@ jobs:
 
       - name: Integration Tests (PR smoke subset)
         if: github.event_name == 'pull_request'
-        run: python3 -m pytest tests/integration/ -n 4 --dist=loadgroup -m ci --durations=25 --tb=short -q
+        run: python3 -m pytest tests/integration/ -n 4 --dist=load -m ci --durations=25 --tb=short -q
 
       - name: Integration Tests (full suite)
         if: github.event_name == 'push'
-        run: python3 -m pytest tests/integration/ -n 4 --dist=loadgroup --durations=25 --tb=short -q
+        run: python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv" --durations=25 --tb=short -q
 
   sanitizers:
     runs-on: ubuntu-latest

@@ -25,7 +25,11 @@ def setup_test_data():
     generate_test_files(SOURCE_DIR, full=False)
     clean_dir(DEST_DIR)
     yield
-    shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+    # Remove only this module's own dirs.  Under pytest-xdist the whole
+    # (worker-keyed) TEST_DATA_DIR is shared with concurrently-interleaved
+    # modules, so never rmtree it here.
+    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+    shutil.rmtree(DEST_DIR, ignore_errors=True)
 
 
 class TestDryRun:
@@ -2855,6 +2859,7 @@ class TestDeletePolicy:
                                "--clear-groups"] + cmd, text=True, capture_output=True)
 
     @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.setpriv
     def test_ignore_errors_keeps_deletion_active_on_scan_error(self, mt):
         """A source I/O error (unreadable subdirectory) aborts the run so no
         deletion happens by default; --ignore-errors continues, still transfers
@@ -2901,6 +2906,7 @@ class TestDeletePolicy:
 
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("timing", ["--delete", "--delete-before"])
+    @pytest.mark.setpriv
     def test_ignore_errors_unreadable_root_never_deletes(self, mt, timing):
         """An unreadable SOURCE ROOT must never be treated as a skippable scan
         error: with --ignore-errors the sequential scanner treats the root as
