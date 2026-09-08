@@ -391,8 +391,8 @@ static void test_file_write_to_disk_with_fsync() {
 static void test_file_write_to_disk_preallocate_atomic() {
   const char* path = "test_file_write_prealloc_atomic.txt";
   const char* content = "prealloc atomic content";
-  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), false, false, true, NULL, false,
-                                  NULL));
+  EXPECT_TRUE(
+      file_to_disk_secure(path, content, strlen(content), false, false, true, NULL, false, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -409,8 +409,8 @@ static void test_file_write_to_disk_preallocate_atomic() {
 static void test_file_write_to_disk_preallocate_inplace() {
   const char* path = "test_file_write_prealloc_inplace.txt";
   const char* content = "prealloc inplace content";
-  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), true, false, true, NULL, false,
-                                  NULL));
+  EXPECT_TRUE(
+      file_to_disk_secure(path, content, strlen(content), true, false, true, NULL, false, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));

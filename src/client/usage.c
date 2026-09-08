@@ -182,7 +182,8 @@ void print_usage(void) {
   printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");
-  printf("  --preallocate       Allocate destination file space up front (fail-fast on full disk)\n");
+  printf(
+      "  --preallocate       Allocate destination file space up front (fail-fast on full disk)\n");
   printf("  --append            Resume a shorter destination by appending only its tail\n");
   printf("                    (prefix is not verified; requires --incremental)\n");
   printf("  --append-verify     Like --append, but verifies the retained prefix checksum\n");

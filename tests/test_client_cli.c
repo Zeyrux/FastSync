@@ -2237,6 +2237,8 @@ static void test_parse_args_rejects_malformed_identity() {
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
 
 /* --preallocate parses as a boolean flag and validates cleanly. */
 static void test_parse_args_preallocate() {
