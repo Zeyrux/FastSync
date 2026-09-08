@@ -1090,6 +1090,49 @@ static void test_config_preallocate_wire_roundtrip() {
     }
   }
 }
+/* Phase-4: preserve_xattrs/--acls (in file options) and --fake-super (trailing)
+ * cross the config wire; the receiver recomputes the derived use_xattrs. */
+static void test_config_phase4_xattr_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  send_cfg->preserve_xattrs = true;
+  send_cfg->preserve_acls = true;
+  send_cfg->fake_super = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL;
+    if (ok) {
+      ok = recv->preserve_xattrs && recv->preserve_acls && recv->fake_super && recv->use_xattrs;
+    }
+    config_delete(recv);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1118,6 +1161,7 @@ void test_config() {
     test_config_receive_rejects_invalid_identity();
     test_config_metadata_times_wire_roundtrip();
     test_config_preallocate_wire_roundtrip();
+    test_config_phase4_xattr_wire_roundtrip();
   }
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

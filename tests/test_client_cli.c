@@ -210,6 +210,60 @@ static void test_parse_args_version() {
   config_delete(cfg);
 }
 
+/* --xattrs/-X and --acls/-A preserve per-file xattrs and both imply metadata
+ * transmission (the xattr block rides the metadata/per-file frame); each is
+ * individually negatable and the derived use_xattrs follows the flags. */
+static void test_parse_args_xattrs_acls() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  EXPECT_FALSE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->use_xattrs);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_long[] = {"fastsync", "--acls", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->use_xattrs);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_neg[] = {"fastsync", "-X", "-A", "--no-xattrs", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv_neg, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->preserve_xattrs);
+  EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->use_xattrs);
+  config_delete(cfg);
+}
+
+/* --fake-super is a receiver-side preference that parks the source
+ * uid/gid/mode/mtime in a reserved xattr; it implies metadata transmission. */
+static void test_parse_args_fake_super() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--fake-super", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->fake_super);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_neg[] = {"fastsync", "--fake-super", "--no-fake-super", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_neg, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->fake_super);
+  config_delete(cfg);
+}
+
 /* Test parse_args with valid port */
 static void test_parse_args_valid_port() {
   Config* cfg = config_create();
@@ -768,10 +822,6 @@ static void test_parse_args_delete_timing_without_delete_rejected() {
 static void test_parse_args_rejects_unimplemented_options() {
   static const char* const options[] = {"--silent",
                                         "--queue-size",
-                                        "-A",
-                                        "--acls",
-                                        "-X",
-                                        "--xattrs",
                                         "-D",
                                         "--devices",
                                         "--delete-excluded",
@@ -2446,6 +2496,8 @@ void test_client_cli() {
   test_parse_args_table_equals_size_options();
   test_parse_args_table_equals_string_and_int_options();
   test_parse_args_missing_argument_diagnostic();
+  test_parse_args_xattrs_acls();
+  test_parse_args_fake_super();
   test_parse_args_partial_progress();
   test_parse_args_itemize_changes();
   test_parse_args_list_only();

@@ -20,6 +20,7 @@
 #include "metadata.h"
 #include "utils.h"
 #include "protocol.h"
+#include "xattr.h"
 
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
@@ -114,6 +115,7 @@ File* file_create(const char* path) {
   file->link_group = 0;
   file->link_first = false;
   file->hardlink_target = NULL;
+  file->xattrs = NULL;
   return file;
 }
 
@@ -133,6 +135,8 @@ void file_destroy(void* item) {
   file->basis_link = NULL;
   free(file->hardlink_target);
   file->hardlink_target = NULL;
+  xattr_list_free(file->xattrs);
+  file->xattrs = NULL;
   free(file);
 }
 
@@ -608,11 +612,25 @@ int file_open_private_dir(const char* dir_path) {
   return fd;
 }
 
+/* After the content and mode/times are restored on the just-written file, apply
+ * the per-file xattrs (-X/-A) and, for --fake-super, park the source's
+ * uid/gid/mode/mtime in the reserved xattr.  All fd-relative (confined to the
+ * destination file) and best-effort: a per-attribute or privilege failure is
+ * logged and skipped, never fatal. */
+static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXattrList* xattrs,
+                             bool fake_super) {
+  xattr_apply_fd(fd, xattrs);
+  if (fake_super && metadata)
+    fake_super_store_fd(fd, (uint32_t)metadata->uid, (uint32_t)metadata->gid,
+                        (uint32_t)metadata->mode, metadata->mtime_sec, metadata->mtime_nsec);
+}
+
 static bool file_to_disk_secure_impl(const char* path, const void* data,
                                      unsigned long long data_size, bool inplace, bool sparse,
                                      bool preallocate, const FileMetadata* metadata,
                                      bool preserve_executability, bool update, bool no_replace,
-                                     bool use_fsync, const char* temp_dir) {
+                                     bool use_fsync, const char* temp_dir,
+                                     const FileXattrList* xattrs, bool fake_super) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -662,6 +680,8 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
             else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
               ok = false;
           }
+          if (ok)
+            restore_extra_fd(fd, metadata, xattrs, fake_super);
           if (ok && use_fsync)
             ok = fsync(fd) == 0;
         }
@@ -749,6 +769,8 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
           ok = write_all(fd, data, data_size);
         if (ok && metadata)
           ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+        if (ok)
+          restore_extra_fd(fd, metadata, xattrs, fake_super);
         if (ok && use_fsync)
           ok = fsync(fd) == 0;
       }
@@ -802,7 +824,8 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
                          bool preserve_executability, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, false, false, false, temp_dir);
+                                  preserve_executability, false, false, false, temp_dir, NULL,
+                                  false);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
@@ -810,7 +833,8 @@ bool file_to_disk_secure_update(const char* path, const void* data, unsigned lon
                                 const FileMetadata* metadata, bool preserve_executability,
                                 const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, true, false, false, temp_dir);
+                                  preserve_executability, true, false, false, temp_dir, NULL,
+                                  false);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
@@ -819,7 +843,8 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     bool preserve_executability, bool use_fsync,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, false, false, use_fsync, temp_dir);
+                                  preserve_executability, false, false, use_fsync, temp_dir, NULL,
+                                  false);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
@@ -827,7 +852,22 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     const FileMetadata* metadata, bool preserve_executability,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
-                                  preserve_executability, false, true, false, temp_dir);
+                                  preserve_executability, false, true, false, temp_dir, NULL,
+                                  false);
+}
+
+/* Receiver write-path variant that also applies the per-file xattrs (-X/-A)
+ * and, under --fake-super, parks the source stat in the reserved xattr, on the
+ * just-written file descriptor before the final rename.  `no_replace` / `update`
+ * mirror the plain wrappers; see file_to_disk_secure_impl for the semantics. */
+bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
+                               bool inplace, bool sparse, bool preallocate,
+                               const FileMetadata* metadata, bool preserve_executability,
+                               bool update, bool no_replace, bool use_fsync,
+                               const FileXattrList* xattrs, bool fake_super, const char* temp_dir) {
+  return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
+                                  preserve_executability, update, no_replace, use_fsync, temp_dir,
+                                  xattrs, fake_super);
 }
 
 /* Atomic --link-dest install.  The destination is replaced (via a temporary
@@ -839,10 +879,18 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
  * fallback; a successful hard link keeps the basis inode's own attributes
  * (applying metadata through the shared inode would mutate the basis file).
  * Returns false only when both the link and the copy fallback fail. */
-bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
-                              unsigned long long data_size, bool preallocate,
-                              const FileMetadata* metadata, bool preserve_executability,
-                              bool use_fsync, const char* temp_dir) {
+/* --link-dest / -H hardlink install with a byte-copy fallback.  `metadata` is
+ * applied only on the copy fallback; a successful hard link keeps the basis
+ * inode's own attributes (applying through the shared inode would mutate the
+ * basis).  Likewise `xattrs`/`fake_super` are applied only on the copy
+ * fallback, so a fallback copy preserves the per-file attributes instead of
+ * silently dropping them. */
+static bool file_to_disk_secure_link_impl(const char* path, const char* basis_path,
+                                          const void* data, unsigned long long data_size,
+                                          bool preallocate, const FileMetadata* metadata,
+                                          bool preserve_executability, bool use_fsync,
+                                          const FileXattrList* xattrs, bool fake_super,
+                                          const char* temp_dir) {
   if (!path || !basis_path)
     return false;
   char* leaf = NULL;
@@ -920,8 +968,9 @@ bool file_to_disk_secure_link(const char* path, const char* basis_path, const vo
     free(leaf);
     /* The basis file could not be linked in (missing, cross-device, refused
        by the filesystem).  Write a byte-identical local copy instead. */
-    return file_to_disk_secure_with_fsync(path, data, data_size, false, false, preallocate,
-                                          metadata, preserve_executability, use_fsync, temp_dir);
+    return file_to_disk_secure_attrs(path, data, data_size, false, false, preallocate, metadata,
+                                     preserve_executability, false, false, use_fsync, xattrs,
+                                     fake_super, temp_dir);
   }
 
   if (scratch_dirfd >= 0)
@@ -929,6 +978,24 @@ bool file_to_disk_secure_link(const char* path, const char* basis_path, const vo
   close(dirfd);
   free(leaf);
   return true;
+}
+
+bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
+                              unsigned long long data_size, bool preallocate,
+                              const FileMetadata* metadata, bool preserve_executability,
+                              bool use_fsync, const char* temp_dir) {
+  return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
+                                       preserve_executability, use_fsync, NULL, false, temp_dir);
+}
+
+bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, const void* data,
+                                    unsigned long long data_size, bool preallocate,
+                                    const FileMetadata* metadata, bool preserve_executability,
+                                    bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                    const char* temp_dir) {
+  return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
+                                       preserve_executability, use_fsync, xattrs, fake_super,
+                                       temp_dir);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

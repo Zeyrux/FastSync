@@ -16,17 +16,18 @@
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
+#include "xattr.h"
 
 bool file_send_single_calls(File* file, int file_descriptor, bool use_metadata,
                             int compression_level, bool send_path) {
   return file_send_single_calls_with_skip(file, file_descriptor, use_metadata, compression_level,
-                                          send_path, NULL, -1, 0);
+                                          send_path, NULL, -1, 0, false);
 }
 
 bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_metadata,
                                       int compression_level, bool send_path,
                                       char* const* skip_suffixes, int skip_count,
-                                      int compression_threads) {
+                                      int compression_threads, bool send_xattrs) {
   if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data))
     return false;
   const Data* data_to_send = file->data;
@@ -49,6 +50,10 @@ bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_
     data_destroy(compressed_data);
     return false;
   }
+  if (send_xattrs && !xattr_send(file_descriptor, file ? file->xattrs : NULL)) {
+    data_destroy(compressed_data);
+    return false;
+  }
   if (!send_data(file_descriptor, data_to_send)) {
     data_destroy(compressed_data);
     return false;
@@ -60,22 +65,24 @@ bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_
 bool file_send_sendfile(File* file, int file_descriptor, bool use_metadata, int compression_level,
                         bool send_path) {
   return file_send_sendfile_with_skip(file, file_descriptor, use_metadata, compression_level,
-                                      send_path, NULL, -1, 0);
+                                      send_path, NULL, -1, 0, false);
 }
 
 bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_metadata,
                                   int compression_level, bool send_path, char* const* skip_suffixes,
-                                  int skip_count, int compression_threads) {
+                                  int skip_count, int compression_threads, bool send_xattrs) {
   if (!file || !file->path || !file->data)
     return false;
   if (compression_level > 0)
     return file_send_single_calls_with_skip(file, file_descriptor, use_metadata, compression_level,
                                             send_path, skip_suffixes, skip_count,
-                                            compression_threads);
+                                            compression_threads, send_xattrs);
 
   if (send_path && !send_str(file_descriptor, file_wire_path(file)))
     return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
+    return false;
+  if (send_xattrs && !xattr_send(file_descriptor, file ? file->xattrs : NULL))
     return false;
 
   int fd = file_open_for_read(file->path);

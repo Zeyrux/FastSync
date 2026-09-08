@@ -128,6 +128,16 @@ void print_usage(void) {
   printf("                      none suppresses info even with --verbose\n");
   printf("  -M, --preserve      Preserve file metadata\n");
   printf("  -E, --executability Preserve executable permission bits\n");
+  printf("  -X, --xattrs        Preserve user extended attributes (user.* only;\n");
+  printf("                      privileged security.*/trusted.* namespaces are\n");
+  printf("                      never captured or applied)\n");
+  printf("  -A, --acls          Preserve POSIX ACLs (the system.posix_acl_* xattrs;\n");
+  printf("                      setting an ACL the receiver is not permitted to\n");
+  printf("                      set is warned and skipped, never fatal)\n");
+  printf("  --fake-super        Store the source uid/gid/mode/mtime in a reserved\n");
+  printf("                      user.fastsync.stat xattr on each written file instead\n");
+  printf("                      of applying ownership (for a later privileged restore);\n");
+  printf("                      partial: full rsync fake-super replay is out of scope\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
   printf("  --numeric-ids       Do not map uid/gid by name: use the source numeric\n");
   printf("                      ids directly when applying ownership\n");

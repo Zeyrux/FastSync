@@ -81,6 +81,14 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse, bool preallocate,
                                     const FileMetadata* metadata, bool preserve_executability,
                                     const char* temp_dir);
+/* Receiver write-path variant that also applies per-file xattrs (-X/-A) and the
+ * --fake-super stat xattr fd-relative before the final rename.  `update` /
+ * `no_replace` / `use_fsync` mirror the plain wrappers above. */
+bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
+                               bool inplace, bool sparse, bool preallocate,
+                               const FileMetadata* metadata, bool preserve_executability,
+                               bool update, bool no_replace, bool use_fsync,
+                               const FileXattrList* xattrs, bool fake_super, const char* temp_dir);
 /* Atomic --link-dest install: replace `path` with a hard link to `basis_path`
    (via a temp name + rename); fall back to a byte-identical local copy from
    `data` when the link is impossible (EXDEV/EPERM/unsupported filesystem).
@@ -91,5 +99,14 @@ bool file_to_disk_secure_link(const char* path, const char* basis_path, const vo
                               unsigned long long data_size, bool preallocate,
                               const FileMetadata* metadata, bool preserve_executability,
                               bool use_fsync, const char* temp_dir);
+/* Like file_to_disk_secure_link, but the byte-copy fallback also applies the
+ * per-file xattrs (-X/-A) and --fake-super stat xattr (fd-relative).  On a
+ * successful hard link no attributes are applied (the shared inode already
+ * carries the basis's). */
+bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, const void* data,
+                                    unsigned long long data_size, bool preallocate,
+                                    const FileMetadata* metadata, bool preserve_executability,
+                                    bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                    const char* temp_dir);
 
 #endif

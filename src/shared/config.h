@@ -310,9 +310,24 @@ typedef struct Config {
    * source files with O_NOATIME so reading for transfer does not bump the
    * source access time. */
   bool open_noatime;
+
+  // Phase 4: xattr / ACL / fake-super preservation.
+  /* -X/--xattrs and -A/--acls toggle the sender's capture and the receiver's
+   * application of per-file extended attributes (xattrs).  Both cross the wire:
+   * the sender only transmits the bounded, whitelisted attribute set it
+   * captures and the receiver re-validates namespaces/sizes before applying
+   * fd-relative.  With neither set (the default) no xattr block is sent, so the
+   * wire is byte-identical to prior protocol versions for unaffected runs. */
+  /* true when preserve_xattrs || preserve_acls; the sender/receiver gate the
+   * xattr wire block on this single flag. */
+  bool use_xattrs;
+  /* --fake-super: receiver-only.  When set, each written file additionally gets
+   * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
+   * so a later privileged restore could re-apply them.  Crosses the wire. */
+  bool fake_super;
 } Config;
 
-#define PROTOCOL_VERSION "2.12.0"
+#define PROTOCOL_VERSION "2.13.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

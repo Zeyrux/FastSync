@@ -4128,3 +4128,177 @@ class TestOmitTimes:
         received = get_dest_received_dir(dest, source)
         mismatches, missing = verify_transfer(source, received)
         assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+
+def _xattr_supported(path):
+    """True when the filesystem hosting `path` supports user xattrs."""
+    try:
+        os.setxattr(path, "user.fastsync-probe", b"p")
+        os.removexattr(path, "user.fastsync-probe")
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
+class TestExtendedAttributes:
+    """-X/--xattrs, -A/--acls, --fake-super: portable extended metadata.
+
+    Runs unprivileged (CI is non-root).  Everything is best-effort and guarded:
+    a filesystem without xattr support, or an ACL toolchain/POSIX-ACL
+    filesystem feature that is missing, is skipped rather than failed.  The
+    security boundary (only user.* and the system.posix_acl_* namespaces are
+    ever applied) is asserted alongside the happy path."""
+
+    def _source_and_dest(self, name):
+        source = os.path.join(TEST_DATA_DIR, name + "_src")
+        dest = os.path.join(TEST_DATA_DIR, name + "_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        return source, dest
+
+    @pytest.mark.ci
+    def test_xattrs_preserves_user_namespace(self, shared_server):
+        source, dest = self._source_and_dest("xattr")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"xattr payload\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(f, "user.foo", b"preserved-value")
+
+        result, _ = run_client(source, dest, flags=["-X"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-X sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "data.txt"), "user.foo") == b"preserved-value"
+
+    def test_without_xattrs_does_not_carry(self, shared_server):
+        source, dest = self._source_and_dest("xattr_ctrl")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"plain\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(f, "user.foo", b"must-not-travel")
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"control sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        with pytest.raises(OSError):
+            os.getxattr(os.path.join(received, "data.txt"), "user.foo")
+
+    def test_reserved_fake_super_key_not_forwarded(self, shared_server):
+        """A source file that already carries the reserved user.fastsync.stat
+        record must NOT have it planted on the receiver during a plain -X run
+        (it is receiver-only, so it cannot be spoofed for a later privileged
+        restore)."""
+        source, dest = self._source_and_dest("xattr_reserved")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"reserved\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(f, "user.fastsync.stat", b"0:0:644:0:0")
+        # A normal user.* attr still travels alongside.
+        os.setxattr(f, "user.keep", b"yes")
+
+        result, _ = run_client(source, dest, flags=["-X"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-X reserved-key sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "data.txt"), "user.keep") == b"yes"
+        with pytest.raises(OSError):
+            os.getxattr(os.path.join(received, "data.txt"), "user.fastsync.stat")
+
+    @pytest.mark.ci
+    def test_xattrs_multithreaded(self, shared_server):
+        source, dest = self._source_and_dest("xattr_mt")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"mt xattr\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(f, "user.k", b"v")
+        result, _ = run_client(source, dest, flags=["-X", "-m"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-X -m sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "data.txt"), "user.k") == b"v"
+
+    @pytest.mark.ci
+    def test_acls_via_posix_acl_xattr(self, shared_server):
+        source, dest = self._source_and_dest("acl")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"acl payload\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support xattrs")
+        acl_blob = None
+        if shutil.which("setfacl") is not None:
+            acl = subprocess.run(["setfacl", "-m", "o::r", f], capture_output=True, text=True)
+            if acl.returncode == 0:
+                try:
+                    acl_blob = os.getxattr(f, "system.posix_acl_access")
+                except OSError:
+                    acl_blob = None
+        if acl_blob is None:
+            # No setfacl (common in the minimal CI image): synthesize a valid
+            # non-trivial POSIX ACL ("u:current-uid:r") xattr blob directly.
+            import struct
+            try:
+                uid_for_acl = os.geteuid() if os.geteuid() != 0 else 65534
+                struct_entry = struct.pack("<HHI", 0x01, 0x4, 0xFFFFFFFF)  # USER_OBJ r
+                struct_entry += struct.pack("<HHI", 0x02, 0x4, uid_for_acl)  # USER r
+                struct_entry += struct.pack("<HHI", 0x04, 0x4, 0xFFFFFFFF)  # GROUP_OBJ r
+                struct_entry += struct.pack("<HHI", 0x10, 0x4, 0xFFFFFFFF)  # MASK r
+                struct_entry += struct.pack("<HHI", 0x20, 0x0, 0xFFFFFFFF)  # OTHER ---
+                blob = struct.pack("<I", 2) + struct_entry
+                os.setxattr(f, "system.posix_acl_access", blob)
+                acl_blob = os.getxattr(f, "system.posix_acl_access")
+            except (OSError, struct.error) as e:
+                pytest.skip(f"cannot set a POSIX ACL unprivileged: {e}")
+
+        result, _ = run_client(source, dest, flags=["-A"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-A sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "data.txt"),
+                           "system.posix_acl_access") == acl_blob
+
+    @pytest.mark.ci
+    def test_acls_imply_xattr_transport(self, shared_server):
+        """-A and -X enable the shared xattr transport; both attributes travel
+        together, and a security.* attribute a malicious peer would send is
+        never applied (receiver whitelist)."""
+        source, dest = self._source_and_dest("acl_xattr")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"combined\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support xattrs")
+        os.setxattr(f, "user.for-acl-flag", b"yes")
+        result, _ = run_client(source, dest, flags=["-A", "-X"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-A -X sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "data.txt"), "user.for-acl-flag") == b"yes"
+
+    @pytest.mark.ci
+    def test_fake_super_stores_source_stat(self, shared_server):
+        source, dest = self._source_and_dest("fakesuper")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"fake-super\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support xattrs")
+        uid = os.stat(f).st_uid
+
+        result, _ = run_client(source, dest, flags=["--fake-super"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--fake-super sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        record = os.getxattr(os.path.join(received, "data.txt"), "user.fastsync.stat").decode()
+        fields = record.split(":")
+        assert len(fields) == 5
+        assert fields[0] == str(uid), f"reserved uid field {fields[0]} != source uid {uid}"

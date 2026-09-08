@@ -2,6 +2,7 @@
 #define FILE_TYPES_H
 
 #include "data.h"
+#include "xattr.h"
 #include <stdbool.h>
 #include <sys/stat.h>
 
@@ -56,6 +57,11 @@ typedef struct {
   int link_group;
   bool link_first;
   char* hardlink_target;
+  /* Phase-4 xattrs (-X/--xattrs, -A/--acls).  Sender: captured from the source
+   * file when use_xattrs is set; transmitted in the per-file metadata frame.
+   * Receiver: parsed off the wire, attached here, and applied fd-relative on
+   * the written file.  NULL/0 == the file carries no xattrs. */
+  FileXattrList* xattrs;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side
