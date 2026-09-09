@@ -6,6 +6,7 @@
 #include "test_compression.h"
 #include "test_config.h"
 #include "test_data.h"
+#include "test_daemon_conf.h"
 #include "test_delay_updates.h"
 #include "test_delta.h"
 #include "test_file.h"
@@ -21,6 +22,7 @@
 #include "test_robustness.h"
 #include "test_scanner.h"
 #include "test_server.h"
+#include "test_server_cli.h"
 #include "test_shared_utils.h"
 #include "test_stress.h"
 #include "test_transport_tcp.h"
@@ -68,6 +70,8 @@ int main() {
   RUN_TEST(test_transport_tls);
   RUN_TEST(test_client_cli);
   RUN_TEST(test_server);
+  RUN_TEST(test_daemon_conf);
+  RUN_TEST(test_server_cli);
   RUN_TEST(test_fuzz_smoke);
   RUN_TEST(test_xattr);
 
