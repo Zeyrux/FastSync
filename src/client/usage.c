@@ -20,6 +20,15 @@ void print_usage(void) {
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  --remove-source-files  Remove regular source files after successful transfer\n");
   printf("  -p <port>           SSH port (default: 22)\n");
+  printf("  -e, --rsh <command>  Remote shell to launch on the client for the SSH\n");
+  printf("                      transport (default: ssh).  The command may include\n");
+  printf("                      arguments, e.g. -e \"ssh -p 2222\"\n");
+  printf("  --rsync-path <path>  Alias for --fastsync-server-path (path to the\n");
+  printf("                      fastsync server binary on the remote side)\n");
+  printf("  --blocking-io        Leave the SSH transport socket without read/write\n");
+  printf("                      timeouts so it blocks naturally\n");
+  printf("  --outbuf=MODE        stdout/stderr buffering: N (none/unbuffered),\n");
+  printf("                      L (line-buffered), or B (block-buffered, default)\n");
   printf("  --progress          Show transfer progress\n");
   printf("  -P                  Partial mode with progress (retention incomplete)\n");
   printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");

@@ -607,12 +607,12 @@ now transmits targets (the prior behavior was broken/partial); its status moved
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-e`, `--rsh=COMMAND` | Remote shell to use | ❌ Not Implemented | Removed; SSH invokes `ssh` directly |
-| `--rsync-path=PROGRAM` | rsync binary on remote | ❌ Not Implemented | Removed; use `--fastsync-server-path` |
+| `-e`, `--rsh=COMMAND` | Remote shell to use | ✅ Implemented | `-e`/`--rsh` (and `--rsh=COMMAND`) select the remote-shell program used to build the SSH child argv, overriding the default `ssh`. The command is whitespace-split into the leading argv words so rsync's `-e "ssh -p 2222"` works; the standard `-o` family, an optional `-p` port, `user@host` and the quoted remote command (`fastsync-server --stdio`) follow. Stored in the `rsh_command` config field. **Client-only, never crosses the wire** (it is a launch concern, not a handshake property) |
+| `--rsync-path=PROGRAM` | rsync binary on remote | ✅ Implemented | Alias for `--fastsync-server-path`: both write the `fastsync_server_path` config field used as the remote-side server program (quoted as one remote-shell word unless `--old-args`), which CROSSES the wire as before. Kept separate from `--rsh`, which names the local connecting program |
 | `--port=PORT` | Alternate daemon port | ✅ Implemented | `server_port` config field |
 | `--sockopts=OPTIONS` | Custom TCP options | ❌ Not Implemented | |
-| `--blocking-io` | Use blocking I/O for remote shell | ❌ Not Implemented | |
-| `--outbuf=N\|L\|B` | Set output buffering | ❌ Not Implemented | |
+| `--blocking-io` | Use blocking I/O for remote shell | ✅ Implemented | With `--blocking-io` the SSH-transport socketpair socket is left without `SO_RCVTIMEO`/`SO_SNDTIMEO`, so the transfer blocks naturally; by default it gets the same read/write timeout as the TCP transport (see `--timeout`). `blocking_io` config bool. **Client-only, never crosses the wire** |
+| `--outbuf=N\|L\|B` | Set output buffering | ✅ Implemented | `N` (none/unbuffered) → `_IONBF`, `L` (line) → `_IOLBF`, `B` (block, the default) → `_IOFBF` via `setvbuf` on stdout and stderr. Garbage values are rejected. `outbuf` config field (`OutbufMode`). **Client-only, never crosses the wire** |
 | `--address=ADDRESS` | Bind address for outgoing socket | ❌ Not Implemented | Removed because it had no effect |
 | `-4`, `--ipv4` | Prefer IPv4 | ❌ Not Implemented | Removed because it had no effect |
 | `-6`, `--ipv6` | Prefer IPv6 | ❌ Not Implemented | Removed because it had no effect |
@@ -744,7 +744,7 @@ These options affect process startup, authentication, sockets, and remote execut
 
 | Features | Effort | Implementation plan |
 |----------|--------|--------------------|
-| `--rsh=COMMAND`, `-e`; `--rsync-path=PROGRAM`; `--blocking-io`; `--outbuf=N\|L\|B` | M | Generalize SSH command construction and subprocess I/O while retaining argument escaping and timeout guarantees. |
+| `--rsh=COMMAND`, `-e`; `--rsync-path=PROGRAM`; `--blocking-io`; `--outbuf=N\|L\|B` | M | ✅ Wave A implemented (see the Connectivity table above). SSH argv construction is generalized: `-e`/`--rsh` replaces the hardcoded `ssh` program (whitespace-split, so `-e "ssh -p 2222"` works), `--rsync-path` aliases the existing `fastsync_server_path`, `--blocking-io` drops the SSH socket timeouts, and `--outbuf` maps N/L/B onto `setvbuf`. All four are client-only launch concerns and never cross the wire. |
 | `--address=ADDRESS`; `--ipv4`, `-4`; `--ipv6`, `-6`; `--sockopts=OPTIONS`; `--port=PORT` daemon semantics | M | Add explicit socket-family/bind configuration and validate it independently for TCP client and daemon modes. |
 | `--remote-option=OPT`, `-M`; `--trust-sender` | L | Add authenticated remote-option/config negotiation and reject unsafe sender-controlled values. `-M` conflicts with FastSync metadata mode. |
 | `--daemon`; `--config=FILE`; `--dparam=OVERRIDE`; `--no-detach`; `--password-file=FILE`; `--early-input=FILE`; `--no-motd` | XL | Implement a real daemon lifecycle, module configuration, authentication, privilege separation, and process management. |

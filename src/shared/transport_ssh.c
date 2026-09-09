@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -16,7 +17,9 @@ typedef struct {
   char* remote_path;
 } RemoteDest;
 
-static void ssh_child_setup_failed(int status_fd) {
+/* Writes the exec-failure marker and exits the child.  Marked noreturn so
+ * static analyzers prove the caller's error path never falls through. */
+__attribute__((noreturn)) static void ssh_child_setup_failed(int status_fd) {
   ssize_t wret = write(status_fd, "x", 1);
   (void)wret;
   _exit(1);
@@ -119,8 +122,119 @@ char* ssh_build_remote_command(const char* server_path, bool old_args) {
   return command;
 }
 
+/* A heap-owned, NULL-terminated argv whose every string is separately malloc'd
+ * (str_dup'd) so a caller can free arbitrary slots, including argv[0]. */
+char** ssh_build_client_argv(const char* rsh_command, int port, const char* userhost,
+                             const char* remote_command) {
+  const char* rsh = (rsh_command && *rsh_command) ? rsh_command : "ssh";
+
+  /* Whitespace-split the remote-shell command into the leading argv words so
+   * "-e 'ssh -p 2222'" (or "--rsh=ssh -p 2222") works like rsync's rsh.  A
+   * blank command falls back to the default "ssh". */
+  char* copy = str_dup(rsh);
+  if (!copy)
+    return NULL;
+  char* save = NULL;
+  int nwords = 0;
+  char** words = NULL;
+  for (char* tok = strtok_r(copy, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save)) {
+    char** grown = realloc(words, (size_t)(nwords + 1) * sizeof(char*));
+    if (!grown) {
+      for (int i = 0; i < nwords; i++)
+        free(words[i]);
+      free(words);
+      free(copy);
+      return NULL;
+    }
+    words = grown;
+    words[nwords] = str_dup(tok);
+    if (!words[nwords]) {
+      for (int i = 0; i < nwords; i++)
+        free(words[i]);
+      free(words);
+      free(copy);
+      return NULL;
+    }
+    nwords++;
+  }
+  free(copy);
+  if (nwords == 0) {
+    words = malloc(sizeof(char*));
+    if (!words)
+      return NULL;
+    words[0] = str_dup("ssh");
+    if (!words[0]) {
+      free(words);
+      return NULL;
+    }
+    nwords = 1;
+  }
+
+  /* Fixed tail: three -o pairs (6) + optional -p/value (2) + user@host +
+   * remote command + terminating NULL. */
+  int port_extra = (port > 0 && port != 22) ? 2 : 0;
+  size_t total = (size_t)nwords + 6 + (size_t)port_extra + 3;
+  char** argv = calloc(total, sizeof(char*));
+  if (!argv) {
+    for (int i = 0; i < nwords; i++)
+      free(words[i]);
+    free(words);
+    return NULL;
+  }
+  int ac = 0;
+  for (int i = 0; i < nwords; i++)
+    argv[ac++] = words[i];
+  free(words);
+
+  char* tail[] = {"-o", "Compression=no",
+                  "-o", "ControlMaster=auto",
+                  "-o", "ControlPath=~/.cache/fastsync-%r@%h:%p"};
+  for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++) {
+    argv[ac] = str_dup(tail[i]);
+    if (!argv[ac])
+      goto fail_argv;
+    ac++;
+  }
+  if (port_extra) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    argv[ac] = str_dup("-p");
+    if (!argv[ac])
+      goto fail_argv;
+    ac++;
+    argv[ac] = str_dup(port_str);
+    if (!argv[ac])
+      goto fail_argv;
+    ac++;
+  }
+  argv[ac] = str_dup(userhost);
+  if (!argv[ac])
+    goto fail_argv;
+  ac++;
+  argv[ac] = str_dup(remote_command);
+  if (!argv[ac])
+    goto fail_argv;
+  ac++;
+  argv[ac] = NULL;
+  return argv;
+
+fail_argv:
+  for (int i = 0; i < ac; i++)
+    free(argv[i]);
+  free(argv);
+  return NULL;
+}
+
+void ssh_free_client_argv(char** argv) {
+  if (!argv)
+    return;
+  for (int i = 0; argv[i]; i++)
+    free(argv[i]);
+  free(argv);
+}
+
 Client* client_connect_ssh(const char* destination, int port, const char* server_path,
-                           bool old_args) {
+                           bool old_args, const char* rsh_command, bool blocking_io) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     char* escaped = output_escape(destination, false);
@@ -141,6 +255,17 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
   setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
   setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
   setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+
+  /* By default the SSH transport socket gets the same read/write timeout as
+   * the TCP transport so a wedged remote shell cannot hang forever.  With
+   * --blocking-io the timeouts are skipped and the socket blocks naturally. */
+  if (!blocking_io) {
+    struct timeval tv;
+    tv.tv_sec = tcp_get_timeout_sec();
+    tv.tv_usec = 0;
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
 
   int exec_pipe[2];
   if (pipe(exec_pipe) < 0) {
@@ -187,29 +312,17 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     else
       snprintf(ssh_user, ssh_user_len, "%s", r.host);
 
-    char* ssh_argv[16];
-    int ac = 0;
-    char port_str[16];
     char* remote_command = ssh_build_remote_command(server_path, old_args);
     if (!remote_command)
       ssh_child_setup_failed(exec_pipe[1]);
-    ssh_argv[ac++] = "ssh";
-    ssh_argv[ac++] = "-o";
-    ssh_argv[ac++] = "Compression=no";
-    ssh_argv[ac++] = "-o";
-    ssh_argv[ac++] = "ControlMaster=auto";
-    ssh_argv[ac++] = "-o";
-    ssh_argv[ac++] = "ControlPath=~/.cache/fastsync-%r@%h:%p";
-    if (port > 0 && port != 22) {
-      ssh_argv[ac++] = "-p";
-      snprintf(port_str, sizeof(port_str), "%d", port);
-      ssh_argv[ac++] = port_str;
-    }
-    ssh_argv[ac++] = ssh_user;
-    ssh_argv[ac++] = remote_command;
-    ssh_argv[ac] = NULL;
-    execvp("ssh", ssh_argv);
-    log_perror("exec of ssh failed");
+    char** ssh_argv = ssh_build_client_argv(rsh_command, port, ssh_user, remote_command);
+    free(ssh_user);
+    free(remote_command);
+    if (!ssh_argv)
+      ssh_child_setup_failed(exec_pipe[1]);
+    execvp(ssh_argv[0], ssh_argv);
+    log_perror("exec of remote shell failed");
+    ssh_free_client_argv(ssh_argv);
     ssh_child_setup_failed(exec_pipe[1]);
   }
 

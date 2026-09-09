@@ -831,9 +831,6 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--delete-excluded",
                                         "--max-delete",
                                         "--prune-empty-dirs",
-                                        "-e",
-                                        "--rsh",
-                                        "--rsync-path",
                                         "--address",
                                         "--bind-address",
                                         "--ipv6",
@@ -1207,6 +1204,117 @@ static void test_parse_args_old_args() {
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->old_args);
+  config_delete(cfg);
+}
+
+/* Phase 5 connectivity: -e/--rsh select the remote-shell program.  Both the
+ * short (space-separated value) and long (=value and space) forms parse, and
+ * a multi-word command line is preserved verbatim for the transport layer. */
+static void test_parse_args_rsh() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-e", "ssh -p 2222", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->rsh_command, "ssh -p 2222");
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_eq[] = {"fastsync", "--rsh=customsh", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_eq, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->rsh_command, "customsh");
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_space[] = {"fastsync", "--rsh", "ssh -l bob", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->rsh_command, "ssh -l bob");
+  config_delete(cfg);
+
+  /* A missing value is a hard error. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_missing[] = {"fastsync", "-e"};
+  EXPECT_EQ_INT(parse_args(cfg, 2, argv_missing, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
+/* --rsync-path is rsync's spelling for the server program path: it aliases
+ * fastsync_server_path exactly like --fastsync-server-path. */
+static void test_parse_args_rsync_path_alias() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--rsync-path", "/usr/bin/fastsync-server", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->fastsync_server_path, "/usr/bin/fastsync-server");
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_eq[] = {"fastsync", "--rsync-path=/opt/bin/srv", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_eq, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->fastsync_server_path, "/opt/bin/srv");
+  config_delete(cfg);
+}
+
+/* --blocking-io is a plain boolean flag that leaves the SSH socket with no
+ * timeouts; the default is off. */
+static void test_parse_args_blocking_io() {
+  Config* cfg = config_create();
+  EXPECT_FALSE(cfg->blocking_io);
+  char* argv[] = {"fastsync", "--blocking-io", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->blocking_io);
+  config_delete(cfg);
+}
+
+/* --outbuf=N|L|B maps onto the OUTBUF_* modes (default: block).  Garbage is
+ * rejected, never silently coerced. */
+static void test_parse_args_outbuf() {
+  Config* cfg = config_create();
+  EXPECT_EQ_INT(cfg->outbuf, OUTBUF_BLOCK);
+  int positional_args[2];
+  int positional_count = 0;
+
+  char* argv_n[] = {"fastsync", "--outbuf=N", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_n, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->outbuf, OUTBUF_NONE);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_l[] = {"fastsync", "--outbuf", "L", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_l, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->outbuf, OUTBUF_LINE);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_b[] = {"fastsync", "--outbuf=b", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_b, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->outbuf, OUTBUF_BLOCK);
+  config_delete(cfg);
+
+  static const char* const bad[] = {"G", "X", ""};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    cfg = config_create();
+    positional_count = 0;
+    char option[32];
+    snprintf(option, sizeof(option), "--outbuf=%s", bad[i]);
+    char* argv_bad[] = {"fastsync", option, "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv_bad, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_missing[] = {"fastsync", "--outbuf"};
+  EXPECT_EQ_INT(parse_args(cfg, 2, argv_missing, positional_args, &positional_count), -1);
   config_delete(cfg);
 }
 
@@ -2556,6 +2664,10 @@ void test_client_cli() {
   test_parse_args_no_preserve_blocks_implicit_metadata();
   test_parse_args_rejects_unsafe_negation();
   test_parse_args_old_args();
+  test_parse_args_rsh();
+  test_parse_args_rsync_path_alias();
+  test_parse_args_blocking_io();
+  test_parse_args_outbuf();
   test_parse_args_fsync();
   test_parse_args_existing();
   test_parse_args_ignore_times();

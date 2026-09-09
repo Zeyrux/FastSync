@@ -194,6 +194,35 @@ static int set_stderr_mode(const char* value) {
   return 0;
 }
 
+/* Parse --outbuf=N|L|B into the config's OutbufMode.  N=none (unbuffered),
+ * L=line-buffered, B=block-buffered (the stdio default).  Anything else is a
+ * clear error, never a silent fallback. */
+static int set_outbuf_option(Config* config, const char* value) {
+  if (strcmp(value, "N") == 0 || strcmp(value, "n") == 0)
+    config->outbuf = OUTBUF_NONE;
+  else if (strcmp(value, "L") == 0 || strcmp(value, "l") == 0)
+    config->outbuf = OUTBUF_LINE;
+  else if (strcmp(value, "B") == 0 || strcmp(value, "b") == 0)
+    config->outbuf = OUTBUF_BLOCK;
+  else {
+    log_message(LOG_LEVEL_ERROR, "--outbuf must be N (none), L (line), or B (block)");
+    return -1;
+  }
+  return 0;
+}
+
+#ifndef FASTSYNC_TEST_BUILD
+/* Apply the parsed --outbuf style to stdout/stderr via setvbuf, matching stdio
+ * semantics: N -> _IONBF (unbuffered), L -> _IOLBF (line), B -> _IOFBF (block,
+ * the default). */
+static void apply_output_buffering(const Config* config) {
+  int mode = config->outbuf;
+  int stdio_mode = (mode == OUTBUF_NONE) ? _IONBF : (mode == OUTBUF_LINE) ? _IOLBF : _IOFBF;
+  setvbuf(stdout, NULL, stdio_mode, 0);
+  setvbuf(stderr, NULL, stdio_mode, 0);
+}
+#endif
+
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
 static int parse_debug_flags(const char* value, Config* config) {
@@ -472,6 +501,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--secluded-args", NULL, OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
     {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
+    {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
+    {"--blocking-io", NULL, OPT_FLAG, offsetof(Config, blocking_io)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
     {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
     {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
@@ -521,6 +552,9 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--ca", NULL, OPT_STRING, offsetof(Config, tls_ca)},
     {"--backup-dir", NULL, OPT_STRING, offsetof(Config, backup_dir)},
     {"--fastsync-server-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
+    /* --rsync-path is rsync's spelling for the same "server program path"; it
+     * is a pure alias for fastsync_server_path (never a distinct field). */
+    {"--rsync-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
     {"--temp-dir", NULL, OPT_STRING, offsetof(Config, temp_dir)},
     {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
     {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
@@ -1191,6 +1225,12 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (identity_parse_chown(config, argv[++i]) != 0)
         return -1;
       config->use_metadata = true;
+    } else if (strncmp(argv[i], "--outbuf=", 9) == 0) {
+      if (set_outbuf_option(config, argv[i] + 9) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--outbuf", NULL)) {
+      if (i + 1 >= argc || set_outbuf_option(config, argv[++i]) != 0)
+        return -1;
     } else if (argv[i][0] == '-') {
       char* escaped = output_escape(argv[i], false);
       fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
@@ -1394,6 +1434,9 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto cleanup;
   }
+
+  /* Apply the requested --outbuf style now that the mode is parsed. */
+  apply_output_buffering(config);
 
   /* --open-noatime is a sender-side policy: install it for every source read
      (scan + data path) without touching the receiver. */
