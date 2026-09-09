@@ -83,6 +83,210 @@ static void test_config_ssh_dest_no_user() {
   config_delete(cfg);
 }
 
+static void test_config_daemon_dest_parse() {
+  Config* cfg = make_config("1.0", "/src", "dahost::files/sub/dir", true, false, false, false,
+                            false, 1, false, 0);
+  int ret = config_parse_daemon_dest(cfg);
+  EXPECT_EQ_INT(ret, 1);
+  EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
+  EXPECT_EQ_STR(cfg->server_host, "dahost");
+  EXPECT_EQ_STR(cfg->module, "files");
+  EXPECT_EQ_STR(cfg->receive_root_directory, "sub/dir");
+  config_delete(cfg);
+}
+
+static void test_config_daemon_dest_no_path() {
+  Config* cfg =
+      make_config("1.0", "/src", "dahost::files", true, false, false, false, false, 1, false, 0);
+  int ret = config_parse_daemon_dest(cfg);
+  EXPECT_EQ_INT(ret, 1);
+  EXPECT_EQ_STR(cfg->server_host, "dahost");
+  EXPECT_EQ_STR(cfg->module, "files");
+  EXPECT_EQ_STR(cfg->receive_root_directory, "");
+  config_delete(cfg);
+}
+
+static void test_config_daemon_dest_double_slash_normalized() {
+  Config* cfg = make_config("1.0", "/src", "dahost::files//sub", true, false, false, false, false,
+                            1, false, 0);
+  int ret = config_parse_daemon_dest(cfg);
+  EXPECT_EQ_INT(ret, 1);
+  EXPECT_EQ_STR(cfg->module, "files");
+  EXPECT_EQ_STR(cfg->receive_root_directory, "sub");
+  config_delete(cfg);
+}
+
+static void test_config_daemon_dest_bad() {
+  /* Missing module name after "::". */
+  Config* cfg =
+      make_config("1.0", "/src", "dahost::", true, false, false, false, false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_daemon_dest(cfg), -1);
+  config_delete(cfg);
+
+  /* Invalid module name. */
+  cfg =
+      make_config("1.0", "/src", "dahost::bad name", true, false, false, false, false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_daemon_dest(cfg), -1);
+  config_delete(cfg);
+
+  /* Traversal path rejected. */
+  cfg = make_config("1.0", "/src", "dahost::mod/../../etc", true, false, false, false, false, 1,
+                    false, 0);
+  EXPECT_EQ_INT(config_parse_daemon_dest(cfg), -1);
+  config_delete(cfg);
+
+  /* user@host::module is not yet supported. */
+  cfg =
+      make_config("1.0", "/src", "user@dahost::mod", true, false, false, false, false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_daemon_dest(cfg), -1);
+  config_delete(cfg);
+
+  /* A non-daemon destination is untouched (returns 0). */
+  cfg = make_config("1.0", "/src", "plain:path", true, false, false, false, false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_daemon_dest(cfg), 0);
+  EXPECT_EQ_STR(cfg->receive_root_directory, "plain:path");
+  config_delete(cfg);
+}
+
+static void test_config_transport_dest_daemon_beats_ssh() {
+  /* host::module selects daemon TCP; host:path still selects SSH. */
+  Config* cfg = make_config("1.0", "/src", "h::m/x", true, false, false, false, false, 1, false, 0);
+  int ret = config_parse_transport_dest(cfg);
+  EXPECT_EQ_INT(ret, 1);
+  EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
+  EXPECT_EQ_STR(cfg->module, "m");
+  config_delete(cfg);
+
+  cfg = make_config("1.0", "/src", "h:dst", true, false, false, false, false, 1, false, 0);
+  ret = config_parse_transport_dest(cfg);
+  EXPECT_EQ_INT(ret, 0);
+  EXPECT_EQ_INT(cfg->transport, TRANSPORT_SSH);
+  EXPECT_EQ_STR(cfg->receive_root_directory, "dst");
+  config_delete(cfg);
+}
+
+static void test_config_is_daemon_dest() {
+  EXPECT_TRUE(config_is_daemon_dest("host::mod"));
+  EXPECT_TRUE(config_is_daemon_dest("host::mod/path"));
+  EXPECT_FALSE(config_is_daemon_dest("host:path"));
+  EXPECT_FALSE(config_is_daemon_dest("/local/path"));
+  /* A colon inside the module-relative path does not change the detection. */
+  EXPECT_TRUE(config_is_daemon_dest("host::mod/single:colon"));
+  EXPECT_FALSE(config_is_daemon_dest(NULL));
+}
+
+static void test_config_module_wire_roundtrip() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("rel/path");
+  send_cfg->module = str_dup("backup");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->module != NULL &&
+              strcmp(recv_cfg->module, "backup") == 0 &&
+              strcmp(recv_cfg->receive_root_directory, "rel/path") == 0;
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+static void test_config_module_wire_empty_canonicalizes_to_null() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  /* module left NULL -> serialized as "" -> received back as NULL. */
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->module == NULL;
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* A module gate that rejects any connection that names a module. */
+static const char* reject_named_module_gate(const Config* config, void* context) {
+  (void)context;
+  if (config && config->module && config->module[0] != '\0')
+    return "test rejection";
+  return NULL;
+}
+
+static void test_config_receive_with_validate_rejects() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  send_cfg->module = str_dup("any-module");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive_with_validate(p[0], reject_named_module_gate, NULL);
+    bool ok = recv == NULL;
+    config_delete(recv);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 static void test_pipeline_sender_lifecycle() {
   Config* cfg = make_config("2.0", "/src2", "/dst2", false, false, true, true, false, 1, false, 0);
   Queue* q1 = queue_create(5, NULL);
@@ -1284,6 +1488,12 @@ void test_config() {
   test_config_ssh_dest();
   test_config_ssh_dest_local_path();
   test_config_ssh_dest_no_user();
+  test_config_daemon_dest_parse();
+  test_config_daemon_dest_no_path();
+  test_config_daemon_dest_double_slash_normalized();
+  test_config_daemon_dest_bad();
+  test_config_transport_dest_daemon_beats_ssh();
+  test_config_is_daemon_dest();
   test_config_trust_sender_default_false();
   test_pipeline_sender_lifecycle();
   test_pipeline_receiver_lifecycle();
@@ -1312,6 +1522,9 @@ void test_config() {
     test_config_devices_wire_roundtrip();
     test_config_preallocate_wire_roundtrip();
     test_config_phase4_xattr_wire_roundtrip();
+    test_config_module_wire_roundtrip();
+    test_config_module_wire_empty_canonicalizes_to_null();
+    test_config_receive_with_validate_rejects();
   }
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

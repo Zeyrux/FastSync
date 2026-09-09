@@ -89,6 +89,12 @@ typedef struct Config {
   int ssh_port;
   TransportType transport;
   char* ssh_destination;
+  /* Daemon module selection (Wave A, protocol 2.15.0).  Client-composed from a
+   * host::module/path destination; NULL or "" means "no module" (the ordinary
+   * standalone-server path).  Crosses the wire as a trailing config-frame
+   * string so the daemon can look the module up in its own config and confine
+   * the connection to the module's root (never a client-chosen root). */
+  char* module;
   char* fastsync_server_path;
   char** exclude_patterns;
   int exclude_count;
@@ -438,7 +444,22 @@ typedef struct Config {
  * fails the version check cleanly up front (rather than the remote server
  * rejecting an unfamiliar forwarded argv at a confusing later point), which is
  * exactly what the lockstep convention of this project requires. */
-#define PROTOCOL_VERSION "2.14.0"
+/* Daemon Wave A: 2.14.0 -> 2.15.0.
+ *
+ * WHY the bump, grounded in the wire: this wave really does add a serialized
+ * field to the binary config frame.  The client sends its requested daemon
+ * module name (Config->module) as a new trailing string on the frame (sent
+ * after the Phase-4 xattr block and before the STATUS_OK/STATUS_ERROR ack, in
+ * config_send/config_receive), and the daemon reads it to select which module
+ * root confines the connection.  Any config-frame layout change must bump the
+ * protocol version because a peer that does not parse the new trailing bytes
+ * would desynchronize on the frame boundary; the strict same-version handshake
+ * (config_receive rejects a mismatched version before parsing anything else)
+ * is what keeps a 2.15 client and a 2.14 server from ever reaching that state.
+ *
+ * NOTE: daemon module-selection bump owned by Wave A (2.15.0); later daemon
+ * waves (auth, motd) must not bump PROTOCOL_VERSION. */
+#define PROTOCOL_VERSION "2.15.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
@@ -457,6 +478,38 @@ bool config_send(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
 bool config_is_remote_dest(const char* s);
 void config_parse_ssh_dest(Config* config);
+
+/* Server-side config-frame gate (daemon module selection, Wave A).  A server
+ * that needs to make an accept/reject decision about a received Config BEFORE
+ * it sends the STATUS_OK ack (so a rejected connection is refused cleanly with
+ * no data transferred) passes a callback here; it runs after the frame parses
+ * and validates but before the STATUS_OK/STATUS_ERROR ack.  Return NULL to
+ * accept the connection; return a non-NULL message to reject it (the message
+ * is logged server-side and STATUS_ERROR is sent in place of STATUS_OK).  The
+ * callback runs in the connection's own process, so it may set up per-module
+ * process state (e.g. the authorized root).  context is an opaque caller
+ * pointer. */
+typedef const char* (*ConfigValidateFunc)(const Config* config, void* context);
+Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc validate,
+                                     void* context);
+
+/* Daemon-destination (host::module[/path]) helpers, Wave A.  config_is_remote_dest
+ * recognizes the ordinary rsync-style single-colon host:path form used by the
+ * SSH transport; config_is_daemon_dest recognizes the double-colon form that
+ * selects a daemon module over TCP.  config_parse_transport_dest is the single
+ * entry point main() uses: it parses a :: destination as a daemon TCP
+ * destination (host -> server_host, module -> config->module, path ->
+ * receive_root_directory) and otherwise falls back to the existing SSH
+ * host:path handling. */
+bool config_is_daemon_dest(const char* s);
+/* Returns 1 when the destination was daemon syntax and was parsed, 0 when it
+ * is not daemon syntax (nothing changed), -1 on an invalid daemon destination
+ * (a message is logged and config is left untouched). */
+int config_parse_daemon_dest(Config* config);
+/* Returns 1/0/-1 mirroring config_parse_daemon_dest when the destination is
+ * daemon syntax; otherwise runs the existing SSH host:path parse and returns
+ * 0. */
+int config_parse_transport_dest(Config* config);
 
 /* True when the negotiated delete timing performs the extra-file deletion
  * BEFORE the transfer data (--delete-before / --delete-during).  The flag is

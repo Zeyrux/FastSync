@@ -1,5 +1,6 @@
 #include "config.h"
 #include "chmod.h"
+#include "daemon_conf.h"
 #include "delay_updates.h"
 #include "delta.h"
 #include "file_list.h"
@@ -36,6 +37,7 @@ static void config_set_defaults(Config* config) {
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
+  config->module = NULL;
   config->fastsync_server_path = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
@@ -470,6 +472,120 @@ bool config_is_remote_dest(const char* s) {
   return true;
 }
 
+/* Daemon destination detection: rsync's host::module[/path] marker is a "::"
+ * immediately after the host part (the first ':' is immediately followed by a
+ * second ':'), with no '/' before it.  A single ':' (host:path) stays the SSH
+ * form even when the path itself later contains colons, and a "[::1]"-style
+ * bracketed IPv6 literal is not recognized as a daemon destination this wave
+ * (its first "::" is inside the brackets). */
+bool config_is_daemon_dest(const char* s) {
+  if (s == NULL)
+    return false;
+  const char* colon = strchr(s, ':');
+  if (colon == NULL || colon == s || colon[1] != ':')
+    return false;
+  for (const char* p = s; p < colon; p++) {
+    if (*p == '/')
+      return false;
+  }
+  return true;
+}
+
+/* Log an escaped message with an 8-bit-safe output policy and return -1 (the
+ * caller-visible parse failure code). */
+static int daemon_dest_parse_error(const char* message, const char* detail) {
+  char* escaped = output_escape(detail ? detail : "", false);
+  log_message(LOG_LEVEL_ERROR, "%s: %s", message, escaped ? escaped : "<allocation failed>");
+  free(escaped);
+  return -1;
+}
+
+int config_parse_daemon_dest(Config* config) {
+  if (!config || !config->receive_root_directory)
+    return 0;
+  const char* dest = config->receive_root_directory;
+  if (!config_is_daemon_dest(dest))
+    return 0;
+
+  const char* colon = strchr(dest, ':');
+  /* user@host::module names a daemon auth user, which this daemon version
+   * cannot verify: reject it rather than silently ignoring the user (auth is
+   * Wave B). */
+  if (memchr(dest, '@', (size_t)(colon - dest)) != NULL)
+    return daemon_dest_parse_error("daemon destination user@host::module is not supported: user "
+                                   "authentication is not implemented by this daemon version",
+                                   dest);
+  const char* host_start = dest;
+
+  const char* module_and_path = colon + 2;
+  if (*module_and_path == '\0')
+    return daemon_dest_parse_error("daemon destination is missing its module name", dest);
+  const char* slash = strchr(module_and_path, '/');
+  size_t module_len = slash ? (size_t)(slash - module_and_path) : strlen(module_and_path);
+  char* module = malloc(module_len + 1);
+  if (!module)
+    return daemon_dest_parse_error("out of memory parsing daemon destination", dest);
+  memcpy(module, module_and_path, module_len);
+  module[module_len] = '\0';
+  if (!daemon_module_name_valid(module)) {
+    free(module);
+    return daemon_dest_parse_error(
+        "invalid daemon module name (must be 1-200 chars of [A-Za-z0-9._-])", dest);
+  }
+
+  const char* path = slash ? slash + 1 : "";
+  while (*path == '/')
+    path++; /* normalize "mod//a" to "mod/a"; keeps path module-relative */
+  if (has_path_traversal(path)) {
+    free(module);
+    return daemon_dest_parse_error("daemon destination path must not contain '..'", dest);
+  }
+
+  size_t host_len = (size_t)(colon - host_start);
+  char* host = malloc(host_len + 1);
+  if (!host) {
+    free(module);
+    return daemon_dest_parse_error("out of memory parsing daemon destination", dest);
+  }
+  memcpy(host, host_start, host_len);
+  host[host_len] = '\0';
+  if (*host == '\0') {
+    free(host);
+    free(module);
+    return daemon_dest_parse_error("daemon destination has no host", dest);
+  }
+
+  char* path_dup = str_dup(path);
+  if (!path_dup) {
+    free(host);
+    free(module);
+    return daemon_dest_parse_error("out of memory parsing daemon destination", dest);
+  }
+
+  free(config->server_host);
+  config->server_host = host;
+  free(config->module);
+  config->module = module;
+  free(config->receive_root_directory);
+  config->receive_root_directory = path_dup;
+  config->transport = TRANSPORT_TCP;
+  return 1;
+}
+
+int config_parse_transport_dest(Config* config) {
+  if (!config || !config->receive_root_directory)
+    return 0;
+  /* Daemon (host::module[/path]) first: the single-colon SSH parser would
+   * otherwise mis-split the double colon.  Returns 1 (parsed as daemon), 0
+   * (not daemon syntax -> try SSH below), or -1 (invalid daemon destination,
+   * already logged). */
+  int daemon_ret = config_parse_daemon_dest(config);
+  if (daemon_ret != 0)
+    return daemon_ret;
+  config_parse_ssh_dest(config);
+  return 0;
+}
+
 void config_parse_ssh_dest(Config* config) {
   if (!config_is_remote_dest(config->receive_root_directory))
     return;
@@ -492,6 +608,7 @@ void config_delete(Config* config) {
   free(config->send_directory);
   free(config->receive_root_directory);
   free(config->ssh_destination);
+  free(config->module);
   free(config->fastsync_server_path);
   for (int i = 0; i < config->exclude_count; i++)
     free(config->exclude_patterns[i]);
@@ -940,6 +1057,27 @@ static bool receive_phase4_xattr_options(int fd, Config* c) {
   return true;
 }
 
+/* Daemon module selection (Wave A, protocol 2.15.0).  Trailing string on the
+ * config frame, sent after the Phase-4 xattr block and before the ack.  The
+ * client composes it from a host::module/path destination; an unset module is
+ * serialized as "" and canonicalized back to NULL on receive so the two never
+ * look different to a peer. */
+static bool send_daemon_module(int fd, const Config* c) {
+  return send_str(fd, c->module ? c->module : "");
+}
+
+static bool receive_daemon_module(int fd, Config* c) {
+  char* module = receive_str(fd);
+  if (!module)
+    return false;
+  if (*module != '\0') {
+    c->module = module;
+  } else {
+    free(module);
+  }
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -951,7 +1089,8 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_identity_options(file_descriptor, config) ||
       !send_metadata_times_options(file_descriptor, config) ||
       !send_symlink_trust_options(file_descriptor, config) ||
-      !send_phase4_xattr_options(file_descriptor, config))
+      !send_phase4_xattr_options(file_descriptor, config) ||
+      !send_daemon_module(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -963,7 +1102,8 @@ bool config_send(int file_descriptor, const Config* config) {
   return true;
 }
 
-Config* config_receive(int file_descriptor) {
+Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc validate,
+                                     void* context) {
   Config* config = config_create();
   if (!config)
     return NULL;
@@ -990,7 +1130,8 @@ Config* config_receive(int file_descriptor) {
       !receive_identity_options(file_descriptor, config) ||
       !receive_metadata_times_options(file_descriptor, config) ||
       !receive_symlink_trust_options(file_descriptor, config) ||
-      !receive_phase4_xattr_options(file_descriptor, config))
+      !receive_phase4_xattr_options(file_descriptor, config) ||
+      !receive_daemon_module(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
@@ -1006,6 +1147,17 @@ Config* config_receive(int file_descriptor) {
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
+  if (validate) {
+    const char* rejection = validate(config, context);
+    if (rejection != NULL) {
+      /* Daemon module gate (unknown module / read-only module / auth-required
+       * module): refuse BEFORE the STATUS_OK so the client aborts at the
+       * config handshake and no file data is ever exchanged. */
+      fprintf(stderr, "%s\n", rejection);
+      send_status(file_descriptor, STATUS_ERROR);
+      goto error;
+    }
+  }
   if (!send_status(file_descriptor, STATUS_OK))
     goto error;
   return config;
@@ -1013,4 +1165,8 @@ Config* config_receive(int file_descriptor) {
 error:
   config_delete(config);
   return NULL;
+}
+
+Config* config_receive(int file_descriptor) {
+  return config_receive_with_validate(file_descriptor, NULL, NULL);
 }

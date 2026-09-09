@@ -1485,7 +1485,6 @@ int main(int argc, char* argv[]) {
       goto cleanup;
     }
     config->save_to_disk = true;
-    config_parse_ssh_dest(config);
   } else if (positional_count == 1) {
     log_message(LOG_LEVEL_ERROR, "missing destination argument");
     print_usage();
@@ -1508,6 +1507,16 @@ int main(int argc, char* argv[]) {
         goto cleanup;
       }
     }
+  }
+
+  /* Resolve the destination's transport form after the source/destination are
+   * final (positional, --dest-dir, or the FASTSYNC_DEST_DIR env fallback):
+   * host::module[/path] selects the daemon TCP transport, host:path the SSH
+   * transport, anything else stays local TCP.  An invalid daemon destination
+   * already logged its reason and is a hard error here. */
+  if (config_parse_transport_dest(config) < 0) {
+    exit_code = 1;
+    goto cleanup;
   }
 
   if (!validate_config(config)) {

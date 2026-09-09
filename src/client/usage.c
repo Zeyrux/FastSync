@@ -11,6 +11,9 @@ void print_usage(void) {
   printf("Destination formats:\n");
   printf("  user@host:/path     SSH transport (rsync-style)\n");
   printf("  host:/path          SSH transport (current user)\n");
+  printf("  host::module/path   Daemon TCP transport (fastsync-server --daemon);\n");
+  printf("                      module names a server-side module, path is relative\n");
+  printf("                      within it (connect with --server-port)\n");
   printf("  /local/path         TCP transport (requires server on localhost:8080)\n");
   printf("\n");
   printf("Options:\n");

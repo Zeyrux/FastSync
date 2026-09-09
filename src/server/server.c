@@ -1,4 +1,5 @@
 #include "config.h"
+#include "daemon_conf.h"
 #include "delay_updates.h"
 #include "file.h"
 #include "identity.h"
@@ -7,6 +8,7 @@
 #include "protocol.h"
 #include "queue.h"
 #include "receiver.h"
+#include "server_cli.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
 #include "utils.h"
@@ -25,6 +27,11 @@ static bool allow_delete;
 static bool trust_sender;
 static bool allow_unauthenticated;
 static const char* required_client_cn;
+
+/* Non-NULL exactly when the listener runs in --daemon mode.  Loaded once in
+ * main before any accept-loop fork, then shared read-only by every forked
+ * connection child (and their threads). */
+static DaemonConf* g_daemon_conf = NULL;
 
 /* Aggregate payload bytes the multithreaded receiver may buffer ahead of the
    slow disk writer.  Receiving one more chunk adds up to ~2 * MAX_CHUNK_SIZE
@@ -80,7 +87,7 @@ static bool ensure_receive_root(const Config* config) {
   return file_directory_exists_secure(config->receive_root_directory);
 }
 
-static bool __attribute__((unused)) configure_authorization(const char* root) {
+static bool configure_authorization(const char* root) {
   char resolved[PATH_MAX];
   if (!root) {
     file_set_authorized_root(-1, NULL);
@@ -123,13 +130,77 @@ static bool __attribute__((unused)) configure_authorization(const char* root) {
   return true;
 }
 
+/* Config-frame gate (runs inside config_receive_with_validate, BEFORE the
+ * STATUS_OK ack, so a rejected connection is refused at the config handshake
+ * and no file data is ever exchanged).
+ *
+ * Plain mode: a connection that carries a daemon module name is refused (the
+ * standalone server simply does not offer modules; honouring one would silently
+ * change what the destination means).  Empty module -> accept.
+ *
+ * Daemon mode: the client MUST select a module (host::module/path).  The
+ * requested module is looked up in the daemon config and its configured `path`
+ * becomes the authorized root via configure_authorization -- exactly the same
+ * root confinement the standalone server applies to its single
+ * --destination-root, but per-module and NEVER client-chosen.  The module is
+ * refused (with a clear log) when it is unknown, when it is `read only` (every
+ * FastSync network transfer writes; there is no read-only wire operation yet),
+ * or when it declares `auth users` (FastSync cannot authenticate a claimed user
+ * this wave, so a module whose admin expected a credential list is refused
+ * rather than silently opened up -- auth is Wave B and will honor the list). */
+static const char* server_module_gate(const Config* config, void* context) {
+  (void)context;
+  if (!config)
+    return "missing config frame";
+  bool is_daemon = g_daemon_conf != NULL;
+  bool has_module = config->module != NULL && config->module[0] != '\0';
+
+  if (!is_daemon) {
+    if (has_module)
+      return "client requested a daemon module but this server is not running "
+             "with --daemon";
+    return NULL;
+  }
+  if (!has_module)
+    return "daemon connection did not select a module (expected a "
+           "host::module/path destination)";
+
+  const DaemonModule* module = daemon_conf_find_module(g_daemon_conf, config->module);
+  if (module == NULL) {
+    char* escaped_module = output_escape(config->module, config->eight_bit_output);
+    log_message(LOG_LEVEL_ERROR, "unknown daemon module '%s' requested",
+                escaped_module ? escaped_module : "<allocation failed>");
+    free(escaped_module);
+    return "requested daemon module does not exist";
+  }
+  if (module->read_only) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
+                config->module);
+    return "requested daemon module is read only";
+  }
+  if (module->auth_user_count > 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' requires authentication (auth users), which this "
+                "daemon version does not implement; refusing",
+                config->module);
+    return "requested daemon module requires authentication that is not yet "
+           "supported";
+  }
+  if (!configure_authorization(module->path)) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s' path '%s' is not usable", config->module,
+                module->path ? module->path : "(null)");
+    return "requested daemon module root is not usable";
+  }
+  return NULL; /* accepted; authorized root is now the module's path */
+}
+
 void handler(int file_descriptor) {
   SSL* ssl = io_get_ssl();
   ProtocolSession session;
   protocol_session_init(&session, file_descriptor, file_descriptor);
   protocol_session_set_ssl(&session, ssl);
   protocol_session_bind(&session);
-  Config* config = config_receive(file_descriptor);
+  Config* config = config_receive_with_validate(file_descriptor, server_module_gate, NULL);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
     close(file_descriptor);
@@ -155,6 +226,19 @@ void handler(int file_descriptor) {
     log_message(LOG_LEVEL_ERROR, "Rejected TLS client with unauthorized identity");
     config_delete(config);
     close(file_descriptor);
+    return;
+  }
+  /* Daemon mode: the module's root is the authorized root (installed by
+     server_module_gate), and the client's destination is a MODULE-RELATIVE
+     path.  Reject an absolute destination up front so the module-relative
+     confinement contract is never eroded by a client that tries to address the
+     module root by absolute path. */
+  if (g_daemon_conf && config->receive_root_directory && config->receive_root_directory[0] == '/') {
+    log_message(LOG_LEVEL_ERROR, "Rejected absolute daemon destination (must be relative to the "
+                                 "selected module root)");
+    config_delete(config);
+    close(file_descriptor);
+    protocol_session_unbind();
     return;
   }
   char* destination = config->receive_root_directory;
@@ -336,6 +420,8 @@ static void cleanup(int sig) {
   (void)sig;
   if (g_server)
     server_delete(&g_server);
+  daemon_conf_free(g_daemon_conf);
+  g_daemon_conf = NULL;
   _exit(0);
 }
 
@@ -344,6 +430,14 @@ static void print_server_usage(void) {
   printf("Usage: fastsync-server [options]\n\n");
   printf("Options:\n");
   printf("  --stdio             Run in stdio mode (SSH transport)\n");
+  printf("  --daemon            Run as a persistent daemon listener using a module\n");
+  printf("                      config file (-p/config port; default 873)\n");
+  printf("  --config=FILE       Daemon config file (default: ~/.config/fastsync/\n");
+  printf("                      fastsyncd.conf, else /etc/fastsyncd.conf)\n");
+  printf("  --dparam=KEY=VALUE  Override one global config key on the command line\n");
+  printf("                      (port, motd file, address)\n");
+  printf("  --no-detach         Stay in the foreground (default detaches to\n");
+  printf("                      background when running --daemon)\n");
   printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
@@ -361,95 +455,140 @@ static void print_server_usage(void) {
   printf("  --help              Show this help\n");
 }
 
-int main(int argc, char* argv[]) {
-  bool use_tls = false;
-  char *tls_cert = NULL, *tls_key = NULL, *tls_ca = NULL;
-  int port = 8080;
-  const char* destination_root = ".";
-  bool stdio_mode = false;
-  const char* bind_address = NULL;
-  int bind_family = AF_UNSPEC;
-
-  signal(SIGPIPE, SIG_IGN);
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0) {
-      print_server_usage();
-      return 0;
-    } else if (strcmp(argv[i], "--stdio") == 0) {
-      stdio_mode = true;
-    } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-      set_log_level(LOG_LEVEL_DEBUG);
-      set_log_debug_flags(LOG_DEBUG_ALL);
-    } else if (strcmp(argv[i], "--tls") == 0) {
-      use_tls = true;
-    } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
-      tls_cert = argv[++i];
-    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
-      tls_key = argv[++i];
-    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
-      tls_ca = argv[++i];
-    } else if (strcmp(argv[i], "--client-cn") == 0 && i + 1 < argc) {
-      required_client_cn = argv[++i];
-    } else if (strcmp(argv[i], "--destination-root") == 0 && i + 1 < argc) {
-      destination_root = argv[++i];
-    } else if (strcmp(argv[i], "--address") == 0 && i + 1 < argc) {
-      bind_address = argv[++i];
-    } else if (strcmp(argv[i], "-4") == 0 || strcmp(argv[i], "--ipv4") == 0) {
-      if (bind_family == AF_INET6) {
-        fprintf(stderr, "Error: --ipv4 and --ipv6 are mutually exclusive\n");
-        return 1;
-      }
-      bind_family = AF_INET;
-    } else if (strcmp(argv[i], "-6") == 0 || strcmp(argv[i], "--ipv6") == 0) {
-      if (bind_family == AF_INET) {
-        fprintf(stderr, "Error: --ipv4 and --ipv6 are mutually exclusive\n");
-        return 1;
-      }
-      bind_family = AF_INET6;
-    } else if (strcmp(argv[i], "--allow-delete") == 0) {
-      allow_delete = true;
-    } else if (strcmp(argv[i], "--trust-sender") == 0) {
-      trust_sender = true;
-    } else if (strcmp(argv[i], "--allow-unauthenticated") == 0) {
-      allow_unauthenticated = true;
-    } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      char* end;
-      long p = strtol(argv[++i], &end, 10);
-      if (*end || p <= 0 || p > 65535) {
-        char* escaped = output_escape(argv[i], false);
-        fprintf(stderr, "Error: invalid port '%s' (must be 1-65535)\n",
-                escaped ? escaped : "<allocation failed>");
-        free(escaped);
-        return 1;
-      }
-      port = (int)p;
-    } else if (argv[i][0] == '-') {
-      char* escaped = output_escape(argv[i], false);
-      fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
-      free(escaped);
-      print_server_usage();
-      return 1;
-    }
+/* Resolve the daemon config default: ~/.config/fastsync/fastsyncd.conf when it
+ * exists (or when HOME is set), otherwise /etc/fastsyncd.conf.  Returns a
+ * pointer to a static buffer (never NULL). */
+static const char* default_daemon_config_path(void) {
+  static char user_path[PATH_MAX];
+  const char* home = getenv("HOME");
+  if (home && *home) {
+    int n = snprintf(user_path, sizeof(user_path), "%s/.config/fastsync/fastsyncd.conf", home);
+    if (n > 0 && (size_t)n < sizeof(user_path) && access(user_path, R_OK) == 0)
+      return user_path;
   }
-  if (tls_ca && !use_tls)
-    log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
-  signal(SIGINT, cleanup);
-  signal(SIGTERM, cleanup);
-  if (!configure_authorization(destination_root)) {
-    char* escaped = output_escape(destination_root, false);
-    fprintf(stderr, "Error: invalid destination root '%s'\n",
-            escaped ? escaped : "<allocation failed>");
-    free(escaped);
+  /* Fall back to the traditional system path. */
+  return "/etc/fastsyncd.conf";
+}
+
+/* Detach from the controlling terminal: fork, exit the parent, and make the
+ * surviving child a session leader (setsid) with stdio redirected to
+ * /dev/null.  The listening socket is already open (bound in main before this
+ * runs), so it is inherited by the background daemon.  Returns true on
+ * success (in the daemon's own process). */
+static bool daemonize(void) {
+  pid_t pid = fork();
+  if (pid < 0)
+    return false;
+  if (pid > 0)
+    _exit(0);
+  if (setsid() < 0)
+    return false;
+  pid = fork();
+  if (pid < 0)
+    return false;
+  if (pid > 0)
+    _exit(0);
+  int devnull = open("/dev/null", O_RDWR);
+  if (devnull >= 0) {
+    dup2(devnull, STDIN_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    if (devnull > STDERR_FILENO)
+      close(devnull);
+  }
+  return true;
+}
+
+int main(int argc, char* argv[]) {
+  ServerCliOptions opts;
+  char cli_err[512];
+  int parse_result = server_cli_parse(argc, argv, &opts, cli_err, sizeof(cli_err));
+  if (parse_result == 1) {
+    print_server_usage();
+    return 0;
+  }
+  if (parse_result < 0) {
+    server_cli_options_free(&opts);
+    fprintf(stderr, "Error: %s\n", cli_err);
+    print_server_usage();
     return 1;
   }
-  if (stdio_mode) {
+
+  int exit_code = 0;
+  signal(SIGPIPE, SIG_IGN);
+  if (opts.verbose) {
+    set_log_level(LOG_LEVEL_DEBUG);
+    set_log_debug_flags(LOG_DEBUG_ALL);
+  }
+  if (opts.tls_ca && !opts.use_tls)
+    log_message(LOG_LEVEL_WARNING, "--ca has no effect without --tls");
+  /* Persist the parsed server policies into the process-global policy state
+   * BEFORE the stdio branch: an SSH-launched `--stdio` server (whose argv came
+   * from the client via --remote-option and friends) must honor --allow-delete,
+   * --trust-sender and --client-cn exactly like the standalone listener. */
+  required_client_cn = opts.client_cn;
+  allow_delete = opts.allow_delete;
+  trust_sender = opts.trust_sender;
+  allow_unauthenticated = opts.allow_unauthenticated;
+  signal(SIGINT, cleanup);
+  signal(SIGTERM, cleanup);
+
+  if (opts.stdio_mode) {
     /* SSH authenticates the stdio transport outside of FastSync. */
     allow_unauthenticated = true;
+    if (!configure_authorization(opts.destination_root)) {
+      char* escaped = output_escape(opts.destination_root, false);
+      fprintf(stderr, "Error: invalid destination root '%s'\n",
+              escaped ? escaped : "<allocation failed>");
+      free(escaped);
+      server_cli_options_free(&opts);
+      return 1;
+    }
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
     handler(STDIN_FILENO);
     release_authorization();
+    server_cli_options_free(&opts);
     return 0;
   }
+
+  int port = opts.port;
+  int bind_family = opts.bind_family;
+  const char* bind_address = opts.bind_address;
+
+  if (opts.daemon_mode) {
+    const char* config_path = opts.config_path ? opts.config_path : default_daemon_config_path();
+    g_daemon_conf = daemon_conf_load(config_path, cli_err, sizeof(cli_err));
+    if (!g_daemon_conf) {
+      server_cli_options_free(&opts);
+      fprintf(stderr, "Error: %s\n", cli_err);
+      return 1;
+    }
+    for (int i = 0; i < opts.dparam_count; i++) {
+      if (daemon_conf_apply_dparam(g_daemon_conf, opts.dparams[i], cli_err, sizeof(cli_err)) != 0) {
+        fprintf(stderr, "Error: --dparam: %s\n", cli_err);
+        exit_code = 1;
+        goto out;
+      }
+    }
+    /* Effective port: -p (highest) > --dparam port > config port (default 873). */
+    if (!opts.port_set)
+      port = g_daemon_conf->global.port;
+    if (!bind_address)
+      bind_address = g_daemon_conf->global.address;
+    if (g_daemon_conf->module_count == 0)
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon config has no modules; every connection will be refused");
+  } else {
+    if (!configure_authorization(opts.destination_root)) {
+      char* escaped = output_escape(opts.destination_root, false);
+      fprintf(stderr, "Error: invalid destination root '%s'\n",
+              escaped ? escaped : "<allocation failed>");
+      free(escaped);
+      server_cli_options_free(&opts);
+      return 1;
+    }
+  }
+
   ServerBindOptions bind_opts;
   bind_opts.bind_address = bind_address;
   bind_opts.family = bind_family;
@@ -457,28 +596,51 @@ int main(int argc, char* argv[]) {
   if (!g_server) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
     release_authorization();
-    return 1;
+    exit_code = 1;
+    goto out;
   }
-  if (use_tls) {
-    if (!tls_cert || !tls_key || !tls_ca || !required_client_cn) {
+  if (opts.use_tls) {
+    if (!opts.tls_cert || !opts.tls_key || !opts.tls_ca || !opts.client_cn) {
       fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
       server_delete(&g_server);
       release_authorization();
-      return 1;
+      exit_code = 1;
+      goto out;
     }
     tls_global_init();
-    if (!server_create_tls(g_server, tls_cert, tls_key, tls_ca)) {
+    if (!server_create_tls(g_server, opts.tls_cert, opts.tls_key, opts.tls_ca)) {
       log_message(LOG_LEVEL_ERROR, "Failed to set up TLS");
       server_delete(&g_server);
       release_authorization();
-      return 1;
+      exit_code = 1;
+      goto out;
     }
-    server_listen_tls(g_server, handler);
-  } else {
-    server_listen(g_server, handler);
   }
+
+  /* Detach after the listening socket (and TLS context) exist so the
+   * background daemon inherits a fully-bound listener.  --no-detach runs in
+   * the foreground, which is how tests drive the daemon. */
+  if (opts.daemon_mode && !opts.no_detach) {
+    if (!daemonize()) {
+      log_message(LOG_LEVEL_ERROR, "Failed to daemonize");
+      server_delete(&g_server);
+      release_authorization();
+      exit_code = 1;
+      goto out;
+    }
+  }
+
+  if (opts.use_tls)
+    server_listen_tls(g_server, handler);
+  else
+    server_listen(g_server, handler);
   server_delete(&g_server);
   release_authorization();
-  return 0;
+
+out:
+  daemon_conf_free(g_daemon_conf);
+  g_daemon_conf = NULL;
+  server_cli_options_free(&opts);
+  return exit_code;
 }
 #endif
