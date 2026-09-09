@@ -12,7 +12,7 @@ bool server_listen_tls(Server* server, void (*handler)(int file_descriptor));
 bool client_connect_tls_ex(Client* client, const char* host, int port, const char* cert_path,
                            const char* key_path, const char* ca_path,
                            const TcpConnectOptions* opts);
-bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
+bool client_connect_tls(Client* client, const char* host, int port, const char* cert_path,
                         const char* key_path, const char* ca_path);
 
 #endif

@@ -66,8 +66,8 @@ Server* server_create_ex(int port, const ServerBindOptions* bind_opts) {
   int err = getaddrinfo(bind_address, port_str, &hints, &result);
   if (err != 0 || result == NULL) {
     char* escaped = bind_address ? output_escape(bind_address, false) : NULL;
-    fprintf(stderr, "Could not resolve bind address %s (%s)\n",
-            escaped ? escaped : "(wildcard)", gai_strerror(err));
+    fprintf(stderr, "Could not resolve bind address %s (%s)\n", escaped ? escaped : "(wildcard)",
+            gai_strerror(err));
     free(escaped);
     free(server);
     return NULL;
@@ -172,8 +172,7 @@ static void plain_child_fn(int fd, void* ctx) {
 }
 
 bool server_listen(Server* server, void (*handler)(int file_descriptor)) {
-  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d",
-              server_address_port(&server->address));
+  log_message(LOG_LEVEL_INFO, "Start Listening on Port: %d", server_address_port(&server->address));
   struct plain_ctx ctx = {handler};
   accept_loop(server, plain_child_fn, &ctx, "Received Connection");
   return true;
@@ -403,7 +402,7 @@ bool tcp_connect_socket_ex(Client* client, const char* host, int port,
   return true;
 }
 
-bool tcp_connect_socket(Client* client, char* host, int port) {
+bool tcp_connect_socket(Client* client, const char* host, int port) {
   return tcp_connect_socket_ex(client, host, port, NULL);
 }
 
@@ -414,7 +413,7 @@ bool client_connect_ex(Client* client, const char* host, int port, const TcpConn
   return true;
 }
 
-bool client_connect(Client* client, char* host, int port) {
+bool client_connect(Client* client, const char* host, int port) {
   if (!tcp_connect_socket_ex(client, host, port, NULL))
     return false;
   tcp_apply_socket_timeout(client->file_descriptor);

@@ -402,7 +402,7 @@ int config_sockopts_parse(const char* spec, SockOptEntry** out, int* out_count) 
   SockOptEntry* entries = NULL;
   char* saveptr = NULL;
   bool ok = true;
-  for (char* token = strtok_r(copy, ",", &saveptr); token != NULL;
+  for (const char* token = strtok_r(copy, ",", &saveptr); token != NULL;
        token = strtok_r(NULL, ",", &saveptr)) {
     if (*token == '\0') {
       ok = false; /* empty entry: a stray/trailing comma */

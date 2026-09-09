@@ -221,7 +221,7 @@ bool client_connect_tls_ex(Client* client, const char* host, int port, const cha
   return true;
 }
 
-bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
+bool client_connect_tls(Client* client, const char* host, int port, const char* cert_path,
                         const char* key_path, const char* ca_path) {
   return client_connect_tls_ex(client, host, port, cert_path, key_path, ca_path, NULL);
 }

@@ -37,8 +37,8 @@ typedef struct {
  * --sockopts).  All fields are client/connection-level and never cross the
  * wire config frame. */
 typedef struct {
-  const char* bind_address; /* --address: local source address to bind, or NULL */
-  int family;               /* AF_INET / AF_INET6 / AF_UNSPEC (from -4 / -6) */
+  const char* bind_address;     /* --address: local source address to bind, or NULL */
+  int family;                   /* AF_INET / AF_INET6 / AF_UNSPEC (from -4 / -6) */
   const SockOptEntry* sockopts; /* --sockopts allowlist entries */
   int sockopt_count;
 } TcpConnectOptions;
@@ -51,10 +51,10 @@ void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
 void server_delete(Server** server);
 Client* client_create();
 bool client_connect_ex(Client* client, const char* host, int port, const TcpConnectOptions* opts);
-bool client_connect(Client* client, char* host, int port);
+bool client_connect(Client* client, const char* host, int port);
 bool tcp_connect_socket_ex(Client* client, const char* host, int port,
                            const TcpConnectOptions* opts);
-bool tcp_connect_socket(Client* client, char* host, int port);
+bool tcp_connect_socket(Client* client, const char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec);

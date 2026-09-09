@@ -33,9 +33,8 @@ static void test_sockopts_parse_valid() {
 
   out = NULL;
   count = 0;
-  EXPECT_EQ_INT(config_sockopts_parse("SO_RCVBUF=65536,SO_SNDBUF=131072,SO_REUSEADDR=1", &out,
-                                      &count),
-                0);
+  EXPECT_EQ_INT(
+      config_sockopts_parse("SO_RCVBUF=65536,SO_SNDBUF=131072,SO_REUSEADDR=1", &out, &count), 0);
   EXPECT_EQ_INT(count, 3);
   EXPECT_EQ_INT(out[0].id, SOCKOPT_SO_RCVBUF);
   EXPECT_EQ_INT(out[0].value, 65536);
@@ -47,16 +46,15 @@ static void test_sockopts_parse_valid() {
 }
 
 static void test_sockopts_parse_rejects() {
-  static const char* const bad[] = {
-      "IP_TTL=1",          /* unknown option name */
-      "SO_KEEPALIVE",      /* missing '=' */
-      "=1",                /* missing option name */
-      "TCP_NODELAY=",      /* missing value */
-      "TCP_NODELAY=2",     /* boolean must be 0/1 */
-      "TCP_NODELAY=on",    /* non-numeric boolean */
-      "SO_RCVBUF=-1",      /* negative buffer */
-      "SO_SNDBUF=abc",     /* non-numeric buffer */
-      ""};                 /* empty spec */
+  static const char* const bad[] = {"IP_TTL=1",       /* unknown option name */
+                                    "SO_KEEPALIVE",   /* missing '=' */
+                                    "=1",             /* missing option name */
+                                    "TCP_NODELAY=",   /* missing value */
+                                    "TCP_NODELAY=2",  /* boolean must be 0/1 */
+                                    "TCP_NODELAY=on", /* non-numeric boolean */
+                                    "SO_RCVBUF=-1",   /* negative buffer */
+                                    "SO_SNDBUF=abc",  /* non-numeric buffer */
+                                    ""};              /* empty spec */
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     SockOptEntry* out = NULL;
     int count = 0;
@@ -74,19 +72,17 @@ static void test_sockopts_apply_sets_option() {
 
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   EXPECT_TRUE(fd >= 0);
-  if (fd >= 0) {
-    for (int i = 0; i < count; i++) {
-      int value = entries[i].value;
-      int level = entries[i].id == SOCKOPT_TCP_NODELAY ? IPPROTO_TCP : SOL_SOCKET;
-      int name = entries[i].id == SOCKOPT_TCP_NODELAY ? TCP_NODELAY : SO_REUSEADDR;
-      EXPECT_EQ_INT(setsockopt(fd, level, name, &value, sizeof(value)), 0);
-    }
-    int got = 0;
-    socklen_t len = sizeof(got);
-    EXPECT_EQ_INT(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &got, &len), 0);
-    EXPECT_EQ_INT(got, 1);
-    close(fd);
+  for (int i = 0; i < count; i++) {
+    int value = entries[i].value;
+    int level = entries[i].id == SOCKOPT_TCP_NODELAY ? IPPROTO_TCP : SOL_SOCKET;
+    int name = entries[i].id == SOCKOPT_TCP_NODELAY ? TCP_NODELAY : SO_REUSEADDR;
+    EXPECT_EQ_INT(setsockopt(fd, level, name, &value, sizeof(value)), 0);
   }
+  int got = 0;
+  socklen_t len = sizeof(got);
+  EXPECT_EQ_INT(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &got, &len), 0);
+  EXPECT_EQ_INT(got, 1);
+  close(fd);
   free(entries);
 }
 
@@ -98,10 +94,8 @@ static void test_server_create_bind_address() {
   opts.family = AF_INET;
   Server* s = server_create_ex(0, &opts);
   EXPECT_NOT_NULL(s);
-  if (s) {
-    EXPECT_EQ_INT(s->address.ss_family, AF_INET);
-    server_delete(&s);
-  }
+  EXPECT_EQ_INT(s->address.ss_family, AF_INET);
+  server_delete(&s);
 }
 
 /* An IPv6 bind is honored when the host supports it; on a host with no IPv6 a

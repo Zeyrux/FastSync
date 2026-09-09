@@ -382,12 +382,11 @@ static Client* connect_transfer_client(const Config* config) {
   connect_opts.sockopt_count = config->sockopt_count;
   bool connected;
   if (config->use_tls) {
-    connected = client_connect_tls_ex(client, config->server_host, config->server_port,
-                                      config->tls_cert, config->tls_key, config->tls_ca,
-                                      &connect_opts);
+    connected =
+        client_connect_tls_ex(client, config->server_host, config->server_port, config->tls_cert,
+                              config->tls_key, config->tls_ca, &connect_opts);
   } else {
-    connected = client_connect_ex(client, config->server_host, config->server_port,
-                                  &connect_opts);
+    connected = client_connect_ex(client, config->server_host, config->server_port, &connect_opts);
   }
   if (!connected) {
     client_disconnect(client);
