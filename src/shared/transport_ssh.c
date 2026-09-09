@@ -189,18 +189,40 @@ char** ssh_build_client_argv(const char* rsh_command, int port, const char* user
   char* tail[] = {"-o", "Compression=no",
                   "-o", "ControlMaster=auto",
                   "-o", "ControlPath=~/.cache/fastsync-%r@%h:%p"};
-  for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++)
-    argv[ac++] = str_dup(tail[i]);
+  for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++) {
+    argv[ac] = str_dup(tail[i]);
+    if (!argv[ac])
+      goto fail_argv;
+    ac++;
+  }
   if (port_extra) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
-    argv[ac++] = str_dup("-p");
-    argv[ac++] = str_dup(port_str);
+    argv[ac] = str_dup("-p");
+    if (!argv[ac])
+      goto fail_argv;
+    ac++;
+    argv[ac] = str_dup(port_str);
+    if (!argv[ac])
+      goto fail_argv;
+    ac++;
   }
-  argv[ac++] = str_dup(userhost);
-  argv[ac++] = str_dup(remote_command);
+  argv[ac] = str_dup(userhost);
+  if (!argv[ac])
+    goto fail_argv;
+  ac++;
+  argv[ac] = str_dup(remote_command);
+  if (!argv[ac])
+    goto fail_argv;
+  ac++;
   argv[ac] = NULL;
   return argv;
+
+fail_argv:
+  for (int i = 0; i < ac; i++)
+    free(argv[i]);
+  free(argv);
+  return NULL;
 }
 
 void ssh_free_client_argv(char** argv) {
