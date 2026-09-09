@@ -64,11 +64,12 @@ def setup_test_data():
     shutil.rmtree(DEST_DIR, ignore_errors=True)
 
 
-def _run_ssh_test(name, flags, expected_missing=None):
+def _run_ssh_test(name, flags, expected_missing=None, path_args=None):
     ssh_dest = f"localhost:{DEST_DIR}"
     clean_dir(DEST_DIR)
-    cmd = CLIENT_CMD + [SOURCE_DIR, ssh_dest, "--save-to-disk",
-                        "--fastsync-server-path", os.path.join(BUILD_DIR, "server")] + flags
+    if not path_args:
+        path_args = ["--fastsync-server-path", os.path.join(BUILD_DIR, "server")]
+    cmd = CLIENT_CMD + [SOURCE_DIR, ssh_dest, "--save-to-disk"] + path_args + flags
     start = __import__("time").monotonic()
     result = subprocess.run(cmd, text=True, capture_output=True)
     duration = __import__("time").monotonic() - start
@@ -141,4 +142,42 @@ class TestSSHFeatures:
 
     def test_preallocate(self):
         r = _run_ssh_test("SSH Preallocate (--preallocate)", ["--preallocate"])
+        assert r["status"] == "Success", r["error"]
+
+
+class TestSSHConnectivity:
+    """Phase 5 connectivity options: -e/--rsh, --rsync-path, --blocking-io,
+    --outbuf.  These are client-side launch concerns, so each must parse and
+    still drive a real SSH transfer to completion."""
+
+    @pytest.fixture(autouse=True)
+    def require_ssh(self):
+        if not SSH_AVAILABLE:
+            pytest.skip(SSH_SKIP_REASON)
+
+    def test_rsh_short_form_selects_ssh(self):
+        r = _run_ssh_test("SSH -e ssh", ["-e", "ssh"])
+        assert r["status"] == "Success", r["error"]
+
+    def test_rsh_long_form_selects_ssh(self):
+        r = _run_ssh_test("SSH --rsh=ssh", ["--rsh=ssh"])
+        assert r["status"] == "Success", r["error"]
+
+    def test_rsync_path_aliases_server_path(self):
+        r = _run_ssh_test("SSH --rsync-path",
+                          [],
+                          path_args=["--rsync-path", os.path.join(BUILD_DIR, "server")])
+        assert r["status"] == "Success", r["error"]
+
+    def test_blocking_io(self):
+        r = _run_ssh_test("SSH --blocking-io", ["--blocking-io"])
+        assert r["status"] == "Success", r["error"]
+
+    @pytest.mark.parametrize("mode", ["N", "L", "B"])
+    def test_outbuf_mode(self, mode):
+        r = _run_ssh_test(f"SSH --outbuf={mode}", [f"--outbuf={mode}"])
+        assert r["status"] == "Success", r["error"]
+
+    def test_blocking_io_with_compression(self):
+        r = _run_ssh_test("SSH --blocking-io -c", ["--blocking-io", "-c"])
         assert r["status"] == "Success", r["error"]

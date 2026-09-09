@@ -4604,3 +4604,53 @@ class TestExtendedAttributes:
         fields = record.split(":")
         assert len(fields) == 5
         assert fields[0] == str(uid), f"reserved uid field {fields[0]} != source uid {uid}"
+
+
+class TestConnectivityClientOptions:
+    """Phase 5 connectivity launch options (--outbuf, --blocking-io).
+
+    These are client-side launch concerns: --outbuf only restyles stdout/stderr
+    buffering and --blocking-io only skips the SSH transport socket timeouts.
+    Over the TCP transport both must parse cleanly and be inert -- a transfer
+    must still complete and verify byte-for-byte."""
+
+    def _source_and_dest(self, name):
+        source = os.path.join(TEST_DATA_DIR, name + "_src")
+        dest = os.path.join(TEST_DATA_DIR, name + "_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        return source, dest
+
+    @pytest.mark.parametrize("flag", ["--outbuf=N", "--outbuf=L", "--outbuf=B",
+                                      "--blocking-io"])
+    def test_option_does_not_break_transfer(self, shared_server, flag):
+        source, dest = self._source_and_dest("connopt")
+        with open(os.path.join(source, "hello.txt"), "wb") as f:
+            f.write(b"connectivity options\n" * 100)
+        with open(os.path.join(source, "data.bin"), "wb") as f:
+            f.write(os.urandom(512 * 1024))
+
+        result, _ = run_client(source, dest, flags=[flag], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"{flag} failed: {(result.stderr or result.stdout)[:300]}"
+        mismatches, missing = verify_transfer(source, get_dest_received_dir(dest, source))
+        assert not mismatches and not missing, \
+            f"{flag}: mismatches={mismatches[:3]} missing={missing[:3]}"
+
+    def test_rejects_invalid_outbuf(self, shared_server):
+        source, dest = self._source_and_dest("connopt_bad")
+        with open(os.path.join(source, "x.txt"), "wb") as f:
+            f.write(b"x")
+        result, _ = run_client(source, dest, flags=["--outbuf=Z"], port=shared_server.port)
+        assert result.returncode != 0, "--outbuf=Z must be rejected"
+
+    def test_blocking_io_does_not_break_compressed_transfer(self, shared_server):
+        source, dest = self._source_and_dest("connopt_zlib")
+        with open(os.path.join(source, "text.txt"), "wb") as f:
+            f.write(b"compress me\n" * 4096)
+        result, _ = run_client(source, dest, flags=["--blocking-io", "-c"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--blocking-io -c failed: {(result.stderr or result.stdout)[:300]}"
+        mismatches, missing = verify_transfer(source, get_dest_received_dir(dest, source))
+        assert not mismatches and not missing

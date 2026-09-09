@@ -119,7 +119,8 @@ static void config_set_defaults(Config* config) {
   config->dirs = false;
   config->mkpath = false;
   config->rsh_command = NULL;
-  config->rsync_path = NULL;
+  config->blocking_io = false;
+  config->outbuf = OUTBUF_BLOCK;
   config->old_args = false;
   config->temp_dir = NULL;
   config->basis_dirs = NULL;
@@ -393,7 +394,6 @@ void config_delete(Config* config) {
   free(config->files_from);
   file_list_destroy((FileListSet*)config->files_from_set);
   free(config->rsh_command);
-  free(config->rsync_path);
   free(config->temp_dir);
   for (int i = 0; i < config->basis_count; i++) {
     free(config->basis_dirs[i].path);

@@ -9,6 +9,15 @@
 
 typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
 
+/* --outbuf stdout/stderr buffering style (client-only launch concern, never
+ * crosses the wire).  OUTBUF_BLOCK is the default, matching the stdio default
+ * (fully buffered when output is not a terminal). */
+typedef enum {
+  OUTBUF_BLOCK = 0, /* _IOFBF */
+  OUTBUF_LINE,      /* _IOLBF */
+  OUTBUF_NONE       /* _IONBF */
+} OutbufMode;
+
 /* Receiver-side staging state for --delay-updates.  Forward-declared here so
    Config can carry it; the concrete type lives in delay_updates.h. */
 typedef struct DelayUpdatesContext DelayUpdatesContext;
@@ -226,8 +235,17 @@ typedef struct Config {
   bool mkpath;
 
   // Issue #130: Remote shell/connection options
+  /* -e/--rsh: the remote-shell program used to establish the SSH transport.
+   * NULL means the default "ssh".  Client-only launch concern: NEVER crosses
+   * the wire (it is not meaningful to the daemon/server handshake). */
   char* rsh_command;
-  char* rsync_path;
+  /* --blocking-io: leave the SSH transport socket without
+   * SO_RCVTIMEO/SO_SNDTIMEO so it blocks naturally instead of timing out.
+   * Client-only launch concern: NEVER crosses the wire. */
+  bool blocking_io;
+  /* --outbuf mode (OutbufMode): stdout/stderr buffering.  Client-only launch
+   * concern: NEVER crosses the wire. */
+  int outbuf;
   bool old_args;
   char* temp_dir;
   /* Alternate basis directories, ordered by command-line appearance.  Each
