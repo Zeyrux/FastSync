@@ -122,7 +122,8 @@ static bool store_port(int* slot, const char* value, char* err, size_t err_size)
 
 /* Apply a global scalar key/value.  Keys are case-insensitive.  Returns false
  * (err filled) on an unknown key or an invalid value. */
-static bool apply_global_key(DaemonConf* conf, char* key, char* value, char* err, size_t err_size) {
+static bool apply_global_key(DaemonConf* conf, char* key, const char* value, char* err,
+                             size_t err_size) {
   if (key_equals(key, "port"))
     return store_port(&conf->global.port, value, err, err_size);
   if (key_equals(key, "motd file")) {
@@ -177,7 +178,7 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     }
     char* save = NULL;
     for (char* token = strtok_r(list, ",", &save); token; token = strtok_r(NULL, ",", &save)) {
-      char* user = trim_ws(token);
+      const char* user = trim_ws(token);
       if (*user == '\0')
         continue;
       char** grown =
@@ -341,7 +342,7 @@ DaemonConf* daemon_conf_load(const char* path, char* err, size_t err_size) {
       }
       *close = '\0';
       char* trailing = close + 1;
-      char* rest = trim_ws(trailing);
+      const char* rest = trim_ws(trailing);
       if (*rest != '\0') {
         set_error(err, err_size, "line %d: unexpected text after module header", line_no);
         ok = false;
@@ -425,7 +426,7 @@ int daemon_conf_apply_dparam(DaemonConf* conf, const char* assignment, char* err
   }
   *eq = '\0';
   char* key = trim_ws(copy);
-  char* value = trim_ws(eq + 1);
+  const char* value = trim_ws(eq + 1);
   if (*key == '\0') {
     free(copy);
     set_error(err, err_size, "--dparam '%s' has an empty key", assignment);

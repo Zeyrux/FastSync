@@ -148,7 +148,7 @@ static void test_daemon_conf_unknown_key_rejected() {
   char* path;
   char err[256];
   EXPECT_EQ_INT(write_conf("bogus_key = 1\n", &path), 0);
-  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  const DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
   free(path);
   EXPECT_NULL(conf);
   EXPECT_TRUE(strstr(err, "unknown global key") != NULL);
@@ -163,7 +163,7 @@ static void test_daemon_conf_unknown_key_rejected() {
 static void test_daemon_conf_malformed_rejected() {
   char* path;
   char err[256];
-  DaemonConf* conf;
+  const DaemonConf* conf;
 
   EXPECT_EQ_INT(write_conf("port 8734\n", &path), 0);
   conf = daemon_conf_load(path, err, sizeof(err));
@@ -235,7 +235,7 @@ static void test_daemon_conf_duplicate_module_rejected() {
   char* path;
   char err[256];
   EXPECT_EQ_INT(write_conf("[m]\npath = /a\n[m]\npath = /b\n", &path), 0);
-  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  const DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
   free(path);
   EXPECT_NULL(conf);
   EXPECT_TRUE(strstr(err, "duplicate module") != NULL);
@@ -249,7 +249,7 @@ static void test_daemon_conf_long_line_rejected() {
   memcpy(body, "[m]\npath = /x\nport = ", 21);
   body[sizeof(body) - 1] = '\0';
   EXPECT_EQ_INT(write_conf(body, &path), 0);
-  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  const DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
   free(path);
   EXPECT_NULL(conf);
   EXPECT_TRUE(strstr(err, "exceeds the") != NULL);
@@ -257,7 +257,8 @@ static void test_daemon_conf_long_line_rejected() {
 
 static void test_daemon_conf_missing_file_rejected() {
   char err[256];
-  DaemonConf* conf = daemon_conf_load("/nonexistent/fastsync_daemon_conf_zzz", err, sizeof(err));
+  const DaemonConf* conf =
+      daemon_conf_load("/nonexistent/fastsync_daemon_conf_zzz", err, sizeof(err));
   EXPECT_NULL(conf);
   EXPECT_TRUE(strstr(err, "cannot open") != NULL);
 }

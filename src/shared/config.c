@@ -1070,6 +1070,16 @@ static bool receive_daemon_module(int fd, Config* c) {
   char* module = receive_str(fd);
   if (!module)
     return false;
+  /* Guard against a hostile client flooding the log with an over-long module
+   * name: only an empty string (module-less) or a valid module name
+   * (bounded by DAEMON_MAX_MODULE_NAME) is accepted.  This is an input
+   * guard, not a wire-format change. */
+  if (*module != '\0' && !daemon_module_name_valid(module)) {
+    log_message(LOG_LEVEL_WARNING, "Daemon client sent an invalid or over-long module name");
+    free(module);
+    send_status(fd, STATUS_ERROR);
+    return false;
+  }
   if (*module != '\0') {
     c->module = module;
   } else {

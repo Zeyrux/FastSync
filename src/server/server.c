@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <openssl/x509.h>
 
 static char* authorized_root;
@@ -459,9 +461,9 @@ static void print_server_usage(void) {
  * exists (or when HOME is set), otherwise /etc/fastsyncd.conf.  Returns a
  * pointer to a static buffer (never NULL). */
 static const char* default_daemon_config_path(void) {
-  static char user_path[PATH_MAX];
   const char* home = getenv("HOME");
   if (home && *home) {
+    static char user_path[PATH_MAX];
     int n = snprintf(user_path, sizeof(user_path), "%s/.config/fastsync/fastsyncd.conf", home);
     if (n > 0 && (size_t)n < sizeof(user_path) && access(user_path, R_OK) == 0)
       return user_path;
@@ -496,6 +498,12 @@ static bool daemonize(void) {
     if (devnull > STDERR_FILENO)
       close(devnull);
   }
+  /* Do not pin the launch CWD (module-relative 'path' entries would resolve
+   * against an unstable working directory) and drop the restrictive host umask
+   * so modules can create files/dirs with the modes the config requests. */
+  if (chdir("/") != 0)
+    log_message(LOG_LEVEL_WARNING, "daemon: chdir to / failed: %s", strerror(errno));
+  umask(0);
   return true;
 }
 

@@ -6,6 +6,7 @@ asks for a module with a host::module/path destination, and the transfer lands
 in the configured module root only.  Read-only modules, unknown modules, and
 auth-required modules are all refused cleanly before any data moves.
 """
+import glob
 import os
 import shutil
 import signal
@@ -34,6 +35,28 @@ FILES_MODULE = os.path.join(MODULE_ROOT, "files")
 READONLY_MODULE = os.path.join(MODULE_ROOT, "readonly")
 AUTH_MODULE = os.path.join(MODULE_ROOT, "auth")
 CONF_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.conf")
+DETACH_MODULE = os.path.join(MODULE_ROOT, "detach")
+DETACH_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.conf")
+DETACH_PORT = None
+
+
+def _kill_by_cmdline_marker(marker):
+    """Send SIGTERM to every running process whose cmdline contains `marker`
+    (used to clean up the double-forked --daemon, which is orphaned to init and
+    no longer a child of the test's own process).  Portable over /proc so the
+    tests do not depend on pgrep being present."""
+    for proc_path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(proc_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        if marker.encode() in data:
+            try:
+                os.kill(int(proc_path.split("/")[2]), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+    time.sleep(0.5)
 
 
 class DaemonManager:
@@ -98,7 +121,7 @@ def _config_port(config_path):
 
 @pytest.fixture(scope="module", autouse=True)
 def daemon_env():
-    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE):
+    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, DETACH_MODULE):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     generate_test_files(SOURCE_DIR, full=False)
@@ -123,7 +146,16 @@ def daemon_env():
             "path = %s\n"
             "auth users = alice\n"
             % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE))
+
+    # A dedicated config for the real (double-fork) detach test: an unique path
+    # lets cleanup identify and kill the orphaned background daemon by cmdline.
+    global DETACH_PORT
+    DETACH_PORT = _find_free_port()
+    with open(DETACH_CONF, "w") as f:
+        f.write("port = %d\n\n[detach]\npath = %s\n" % (DETACH_PORT, DETACH_MODULE))
+
     yield
+    _kill_by_cmdline_marker(DETACH_CONF)
     shutil.rmtree(MODULE_ROOT, ignore_errors=True)
     shutil.rmtree(SOURCE_DIR, ignore_errors=True)
 
@@ -165,14 +197,56 @@ class TestDaemonModuleSelection:
 
 
 class TestDaemonRejection:
+    def _tree_files(self):
+        """Snapshot every file path (module-relative) currently under the module
+        root tree, so confinement can be asserted by diff rather than by an
+        absolute 'empty' check (other tests legitimately populate modules)."""
+        files = set()
+        for root, _, names in os.walk(MODULE_ROOT):
+            for name in names:
+                full = os.path.join(root, name)
+                files.add(os.path.relpath(full, MODULE_ROOT))
+        return files
+
     def test_read_only_module_blocked(self, daemon):
         result = _push("127.0.0.1::readonly", daemon.port)
         assert result.returncode != 0
         file_count = sum(len(files) for _, _, files in os.walk(READONLY_MODULE))
         assert file_count == 0, "read-only module must not receive any file"
 
+    def test_read_only_no_write_anywhere(self, daemon):
+        """A refused read-only transfer must not add a single file anywhere under
+        the module root tree (negative confinement, not just the target)."""
+        before = self._tree_files()
+        result = _push("127.0.0.1::readonly", daemon.port)
+        assert result.returncode != 0
+        assert self._tree_files() == before, "read-only rejection wrote under the module root"
+
     def test_unknown_module_rejected(self, daemon):
         result = _push("127.0.0.1::no-such-module", daemon.port)
+        assert result.returncode != 0
+
+    def test_unknown_module_no_write_anywhere(self, daemon):
+        """An unknown module must be refused cleanly before any file lands
+        anywhere beneath the module root tree."""
+        before = self._tree_files()
+        result = _push("127.0.0.1::no-such-module", daemon.port)
+        assert result.returncode != 0
+        assert self._tree_files() == before, "unknown-module rejection wrote under the module root"
+
+    def test_module_less_destination_rejected(self, daemon):
+        """A daemon destination with no module name (host::/path) is refused at
+        parse time, before any connection payload is sent."""
+        result = _push("127.0.0.1::", daemon.port)
+        assert result.returncode != 0
+        result = _push("127.0.0.1::/sub", daemon.port)
+        assert result.returncode != 0
+
+    def test_dotdot_destination_rejected(self, daemon):
+        """A '..' path expansion in the module-relative path is refused at parse
+        time so a client cannot escape the module root while it is still on the
+        client side of the wire."""
+        result = _push("127.0.0.1::files/../..", daemon.port)
         assert result.returncode != 0
 
     def test_auth_required_module_rejected(self, daemon):
@@ -180,6 +254,25 @@ class TestDaemonRejection:
         assert result.returncode != 0
         file_count = sum(len(files) for _, _, files in os.walk(AUTH_MODULE))
         assert file_count == 0
+
+    @pytest.mark.daemon_detach
+    def test_real_detach_path(self):
+        """--daemon WITHOUT --no-detach double-forks a real background daemon;
+        a client can still transfer into the module root, and the orphaned
+        process is terminated cleanly (via SIGTERM after polling the port)."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", DETACH_CONF, "--allow-unauthenticated"]
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+        try:
+            _wait_for_port(DETACH_PORT, timeout=15)
+            result = _push("127.0.0.1::detach", DETACH_PORT)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(DETACH_MODULE, SOURCE_DIR)
+            _, missing = verify_transfer(SOURCE_DIR, received)
+            assert not missing, f"missing: {missing[:5]}"
+        finally:
+            _kill_by_cmdline_marker(DETACH_CONF)
 
     def test_plaintext_requires_allow_unauthenticated(self):
         """Secure default: a daemon started WITHOUT --allow-unauthenticated must
