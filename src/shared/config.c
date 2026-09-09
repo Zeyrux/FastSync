@@ -125,6 +125,8 @@ static void config_set_defaults(Config* config) {
   config->outbuf = OUTBUF_BLOCK;
   config->old_args = false;
   config->temp_dir = NULL;
+  config->remote_options = NULL;
+  config->remote_option_count = 0;
   config->basis_dirs = NULL;
   config->basis_count = 0;
   config->partial_dir = NULL;
@@ -166,6 +168,7 @@ static void config_set_defaults(Config* config) {
   config->open_noatime = false;
   config->use_xattrs = false;
   config->fake_super = false;
+  config->trust_sender = false;
 }
 
 static bool valid_wire_bool(int value) {
@@ -507,6 +510,13 @@ void config_delete(Config* config) {
   file_list_destroy((FileListSet*)config->files_from_set);
   free(config->rsh_command);
   free(config->temp_dir);
+  if (config->remote_options) {
+    for (int i = 0; i < config->remote_option_count; i++)
+      free(config->remote_options[i]);
+    free(config->remote_options);
+  }
+  config->remote_options = NULL;
+  config->remote_option_count = 0;
   for (int i = 0; i < config->basis_count; i++) {
     free(config->basis_dirs[i].path);
     config->basis_dirs[i].path = NULL;

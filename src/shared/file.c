@@ -363,6 +363,23 @@ bool file_get_keep_dirlinks(void) {
   return file_keep_dirlinks;
 }
 
+/* --trust-sender (Phase 5) receiver process-wide policy: when set, the receiver
+ * trusts the sender's file list and skips its own redundant up-front re-
+ * validation (empty/".." path rejection, escaping-symlink-target containment).
+ * Kept OFF by default; the server's per-connection handler sets it once from the
+ * received config before any receiver/writer threads start (each connection is
+ * its own forked process, so this per-process value never bleeds across
+ * connections). */
+static bool file_trust_sender = false;
+
+void file_set_trust_sender(bool enable) {
+  file_trust_sender = enable;
+}
+
+bool file_get_trust_sender(void) {
+  return file_trust_sender;
+}
+
 /* True when `target` is a lexical symlink target that can never escape the
  * receive root once created beneath it: relative (not absolute) and containing
  * no ".." path component.  Used by --munge-links' sender-side containment: an
@@ -425,7 +442,16 @@ char* file_symlink_munge(const char* target) {
  * false) so a malicious sender can never materialize a symlink that points
  * outside the receive root. */
 bool file_symlink_at_secure(const char* path, const char* target) {
-  if (!path || !target || has_path_traversal(path) || !file_symlink_target_contained(target))
+  /* The link itself (`path`) is always kept below the authorized root.  The
+     TARGET may point anywhere: normally only a contained (relative, ".."-free)
+     target is permitted so a malicious sender can never plant a symlink that
+     later dereferences outside the root.  Under --trust-sender that target
+     containment check is relaxed (the receiver trusts the sender and copies the
+     link verbatim, matching rsync -l), but path/leaf confinement is never
+     disabled, so the link still cannot be placed outside the tree. */
+  if (!path || !target || has_path_traversal(path))
+    return false;
+  if (!file_trust_sender && !file_symlink_target_contained(target))
     return false;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(path, &leaf, true);

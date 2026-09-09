@@ -54,6 +54,15 @@ bool file_symlink_at_secure(const char* path, const char* target);
 void file_set_keep_dirlinks(bool enable);
 bool file_get_keep_dirlinks(void);
 
+/* --trust-sender receiver process-wide policy (Phase 5).  When set, the
+ * receiver trusts that the sender already produced a clean file list and skips
+ * its own redundant up-front re-validation of incoming paths (the empty/".."
+ * rejection and the escaping-symlink-target containment).  The low-level
+ * fd-relative confinement primitives below are deliberately NOT disabled by
+ * this flag, so a hostile sender still cannot escape the authorized root. */
+void file_set_trust_sender(bool enable);
+bool file_get_trust_sender(void);
+
 /* A configured fd without a canonical identity deliberately rejects paths. */
 bool file_set_authorized_root(int fd, const char* canonical_path);
 

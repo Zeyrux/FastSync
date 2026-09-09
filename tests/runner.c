@@ -55,6 +55,7 @@ int main() {
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
   RUN_TEST(test_file);
+  RUN_TEST(test_trust_sender);
   RUN_TEST(test_delay_updates);
   RUN_TEST(test_file_sendfile);
   RUN_TEST(test_multiprocessing);

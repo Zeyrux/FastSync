@@ -6,6 +6,7 @@
 #include "protocol.h"
 #include "test_utils.h"
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -1020,6 +1021,199 @@ static void test_dir_entry_save_to_disk() {
   rmdir("test_dir_entry_root/alpha/beta");
   rmdir("test_dir_entry_root/alpha");
   rmdir(root);
+}
+
+/* ---- Phase 5 (--trust-sender) safety-floor tests ----
+ *
+ * --trust-sender is a receiver-local policy that never crosses the wire: a real
+ * receiver enables it from its own process (the standalone server's --trust-
+ * sender CLI switch, which a client forwards as --remote-option=--trust-sender),
+ * so these tests force file_set_trust_sender(true) directly.  Trust must RELAX
+ * only the redundant list-level re-validation (an escaping symlink TARGET is
+ * copied verbatim, rsync -l parity) and must NEVER disable the low-level
+ * fd-relative confinement floor: file_open_secure_parent's ".." rejection, the
+ * O_NOFOLLOW parent walk, leaf/destination confinement, and the ungated
+ * has_path_traversal on the link's own placement path in file_symlink_at_secure
+ * stay hard.  A hostile sender therefore still cannot place a file, directory
+ * or symlink outside the receive root even with trust on. */
+
+static void test_trust_sender_relaxes_symlink_target() {
+  const char* root = "test_trust_sender_root";
+  const char* link = "test_trust_sender_root/escape_link";
+  unlink(link);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+
+  /* Control: without trust an absolute (escaping) target is refused and the
+     link is never placed. */
+  file_set_trust_sender(false);
+  EXPECT_FALSE(file_symlink_at_secure(link, "/etc/passwd"));
+  struct stat st;
+  EXPECT_EQ_INT(lstat(link, &st), -1);
+
+  /* Trust ON: the escaping target is copied verbatim (rsync -l parity) ... */
+  file_set_trust_sender(true);
+  EXPECT_TRUE(file_symlink_at_secure(link, "/etc/passwd"));
+  EXPECT_EQ_INT(lstat(link, &st), 0);
+  EXPECT_TRUE(S_ISLNK(st.st_mode));
+  /* ...but the link itself still lands beneath the receive root. */
+  char target[128];
+  ssize_t target_len = readlink(link, target, sizeof(target) - 1);
+  EXPECT_TRUE(target_len > 0);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (target_len > 0) {
+    target[target_len] = '\0';
+    EXPECT_EQ_STR(target, "/etc/passwd");
+  }
+  unlink(link);
+
+  /* Same relaxation through the real save funnel (file_save_to_disk_full). */
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  const char* save_link = "test_trust_sender_root/save_link";
+  unlink(save_link);
+
+  File* sym = file_create("save_link");
+  EXPECT_NOT_NULL(sym);
+  sym->is_symlink = true;
+  sym->symlink_target = str_dup("/etc/passwd");
+  EXPECT_NOT_NULL(sym->symlink_target);
+
+  file_set_trust_sender(false);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, sym, config), FILE_SAVE_SKIPPED);
+  EXPECT_EQ_INT(lstat(save_link, &st), -1);
+
+  file_set_trust_sender(true);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, sym, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(lstat(save_link, &st), 0);
+  EXPECT_TRUE(S_ISLNK(st.st_mode));
+
+  file_destroy(sym);
+  config_delete(config);
+  unlink(save_link);
+  rmdir(root);
+}
+
+static void test_trust_sender_confines_hostile_paths() {
+  const char* root = "test_trust_sender_root";
+  const char* escaped_file = "../test_trust_sender_escaped_file.txt";
+  const char* escaped_dir = "../test_trust_sender_escaped_dir";
+  const char* escaped_link = "../test_trust_sender_escaped_link";
+  unlink(escaped_file);
+  rmdir(escaped_dir);
+  unlink(escaped_link);
+  unlink(root);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  file_set_trust_sender(true);
+  struct stat st;
+
+  /* A hostile regular-file path that would escape the root is contained: the
+     save-layer ".." re-check is relaxed under trust, so the attempt reaches the
+     secure floor, which refuses the walk -- nothing appears outside. */
+  File* file = file_create(escaped_file);
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(5);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, "evil", 4);
+  file->data->size = 4;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, file, config), FILE_SAVE_ERROR);
+  file_destroy(file);
+  EXPECT_EQ_INT(lstat(escaped_file, &st), -1);
+
+  /* A hostile directory entry is contained the same way. */
+  File* dir = file_create(escaped_dir);
+  EXPECT_NOT_NULL(dir);
+  dir->is_dir = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, dir, config), FILE_SAVE_ERROR);
+  file_destroy(dir);
+  EXPECT_EQ_INT(lstat(escaped_dir, &st), -1);
+
+  /* A hostile symlink whose OWN placement path escapes the root is refused even
+     under trust: the ungated has_path_traversal in file_symlink_at_secure never
+     turns off. */
+  EXPECT_FALSE(file_symlink_at_secure("test_trust_sender_root/../escaped_link", "/etc/passwd"));
+  EXPECT_EQ_INT(lstat(escaped_link, &st), -1);
+
+  /* file_open_secure_parent still refuses a ".." component outright. */
+  char* leaf = NULL;
+  EXPECT_EQ_INT(file_open_secure_parent("test_trust_sender_root/../../etc/passwd", &leaf, true),
+                -1);
+  free(leaf);
+
+  config_delete(config);
+  rmdir(root);
+}
+
+/* The same guarantees under a configured authorized root: a within-root link
+   with an escaping target is created (relaxed), while a placement path that is
+   a clean absolute path OUTSIDE the authorized root (no ".." anywhere) is
+   refused by the leaf/destination confinement. */
+static void test_trust_sender_authorized_root_confinement() {
+  const char* root = "test_trust_sender_root";
+  const char* sibling = "test_trust_sender_sibling";
+  unlink(root);
+  rmdir(root);
+  rmdir(sibling);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sibling, 0755), 0);
+
+  char root_abs[PATH_MAX];
+  char sibling_abs[PATH_MAX];
+  EXPECT_NOT_NULL(realpath(root, root_abs));
+  EXPECT_NOT_NULL(realpath(sibling, sibling_abs));
+  int root_fd = open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  EXPECT_TRUE(root_fd >= 0);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (root_fd < 0) {
+    rmdir(root);
+    rmdir(sibling);
+    return;
+  }
+  EXPECT_TRUE(file_set_authorized_root(root_fd, root_abs));
+
+  file_set_trust_sender(true);
+  struct stat st;
+
+  /* Within the authorized root, an escaping symlink TARGET is copied verbatim. */
+  char* inside_link = path_cat(root_abs, "authorized_escape_link");
+  EXPECT_NOT_NULL(inside_link);
+  unlink(inside_link);
+  EXPECT_TRUE(file_symlink_at_secure(inside_link, "/etc/passwd"));
+  EXPECT_EQ_INT(lstat(inside_link, &st), 0);
+  EXPECT_TRUE(S_ISLNK(st.st_mode));
+  unlink(inside_link);
+
+  /* A clean absolute path in a sibling directory (outside the authorized root)
+     is still refused even under trust. */
+  char* outside_link = path_cat(sibling_abs, "test_trust_sender_outside_link");
+  EXPECT_NOT_NULL(outside_link);
+  unlink(outside_link);
+  EXPECT_FALSE(file_symlink_at_secure(outside_link, "/etc/passwd"));
+  EXPECT_EQ_INT(lstat(outside_link, &st), -1);
+
+  free(outside_link);
+  free(inside_link);
+  file_set_authorized_root(-1, NULL);
+  close(root_fd);
+  unlink("test_trust_sender_outside_link");
+  rmdir(sibling);
+  rmdir(root);
+}
+
+void test_trust_sender() {
+  /* The final reset lines always run (a failing EXPECT only returns from the
+     helper), so a later group never inherits a stray trust/authorized-root
+     policy. */
+  file_set_trust_sender(false);
+  test_trust_sender_relaxes_symlink_target();
+  test_trust_sender_confines_hostile_paths();
+  test_trust_sender_authorized_root_confinement();
+  file_set_trust_sender(false);
+  file_set_authorized_root(-1, NULL);
 }
 
 void test_file() {

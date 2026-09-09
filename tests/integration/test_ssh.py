@@ -144,7 +144,6 @@ class TestSSHFeatures:
         r = _run_ssh_test("SSH Preallocate (--preallocate)", ["--preallocate"])
         assert r["status"] == "Success", r["error"]
 
-
 class TestSSHConnectivity:
     """Phase 5 connectivity options: -e/--rsh, --rsync-path, --blocking-io,
     --outbuf.  These are client-side launch concerns, so each must parse and
@@ -181,3 +180,48 @@ class TestSSHConnectivity:
     def test_blocking_io_with_compression(self):
         r = _run_ssh_test("SSH --blocking-io -c", ["--blocking-io", "-c"])
         assert r["status"] == "Success", r["error"]
+
+    def test_trust_sender(self):
+        r = _run_ssh_test("SSH Trust Sender (--trust-sender)", ["--trust-sender"])
+        assert r["status"] == "Success", r["error"]
+
+    def test_remote_option_reaches_server(self):
+        """--remote-option=OPT appends OPT to the remote server command line and
+        the server honors it.  Over SSH the server is launched without
+        --allow-delete, so a bare --delete is inert (nothing is removed).  If
+        --remote-option=--allow-delete really reaches the remote server, the
+        receiver's deletion policy becomes permissive and the stale destination
+        file IS removed.  Asserting the file is gone is therefore a positive
+        proof the forwarded option was honored by the server."""
+        src = SOURCE_DIR
+        if os.path.exists(src):
+            shutil.rmtree(src)
+        os.makedirs(src)
+        with open(os.path.join(src, "keep.txt"), "w") as f:
+            f.write("kept\n")
+        with open(os.path.join(src, "stale.txt"), "w") as f:
+            f.write("stale\n")
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+
+        # Initial push so the destination mirrors the source.
+        clean_dir(DEST_DIR)
+        ssh_dest = f"localhost:{DEST_DIR}"
+        base = CLIENT_CMD + [src, ssh_dest, "--save-to-disk",
+                             "--fastsync-server-path", os.path.join(BUILD_DIR, "server")]
+        first = subprocess.run(base, text=True, capture_output=True)
+        assert first.returncode == 0, f"initial push failed: {(first.stderr or first.stdout)[:200]}"
+        assert os.path.exists(os.path.join(received, "stale.txt"))
+
+        # Remove stale.txt from the source and re-push with --delete +
+        # --remote-option=--allow-delete.  Forwarding --allow-delete to the
+        # server is what makes the deletion actually happen.
+        os.remove(os.path.join(src, "stale.txt"))
+        second = subprocess.run(base + ["--delete", "--remote-option=--allow-delete"],
+                                text=True, capture_output=True)
+        assert second.returncode == 0, \
+            f"second push failed: {(second.stderr or second.stdout)[:200]}"
+        assert not os.path.exists(os.path.join(received, "stale.txt")), (
+            "stale.txt still present: --allow-delete (forwarded via "
+            "--remote-option) did not reach the remote server"
+        )
+        assert os.path.exists(os.path.join(received, "keep.txt"))

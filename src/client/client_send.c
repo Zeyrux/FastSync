@@ -368,7 +368,8 @@ static Client* connect_transfer_client(const Config* config) {
     }
     return client_connect_ssh(config->ssh_destination, config->ssh_port,
                               config->fastsync_server_path, config->old_args, config->rsh_command,
-                              config->blocking_io);
+                              config->blocking_io, config->remote_options,
+                              config->remote_option_count);
   }
 
   Client* client = client_create();
