@@ -369,7 +369,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     else
       snprintf(ssh_user, ssh_user_len, "%s", r.host);
 
-char* remote_command =
+    char* remote_command =
         ssh_build_remote_command(server_path, old_args, remote_options, remote_option_count);
     if (!remote_command)
       ssh_child_setup_failed(exec_pipe[1]);

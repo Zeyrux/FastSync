@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 101 | Feature works end-to-end |
+| ✅ Implemented | 111 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 10 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 3 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 30 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 20 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
@@ -754,6 +754,10 @@ These options affect process startup, authentication, sockets, and remote execut
 **Phase 5, Wave B (socket/bind) shipping note:** `--sockopts` adds a strict allowlisted `OPT=VAL` socket-option layer applied with correct per-option value types; `--address` binds the outgoing client socket to a local source address; `-4`/`-6` pin the address family via `getaddrinfo` hints on both the client connect and the server bind; and the server bind now honors `--address` plus `-4`/`-6` (falling back to the historical IPv4 `INADDR_ANY` when none are given). All of these are local socket concerns and none cross the wire config frame (only `--port` maps to `server_port`).
 | `--remote-option=OPT`, `-M`; `--trust-sender` | L | Add authenticated remote-option/config negotiation and reject unsafe sender-controlled values. `-M` conflicts with FastSync metadata mode. |
 | `--daemon`; `--config=FILE`; `--dparam=OVERRIDE`; `--no-detach`; `--password-file=FILE`; `--early-input=FILE`; `--no-motd` | XL | Implement a real daemon lifecycle, module configuration, authentication, privilege separation, and process management. |
+
+**Phase 5, Wave A (rsh/ssh) shipping note:** the SSH transport no longer hardcodes `ssh`. `-e`/`--rsh=COMMAND` selects the remote-shell program (whitespace-split into the leading child argv words), `--rsync-path=PROGRAM` aliases `--fastsync-server-path`, `--blocking-io` removes the SSH-socketpair `SO_RCVTIMEO`/`SO_SNDTIMEO` timeouts (by default they now match the TCP transport so a wedged shell cannot hang forever), and `--outbuf=N|L|B` maps onto `setvbuf` (`_IONBF`/`_IOLBF`/`_IOFBF`, garbage rejected). All four are client-only launch concerns and never cross the wire.
+
+**Phase 5, Wave C (remote-option/trust-sender) shipping note (PROTOCOL 2.13.0 → 2.14.0):** `--remote-option=OPT` (long form only; the short `-M` is intentionally left as FastSync metadata mode — documented divergence) appends each validated value to the remote server invocation over SSH as an individually single-quote-escaped shell word, so shell metacharacters cannot break out and a `--` can never be turned into injection; options never cross the binary config frame. `--trust-sender` is a receiver-local policy (never serialized, so a wire peer can't enable it): when requested on the server (via `--remote-option=--trust-sender`), it removes only the redundant receiver/save-layer path re-checking; the low-level floor (`file_open_secure_parent`'s `..` rejection, the O_NOFOLLOW parent walk, leaf/destination confinement) stays enforced. Off by default. The wire config-frame layout is unchanged; the bump reflects that a 2.14 sender composing remote options requires a 2.14 receiver to honor them.
 
 ### Phase 6: Batch, Encoding, and Protocol Interoperability
 
