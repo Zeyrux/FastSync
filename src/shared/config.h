@@ -40,6 +40,24 @@ typedef struct {
   int32_t to;
 } IdentityMap;
 
+/* --sockopts=OPTIONS allowlist.  Only these option names are accepted; anything
+ * else is rejected (never silently ignored).  TCP_NODELAY, SO_KEEPALIVE and
+ * SO_REUSEADDR are boolean options (value 0/1); SO_RCVBUF and SO_SNDBUF take a
+ * non-negative byte count.  All are applied as int-sized setsockopt values. */
+typedef enum {
+  SOCKOPT_TCP_NODELAY = 0,
+  SOCKOPT_SO_KEEPALIVE,
+  SOCKOPT_SO_RCVBUF,
+  SOCKOPT_SO_SNDBUF,
+  SOCKOPT_SO_REUSEADDR,
+  SOCKOPT_COUNT
+} SockOptId;
+
+typedef struct {
+  SockOptId id; /* allowlist index */
+  int value;    /* 0/1 for booleans, byte count for SO_RCVBUF/SO_SNDBUF */
+} SockOptEntry;
+
 typedef struct Config {
   char* version;
   char* send_directory;
@@ -264,6 +282,13 @@ typedef struct Config {
   char* bind_address;
   bool ipv6;
   bool ipv4;
+  /* --sockopts=OPTIONS (Phase 5, Wave B): strict allowlist of TCP/socket
+   * options applied via setsockopt after socket() and before connect()/bind().
+   * These are LOCAL socket concerns: they never cross the wire config frame.
+   * .address is the outgoing/source bind address (--address); .bind_address is
+   * reserved for daemon-side binding and is not wired yet. */
+  SockOptEntry* sockopts;
+  int sockopt_count;
 
   // PR #182: Daemon/server mode
   bool daemon;
@@ -389,5 +414,12 @@ bool config_has_basis(const Config* config);
 int config_basis_append(Config* config, BasisDestType type, const char* path);
 /* Validate a client-provided basis-dir path (relative, confined, non-empty). */
 bool config_basis_path_valid(const char* path);
+
+/* Parse and validate a --sockopts=OPTIONS comma-separated "OPT=VAL" list into a
+ * malloc'd array of at most *out_count entries.  Returns 0 on success (the
+ * caller takes ownership of *out), or -1 on the first invalid option name or
+ * value.  Pure/static-analysis friendly: performs no socket calls, so it is
+ * directly unit-testable. */
+int config_sockopts_parse(const char* spec, SockOptEntry** out, int* out_count);
 
 #endif

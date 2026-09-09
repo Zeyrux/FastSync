@@ -373,12 +373,21 @@ static Client* connect_transfer_client(const Config* config) {
   Client* client = client_create();
   if (!client)
     return NULL;
+  /* Socket/connect concerns that never cross the wire: --address (source bind),
+   * -4/-6 (family pinning), and --sockopts.  Passed straight to the TCP layer. */
+  TcpConnectOptions connect_opts;
+  connect_opts.bind_address = config->address;
+  connect_opts.family = tcp_connect_family(config->ipv4, config->ipv6);
+  connect_opts.sockopts = config->sockopts;
+  connect_opts.sockopt_count = config->sockopt_count;
   bool connected;
   if (config->use_tls) {
-    connected = client_connect_tls(client, config->server_host, config->server_port,
-                                   config->tls_cert, config->tls_key, config->tls_ca);
+    connected = client_connect_tls_ex(client, config->server_host, config->server_port,
+                                      config->tls_cert, config->tls_key, config->tls_ca,
+                                      &connect_opts);
   } else {
-    connected = client_connect(client, config->server_host, config->server_port);
+    connected = client_connect_ex(client, config->server_host, config->server_port,
+                                  &connect_opts);
   }
   if (!connected) {
     client_disconnect(client);

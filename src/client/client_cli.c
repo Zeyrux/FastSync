@@ -148,6 +148,24 @@ static int set_compression_threads_option(int* dest, const char* value) {
   return 0;
 }
 
+/* Parse and validate --sockopts=OPTIONS into the config.  The strict allowlist
+ * (config_sockopts_parse) rejects an unknown option name or an invalid value
+ * up front, so a typo never silently disables a socket option. */
+static int set_sockopts_option(Config* config, const char* value) {
+  SockOptEntry* entries = NULL;
+  int count = 0;
+  if (config_sockopts_parse(value, &entries, &count) != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--sockopts must be a comma-separated OPT=VAL list of supported options "
+                "(TCP_NODELAY, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF, SO_REUSEADDR)");
+    return -1;
+  }
+  free(config->sockopts);
+  config->sockopt_count = count;
+  config->sockopts = entries;
+  return 0;
+}
+
 /* Parse a string as a non-negative integer into *dest. Returns 0 on success, -1 on error. */
 static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_nonneg_int(value, dest)) {
@@ -530,6 +548,9 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
     {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
     {"--max-depth", NULL, OPT_NONNEG_INT, offsetof(Config, max_depth)},
+    {"--address", NULL, OPT_STRING, offsetof(Config, address)},
+    {"--ipv4", "-4", OPT_FLAG, offsetof(Config, ipv4)},
+    {"--ipv6", "-6", OPT_FLAG, offsetof(Config, ipv6)},
 
     {"--max-size", NULL, OPT_ULL, offsetof(Config, max_size)},
     {"--min-size", NULL, OPT_ULL, offsetof(Config, min_size)},
@@ -1124,6 +1145,16 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
       if (set_checksum_seed(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--sockopts=", 11) == 0) {
+      if (set_sockopts_option(config, argv[i] + 11) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--sockopts", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --sockopts");
+        return -1;
+      }
+      if (set_sockopts_option(config, argv[++i]) != 0)
         return -1;
     } else if (strncmp(argv[i], "--compare-dest=", 15) == 0) {
       if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[i] + 15, "--compare-dest") != 0)

@@ -610,12 +610,12 @@ now transmits targets (the prior behavior was broken/partial); its status moved
 | `-e`, `--rsh=COMMAND` | Remote shell to use | ❌ Not Implemented | Removed; SSH invokes `ssh` directly |
 | `--rsync-path=PROGRAM` | rsync binary on remote | ❌ Not Implemented | Removed; use `--fastsync-server-path` |
 | `--port=PORT` | Alternate daemon port | ✅ Implemented | `server_port` config field |
-| `--sockopts=OPTIONS` | Custom TCP options | ❌ Not Implemented | |
+| `--sockopts=OPTIONS` | Custom TCP options | ✅ Implemented | Comma-separated allowlist of `OPT=VAL` applied via `setsockopt` after `socket()` before `connect()`/`bind()`. Only `TCP_NODELAY`, `SO_KEEPALIVE`, `SO_REUSEADDR` (0/1) and `SO_RCVBUF`/`SO_SNDBUF` (byte count) are accepted; an unknown option name or a bad value is rejected up front, never silently ignored. A value is required for every option (`OPT=VAL`; a bare name is an error). Applied to the outgoing TCP and TLS client reset when absent. Local socket concern: never crosses the wire |
 | `--blocking-io` | Use blocking I/O for remote shell | ❌ Not Implemented | |
 | `--outbuf=N\|L\|B` | Set output buffering | ❌ Not Implemented | |
-| `--address=ADDRESS` | Bind address for outgoing socket | ❌ Not Implemented | Removed because it had no effect |
-| `-4`, `--ipv4` | Prefer IPv4 | ❌ Not Implemented | Removed because it had no effect |
-| `-6`, `--ipv6` | Prefer IPv6 | ❌ Not Implemented | Removed because it had no effect |
+| `--address=ADDRESS` | Bind address for outgoing socket | ✅ Implemented | Binds the outgoing client socket to a local source address before `connect()` (resolved with the same `-4`/`-6` family hints as the destination). Local socket concern: never crosses the wire |
+| `-4`, `--ipv4` | Prefer IPv4 | ✅ Implemented | Forces `AF_INET` in the `getaddrinfo` hints for client destination/source resolution and the server bind (see the Phase 5, Wave B note). Mutually exclusive with `-6` |
+| `-6`, `--ipv6` | Prefer IPv6 | ✅ Implemented | Forces `AF_INET6` in the `getaddrinfo` hints for client destination/source resolution and the server bind. Mutually exclusive with `-4` |
 | `--remote-option=OPT`, `-M` | Send an option only to the remote side | ❌ Not Implemented | `-M` is FastSync's metadata-preservation flag |
 
 ## 14. Daemon Mode
@@ -746,6 +746,8 @@ These options affect process startup, authentication, sockets, and remote execut
 |----------|--------|--------------------|
 | `--rsh=COMMAND`, `-e`; `--rsync-path=PROGRAM`; `--blocking-io`; `--outbuf=N\|L\|B` | M | Generalize SSH command construction and subprocess I/O while retaining argument escaping and timeout guarantees. |
 | `--address=ADDRESS`; `--ipv4`, `-4`; `--ipv6`, `-6`; `--sockopts=OPTIONS`; `--port=PORT` daemon semantics | M | Add explicit socket-family/bind configuration and validate it independently for TCP client and daemon modes. |
+
+**Phase 5, Wave B (socket/bind) shipping note:** `--sockopts` adds a strict allowlisted `OPT=VAL` socket-option layer applied with correct per-option value types; `--address` binds the outgoing client socket to a local source address; `-4`/`-6` pin the address family via `getaddrinfo` hints on both the client connect and the server bind; and the server bind now honors `--address` plus `-4`/`-6` (falling back to the historical IPv4 `INADDR_ANY` when none are given). All of these are local socket concerns and none cross the wire config frame (only `--port` maps to `server_port`).
 | `--remote-option=OPT`, `-M`; `--trust-sender` | L | Add authenticated remote-option/config negotiation and reject unsafe sender-controlled values. `-M` conflicts with FastSync metadata mode. |
 | `--daemon`; `--config=FILE`; `--dparam=OVERRIDE`; `--no-detach`; `--password-file=FILE`; `--early-input=FILE`; `--no-motd` | XL | Implement a real daemon lifecycle, module configuration, authentication, privilege separation, and process management. |
 

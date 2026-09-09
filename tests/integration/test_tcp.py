@@ -110,6 +110,35 @@ class TestTCPFlags:
         assert r["status"] == "Success", r["error"]
 
 
+class TestTCPSocketOptions:
+    """--sockopts, -4/-6 and --address: rsync-compatible socket/bind options.
+
+    These are purely local (client-side) socket concerns that never cross the
+    wire, so each is exercised by a normal transfer succeeding end-to-end."""
+
+    @pytest.mark.ci
+    def test_sockopts_apply(self, shared_server):
+        r = _run_tcp_test("Sockopts (TCP_NODELAY=1,SO_KEEPALIVE=1)", shared_server.port,
+                          ["--sockopts=TCP_NODELAY=1,SO_KEEPALIVE=1"])
+        assert r["status"] == "Success", r["error"]
+
+    def test_sockopts_buffer_sizes(self, shared_server):
+        r = _run_tcp_test("Sockopts buffer sizes (SO_RCVBUF/SO_SNDBUF)", shared_server.port,
+                          ["--sockopts=SO_RCVBUF=131072,SO_SNDBUF=131072"])
+        assert r["status"] == "Success", r["error"]
+
+    def test_ipv4_forced(self, shared_server):
+        r = _run_tcp_test("Force IPv4 (-4)", shared_server.port, ["-4"])
+        assert r["status"] == "Success", r["error"]
+
+    @pytest.mark.skipif(shutil.which("ip") is None,
+                        reason="requires ip tooling to enumerate a usable local address")
+    def test_address_source_bind(self, shared_server):
+        r = _run_tcp_test("Source bind (--address=127.0.0.1)", shared_server.port,
+                          ["--address", "127.0.0.1"])
+        assert r["status"] == "Success", r["error"]
+
+
 class TestTCPChunkSize:
     def test_custom_chunk_size(self, shared_server):
         r = _run_tcp_test("Chunk size 5MB", shared_server.port, ["--chunk-size", "5242880"])

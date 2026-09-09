@@ -166,6 +166,11 @@ void print_usage(void) {
   printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
   printf("  -T <sec>            Alias for --timeout\n");
   printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
+  printf("  --address <ip>      Bind the outgoing client socket to this source address\n");
+  printf("  -4, --ipv4          Force IPv4 for destination resolution\n");
+  printf("  -6, --ipv6          Force IPv6 for destination resolution\n");
+  printf("  --sockopts=OPTS     Comma-separated OPT=VAL socket options applied before connect:\n");
+  printf("                      TCP_NODELAY, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF, SO_REUSEADDR\n");
   printf("  --backup            Backup existing files before overwriting\n");
   printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
   printf("  --suffix <str>      Backup suffix (default: ~)\n");
