@@ -22,6 +22,7 @@
 static char* authorized_root;
 static int authorized_root_fd = -1;
 static bool allow_delete;
+static bool trust_sender;
 static bool allow_unauthenticated;
 static const char* required_client_cn;
 
@@ -221,11 +222,14 @@ void handler(int file_descriptor) {
      across the per-connection forked processes). */
   file_set_keep_dirlinks(config->keep_dirlinks);
   /* --trust-sender is a LOCAL receiver policy: it never crosses the wire (so a
-     wire peer can never enable it), the receiving process applies it here from
-     its own config.  Set before any multithreaded receiver/writer threads are
-     spawned so the fd-walk reads a stable value during the whole transfer, and
-     never bleeds across the per-connection forked processes.  Off by default. */
-  file_set_trust_sender(config->trust_sender);
+     wire peer can never enable it).  The standalone server only honours it when
+     its own CLI was started with --trust-sender (the client forwards that switch
+     into the remote argv via --remote-option=--trust-sender; the server then
+     parses it here and applies the policy below).  Set before any multithreaded
+     receiver/writer threads are spawned so the fd-walk reads a stable value
+     during the whole transfer, and never bleeds across the per-connection
+     forked processes.  Off by default. */
+  file_set_trust_sender(trust_sender);
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {
@@ -348,6 +352,7 @@ static void print_server_usage(void) {
   printf("  --client-cn <name>  Required TLS client certificate CN\n");
   printf("  --destination-root <path>  Authorized destination root (default: .)\n");
   printf("  --allow-delete      Permit manifest deletion\n");
+  printf("  --trust-sender      Trust the remote sender's file list\n");
   printf("  --allow-unauthenticated  Allow plaintext/anonymous network clients\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  --help              Show this help\n");
@@ -384,6 +389,8 @@ int main(int argc, char* argv[]) {
       destination_root = argv[++i];
     } else if (strcmp(argv[i], "--allow-delete") == 0) {
       allow_delete = true;
+    } else if (strcmp(argv[i], "--trust-sender") == 0) {
+      trust_sender = true;
     } else if (strcmp(argv[i], "--allow-unauthenticated") == 0) {
       allow_unauthenticated = true;
     } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
