@@ -831,10 +831,7 @@ static void test_parse_args_rejects_unimplemented_options() {
                                         "--delete-excluded",
                                         "--max-delete",
                                         "--prune-empty-dirs",
-                                        "--address",
                                         "--bind-address",
-                                        "--ipv6",
-                                        "--ipv4",
                                         "--daemon",
                                         "--config",
                                         "--server"};
@@ -2588,6 +2585,90 @@ static void test_parse_args_devices_specials() {
   config_delete(cfg);
 }
 
+/* --address binds the outgoing client socket; it is a plain string option. */
+static void test_parse_args_address() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--address", "192.0.2.10", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->address, "192.0.2.10");
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* eq_argv[] = {"fastsync", "--address=10.0.0.5", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, eq_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->address, "10.0.0.5");
+  config_delete(cfg);
+}
+
+/* -4/--ipv4 and -6/--ipv6 set the resolution family; both together are
+ * rejected by validate_config (an address cannot be both v4 and v6). */
+static void test_parse_args_ipv4_ipv6() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-4", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->ipv4);
+  EXPECT_FALSE(cfg->ipv6);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* longv6[] = {"fastsync", "--ipv6", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, longv6, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->ipv4);
+  EXPECT_TRUE(cfg->ipv6);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* both[] = {"fastsync", "-4", "-6", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, both, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->ipv4);
+  EXPECT_TRUE(cfg->ipv6);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
+/* --sockopts parses and stores the allowlist; unknown options and bad values
+ * are rejected at the CLI layer (never silently ignored). */
+static void test_parse_args_sockopts() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--sockopts=TCP_NODELAY=1,SO_KEEPALIVE=1", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->sockopt_count, 2);
+  EXPECT_EQ_INT(cfg->sockopts[0].id, SOCKOPT_TCP_NODELAY);
+  EXPECT_EQ_INT(cfg->sockopts[0].value, 1);
+  EXPECT_EQ_INT(cfg->sockopts[1].id, SOCKOPT_SO_KEEPALIVE);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* sep_argv[] = {"fastsync", "--sockopts", "SO_RCVBUF=65536", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, sep_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->sockopt_count, 1);
+  EXPECT_EQ_INT(cfg->sockopts[0].id, SOCKOPT_SO_RCVBUF);
+  EXPECT_EQ_INT(cfg->sockopts[0].value, 65536);
+  config_delete(cfg);
+
+  static const char* const bad[] = {"--sockopts=IP_TTL=1", "--sockopts=TCP_NODELAY=2",
+                                    "--sockopts=SO_KEEPALIVE"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    cfg = config_create();
+    positional_count = 0;
+    char* b[] = {"fastsync", (char*)bad[i], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, b, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -2601,6 +2682,9 @@ void test_client_cli() {
   test_parse_args_devices_specials();
   test_parse_args_atimes_long_and_short();
   test_parse_args_omit_link_times_long();
+  test_parse_args_address();
+  test_parse_args_ipv4_ipv6();
+  test_parse_args_sockopts();
   test_parse_args_append();
   test_parse_args_append_verify();
   test_parse_args_append_both();

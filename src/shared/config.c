@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <errno.h>
 
 static void config_set_defaults(Config* config) {
   config->version = str_dup(PROTOCOL_VERSION);
@@ -134,6 +136,8 @@ static void config_set_defaults(Config* config) {
   config->bind_address = NULL;
   config->ipv6 = false;
   config->ipv4 = false;
+  config->sockopts = NULL;
+  config->sockopt_count = 0;
   config->daemon = false;
   config->daemon_config = NULL;
   config->server_mode = false;
@@ -340,6 +344,114 @@ int config_basis_append(Config* config, BasisDestType type, const char* path) {
   return 0;
 }
 
+/* Strict --sockopts allowlist: map an option NAME to its SockOptId, or -1 when
+ * the name is not on the allowlist.  The list is intentionally closed so an
+ * unknown option is an error, never a silent no-op. */
+static int sockopt_id_from_name(const char* name) {
+  if (strcmp(name, "TCP_NODELAY") == 0)
+    return SOCKOPT_TCP_NODELAY;
+  if (strcmp(name, "SO_KEEPALIVE") == 0)
+    return SOCKOPT_SO_KEEPALIVE;
+  if (strcmp(name, "SO_RCVBUF") == 0)
+    return SOCKOPT_SO_RCVBUF;
+  if (strcmp(name, "SO_SNDBUF") == 0)
+    return SOCKOPT_SO_SNDBUF;
+  if (strcmp(name, "SO_REUSEADDR") == 0)
+    return SOCKOPT_SO_REUSEADDR;
+  return -1;
+}
+
+static bool sockopt_is_boolean(SockOptId id) {
+  return id == SOCKOPT_TCP_NODELAY || id == SOCKOPT_SO_KEEPALIVE || id == SOCKOPT_SO_REUSEADDR;
+}
+
+/* Parse one SockOptId's value.  Booleans accept only 0/1 (a numeric "on" is
+ * rejected rather than coerced); buffer sizes accept any non-negative int.
+ * Returns 0 on success, -1 on a bad value. */
+static int sockopt_parse_value(SockOptId id, const char* value, int* out) {
+  if (sockopt_is_boolean(id)) {
+    if (strcmp(value, "0") == 0) {
+      *out = 0;
+      return 0;
+    }
+    if (strcmp(value, "1") == 0) {
+      *out = 1;
+      return 0;
+    }
+    return -1;
+  }
+  if (!value || *value == '\0')
+    return -1;
+  char* end;
+  errno = 0;
+  long v = strtol(value, &end, 10);
+  if (errno != 0 || *end != '\0' || v < 0 || v > INT_MAX)
+    return -1;
+  *out = (int)v;
+  return 0;
+}
+
+int config_sockopts_parse(const char* spec, SockOptEntry** out, int* out_count) {
+  if (!spec || *spec == '\0' || !out || !out_count)
+    return -1;
+  char* copy = str_dup(spec);
+  if (!copy)
+    return -1;
+
+  int count = 0;
+  int capacity = 0;
+  SockOptEntry* entries = NULL;
+  char* saveptr = NULL;
+  bool ok = true;
+  for (const char* token = strtok_r(copy, ",", &saveptr); token != NULL;
+       token = strtok_r(NULL, ",", &saveptr)) {
+    if (*token == '\0') {
+      ok = false; /* empty entry: a stray/trailing comma */
+      break;
+    }
+    char* eq = strchr(token, '=');
+    if (eq)
+      *eq = '\0';
+    int id = sockopt_id_from_name(token);
+    if (id < 0) {
+      ok = false; /* unknown option name */
+      break;
+    }
+    int val;
+    /* rsync's --sockopts are OPT=VAL; a value is required for every option, so
+     * a bare option name (no '=') is rejected rather than coerced. */
+    if (eq == NULL || eq[1] == '\0') {
+      ok = false; /* missing '=' or missing value */
+      break;
+    }
+    if (sockopt_parse_value((SockOptId)id, eq + 1, &val) != 0) {
+      ok = false; /* bad value for an allowed option */
+      break;
+    }
+    if (count == capacity) {
+      int new_cap = capacity == 0 ? 4 : capacity * 2;
+      SockOptEntry* grown = realloc(entries, (size_t)new_cap * sizeof(SockOptEntry));
+      if (!grown) {
+        ok = false;
+        break;
+      }
+      entries = grown;
+      capacity = new_cap;
+    }
+    entries[count].id = (SockOptId)id;
+    entries[count].value = val;
+    count++;
+  }
+  free(copy);
+  if (!ok) {
+    free(entries);
+    return -1;
+  }
+  *out = entries;
+  *out_count = count;
+  return 0;
+}
+
 bool config_is_remote_dest(const char* s) {
   if (s == NULL)
     return false;
@@ -406,6 +518,7 @@ void config_delete(Config* config) {
   free(config->suffix);
   free(config->address);
   free(config->bind_address);
+  free(config->sockopts);
   free(config->daemon_config);
   free(config->compress_choice);
   free(config->chmod_spec);

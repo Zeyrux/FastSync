@@ -341,6 +341,9 @@ static void print_server_usage(void) {
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
   printf("  --client-cn <name>  Required TLS client certificate CN\n");
   printf("  --destination-root <path>  Authorized destination root (default: .)\n");
+  printf("  --address <addr>    Bind the listening socket to this address\n");
+  printf("  -4, --ipv4          Bind an IPv4 socket (default)\n");
+  printf("  -6, --ipv6          Bind an IPv6 socket\n");
   printf("  --allow-delete      Permit manifest deletion\n");
   printf("  --allow-unauthenticated  Allow plaintext/anonymous network clients\n");
   printf("  -v, --verbose       Enable debug logging\n");
@@ -353,6 +356,8 @@ int main(int argc, char* argv[]) {
   int port = 8080;
   const char* destination_root = ".";
   bool stdio_mode = false;
+  const char* bind_address = NULL;
+  int bind_family = AF_UNSPEC;
 
   signal(SIGPIPE, SIG_IGN);
   for (int i = 1; i < argc; i++) {
@@ -376,6 +381,20 @@ int main(int argc, char* argv[]) {
       required_client_cn = argv[++i];
     } else if (strcmp(argv[i], "--destination-root") == 0 && i + 1 < argc) {
       destination_root = argv[++i];
+    } else if (strcmp(argv[i], "--address") == 0 && i + 1 < argc) {
+      bind_address = argv[++i];
+    } else if (strcmp(argv[i], "-4") == 0 || strcmp(argv[i], "--ipv4") == 0) {
+      if (bind_family == AF_INET6) {
+        fprintf(stderr, "Error: --ipv4 and --ipv6 are mutually exclusive\n");
+        return 1;
+      }
+      bind_family = AF_INET;
+    } else if (strcmp(argv[i], "-6") == 0 || strcmp(argv[i], "--ipv6") == 0) {
+      if (bind_family == AF_INET) {
+        fprintf(stderr, "Error: --ipv4 and --ipv6 are mutually exclusive\n");
+        return 1;
+      }
+      bind_family = AF_INET6;
     } else if (strcmp(argv[i], "--allow-delete") == 0) {
       allow_delete = true;
     } else if (strcmp(argv[i], "--allow-unauthenticated") == 0) {
@@ -418,7 +437,10 @@ int main(int argc, char* argv[]) {
     release_authorization();
     return 0;
   }
-  g_server = server_create(port);
+  ServerBindOptions bind_opts;
+  bind_opts.bind_address = bind_address;
+  bind_opts.family = bind_family;
+  g_server = server_create_ex(port, &bind_opts);
   if (!g_server) {
     log_message(LOG_LEVEL_ERROR, "Failed to create server");
     release_authorization();

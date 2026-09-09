@@ -34,6 +34,11 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "--incremental is not supported with -s (chunk serialization)");
     return false;
   }
+  /* -4 and -6 are mutually exclusive: a socket address family cannot be both. */
+  if (config->ipv4 && config->ipv6) {
+    log_message(LOG_LEVEL_ERROR, "-4/--ipv4 and -6/--ipv6 are mutually exclusive");
+    return false;
+  }
   if (config->skip_compress_set && config->use_chunk_serialization) {
     log_message(LOG_LEVEL_ERROR,
                 "--skip-compress cannot be combined with -s (chunk serialization)");

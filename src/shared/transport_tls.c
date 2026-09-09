@@ -186,9 +186,10 @@ bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {
   return true;
 }
 
-bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
-                        const char* key_path, const char* ca_path) {
-  if (!tcp_connect_socket(client, host, port)) {
+bool client_connect_tls_ex(Client* client, const char* host, int port, const char* cert_path,
+                           const char* key_path, const char* ca_path,
+                           const TcpConnectOptions* opts) {
+  if (!tcp_connect_socket_ex(client, host, port, opts)) {
     if (client->file_descriptor >= 0)
       close(client->file_descriptor);
     client->file_descriptor = -1;
@@ -218,4 +219,9 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
   client->ssl = ssl;
   io_set_ssl(ssl);
   return true;
+}
+
+bool client_connect_tls(Client* client, const char* host, int port, const char* cert_path,
+                        const char* key_path, const char* ca_path) {
+  return client_connect_tls_ex(client, host, port, cert_path, key_path, ca_path, NULL);
 }
