@@ -186,6 +186,16 @@ void print_usage(void) {
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf(
       "  --old-args          Disable safe SSH command argument quoting (legacy compatibility)\n");
+  printf("  --remote-option=OPT  Append OPT to the REMOTE server invocation over SSH\n");
+  printf("                      (repeatable; each value is single-quote-escaped on the remote\n");
+  printf("                      command line; empty values and values with control characters\n");
+  printf("                      are rejected).  Long form only: rsync's -M short form is NOT\n");
+  printf("                      available because -M already means metadata preservation in\n");
+  printf("                      FastSync (documented divergence)\n");
+  printf("  --trust-sender      Trust the remote sender's file list: the receiver skips its\n");
+  printf("                      own up-front path-traversal/containment re-validation of the\n");
+  printf("                      incoming file list (fewer checks, faster, potentially unsafe).\n");
+  printf("                      Local receiver policy: never sent to the peer, off by default\n");
   printf("  -l, --links         Copy symlinks as symlinks\n");
   printf("  --copy-links        Transform symlinks into referent files\n");
   printf("  --safe-links        Skip symlinks that point outside transfer tree\n");

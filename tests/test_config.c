@@ -1226,15 +1226,70 @@ static void test_config_phase4_xattr_wire_roundtrip() {
   }
 }
 
+/* --trust-sender defaults to OFF (a receiver-local policy). */
+static void test_config_trust_sender_default_false() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_FALSE(cfg->trust_sender);
+  EXPECT_NULL(cfg->remote_options);
+  EXPECT_EQ_INT(cfg->remote_option_count, 0);
+  config_delete(cfg);
+}
+
+/* --trust-sender and --remote-option are LOCAL to the process that sets them:
+ * they must never cross the wire.  After a round-trip the receiver observes the
+ * neutral defaults (trust_sender=false, no remote options), even when the
+ * sender had them set. */
+static void test_config_local_only_fields_not_serialized() {
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL && !recv->trust_sender && recv->remote_options == NULL &&
+              recv->remote_option_count == 0;
+    config_delete(recv);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  }
+
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->trust_sender = true;
+  /* remote_options is client-side state; populate it like the CLI would. */
+  send_cfg->remote_options = malloc(sizeof(char*));
+  send_cfg->remote_options[0] = str_dup("--allow-delete");
+  send_cfg->remote_option_count = 1;
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  bool sent = config_send(p[1], send_cfg);
+  int status;
+  waitpid(pid, &status, 0);
+  close(p[1]);
+  config_delete(send_cfg);
+
+  EXPECT_TRUE(sent);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
   test_config_ssh_dest_local_path();
   test_config_ssh_dest_no_user();
+  test_config_trust_sender_default_false();
   test_pipeline_sender_lifecycle();
   test_pipeline_receiver_lifecycle();
   if (!is_running_under_valgrind()) {
     test_config_send_receive();
+    test_config_local_only_fields_not_serialized();
     test_config_send_receive_version_mismatch();
     test_config_receive_truncated();
     test_config_string_null_vs_empty_roundtrip();

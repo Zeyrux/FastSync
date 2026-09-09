@@ -595,8 +595,12 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
        could escape the receive root (absolute, or relative-with-"..") is never
        materialized.  It is contained (the entry is skipped) rather than failing
        the whole transfer, so a hostile sender can inject a broken symlink but
-       can never redirect it outside the root. */
-    if (ok && !file_symlink_target_contained(target))
+       can never redirect it outside the root.  --trust-sender deliberately
+       relaxes this receiver-side re-validation: a trusted sender's escaping
+       symlink target is copied verbatim (rsync -l parity).  The low-level
+       leaf/destination confinement in file_symlink_at_secure still ensures the
+       link itself is placed inside the authorized root. */
+    if (ok && !file_get_trust_sender() && !file_symlink_target_contained(target))
       ok = false;
     if (!ok) {
       /* Skip the escaping/empty target (contained) rather than abort. */
@@ -2076,7 +2080,7 @@ File* file_receive(const Config* config, int file_descriptor) {
   char* path = receive_str(file_descriptor);
   if (path == NULL)
     return NULL;
-  if (path[0] == '\0' || has_path_traversal(path)) {
+  if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "Invalid received file path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");
@@ -2136,7 +2140,7 @@ File* file_receive_directory(int file_descriptor) {
   char* path = receive_str(file_descriptor);
   if (path == NULL)
     return NULL;
-  if (path[0] == '\0' || has_path_traversal(path)) {
+  if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "Invalid received directory path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");
@@ -2163,7 +2167,7 @@ File* file_receive_hardlink(int file_descriptor) {
   char* path = receive_str(file_descriptor);
   if (path == NULL)
     return NULL;
-  if (path[0] == '\0' || has_path_traversal(path)) {
+  if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "Invalid received hard-link path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");
@@ -2182,7 +2186,7 @@ File* file_receive_hardlink(int file_descriptor) {
     free(path);
     return NULL;
   }
-  if (target[0] == '\0' || has_path_traversal(target)) {
+  if (target[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(target))) {
     char* escaped = output_escape(target, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "Invalid hard-link target path: %s",
                 escaped ? escaped : "<allocation failed>");
@@ -2213,7 +2217,7 @@ File* file_receive_symlink(int file_descriptor, const Config* config) {
   char* path = receive_str(file_descriptor);
   if (path == NULL)
     return NULL;
-  if (path[0] == '\0' || has_path_traversal(path)) {
+  if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "Invalid received symlink path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");
@@ -2268,7 +2272,7 @@ File* file_receive_special(int file_descriptor) {
   char* path = receive_str(file_descriptor);
   if (path == NULL)
     return NULL;
-  if (path[0] == '\0' || has_path_traversal(path)) {
+  if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "Invalid received special path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");

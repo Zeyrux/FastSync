@@ -2480,6 +2480,109 @@ static void test_parse_args_devices_specials() {
   config_delete(cfg);
 }
 
+/* --trust-sender parses; default is false (receiver-local policy, off). */
+static void test_parse_args_trust_sender_default_false() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->trust_sender);
+  config_delete(cfg);
+}
+
+static void test_parse_args_trust_sender() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--trust-sender", "--source-dir", "/src", "--dest-dir", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->trust_sender);
+  config_delete(cfg);
+}
+
+/* --remote-option=OPT is repeatable and stores each value in order. */
+static void test_parse_args_remote_option_multiple() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_EQ_INT(cfg->remote_option_count, 0);
+  char* argv[] = {"fastsync",
+                  "--source-dir",
+                  "/src",
+                  "--dest-dir",
+                  "/dst",
+                  "--remote-option=--allow-delete",
+                  "--remote-option=--verbose"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->remote_option_count, 2);
+  EXPECT_EQ_STR(cfg->remote_options[0], "--allow-delete");
+  EXPECT_EQ_STR(cfg->remote_options[1], "--verbose");
+  config_delete(cfg);
+}
+
+/* Space-separated form "--remote-option OPT" also parses. */
+static void test_parse_args_remote_option_space_form() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--source-dir",    "/src", "--dest-dir",
+                  "/dst",     "--remote-option", "-v"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->remote_option_count, 1);
+  EXPECT_EQ_STR(cfg->remote_options[0], "-v");
+  config_delete(cfg);
+}
+
+/* A missing argument bare --remote-option is rejected. */
+static void test_parse_args_remote_option_missing_value() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst", "--remote-option"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
+/* An empty --remote-option value and a value with control characters is
+ * rejected (the value would break the remote shell quoting). */
+static void test_parse_args_remote_option_rejects_bad_values() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst", "--remote-option="};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->remote_option_count, 0);
+
+  char* argv2[] = {"fastsync", "--source-dir",    "/src",         "--dest-dir",
+                   "/dst",     "--remote-option", "--bad\noption"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv2, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->remote_option_count, 0);
+  config_delete(cfg);
+}
+
+/* A short -M form must NOT be accepted as --remote-option: -M stays FastSync
+ * metadata mode (documented divergence). */
+static void test_parse_args_remote_option_no_short_M() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  /* -M followed by a remote-option-looking word still means metadata mode. */
+  char* argv[] = {"fastsync", "-M", "-v", "--source-dir", "/src", "--dest-dir", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_EQ_INT(cfg->remote_option_count, 0);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -2608,4 +2711,11 @@ void test_client_cli() {
   test_parse_args_delete_policy_invalid_values();
   test_parse_args_max_delete_inert_without_delete();
   test_parse_args_missing_args_flags();
+  test_parse_args_trust_sender_default_false();
+  test_parse_args_trust_sender();
+  test_parse_args_remote_option_multiple();
+  test_parse_args_remote_option_space_form();
+  test_parse_args_remote_option_missing_value();
+  test_parse_args_remote_option_rejects_bad_values();
+  test_parse_args_remote_option_no_short_M();
 }

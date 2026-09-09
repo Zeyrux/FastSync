@@ -3,6 +3,7 @@
 #include "chunk.h"
 #include "config.h"
 #include "delay_updates.h"
+#include "file.h"
 #include "file_receive.h"
 #include "log.h"
 #include "metadata.h"
@@ -92,7 +93,11 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
       send_status(file_descriptor, STATUS_ERROR);
       return false;
     }
-    if (!utils_valid_batch_path(check_path)) {
+    /* --trust-sender: accept a ``..``/absolute check path (a trusted sender's
+         odd-but-legit entry) and defer containment to the secure stat below;
+         an empty path is still always rejected. */
+    if (check_path[0] == '\0' ||
+        (!file_get_trust_sender() && !utils_valid_batch_path(check_path))) {
       free(check_path);
       send_status(file_descriptor, STATUS_ERROR);
       return false;

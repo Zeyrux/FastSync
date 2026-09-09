@@ -230,6 +230,14 @@ typedef struct Config {
   char* rsync_path;
   bool old_args;
   char* temp_dir;
+  /* --remote-option=OPT (Phase 5, long form only): one or more extra command-line
+   * options to append to the REMOTE server invocation over SSH.  CLIENT-ONLY:
+   * they are composed into the remote command line by ssh_build_remote_command()
+   * (each valid word is shell-escaped with the same quoting boundary as the
+   * server path), and are NEVER serialized into the binary config frame.  They
+   * do NOT cross the wire and are never parsed on the receiver process. */
+  char** remote_options;
+  int remote_option_count;
   /* Alternate basis directories, ordered by command-line appearance.  Each
    * entry's type selects compare/copy/link behavior on an exact match.  These
    * cross the wire so the receiver can consult them; they are interpreted
@@ -350,9 +358,44 @@ typedef struct Config {
    * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
    * so a later privileged restore could re-apply them.  Crosses the wire. */
   bool fake_super;
+
+  // Phase 5: --trust-sender
+  /* Long-form-only, receiver-local policy.  rsync's --trust-sender tells the
+   * receiving side to trust that the sender already produced a sane file list,
+   * relaxing the receiver's own up-front re-validation of every incoming path.
+   * In FastSync the receiver normally double-checks each transmitted file-list
+   * entry (empty / ".." path-traversal rejection) and refuses to materialize a
+   * symlink whose target could escape the receive root.  When trust_sender is
+   * set, those redundant list-level re-checks are SKIPPED: the receiving side
+   * trusts the sender's list instead of re-validating it (fewer checks, faster,
+   * potentially unsafe, matching rsync).  It is a LOCAL receiver policy and is
+   * NEVER serialized into the config frame (it exists only on the process that
+   * actually receives the file list).  Even under trust_sender the low-level
+   * fd-relative confinement primitives (file_open_secure_parent, the O_NOFOLLOW
+   * parent walk, leaf/destination confinement) are deliberately KEPT as a hard
+   * floor, so a hostile sender still cannot write or link outside the
+   * authorized root (see the phase-5 notes in RSYNC_COMPAT.md).  Off by
+   * default; only relaxes validation when explicitly requested. */
+  bool trust_sender;
 } Config;
 
-#define PROTOCOL_VERSION "2.13.0"
+/* Phase 5 (remote-option wave): 2.13.0 -> 2.14.0.
+ *
+ * WHY the bump, grounded in the wire: the binary config-frame layout is
+ * UNCHANGED by this wave (neither --remote-option nor --trust-sender adds a
+ * serialized field; see the field comments above).  --remote-option is
+ * forwarded to the remote server over the SSH remote-command line
+ * (ssh_build_remote_command) and --trust-sender is a purely local receiver
+ * policy, so there is no new frame byte to negotiate.  The bump is still the
+ * correct release marker for Phase 5 because the client-to-server INVOCATION
+ * surface changed: a client that composes remote-options expects a server that
+ * knows how to honor them, and the only safe way to express "this feature set
+ * is one coordinated release" is the strict same-version handshake FastSync
+ * already performs for every release.  A 2.14 client against a 2.13 server
+ * fails the version check cleanly up front (rather than the remote server
+ * rejecting an unfamiliar forwarded argv at a confusing later point), which is
+ * exactly what the lockstep convention of this project requires. */
+#define PROTOCOL_VERSION "2.14.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

@@ -220,6 +220,12 @@ void handler(int file_descriptor) {
      fd-walk reads a stable value during the whole transfer (and never bleeds
      across the per-connection forked processes). */
   file_set_keep_dirlinks(config->keep_dirlinks);
+  /* --trust-sender is a LOCAL receiver policy: it never crosses the wire (so a
+     wire peer can never enable it), the receiving process applies it here from
+     its own config.  Set before any multithreaded receiver/writer threads are
+     spawned so the fd-walk reads a stable value during the whole transfer, and
+     never bleeds across the per-connection forked processes.  Off by default. */
+  file_set_trust_sender(config->trust_sender);
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {

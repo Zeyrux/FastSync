@@ -157,6 +157,40 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
   return 0;
 }
 
+/* Forward decl: config_add_pattern is defined below, but the --remote-option
+ * helper above needs it. */
+static int config_add_pattern(char*** patterns, int* count, const char* value, const char* optname);
+
+/* Validate and append one --remote-option=OPT value.  OPT is forwarded to the
+ * remote server invocation (over SSH) by appending it to the remote command
+ * line, so it must be a single safe shell word: it must be non-empty and must
+ * contain no control characters that could break the single-quoted command
+ * word ssh_build_remote_command wraps it in (newline/CR and other ASCII
+ * control chars are rejected up front).  Ordinary shell metacharacters
+ * (; & | ` $ () etc.) need not be rejected because they are neutralized by the
+ * single-quoting boundary, but rejecting control characters keeps the
+ * quoting scheme airtight regardless of the remote shell.  Returns 0 on
+ * success, -1 on a rejected value. */
+static int config_add_remote_option(Config* config, const char* value, const char* optname) {
+  if (!value || value[0] == '\0') {
+    log_message(LOG_LEVEL_ERROR, "%s requires a non-empty option value", optname);
+    return -1;
+  }
+  for (const unsigned char* p = (const unsigned char*)value; *p; p++) {
+    if (*p < 0x20 || *p == 0x7f) {
+      log_message(LOG_LEVEL_ERROR,
+                  "%s value contains a control character that could break the remote shell "
+                  "quoting; rejecting",
+                  optname);
+      return -1;
+    }
+  }
+  if (config_add_pattern(&config->remote_options, &config->remote_option_count, value, optname) !=
+      0)
+    return -1;
+  return 0;
+}
+
 /* Validate and append one --compare-dest/--copy-dest/--link-dest directory.
  * The path is interpreted on the receiver relative to the destination root,
  * so it must be a non-empty relative path with no "." / ".." components (an
@@ -551,6 +585,11 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--xattrs", "-X", OPT_FLAG, offsetof(Config, preserve_xattrs)},
     {"--acls", "-A", OPT_FLAG, offsetof(Config, preserve_acls)},
     {"--fake-super", NULL, OPT_FLAG, offsetof(Config, fake_super)},
+    /* Long-form-only: rsync's -M short form of --remote-option is INTENTIONALLY
+     * unavailable because -M already means metadata mode in FastSync (a
+     * documented divergence; see RSYNC_COMPAT.md).  --trust-sender is a local
+     * receiver policy and never travels to the remote peer. */
+    {"--trust-sender", NULL, OPT_FLAG, offsetof(Config, trust_sender)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -1124,6 +1163,16 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
       }
       if (set_checksum_seed(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--remote-option=", 16) == 0) {
+      if (config_add_remote_option(config, argv[i] + 16, "--remote-option") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--remote-option", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --remote-option");
+        return -1;
+      }
+      if (config_add_remote_option(config, argv[++i], "--remote-option") != 0)
         return -1;
     } else if (strncmp(argv[i], "--compare-dest=", 15) == 0) {
       if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[i] + 15, "--compare-dest") != 0)

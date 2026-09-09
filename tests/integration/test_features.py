@@ -187,6 +187,20 @@ def setup_test_data():
 
 
 class TestDryRun:
+    def test_trust_sender_transfer_completes(self, shared_server):
+        """--trust-sender is a receiver-local policy (never sent to the peer).
+        A transfer run with it must still complete and produce byte-identical
+        results: the receiver keeps its low-level root confinement, so a normal
+        trusted transfer is unchanged."""
+        clean_dir(DEST_DIR)
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--trust-sender"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing files: {missing[:5]}"
+        assert not mismatches, f"Mismatched files: {mismatches[:5]}"
+
     def test_human_readable_dry_run(self):
         result, dur = run_client(SOURCE_DIR, DEST_DIR, flags=["-h", "--dry-run"])
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"

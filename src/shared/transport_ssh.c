@@ -75,52 +75,108 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
   return 0;
 }
 
-char* ssh_build_remote_command(const char* server_path, bool old_args) {
+char* ssh_build_remote_command(const char* server_path, bool old_args, char* const* remote_options,
+                               int remote_option_count) {
   const char* path = server_path ? server_path : "fastsync-server";
   const char* suffix = " --stdio";
+
+  /* Each --remote-option=OPT is appended after " --stdio" as one shell word,
+     escaped with the SAME single-quote boundary used for the server path.  This
+     stays safe even in --old-args mode (which leaves the server path unquoted):
+     remote options are always single-quoted individually, so a value containing
+     shell metacharacters (; & | ` $ ()) can never break out of the quoting to
+     inject an unrelated remote command.  Values are already validated at CLI
+     parse time (non-empty, no control characters); this layer only adds the
+     escaping boundary. */
   size_t path_len = strlen(path);
   size_t suffix_len = strlen(suffix);
 
+  /* The base command (server path, quoted unless --old-args, then " --stdio"). */
+  size_t command_len;
   if (old_args) {
     if (path_len > SIZE_MAX - suffix_len - 1)
       return NULL;
-    char* command = malloc(path_len + suffix_len + 1);
-    if (!command)
+    command_len = path_len + suffix_len + 1;
+  } else {
+    size_t quote_count = 0;
+    for (const char* p = path; *p; p++)
+      if (*p == '\'')
+        quote_count++;
+    if (path_len > SIZE_MAX - suffix_len - 4 ||
+        quote_count > (SIZE_MAX - path_len - suffix_len - 4) / 4)
       return NULL;
-    memcpy(command, path, path_len);
-    memcpy(command + path_len, suffix, suffix_len + 1);
-    return command;
+    command_len = path_len + quote_count * 4 + suffix_len + 4;
   }
 
-  /* Quote the executable as one remote-shell word. This is the default safety boundary. */
-  size_t quote_count = 0;
-  for (const char* p = path; *p; p++)
-    if (*p == '\'')
-      quote_count++;
-  if (path_len > SIZE_MAX - suffix_len - 4 ||
-      quote_count > (SIZE_MAX - path_len - suffix_len - 4) / 4)
-    return NULL;
-  size_t command_len = path_len + quote_count * 4 + suffix_len + 4;
-  char* command = malloc(command_len + 1);
+  /* Add each remote option, escaped as one single-quoted word:
+     " '<body>'", i.e. 1 leading space + 1 open quote + body (len + 3 per
+     embedded single quote) + 1 close quote = len + q*3 + 3 bytes.
+     Defense-in-depth against a non-conforming caller: never forward an empty
+     or control-character value, independent of the CLI validation. */
+  for (int i = 0; i < remote_option_count; i++) {
+    const char* opt = remote_options[i];
+    if (!opt || opt[0] == '\0')
+      return NULL;
+    size_t len = 0, q = 0;
+    for (const char* p = opt; *p; p++) {
+      /* Defense-in-depth: never forward a control character (newline/CR/etc.)
+         that could break the single-quoted shell word regardless of the remote
+         shell, independent of the CLI validation. */
+      if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f)
+        return NULL;
+      if (*p == '\'')
+        q++;
+      len++;
+    }
+    if (len > SIZE_MAX - q * 3 || len + q * 3 + 3 > SIZE_MAX - command_len)
+      return NULL;
+    command_len += len + q * 3 + 3;
+  }
+  command_len += 1; /* NUL */
+
+  char* command = malloc(command_len);
   if (!command)
     return NULL;
   char* out = command;
-  *out++ = '\'';
-  for (const char* p = path; *p; p++) {
-    if (*p == '\'') {
-      memcpy(out, "'\\''", 4);
-      out += 4;
-    } else {
-      *out++ = *p;
+  if (old_args) {
+    memcpy(out, path, path_len);
+    out += path_len;
+    memcpy(out, suffix, suffix_len + 1);
+    out += suffix_len;
+  } else {
+    *out++ = '\'';
+    for (const char* p = path; *p; p++) {
+      if (*p == '\'') {
+        memcpy(out, "'\\''", 4);
+        out += 4;
+      } else {
+        *out++ = *p;
+      }
     }
+    *out++ = '\'';
+    memcpy(out, suffix, suffix_len + 1);
+    out += suffix_len;
   }
-  *out++ = '\'';
-  memcpy(out, suffix, suffix_len + 1);
+  for (int i = 0; i < remote_option_count; i++) {
+    const char* opt = remote_options[i];
+    *out++ = ' ';
+    *out++ = '\'';
+    for (const char* p = opt; *p; p++) {
+      if (*p == '\'') {
+        memcpy(out, "'\\''", 4);
+        out += 4;
+      } else {
+        *out++ = *p;
+      }
+    }
+    *out++ = '\'';
+  }
+  *out = '\0';
   return command;
 }
 
 Client* client_connect_ssh(const char* destination, int port, const char* server_path,
-                           bool old_args) {
+                           bool old_args, char* const* remote_options, int remote_option_count) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     char* escaped = output_escape(destination, false);
@@ -190,7 +246,8 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
     char* ssh_argv[16];
     int ac = 0;
     char port_str[16];
-    char* remote_command = ssh_build_remote_command(server_path, old_args);
+    char* remote_command =
+        ssh_build_remote_command(server_path, old_args, remote_options, remote_option_count);
     if (!remote_command)
       ssh_child_setup_failed(exec_pipe[1]);
     ssh_argv[ac++] = "ssh";
