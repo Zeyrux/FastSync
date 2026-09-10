@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 typedef enum { TRANSPORT_TCP, TRANSPORT_SSH } TransportType;
 
@@ -446,6 +447,18 @@ typedef struct Config {
    * authorized root (see the phase-5 notes in RSYNC_COMPAT.md).  Off by
    * default; only relaxes validation when explicitly requested. */
   bool trust_sender;
+
+  // Phase 6: --stop-after / --stop-at
+  /* Client-only sender-side transfer stop deadlines.  --stop-after=MINS stops
+   * the transfer after a number of elapsed minutes (checked against
+   * CLOCK_MONOTONIC so clock changes do not skew it); --stop-at=TIME stops at
+   * an absolute wall-clock time (HH:MM, HH:MM:SS, or now+N[smhd]).  At the
+   * deadline the run stops elegantly at the next chunk/file boundary and the
+   * completion tail still runs (exit 0).  Both are LOCAL to the sending
+   * process and are NEVER serialized into the config frame. */
+  int stop_after_mins; /* --stop-after=MINS minutes; 0 when unset */
+  time_t stop_at;      /* --stop-at=... absolute wall-clock deadline */
+  bool stop_at_set;    /* true when --stop-at was given */
 } Config;
 
 /* Phase 5 (remote-option wave): 2.13.0 -> 2.14.0.

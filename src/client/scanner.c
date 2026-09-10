@@ -487,6 +487,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->relative_mode = options->relative && options->file_list != NULL;
   scanner->hardlinks = options->hardlinks;
   scanner->prune_empty_dirs = options->prune_empty_dirs;
+  scanner->stop_condition = options->stop_condition;
   scanner->dirs_root_emitted = false;
   scanner->list_index = 0;
   scanner->dirs_batch = NULL;
@@ -843,6 +844,12 @@ static Chunk* dirs_flush_batch(DirectoryScanner* scanner) {
 
 static Chunk* directory_scanner_next_dirs(DirectoryScanner* scanner) {
   while (scanner->dirs_batch == NULL || scanner->dirs_batch_size <= scanner->chunk_size) {
+    if (scanner->stop_condition && stop_condition_reached(scanner->stop_condition)) {
+      Chunk* leftover = dirs_flush_batch(scanner);
+      if (leftover)
+        chunk_destroy(leftover);
+      return NULL;
+    }
     if (!scanner->dirs_batch) {
       scanner->dirs_batch = array_list_create(file_destroy);
       if (!scanner->dirs_batch) {
@@ -886,6 +893,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
   unsigned long long chunk_data_size = 0;
 
   while (1) {
+    if (scanner->stop_condition && stop_condition_reached(scanner->stop_condition)) {
+      array_list_delete(chunk_data);
+      return NULL;
+    }
     if (scanner->current_dir == NULL) {
       int ret = open_next_directory(scanner);
       if (ret == 0)

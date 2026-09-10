@@ -10,6 +10,7 @@
 #include "protocol.h"
 #include "queue.h"
 #include "receiver.h"
+#include "stop_condition.h"
 #include <openssl/ssl.h>
 
 typedef struct {
@@ -56,6 +57,9 @@ typedef struct {
   bool sender_done;
   atomic_bool cancelled;
   ProtocolSession allocation_session;
+  /* Phase 6: client-only sender stop deadline, computed once before the worker
+   * threads start and shared read-only by the scanner and the sender thread. */
+  StopCondition stop_condition;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {

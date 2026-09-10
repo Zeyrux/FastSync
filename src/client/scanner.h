@@ -7,6 +7,7 @@
 #include "hardlink.h"
 #include "protocol.h"
 #include "queue.h"
+#include "stop_condition.h"
 #include <dirent.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -92,6 +93,11 @@ typedef struct {
    * read-only here; the parallel scanner passes it unchanged to every worker so
    * one table detects every group across all subdirectories. */
   HardLinkTable* hardlinks;
+  /* Phase 6: optional sender stop deadline.  When non-NULL the scanner checks
+   * it at natural loop boundaries and stops emitting chunks once reached
+   * (without marking the scan as failed), so a busy scan itself stops early.
+   * Client-only, never serialized to the wire. */
+  const StopCondition* stop_condition;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -165,6 +171,8 @@ typedef struct {
   /* --hard-links (-H): shared link-group detection table (see ScannerOptions).
      NULL when -H is off. */
   HardLinkTable* hardlinks;
+  /* Phase 6: sender stop deadline (from ScannerOptions). */
+  const StopCondition* stop_condition;
 } DirectoryScanner;
 
 typedef struct {

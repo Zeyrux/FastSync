@@ -184,6 +184,11 @@ void print_usage(void) {
   printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
   printf("  -T <sec>            Alias for --timeout\n");
   printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
+  printf("  --stop-after=MINS   Stop the transfer after MINS minutes (a positive\n");
+  printf("                      integer); whatever was already transferred is kept\n");
+  printf("  --stop-at=TIME      Stop at an absolute time: HH:MM, HH:MM:SS, or\n");
+  printf("                      now+N[smhd] (a time already in the past stops the\n");
+  printf("                      transfer immediately; client-only)\n");
   printf("  --address <ip>      Bind the outgoing client socket to this source address\n");
   printf("  -4, --ipv4          Force IPv4 for destination resolution\n");
   printf("  -6, --ipv6          Force IPv6 for destination resolution\n");

@@ -11,12 +11,14 @@
 #include "identity.h"
 #include "log.h"
 #include "protocol.h"
+#include "stop_condition.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
 #include "usage.h"
 #include "utils.h"
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -845,6 +847,47 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     if (strncmp(argv[i], "-@", 2) == 0 && argv[i][2] != '\0') {
       if (set_nonneg_int_option(&config->modify_window, argv[i] + 2, "-@") != 0)
         return -1;
+      continue;
+    }
+    /* --stop-after/--stop-at are client-only sender-side stop deadlines.  They
+     * are parsed by stop_condition (so the unit tests exercise the same validate
+     * that production uses) and never serialized into the config frame. */
+    if (strncmp(argv[i], "--stop-after=", 13) == 0) {
+      if (!stop_parse_after_minutes(argv[i] + 13, &config->stop_after_mins)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-after must be a positive number of minutes");
+        return -1;
+      }
+      continue;
+    }
+    if (strcmp(argv[i], "--stop-after") == 0) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --stop-after");
+        return -1;
+      }
+      if (!stop_parse_after_minutes(argv[++i], &config->stop_after_mins)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-after must be a positive number of minutes");
+        return -1;
+      }
+      continue;
+    }
+    if (strncmp(argv[i], "--stop-at=", 10) == 0) {
+      if (!stop_parse_at_time(argv[i] + 10, time(NULL), &config->stop_at)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+        return -1;
+      }
+      config->stop_at_set = true;
+      continue;
+    }
+    if (strcmp(argv[i], "--stop-at") == 0) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --stop-at");
+        return -1;
+      }
+      if (!stop_parse_at_time(argv[++i], time(NULL), &config->stop_at)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+        return -1;
+      }
+      config->stop_at_set = true;
       continue;
     }
     const char* threads_prefix = "--compress-threads=";
