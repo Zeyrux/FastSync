@@ -41,6 +41,9 @@ void print_usage(void) {
   printf("                      converted before transmission and back on receipt; a\n");
   printf("                      name that cannot be represented in the target charset\n");
   printf("                      fails that transfer cleanly (rsync-compatible)\n");
+  printf("  --protocol=NUM       Force the wire protocol version (must equal the current\n");
+  printf("                       PROTOCOL_VERSION; FastSync cannot speak older/virtual\n");
+  printf("                       wire formats)\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("                      (default timing: delete only after the whole\n");
   printf("                      transfer has succeeded)\n");

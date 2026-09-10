@@ -210,6 +210,67 @@ static void test_parse_args_version() {
   config_delete(cfg);
 }
 
+/* --protocol=NUM forces the wire protocol version: the current PROTOCOL_VERSION
+ * is accepted (stored into config->version, which the config frame transmits),
+ * and any other value is rejected.  Client-only: no server-side flag exists. */
+static void test_parse_args_protocol_accept_current() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
+                         "--dest-dir", "/dst",         "--protocol=2.16.0"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
+                        "/dst",     "--protocol",   "2.16.0"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
+  config_delete(cfg);
+}
+
+/* Any --protocol value other than the current PROTOCOL_VERSION must end in
+ * failure (parse_args simply stores it; validate_config rejects it up front). */
+static void test_parse_args_protocol_rejects_other_versions() {
+  static const char* const bad_versions[] = {"2.16", "2.15.0", "2.17.0", "216", "31", "abc", ""};
+  for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
+    Config* cfg = valid_client_config();
+    EXPECT_NOT_NULL(cfg);
+    char arg[64];
+    snprintf(arg, sizeof(arg), "--protocol=%s", bad_versions[i]);
+    char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst", arg};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(strcmp(cfg->version, PROTOCOL_VERSION) != 0);
+    EXPECT_FALSE(validate_config(cfg));
+    config_delete(cfg);
+  }
+}
+
+/* validate_config accepts the current PROTOCOL_VERSION (the default) and rejects
+ * a version that does not equal it -- the honest post-parse enforcement. */
+static void test_validate_config_protocol_version() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup("2.15.0");
+  EXPECT_NOT_NULL(cfg->version);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 /* --xattrs/-X and --acls/-A preserve per-file xattrs and both imply metadata
  * transmission (the xattr block rides the metadata/per-file frame); each is
  * individually negatable and the derived use_xattrs follows the flags. */
@@ -1794,7 +1855,8 @@ static void test_parse_args_table_equals_string_and_int_options() {
  * generic "Unknown option", when they are the final argv entry. */
 static void test_parse_args_missing_argument_diagnostic() {
   static const char* const options[] = {"--exclude", "--server-port", "--skip-compress",
-                                        "-T",        "--out-format",  "--log-file-format"};
+                                        "-T",        "--out-format",  "--log-file-format",
+                                        "--protocol"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
@@ -2850,6 +2912,9 @@ void test_client_cli() {
   test_cli_exclude_patterns();
   test_parse_args_help();
   test_parse_args_version();
+  test_parse_args_protocol_accept_current();
+  test_parse_args_protocol_rejects_other_versions();
+  test_validate_config_protocol_version();
   test_parse_args_valid_port();
   test_parse_args_size_only();
   test_parse_args_ignore_existing();

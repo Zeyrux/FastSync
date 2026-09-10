@@ -3,6 +3,7 @@
 #include "delay_updates.h"
 #include "log.h"
 #include "usage.h"
+#include <string.h>
 #include <stdio.h>
 
 /* Validate config after parsing. Returns true if valid. */
@@ -130,6 +131,16 @@ bool validate_config(const Config* config) {
   if (!charset_spec_valid(config->iconv_spec)) {
     log_message(LOG_LEVEL_ERROR,
                 "--iconv requires LOCAL[,REMOTE] charset names supported by iconv");
+    return false;
+  }
+  /* --protocol: FastSync has exactly one wire format, so the forced version
+     must equal the current PROTOCOL_VERSION exactly.  Rejected here, before any
+     network I/O, rather than letting the server hit its own mismatch check. */
+  if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--protocol must be %s (FastSync supports only its current wire "
+                "protocol version and cannot speak an older or virtual one)",
+                PROTOCOL_VERSION);
     return false;
   }
   return true;
