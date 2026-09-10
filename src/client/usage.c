@@ -188,7 +188,9 @@ void print_usage(void) {
   printf("                      integer); whatever was already transferred is kept\n");
   printf("  --stop-at=TIME      Stop at an absolute time: HH:MM, HH:MM:SS, or\n");
   printf("                      now+N[smhd] (a time already in the past stops the\n");
-  printf("                      transfer immediately; client-only)\n");
+  printf("                      transfer immediately; client-only).  An early stop\n");
+  printf("                      skips the late --delete keep-set so it cannot delete\n");
+  printf("                      source mirrors that were not yet scanned\n");
   printf("  --address <ip>      Bind the outgoing client socket to this source address\n");
   printf("  -4, --ipv4          Force IPv4 for destination resolution\n");
   printf("  -6, --ipv6          Force IPv6 for destination resolution\n");

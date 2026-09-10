@@ -7,6 +7,7 @@ elegantly at the next chunk/file boundary -- whatever was already transferred is
 kept, the completion tail still runs, and the exit code is 0 (like rsync's
 clean "stopped early" behavior).  Malformed values are rejected up front.
 """
+import filecmp
 import os
 import shutil
 import time
@@ -58,6 +59,32 @@ def _seed_source(source):
             fh.write(content)
 
 
+def _seed_many(source, count=40, size=32 * 1024):
+    """Create `count` same-size regular files (enough to span several chunks)."""
+    blob = os.urandom(size)
+    for i in range(count):
+        with open(os.path.join(source, f"f{i:04d}.dat"), "wb") as fh:
+            fh.write(blob)
+
+
+def _seed_dest_by_transfer(source, dest, port, extra=None):
+    """Do a plain full transfer source->dest so dest exactly mirrors source."""
+    run_client(source, dest, flags=(extra or []), port=port)
+
+
+def _received_subset_matches(source, received):
+    """Every file under `received` exists under `source` with identical bytes."""
+    if not os.path.isdir(received):
+        return not _received_files(received)
+    rels = _received_files(received)
+    for rel in rels:
+        src = os.path.join(source, rel)
+        dst = os.path.join(received, rel)
+        if not os.path.isfile(src) or not filecmp.cmp(src, dst, shallow=False):
+            return False
+    return True
+
+
 class TestStopAfter:
     @pytest.mark.ci
     def test_stop_after_within_window(self, shared_server):
@@ -91,12 +118,15 @@ class TestStopAt:
         cleanly (exit 0, nothing transferred)."""
         source, dest = _make("past")
         _seed_source(source)
-        now = time.localtime()
-        if now.tm_hour * 60 + now.tm_min >= 1:
+        # Use a same-day HH:MM two minutes in the past when that cannot roll
+        # over into the previous day (which would parse as a FUTURE time today);
+        # otherwise fall back to now+0s which is deterministically immediate.
+        lt = time.localtime()
+        if lt.tm_hour * 60 + lt.tm_min >= 3:
             past = time.localtime(time.time() - 120)
             stop_value = f"{past.tm_hour:02d}:{past.tm_min:02d}"
         else:
-            stop_value = "now+0s"  # first minute of the day: use "immediately now"
+            stop_value = "now+0s"
         result, _ = run_client(source, dest, flags=[f"--stop-at={stop_value}"],
                                port=shared_server.port)
         assert result.returncode == 0, \
@@ -130,3 +160,82 @@ class TestStopAt:
             result, _ = run_client(source, dest, flags=[flag],
                                    port=shared_server.port)
             assert result.returncode != 0, f"{flag} should be rejected"
+
+
+class TestStopPartial:
+    """A genuine mid-transfer stop leaves a valid, strict non-empty prefix."""
+
+    @pytest.mark.ci
+    def test_stop_mid_transfer_leaves_valid_partial(self, shared_server):
+        """With --bwlimit a real deadline cuts the transfer mid-way: what WAS
+        transferred is byte-identical, not everything is transferred, and the
+        run returns 0 without corrupting any file."""
+        source, dest = _make("partial")
+        _seed_many(source, count=60, size=32 * 1024)
+        flags = ["--chunk-size", "262144", "--bwlimit", "300", "--stop-at=now+3s"]
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"mid-transfer stop failed (rc {result.returncode}): " \
+            f"{(result.stderr or result.stdout)[:400]}"
+        received = get_dest_received_dir(dest, source)
+        got = _received_files(received)
+        assert len(got) > 0, "expected an early stop to still transfer a prefix"
+        assert len(got) < 60, \
+            f"expected a PARTIAL transfer (all 60 arrived): stopped too late"
+        assert _received_subset_matches(source, received), \
+            f"received files are not a byte-identical subset of the source"
+
+
+class TestStopDelete:
+    """--delete must never wipe the destination when the scan is cut short."""
+
+    def _seed(self, prefix, port, many=False):
+        source, dest = _make(prefix)
+        if many:
+            _seed_many(source, count=40, size=96 * 1024)
+        else:
+            _seed_source(source)
+        _seed_dest_by_transfer(source, dest, port)
+        return source, dest
+
+    @pytest.mark.ci
+    def test_stop_delete_immediate_preserves_source_mirrors(self, shared_server):
+        """Immediate stop + --delete: the incomplete/empty keep-set must NOT
+        delete the seeded source mirrors (returncode 0, files survive)."""
+        source, dest = self._seed("del_imm", shared_server.port)
+        result, _ = run_client(source, dest, flags=["--delete", "--stop-at=now+0s"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--delete immediate stop failed: {(result.stderr or result.stdout)[:400]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not mismatches and not missing, \
+            f"--delete wiped source mirrors: missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_stop_delete_midscan_preserves_source_mirrors(self, shared_server):
+        """A mid-scan stop + --delete must suppress the partial keep-set so all
+        seeded source mirrors survive."""
+        source, dest = self._seed("del_mid", shared_server.port, many=True)
+        flags = ["--delete", "--chunk-size", "262144", "--bwlimit", "300", "--stop-at=now+3s"]
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--delete mid-scan stop failed: {(result.stderr or result.stdout)[:400]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not mismatches and not missing, \
+            f"--delete mid-scan wiped source mirrors: missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_stop_delete_multithreaded_preserves_source_mirrors(self, shared_server):
+        """-m immediate stop + --delete: the completion tail must not read the
+        still-appendable manifest (no race) and must not delete the mirrors."""
+        source, dest = self._seed("del_mt", shared_server.port, many=True)
+        result, _ = run_client(source, dest, flags=["-m", "--delete", "--stop-at=now+0s"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-m --delete immediate stop failed: {(result.stderr or result.stdout)[:400]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not mismatches and not missing, \
+            f"-m --delete wiped source mirrors: missing={missing} mismatches={mismatches}"

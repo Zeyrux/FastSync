@@ -60,6 +60,13 @@ typedef struct {
   /* Phase 6: client-only sender stop deadline, computed once before the worker
    * threads start and shared read-only by the scanner and the sender thread. */
   StopCondition stop_condition;
+  /* Phase 6: set when the scanner/sender reached the stop deadline before the
+   * scan (and thus the keep-set manifest) completed naturally.  When true the
+   * completion tail must NOT transmit the partial manifest, or the receiver
+   * would delete unscanned source mirrors.  Written by the sender thread
+   * before it reads the manifest, so no additional synchronization is needed
+   * to suppress the manifest. */
+  bool scan_stopped_early;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {

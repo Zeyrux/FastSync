@@ -24,7 +24,9 @@ static void test_stop_after_parse_invalid() {
   EXPECT_FALSE(stop_parse_after_minutes("", &minutes));
   EXPECT_FALSE(stop_parse_after_minutes("5x", &minutes));
   EXPECT_FALSE(stop_parse_after_minutes("1.5", &minutes));
+  EXPECT_FALSE(stop_parse_after_minutes(" 5", &minutes));
   EXPECT_FALSE(stop_parse_after_minutes(" 5 ", &minutes));
+  EXPECT_FALSE(stop_parse_after_minutes("+5", &minutes));
   EXPECT_FALSE(stop_parse_after_minutes("2147483648", &minutes));
   EXPECT_FALSE(stop_parse_after_minutes(NULL, &minutes));
 }
@@ -87,6 +89,12 @@ static void test_stop_at_parse_invalid() {
   EXPECT_FALSE(stop_parse_at_time("now+5x", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("now-5m", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("now+1w", now, &deadline));
+  EXPECT_FALSE(stop_parse_at_time("now+ 5s", now, &deadline));
+  EXPECT_FALSE(stop_parse_at_time("now++5s", now, &deadline));
+  /* Signed overflow of the destination deadline must be rejected, not wrap. */
+  EXPECT_FALSE(stop_parse_at_time("now+9223372036854775807s", now, &deadline));
+  /* 10^15 days is well beyond LONG_MAX/86400, so the amount itself is rejected. */
+  EXPECT_FALSE(stop_parse_at_time("now+1000000000000000d", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("abc", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time(NULL, now, &deadline));
@@ -112,6 +120,12 @@ static void test_stop_deadline_latency() {
   EXPECT_FALSE(no_after.has_monotonic);
   EXPECT_FALSE(no_after.has_wall);
   EXPECT_FALSE(stop_condition_reached(&no_after));
+
+  /* An invalid (non-positive) after_minutes never arms the monotonic half. */
+  StopCondition zero_after = stop_condition_make(true, 0, false, 0, now);
+  EXPECT_FALSE(zero_after.has_monotonic);
+  StopCondition neg_after = stop_condition_make(true, -5, false, 0, now);
+  EXPECT_FALSE(neg_after.has_monotonic);
 
   /* --stop-at: a wall-clock deadline in the past/now is reached; one in the
      future is not, and it stays independent of the monotonic half. */

@@ -4,16 +4,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Parse a strictly positive decimal integer.  Accepts leading '+' but not a
- * leading '-', surrounding whitespace, fractional parts or trailing garbage. */
+/* Parse a strictly positive decimal integer: only ASCII digits, no leading
+ * whitespace, sign or trailing garbage. */
 static bool parse_positive_minutes(const char* value, long* out) {
   if (!value || *value == '\0')
     return false;
-  errno = 0;
-  char* end = NULL;
-  long v = strtol(value, &end, 10);
-  if (errno != 0 || end == value || *end != '\0')
+  if (*value < '0' || *value > '9')
     return false;
+  long v = 0;
+  for (const char* p = value; *p != '\0'; p++) {
+    if (*p < '0' || *p > '9')
+      return false;
+    int digit = *p - '0';
+    if (v > (LONG_MAX - digit) / 10)
+      return false;
+    v = v * 10 + digit;
+  }
   if (v <= 0 || v > INT_MAX)
     return false;
   *out = v;
@@ -45,10 +51,12 @@ bool stop_parse_at_time(const char* value, time_t now, time_t* out_deadline) {
   /* now+N[smhd]: N whole units from the current wall clock. */
   if (strncmp(value, "now+", 4) == 0) {
     const char* p = value + 4;
-    if (*p == '\0')
+    /* The count must be a bare non-negative digit run: reject leading
+       whitespace ('now+ 5s') and a leading sign ('now++5s'). */
+    if (*p < '0' || *p > '9')
       return false;
-    char* end = NULL;
     errno = 0;
+    char* end = NULL;
     long amount = strtol(p, &end, 10);
     if (errno != 0 || end == p || amount < 0)
       return false;
@@ -74,6 +82,11 @@ bool stop_parse_at_time(const char* value, time_t now, time_t* out_deadline) {
     if (amount > LONG_MAX / unit_seconds)
       return false;
     long long delta = (long long)amount * unit_seconds;
+    /* Guard against signed overflow of now + delta. */
+    if ((long long)now > 0 && delta > (long long)LLONG_MAX - (long long)now)
+      return false;
+    if ((long long)now < 0 && delta < (long long)LLONG_MIN - (long long)now)
+      return false;
     *out_deadline = now + (time_t)delta;
     return true;
   }
