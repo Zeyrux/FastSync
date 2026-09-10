@@ -51,6 +51,11 @@ static void test_iconv_spec_valid() {
   EXPECT_FALSE(charset_spec_valid("utf-8,no-such-charset"));
   EXPECT_FALSE(charset_spec_valid(",,,"));
   EXPECT_FALSE(charset_spec_valid("utf-8,"));
+  /* A target charset whose conversion emits embedded NUL bytes would be
+     truncated by the C-string wire helpers; it must be rejected up front. */
+  EXPECT_FALSE(charset_spec_valid("utf-8,utf-16"));
+  EXPECT_FALSE(charset_spec_valid("utf-16"));
+  EXPECT_FALSE(charset_spec_valid("iso-8859-1,utf-16"));
 }
 
 /* --- one-shot conversion ------------------------------------------------ */
@@ -91,6 +96,45 @@ static void test_iconv_unrepresentable_fails() {
   EXPECT_NOT_NULL(conv);
   EXPECT_TRUE(charset_convert(conv, "caf\xc3\xa9", NULL) == NULL);
   charset_conversion_close(conv);
+}
+
+/* A latin1 high-bit byte expands to two UTF-8 bytes.  With exactly 16 high
+ * bytes the output is exactly cap = in_len + 16, so the final iconv call fills
+ * the buffer completely and a naive NUL-terminator write would overflow. */
+static void test_iconv_exact_fill_no_overflow() {
+  char name[64];
+  strcpy(name, "dir/");
+  int n = 4;
+  for (int i = 0; i < 16; i++)
+    name[n++] = (char)(0x80 + i);
+  name[n] = '\0';
+
+  void* conv = charset_conversion_open("iso-8859-1", "utf-8");
+  EXPECT_NOT_NULL(conv);
+  char* out = charset_convert(conv, name, NULL);
+  EXPECT_NOT_NULL(out);
+  EXPECT_EQ_INT((int)strlen(out), n + 16);
+  charset_conversion_close(conv);
+  free(out);
+}
+
+/* Many high-bit bytes force the output buffer past its initial cap, exercising
+ * the E2BIG growth path (input partially consumed/produced before the grow). */
+static void test_iconv_growth_expanding_name() {
+  char name[256];
+  strcpy(name, "dir/");
+  int n = 4;
+  for (int i = 0; i < 80; i++)
+    name[n++] = (char)(0x80 + (i % 0x80));
+  name[n] = '\0';
+
+  void* conv = charset_conversion_open("iso-8859-1", "utf-8");
+  EXPECT_NOT_NULL(conv);
+  char* out = charset_convert(conv, name, NULL);
+  EXPECT_NOT_NULL(out);
+  EXPECT_EQ_INT((int)strlen(out), n + 80);
+  charset_conversion_close(conv);
+  free(out);
 }
 
 /* --- process-wide wire conversion ---------------------------------------- */
@@ -164,6 +208,8 @@ void test_iconv() {
   test_iconv_latin1_to_utf8();
   test_iconv_invalid_sequence_fails();
   test_iconv_unrepresentable_fails();
+  test_iconv_exact_fill_no_overflow();
+  test_iconv_growth_expanding_name();
   test_iconv_wire_sender_converts_local_to_remote();
   test_iconv_wire_receiver_converts_remote_to_local();
   test_iconv_wire_disabled_passthrough();

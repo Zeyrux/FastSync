@@ -22,15 +22,24 @@
 /* Parse CONVERT_SPEC into malloc'd LOCAL and REMOTE charset names (caller
  * frees both).  REMOTE is a separate copy of LOCAL when no comma is present.
  * Returns 0 on success, -1 on a malformed spec (empty halves / missing value /
- * allocation failure); nothing is allocated on the -1 path. */
+ * allocation failure); nothing is allocated on the -1 path.  Both output
+ * pointers are REQUIRED (non-NULL). */
 int charset_spec_parse(const char* spec, char** local_out, char** remote_out);
 
-/* True when a CONVERT_SPEC is well-formed AND every charset name opens in a
- * probe iconv_open (so a typo'd name is rejected at startup, not mid-run).
- * NULL (iconv disabled) is always valid. */
+/* True when a CONVERT_SPEC is well-formed AND its charsets are usable for this
+ * feature: each pair opens in a probe iconv_open in BOTH directions (a sender
+ * converts local->remote, the receiver converts remote->local) and converting
+ * a representative ASCII name emits no embedded NUL byte (a UTF-16-style NUL
+ * emitter would be silently truncated by the C-string wire helpers).  A typo'd
+ * charset name is therefore rejected at startup, not mid-run.  NULL (iconv
+ * disabled) is always valid. */
 bool charset_spec_valid(const char* spec);
 
-/* Probe a local->remote conversion pair without keeping the descriptor. */
+/* Probe a concrete from->to conversion pair without keeping the descriptor:
+ * both charsets open AND a representative ASCII name converts with no embedded
+ * NUL.  Used for direction-specific validation (e.g. the receiver's exact
+ * wire->local direction including a server-side charset override). */
+bool charset_spec_valid_direction(const char* from_charset, const char* to_charset);
 bool charset_pair_valid(const char* local, const char* remote);
 
 /* One-shot conversion of a NUL-terminated input to a malloc'd NUL-terminated
@@ -55,6 +64,12 @@ bool charset_wire_init_sender(const char* spec);
 bool charset_wire_init_receiver(const char* spec, const char* server_spec);
 void charset_wire_free(void);
 bool charset_wire_active(void);
+
+/* Pre-ack receiver-direction sanity (see charset_wire_init_receiver): true
+ * when the exact wire->server-local conversion the receiver will use (client
+ * spec's REMOTE half into the server's own LOCAL half, or the client's LOCAL
+ * half when the server has no --iconv) opens and produces NUL-free output. */
+bool charset_wire_receiver_spec_valid(const char* spec, const char* server_spec);
 
 /* Convert a path across the wire in the process direction.  Returns a malloc'd
  * string, or NULL when the name cannot be represented in the target charset. */

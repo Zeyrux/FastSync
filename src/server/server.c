@@ -175,6 +175,15 @@ static const char* server_module_gate(const Config* config, void* context) {
   ModuleGateContext* gate_ctx = (ModuleGateContext*)context;
   if (!config)
     return "missing config frame";
+  /* --iconv (protocol 2.16.0): the receiver's exact conversion direction (the
+     client spec's wire charset into this server's local charset, including a
+     server-side --iconv override) must be usable BEFORE the STATUS_OK ack, so
+     an impossible conversion is refused at the handshake instead of failing
+     the first file mid-transfer.  The client spec itself was already sanity
+     checked by validate_received_config. */
+  if (config->iconv_spec &&
+      !charset_wire_receiver_spec_valid(config->iconv_spec, server_iconv_spec))
+    return "client --iconv conversion cannot be honored by this server";
   bool is_daemon = g_daemon_conf != NULL;
   bool has_module = config->module != NULL && config->module[0] != '\0';
 

@@ -137,3 +137,114 @@ def test_iconv_garbage_spec_rejected(shared_server):
 
     result, _ = run_client(source, dest, flags=["--iconv=,,,"], port=shared_server.port)
     assert result.returncode != 0
+
+
+@pytest.mark.ci
+def test_iconv_expanding_name_growth(shared_server):
+    """A long latin1 name whose UTF-8 encoding expands past the initial output
+    buffer exercises the E2BIG growth path in charset_convert (each high-bit
+    latin1 byte doubles in UTF-8), and must land unchanged on the destination."""
+    source, dest = _make("growth")
+    name_bytes = b"a" * 40 + bytes(range(0x80, 0x80 + 40)) + b".txt"
+    _place_bytes(source, name_bytes, data=b"growth\n")
+
+    result, _ = run_client(
+        source, dest, flags=["--iconv=iso-8859-1,utf-8"], port=shared_server.port
+    )
+    assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+
+    assert os.path.exists(_dest_file(source, dest, name_bytes))
+
+
+def test_iconv_symlink_path_and_target(shared_server):
+    """A latin1-named symlink pointing at a latin1-named target survives the
+    transfer: both the link name and the link target are wire-converted and
+    re-decoded on the destination (-l preserves links)."""
+    source, dest = _make("symlink")
+    target = b"target\xe9.dat"
+    _place_bytes(source, target, data=b"t\n")
+    os.symlink(target, os.path.join(os.fsencode(source), b"link\xe9"))
+
+    result, _ = run_client(
+        source, dest, flags=["--iconv=iso-8859-1,utf-8", "--links"], port=shared_server.port
+    )
+    assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+
+    dst_target = _dest_file(source, dest, target)
+    dst_link = _dest_file(source, dest, b"link\xe9")
+    assert os.path.exists(dst_target), "dest latin1 target file missing"
+    assert os.path.islink(dst_link), "dest latin1 symlink missing"
+    assert os.readlink(dst_link) == target, "symlink target not preserved/decoded"
+    with open(dst_link, "rb") as fh:
+        assert fh.read() == b"t\n"
+
+
+def test_iconv_hardlink_path_and_target(shared_server):
+    """A latin1-named hard-linked pair is preserved: -H transmits later group
+    members as a path+target link to the first member, so both the member name
+    and the target wire-convert (the two destination names must stay one
+    inode)."""
+    source, dest = _make("hardlink")
+    a = b"hl_a\xe9.txt"
+    b = b"hl_b\xe9.txt"
+    src_a = os.path.join(os.fsencode(source), a)
+    with open(src_a, "wb") as fh:
+        fh.write(b"shared\n")
+    os.link(src_a, os.path.join(os.fsencode(source), b))
+
+    result, _ = run_client(
+        source, dest, flags=["--iconv=iso-8859-1,utf-8", "--hard-links"],
+        port=shared_server.port,
+    )
+    assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+
+    dst_a = _dest_file(source, dest, a)
+    dst_b = _dest_file(source, dest, b)
+    assert os.path.exists(dst_a) and os.path.exists(dst_b)
+    assert os.stat(dst_a).st_ino == os.stat(dst_b).st_ino, \
+        "hard-link relationship not preserved across the transfer"
+
+
+def test_iconv_delete_manifest_consistent(shared_server):
+    """Combining --iconv with --delete: the delete manifest's keep-set paths are
+    wire-converted on send and disk-converted on receive, so the receiver's
+    delete walker compares like with like and removes exactly the missing
+    latin1-named file (never a wrong-named mirror)."""
+    source, dest = _make("delete")
+    keep = b"keep\xe9.txt"
+    gone = b"gone\xe9.txt"
+    _place_bytes(source, keep, data=b"k\n")
+    _place_bytes(source, gone, data=b"g\n")
+
+    with ServerManager() as server:
+        server.start(extra_args=["--allow-delete"])
+        flags = ["--iconv=iso-8859-1,utf-8"]
+        result, _ = run_client(source, dest, flags=flags, port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+        assert os.path.exists(_dest_file(source, dest, keep))
+        assert os.path.exists(_dest_file(source, dest, gone))
+
+        os.remove(os.path.join(os.fsencode(source), gone))
+        result, _ = run_client(
+            source, dest, flags=flags + ["--delete"], port=server.port
+        )
+        assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+        assert os.path.exists(_dest_file(source, dest, keep)), "kept file deleted"
+        assert not os.path.exists(_dest_file(source, dest, gone)), \
+            "missing file was not deleted"
+
+
+def test_iconv_chunk_serialization_blob(shared_server):
+    """-s (chunk serialization) embeds paths and symlink targets inside the
+    serialized chunk blob rather than as separate frames; a latin1 name must
+    still wire-convert and re-decoded on the destination."""
+    source, dest = _make("chunk")
+    name = b"\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9\xe9.txt"
+    _place_bytes(source, name, data=b"blob\n")
+
+    result, _ = run_client(
+        source, dest, flags=["--iconv=iso-8859-1,utf-8", "-s"], port=shared_server.port
+    )
+    assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+
+    assert os.path.exists(_dest_file(source, dest, name))
