@@ -598,6 +598,12 @@ static const OptionEntry OPTION_TABLE[] = {
      * charsets at startup (client_validation.c) and the full spec rides the
      * config frame so the receiver derives the wire charset symmetrically. */
     {"--iconv", NULL, OPT_STRING, offsetof(Config, iconv_spec)},
+    /* --protocol=NUM: rsync-compatible flag that forces the wire protocol
+     * version to the current value.  FastSync has exactly one wire format, so
+     * any value other than PROTOCOL_VERSION is rejected at validation, before
+     * any network I/O.  Client-only: the server does not negotiate, it just
+     * enforces an exact match. */
+    {"--protocol", NULL, OPT_STRING, offsetof(Config, version)},
     {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
