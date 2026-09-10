@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 121 | Feature works end-to-end |
+| ✅ Implemented | 125 | Feature works end-to-end |
 | 🔀 Alt Arg | 3 | Functionality exists but under different flag/semantics |
 | ⚠️ Partial | 10 | Flag parsed/stored but behavior incomplete |
 | 🔄 Compatibility No-op | 3 | Flag is accepted for CLI compatibility but has no effect |
-| ❌ Not Implemented | 10 | Flag not recognized or no behavior |
+| ❌ Not Implemented | 6 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
 ---
@@ -58,11 +58,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 | `-0`, `--from0` | Delimit *-from files with NULs | ✅ Implemented | `--files-from` entries become NUL-delimited; the flag may appear before or after `--files-from` on the command line. NUL mode preserves entry bytes exactly (trailing CR/LF are part of the name; only newline mode trims them) |
 | `--max-size=SIZE` | Skip files larger than SIZE | ✅ Implemented | `max_size` in scanner |
 | `--min-size=SIZE` | Skip files smaller than SIZE | ✅ Implemented | `min_size` in scanner |
-| `-I`, `--ignore-times` | Don't skip files matching size+time | ❌ Not Implemented | |
+| `-I`, `--ignore-times` | Don't skip files matching size+time | ✅ Implemented | `ignore_times` config field (crosses the wire). Disables the size+mtime quick-check in the `--incremental` per-file handshake and the basis-dir quick-match, forcing the file to be transferred rather than skipped as unchanged. Receiver-side policy: `match_by_metadata` (file_receive.c) is bypassed, so the receiver never replies `STATUS_OK` for a matching size+mtime. Requires `--incremental` to have the handshake to act on (rsync does its quick check by default; FastSync's `-I`/`--size-only`/`--modify-window` only take effect under `--incremental`, exactly like they take effect through the basis check) |
 | `--size-only` | Skip based on size only | ✅ Implemented | With `--incremental`, ignores mtime |
 | `-@`, `--modify-window=NUM` | Mod-time comparison accuracy | ✅ Implemented | Whole-second tolerance with nanosecond-aware comparisons |
 | `--existing` | Skip creating new files on receiver | ✅ Implemented | Existing destination files continue through normal update handling |
-| `--ignore-existing` | Skip updating existing files | ❌ Not Implemented | |
+| `--ignore-existing` | Skip updating existing files | ✅ Implemented | `ignore_existing` config field (crosses the wire; receiver-side policy). For a destination entry that already exists, the receiver skips the write: in the regular-file path, existing/delay-updates-staged, hardlink-sibling, and special/device handlers all return `FILE_SAVE_SKIPPED` without overwriting (passed as `no_replace` to the write engine), and `--backup` is disabled for skipped files. Note: it is applied at write time, so an existing dest whose size+mtime differ still has its data (or delta) transmitted before the write is discarded — functionally correct, bandwidth-suboptimal vs rsync, which short-circuits earlier. Like rsync, it does not apply to directories/symlinks (those return before the block). Combines with `-m` and `--delay-updates`. See Phase-4/— notes below |
 | `--remove-source-files` | Sender removes regular files after confirmed transfer | ✅ Implemented | |
 | `-x`, `--one-file-system` | Do not cross filesystem boundaries | ✅ Implemented | Sender scanner captures the root device and skips descending into mount-point crossings (`st_dev` differs); cross-filesystem mount-point subdirectories are dropped entirely, matching rsync |
 | `-F` | Add the default `.rsync-filter` rules | ✅ Implemented | Reads one filter rule per line from each directory's `.rsync-filter` file during traversal and applies it to that directory's subtree; the current directory's rules are evaluated before its ancestors', so deeper files override shallower ones and per-directory files override the command-line `--filter`/`-C` base by default (matching rsync's first-match-wins precedence); `.rsync-filter` files are never transferred. The rsync `-FF` behavior (also `.cvsignore`) is out of scope; unsupported rule types inside the file abort with a clear error |
@@ -81,11 +81,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-u`, `--update` | Skip files newer on receiver | ❌ Not Implemented | Removed because it had no effect |
+| `-u`, `--update` | Skip files newer on receiver | ✅ Implemented | `update` config field (crosses the wire; receiver-side policy, implies `-M` metadata). Before writing a regular file, the receiver checks `file_destination_is_newer_secure()` (via `stat_is_newer`, second-then-nanosecond strict `>` on the existing destination) and skips the write when the destination is newer than the source (`FILE_SAVE_SKIPPED`); equal-or-older destination (or a newer source) is transferred normally. Applied at write time on the regular-file, delay-updates-staged, hardlink-sibling, and special/device paths. Only regular destinations can be guarded (the newer-check requires `S_ISREG`), and like the other write-time policies it does not short-circuit the data transfer for a differing-size dest. `--remove-source-files` correctly respects the receiver's skip outcome so a skipped source is not removed |
 | `--inplace` | Update files in-place | ✅ Implemented | Direct write mode |
 | `--append` | Append data to shorter files | ✅ Implemented | Tail-only resume. When an existing destination file is SHORTER than the source, the receiver negotiates a resume offset with the sender and only the tail is transferred; the receiver rebuilds the full file (retained prefix + tail) and installs it through the normal atomic store path, so the result is byte-identical to the source whenever the retained prefix matches. Plain `--append` does NOT content-verify that prefix (rsync parity): a destination whose prefix differs from the source is resumed anyway, so the result (wrong prefix + correct tail) is NOT byte-identical and the file is effectively left corrupt — the documented rsync-parity risk (use `--append-verify` when the prefix cannot be trusted). Non-content attributes (permissions/ownership/mtime, via `-M`) are still applied. Requires the per-file `STATUS_CHECK` handshake, so it implies `--incremental`; it takes precedence over block delta for a growing file and falls back to delta/full when the destination is not shorter. Incompatible with `-s` (chunk serialization) and `--whole-file` (both rejected up front so the mode never silently degrades to a full transfer). Combines with `--inplace`, `--partial`/`--partial-dir`, and `--delay-updates` (the reconstructed full file flows through those paths unchanged). Divergence: rsync appends in place; FastSync reconstructs and atomically installs, so an interrupted or failed resume never leaves a half-written file at the destination (no corruption window), and `--append` is thus safe to use with the normal atomic path — not only with in-place writes |
 | `--append-verify` | Append with old-data checksum | ✅ Implemented | Like `--append`, but the retained prefix IS verified before resuming: the sender transmits the source prefix checksum and the receiver compares it to the xxHash64 of the retained destination prefix; on a match only the tail is transferred, on a MISMATCH the run falls back to a clean full transfer so the result is always a byte-identical source copy (never a corrupt prefix+tail blend). Wire/protocol: the append handshake adds `STATUS_APPEND` / `STATUS_APPEND_SIG` / `STATUS_APPEND_OK` / `STATUS_APPEND_DATA` frames and `PROTOCOL_VERSION` was bumped **2.9.0 → 2.10.0** (peers must match, and both must be 2.10.0 or the run fails the version check). Same implications/incompatibilities as `--append`; when both spellings are given `--append-verify` wins (the safer semantics). See the Phase-3 append notes below |
-| `-W`, `--whole-file` | Copy whole file (no delta) | ❌ Not Implemented | |
+| `-W`, `--whole-file` | Copy whole file (no delta) | ✅ Implemented | `whole_file` config field. Forces a full (whole-file) copy, disabling the block-level delta machinery: the sender only sends `STATUS_NEXT` + full data (client_send.c) and the receiver never requests a delta signature/reconstruction — the receiver's `try_delta = use_delta && !whole_file && ...` short-circuits. `whole_file` crosses the wire folded into `use_delta` (the wire carries `use_delta && !whole_file`), so no separate field/bump is needed. Delta is opt-in (`--delta` needs `--incremental`); `-W` additionally makes `--fuzzy` inert (no similar-file delta basis). `--append`/`--append-verify` are incompatible with `-W` and rejected up front (both sides). See the delta/append notes below |
 | `--block-size=SIZE` | Force checksum block-size | ⚠️ Partial | Parsed as `--delta-block`; controls delta transfer block size |
 
 ## 6. Destination Handling
@@ -600,7 +600,7 @@ now transmits targets (the prior behavior was broken/partial); its status moved
 | `-z`, `--compress` | Compress file data | 🔀 Alt Arg | Always uses zstd (rsync supports multiple algorithms) |
 | `--compress-choice=STR`, `--zc=STR` | Choose compression algorithm | ✅ Implemented | FastSync supports `zstd` and `none` |
 | `--compress-level=NUM`, `--zl=NUM` | Set compression level | ✅ Implemented | 1-22, default 5 |
-| `--compress-threads=NUM` | Set compression threads | ❌ Not Implemented | |
+| `--compress-threads=NUM` | Set compression threads | ✅ Implemented | `compression_threads` config field (client-only; does not cross the wire). Sets the number of worker threads used by the zstd compression pool to NUM (1..64; 0/garbage/oversized rejected up front). Accepted in both `--compress-threads=NUM` and two-argument `--compress-threads NUM` forms. Composes with `-c`/compression; under the `-m` multithreaded pipeline it parallelizes compressed chunk encoding. See test_tcp.py `-c --compress-threads=2` and test_client_cli.c |
 | `--skip-compress=LIST` | Skip compress for suffixes | ✅ Implemented | Comma-separated, case-insensitive suffix list; empty list skips none; incompatible with FastSync chunk serialization (`-s`) |
 
 ## 13. Connectivity
@@ -788,6 +788,8 @@ These are the hardest compatibility items because they require durable formats o
 
 **Phase 6, Wave B (iconv) shipping note (PROTOCOL 2.15.0 → 2.16.0):** `--iconv=LOCAL[,REMOTE]` converts file NAMES at the wire boundary (never content). The full CONVERT_SPEC is serialized into the config frame as a new trailing string field (empty→NULL canonicalized), so both ends share the same wire charset interpretation; this required the PROTOCOL bump because the frame is a strict ordered sequence and a peer that does not parse the new trailing field would desynchronize. Each end derives LOCAL (its own charset) and REMOTE (the wire charset): the sender opens LOCAL→REMOTE and converts every transmitted filename; the receiver opens REMOTE→LOCAL and converts every received filename before creating/writing. Conversion is applied at every wire-path site (regular/MKDIR/hardlink path+target/symlink path+target/SPECIAL, the delete manifest keep/protected/missing entries, the incremental-check path, and the embedded `-s`/chunk-blob path). A name it cannot convert (EILSEQ/EINVAL) is failed cleanly with a logged `--iconv: cannot convert file name ...` and is never written truncated/mangled. Validation probes both directions up front (both the sender local→remote and the receiver remote→local, and, for a server/daemon with its own `--iconv`, the client-REMOTE→server-LOCAL pair) so an unusable spec is rejected before the connection rather than mid-transfer, and NUL-emitting target charsets (utf-16/utf-32/ucs-2) are refused because filenames cannot contain NUL. Divergence documented upstream: the receiver does NOT half-swap; the wire charset always comes from the sender's REMOTE half, so a server whose local charset differs from the client's LOCAL must declare it with its own `--iconv`. Conversion is process-global and runs on a single thread per process (sender thread / receiver-loop thread), initialized before worker threads start and freed after they join.
 
+**Phase-1/2 selection-and-update status correction (docs):** `-I/--ignore-times`, `--size-only`, `-@/--modify-window`, `--existing`, `--ignore-existing`, `-u/--update`, `-W/--whole-file`, and `--compress-threads` were previously listed as not-implemented in this document but are in fact fully implemented and tested on `dev`. This pass corrects the matrix to match the code. The realistic model of these is that FastSync is a *sender-driven* whole-tree copy, so the size+mtime quick-check and all three receiver-policy skips (`--existing`, `--ignore-existing`, `-u`) are evaluated against the **destination** on the receiver side, and their booleans cross the wire in the config frame. `-I`/`--size-only`/`--modify-window` modify the `--incremental` per-file `STATUS_CHECK` handshake's match predicate (`-I` disables the mtime leg and forces transfer; `--size-only` drops only the mtime leg; `--modify-window` adds tolerance to `metadata_mtime_matches`); they require `--incremental` (or a basis dir) to have a handshake to affect, mirroring how they only matter where a quick-check exists in rsync. `--existing`/`--ignore-existing`/`-u` are receiver write-time policies (skipping the write / newer-destination guard) applied across the regular-file, `--delay-updates`-staged, hardlink-sibling, and special/device paths; `-u` implies `-M` metadata and uses a second-then-nanosecond strict `>` newer check; both correctly influence `--remove-source-files` (a skipped source is not removed). `-W/--whole-file` disables block-level delta (opt-in via `--delta`), folded into the wire `use_delta` so no protocol bump was needed, and makes `--fuzzy` inert; `--append`/`--append-verify` are rejected with `-W`. `--compress-threads=NUM` (1..64, client-only, never crosses the wire) sizes the zstd compression worker pool. No code was changed by this correction; the implementation had landed in earlier merge waves (feat/ignore-times, feat/ignore-existing via the newer `file_to_disk_secure_no_replace`/`linkat EEXIST` path, feat/size-only, feat/modify-window, feat/whole-file, feat/update, compression-threads).
+
 ### Recommended Delivery Order
 
 1. Resolve short-option conflicts (`-m`, `-M`, `-T`, `-f`, `-s`) and define the compatibility contract.
@@ -802,15 +804,15 @@ The existing priority list below is a feature shortlist, not an implementation s
 
 ## Recommendations: Top Features to Implement Next
 
-Ranked by user demand, implementation complexity, and interoperability impact:
+Ranked by user demand, implementation complexity, and interoperability impact (_status reflects current `dev`_):
 
 | Priority | Feature | Effort | Impact |
 |----------|---------|--------|--------|
-| 1 | `--whole-file` / `-W` | Low | High — users expect opt-out of delta |
-| 2 | `--ignore-times` / `-I` | Low | Medium — useful for forcing re-transfer |
-| 3 | `--size-only` | Low | Medium — common migration scenario |
-| 4 | `--ignore-existing` | Low | Medium — common sync patterns |
-| 5 | `--existing` | Low | Medium — common sync patterns |
+| 1 | `--whole-file` / `-W` | Low | High — users expect opt-out of delta — **✅ implemented** |
+| 2 | `--ignore-times` / `-I` | Low | Medium — useful for forcing re-transfer — **✅ implemented** |
+| 3 | `--size-only` | Low | Medium — common migration scenario — **✅ implemented** |
+| 4 | `--ignore-existing` | Low | Medium — common sync patterns — **✅ implemented** |
+| 5 | `--existing` | Low | Medium — common sync patterns — **✅ implemented** |
 | 6 | `--remove-source-files` | Low | High — common for moves/backup |
 | 7 | `--delete-during` | Medium | High — performance improvement |
 | 8 | `--delay-updates` | Medium | High — atomic updates |
