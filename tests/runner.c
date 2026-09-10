@@ -27,6 +27,7 @@
 #include "test_server_cli.h"
 #include "test_shared_utils.h"
 #include "test_stress.h"
+#include "test_stop.h"
 #include "test_transport_tcp.h"
 #include "test_transport_ssh.h"
 #include "test_transport_tls.h"
@@ -67,6 +68,7 @@ int main() {
   RUN_TEST(test_log);
   RUN_TEST(test_robustness);
   RUN_TEST(test_stress);
+  RUN_TEST(test_stop);
   RUN_TEST(test_property);
   RUN_TEST(test_transport_tcp);
   RUN_TEST(test_transport_ssh);
