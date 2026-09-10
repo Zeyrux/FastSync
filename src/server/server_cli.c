@@ -107,6 +107,18 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       }
       opts->destination_root = argv[++i];
       opts->destination_root_set = true;
+    } else if (arg_is(argv[i], "--password-file")) {
+      if (i + 1 >= argc) {
+        set_error(err, err_size, "missing argument for --password-file");
+        return -1;
+      }
+      opts->password_file = argv[++i];
+    } else if (arg_is(argv[i], "--early-input")) {
+      if (i + 1 >= argc) {
+        set_error(err, err_size, "missing argument for --early-input");
+        return -1;
+      }
+      opts->early_input_file = argv[++i];
     } else if (arg_is(argv[i], "--address")) {
       if (i + 1 >= argc) {
         set_error(err, err_size, "missing argument for --address");
@@ -150,6 +162,24 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
           inline_value = argv[++i];
         }
         opts->config_path = inline_value;
+      } else if (arg_has_value(argv[i], "--password-file", &inline_value)) {
+        if (!inline_value) {
+          if (i + 1 >= argc) {
+            set_error(err, err_size, "missing argument for --password-file");
+            return -1;
+          }
+          inline_value = argv[++i];
+        }
+        opts->password_file = inline_value;
+      } else if (arg_has_value(argv[i], "--early-input", &inline_value)) {
+        if (!inline_value) {
+          if (i + 1 >= argc) {
+            set_error(err, err_size, "missing argument for --early-input");
+            return -1;
+          }
+          inline_value = argv[++i];
+        }
+        opts->early_input_file = inline_value;
       } else if (arg_has_value(argv[i], "--dparam", &inline_value)) {
         if (!inline_value) {
           if (i + 1 >= argc) {
@@ -190,8 +220,11 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
     return -1;
   }
   if (!opts->daemon_mode &&
-      (opts->config_path != NULL || opts->dparam_count > 0 || opts->no_detach)) {
-    set_error(err, err_size, "--config, --dparam, and --no-detach require --daemon");
+      (opts->config_path != NULL || opts->dparam_count > 0 || opts->no_detach ||
+       opts->password_file != NULL || opts->early_input_file != NULL)) {
+    set_error(err, err_size,
+              "--config, --dparam, --no-detach, --password-file, and --early-input require "
+              "--daemon");
     return -1;
   }
   return 0;

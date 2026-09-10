@@ -412,7 +412,11 @@ static const char* status_to_string(Status status) {
   }
 }
 
-bool protocol_send_str(ProtocolSession* session, const char* data) {
+/* Shared string send/receive implementation.  `redact` selects whether the
+ * payload body is written to the LOG_DEBUG_PROTO debug log: secrets (daemon
+ * auth username/digest) set it so a --verbose log never captures a replayable
+ * credential, while every other string keeps its normal debug trace. */
+static bool protocol_send_str_impl(ProtocolSession* session, const char* data, bool redact) {
   if (data == NULL)
     return false;
   size_t size = strlen(data);
@@ -420,11 +424,14 @@ bool protocol_send_str(ProtocolSession* session, const char* data) {
     return false;
   if (!protocol_send_n_data(session, data, size))
     return false;
-  log_debug_message(LOG_DEBUG_PROTO, "Send String: %s", data);
+  if (redact)
+    log_debug_message(LOG_DEBUG_PROTO, "Send String: <redacted>");
+  else
+    log_debug_message(LOG_DEBUG_PROTO, "Send String: %s", data);
   return true;
 }
 
-char* protocol_receive_str(ProtocolSession* session) {
+static char* protocol_receive_str_impl(ProtocolSession* session, bool redact) {
   size_t size;
   if (!protocol_receive_n_data(session, &size, sizeof(size_t)))
     return NULL;
@@ -446,8 +453,27 @@ char* protocol_receive_str(ProtocolSession* session) {
     return NULL;
   }
   data[size] = '\0';
-  log_debug_message(LOG_DEBUG_PROTO, "Received String: %s", data);
+  if (redact)
+    log_debug_message(LOG_DEBUG_PROTO, "Received String: <redacted>");
+  else
+    log_debug_message(LOG_DEBUG_PROTO, "Received String: %s", data);
   return data;
+}
+
+bool protocol_send_str(ProtocolSession* session, const char* data) {
+  return protocol_send_str_impl(session, data, false);
+}
+
+bool protocol_send_str_redacted(ProtocolSession* session, const char* data) {
+  return protocol_send_str_impl(session, data, true);
+}
+
+char* protocol_receive_str(ProtocolSession* session) {
+  return protocol_receive_str_impl(session, false);
+}
+
+char* protocol_receive_str_redacted(ProtocolSession* session) {
+  return protocol_receive_str_impl(session, true);
 }
 
 bool protocol_send_data(ProtocolSession* session, const Data* data) {
@@ -552,6 +578,14 @@ bool send_str(int fd, const char* data) {
 }
 char* receive_str(int fd) {
   return protocol_receive_str(legacy_session(fd, -1));
+}
+/* Redacted variants: identical framing, but the string body is never written to
+   the debug protocol log.  Used for the daemon auth username/digest. */
+bool send_str_redacted(int fd, const char* data) {
+  return protocol_send_str_redacted(legacy_session(-1, fd), data);
+}
+char* receive_str_redacted(int fd) {
+  return protocol_receive_str_redacted(legacy_session(fd, -1));
 }
 bool send_data(int fd, const Data* data) {
   return protocol_send_data(legacy_session(-1, fd), data);

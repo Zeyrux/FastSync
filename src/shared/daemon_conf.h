@@ -26,11 +26,12 @@
  * per-module).  There is never any client-chosen root and no --super /
  * --copy-as: a module path always stays confined.
  *
- * `auth_users` is parsed and stored now (Wave A) for Wave B to honor, but the
- * presence of auth users is already enforced with a SAFE default this wave:
- * because FastSync cannot yet authenticate a claimed user, a module that
- * declares auth users refuses every connection (see server.c).  Auth is never
- * bypassed by ignoring the list. */
+ * `auth_users` is honored by Wave B daemon authentication: a module that
+ * declares auth users accepts a connection only when the presented username is
+ * on this list AND verifies against the daemon's credential store
+ * (--password-file / --early-input).  An auth-required module with no usable
+ * store refuses (fail closed) rather than falling open; see server.c.  Auth is
+ * never bypassed by ignoring the list. */
 typedef struct DaemonModule {
   char* name;        /* module name, as the client requests it */
   char* path;        /* module root (daemon-side authorized root) */

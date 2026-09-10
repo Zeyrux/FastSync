@@ -1,4 +1,5 @@
 #include "config.h"
+#include "credentials.h"
 #include "daemon_conf.h"
 #include "delay_updates.h"
 #include "file.h"
@@ -34,6 +35,20 @@ static const char* required_client_cn;
  * main before any accept-loop fork, then shared read-only by every forked
  * connection child (and their threads). */
 static DaemonConf* g_daemon_conf = NULL;
+
+/* Daemon credential store (Wave B), loaded once in main from --password-file /
+ * --early-input and shared read-only by every forked connection child.  When a
+ * module declares `auth users` but no store was configured, the daemon refuses
+ * to start (fail closed); the store is never NULL after a successful start when
+ * such a module exists. */
+static CredentialStore* g_credentials = NULL;
+
+/* Opaque context threaded through to the config-frame gate: the connection's
+ * SSL object (NULL over plaintext) so the gate can warn when a credential
+ * exchange is not encrypted. */
+typedef struct ModuleGateContext {
+  SSL* ssl;
+} ModuleGateContext;
 
 /* Aggregate payload bytes the multithreaded receiver may buffer ahead of the
    slow disk writer.  Receiving one more chunk adds up to ~2 * MAX_CHUNK_SIZE
@@ -147,11 +162,11 @@ static bool configure_authorization(const char* root) {
  * --destination-root, but per-module and NEVER client-chosen.  The module is
  * refused (with a clear log) when it is unknown, when it is `read only` (every
  * FastSync network transfer writes; there is no read-only wire operation yet),
- * or when it declares `auth users` (FastSync cannot authenticate a claimed user
- * this wave, so a module whose admin expected a credential list is refused
- * rather than silently opened up -- auth is Wave B and will honor the list). */
+ * or when the presented daemon credentials fail for a module that declares
+ * `auth users`.  Wave A refused every auth-required module (auth was not yet
+ * implemented); Wave B authenticates the client instead (see below). */
 static const char* server_module_gate(const Config* config, void* context) {
-  (void)context;
+  ModuleGateContext* gate_ctx = (ModuleGateContext*)context;
   if (!config)
     return "missing config frame";
   bool is_daemon = g_daemon_conf != NULL;
@@ -181,12 +196,44 @@ static const char* server_module_gate(const Config* config, void* context) {
     return "requested daemon module is read only";
   }
   if (module->auth_user_count > 0) {
-    log_message(LOG_LEVEL_ERROR,
-                "daemon module '%s' requires authentication (auth users), which this "
-                "daemon version does not implement; refusing",
-                config->module);
-    return "requested daemon module requires authentication that is not yet "
-           "supported";
+    /* Auth-required module (Wave B): verify the presented credentials against
+     * the store BEFORE the module root is installed and before any data moves.
+     * Fail closed: no store -> refuse; no/invalid credentials -> refuse.  The
+     * username may be logged (never the digest/password). */
+    if (g_credentials == NULL) {
+      log_message(LOG_LEVEL_ERROR,
+                  "daemon module '%s' requires authentication but no credential store is "
+                  "configured (--password-file/--early-input); refusing",
+                  config->module);
+      return "requested daemon module requires authentication and no credential "
+             "store is configured";
+    }
+    if (!config->auth_user || !config->auth_password_hash) {
+      log_message(LOG_LEVEL_ERROR,
+                  "daemon module '%s' requires authentication; the client "
+                  "presented no credentials",
+                  config->module);
+      return "requested daemon module requires authentication";
+    }
+    if (gate_ctx && !gate_ctx->ssl) {
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon module '%s' is authenticating over a plaintext connection (no --tls); "
+                  "the credential exchange is not encrypted",
+                  config->module);
+    }
+    if (!credentials_gate_allows(g_credentials, (const char* const*)module->auth_users,
+                                 module->auth_user_count, config->auth_user,
+                                 config->auth_password_hash)) {
+      char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
+      log_message(LOG_LEVEL_ERROR, "daemon module '%s': authentication failed for user '%s'",
+                  config->module, escaped_user ? escaped_user : "<allocation failed>");
+      free(escaped_user);
+      return "authentication failed for the requested daemon module";
+    }
+    char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
+    log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' authenticated", config->module,
+                escaped_user ? escaped_user : "<allocation failed>");
+    free(escaped_user);
   }
   if (!configure_authorization(module->path)) {
     log_message(LOG_LEVEL_ERROR, "daemon module '%s' path '%s' is not usable", config->module,
@@ -202,7 +249,9 @@ void handler(int file_descriptor) {
   protocol_session_init(&session, file_descriptor, file_descriptor);
   protocol_session_set_ssl(&session, ssl);
   protocol_session_bind(&session);
-  Config* config = config_receive_with_validate(file_descriptor, server_module_gate, NULL);
+  ModuleGateContext gate_ctx;
+  gate_ctx.ssl = ssl;
+  Config* config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
     close(file_descriptor);
@@ -424,6 +473,8 @@ static void cleanup(int sig) {
     server_delete(&g_server);
   daemon_conf_free(g_daemon_conf);
   g_daemon_conf = NULL;
+  credentials_free(g_credentials);
+  g_credentials = NULL;
   _exit(0);
 }
 
@@ -440,6 +491,14 @@ static void print_server_usage(void) {
   printf("                      (port, motd file, address)\n");
   printf("  --no-detach         Stay in the foreground (default detaches to\n");
   printf("                      background when running --daemon)\n");
+  printf("  --password-file=FILE  Credential store for modules that declare\n");
+  printf("                      'auth users' (line format: user:SHA256HEX where\n");
+  printf("                      SHA256HEX is the lowercase hex SHA-256 of the\n");
+  printf("                      user's password).  Requires --daemon; an auth-\n");
+  printf("                      required module with no store refuses to start\n");
+  printf("  --early-input=FILE  Second credential store layered over\n");
+  printf("                      --password-file (same format); usually a secrets-\n");
+  printf("                      manager/process-substitution file.  Requires --daemon\n");
   printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
@@ -586,6 +645,48 @@ int main(int argc, char* argv[]) {
     if (g_daemon_conf->module_count == 0)
       log_message(LOG_LEVEL_WARNING,
                   "daemon config has no modules; every connection will be refused");
+    /* Daemon credential store (Wave B).  --password-file and --early-input
+     * feed the same store, loaded BEFORE the listener forks so every
+     * connection child shares one read-only store.  Fail closed at startup: a
+     * module that declares `auth users` without a store (or with an empty
+     * store) refuses to start rather than serving a module whose credentials
+     * can never be verified. */
+    g_credentials =
+        credentials_load(opts.password_file, opts.early_input_file, cli_err, sizeof(cli_err));
+    if (!g_credentials) {
+      server_cli_options_free(&opts);
+      fprintf(stderr, "Error: %s\n", cli_err);
+      return 1;
+    }
+    bool credential_source_given = opts.password_file != NULL || opts.early_input_file != NULL;
+    for (int i = 0; i < g_daemon_conf->module_count; i++) {
+      const DaemonModule* module = &g_daemon_conf->modules[i];
+      if (module->auth_user_count == 0)
+        continue;
+      if (!credential_source_given) {
+        fprintf(stderr,
+                "Error: module '%s' declares 'auth users' but no credential store was given "
+                "(--password-file or --early-input); refusing to start (fail closed)\n",
+                module->name);
+        server_cli_options_free(&opts);
+        return 1;
+      }
+      if (credentials_store_size(g_credentials) == 0) {
+        fprintf(stderr,
+                "Error: module '%s' declares 'auth users' but the credential store is empty; "
+                "refusing to start (fail closed)\n",
+                module->name);
+        server_cli_options_free(&opts);
+        return 1;
+      }
+      for (int j = 0; j < module->auth_user_count; j++) {
+        if (!credentials_store_has(g_credentials, module->auth_users[j]))
+          log_message(LOG_LEVEL_WARNING,
+                      "daemon module '%s': auth user '%s' has no credential store entry; that "
+                      "user can never authenticate",
+                      module->name, module->auth_users[j]);
+      }
+    }
   } else {
     if (!configure_authorization(opts.destination_root)) {
       char* escaped = output_escape(opts.destination_root, false);
@@ -648,6 +749,8 @@ int main(int argc, char* argv[]) {
 out:
   daemon_conf_free(g_daemon_conf);
   g_daemon_conf = NULL;
+  credentials_free(g_credentials);
+  g_credentials = NULL;
   server_cli_options_free(&opts);
   return exit_code;
 }

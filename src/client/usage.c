@@ -170,6 +170,10 @@ void print_usage(void) {
   printf("  --save-to-disk      Write received files to disk\n");
   printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
   printf("  --server-port <n>   Server port (default: 8080)\n");
+  printf("  --password-file <f> Authenticate a host::module/path daemon destination.\n");
+  printf("                      The file's first user:password line supplies the\n");
+  printf("                      username and password (only a SHA-256 digest of the\n");
+  printf("                      password is sent; keep the file mode 0600)\n");
   printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
