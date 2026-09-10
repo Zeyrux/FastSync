@@ -14,6 +14,7 @@
 #include "test_file_sendfile.h"
 #include "test_fuzz_smoke.h"
 #include "test_glob.h"
+#include "test_iconv.h"
 #include "test_log.h"
 #include "test_metadata.h"
 #include "test_motd.h"
@@ -59,6 +60,7 @@ int main() {
   RUN_TEST(test_protocol);
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
+  RUN_TEST(test_iconv);
   RUN_TEST(test_file);
   RUN_TEST(test_trust_sender);
   RUN_TEST(test_delay_updates);

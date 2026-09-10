@@ -1,5 +1,6 @@
 #include "receiver.h"
 
+#include "charset.h"
 #include "chunk.h"
 #include "config.h"
 #include "delay_updates.h"
@@ -79,7 +80,7 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
       count > MAX_MANIFEST_ENTRIES)
     return false;
   for (int i = 0; i < count; i++) {
-    char* check_path = receive_str(file_descriptor);
+    char* check_path = receive_wire_str(file_descriptor);
     if (!check_path)
       return false;
     unsigned long long check_size;

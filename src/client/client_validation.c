@@ -1,4 +1,5 @@
 #include "client_validation.h"
+#include "charset.h"
 #include "delay_updates.h"
 #include "log.h"
 #include "usage.h"
@@ -121,6 +122,14 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR,
                 "--delete-before/--delete-during/--delete-delay/--delete-after select the delete "
                 "timing; at most one may be given and each implies --delete");
+    return false;
+  }
+  /* --iconv: reject a malformed CONVERT_SPEC or an unsupported charset name at
+     startup (a probe iconv_open is attempted), so a typo'd charset never fails
+     the run mid-transfer with per-file errors. */
+  if (!charset_spec_valid(config->iconv_spec)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--iconv requires LOCAL[,REMOTE] charset names supported by iconv");
     return false;
   }
   return true;

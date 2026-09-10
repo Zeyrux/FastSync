@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "array_list.h"
+#include "charset.h"
 #include "chunk.h"
 #include "compression.h"
 #include "data.h"
@@ -63,9 +64,22 @@ void chunk_destroy(void* item) {
   free(chunk);
 }
 
+/* --iconv: a chunk blob carries wire-charset path/target bytes.  Encode the
+ * sender-side path (a no-op copy when iconv is disabled) so the blob is in the
+ * same charset as every other wire string. */
+static char* chunk_encode_wire(const char* path) {
+  if (!charset_wire_active())
+    return str_dup(path);
+  return charset_wire_apply(path);
+}
+
 static unsigned long long per_file_serialize_size(File* file, bool use_metadata) {
   unsigned long long size = sizeof(size_t);
-  size_t path_len = strlen(file_wire_path(file));
+  char* wire_path = chunk_encode_wire(file_wire_path(file));
+  if (!wire_path)
+    return 0;
+  size_t path_len = strlen(wire_path);
+  free(wire_path);
   unsigned long long metadata_size =
       use_metadata ? sizeof(int) + (file->metadata ? FILE_METADATA_WIRE_SIZE : 0) : 0;
   if ((unsigned long long)path_len > ULLONG_MAX - size)
@@ -94,7 +108,11 @@ static unsigned long long per_file_serialize_size(File* file, bool use_metadata)
   size += file->data->size;
   /* Symlink entries append the target string (length-prefixed). */
   if (file->is_symlink) {
-    size_t target_len = file->symlink_target ? strlen(file->symlink_target) : 0;
+    char* wire_target = chunk_encode_wire(file->symlink_target ? file->symlink_target : "");
+    if (!wire_target)
+      return 0;
+    size_t target_len = strlen(wire_target);
+    free(wire_target);
     if (sizeof(size_t) > ULLONG_MAX - size)
       return 0;
     size += sizeof(size_t);
@@ -128,12 +146,17 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
   char* data_pointer = data->data;
   for (int i = 0; i < chunk->element_count; i++) {
     File* file = chunk->items[i];
-    const char* wire_path = file_wire_path(file);
+    char* wire_path = chunk_encode_wire(file_wire_path(file));
+    if (wire_path == NULL) {
+      data_destroy(data);
+      return NULL;
+    }
     size_t path_len = strlen(wire_path);
     memcpy(data_pointer, &path_len, sizeof(size_t));
     data_pointer += sizeof(size_t);
     memcpy(data_pointer, wire_path, path_len);
     data_pointer += path_len;
+    free(wire_path);
 
     int entry_type = file->is_dir ? 1 : (file->is_symlink ? 2 : (file->is_special ? 3 : 0));
     memcpy(data_pointer, &entry_type, sizeof(int));
@@ -159,12 +182,18 @@ Data* chunk_serialize(Chunk* chunk, bool use_metadata) {
     data_pointer += file_data_size;
 
     if (file->is_symlink) {
-      size_t target_len = file->symlink_target ? strlen(file->symlink_target) : 0;
+      char* wire_target = chunk_encode_wire(file->symlink_target ? file->symlink_target : "");
+      if (wire_target == NULL) {
+        data_destroy(data);
+        return NULL;
+      }
+      size_t target_len = strlen(wire_target);
       memcpy(data_pointer, &target_len, sizeof(size_t));
       data_pointer += sizeof(size_t);
       if (target_len > 0)
-        memcpy(data_pointer, file->symlink_target, target_len);
+        memcpy(data_pointer, wire_target, target_len);
       data_pointer += target_len;
+      free(wire_target);
     }
   }
   return data;
@@ -221,6 +250,22 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
     data_pointer += path_len;
     remaining_size -= path_len;
+
+    /* --iconv: the blob holds the wire charset; translate it to the receiver's
+       local charset before validation and creation so the destination gets the
+       local name.  A name that cannot be decoded fails the file cleanly. */
+    if (charset_wire_active()) {
+      char* local_path = charset_wire_apply(path);
+      free(path);
+      if (local_path == NULL) {
+        log_message(LOG_LEVEL_ERROR,
+                    "--iconv: received chunk file name cannot be converted to the local charset");
+        array_list_delete(files);
+        return NULL;
+      }
+      path = local_path;
+      path_len = strlen(path);
+    }
 
     if (path_len == 0 || has_path_traversal(path)) {
       free(path);
@@ -391,6 +436,21 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
         file_destroy(file);
         array_list_delete(files);
         return NULL;
+      }
+      /* The symlink target also rides the wire charset; decode it to the local
+         charset like the path (a target is a path). */
+      if (charset_wire_active()) {
+        char* local_target = charset_wire_apply(target);
+        free(target);
+        if (local_target == NULL) {
+          log_message(LOG_LEVEL_ERROR,
+                      "--iconv: received chunk symlink target cannot be converted to the local "
+                      "charset");
+          file_destroy(file);
+          array_list_delete(files);
+          return NULL;
+        }
+        target = local_target;
       }
       file->symlink_target = target;
       data_pointer += target_len;

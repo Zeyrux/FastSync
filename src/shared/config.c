@@ -1,4 +1,5 @@
 #include "config.h"
+#include "charset.h"
 #include "chmod.h"
 #include "credentials.h"
 #include "daemon_conf.h"
@@ -42,6 +43,7 @@ static void config_set_defaults(Config* config) {
   config->auth_user = NULL;
   config->auth_password_hash = NULL;
   config->password_file = NULL;
+  config->iconv_spec = NULL;
   config->fastsync_server_path = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
@@ -242,7 +244,13 @@ static bool validate_received_config(const Config* config) {
          config->max_delete >= -1 && config->skip_compress_count >= 0 &&
          config->skip_compress_count <= 10000 && config->max_alloc > 0 &&
          (!config->chmod_spec || !*config->chmod_spec ||
-          chmod_apply(0, config->chmod_spec, &(mode_t){0}));
+          chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
+         /* The received --iconv CONVERT_SPEC is untrusted input that drives
+            the receiver's path decoding: reject a malformed spec or an
+            unsupported charset name so the run is refused up front instead of
+            every received file name failing mid-transfer.  A NULL spec (iconv
+            disabled) is always accepted. */
+         (!config->iconv_spec || charset_spec_valid(config->iconv_spec));
 }
 
 Config* config_create(void) {
@@ -619,6 +627,7 @@ void config_delete(Config* config) {
   free(config->auth_user);
   free(config->auth_password_hash);
   free(config->password_file);
+  free(config->iconv_spec);
   free(config->fastsync_server_path);
   for (int i = 0; i < config->exclude_count; i++)
     free(config->exclude_patterns[i]);
@@ -1144,6 +1153,29 @@ static bool receive_daemon_auth(int fd, Config* c) {
   return true;
 }
 
+/* --iconv CONVERT_SPEC (protocol 2.16.0).  Trailing string on the config frame,
+ * sent after the Wave A/B daemon-auth block and before the ack, so the
+ * receiver knows the wire charset before the first file name arrives.  The full
+ * spec travels (LOCAL,REMOTE) and each end derives its own LOCAL and the wire
+ * (REMOTE) charset symmetrically; an unset spec is serialized as "" and
+ * canonicalized back to NULL on receive. */
+static bool send_iconv_spec(int fd, const Config* c) {
+  return send_str(fd, c->iconv_spec ? c->iconv_spec : "");
+}
+
+static bool receive_iconv_spec(int fd, Config* c) {
+  char* spec = receive_str(fd);
+  if (!spec)
+    return false;
+  if (*spec == '\0') {
+    free(spec);
+    c->iconv_spec = NULL;
+    return true;
+  }
+  c->iconv_spec = spec;
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -1156,7 +1188,8 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_metadata_times_options(file_descriptor, config) ||
       !send_symlink_trust_options(file_descriptor, config) ||
       !send_phase4_xattr_options(file_descriptor, config) ||
-      !send_daemon_module(file_descriptor, config) || !send_daemon_auth(file_descriptor, config))
+      !send_daemon_module(file_descriptor, config) || !send_daemon_auth(file_descriptor, config) ||
+      !send_iconv_spec(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -1198,7 +1231,7 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_symlink_trust_options(file_descriptor, config) ||
       !receive_phase4_xattr_options(file_descriptor, config) ||
       !receive_daemon_module(file_descriptor, config) ||
-      !receive_daemon_auth(file_descriptor, config))
+      !receive_daemon_auth(file_descriptor, config) || !receive_iconv_spec(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "charset.h"
 #include "credentials.h"
 #include "daemon_conf.h"
 #include "delay_updates.h"
@@ -31,6 +32,10 @@ static bool allow_delete;
 static bool trust_sender;
 static bool allow_unauthenticated;
 static const char* required_client_cn;
+/* --iconv CONVERT_SPEC the server was itself started with (borrowed argv
+ * pointer).  Its LOCAL half may override the local charset the client assumed;
+ * see charset_wire_init_receiver. */
+static const char* server_iconv_spec;
 
 /* Non-NULL exactly when the listener runs in --daemon mode.  Loaded once in
  * main before any accept-loop fork, then shared read-only by every forked
@@ -170,6 +175,15 @@ static const char* server_module_gate(const Config* config, void* context) {
   ModuleGateContext* gate_ctx = (ModuleGateContext*)context;
   if (!config)
     return "missing config frame";
+  /* --iconv (protocol 2.16.0): the receiver's exact conversion direction (the
+     client spec's wire charset into this server's local charset, including a
+     server-side --iconv override) must be usable BEFORE the STATUS_OK ack, so
+     an impossible conversion is refused at the handshake instead of failing
+     the first file mid-transfer.  The client spec itself was already sanity
+     checked by validate_received_config. */
+  if (config->iconv_spec &&
+      !charset_wire_receiver_spec_valid(config->iconv_spec, server_iconv_spec))
+    return "client --iconv conversion cannot be honored by this server";
   bool is_daemon = g_daemon_conf != NULL;
   bool has_module = config->module != NULL && config->module[0] != '\0';
 
@@ -318,6 +332,20 @@ void handler(int file_descriptor) {
     return;
   }
   config->use_delete = config->use_delete && allow_delete;
+  /* --iconv (protocol 2.16.0): install the receiver-side wire->local conversion
+     now that the client's full CONVERT_SPEC has been received and validated,
+     before any received file name is decoded.  The server's own --iconv (if
+     any) may override the local charset; a spec the client is known to have
+     validated cannot fail here unless the server's override names an
+     unsupported charset. */
+  if (config->iconv_spec && !charset_wire_init_receiver(config->iconv_spec, server_iconv_spec)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--iconv: unsupported charset conversion requested (LOCAL[,REMOTE])");
+    config_delete(config);
+    close(file_descriptor);
+    protocol_session_unbind();
+    return;
+  }
   /* --delete-missing-args deletes destination mirrors receiver-side, so it is
      deletion and stays gated by the same --allow-delete server policy.  When
      the server policy is off the flag is inert (the missing entries are still
@@ -485,6 +513,7 @@ void handler(int file_descriptor) {
   }
   protocol_session_unbind();
   identity_clear_active();
+  charset_wire_free();
   close(file_descriptor);
 }
 
@@ -535,6 +564,11 @@ static void print_server_usage(void) {
   printf("  -6, --ipv6          Bind an IPv6 socket\n");
   printf("  --allow-delete      Permit manifest deletion\n");
   printf("  --trust-sender      Trust the remote sender's file list\n");
+  printf("  --iconv=LOCAL[,REMOTE]  Declare this server's LOCAL charset for file-name\n");
+  printf("                      conversion: received names are translated to this\n");
+  printf("                      charset (the wire charset still comes from the\n");
+  printf("                      client's CONVERT_SPEC).  A name that cannot be\n");
+  printf("                      represented fails the run cleanly\n");
   printf("  --allow-unauthenticated  Allow plaintext/anonymous network clients\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  --help              Show this help\n");
@@ -621,6 +655,7 @@ int main(int argc, char* argv[]) {
   allow_delete = opts.allow_delete;
   trust_sender = opts.trust_sender;
   allow_unauthenticated = opts.allow_unauthenticated;
+  server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
 
