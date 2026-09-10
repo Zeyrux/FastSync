@@ -2772,6 +2772,29 @@ static void test_parse_args_remote_option_no_short_M() {
   config_delete(cfg);
 }
 
+/* --no-motd is a real rsync option (client-side daemon MOTD display
+ * suppression), not a negation of a --motd flag: it sets config->no_motd. */
+static void test_parse_args_no_motd() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_FALSE(cfg->no_motd);
+  char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst", "--no-motd"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->no_motd);
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_FALSE(cfg->no_motd);
+  char* argv2[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->no_motd);
+  config_delete(cfg);
+}
+
 /* --password-file stores its path on the config (the file is read later, once
  * the destination form is known). */
 static void test_parse_args_password_file() {
@@ -2934,5 +2957,6 @@ void test_client_cli() {
   test_parse_args_remote_option_missing_value();
   test_parse_args_remote_option_rejects_bad_values();
   test_parse_args_remote_option_no_short_M();
+  test_parse_args_no_motd();
   test_parse_args_password_file();
 }

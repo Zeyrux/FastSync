@@ -149,6 +149,7 @@ static void config_set_defaults(Config* config) {
   config->daemon = false;
   config->daemon_config = NULL;
   config->server_mode = false;
+  config->no_motd = false;
   config->checksum = false;
   config->checksum_algo = CHECKSUM_ALGO_XXH64;
   config->checksum_seed = 0;

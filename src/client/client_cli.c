@@ -819,6 +819,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       config->no_implied_dirs = true;
       continue;
     }
+    /* "--no-motd" is a real rsync option name (client-side daemon MOTD display
+     * suppression), not a negation of a "--motd" flag, so it is handled before
+     * the generic --no-* negation branch. */
+    if (strcmp(argv[i], "--no-motd") == 0) {
+      config->no_motd = true;
+      continue;
+    }
     if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {
       if (strcmp(argv[i], "--no-delta") == 0)
         no_delta = true;

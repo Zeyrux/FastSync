@@ -16,6 +16,7 @@
 #include "test_glob.h"
 #include "test_log.h"
 #include "test_metadata.h"
+#include "test_motd.h"
 #include "test_multiprocessing.h"
 #include "test_property.h"
 #include "test_protocol.h"
@@ -73,6 +74,7 @@ int main() {
   RUN_TEST(test_client_cli);
   RUN_TEST(test_server);
   RUN_TEST(test_daemon_conf);
+  RUN_TEST(test_motd);
   RUN_TEST(test_server_cli);
   RUN_TEST(test_fuzz_smoke);
   RUN_TEST(test_xattr);

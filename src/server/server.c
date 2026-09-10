@@ -5,6 +5,7 @@
 #include "file.h"
 #include "identity.h"
 #include "log.h"
+#include "motd.h"
 #include "multiprocessing.h"
 #include "protocol.h"
 #include "queue.h"
@@ -365,6 +366,29 @@ void handler(int file_descriptor) {
      during the whole transfer, and never bleeds across the per-connection
      forked processes.  Off by default. */
   file_set_trust_sender(trust_sender);
+  /* Wave C MOTD: on the daemon listener path only, once the module gate + auth
+     have accepted and every destination check has passed, send the configured
+     `motd file` as the first server->client frame before any transfer data
+     (rsync sends its MOTD as the first thing from the server on a daemon
+     connection).  Every daemon connection gets the frame -- an unset or
+     unreadable motd file sends an empty string -- so the client's read is
+     deterministic and an absent file is never an error.  The --stdio SSH path
+     has no MOTD (g_daemon_conf is NULL there).  No PROTOCOL_VERSION bump: the
+     frame is symmetric server->client in every 2.15.0 daemon build (see the
+     Wave C note in config.h). */
+  if (g_daemon_conf) {
+    char* motd = motd_read_file(g_daemon_conf->global.motd_file);
+    if (!motd_send(file_descriptor, motd ? motd : "")) {
+      free(motd);
+      log_message(LOG_LEVEL_ERROR, "Failed to send daemon MOTD");
+      config_delete(config);
+      close(file_descriptor);
+      protocol_session_unbind();
+      identity_clear_active();
+      return;
+    }
+    free(motd);
+  }
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
     if (q == NULL) {

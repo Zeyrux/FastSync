@@ -174,6 +174,8 @@ void print_usage(void) {
   printf("                      The file's first user:password line supplies the\n");
   printf("                      username and password (only a SHA-256 digest of the\n");
   printf("                      password is sent; keep the file mode 0600)\n");
+  printf("  --no-motd           Suppress display of the daemon's MOTD (the server\n");
+  printf("                      still sends it; the client just does not show it)\n");
   printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
