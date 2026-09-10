@@ -8,7 +8,34 @@
 
 /* Validate config after parsing. Returns true if valid. */
 bool validate_config(const Config* config) {
-  if (!config->send_directory || !config->receive_root_directory) {
+  /* Phase 6 residual-batch modes relax the normal source+destination pair: the
+     batch driver is local and needs only what it consumes.  --only-write-batch
+     emits a batch from the source (no destination, no server);
+     --read-batch applies a batch to the destination (no source, no server);
+     --write-batch runs the live transfer AND emits a batch, so it keeps the
+     full pair. */
+  bool write_batch = config->write_batch != NULL;
+  bool only_write_batch = config->only_write_batch != NULL;
+  bool read_batch = config->read_batch != NULL;
+  if ((write_batch && only_write_batch) || (write_batch && read_batch) ||
+      (only_write_batch && read_batch)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--write-batch, --only-write-batch, and --read-batch are mutually exclusive");
+    return false;
+  }
+  if (read_batch) {
+    if (!config->receive_root_directory) {
+      log_message(LOG_LEVEL_ERROR, "--read-batch requires a destination directory");
+      print_usage();
+      return false;
+    }
+  } else if (only_write_batch) {
+    if (!config->send_directory) {
+      log_message(LOG_LEVEL_ERROR, "--only-write-batch requires a source directory");
+      print_usage();
+      return false;
+    }
+  } else if (!config->send_directory || !config->receive_root_directory) {
     log_message(LOG_LEVEL_ERROR, "source and destination directories are required");
     print_usage();
     return false;

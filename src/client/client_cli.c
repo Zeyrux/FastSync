@@ -604,6 +604,14 @@ static const OptionEntry OPTION_TABLE[] = {
      * any network I/O.  Client-only: the server does not negotiate, it just
      * enforces an exact match. */
     {"--protocol", NULL, OPT_STRING, offsetof(Config, version)},
+    /* Phase 6 residual-batch (client-only): --write-batch=FILE runs the normal
+     * live transfer AND also emits the self-contained batch FILE;
+     * --only-write-batch=FILE emits FILE only (no destination, no server);
+     * --read-batch=FILE applies FILE to the destination (no source, no server).
+     * All three are LOCAL driver flags and never cross the wire. */
+    {"--write-batch", NULL, OPT_STRING, offsetof(Config, write_batch)},
+    {"--only-write-batch", NULL, OPT_STRING, offsetof(Config, only_write_batch)},
+    {"--read-batch", NULL, OPT_STRING, offsetof(Config, read_batch)},
     {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
@@ -1603,10 +1611,33 @@ int main(int argc, char* argv[]) {
     }
     config->save_to_disk = true;
   } else if (positional_count == 1) {
-    log_message(LOG_LEVEL_ERROR, "missing destination argument");
-    print_usage();
-    exit_code = 1;
-    goto cleanup;
+    if (config->read_batch) {
+      /* --read-batch=<file> <dest>: the single positional is the destination
+         (there is no source). */
+      free(config->receive_root_directory);
+      config->receive_root_directory = str_dup(argv[positional_args[0]]);
+      if (!config->receive_root_directory) {
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->save_to_disk = true;
+    } else if (config->only_write_batch) {
+      /* --only-write-batch=<file> <source>: the single positional is the
+         source (there is no destination). */
+      free(config->send_directory);
+      config->send_directory = str_dup(argv[positional_args[0]]);
+      if (!config->send_directory) {
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else {
+      log_message(LOG_LEVEL_ERROR, "missing destination argument");
+      print_usage();
+      exit_code = 1;
+      goto cleanup;
+    }
   } else {
     if (!config->send_directory && env_source) {
       config->send_directory = str_dup(env_source);
@@ -1672,8 +1703,29 @@ int main(int argc, char* argv[]) {
 
   tcp_set_timeouts(config->timeout, config->contimeout);
 
+  /* Phase 6 residual-batch driver modes.  --read-batch / --only-write-batch are
+     purely local (apply a batch file, or emit one from a scan): neither connects
+     to nor transfers to a server.  --write-batch runs the normal live transfer
+     AND then emits the batch FILE from a separate deterministic scan pass.  It
+     drives the single-threaded transfer so the config outlives the run for that
+     second pass (the -m path takes ownership of the config). */
+  if (config->read_batch) {
+    exit_code = apply_batch_to_dest(config, config->read_batch, config->receive_root_directory);
+    goto cleanup;
+  }
+  if (config->only_write_batch) {
+    exit_code = write_batch_from_source(config, config->only_write_batch);
+    goto cleanup;
+  }
+
   /* Execute transfer */
-  if (config->use_multithreading) {
+  if (config->write_batch) {
+    exit_code = send_files(config);
+    if (exit_code == 0 && write_batch_from_source(config, config->write_batch) != 0) {
+      log_message(LOG_LEVEL_ERROR, "live transfer succeeded but batch emission failed");
+      exit_code = 1;
+    }
+  } else if (config->use_multithreading) {
     exit_code = send_files_multithreaded(&config);
   } else {
     exit_code = send_files(config);
