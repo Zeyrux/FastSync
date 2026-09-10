@@ -178,6 +178,9 @@ static void config_set_defaults(Config* config) {
   config->use_xattrs = false;
   config->fake_super = false;
   config->trust_sender = false;
+  config->stop_after_mins = 0;
+  config->stop_at = 0;
+  config->stop_at_set = false;
 }
 
 static bool valid_wire_bool(int value) {
