@@ -610,6 +610,8 @@ class TestDaemonMotd:
         try:
             result = self._push(port)
             assert result.returncode == 0, result.stderr or result.stdout
+            assert "FastSync test daemon" not in (result.stdout or "")
+            assert "banner" not in (result.stdout or "")
         finally:
             d.stop()
 
