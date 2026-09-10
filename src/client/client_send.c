@@ -1456,9 +1456,12 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   context->scan_stopped_early =
       context->scan_stopped_early || stop_condition_reached(&context->stop_condition);
   if (context->scan_stopped_early) {
-    log_message(LOG_LEVEL_WARNING,
-                "transfer stopped early (stop deadline); skipping --delete keep-set so "
-                "unscanned source mirrors are not deleted");
+    if (context->config->use_delete || context->config->delete_missing_args)
+      log_message(LOG_LEVEL_WARNING,
+                  "transfer stopped early (stop deadline); skipping --delete keep-set so "
+                  "unscanned source mirrors are not deleted");
+    else
+      log_message(LOG_LEVEL_WARNING, "transfer stopped early (stop deadline)");
   } else if (context->config->use_delete && !context->early_delete) {
     /* Empty keep-set + scan I/O error must not delete the whole destination
        (the source may not be genuinely empty -- see send_files). */
@@ -1911,9 +1914,12 @@ int send_files(Config* config) {
      loss), so the late delete manifest is suppressed below. */
   scan_stopped_early = scan_stopped_early || stop_condition_reached(&stop);
   if (scan_stopped_early) {
-    log_message(LOG_LEVEL_WARNING,
-                "transfer stopped early (stop deadline); skipping --delete keep-set so "
-                "unscanned source mirrors are not deleted");
+    if (config->use_delete || config->delete_missing_args)
+      log_message(LOG_LEVEL_WARNING,
+                  "transfer stopped early (stop deadline); skipping --delete keep-set so "
+                  "unscanned source mirrors are not deleted");
+    else
+      log_message(LOG_LEVEL_WARNING, "transfer stopped early (stop deadline)");
   } else {
     if (had_scan_io && manifest && manifest->size == 0) {
       /* A scan that hit an I/O error and produced no keep entries is ambiguous;

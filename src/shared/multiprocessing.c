@@ -31,6 +31,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
   context->early_delete = false;
+  context->scan_stopped_early = false;
   context->total_files = 0;
   context->progress_bytes = 0;
   context->total_bytes = 0;

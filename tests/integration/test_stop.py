@@ -172,7 +172,7 @@ class TestStopPartial:
         run returns 0 without corrupting any file."""
         source, dest = _make("partial")
         _seed_many(source, count=60, size=32 * 1024)
-        flags = ["--chunk-size", "262144", "--bwlimit", "300", "--stop-at=now+3s"]
+        flags = ["--chunk-size", "262144", "--bwlimit", "100", "--stop-at=now+3s"]
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, \
             f"mid-transfer stop failed (rc {result.returncode}): " \
