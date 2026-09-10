@@ -470,6 +470,19 @@ typedef struct Config {
   int stop_after_mins; /* --stop-after=MINS minutes; 0 when unset */
   time_t stop_at;      /* --stop-at=... absolute wall-clock deadline */
   bool stop_at_set;    /* true when --stop-at was given */
+
+  // Phase 6: --write-batch / --only-write-batch / --read-batch
+  /* Client-only residual-batch paths.  A residual batch is a self-contained
+   * single-file record of the whole source tree (full file images using the
+   * chunk codec), independent of any live server.  --write-batch=FILE runs the
+   * normal live transfer AND additionally emits the batch FILE;
+   * --only-write-batch=FILE emits FILE only (no destination, no server);
+   * --read-batch=FILE applies FILE to the destination (no source, no server).
+   * All three are LOCAL to the driving process and are NEVER serialized into
+   * the config frame (the batch paths bypass the transport entirely). */
+  char* write_batch;       /* --write-batch=FILE path, or NULL */
+  char* only_write_batch;  /* --only-write-batch=FILE path, or NULL */
+  char* read_batch;        /* --read-batch=FILE path, or NULL */
 } Config;
 
 /* Phase 5 (remote-option wave): 2.13.0 -> 2.14.0.

@@ -44,6 +44,12 @@ void print_usage(void) {
   printf("  --protocol=NUM       Force the wire protocol version (must equal the current\n");
   printf("                       PROTOCOL_VERSION; FastSync cannot speak older/virtual\n");
   printf("                       wire formats)\n");
+  printf("  --write-batch=FILE    Run the normal live transfer AND also emit a\n");
+  printf("                       self-contained batch file of the whole source tree\n");
+  printf("  --only-write-batch=FILE\n");
+  printf("                       Emit the batch file only (no destination, no server)\n");
+  printf("  --read-batch=FILE     Apply the batch file to the destination (no source, no\n");
+  printf("                       server); takes only the destination as an argument\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("                      (default timing: delete only after the whole\n");
   printf("                      transfer has succeeded)\n");

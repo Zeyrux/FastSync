@@ -181,6 +181,9 @@ static void config_set_defaults(Config* config) {
   config->stop_after_mins = 0;
   config->stop_at = 0;
   config->stop_at_set = false;
+  config->write_batch = NULL;
+  config->only_write_batch = NULL;
+  config->read_batch = NULL;
 }
 
 static bool valid_wire_bool(int value) {
@@ -631,6 +634,9 @@ void config_delete(Config* config) {
   free(config->auth_password_hash);
   free(config->password_file);
   free(config->iconv_spec);
+  free(config->write_batch);
+  free(config->only_write_batch);
+  free(config->read_batch);
   free(config->fastsync_server_path);
   for (int i = 0; i < config->exclude_count; i++)
     free(config->exclude_patterns[i]);

@@ -604,6 +604,14 @@ static const OptionEntry OPTION_TABLE[] = {
      * any network I/O.  Client-only: the server does not negotiate, it just
      * enforces an exact match. */
     {"--protocol", NULL, OPT_STRING, offsetof(Config, version)},
+    /* Phase 6 residual-batch (client-only): --write-batch=FILE runs the normal
+     * live transfer AND also emits the self-contained batch FILE;
+     * --only-write-batch=FILE emits FILE only (no destination, no server);
+     * --read-batch=FILE applies FILE to the destination (no source, no server).
+     * All three are LOCAL driver flags and never cross the wire. */
+    {"--write-batch", NULL, OPT_STRING, offsetof(Config, write_batch)},
+    {"--only-write-batch", NULL, OPT_STRING, offsetof(Config, only_write_batch)},
+    {"--read-batch", NULL, OPT_STRING, offsetof(Config, read_batch)},
     {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
