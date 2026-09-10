@@ -1,5 +1,6 @@
 #include "client_send.h"
 #include "array_list.h"
+#include "batch.h"
 #include "change_list.h"
 #include "charset.h"
 #include "chunk.h"
@@ -1716,6 +1717,78 @@ static int progress_thread_fn(void* arg) {
     thrd_sleep(&ts, NULL);
   }
   return thrd_success;
+}
+
+/* Phase 6 residual-batch (client-only).  --write-batch=FILE / --only-write-batch
+ * emit a self-contained single-file batch of a whole source tree from a
+ * deterministic separate scan pass.  Each chunk's file images are fully loaded
+ * into memory (so chunk_serialize sees complete content, matching the -s wire
+ * codec byte-for-byte) and written to FILE as a length-prefixed record.  The
+ * batch never crosses the wire and needs no server.  Returns 0 on success. */
+int write_batch_from_source(const Config* config, const char* batch_path) {
+  if (!config || !batch_path || !config->send_directory)
+    return 1;
+  PreparedScanner prepared;
+  memset(&prepared, 0, sizeof(prepared));
+  if (!prepare_scanner(config, 0, &prepared))
+    return 1;
+  DirectoryScanner* scanner =
+      directory_scanner_create_with_options(config->send_directory, &prepared.options);
+  if (!scanner) {
+    prepared_scanner_destroy(&prepared);
+    return 1;
+  }
+  int fd = open(batch_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    log_perror("could not create batch file");
+    directory_scanner_destroy(scanner);
+    prepared_scanner_destroy(&prepared);
+    return 1;
+  }
+  bool ok = batch_write_header(fd, config);
+  Chunk* chunk;
+  while (ok && (chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count && ok; i++) {
+      File* f = chunk->items[i];
+      if (f == NULL || f->data == NULL)
+        continue;
+      if (f->data->size > 0 && f->data->data == NULL && !file_load_data(f)) {
+        log_message(LOG_LEVEL_ERROR, "batch: failed to load data for %s",
+                    f->path ? f->path : "<no path>");
+        ok = false;
+        break;
+      }
+    }
+    if (ok)
+      ok = batch_write_chunk(fd, chunk);
+    chunk_destroy(chunk);
+  }
+  if (ok && directory_scanner_failed(scanner))
+    ok = false;
+  if (directory_scanner_had_io_error(scanner))
+    log_message(LOG_LEVEL_WARNING, "batch: source scan hit an unreadable directory");
+  close(fd);
+  directory_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
+  if (!ok && batch_path[0] != '\0')
+    unlink(batch_path); /* never leave a partial batch behind */
+  return ok ? 0 : 1;
+}
+
+/* Apply a batch FILE to DEST_ROOT (client-only, no server).  Returns 0 on
+ * success; a malformed/truncated/oversized record or an apply error fails the
+ * whole apply. */
+int apply_batch_to_dest(const Config* config, const char* batch_path, const char* dest_root) {
+  if (!batch_path || !dest_root)
+    return 1;
+  int fd = open(batch_path, O_RDONLY);
+  if (fd < 0) {
+    log_perror("could not open batch file");
+    return 1;
+  }
+  int rc = batch_read_apply(fd, config, dest_root);
+  close(fd);
+  return rc;
 }
 
 int send_files(Config* config) {

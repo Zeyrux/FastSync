@@ -1,4 +1,5 @@
 #include "test_array_list.h"
+#include "test_batch.h"
 #include "test_chunk.h"
 #include "test_change_list.h"
 #include "test_checksum.h"
@@ -50,6 +51,7 @@ int main() {
   RUN_TEST(test_array_list);
   RUN_TEST(test_shared_utils);
   RUN_TEST(test_chunk);
+  RUN_TEST(test_batch);
   RUN_TEST(test_change_list);
   RUN_TEST(test_config);
   RUN_TEST(test_credentials);
