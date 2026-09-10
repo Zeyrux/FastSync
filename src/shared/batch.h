@@ -13,8 +13,12 @@
 #define BATCH_MAGIC "FSTRESBATCH"
 #define BATCH_MAGIC_LEN 11
 #define BATCH_FORMAT_VERSION 1
-/* A single deserialized record is bounded by the chunk codec's 64 MB cap
- * (the same per-file data cap chunk_deserialize enforces). */
+/* Max size of a single length-prefixed record (a whole serialized chunk,
+ * which can span several files).  A single source file near the 64 MB wire
+ * limit plus per-file headers can produce a record slightly over 64 MB, so a
+ * large file just under the wire cap may be refused by the batch writer; this
+ * is documented upstream and the failure is clean (the partial batch is
+ * unlinked), never a truncated/corrupt batch. */
 #define BATCH_MAX_RECORD (64ULL * 1024 * 1024)
 
 bool batch_write_header(int fd, const Config* config);

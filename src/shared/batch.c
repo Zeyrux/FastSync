@@ -128,7 +128,7 @@ int batch_read_apply(int fd, const Config* config, const char* dest_root) {
       log_message(LOG_LEVEL_ERROR, "batch: could not allocate a %llu-byte record", length);
       return -1;
     }
-    if (!read_exact(fd, record, (size_t)length, &eof)) {
+    if (!read_exact(fd, record, (size_t)length, &eof) || eof) {
       log_message(LOG_LEVEL_ERROR, "batch: truncated chunk record");
       free(record);
       return -1;

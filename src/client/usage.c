@@ -46,6 +46,7 @@ void print_usage(void) {
   printf("                       wire formats)\n");
   printf("  --write-batch=FILE    Run the normal live transfer AND also emit a\n");
   printf("                       self-contained batch file of the whole source tree\n");
+  printf("                       (implies the single-threaded transfer path)\n");
   printf("  --only-write-batch=FILE\n");
   printf("                       Emit the batch file only (no destination, no server)\n");
   printf("  --read-batch=FILE     Apply the batch file to the destination (no source, no\n");

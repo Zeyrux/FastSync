@@ -179,10 +179,77 @@ static void test_batch_reject_oversized() {
   unlink("batch_big.bin");
 }
 
+/* A clean header followed by a length prefix with NO record bytes at all (clean
+ * EOF on the record-body read) must be rejected as truncated — it must not feed
+ * an uninitialized buffer to chunk_deserialize. Regression test for a
+ * confirmed uninitialized-read on the untrusted read side. */
+static void test_batch_reject_eof_after_prefix() {
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  int fd = open("batch_eof.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  EXPECT_TRUE(fd >= 0);
+  EXPECT_TRUE(batch_write_header(fd, config));
+  unsigned long long length = 32;
+  EXPECT_EQ_INT(write(fd, &length, sizeof(length)), (ssize_t)sizeof(length));
+  EXPECT_EQ_INT(close(fd), 0);
+  fd = open("batch_eof.bin", O_RDONLY);
+  EXPECT_TRUE(fd >= 0);
+  EXPECT_EQ_INT(batch_read_apply(fd, config, "batch_dest"), -1);
+  EXPECT_EQ_INT(close(fd), 0);
+  config_delete(config);
+  unlink("batch_eof.bin");
+}
+
+/* A malicious batch record whose chunk carries a path-traversal wire path must
+ * be refused by the apply path — never applied outside the destination root.
+ * We craft a chunk whose wire path is `../escape.txt` (the local source file
+ * is a benign temp file; only the transmitted path is hostile) and assert the
+ * apply refuses it and nothing is created outside the root. */
+static void test_batch_reject_traversal_path() {
+  const char* content = "hostile traversal image\n";
+  size_t content_len = strlen(content);
+  file_write_to_disk("batch_trav_src.txt", content, content_len, false, false);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat("batch_trav_src.txt", &st), 0);
+  File* f = file_create("batch_trav_src.txt");
+  EXPECT_NOT_NULL(f);
+  f->data->size = (unsigned long long)st.st_size;
+  EXPECT_TRUE(file_load_data(f));
+  f->send_path = str_dup("../escape.txt");
+  EXPECT_NOT_NULL(f->send_path);
+  File* files[1] = {f};
+  Chunk* chunk = chunk_create(files, 1);
+  EXPECT_NOT_NULL(chunk);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+
+  int wfd = open("batch_trav.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  EXPECT_TRUE(wfd >= 0);
+  EXPECT_TRUE(batch_write_header(wfd, config));
+  EXPECT_TRUE(batch_write_chunk(wfd, chunk));
+  EXPECT_EQ_INT(close(wfd), 0);
+  chunk_destroy(chunk); /* frees f and f->send_path */
+
+  int rfd = open("batch_trav.bin", O_RDONLY);
+  EXPECT_TRUE(rfd >= 0);
+  EXPECT_EQ_INT(batch_read_apply(rfd, config, "batch_dest"), -1);
+  EXPECT_EQ_INT(close(rfd), 0);
+  unlink("../escape.txt"); /* clear any stale file so the probe below is clean */
+  EXPECT_TRUE(access("../escape.txt", F_OK) != 0);
+
+  config_delete(config);
+  unlink("batch_trav.bin");
+  unlink("batch_trav_src.txt");
+}
+
 void test_batch() {
   test_batch_roundtrip();
   test_batch_roundtrip_metadata();
   test_batch_reject_bad_magic();
   test_batch_reject_truncated();
   test_batch_reject_oversized();
+  test_batch_reject_eof_after_prefix();
+  test_batch_reject_traversal_path();
 }
