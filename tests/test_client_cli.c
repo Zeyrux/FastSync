@@ -266,6 +266,7 @@ static void test_validate_config_protocol_version() {
   EXPECT_NOT_NULL(cfg);
   free(cfg->version);
   cfg->version = str_dup("2.15.0");
+  EXPECT_NOT_NULL(cfg->version);
   EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
@@ -1854,7 +1855,8 @@ static void test_parse_args_table_equals_string_and_int_options() {
  * generic "Unknown option", when they are the final argv entry. */
 static void test_parse_args_missing_argument_diagnostic() {
   static const char* const options[] = {"--exclude", "--server-port", "--skip-compress",
-                                        "-T",        "--out-format",  "--log-file-format"};
+                                        "-T",        "--out-format",  "--log-file-format",
+                                        "--protocol"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
