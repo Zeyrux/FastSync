@@ -5,6 +5,7 @@
 #include "test_client_cli.h"
 #include "test_compression.h"
 #include "test_config.h"
+#include "test_credentials.h"
 #include "test_data.h"
 #include "test_daemon_conf.h"
 #include "test_delay_updates.h"
@@ -48,6 +49,7 @@ int main() {
   RUN_TEST(test_chunk);
   RUN_TEST(test_change_list);
   RUN_TEST(test_config);
+  RUN_TEST(test_credentials);
   RUN_TEST(test_compression);
   RUN_TEST(test_scanner);
   RUN_TEST(test_checksum);

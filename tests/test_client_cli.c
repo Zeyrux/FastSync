@@ -2772,6 +2772,26 @@ static void test_parse_args_remote_option_no_short_M() {
   config_delete(cfg);
 }
 
+/* --password-file stores its path on the config (the file is read later, once
+ * the destination form is known). */
+static void test_parse_args_password_file() {
+  Config* cfg = valid_client_config();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync",   "--source-dir", "/src",
+                  "--dest-dir", "/dst",         "--password-file=/etc/fast.pw"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->password_file, "/etc/fast.pw");
+
+  char* argv2[] = {"fastsync", "--source-dir",    "/src",         "--dest-dir",
+                   "/dst",     "--password-file", "/etc/other.pw"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->password_file, "/etc/other.pw");
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -2914,4 +2934,5 @@ void test_client_cli() {
   test_parse_args_remote_option_missing_value();
   test_parse_args_remote_option_rejects_bad_values();
   test_parse_args_remote_option_no_short_M();
+  test_parse_args_password_file();
 }

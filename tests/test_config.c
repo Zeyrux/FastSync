@@ -245,6 +245,88 @@ static void test_config_module_wire_empty_canonicalizes_to_null() {
   }
 }
 
+/* Daemon auth credentials (Wave B) ride the config frame: username + SHA-256
+ * hex digest are present together, or both are absent.  Round-trip a present
+ * pair. */
+static void test_config_daemon_auth_wire_roundtrip() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("rel/path");
+  send_cfg->module = str_dup("backup");
+  send_cfg->auth_user = str_dup("alice");
+  send_cfg->auth_password_hash =
+      str_dup("9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->auth_user != NULL &&
+              strcmp(recv_cfg->auth_user, "alice") == 0 && recv_cfg->auth_password_hash != NULL &&
+              strcmp(recv_cfg->auth_password_hash,
+                     "9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3") == 0;
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* The receive side validates the auth payload: a present-but-malformed digest
+ * is refused (config_receive returns NULL), so a hostile peer cannot slip a
+ * garbage credential past the receive guard into the module gate. */
+static void test_config_daemon_auth_wire_rejects_malformed() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  send_cfg->module = str_dup("m");
+  send_cfg->auth_user = str_dup("alice");
+  send_cfg->auth_password_hash = str_dup("not-a-valid-sha256-hex-digest!!");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg == NULL;
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 /* A module gate that rejects any connection that names a module. */
 static const char* reject_named_module_gate(const Config* config, void* context) {
   (void)context;
@@ -1524,6 +1606,8 @@ void test_config() {
     test_config_phase4_xattr_wire_roundtrip();
     test_config_module_wire_roundtrip();
     test_config_module_wire_empty_canonicalizes_to_null();
+    test_config_daemon_auth_wire_roundtrip();
+    test_config_daemon_auth_wire_rejects_malformed();
     test_config_receive_with_validate_rejects();
   }
   test_config_delete_timing_early_helper();

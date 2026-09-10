@@ -95,6 +95,20 @@ typedef struct Config {
    * string so the daemon can look the module up in its own config and confine
    * the connection to the module's root (never a client-chosen root). */
   char* module;
+  /* Daemon password authentication (Wave B, protocol 2.15.0, WITHIN the Wave A
+   * frame layout -- see the PROTOCOL_VERSION note below for why this is not a
+   * bump).  Client-composed from a --password-file whose first meaningful line
+   * is `user:password`: the client sends ONLY the username and a SHA-256 hex
+   * digest of the password (auth_user + auth_password_hash), never the literal
+   * password.  Both are NULL when the client has no credentials to present; a
+   * module WITHOUT `auth users` stays open and the server ignores any
+   * credentials that do arrive (the client sends them opportunistically and
+   * the server decides). */
+  char* auth_user;
+  char* auth_password_hash;
+  /* Client-only path of --password-file (never crosses the wire; it is read to
+   * populate auth_user/auth_password_hash before connecting). */
+  char* password_file;
   char* fastsync_server_path;
   char** exclude_patterns;
   int exclude_count;
@@ -458,7 +472,14 @@ typedef struct Config {
  * is what keeps a 2.15 client and a 2.14 server from ever reaching that state.
  *
  * NOTE: daemon module-selection bump owned by Wave A (2.15.0); later daemon
- * waves (auth, motd) must not bump PROTOCOL_VERSION. */
+ * waves (auth, motd) must not bump PROTOCOL_VERSION.  Wave B (auth) adds the
+ * credential fields (auth_user/auth_password_hash) as further trailing
+ * config-frame strings AFTER the Wave A module string, with a presence int
+ * prefix.  This is not a new frame version: sender and receiver of a 2.15.0
+ * build always read and write the same full layout (the strict same-version
+ * handshake rejects any other version before a byte of the frame is parsed),
+ * so a peer can never desynchronize on the added tail.  The 2.15.0 release
+ * ships Wave A + Wave B together; the bump stays owned by Wave A. */
 #define PROTOCOL_VERSION "2.15.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */

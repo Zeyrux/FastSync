@@ -141,6 +141,41 @@ static void test_server_cli_invalid() {
   server_cli_options_free(&opts);
 }
 
+static void test_server_cli_password_and_early_input() {
+  const char* args[] = {"s", "--daemon", "--password-file=/etc/fast.pw", "--early-input",
+                        "/run/secrets"};
+  ServerCliOptions opts;
+  EXPECT_EQ_INT(parse_ok(args, 5, &opts), 0);
+  EXPECT_EQ_STR(opts.password_file, "/etc/fast.pw");
+  EXPECT_EQ_STR(opts.early_input_file, "/run/secrets");
+
+  const char* args2[] = {"s", "--daemon", "--password-file", "/etc/fast.pw",
+                         "--early-input=/secrets"};
+  ServerCliOptions opts2;
+  EXPECT_EQ_INT(parse_ok(args2, 5, &opts2), 0);
+  EXPECT_EQ_STR(opts2.password_file, "/etc/fast.pw");
+  EXPECT_EQ_STR(opts2.early_input_file, "/secrets");
+  server_cli_options_free(&opts);
+  server_cli_options_free(&opts2);
+}
+
+static void test_server_cli_password_requires_daemon() {
+  char err[256];
+  ServerCliOptions opts;
+  const char* a1[] = {"s", "--password-file", "/etc/fast.pw"};
+  EXPECT_EQ_INT(server_cli_parse(3, (char**)a1, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "require --daemon") != NULL);
+
+  const char* a2[] = {"s", "--early-input", "/secrets"};
+  EXPECT_EQ_INT(server_cli_parse(3, (char**)a2, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "require --daemon") != NULL);
+
+  const char* a3[] = {"s", "--daemon", "--password-file"};
+  EXPECT_EQ_INT(server_cli_parse(3, (char**)a3, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "missing argument") != NULL);
+  server_cli_options_free(&opts);
+}
+
 static void test_server_cli_help() {
   char err[256];
   const char* a1[] = {"s", "--help"};
@@ -157,5 +192,7 @@ void test_server_cli() {
   test_server_cli_preserves_existing_flags();
   test_server_cli_conflicts();
   test_server_cli_invalid();
+  test_server_cli_password_and_early_input();
+  test_server_cli_password_requires_daemon();
   test_server_cli_help();
 }

@@ -4,9 +4,15 @@ These exercise the Wave A daemon foundation end to end: a fastsync-server
 started with --daemon reads a FastSync-native module config file, the client
 asks for a module with a host::module/path destination, and the transfer lands
 in the configured module root only.  Read-only modules, unknown modules, and
-auth-required modules are all refused cleanly before any data moves.
+auth-required modules without valid credentials are all refused cleanly before
+any data moves.  Wave B (daemon authentication) adds the real credential
+round-trips exercised in TestDaemonAuthentication: modules that declare
+`auth users` accept only a client whose --password-file presents a username on
+the module's list with a matching password (verified as a SHA-256 digest), and
+the daemon refuses to start when such a module has no credential store.
 """
 import glob
+import hashlib
 import os
 import shutil
 import signal
@@ -34,10 +40,30 @@ MODULE_ROOT = os.path.join(TEST_DATA_DIR, "daemon_modules")
 FILES_MODULE = os.path.join(MODULE_ROOT, "files")
 READONLY_MODULE = os.path.join(MODULE_ROOT, "readonly")
 AUTH_MODULE = os.path.join(MODULE_ROOT, "auth")
+TEAM_MODULE = os.path.join(MODULE_ROOT, "team")
 CONF_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.conf")
+CRED_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.passwd")
+STARTFAIL_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_startfail.conf")
+STARTFAIL_PORT = None
 DETACH_MODULE = os.path.join(MODULE_ROOT, "detach")
 DETACH_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.conf")
 DETACH_PORT = None
+
+# Passwords are never sent as plaintext and never logged; these literals are
+# only hashed into the server credential file / client password file.
+ALICE_PASS = "alice-s3cret"
+BOB_PASS = "bob-s3cret"
+WRONG_PASS = "wrong-password"
+
+
+def _pw_hash(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def _write_client_password_file(path, user, password):
+    with open(path, "w") as f:
+        f.write("%s:%s\n" % (user, password))
+    return path
 
 
 def _kill_by_cmdline_marker(marker):
@@ -67,7 +93,7 @@ class DaemonManager:
         self._proc = None
         self._port = None
 
-    def start(self, config_path, port_override=None):
+    def start(self, config_path, port_override=None, extra_args=None):
         self.stop()
         # When no override is given the daemon binds the config file's `port`
         # (the plain config-port path); with an override the --dparam path.
@@ -76,6 +102,8 @@ class DaemonManager:
                              "--no-detach"])
         if port_override is not None:
             cmd += ["--dparam", f"port={port_override}"]
+        if extra_args:
+            cmd += extra_args
         log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         log = open(log_path, "w")
         self._proc = subprocess.Popen(
@@ -121,10 +149,17 @@ def _config_port(config_path):
 
 @pytest.fixture(scope="module", autouse=True)
 def daemon_env():
-    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, DETACH_MODULE):
+    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, DETACH_MODULE):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     generate_test_files(SOURCE_DIR, full=False)
+
+    # Server-side credential store: alice and bob (password digests only; the
+    # plaintext passwords never appear on the daemon host or in any log).
+    with open(CRED_FILE, "w") as f:
+        f.write("# daemon credential store (Wave B)\n")
+        f.write("alice:%s\n" % _pw_hash(ALICE_PASS))
+        f.write("bob:%s\n" % _pw_hash(BOB_PASS))
 
     # The config's port is a free port chosen per worker; the `daemon` fixture
     # boots on it (the config-port path) and the --dparam override test boots a
@@ -145,7 +180,20 @@ def daemon_env():
             "[locked]\n"
             "path = %s\n"
             "auth users = alice\n"
-            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE))
+            "\n"
+            "[team]\n"
+            "path = %s\n"
+            "auth users = alice,bob\n"
+            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE))
+
+    # A dedicated config for the fail-closed startup check: an auth-required
+    # module with no credential store must refuse to start.  Its own free port
+    # keeps it independent of the running daemon.
+    global STARTFAIL_PORT
+    STARTFAIL_PORT = _find_free_port()
+    with open(STARTFAIL_CONF, "w") as f:
+        f.write("port = %d\n\n[locked]\npath = %s\nauth users = alice\n"
+                % (STARTFAIL_PORT, AUTH_MODULE))
 
     # A dedicated config for the real (double-fork) detach test: an unique path
     # lets cleanup identify and kill the orphaned background daemon by cmdline.
@@ -163,7 +211,7 @@ def daemon_env():
 @pytest.fixture(scope="module")
 def daemon():
     d = DaemonManager()
-    d.start(CONF_FILE)
+    d.start(CONF_FILE, extra_args=["--password-file", CRED_FILE])
     yield d
     d.stop()
 
@@ -171,6 +219,23 @@ def daemon():
 def _push(dest, port):
     result, _ = run_client(SOURCE_DIR, dest, port=port)
     return result
+
+
+def _push_with_creds(dest, port, user, password):
+    """Push using a --password-file carrying user:password (a fresh temp file
+    each call so tests never share mutable state)."""
+    cred_path = os.path.join(TEST_DATA_DIR, f"client_{user}_{os.getpid()}_{time.time_ns()}.pw")
+    _write_client_password_file(cred_path, user, password)
+    try:
+        result, _ = run_client(SOURCE_DIR, dest, port=port,
+                               extra_args=["--password-file", cred_path])
+        return result
+    finally:
+        os.unlink(cred_path)
+
+
+def _tree_file_count(root):
+    return sum(len(files) for _, _, files in os.walk(root)) if os.path.exists(root) else 0
 
 
 class TestDaemonModuleSelection:
@@ -211,8 +276,7 @@ class TestDaemonRejection:
     def test_read_only_module_blocked(self, daemon):
         result = _push("127.0.0.1::readonly", daemon.port)
         assert result.returncode != 0
-        file_count = sum(len(files) for _, _, files in os.walk(READONLY_MODULE))
-        assert file_count == 0, "read-only module must not receive any file"
+        assert _tree_file_count(READONLY_MODULE) == 0, "read-only module must not receive a file"
 
     def test_read_only_no_write_anywhere(self, daemon):
         """A refused read-only transfer must not add a single file anywhere under
@@ -249,11 +313,12 @@ class TestDaemonRejection:
         result = _push("127.0.0.1::files/../..", daemon.port)
         assert result.returncode != 0
 
-    def test_auth_required_module_rejected(self, daemon):
+    def test_auth_module_without_credentials_rejected(self, daemon):
+        """Wave B: an auth-required module refuses a client that presents no
+        credentials (the daemon does not fall open)."""
         result = _push("127.0.0.1::locked", daemon.port)
         assert result.returncode != 0
-        file_count = sum(len(files) for _, _, files in os.walk(AUTH_MODULE))
-        assert file_count == 0
+        assert _tree_file_count(AUTH_MODULE) == 0
 
     @pytest.mark.daemon_detach
     def test_real_detach_path(self):
@@ -282,6 +347,7 @@ class TestDaemonRejection:
         log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_noauth.log")
         log = open(log_path, "w")
         cmd = SERVER_CMD + ["--daemon", "--config", CONF_FILE, "--no-detach",
+                            "--password-file", CRED_FILE,
                             "--dparam", f"port={port}"]
         d._proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
                                    start_new_session=True)
@@ -297,7 +363,7 @@ class TestDaemonRejection:
         """--dparam port=N overrides the config's port and the daemon serves on N."""
         override = _find_free_port()
         d = DaemonManager()
-        d.start(CONF_FILE, port_override=override)
+        d.start(CONF_FILE, port_override=override, extra_args=["--password-file", CRED_FILE])
         try:
             result = _push("127.0.0.1::files", override)
             assert result.returncode == 0, result.stderr or result.stdout
@@ -306,3 +372,218 @@ class TestDaemonRejection:
             assert not missing, f"missing: {missing[:5]}"
         finally:
             d.stop()
+
+
+class TestDaemonAuthentication:
+    """Wave B password authentication round-trips on the shared daemon (its
+    config declares `locked` with `auth users = alice` and `team` with
+    `auth users = alice,bob`; the server runs with CRED_FILE holding alice and
+    bob digest entries)."""
+
+    def test_correct_password_succeeds(self, daemon):
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "alice", ALICE_PASS)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(AUTH_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def test_wrong_password_rejected_no_data(self, daemon):
+        before = _tree_file_count(AUTH_MODULE)
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "alice", WRONG_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == before, "wrong password must not write a file"
+
+    def test_unknown_user_rejected(self, daemon):
+        """A user with a valid-shaped password but no store entry is refused
+        (the daemon must not fall open for unknown users)."""
+        before = _tree_file_count(AUTH_MODULE)
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "mallory", WRONG_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == before
+
+    def test_user_not_on_module_list_rejected(self, daemon):
+        """bob's credentials verify against the store, but bob is not on the
+        `locked` module's auth users list, so the connection is refused."""
+        before = _tree_file_count(AUTH_MODULE)
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "bob", BOB_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == before
+
+    def test_second_module_user_succeeds(self, daemon):
+        """bob IS on the `team` module's list, so his correct password works
+        there (module list + credential store both gate)."""
+        result = _push_with_creds("127.0.0.1::team", daemon.port, "bob", BOB_PASS)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(TEAM_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def test_missing_password_file_rejected(self, daemon):
+        """A client with no --password-file at all is refused by an auth-required
+        module (no credentials on the wire)."""
+        result = _push("127.0.0.1::locked", daemon.port)
+        assert result.returncode != 0
+
+    def test_open_module_ignores_credentials(self, daemon):
+        """A module WITHOUT `auth users` stays open: credentials sent
+        opportunistically (even wrong ones) are ignored, not required."""
+        result = _push_with_creds("127.0.0.1::files", daemon.port, "alice", WRONG_PASS)
+        assert result.returncode == 0, result.stderr or result.stdout
+
+    def test_read_only_still_refuses_authenticated_client(self, daemon):
+        """Read-only is orthogonal to auth: an authenticated push to a read-only
+        module is still refused with no data written (Wave A behavior)."""
+        before = _tree_file_count(READONLY_MODULE)
+        result = _push_with_creds("127.0.0.1::readonly", daemon.port, "alice", ALICE_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(READONLY_MODULE) == before
+
+    def test_password_file_requires_daemon_dest(self, daemon):
+        """Client-side: --password-file without a host::module/path destination is
+        a client error (fail fast), not a silently ignored flag."""
+        cred_path = os.path.join(TEST_DATA_DIR, "client_local.pw")
+        _write_client_password_file(cred_path, "alice", ALICE_PASS)
+        try:
+            # A plain (non-::) destination with --password-file is rejected client-side.
+            cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR, "--dest-dir", "/tmp/local-dest-xyz",
+                                "--save-to-disk", "--password-file", cred_path,
+                                "--server-port", str(daemon.port)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            assert result.returncode != 0
+            assert "host::module/path" in (result.stderr or result.stdout)
+        finally:
+            os.unlink(cred_path)
+
+    def test_client_empty_password_file_rejected(self):
+        """Client-side: an empty --password-file is rejected (no credentials)."""
+        cred_path = os.path.join(TEST_DATA_DIR, "client_empty.pw")
+        with open(cred_path, "w") as f:
+            f.write("# nothing here\n")
+        try:
+            cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR,
+                                "--dest-dir", "127.0.0.1::files",
+                                "--save-to-disk", "--password-file", cred_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            assert result.returncode != 0
+            assert "no 'user:password'" in (result.stderr or result.stdout)
+        finally:
+            os.unlink(cred_path)
+
+    def test_daemon_fails_closed_without_credential_store(self):
+        """Fail-closed startup: a config with an auth-required module but no
+        --password-file/--early-input refuses to start (never serves open)."""
+        proc = subprocess.run(
+            SERVER_CMD + ["--daemon", "--config", STARTFAIL_CONF, "--no-detach"],
+            capture_output=True, text=True, timeout=15)
+        assert proc.returncode != 0
+        assert "fail closed" in (proc.stderr or proc.stdout)
+
+    def test_daemon_early_input_feeds_credential_store(self):
+        """--early-input is an alternative credential store source: a daemon
+        started with --early-input (and no --password-file) authenticates alice."""
+        d = DaemonManager()
+        port = _find_free_port()
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=["--early-input", CRED_FILE])
+            result = _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
+            assert result.returncode == 0, result.stderr or result.stdout
+            # Wrong password over the early-input store is still rejected.
+            result = _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
+            assert result.returncode != 0
+        finally:
+            d.stop()
+
+    def test_auth_log_does_not_leak_password(self, daemon):
+        """The daemon log must never contain the password or its digest."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        _push_with_creds("127.0.0.1::locked", daemon.port, "alice", WRONG_PASS)
+        _push_with_creds("127.0.0.1::locked", daemon.port, "alice", ALICE_PASS)
+        time.sleep(0.3)
+        with open(log_path, "rb") as f:
+            f.seek(before)
+            tail = f.read().decode("utf-8", "replace")
+        assert ALICE_PASS not in tail
+        assert WRONG_PASS not in tail
+        assert _pw_hash(ALICE_PASS) not in tail
+        assert _pw_hash(WRONG_PASS) not in tail
+
+
+def _generate_tls_certs(cert_dir):
+    """Generate a self-signed CA, server cert (with 127.0.0.1 SAN) and a client
+    cert signed by that CA, for the TLS+auth composition test."""
+    os.makedirs(cert_dir, exist_ok=True)
+    ca_key, ca_cert = os.path.join(cert_dir, "ca.key"), os.path.join(cert_dir, "ca.pem")
+    server_key = os.path.join(cert_dir, "server.key")
+    server_cert = os.path.join(cert_dir, "server.pem")
+    client_key = os.path.join(cert_dir, "client.key")
+    client_cert = os.path.join(cert_dir, "client.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", ca_key, "-out", ca_cert, "-days", "1",
+                    "-subj", "/CN=FastSync Test CA"], check=True, capture_output=True)
+    san = os.path.join(cert_dir, "san.conf")
+    with open(san, "w") as f:
+        f.write("[req]\ndistinguished_name = dn\nreq_extensions = v3_req\n\n"
+                "[dn]\nCN = localhost\n\n[v3_req]\nsubjectAltName = @an\n\n"
+                "[an]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\n")
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", server_key, "-out", os.path.join(cert_dir, "server.csr"),
+                    "-subj", "/CN=localhost", "-config", san], check=True, capture_output=True)
+    subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "server.csr"),
+                    "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+                    "-out", server_cert, "-days", "1",
+                    "-extfile", san, "-extensions", "v3_req"], check=True, capture_output=True)
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", client_key, "-out", os.path.join(cert_dir, "client.csr"),
+                    "-subj", "/CN=fastsync-client"], check=True, capture_output=True)
+    subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "client.csr"),
+                    "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+                    "-out", client_cert, "-days", "1"], check=True, capture_output=True)
+    return {
+        "ca": ca_cert,
+        "server_cert": server_cert,
+        "server_key": server_key,
+        "client_cert": client_cert,
+        "client_key": client_key,
+    }
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None,
+                    reason="openssl CLI required to mint test certificates")
+class TestDaemonTLSAuth:
+    """TLS + password-auth composition: --client-cn (TLS client identity) and
+    the module password credential check are independent; both can be required
+    on the same auth-required module.  Env-dependent: needs the openssl CLI."""
+
+    def test_tls_and_password_auth_compose(self):
+        cert_dir = os.path.join(TEST_DATA_DIR, "daemon_tls_certs")
+        certs = _generate_tls_certs(cert_dir)
+        client_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_client.pw")
+        _write_client_password_file(client_creds, "alice", ALICE_PASS)
+        d = DaemonManager()
+        port = _find_free_port()
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=[
+                "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
+                "--password-file", CRED_FILE])
+            tls_flags = ["--tls",
+                         "--cert", certs["client_cert"], "--key", certs["client_key"],
+                         "--ca", certs["ca"]]
+            # Correct password over TLS, with the right client CN: succeeds.
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::locked", port=port,
+                                   flags=tls_flags, extra_args=["--password-file", client_creds])
+            assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+            # Wrong password over TLS is still refused by the credential check.
+            bad_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_client_bad.pw")
+            _write_client_password_file(bad_creds, "alice", WRONG_PASS)
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::locked", port=port,
+                                   flags=tls_flags, extra_args=["--password-file", bad_creds])
+            assert result.returncode != 0
+            os.unlink(bad_creds)
+        finally:
+            d.stop()
+            os.unlink(client_creds)
+            shutil.rmtree(cert_dir, ignore_errors=True)

@@ -1,5 +1,6 @@
 #include "config.h"
 #include "chmod.h"
+#include "credentials.h"
 #include "daemon_conf.h"
 #include "delay_updates.h"
 #include "delta.h"
@@ -38,6 +39,9 @@ static void config_set_defaults(Config* config) {
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
   config->module = NULL;
+  config->auth_user = NULL;
+  config->auth_password_hash = NULL;
+  config->password_file = NULL;
   config->fastsync_server_path = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
@@ -508,13 +512,15 @@ int config_parse_daemon_dest(Config* config) {
     return 0;
 
   const char* colon = strchr(dest, ':');
-  /* user@host::module names a daemon auth user, which this daemon version
-   * cannot verify: reject it rather than silently ignoring the user (auth is
-   * Wave B). */
+  /* user@host::module names a daemon auth user.  FastSync takes the username
+   * from the --password-file (its first user:password line) so there is a
+   * single source of truth; an @user that could contradict it is rejected
+   * with a pointer to the supported form. */
   if (memchr(dest, '@', (size_t)(colon - dest)) != NULL)
-    return daemon_dest_parse_error("daemon destination user@host::module is not supported: user "
-                                   "authentication is not implemented by this daemon version",
-                                   dest);
+    return daemon_dest_parse_error(
+        "daemon destination user@host::module is not supported: supply the username with "
+        "--password-file (first line: user:password)",
+        dest);
   const char* host_start = dest;
 
   const char* module_and_path = colon + 2;
@@ -609,6 +615,9 @@ void config_delete(Config* config) {
   free(config->receive_root_directory);
   free(config->ssh_destination);
   free(config->module);
+  free(config->auth_user);
+  free(config->auth_password_hash);
+  free(config->password_file);
   free(config->fastsync_server_path);
   for (int i = 0; i < config->exclude_count; i++)
     free(config->exclude_patterns[i]);
@@ -1088,6 +1097,48 @@ static bool receive_daemon_module(int fd, Config* c) {
   return true;
 }
 
+/* Daemon password credentials (Wave B, within protocol 2.15.0 -- see the
+ * PROTOCOL_VERSION note in config.h: this rides the Wave A trailing-string
+ * area, symmetric sender+receiver in every 2.15.0 build, so it is not a frame
+ * layout that needs its own bump).  A single presence int is followed, when
+ * set, by the username and the SHA-256 hex digest of the password.  The
+ * literal password never crosses the wire. */
+static bool send_daemon_auth(int fd, const Config* c) {
+  bool present = c->auth_user != NULL && c->auth_password_hash != NULL && c->auth_user[0] != '\0' &&
+                 c->auth_password_hash[0] != '\0';
+  if (!send_int(fd, present ? 1 : 0))
+    return false;
+  if (!present)
+    return true;
+  return send_str(fd, c->auth_user) && send_str(fd, c->auth_password_hash);
+}
+
+static bool receive_daemon_auth(int fd, Config* c) {
+  int present;
+  if (!receive_int(fd, &present) || !valid_wire_bool(present))
+    return false;
+  if (!present)
+    return true;
+  char* user = receive_str(fd);
+  char* hash = receive_str(fd);
+  if (!user || !hash) {
+    free(user);
+    free(hash);
+    return false;
+  }
+  size_t user_len = strlen(user);
+  bool valid = user_len > 0 && user_len <= CREDENTIAL_MAX_USER_LEN && credentials_hash_valid(hash);
+  if (!valid) {
+    free(user);
+    free(hash);
+    log_message(LOG_LEVEL_WARNING, "Daemon client sent malformed auth credentials");
+    return false;
+  }
+  c->auth_user = user;
+  c->auth_password_hash = hash;
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -1100,7 +1151,7 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_metadata_times_options(file_descriptor, config) ||
       !send_symlink_trust_options(file_descriptor, config) ||
       !send_phase4_xattr_options(file_descriptor, config) ||
-      !send_daemon_module(file_descriptor, config))
+      !send_daemon_module(file_descriptor, config) || !send_daemon_auth(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -1141,7 +1192,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_metadata_times_options(file_descriptor, config) ||
       !receive_symlink_trust_options(file_descriptor, config) ||
       !receive_phase4_xattr_options(file_descriptor, config) ||
-      !receive_daemon_module(file_descriptor, config))
+      !receive_daemon_module(file_descriptor, config) ||
+      !receive_daemon_auth(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

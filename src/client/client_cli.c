@@ -3,6 +3,7 @@
 #include "chmod.h"
 #include "compression.h"
 #include "config.h"
+#include "credentials.h"
 #include "delta.h"
 #include "file.h"
 #include "file_list.h"
@@ -584,6 +585,11 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--old-d", NULL, OPT_FLAG, offsetof(Config, dirs)},
     {"--relative", "-R", OPT_FLAG, offsetof(Config, relative)},
     {"--mkpath", NULL, OPT_FLAG, offsetof(Config, mkpath)},
+    /* --password-file: client-only path to a `user:password` secret file used
+     * to authenticate a daemon (host::module/path) destination.  Stored as a
+     * path; main() reads it (after the destination form is known) and derives
+     * the wire credentials.  Never crosses the wire. */
+    {"--password-file", NULL, OPT_STRING, offsetof(Config, password_file)},
     {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
@@ -1440,6 +1446,55 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
 }
 
 #ifndef FASTSYNC_TEST_BUILD
+/* Daemon auth (Wave B): read --password-file and derive the wire credentials
+ * (username + SHA-256 hex digest of the password).  Runs once the destination
+ * form is known: the credentials only make sense for a daemon
+ * (host::module/path) destination, so a --password-file without one is a hard
+ * error here rather than a silently-ignored flag.  The literal password is
+ * hashed immediately and wiped from memory; only the digest (and username) are
+ * kept on the Config for config_send.  Returns 0 on success, -1 on error (the
+ * reason is logged; neither the password nor its digest is ever logged). */
+static int load_daemon_credentials(Config* config) {
+  if (!config->password_file)
+    return 0;
+  if (!config->module || config->module[0] == '\0') {
+    log_message(LOG_LEVEL_ERROR,
+                "--password-file requires a daemon destination (host::module/path)");
+    return -1;
+  }
+  char err[512];
+  char* user = NULL;
+  char* password = NULL;
+  if (credentials_read_secret_file(config->password_file, &user, &password, err, sizeof(err)) !=
+      0) {
+    log_message(LOG_LEVEL_ERROR, "%s", err);
+    return -1;
+  }
+  char hash[CREDENTIAL_HASH_HEX_LEN + 1];
+  if (!credentials_hash_password(password, hash)) {
+    log_message(LOG_LEVEL_ERROR, "failed to hash the password from '%s'", config->password_file);
+    credentials_burn(password, strlen(password));
+    free(password);
+    free(user);
+    return -1;
+  }
+  credentials_burn(password, strlen(password));
+  free(password);
+
+  free(config->auth_user);
+  free(config->auth_password_hash);
+  config->auth_user = user;
+  config->auth_password_hash = str_dup(hash);
+  if (!config->auth_password_hash) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed reading '%s'", config->password_file);
+    free(config->auth_user);
+    config->auth_user = NULL;
+    return -1;
+  }
+  log_info_message(LOG_INFO_MISC, "Loaded daemon credentials for user '%s'", config->auth_user);
+  return 0;
+}
+
 int main(int argc, char* argv[]) {
   /* The server may close a connection mid-stream (e.g. when it rejects an
      oversized delta).  Ignore SIGPIPE so that a broken TCP connection
@@ -1515,6 +1570,13 @@ int main(int argc, char* argv[]) {
    * transport, anything else stays local TCP.  An invalid daemon destination
    * already logged its reason and is a hard error here. */
   if (config_parse_transport_dest(config) < 0) {
+    exit_code = 1;
+    goto cleanup;
+  }
+
+  /* Daemon auth: read --password-file (if any) into the wire credentials now
+   * that the destination's module is known. */
+  if (load_daemon_credentials(config) != 0) {
     exit_code = 1;
     goto cleanup;
   }

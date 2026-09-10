@@ -24,6 +24,8 @@ typedef struct ServerCliOptions {
   bool port_set;                /* an explicit -p was given */
   int port;                     /* -p value (default 8080 when unset) */
   const char* config_path;      /* --config value, or NULL */
+  const char* password_file;    /* --password-file value, or NULL (daemon) */
+  const char* early_input_file; /* --early-input value, or NULL (daemon) */
   const char** dparams;         /* raw --dparam override strings */
   int dparam_count;
   const char* bind_address;   /* --address */
