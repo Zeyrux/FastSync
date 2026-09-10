@@ -1110,7 +1110,10 @@ static bool send_daemon_auth(int fd, const Config* c) {
     return false;
   if (!present)
     return true;
-  return send_str(fd, c->auth_user) && send_str(fd, c->auth_password_hash);
+  /* Redacted send: the username and hard-wired digest must never reach a
+   * --verbose debug log (they are replayable), while normal protocol strings
+   * keep their debug trace. */
+  return send_str_redacted(fd, c->auth_user) && send_str_redacted(fd, c->auth_password_hash);
 }
 
 static bool receive_daemon_auth(int fd, Config* c) {
@@ -1119,8 +1122,9 @@ static bool receive_daemon_auth(int fd, Config* c) {
     return false;
   if (!present)
     return true;
-  char* user = receive_str(fd);
-  char* hash = receive_str(fd);
+  /* Redacted receive: never log the incoming username/digest bodies. */
+  char* user = receive_str_redacted(fd);
+  char* hash = receive_str_redacted(fd);
   if (!user || !hash) {
     free(user);
     free(hash);

@@ -343,7 +343,10 @@ int credentials_read_secret_file(const char* path, char** user_out, char** passw
     }
     *colon = '\0';
     const char* user = trim_space(cursor);
-    const char* password = trim_space(colon + 1);
+    /* Preserve the password's exact bytes: only the line's trailing CR/LF was
+     * already stripped above.  Trimming leading/trailing space here would make
+     * a password that legitimately begins or ends with whitespace unusable. */
+    const char* password = colon + 1;
     if (!username_wellformed(user)) {
       set_error(err, err_size,
                 "password file '%s' line %d: invalid username (must be 1-%d "
@@ -389,6 +392,10 @@ int credentials_read_secret_file(const char* path, char** user_out, char** passw
   set_error(err, err_size, "password file '%s' contains no 'user:password' line", path);
 
 done:
+  /* Wipe the stack line (which may hold the literal password) before return.
+   * user/password were str_dup'd into their outputs on success, so the stack
+   * copy is the only remaining plaintext. */
+  credentials_burn(line, sizeof(line));
   fclose(fp);
   return result;
 }
@@ -399,6 +406,27 @@ void credentials_burn(char* secret, size_t len) {
   volatile char* p = (volatile char*)secret;
   for (size_t i = 0; i < len; i++)
     p[i] = '\0';
+}
+
+/* Constant-time equality over two usernames.  Compares a fixed
+ * CREDENTIAL_MAX_USER_LEN-byte window (padding with zeros past each string's
+ * own length) and folds the length difference into the accumulator, so no byte
+ * returns early.  This closes the byte-wise username-enumeration timing oracle
+ * that a plain strcmp (which short-circuits on the first differing byte)
+ * would otherwise expose.  Over-long inputs are refused (length differs), which
+ * is a non-secret branch: usernames are bounded in every caller anyway. */
+static bool username_secure_equal(const char* a, const char* b) {
+  size_t alen = strlen(a);
+  size_t blen = strlen(b);
+  if (alen > CREDENTIAL_MAX_USER_LEN || blen > CREDENTIAL_MAX_USER_LEN)
+    return false;
+  size_t diff = alen ^ blen;
+  for (size_t i = 0; i < CREDENTIAL_MAX_USER_LEN; i++) {
+    unsigned char ac = i < alen ? (unsigned char)a[i] : 0u;
+    unsigned char bc = i < blen ? (unsigned char)b[i] : 0u;
+    diff |= (size_t)(ac ^ bc);
+  }
+  return diff == 0;
 }
 
 /* Fixed 64-lowercase-hex dummy used for a constant-time digest comparison when
@@ -414,7 +442,9 @@ bool credentials_verify(const CredentialStore* store, const char* user,
     return false;
   const char* stored = k_dummy_hash;
   for (int i = 0; i < store->count; i++) {
-    if (strcmp(store->entries[i].user, user) == 0)
+    /* Constant-time username match: no early return, so time depends on the
+     * fixed compare window and a byte-wise prefix match cannot be observed. */
+    if (username_secure_equal(store->entries[i].user, user))
       stored = store->entries[i].password_hex;
   }
   return credentials_secure_equal(presented_hash_hex, stored, CREDENTIAL_HASH_HEX_LEN);
@@ -429,7 +459,9 @@ bool credentials_gate_allows(const CredentialStore* store, const char* const* mo
     return false; /* no credentials presented */
   bool on_module_list = false;
   for (int i = 0; i < module_user_count; i++) {
-    if (module_users[i] && strcmp(module_users[i], presented_user) == 0) {
+    /* Constant-time match against the module's auth-users list, for the same
+     * reason as credentials_verify, so the list is not an enumeration oracle. */
+    if (module_users[i] && username_secure_equal(module_users[i], presented_user)) {
       on_module_list = true;
       break;
     }

@@ -169,10 +169,15 @@ static void test_credentials_store_empty_and_null() {
 }
 
 static void test_credentials_store_overlong_line_rejected() {
+  /* A line longer than CREDENTIAL_MAX_LINE must be rejected.  Fill the buffer
+   * fully so the line really is overlong, but keep both a trailing newline and
+   * a NUL terminator at known indices: make_tmp_file does strlen(contents), so
+   * an unterminated stack buffer would be an out-of-bounds read (ASan). */
   char big[CREDENTIAL_MAX_LINE + 80];
   int n = snprintf(big, sizeof(big), "alice:%s", SHA256_SECRET);
   memset(big + n, 'a', sizeof(big) - (size_t)n - 1);
-  big[sizeof(big) - 1] = '\n';
+  big[sizeof(big) - 2] = '\n';
+  big[sizeof(big) - 1] = '\0';
   char* path = make_tmp_file(big);
   EXPECT_NOT_NULL(path);
   char err[512];
@@ -246,12 +251,26 @@ static void test_credentials_read_secret_file() {
   rm_temp(path);
   free(path);
 
-  /* CRLF and surrounding whitespace are tolerated. */
+  /* CRLF is tolerated; the username is trimmed but the password's exact bytes
+   * (edge spaces included) are preserved so a whitespace password stays usable. */
   path = make_tmp_file("  bob  :  s3cret  \r\n");
   EXPECT_NOT_NULL(path);
   EXPECT_EQ_INT(credentials_read_secret_file(path, &user, &password, err, sizeof(err)), 0);
   EXPECT_EQ_STR(user, "bob");
-  EXPECT_EQ_STR(password, "s3cret");
+  EXPECT_EQ_STR(password, "  s3cret  ");
+  free(user);
+  free(password);
+  user = password = NULL;
+  rm_temp(path);
+  free(path);
+
+  /* A whitespace-only password (no characters) is still a real password and is
+   * preserved exactly, not mistaken for an empty line. */
+  path = make_tmp_file("carol:   \n");
+  EXPECT_NOT_NULL(path);
+  EXPECT_EQ_INT(credentials_read_secret_file(path, &user, &password, err, sizeof(err)), 0);
+  EXPECT_EQ_STR(user, "carol");
+  EXPECT_EQ_STR(password, "   ");
   free(user);
   free(password);
   user = password = NULL;
@@ -278,8 +297,8 @@ static void test_credentials_read_secret_file_bad() {
       ":password\n",
       /* empty password */
       "alice:\n",
-      /* empty password after whitespace */
-      "alice:   \n",
+      /* empty password after CR-only line ending */
+      "alice:\r\n",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     char* path = make_tmp_file(cases[i]);

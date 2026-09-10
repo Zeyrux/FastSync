@@ -126,6 +126,12 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size);
 bool protocol_send_str(ProtocolSession* session, const char* data);
 char* protocol_receive_str(ProtocolSession* session);
+/* Redacted string variants: identical wire framing to protocol_send_str /
+ * protocol_receive_str, but the payload body is replaced by `<redacted>` in the
+ * LOG_DEBUG_PROTO debug log.  Used for secrets (daemon auth username/digest) so
+ * a --verbose log can never capture a replayable credential. */
+bool protocol_send_str_redacted(ProtocolSession* session, const char* data);
+char* protocol_receive_str_redacted(ProtocolSession* session);
 bool protocol_send_data(ProtocolSession* session, const Data* data);
 Data* protocol_receive_data(ProtocolSession* session);
 Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long maximum_size);
@@ -138,6 +144,9 @@ bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 
 bool send_str(int file_descriptor, const char* data);
 char* receive_str(int file_descriptor);
+/* Redacted fd-level string variants (see protocol_send_str_redacted). */
+bool send_str_redacted(int file_descriptor, const char* data);
+char* receive_str_redacted(int file_descriptor);
 bool send_data(int file_descriptor, const Data* data);
 Data* receive_data(int file_descriptor);
 Data* receive_data_limited(int file_descriptor, unsigned long long maximum_size);

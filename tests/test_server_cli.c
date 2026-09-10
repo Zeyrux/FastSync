@@ -101,6 +101,9 @@ static void test_server_cli_preserves_existing_flags() {
 }
 
 static void test_server_cli_conflicts() {
+  /* server_cli_parse zero-initializes opts (server_cli_options_default) before
+   * parsing, so `opts` is still safe to pass to server_cli_options_free even
+   * when every parse below returns -1 on failure. */
   char err[256];
   ServerCliOptions opts;
   const char* a1[] = {"s", "--daemon", "--stdio"};

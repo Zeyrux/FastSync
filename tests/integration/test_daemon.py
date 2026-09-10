@@ -510,6 +510,34 @@ class TestDaemonAuthentication:
         assert _pw_hash(ALICE_PASS) not in tail
         assert _pw_hash(WRONG_PASS) not in tail
 
+    def test_auth_digest_not_logged_at_debug_level(self):
+        """Under --verbose the daemon enables LOG_DEBUG_ALL, which normally
+        traces every protocol string -- the auth username/digest must NOT leak
+        into that trace even then.  The redacted marker is logged instead, and
+        the digest/username/password never appear while debug protocol logging
+        is actually proving itself active."""
+        d = DaemonManager()
+        port = _find_free_port()
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=["--verbose",
+                                                               "--password-file", CRED_FILE])
+            _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
+            _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
+            time.sleep(0.3)
+            log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+            with open(log_path, "rb") as f:
+                log = f.read().decode("utf-8", "replace")
+        finally:
+            d.stop()
+        # Debug protocol tracing is genuinely active on the server: the auth
+        # fields were received (redacted marker) so the leak path is exercised.
+        assert "Received String: <redacted>" in log
+        # The secret-worthy fields must never appear, at any log level.
+        assert ALICE_PASS not in log
+        assert WRONG_PASS not in log
+        assert _pw_hash(ALICE_PASS) not in log
+        assert _pw_hash(WRONG_PASS) not in log
+
 
 def _generate_tls_certs(cert_dir):
     """Generate a self-signed CA, server cert (with 127.0.0.1 SAN) and a client

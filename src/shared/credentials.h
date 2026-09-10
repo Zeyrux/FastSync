@@ -75,7 +75,11 @@ bool credentials_hash_password(const char* password, char* out_hex);
  * `user:password` (the literal password).  *user_out and *password_out are
  * freshly allocated on success (password is plaintext -- the caller hashes it
  * and then burns/frees it); both are NULL on error.  Returns 0 on success, -1
- * on failure (err filled: the path is named, never the credential itself). */
+ * on failure (err filled: the path is named, never the credential itself).
+ * Only the line's trailing CR/LF are stripped: the password's bytes are
+ * otherwise preserved exactly, so a password with leading/trailing whitespace
+ * (after the ':') is kept usable.  The username is trimmed of surrounding
+ * space/tabs. */
 int credentials_read_secret_file(const char* path, char** user_out, char** password_out, char* err,
                                  size_t err_size);
 
@@ -92,7 +96,9 @@ void credentials_burn(char* secret, size_t len);
  * the store holds an entry for `user` whose stored digest equals the presented
  * one.  A NULL store, NULL user/digest, unknown user and wrong digest all
  * return false.  The digest comparison runs over a fixed dummy whenever the
- * user is absent, so "unknown user" and "wrong password" take the same time
+ * user is absent, and the username lookup is a single constant-time
+ * full-length compare (no byte-wise early exit), so neither "unknown user" vs
+ * "wrong password" nor a username prefix match can be distinguished by timing
  * (no user-enumeration oracle in the comparison path). */
 bool credentials_verify(const CredentialStore* store, const char* user,
                         const char* presented_hash_hex);
@@ -103,7 +109,9 @@ bool credentials_verify(const CredentialStore* store, const char* user,
  * list AND to verify against the store.  Returns false (fail closed) when the
  * store is NULL, when no credential was presented, when the user is not on the
  * module's list, or when verification fails.  This is the single decision the
- * server_module_gate seam applies to an auth-required module. */
+ * server_module_gate seam applies to an auth-required module.  Like
+ * credentials_verify, username matches here use a constant-time full-length
+ * compare rather than a byte-wise-short-circuiting strcmp. */
 bool credentials_gate_allows(const CredentialStore* store, const char* const* module_users,
                              int module_user_count, const char* presented_user,
                              const char* presented_hash_hex);
