@@ -340,6 +340,12 @@ typedef struct Config {
   bool daemon;
   char* daemon_config;
   bool server_mode;
+  /* --no-motd (Wave C): CLIENT-ONLY, never crosses the wire.  Suppresses
+   * DISPLAY of the daemon's MOTD; the daemon still sends the MOTD frame, so
+   * the client reads and discards it to keep the stream in sync.  rsync's
+   * --no-motd is likewise a client-side display switch.  Default false (the
+   * MOTD is shown when a daemon offers one). */
+  bool no_motd;
 
   // PR #183: Checksum comparison
   bool checksum;
@@ -479,7 +485,15 @@ typedef struct Config {
  * build always read and write the same full layout (the strict same-version
  * handshake rejects any other version before a byte of the frame is parsed),
  * so a peer can never desynchronize on the added tail.  The 2.15.0 release
- * ships Wave A + Wave B together; the bump stays owned by Wave A. */
+ * ships Wave A + Wave B together; the bump stays owned by Wave A.
+ *
+ * Wave C (MOTD) adds NO config-frame field and no version bump either.  On the
+ * daemon listener path only, the server sends one MOTD string frame AFTER the
+ * config-frame STATUS_OK (server.c handler), and every 2.15.0 daemon client
+ * reads that frame right after the ack (client_send.c) -- symmetric
+ * server->client in every build, so the strict same-version handshake keeps the
+ * two peers in lockstep and nothing can desynchronize.  The --stdio SSH path
+ * sends/reads no MOTD at all. */
 #define PROTOCOL_VERSION "2.15.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */

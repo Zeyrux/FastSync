@@ -539,6 +539,99 @@ class TestDaemonAuthentication:
         assert _pw_hash(WRONG_PASS) not in log
 
 
+class TestDaemonMotd:
+    """Wave C MOTD: a daemon configured with a global `motd file` sends it to a
+    host::module/path client right after the config/auth handshake; the client
+    shows it on stdout unless --no-motd suppresses the display.  The MOTD is
+    escaped at display time so a hostile motd cannot inject terminal escapes.
+
+    Each test boots its own motd-configured daemon (the shared `daemon` fixture
+    config has no `motd file`).  The MOTD is only sent on the daemon listener
+    path; these all exercise `host::module` connections.
+    """
+
+    MOTD_MODULE = os.path.join(MODULE_ROOT, "motd_module")
+    MOTD_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_motd.conf")
+
+    def _start(self, motd_path):
+        port = _find_free_port()
+        motd_line = "motd file = %s\n" % motd_path if motd_path else ""
+        os.makedirs(self.MOTD_MODULE, exist_ok=True)
+        with open(self.MOTD_CONF, "w") as f:
+            f.write("port = %d\n%s\n[files]\npath = %s\n" % (port, motd_line, self.MOTD_MODULE))
+        d = DaemonManager()
+        d.start(self.MOTD_CONF, port_override=port)
+        return d, port
+
+    def _push(self, port, extra_args=None):
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=port,
+                               extra_args=extra_args)
+        return result
+
+    @pytest.mark.ci
+    def test_motd_displayed(self):
+        motd_path = os.path.join(TEST_DATA_DIR, "fastsyncd_motd_banner.txt")
+        banner = "Welcome to the FastSync test daemon\nSecond line here.\n"
+        with open(motd_path, "w") as f:
+            f.write(banner)
+        d, port = self._start(motd_path)
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "Welcome to the FastSync test daemon" in (result.stdout or "")
+            assert "Second line here." in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_no_motd_suppresses_display(self):
+        motd_path = os.path.join(TEST_DATA_DIR, "fastsyncd_motd_banner2.txt")
+        banner = "This banner must never be shown.\n"
+        with open(motd_path, "w") as f:
+            f.write(banner)
+        d, port = self._start(motd_path)
+        try:
+            result = self._push(port, extra_args=["--no-motd"])
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert banner.strip() not in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_absent_motd_file_no_error(self):
+        d, port = self._start(os.path.join(TEST_DATA_DIR, "no-such-motd-file.txt"))
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "no-such-motd" not in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_no_config_key_sends_no_banner(self):
+        d, port = self._start(None)
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+        finally:
+            d.stop()
+
+    def test_motd_control_bytes_are_escaped(self):
+        """A hostile motd (ANSI escape sequences) is displayed with every
+        control byte escaped octal-style, so no terminal escape reaches the
+        controlling terminal.  The transfer still succeeds (the motd is only
+        display text, never a wire/transfer hazard)."""
+        motd_path = os.path.join(TEST_DATA_DIR, "fastsyncd_motd_hostile.txt")
+        with open(motd_path, "w") as f:
+            f.write("hello\033[31mred\033[0m\n")
+        d, port = self._start(motd_path)
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "\x1b" not in (result.stdout or ""), "raw ESC byte leaked to stdout"
+            assert "\\#033[31m" in (result.stdout or ""), result.stdout
+            assert "\\#033[0m" in (result.stdout or ""), result.stdout
+        finally:
+            d.stop()
+
+
 def _generate_tls_certs(cert_dir):
     """Generate a self-signed CA, server cert (with 127.0.0.1 SAN) and a client
     cert signed by that CA, for the TLS+auth composition test."""

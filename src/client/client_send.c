@@ -11,6 +11,7 @@
 #include "filter.h"
 #include "hardlink.h"
 #include "metadata.h"
+#include "motd.h"
 #include "log.h"
 #include "multiprocessing.h"
 #include "protocol.h"
@@ -357,6 +358,36 @@ static bool basis_oversize_preflight(const Config* config) {
     ok = false;
   directory_scanner_destroy(scanner);
   return ok;
+}
+
+/* Read the daemon's MOTD frame and, unless --no-motd, display it on stdout.
+ *
+ * The daemon sends the MOTD as the first thing after the config-frame STATUS_OK
+ * on a host::module/path connection (rsync semantics), so this runs immediately
+ * after config_send succeeds.  The frame is ALWAYS consumed for a daemon
+ * connection -- even with --no-motd -- so the byte stream stays in sync; the
+ * flag only suppresses the display.  A non-daemon (local TCP / SSH) connection
+ * has no MOTD frame.  The text is rendered through motd_render so a hostile
+ * server cannot inject terminal escape sequences.  A read failure is not fatal
+ * here: the transfer that follows surfaces the real connection error. */
+static void receive_daemon_motd(Client* client, const Config* config) {
+  if (!config->module || config->module[0] == '\0')
+    return;
+  char* motd = motd_receive(client->file_descriptor);
+  if (!motd)
+    return;
+  if (!config->no_motd && motd[0] != '\0') {
+    char* rendered = motd_render(motd, config->eight_bit_output);
+    if (rendered) {
+      fputs(rendered, stdout);
+      size_t length = strlen(rendered);
+      if (length == 0 || rendered[length - 1] != '\n')
+        fputc('\n', stdout);
+      fflush(stdout);
+      free(rendered);
+    }
+  }
+  free(motd);
 }
 
 /* Select the configured transport for both transfer execution paths. */
@@ -1350,6 +1381,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     protocol_session_unbind();
     return thrd_error;
   }
+  receive_daemon_motd(client, context->config);
   if (context->early_delete) {
     /* The keep-set manifest was prebuilt by a path-only pre-scan.  Transmit it
        and wait for the receiver to delete extras before streaming any data. */
@@ -1702,6 +1734,7 @@ int send_files(Config* config) {
   memset(&prepared, 0, sizeof(prepared));
   if (!config_send(client->file_descriptor, config))
     goto send_fail;
+  receive_daemon_motd(client, config);
   if (!prepare_scanner(config, 0, &prepared))
     goto send_fail;
   if (config->remove_source_files)
