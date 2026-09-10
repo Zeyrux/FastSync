@@ -1,5 +1,6 @@
 #include "client_send.h"
 #include "client_validation.h"
+#include "charset.h"
 #include "chmod.h"
 #include "compression.h"
 #include "config.h"
@@ -590,6 +591,11 @@ static const OptionEntry OPTION_TABLE[] = {
      * path; main() reads it (after the destination form is known) and derives
      * the wire credentials.  Never crosses the wire. */
     {"--password-file", NULL, OPT_STRING, offsetof(Config, password_file)},
+    /* --iconv (protocol 2.16.0): convert file-NAME charsets at the wire
+     * boundary.  The CONVERT_SPEC (LOCAL[,REMOTE]) is validated for real iconv
+     * charsets at startup (client_validation.c) and the full spec rides the
+     * config frame so the receiver derives the wire charset symmetrically. */
+    {"--iconv", NULL, OPT_STRING, offsetof(Config, iconv_spec)},
     {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
@@ -1593,6 +1599,17 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
+  /* --iconv: install the sender-side local->wire conversion before any path is
+     scanned or serialized (the scanner and the chunk/data path read windows are
+     all driven from this process, so one global initialization covers every
+     send site). */
+  if (!charset_wire_init_sender(config->iconv_spec)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--iconv has an invalid CONVERT_SPEC or an unsupported charset name");
+    exit_code = 1;
+    goto cleanup;
+  }
+
   /* Apply the requested --outbuf style now that the mode is parsed. */
   apply_output_buffering(config);
 
@@ -1614,6 +1631,7 @@ int main(int argc, char* argv[]) {
   }
 
 cleanup:
+  charset_wire_free();
   if (config) {
     config_delete(config);
   }

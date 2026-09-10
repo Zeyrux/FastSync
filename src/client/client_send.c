@@ -1,6 +1,7 @@
 #include "client_send.h"
 #include "array_list.h"
 #include "change_list.h"
+#include "charset.h"
 #include "chunk.h"
 #include "compression.h"
 #include "config.h"
@@ -810,21 +811,21 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
   if (!send_int(fd, keep_count))
     return -1;
   for (int i = 0; i < keep_count; i++) {
-    if (!send_str(fd, (char*)manifest->items[i]))
+    if (!send_wire_str(fd, (char*)manifest->items[i]))
       return -1;
   }
   int protected_count = protected_prefixes ? protected_prefixes->size : 0;
   if (!send_int(fd, protected_count))
     return -1;
   for (int i = 0; i < protected_count; i++) {
-    if (!send_str(fd, (char*)protected_prefixes->items[i]))
+    if (!send_wire_str(fd, (char*)protected_prefixes->items[i]))
       return -1;
   }
   int missing_count = missing_args ? missing_args->size : 0;
   if (!send_int(fd, missing_count))
     return -1;
   for (int i = 0; i < missing_count; i++) {
-    if (!send_str(fd, (char*)missing_args->items[i]))
+    if (!send_wire_str(fd, (char*)missing_args->items[i]))
       return -1;
   }
   return 0;
@@ -899,7 +900,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
     *resume_offset = 0;
   if (!send_status(client->file_descriptor, STATUS_CHECK))
     return -1;
-  if (!send_str(client->file_descriptor, file_wire_path(file)))
+  if (!send_wire_str(client->file_descriptor, file_wire_path(file)))
     return -1;
   unsigned long long fsize = file->data->size;
   long long mtime = file->metadata ? file->metadata->mtime_sec : 0;
@@ -1119,7 +1120,7 @@ static bool send_directory_entry(Client* client, File* file) {
     return false;
   if (!send_status(client->file_descriptor, STATUS_MKDIR))
     return false;
-  return send_str(client->file_descriptor, file_wire_path(file));
+  return send_wire_str(client->file_descriptor, file_wire_path(file));
 }
 
 /* Transmit one symlink entry: a STATUS_SYMLINK frame carrying the destination
@@ -1130,8 +1131,8 @@ static bool send_symlink_entry(const Client* client, File* file, const Config* c
   if (!file || !file_wire_path(file) || !file->symlink_target)
     return false;
   int fd = client->file_descriptor;
-  if (!send_status(fd, STATUS_SYMLINK) || !send_str(fd, file_wire_path(file)) ||
-      !send_str(fd, file->symlink_target))
+  if (!send_status(fd, STATUS_SYMLINK) || !send_wire_str(fd, file_wire_path(file)) ||
+      !send_wire_str(fd, file->symlink_target))
     return false;
   return !config->use_metadata || metadata_send(fd, file->metadata);
 }
@@ -1311,9 +1312,9 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
        wire path so the receiver links this entry to that installed file. */
     if (f->link_group != 0 && !f->link_first && f->hardlink_target != NULL) {
       if (!send_status(client->file_descriptor, STATUS_HARDLINK) ||
-          !send_str(client->file_descriptor, file_wire_path(f)) ||
+          !send_wire_str(client->file_descriptor, file_wire_path(f)) ||
           !send_int(client->file_descriptor, f->link_group) ||
-          !send_str(client->file_descriptor, f->hardlink_target))
+          !send_wire_str(client->file_descriptor, f->hardlink_target))
         return -1;
       change_emit_file_sent(config, f);
       continue;

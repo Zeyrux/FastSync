@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "charset.h"
 #include "compression.h"
 #include "data.h"
 #include "file.h"
@@ -27,7 +28,7 @@ bool file_send_special(const File* file, int file_descriptor, bool use_metadata)
     return false;
   if (!send_status(file_descriptor, STATUS_SPECIAL))
     return false;
-  if (!send_str(file_descriptor, file_wire_path(file)))
+  if (!send_wire_str(file_descriptor, file_wire_path(file)))
     return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
     return false;
@@ -61,7 +62,7 @@ bool file_send_single_calls_with_skip(File* file, int file_descriptor, bool use_
     }
     data_to_send = compressed_data;
   }
-  if (send_path && !send_str(file_descriptor, file_wire_path(file))) {
+  if (send_path && !send_wire_str(file_descriptor, file_wire_path(file))) {
     data_destroy(compressed_data);
     return false;
   }
@@ -97,7 +98,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
                                             send_path, skip_suffixes, skip_count,
                                             compression_threads, send_xattrs);
 
-  if (send_path && !send_str(file_descriptor, file_wire_path(file)))
+  if (send_path && !send_wire_str(file_descriptor, file_wire_path(file)))
     return false;
   if (use_metadata && !metadata_send(file_descriptor, file->metadata))
     return false;

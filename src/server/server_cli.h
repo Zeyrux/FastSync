@@ -33,6 +33,12 @@ typedef struct ServerCliOptions {
   bool allow_delete;          /* --allow-delete */
   bool trust_sender;          /* --trust-sender */
   bool allow_unauthenticated; /* --allow-unauthenticated */
+  /* --iconv=CONVERT_SPEC: the server's own LOCAL charset declaration.  The
+   * client's full spec rides the wire config frame anyway; when the server is
+   * started with its own --iconv, its LOCAL half overrides the local charset
+   * the client assumed so the server converts received names to ITS charset.
+   * Borrowed pointer into argv (never owns heap). */
+  const char* iconv_spec; /* --iconv value, or NULL */
 } ServerCliOptions;
 
 /* Parse argc/argv into *opts.  Zero-initialize *opts before calling (or use

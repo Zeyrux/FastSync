@@ -35,6 +35,12 @@ void print_usage(void) {
   printf("  --progress          Show transfer progress\n");
   printf("  -P                  Partial mode with progress (retention incomplete)\n");
   printf("  -8, --8-bit-output  Leave high-bit characters unescaped in output\n");
+  printf("  --iconv=LOCAL[,REMOTE]  Convert file-NAME charsets at the wire boundary:\n");
+  printf("                      LOCAL is the charset of our file names, REMOTE is the\n");
+  printf("                      remote side's charset (defaults to LOCAL).  Names are\n");
+  printf("                      converted before transmission and back on receipt; a\n");
+  printf("                      name that cannot be represented in the target charset\n");
+  printf("                      fails that transfer cleanly (rsync-compatible)\n");
   printf("  --delete            Delete files on receiver not in source\n");
   printf("                      (default timing: delete only after the whole\n");
   printf("                      transfer has succeeded)\n");

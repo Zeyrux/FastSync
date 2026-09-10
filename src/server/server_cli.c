@@ -1,4 +1,5 @@
 #include "server_cli.h"
+#include "charset.h"
 #include "utils.h"
 #include <limits.h>
 #include <stdarg.h>
@@ -143,6 +144,12 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       opts->trust_sender = true;
     } else if (arg_is(argv[i], "--allow-unauthenticated")) {
       opts->allow_unauthenticated = true;
+    } else if (arg_is(argv[i], "--iconv")) {
+      if (i + 1 >= argc) {
+        set_error(err, err_size, "missing argument for --iconv");
+        return -1;
+      }
+      opts->iconv_spec = argv[++i];
     } else if (arg_is(argv[i], "-p")) {
       if (i + 1 >= argc) {
         set_error(err, err_size, "missing argument for -p");
@@ -180,6 +187,15 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
           inline_value = argv[++i];
         }
         opts->early_input_file = inline_value;
+      } else if (arg_has_value(argv[i], "--iconv", &inline_value)) {
+        if (!inline_value) {
+          if (i + 1 >= argc) {
+            set_error(err, err_size, "missing argument for --iconv");
+            return -1;
+          }
+          inline_value = argv[++i];
+        }
+        opts->iconv_spec = inline_value;
       } else if (arg_has_value(argv[i], "--dparam", &inline_value)) {
         if (!inline_value) {
           if (i + 1 >= argc) {
@@ -225,6 +241,12 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
     set_error(err, err_size,
               "--config, --dparam, --no-detach, --password-file, and --early-input require "
               "--daemon");
+    return -1;
+  }
+  /* --iconv: reject a malformed CONVERT_SPEC or an unsupported charset name at
+     startup (a probe iconv_open is attempted). */
+  if (opts->iconv_spec != NULL && !charset_spec_valid(opts->iconv_spec)) {
+    set_error(err, err_size, "--iconv requires LOCAL[,REMOTE] charset names supported by iconv");
     return -1;
   }
   return 0;

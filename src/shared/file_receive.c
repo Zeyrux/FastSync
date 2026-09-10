@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "array_list.h"
+#include "charset.h"
 #include "chmod.h"
 #include "compression.h"
 #include "config.h"
@@ -1555,7 +1556,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
   *skipped = false;
-  char* check_path = receive_str(fd);
+  char* check_path = receive_wire_str(fd);
   if (check_path == NULL) {
     return NULL;
   }
@@ -2082,7 +2083,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 }
 
 File* file_receive(const Config* config, int file_descriptor) {
-  char* path = receive_str(file_descriptor);
+  char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
     return NULL;
   if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
@@ -2142,7 +2143,7 @@ File* file_receive(const Config* config, int file_descriptor) {
    traversal), and the created File is routed through the regular store_file
    sink so single-threaded and -m receivers handle directories identically. */
 File* file_receive_directory(int file_descriptor) {
-  char* path = receive_str(file_descriptor);
+  char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
     return NULL;
   if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
@@ -2169,7 +2170,7 @@ File* file_receive_directory(int file_descriptor) {
    member.  All paths are validated like every other received path (non-empty,
    relative, no traversal). */
 File* file_receive_hardlink(int file_descriptor) {
-  char* path = receive_str(file_descriptor);
+  char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
     return NULL;
   if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
@@ -2186,7 +2187,7 @@ File* file_receive_hardlink(int file_descriptor) {
     free(path);
     return NULL;
   }
-  char* target = receive_str(file_descriptor);
+  char* target = receive_wire_str(file_descriptor);
   if (!target) {
     free(path);
     return NULL;
@@ -2219,7 +2220,7 @@ File* file_receive_hardlink(int file_descriptor) {
    routed through the regular store_file sink, which creates the link beneath
    the receive root (unmungeing the target first). */
 File* file_receive_symlink(int file_descriptor, const Config* config) {
-  char* path = receive_str(file_descriptor);
+  char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
     return NULL;
   if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
@@ -2231,7 +2232,7 @@ File* file_receive_symlink(int file_descriptor, const Config* config) {
     send_status(file_descriptor, STATUS_ERROR);
     return NULL;
   }
-  char* target = receive_str(file_descriptor);
+  char* target = receive_wire_str(file_descriptor);
   if (!target) {
     free(path);
     return NULL;
@@ -2274,7 +2275,7 @@ File* file_receive_symlink(int file_descriptor, const Config* config) {
  * confined).  rdev is validated here (non-negative, range-checked) so a bogus
  * value cannot drive a dangerous node on the receiver. */
 File* file_receive_special(int file_descriptor) {
-  char* path = receive_str(file_descriptor);
+  char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
     return NULL;
   if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
@@ -2354,7 +2355,7 @@ static bool receive_manifest_section(int fd, ArrayList* list, size_t* manifest_b
     return false;
   }
   for (int i = 0; i < count; i++) {
-    char* s = receive_str(fd);
+    char* s = receive_wire_str(fd);
     size_t entry_size = s ? strlen(s) : 0;
     if (!s || s[0] == '\0' || s[0] == '/' || has_path_traversal(s) ||
         entry_size > MAX_MANIFEST_BYTES - *manifest_bytes ||

@@ -110,6 +110,17 @@ typedef struct Config {
    * populate auth_user/auth_password_hash before connecting). */
   char* password_file;
   char* fastsync_server_path;
+  /* --iconv=CONVERT_SPEC (protocol 2.16.0, rsync compatibility): convert the
+   * charset of FILE NAMES at the wire boundary.  CONVERT_SPEC is
+   * "LOCAL[,REMOTE]": LOCAL is the charset of our own file names, REMOTE is
+   * the remote side's charset and defaults to LOCAL.  The sender converts
+   * every path LOCAL->REMOTE before transmitting it; the receiver converts
+   * every received path back REMOTE->LOCAL before creating/writing it.  The
+   * FULL SPEC crosses the wire as a trailing config-frame string so each end
+   * derives its own LOCAL and the wire (REMOTE) charset symmetrically.  NULL
+   * (or "") means no conversion: identity with zero overhead.  See charset.c
+   * and the PROTOCOL_VERSION note below. */
+  char* iconv_spec;
   char** exclude_patterns;
   int exclude_count;
   char** include_patterns;
@@ -493,8 +504,21 @@ typedef struct Config {
  * reads that frame right after the ack (client_send.c) -- symmetric
  * server->client in every build, so the strict same-version handshake keeps the
  * two peers in lockstep and nothing can desynchronize.  The --stdio SSH path
- * sends/reads no MOTD at all. */
-#define PROTOCOL_VERSION "2.15.0"
+ * sends/reads no MOTD at all.
+ *
+ * --iconv Wave (P6): 2.15.0 -> 2.16.0.
+ *
+ * WHY the bump, grounded in the wire: the --iconv feature adds a serialized
+ * field to the binary config frame.  The client sends the full CONVERT_SPEC
+ * (Config->iconv_spec) as a new trailing string AFTER the Wave A/B daemon-auth
+ * block (in config_send/config_receive), so the receiver knows the wire charset
+ * (the REMOTE half) before the first file name arrives.  Any config-frame
+ * layout change must bump the protocol version: a peer that does not parse the
+ * new trailing bytes would desynchronize on the frame boundary, and the strict
+ * same-version handshake (config_receive rejects a mismatched version before
+ * parsing anything else) is what keeps a 2.16 client and a 2.15 server from
+ * ever reaching that state. */
+#define PROTOCOL_VERSION "2.16.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
