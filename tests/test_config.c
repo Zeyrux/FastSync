@@ -1565,6 +1565,110 @@ static void test_config_local_only_fields_not_serialized() {
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void test_config_iconv_spec_wire_roundtrip() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("rel/path");
+  send_cfg->iconv_spec = str_dup("utf-8,iso-8859-1");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->iconv_spec != NULL &&
+              strcmp(recv_cfg->iconv_spec, "utf-8,iso-8859-1") == 0;
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+static void test_config_iconv_spec_empty_canonicalizes_to_null() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  /* iconv_spec left NULL -> serialized as "" -> received back as NULL. */
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->iconv_spec == NULL;
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+static void test_config_receive_rejects_invalid_iconv_spec() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  send_cfg->iconv_spec = str_dup("no-such-charset,utf-8");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    /* A malformed/unsupported spec must be refused at the config handshake
+       (STATUS_ERROR makes config_send fail on the parent). */
+    Config* recv_cfg = config_receive(p[0]);
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(recv_cfg ? 1 : 0);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1608,6 +1712,9 @@ void test_config() {
     test_config_module_wire_empty_canonicalizes_to_null();
     test_config_daemon_auth_wire_roundtrip();
     test_config_daemon_auth_wire_rejects_malformed();
+    test_config_iconv_spec_wire_roundtrip();
+    test_config_iconv_spec_empty_canonicalizes_to_null();
+    test_config_receive_rejects_invalid_iconv_spec();
     test_config_receive_with_validate_rejects();
   }
   test_config_delete_timing_early_helper();
