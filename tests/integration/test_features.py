@@ -4255,6 +4255,118 @@ class TestCrtimes:
             f"combined -U -N dest atime {dst_st.st_atime} != {atime}"
 
 
+class TestSparse:
+    """-S/--sparse: the receiver preserves holes by skipping long zero runs with
+    lseek (no wire change; the full image is in memory).  The destination file
+    must round-trip its logical size and content byte-for-byte; on filesystems
+    that report holes (SEEK_HOLE/SEEK_DATA) we additionally assert the file is
+    genuinely sparse via st_blocks, but that check is tolerant (CI filesystems
+    may report no holes)."""
+
+    def _make_sparse_source(self, name, total, zero_start, zero_len):
+        source = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(source)
+        sfile = os.path.join(source, "blob.bin")
+        with open(sfile, "wb") as f:
+            head = os.urandom(zero_start)
+            tail = os.urandom(total - zero_start - zero_len)
+            f.write(head)
+            f.write(b"\x00" * zero_len)
+            f.write(tail)
+            assert f.tell() == total
+        return source, sfile
+
+    @pytest.mark.parametrize("flag", ["-S", "--sparse"])
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_sparse_transfer_round_trips(self, shared_server, flag, mt):
+        total = 4 * 1024 * 1024
+        source = os.path.join(TEST_DATA_DIR, f"sparse_mt{mt}_{flag.lstrip('-')}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"sparse_mt{mt}_{flag.lstrip('-')}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        zero_start = 1 * 1024 * 1024
+        zero_len = 2 * 1024 * 1024
+        _, sfile = self._make_sparse_source(os.path.basename(source), total, zero_start, zero_len)
+        with open(sfile, "rb") as f:
+            src_bytes = f.read()
+
+        flags = [flag] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"{flag} transfer failed: {(result.stderr or result.stdout)[:300]}"
+
+        received = get_dest_received_dir(dest, source)
+        dfile = os.path.join(received, "blob.bin")
+        assert os.path.getsize(dfile) == total, "logical size must match data_size"
+        with open(dfile, "rb") as f:
+            assert f.read() == src_bytes, "sparse destination content must round-trip exactly"
+
+        # Tolerant sparseness assert: if the filesystem reports holes, the file
+        # must actually be sparse (fewer allocated blocks than its size).
+        with open(dfile, "rb") as f:
+            off = os.lseek(f.fileno(), zero_start, os.SEEK_DATA)
+            if off >= 0:
+                hole = os.lseek(f.fileno(), off, os.SEEK_HOLE)
+            else:
+                hole = -1
+        if hole > zero_start:
+            st = os.stat(dfile)
+            assert st.st_blocks * 512 < total, \
+                f"-S file not sparse: {st.st_blocks} blocks for {total} bytes"
+
+    def test_sparse_inplace(self, shared_server):
+        """--sparse must also preserve holes in the --inplace write path."""
+        total = 2 * 1024 * 1024
+        source = os.path.join(TEST_DATA_DIR, "sparse_inplace_src")
+        dest = os.path.join(TEST_DATA_DIR, "sparse_inplace_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        _, sfile = self._make_sparse_source(os.path.basename(source), total, total // 2,
+                                            total // 4)
+        with open(sfile, "rb") as f:
+            src_bytes = f.read()
+        result, _ = run_client(source, dest, flags=["-S", "--inplace"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-S --inplace failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        dfile = os.path.join(received, "blob.bin")
+        assert os.path.getsize(dfile) == total
+        with open(dfile, "rb") as f:
+            assert f.read() == src_bytes
+
+
+class TestBlockSize:
+    """--block-size / --delta-block: the checksum block size is genuinely honored
+    by the delta engine (both spellings parse to config->delta_block_size).  An
+    end-to-end delta transfer with a non-default block size must still be
+    byte-exact."""
+
+    @pytest.mark.parametrize("flag", ["--block-size", "--delta-block"])
+    def test_non_default_block_size_delta_transfer(self, shared_server, flag):
+        source = os.path.join(TEST_DATA_DIR, "blocksize_delta_src")
+        dest = os.path.join(TEST_DATA_DIR, "blocksize_delta_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        payload = os.urandom(300 * 1024)  # enough for several 1 KiB blocks
+        with open(os.path.join(source, "big.bin"), "wb") as f:
+            f.write(payload)
+        # First run installs the file; second run with delta + a small block size.
+        result, _ = run_client(source, dest, flags=["-S"],
+                               port=shared_server.port)
+        assert result.returncode == 0
+        received = get_dest_received_dir(dest, source)
+        # Change the source, then delta-transfer with a non-default block size.
+        with open(os.path.join(source, "big.bin"), "ab") as f:
+            f.write(os.urandom(4096))
+        clean_dir(dest)
+        result, _ = run_client(source, dest,
+                               flags=["--incremental", "--delta", flag, "1024"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"{flag} 1024 delta transfer failed: {(result.stderr or result.stdout)[:300]}"
+        with open(os.path.join(received, "big.bin"), "rb") as f:
+            assert f.read() == open(os.path.join(source, "big.bin"), "rb").read()
+
 class TestOmitTimes:
     """-O/--omit-dir-times and -J/--omit-link-times are recognized and cross the
     wire as receiver-side preferences.  FastSync does not currently apply dir or

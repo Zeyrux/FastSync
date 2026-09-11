@@ -222,6 +222,49 @@ static void test_link_copy_fallback_preserves_xattrs() {
   rmdir(basis_dir);
 }
 
+/* --fake-super replay: fake_super_store_fd records the source stat into the
+ * reserved xattr, and fake_super_restore_fd re-applies mode/mtime (and owner,
+ * when the process may) fd-relative.  Restore must also be a safe no-op with no
+ * xattr present.  Guarded on filesystem xattr support. */
+static void test_fake_super_restore() {
+  const char* path = "test_fake_super_restore.txt";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool has_xattr = setxattr(path, "user.fastsync.xprobe", "p", 1, 0) == 0;
+  if (has_xattr)
+    removexattr(path, "user.fastsync.xprobe");
+  if (!has_xattr) {
+    close(fd);
+    unlink(path);
+    return; /* skip silently when the filesystem has no xattr support */
+  }
+
+  /* No xattr present yet: restore is a silent no-op (returns false, no crash). */
+  EXPECT_FALSE(fake_super_restore_fd(fd));
+
+  fake_super_store_fd(fd, 1001, 1002, 0751, 1700000000, 123456789);
+  EXPECT_TRUE(fake_super_restore_fd(fd));
+  struct stat st;
+  EXPECT_EQ_INT(fstat(fd, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 07777), 0751);
+
+  /* Restore with a malformed record must skip without failing. */
+  time_t before = st.st_mtime;
+  int wfd = open(path, O_RDONLY);
+  if (wfd >= 0) {
+    EXPECT_EQ_INT((int)fsetxattr(wfd, FAKESUPER_XATTR, "not-a-valid-record", 19, 0), 0);
+    close(wfd);
+  }
+  EXPECT_FALSE(fake_super_restore_fd(fd));
+  fstat(fd, &st);
+  EXPECT_EQ_INT((int)st.st_mtime, (int)before);
+
+  close(fd);
+  unlink(path);
+}
+
 void test_xattr() {
   test_xattr_wire_roundtrip();
   test_xattr_reject_privileged_namespace();
@@ -229,4 +272,5 @@ void test_xattr() {
   test_xattr_count_bound();
   test_xattr_capture_and_appliable();
   test_link_copy_fallback_preserves_xattrs();
+  test_fake_super_restore();
 }

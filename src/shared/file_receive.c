@@ -87,10 +87,10 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
                                   config->preallocate, metadata, preserve_executability,
                                   config->use_fsync, NULL);
   } else {
-    ok =
-        file_to_disk_secure_attrs(staged_path, file->data->data, file->data->size, false, sparse,
-                                  config->preallocate, metadata, preserve_executability, false,
-                                  false, config->use_fsync, file->xattrs, config->fake_super, NULL);
+    ok = file_to_disk_secure_attrs(staged_path, file->data->data, file->data->size, false, sparse,
+                                   config->preallocate, metadata, preserve_executability, false,
+                                   false, config->use_fsync, file->xattrs, config->fake_super,
+                                   false, NULL);
   }
   if (!ok) {
     free(staged_path);
@@ -796,11 +796,11 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   } else {
     /* The plain no-replace / update / with-fsync engines, plus per-file xattr
        (-X/-A) and --fake-super application on the written fd. */
-    ok = file_to_disk_secure_attrs(disk_path, file->data->data, file->data->size, inplace, sparse,
-                                   config && config->preallocate, metadata, preserve_executability,
-                                   config && config->update, config && config->ignore_existing,
-                                   config && config->use_fsync, file->xattrs,
-                                   config ? config->fake_super : false, confined_temp);
+    ok = file_to_disk_secure_attrs(
+        disk_path, file->data->data, file->data->size, inplace, sparse,
+        config && config->preallocate, metadata, preserve_executability, config && config->update,
+        config && config->ignore_existing, config && config->use_fsync, file->xattrs,
+        config ? config->fake_super : false, config ? config->partial : false, confined_temp);
   }
   free(confined_temp);
   confined_temp = NULL;

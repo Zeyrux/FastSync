@@ -3,6 +3,7 @@
 #include "client_validation.h"
 #include "chmod.h"
 #include "config.h"
+#include "delta.h"
 #include "file_list.h"
 #include "log.h"
 #include "test_utils.h"
@@ -2908,6 +2909,55 @@ static void test_parse_args_password_file() {
   config_delete(cfg);
 }
 
+/* --block-size (Delta block size): --block-size/--delta-block set
+ * config->delta_block_size, out-of-range values are rejected with the default
+ * kept, and the configured size genuinely reaches the delta engine (a larger
+ * block yields fewer signature blocks for identical data). */
+static void test_parse_args_block_size() {
+  Config* cfg = config_create();
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  int positional_args[2];
+  int positional_count = 0;
+
+  char* argv_long[] = {"fastsync", "--block-size", "4096", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_long, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 4096);
+
+  cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
+  char* argv_delta[] = {"fastsync", "--delta-block", "2048", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_delta, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 2048);
+
+  /* Out of range: parsed, warned, and the default is kept. */
+  cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
+  char* argv_bad[] = {"fastsync", "--block-size", "1", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_bad, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, (int)DELTA_BLOCK_SIZE_DEFAULT);
+
+  /* A non-default block size changes the number of signature blocks for
+     identical data: block_count = ceil(size / block_size). */
+  const char data[10000] = {0};
+  DeltaSignature* small = delta_signature_create_seeded(data, sizeof(data), 1024, 0);
+  DeltaSignature* large = delta_signature_create_seeded(data, sizeof(data), 8192, 0);
+  EXPECT_NOT_NULL(small);
+  EXPECT_NOT_NULL(large);
+  /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL above asserts,
+     but cppcheck cannot see through the macro; the guard is defensive. */
+  if (small && large) {
+    EXPECT_TRUE(large->block_size == 8192 && small->block_size == 1024);
+    EXPECT_TRUE(large->block_count < small->block_count);
+    EXPECT_EQ_INT((int)small->block_count, 10); /* ceil(10000/1024) */
+    EXPECT_EQ_INT((int)large->block_count, 2);  /* ceil(10000/8192) */
+  }
+  delta_signature_destroy(small);
+  delta_signature_destroy(large);
+
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -2918,6 +2968,7 @@ void test_client_cli() {
   test_parse_args_rejects_malformed_identity();
   test_parse_args_preallocate();
   test_parse_args_metadata_times();
+  test_parse_args_block_size();
   test_parse_args_devices_specials();
   test_parse_args_atimes_long_and_short();
   test_parse_args_omit_link_times_long();

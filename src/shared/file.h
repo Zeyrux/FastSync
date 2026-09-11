@@ -113,12 +113,14 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     const char* temp_dir);
 /* Receiver write-path variant that also applies per-file xattrs (-X/-A) and the
  * --fake-super stat xattr fd-relative before the final rename.  `update` /
- * `no_replace` / `use_fsync` mirror the plain wrappers above. */
+ * `no_replace` / `use_fsync` mirror the plain wrappers above; `keep_partial`
+ * enables --partial best-effort retention of a failed write's temp. */
 bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
                                bool inplace, bool sparse, bool preallocate,
                                const FileMetadata* metadata, bool preserve_executability,
                                bool update, bool no_replace, bool use_fsync,
-                               const FileXattrList* xattrs, bool fake_super, const char* temp_dir);
+                               const FileXattrList* xattrs, bool fake_super, bool keep_partial,
+                               const char* temp_dir);
 /* Atomic --link-dest install: replace `path` with a hard link to `basis_path`
    (via a temp name + rename); fall back to a byte-identical local copy from
    `data` when the link is impossible (EXDEV/EPERM/unsupported filesystem).

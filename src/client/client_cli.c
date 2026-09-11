@@ -1079,7 +1079,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (config_add_pattern(&config->include_patterns, &config->include_count, argv[++i],
                              "--include") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--delta-block", NULL)) {
+    } else if (opt_is(argv[i], "--delta-block", "--block-size")) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
