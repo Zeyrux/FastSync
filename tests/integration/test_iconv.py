@@ -243,7 +243,7 @@ def test_iconv_chunk_serialization_blob(shared_server):
     _place_bytes(source, name, data=b"blob\n")
 
     result, _ = run_client(
-        source, dest, flags=["--iconv=iso-8859-1,utf-8", "-s"], port=shared_server.port
+        source, dest, flags=["--iconv=iso-8859-1,utf-8", "--chunk-serialization"], port=shared_server.port
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[:400]
 

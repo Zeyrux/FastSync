@@ -30,11 +30,11 @@ def _run_tcp_test(name, port, flags, use_metadata=True, posix=False):
     clean_dir(DEST_DIR)
     if posix:
         result, dur = run_client_posix(SOURCE_DIR, DEST_DIR,
-                                       flags=(["-M"] if use_metadata else []) + flags,
+                                       flags=(["--preserve"] if use_metadata else []) + flags,
                                        port=port)
     else:
         result, dur = run_client(SOURCE_DIR, DEST_DIR,
-                                 flags=(["-M"] if use_metadata else []) + flags,
+                                 flags=(["--preserve"] if use_metadata else []) + flags,
                                  port=port)
 
     if result.returncode != 0:
@@ -68,45 +68,45 @@ class TestTCPStandard:
 class TestTCPFlags:
     @pytest.mark.ci
     def test_multithreading(self, shared_server):
-        r = _run_tcp_test("Multithreading (-m)", shared_server.port, ["-m"])
+        r = _run_tcp_test("Multithreading (--threads)", shared_server.port, ["--threads"])
         assert r["status"] == "Success", r["error"]
 
     @pytest.mark.ci
     def test_compression(self, shared_server):
-        r = _run_tcp_test("Compression (-c)", shared_server.port, ["-c"])
+        r = _run_tcp_test("Compression (-z)", shared_server.port, ["-z"])
         assert r["status"] == "Success", r["error"]
 
     def test_compression_threads(self, shared_server):
-        r = _run_tcp_test("Compression threads (-c --compress-threads=2)", shared_server.port,
-                          ["-c", "--compress-threads=2"])
+        r = _run_tcp_test("Compression threads (-z --compress-threads=2)", shared_server.port,
+                          ["-z", "--compress-threads=2"])
         assert r["status"] == "Success", r["error"]
 
     def test_chunk_serialization(self, shared_server):
-        r = _run_tcp_test("Chunk Serialization (-s)", shared_server.port, ["-s"])
+        r = _run_tcp_test("Chunk Serialization (--chunk-serialization)", shared_server.port, ["--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_compression_chunk(self, shared_server):
-        r = _run_tcp_test("Compression + Chunk (-c -s)", shared_server.port, ["-c", "-s"])
+        r = _run_tcp_test("Compression + Chunk (-z --chunk-serialization)", shared_server.port, ["-z", "--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_multithread_compression(self, shared_server):
-        r = _run_tcp_test("Multithreading + Compression (-m -c)", shared_server.port, ["-m", "-c"])
+        r = _run_tcp_test("Multithreading + Compression (--threads -z)", shared_server.port, ["--threads", "-z"])
         assert r["status"] == "Success", r["error"]
 
     def test_multithread_chunk(self, shared_server):
-        r = _run_tcp_test("Multithreading + Chunk (-m -s)", shared_server.port, ["-m", "-s"])
+        r = _run_tcp_test("Multithreading + Chunk (--threads --chunk-serialization)", shared_server.port, ["--threads", "--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_all_flags(self, shared_server):
-        r = _run_tcp_test("Multithread + Compression + Chunk (-m -c -s)", shared_server.port, ["-m", "-c", "-s"])
+        r = _run_tcp_test("Multithread + Compression + Chunk (--threads -z --chunk-serialization)", shared_server.port, ["--threads", "-z", "--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_sendfile(self, shared_server):
-        r = _run_tcp_test("Sendfile (-f)", shared_server.port, ["-f"])
+        r = _run_tcp_test("Sendfile (--sendfile)", shared_server.port, ["--sendfile"])
         assert r["status"] == "Success", r["error"]
 
     def test_sendfile_multithread(self, shared_server):
-        r = _run_tcp_test("Sendfile + Multithreading (-f -m)", shared_server.port, ["-f", "-m"])
+        r = _run_tcp_test("Sendfile + Multithreading (--sendfile --threads)", shared_server.port, ["--sendfile", "--threads"])
         assert r["status"] == "Success", r["error"]
 
 

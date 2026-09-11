@@ -17,12 +17,14 @@ void print_usage(void) {
   printf("  /local/path         TCP transport (requires server on localhost:8080)\n");
   printf("\n");
   printf("Options:\n");
-  printf("  -c [level]          Enable compression (level 1-22, default 5)\n");
-  printf("  -z [level]          Alias for -c\n");
-  printf("  -a, --archive       Archive mode (-c -m -M)\n");
+  printf("  -c, --checksum      Verify content by checksum instead of size+mtime\n");
+  printf("  -z, --compress [level]  Enable compression (level 1-22, default 5)\n");
+  printf("  -a, --archive       rsync archive mode (-rlptgoD): links, metadata,\n");
+  printf("                      devices and specials (not compression/multithreading)\n");
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  --remove-source-files  Remove regular source files after successful transfer\n");
-  printf("  -p <port>           SSH port (default: 22)\n");
+  printf("  -p, --perms         Preserve permission bits (part of the metadata bundle)\n");
+  printf("  --ssh-port <port>   SSH port (default: 22)\n");
   printf("  -e, --rsh <command>  Remote shell to launch on the client for the SSH\n");
   printf("                      transport (default: ssh).  The command may include\n");
   printf("                      arguments, e.g. -e \"ssh -p 2222\"\n");
@@ -80,9 +82,8 @@ void print_usage(void) {
   printf("                      entry's destination mirror receiver-side.  Independent of\n");
   printf("                      --delete (it does not imply --delete; a non-empty directory\n");
   printf("                      mirror is removed only with --force or --delete)\n");
-  printf("  --prune-empty-dirs  Do not transfer empty directory entries (--dirs mode);\n");
-  printf("                      recursive transfers never send empty dirs.  rsync's -m\n");
-  printf("                      short form stays FastSync multithreading\n");
+  printf("  -m, --prune-empty-dirs  Do not transfer empty directory entries (--dirs mode);\n");
+  printf("                      recursive transfers never send empty dirs\n");
   printf("  Note: each timing flag implies --delete.  Combining a timing flag with\n");
   printf("  --no-delete (in either order) is rejected as a config error.\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
@@ -105,8 +106,8 @@ void print_usage(void) {
   printf("  --files-from <file> Read the source file list from FILE (paths relative to the "
          "source root)\n");
   printf("  -0, --from0       Entries in --files-from are NUL-delimited\n");
-  printf("  --filter=RULE     rsync-style filter rule (+/- include/exclude; repeatable; the\n");
-  printf("                    rsync -f short form conflicts with FastSync sendfile -f)\n");
+  printf("  -f, --filter=RULE rsync-style filter rule (+/- include/exclude; repeatable;\n");
+  printf("                  both --filter=RULE and the -f RULE / -f=RULE short forms work)\n");
   printf("  -C, --cvs-exclude Auto-ignore common CVS/SCM files (.git/, .svn/, *.o, *~, ...)\n");
   printf("  -F                Apply per-directory .rsync-filter files during the scan\n");
   printf("  --max-size <n>      Skip files larger than n bytes\n");
@@ -143,10 +144,11 @@ void print_usage(void) {
          DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
          DELTA_MAX_FILE_SIZE);
-  printf("  -m                  Enable multithreading\n");
-  printf("  -s                  Enable chunk serialization\n");
-  printf("  --secluded-args    Accept rsync compatibility option (no effect)\n");
-  printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
+  printf("  -j, --threads       Enable multithreading\n");
+  printf("  --chunk-serialization  Enable chunk serialization (long form only)\n");
+  printf("  -s, --secluded-args    Protect-args compatibility option (no effect; remote\n");
+  printf("                      SSH argv is already built injection-safe)\n");
+  printf("  --sendfile          Enable sendfile zero-copy (TCP only; long form only)\n");
   printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
   printf("  --zc <alg>          Alias for --compress-choice\n");
   printf("  -v, --verbose       Enable debug logging\n");
@@ -154,7 +156,7 @@ void print_usage(void) {
   printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
   printf("  --info=FLAGS        Fine-grained info: copy,misc,skip,stats,all,none\n");
   printf("                      none suppresses info even with --verbose\n");
-  printf("  -M, --preserve      Preserve file metadata\n");
+  printf("  --preserve          Preserve file metadata (long form only)\n");
   printf("  -E, --executability Preserve executable permission bits\n");
   printf("  -X, --xattrs        Preserve user extended attributes (user.* only;\n");
   printf("                      privileged security.*/trusted.* namespaces are\n");
@@ -178,8 +180,8 @@ void print_usage(void) {
   printf("                      USER:GROUP, USER (owner only), :GROUP (group only); a\n");
   printf("                      value of * means the current/root user as appropriate.\n");
   printf("                      Names resolve on the source machine; @N for numerics.\n");
-  printf("                      Note: -M is already FastSync's preserve flag; these use\n");
-  printf("                      long forms only.\n");
+  printf("                      (Metadata is enabled with --preserve; -M now means\n");
+  printf("                      rsync's --remote-option.)\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");
@@ -197,8 +199,7 @@ void print_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
-  printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
-  printf("  -T <sec>            Alias for --timeout\n");
+  printf("  --timeout <sec>     I/O timeout in seconds (default: 30; long form only)\n");
   printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
   printf("  --stop-after=MINS   Stop the transfer after MINS minutes (a positive\n");
   printf("                      integer); whatever was already transferred is kept\n");
@@ -227,17 +228,15 @@ void print_usage(void) {
   printf("  --stderr=MODE       Route logging to stderr: errors or all\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --partial-dir <dir> Directory for partial files\n");
-  printf("  --temp-dir <dir>    Scratch dir for temp files before atomic install\n");
+  printf("  -T, --temp-dir <dir>  Scratch dir for temp files before atomic install\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
   printf(
       "  --old-args          Disable safe SSH command argument quoting (legacy compatibility)\n");
-  printf("  --remote-option=OPT  Append OPT to the REMOTE server invocation over SSH\n");
+  printf("  -M, --remote-option=OPT  Append OPT to the REMOTE server invocation over SSH\n");
   printf("                      (repeatable; each value is single-quote-escaped on the remote\n");
   printf("                      command line; empty values and values with control characters\n");
-  printf("                      are rejected).  Long form only: rsync's -M short form is NOT\n");
-  printf("                      available because -M already means metadata preservation in\n");
-  printf("                      FastSync (documented divergence)\n");
+  printf("                      are rejected; -M OPT, -M=OPT and --remote-option=OPT work)\n");
   printf("  --trust-sender      Trust the remote sender's file list: the receiver skips its\n");
   printf("                      own up-front path-traversal/containment re-validation of the\n");
   printf("                      incoming file list (fewer checks, faster, potentially unsafe).\n");

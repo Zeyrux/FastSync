@@ -554,7 +554,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
     {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
-    {"--secluded-args", NULL, OPT_NOOP, 0},
+    {"--secluded-args", "-s", OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
     {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
     {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
@@ -573,7 +573,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--append", NULL, OPT_FLAG, offsetof(Config, append)},
     {"--append-verify", NULL, OPT_FLAG, offsetof(Config, append_verify)},
     {"--fsync", NULL, OPT_FLAG, offsetof(Config, use_fsync)},
-    {"--checksum", NULL, OPT_FLAG, offsetof(Config, checksum)},
+    {"--checksum", "-c", OPT_FLAG, offsetof(Config, checksum)},
     {"--8-bit-output", "-8", OPT_FLAG, offsetof(Config, eight_bit_output)},
     {"--itemize-changes", "-i", OPT_FLAG, offsetof(Config, itemize_changes)},
     {"--list-only", NULL, OPT_FLAG, offsetof(Config, list_only)},
@@ -620,7 +620,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--max-delete", NULL, OPT_NONNEG_INT, offsetof(Config, max_delete)},
     {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
     {"--force", NULL, OPT_FLAG, offsetof(Config, force_delete)},
-    {"--prune-empty-dirs", NULL, OPT_FLAG, offsetof(Config, prune_empty_dirs)},
+    {"--prune-empty-dirs", "-m", OPT_FLAG, offsetof(Config, prune_empty_dirs)},
     {"--ignore-missing-args", NULL, OPT_FLAG, offsetof(Config, ignore_missing_args)},
     {"--delete-missing-args", NULL, OPT_FLAG, offsetof(Config, delete_missing_args)},
 
@@ -635,7 +635,7 @@ static const OptionEntry OPTION_TABLE[] = {
     /* --rsync-path is rsync's spelling for the same "server program path"; it
      * is a pure alias for fastsync_server_path (never a distinct field). */
     {"--rsync-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
-    {"--temp-dir", NULL, OPT_STRING, offsetof(Config, temp_dir)},
+    {"--temp-dir", "-T", OPT_STRING, offsetof(Config, temp_dir)},
     {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
     {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
     {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},
@@ -668,10 +668,10 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--xattrs", "-X", OPT_FLAG, offsetof(Config, preserve_xattrs)},
     {"--acls", "-A", OPT_FLAG, offsetof(Config, preserve_acls)},
     {"--fake-super", NULL, OPT_FLAG, offsetof(Config, fake_super)},
-    /* Long-form-only: rsync's -M short form of --remote-option is INTENTIONALLY
-     * unavailable because -M already means metadata mode in FastSync (a
-     * documented divergence; see RSYNC_COMPAT.md).  --trust-sender is a local
-     * receiver policy and never travels to the remote peer. */
+    /* rsync's -M/--remote-option: -M is now the short alias for --remote-option
+     * (metadata mode is long-only --preserve), handled in the parse loop where
+     * --remote-option is parsed.  --trust-sender is a local receiver policy and
+     * never travels to the remote peer. */
     {"--trust-sender", NULL, OPT_FLAG, offsetof(Config, trust_sender)},
 };
 
@@ -696,17 +696,17 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"sparse", "S", offsetof(Config, preserve_sparse)},
     {"inplace", NULL, offsetof(Config, inplace)},
     {"preallocate", NULL, offsetof(Config, preallocate)},
-    {"checksum", NULL, offsetof(Config, checksum)},
+    {"checksum", "c", offsetof(Config, checksum)},
     {"from0", NULL, offsetof(Config, from0)},
     {"cvs-exclude", NULL, offsetof(Config, cvs_exclude)},
 
     /* These options are also implied by --archive or handled outside the table. */
-    {"compress", "c", offsetof(Config, use_compression)},
+    {"compress", NULL, offsetof(Config, use_compression)},
     {"compress", "z", offsetof(Config, use_compression)},
-    {"multithreading", "m", offsetof(Config, use_multithreading)},
-    {"preserve", "M", offsetof(Config, use_metadata)},
-    {"sendfile", "f", offsetof(Config, use_sendfile)},
-    {"chunk-serialization", "s", offsetof(Config, use_chunk_serialization)},
+    {"multithreading", "j", offsetof(Config, use_multithreading)},
+    {"preserve", NULL, offsetof(Config, use_metadata)},
+    {"sendfile", NULL, offsetof(Config, use_sendfile)},
+    {"chunk-serialization", NULL, offsetof(Config, use_chunk_serialization)},
     {"xattrs", "X", offsetof(Config, preserve_xattrs)},
     {"acls", "A", offsetof(Config, preserve_acls)},
     {"fake-super", NULL, offsetof(Config, fake_super)},
@@ -1029,17 +1029,35 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       config->preserve_specials = true;
       log_info_message(LOG_INFO_MISC, "Enabled preservation of device and special files (-D)");
     } else if (opt_is(argv[i], "-a", "--archive")) {
-      config->use_compression =
-          !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
-      config->use_multithreading = true;
+      /* Real rsync archive (-rlptgoD).  FastSync is always recursive and always
+       * preserves hard-link/other transfer semantics per its own flags, so -a
+       * implies links, full metadata (perms/times/group/owner as FastSync's
+       * broad bundle), devices and specials.  Compression and multithreading
+       * are NOT implied (they are no longer part of archive mode). */
+      config->follow_symlinks = true;
       config->use_metadata = true;
-      log_info_message(LOG_INFO_MISC, "Enabled archive mode (-c -m -M)");
-    } else if (opt_is(argv[i], "-p", NULL)) {
+      config->preserve_devices = true;
+      config->preserve_specials = true;
+      log_info_message(LOG_INFO_MISC,
+                       "Enabled archive mode (-rlptgoD: links, metadata, devices, specials)");
+    } else if (opt_is(argv[i], "-p", "--perms")) {
+      /* rsync -p/--perms: preserve permission bits.  Folded into FastSync's
+       * broad metadata bundle (mode/mtime travel together). */
+      config->use_metadata = true;
+      log_info_message(LOG_INFO_MISC, "Enabled permission preservation");
+    } else if (opt_is(argv[i], "--ssh-port", NULL)) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      if (set_positive_int_option(&config->ssh_port, argv[++i], "-p") != 0)
+      if (set_positive_int_option(&config->ssh_port, argv[++i], "--ssh-port") != 0)
+        return -1;
+      if (config->ssh_port > 65535) {
+        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
+        return -1;
+      }
+    } else if (strncmp(argv[i], "--ssh-port=", 11) == 0) {
+      if (set_positive_int_option(&config->ssh_port, argv[i] + 11, "--ssh-port") != 0)
         return -1;
       if (config->ssh_port > 65535) {
         log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
@@ -1085,7 +1103,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         config->delta_max_file_size = val;
       else
         log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
-    } else if (opt_is(argv[i], "-c", "-z")) {
+    } else if (opt_is(argv[i], "-z", "--compress")) {
       config->use_compression =
           !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
       log_info_message(LOG_INFO_MISC, "Enabled Compression");
@@ -1102,20 +1120,20 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
           i++;
         }
       }
-    } else if (opt_is(argv[i], "-M", "--preserve")) {
+    } else if (opt_is(argv[i], "--preserve", NULL)) {
       config->use_metadata = true;
       log_info_message(LOG_INFO_MISC, "Enabled metadata preservation");
     } else if (opt_is(argv[i], "-E", "--executability")) {
       config->use_metadata = true;
       config->use_executability = true;
       log_info_message(LOG_INFO_MISC, "Enabled executable permission preservation");
-    } else if (opt_is(argv[i], "-f", "--sendfile")) {
+    } else if (opt_is(argv[i], "--sendfile", NULL)) {
       config->use_sendfile = true;
       log_info_message(LOG_INFO_MISC, "Enabled sendfile");
-    } else if (opt_is(argv[i], "-m", NULL)) {
+    } else if (opt_is(argv[i], "-j", "--threads")) {
       config->use_multithreading = true;
       log_info_message(LOG_INFO_MISC, "Enabled Multithreading");
-    } else if (opt_is(argv[i], "-s", NULL)) {
+    } else if (opt_is(argv[i], "--chunk-serialization", NULL)) {
       config->use_chunk_serialization = true;
       log_info_message(LOG_INFO_MISC, "Enabled Chunk Serialization");
     } else if (opt_is(argv[i], "--server-port", NULL)) {
@@ -1210,7 +1228,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strncmp(argv[i], "--filter=", 9) == 0) {
       if (config_add_filter(config, argv[i] + 9) != 0)
         return -1;
-    } else if (opt_is(argv[i], "--filter", NULL)) {
+    } else if (strncmp(argv[i], "-f=", 3) == 0) {
+      if (config_add_filter(config, argv[i] + 3) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--filter", "-f")) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
@@ -1247,13 +1268,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
         return -1;
     } else if (opt_is(argv[i], "--info", NULL)) {
       if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
-        return -1;
-    } else if (opt_is(argv[i], "-T", NULL)) {
-      if (i + 1 >= argc) {
-        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
-        return -1;
-      }
-      if (set_positive_int_option(&config->timeout, argv[++i], "-T") != 0)
         return -1;
     } else if (strncmp(argv[i], "--skip-compress=", 16) == 0) {
       if (parse_skip_compress(config, argv[i] + 16) != 0)
@@ -1308,7 +1322,10 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strncmp(argv[i], "--remote-option=", 16) == 0) {
       if (config_add_remote_option(config, argv[i] + 16, "--remote-option") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--remote-option", NULL)) {
+    } else if (strncmp(argv[i], "-M=", 3) == 0) {
+      if (config_add_remote_option(config, argv[i] + 3, "-M") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--remote-option", "-M")) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for --remote-option");
         return -1;
