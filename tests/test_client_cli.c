@@ -2374,20 +2374,24 @@ static void test_parse_args_append_both() {
 
 static void test_validate_config_append_rejects_chunk_serialization() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--append", "-s", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--append", "--chunk-serialization", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
   EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
 
 static void test_validate_config_append_verify_rejects_chunk_serialization() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--append-verify", "-s", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--append-verify", "--chunk-serialization", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
   EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }

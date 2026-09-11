@@ -101,7 +101,7 @@ class TestDeviceSpecial:
         assert os.major(st.st_rdev) == 1 and os.minor(st.st_rdev) == 3
 
     def test_m_remove_source_files_keeps_recreated_fifo(self, shared_server):
-        """-m --remove-source-files --specials: a recreated FIFO must NOT be
+        """--threads --remove-source-files --specials: a recreated FIFO must NOT be
         acknowledged as a removable source (its outcome must not shift the
         per-file status stream, which would break the run and mis-remove the
         adjacent regular file).  The regular file is removed; the FIFO stays."""
@@ -122,7 +122,7 @@ class TestDeviceSpecial:
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
     def test_m_remove_source_files_keeps_recreated_device(self, shared_server):
-        """Root-only: -m --remove-source-files --devices must not remove a
+        """Root-only: --threads --remove-source-files --devices must not remove a
         source device node the receiver recreated (mirrors the single-threaded
         behavior; the special is never acknowledged as a removable source)."""
         self._setup()
@@ -320,7 +320,7 @@ class TestRemoveSourceFiles:
         with open(source_file, "wb") as f:
             f.write(b"keep after skip")
 
-        # The seed run preserves timestamps (-M) so the destination copy has the
+        # The seed run preserves timestamps (--preserve) so the destination copy has the
         # source's exact mtime; otherwise the incremental skip would depend on
         # both writes landing in the same whole second (a race).
         result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
@@ -348,11 +348,15 @@ class TestArchiveMode:
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
 
-    def test_archive_implied_options_can_be_negated(self, shared_server):
+    def test_archive_with_negated_links(self, shared_server):
+        # --archive implies links + metadata + devices + specials.  Devices/specials
+        # force metadata transmission (recreating a node needs the metadata mode), so
+        # the post-parse layer keeps use_metadata on even under --no-preserve; only the
+        # independently-negatable --no-links actually takes effect here.
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["--archive", "--no-links", "--no-preserve"],
+            flags=["--archive", "--no-links"],
             port=shared_server.port,
         )
         if result.returncode != 0:
@@ -1770,13 +1774,13 @@ class TestLogFileFormat:
             flags=["--log-file", log_path, "--log-file-format=%f %l", "--threads"],
             port=shared_server.port,
         )
-        assert result.returncode == 0, f"log-file -m sync failed: {result.stderr[:200]}"
+        assert result.returncode == 0, f"log-file --threads sync failed: {result.stderr[:200]}"
         assert os.path.exists(log_path), "--log-file created no log"
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
         expected = {f"{os.path.join(source, rel)} {len(data)}" for rel, data in files.items()}
         for line in expected:
-            assert line in content, f"log file (-m) missing {line!r}"
+            assert line in content, f"log file (--threads) missing {line!r}"
 
 
 class TestDelayUpdates:
@@ -4552,7 +4556,7 @@ class TestExtendedAttributes:
             pytest.skip("filesystem does not support xattrs")
         acl_blob = None
         if shutil.which("setfacl") is not None:
-            acl = subprocess.run(["setfacl", "--threads", "o::r", f], capture_output=True, text=True)
+            acl = subprocess.run(["setfacl", "-m", "o::r", f], capture_output=True, text=True)
             if acl.returncode == 0:
                 try:
                     acl_blob = os.getxattr(f, "system.posix_acl_access")
