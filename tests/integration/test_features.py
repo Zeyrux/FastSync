@@ -108,7 +108,7 @@ class TestDeviceSpecial:
         self._setup()
         os.mkfifo(os.path.join(DEVICE_SOURCE, "pipe.fifo"))
         result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
-                               flags=["-m", "--remove-source-files", "--specials"],
+                               flags=["--threads", "--remove-source-files", "--specials"],
                                port=shared_server.port)
         assert result.returncode == 0, (
             f"Exit {result.returncode}: {result.stderr[:300]}"
@@ -129,7 +129,7 @@ class TestDeviceSpecial:
         src_dev = os.path.join(DEVICE_SOURCE, "realdev")
         os.mknod(src_dev, stat.S_IFCHR | 0o666, os.makedev(1, 3))
         result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
-                               flags=["-m", "--remove-source-files", "--devices"],
+                               flags=["--threads", "--remove-source-files", "--devices"],
                                port=shared_server.port)
         assert result.returncode == 0, (
             f"Exit {result.returncode}: {result.stderr[:300]}"
@@ -263,7 +263,7 @@ class TestRemoveSourceFiles:
         os.makedirs(os.path.join(source, "directory"))
         os.symlink("one.txt", os.path.join(source, "link.txt"))
 
-        result, _ = run_client(source, dest, flags=["--remove-source-files", "-m"],
+        result, _ = run_client(source, dest, flags=["--remove-source-files", "--threads"],
                                port=shared_server.port)
         assert result.returncode == 0, f"Remove-source sync failed: {result.stderr[:200]}"
         assert not os.path.exists(os.path.join(source, "one.txt"))
@@ -323,7 +323,7 @@ class TestRemoveSourceFiles:
         # The seed run preserves timestamps (-M) so the destination copy has the
         # source's exact mtime; otherwise the incremental skip would depend on
         # both writes landing in the same whole second (a race).
-        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
         result, _ = run_client(source, dest,
                                flags=["--remove-source-files", "--incremental"],
@@ -352,7 +352,7 @@ class TestArchiveMode:
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["--archive", "--no-compress", "--no-m", "--no-preserve"],
+            flags=["--archive", "--no-links", "--no-preserve"],
             port=shared_server.port,
         )
         if result.returncode != 0:
@@ -477,7 +477,7 @@ class TestSkipCompress:
             f.write((b"skip compression case test\n" * 100))
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-c", "--skip-compress=.txt"],
+            flags=["-z", "--skip-compress=.txt"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Skip-compress sync failed: {(result.stderr or result.stdout)[:200]}"
@@ -489,7 +489,7 @@ class TestSkipCompress:
         clean_dir(DEST_DIR)
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-c", "--skip-compress="],
+            flags=["-z", "--skip-compress="],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Empty skip-compress sync failed: {(result.stderr or result.stdout)[:200]}"
@@ -503,7 +503,7 @@ class TestSkipCompress:
         path = os.path.join(SOURCE_DIR, "incremental-skip.TXT")
         with open(path, "wb") as f:
             f.write(b"original skipped content\n")
-        flags = ["-c", "-M", "--skip-compress=.txt"]
+        flags = ["-z", "--preserve", "--skip-compress=.txt"]
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"Initial sync failed: {(result.stderr or result.stdout)[:200]}"
         with open(path, "wb") as f:
@@ -521,7 +521,7 @@ class TestSkipCompress:
     def test_skip_compress_rejects_chunk_serialization(self, shared_server):
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-c", "-s", "--skip-compress=.txt"],
+            flags=["-z", "--chunk-serialization", "--skip-compress=.txt"],
             port=shared_server.port,
         )
         assert result.returncode != 0
@@ -620,7 +620,7 @@ class TestIncremental:
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M"],
+            flags=["--preserve"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"First sync failed: {result.stderr[:100]}"
@@ -628,7 +628,7 @@ class TestIncremental:
         start = time.monotonic()
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M", "--incremental"],
+            flags=["--preserve", "--incremental"],
             port=shared_server.port,
         )
         incremental_time = time.monotonic() - start
@@ -645,7 +645,7 @@ class TestIncremental:
         clean_dir(DEST_DIR)
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M"],
+            flags=["--preserve"],
             port=shared_server.port,
         )
         assert result.returncode == 0
@@ -656,7 +656,7 @@ class TestIncremental:
 
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M", "--incremental"],
+            flags=["--preserve", "--incremental"],
             port=shared_server.port,
         )
         assert result.returncode == 0
@@ -673,7 +673,7 @@ class TestIncremental:
 
     def test_checksum_detects_same_size_and_mtime_change(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
@@ -685,7 +685,7 @@ class TestIncremental:
         os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
 
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "--incremental", "--checksum"],
+                               flags=["--preserve", "--incremental", "--checksum"],
                                port=shared_server.port)
         assert result.returncode == 0, f"Checksum sync failed: {result.stderr[:200]}"
         with open(received_file, "rb") as f:
@@ -693,7 +693,7 @@ class TestIncremental:
 
     def test_size_only_skips_same_size_with_different_mtime(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
@@ -704,7 +704,7 @@ class TestIncremental:
 
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M", "--incremental", "--size-only"],
+            flags=["--preserve", "--incremental", "--size-only"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Size-only sync failed: {result.stderr[:200]}"
@@ -713,7 +713,7 @@ class TestIncremental:
 
     def test_ignore_times_transfers_same_size_and_mtime(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
@@ -725,7 +725,7 @@ class TestIncremental:
         os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
 
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "--incremental", "--ignore-times"],
+                               flags=["--preserve", "--incremental", "--ignore-times"],
                                port=shared_server.port)
         assert result.returncode == 0, f"Ignore-times sync failed: {result.stderr[:200]}"
         with open(received_file, "rb") as f:
@@ -733,7 +733,7 @@ class TestIncremental:
 
     def test_modify_window_allows_subsecond_mtime_difference(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
@@ -746,7 +746,7 @@ class TestIncremental:
                                     source_stat.st_mtime_ns - 1500000000))
 
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "--incremental", "--modify-window=2"],
+                               flags=["--preserve", "--incremental", "--modify-window=2"],
                                port=shared_server.port)
         assert result.returncode == 0, f"Modify-window sync failed: {result.stderr[:200]}"
         with open(received_file, "rb") as f:
@@ -754,7 +754,7 @@ class TestIncremental:
 
     def test_whole_file_disables_delta_and_keeps_compression(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
         source_file = os.path.join(SOURCE_DIR, "medium.txt")
@@ -764,7 +764,7 @@ class TestIncremental:
         result, _ = run_client(
             SOURCE_DIR,
             DEST_DIR,
-            flags=["-M", "--incremental", "--delta", "-W", "-c"],
+            flags=["--preserve", "--incremental", "--delta", "-W", "-z"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Whole-file sync failed: {(result.stderr or result.stdout)[:200]}"
@@ -795,11 +795,11 @@ class TestChecksumChoice:
     @pytest.mark.parametrize("mt", [False, True])
     def test_unchanged_skipped_and_bytes_preserved(self, shared_server, algo, mt):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
 
-        flags = (["-M", "--incremental", "--checksum", f"--checksum-choice={algo}"] +
-                 (["-m"] if mt else []))
+        flags = (["--preserve", "--incremental", "--checksum", f"--checksum-choice={algo}"] +
+                 (["--threads"] if mt else []))
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"checksum {algo} run failed: {result.stderr[:200]}"
 
@@ -816,7 +816,7 @@ class TestChecksumChoice:
     @pytest.mark.parametrize("mt", [False, True])
     def test_changed_same_size_mtime_redetected(self, shared_server, algo, mt):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
@@ -827,8 +827,8 @@ class TestChecksumChoice:
             f.write(b"DDDDDDDDDDDD")  # same size, different content
         os.utime(received_file, (source_stat.st_atime, source_stat.st_mtime))
 
-        flags = (["-M", "--incremental", "--checksum", f"--checksum-choice={algo}"] +
-                 (["-m"] if mt else []))
+        flags = (["--preserve", "--incremental", "--checksum", f"--checksum-choice={algo}"] +
+                 (["--threads"] if mt else []))
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"checksum {algo} redetect failed: {result.stderr[:200]}"
         with open(received_file, "rb") as f:
@@ -840,10 +840,10 @@ class TestChecksumChoice:
         # small handshake travels, not the payloads.  Proxy byte counts are not
         # available for -m (multithreaded connections), so single-thread only.
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0
 
-        flags = ["-M", "--incremental", "--checksum", f"--checksum-choice={algo}"]
+        flags = ["--preserve", "--incremental", "--checksum", f"--checksum-choice={algo}"]
         proxy = CountingProxy(shared_server.port)
         cmd = (CLIENT_CMD + ["--source-dir", SOURCE_DIR, "--dest-dir", DEST_DIR,
                              "--save-to-disk", "--server-port", str(proxy.port)] + flags)
@@ -855,8 +855,8 @@ class TestChecksumChoice:
     @pytest.mark.parametrize("mt", [False, True])
     def test_seed_is_deterministic_and_preserves_content(self, shared_server, mt):
         clean_dir(DEST_DIR)
-        flags = ["-M", "--incremental", "--checksum",
-                 "--checksum-choice=xxh64", "--checksum-seed=987654"] + (["-m"] if mt else [])
+        flags = ["--preserve", "--incremental", "--checksum",
+                 "--checksum-choice=xxh64", "--checksum-seed=987654"] + (["--threads"] if mt else [])
         first, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
         assert first.returncode == 0, f"seeded run failed: {first.stderr[:200]}"
 
@@ -894,7 +894,7 @@ class TestChecksumChoice:
         big = os.path.join(source, "big.bin")
         with open(big, "wb") as f:
             f.write(bytes(range(256)) * 200)  # 51200 bytes > delta 16K floor
-        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"seed delta seed failed: {result.stderr[:200]}"
 
         # Edit a region so the receiver must match a changed block with the seed.
@@ -906,8 +906,8 @@ class TestChecksumChoice:
         # edit and the prior sync share a second.  Setting an old dest mtime
         # guarantees the delta path is exercised deterministically.
         os.utime(os.path.join(get_dest_received_dir(dest, source), "big.bin"), (0, 0))
-        flags = (["-M", "--incremental", "--delta", "--checksum-seed=314159"] +
-                 (["-m"] if mt else []))
+        flags = (["--preserve", "--incremental", "--delta", "--checksum-seed=314159"] +
+                 (["--threads"] if mt else []))
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"seed delta run failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
@@ -975,7 +975,7 @@ class TestExisting:
     @pytest.mark.ci
     def test_existing_updates_existing_and_skips_new(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"Initial sync failed: {(result.stderr or result.stdout)[:200]}"
 
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
@@ -988,7 +988,7 @@ class TestExisting:
 
         try:
             result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                                   flags=["-M", "--existing"], port=shared_server.port)
+                                   flags=["--preserve", "--existing"], port=shared_server.port)
             assert result.returncode == 0, f"--existing sync failed: {(result.stderr or result.stdout)[:200]}"
 
             with open(os.path.join(received, "small.txt"), "rb") as f:
@@ -1060,7 +1060,7 @@ class TestDelete:
         clean_dir(DEST_DIR)
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M"],
+            flags=["--preserve"],
             port=shared_server.port,
         )
         assert result.returncode == 0
@@ -1076,7 +1076,7 @@ class TestDelete:
 
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-M", "--delete"],
+            flags=["--preserve", "--delete"],
             port=shared_server.port,
         )
 
@@ -1119,7 +1119,7 @@ class TestProgress:
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-m", "-h", "--progress"],
+            flags=["--threads", "-h", "--progress"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
@@ -1145,7 +1145,7 @@ class TestInfo:
         clean_dir(DEST_DIR)
         result, _ = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["-m", "--info=stats"],
+            flags=["--threads", "--info=stats"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Info stats sync failed: {(result.stderr or result.stdout)[:200]}"
@@ -1277,7 +1277,7 @@ class TestRemoveSourceFilesSkips:
         assert result.returncode == 0
 
         result, _ = run_client(source, dest,
-                               flags=["--remove-source-files", "--ignore-existing", "-m"],
+                               flags=["--remove-source-files", "--ignore-existing", "--threads"],
                                port=shared_server.port)
         assert result.returncode == 0, f"Sync failed: {result.stderr[:200]}"
         # Destination already has the file, so the receiver (writer thread)
@@ -1425,7 +1425,7 @@ class TestOneFileSystem:
         source = os.path.join(TEST_DATA_DIR, "ofs_m_src")
         self._make_tree(source)
         self._assert_full_tree_transferred(source, os.path.join(TEST_DATA_DIR, "ofs_m_dst"),
-                                           shared_server.port, ["-m", "--one-file-system"])
+                                           shared_server.port, ["--threads", "--one-file-system"])
 
     def test_x_skips_other_device_mountpoint(self, shared_server):
         if os.geteuid() != 0 or shutil.which("mount") is None or shutil.which("umount") is None:
@@ -1518,7 +1518,7 @@ class TestTempDir:
         source = self._make_source("tempdir_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_dst")
         clean_dir(dest)
-        flags = ["--temp-dir=scratch"] + (["-m"] if mt else [])
+        flags = ["--temp-dir=scratch"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"temp-dir sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
@@ -1629,7 +1629,7 @@ class TestListOnly:
 
     def test_list_only_multithreaded(self):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "-m"])
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "--threads"])
         assert result.returncode == 0, f"list-only -m failed: {result.stderr[:200]}"
         for full_path in _source_files():
             assert full_path in result.stdout, f"list-only -m omitted {full_path}"
@@ -1643,7 +1643,7 @@ class TestItemizeChanges:
     def test_first_run_prints_sent_lines(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "-i"], port=shared_server.port)
+                               flags=["--preserve", "-i"], port=shared_server.port)
         assert result.returncode == 0, f"itemize sync failed: {result.stderr[:200]}"
         sent_lines = {">f+++++++++ " + p for p in _source_files()}
         assert sent_lines <= set(result.stdout.splitlines()), (
@@ -1652,10 +1652,10 @@ class TestItemizeChanges:
 
     def test_incremental_second_run_prints_no_line_for_unchanged(self, shared_server):
         clean_dir(DEST_DIR)
-        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "-i", "--incremental"],
+                               flags=["--preserve", "-i", "--incremental"],
                                port=shared_server.port)
         assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
         itemized = [line for line in result.stdout.splitlines() if line and line[0] in ">.<c"]
@@ -1664,7 +1664,7 @@ class TestItemizeChanges:
     def test_multithreaded_emits_same_itemize_lines(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["-M", "-i", "-m"], port=shared_server.port)
+                               flags=["--preserve", "-i", "--threads"], port=shared_server.port)
         assert result.returncode == 0, f"itemize -m sync failed: {result.stderr[:200]}"
         sent_lines = {">f+++++++++ " + p for p in _source_files()}
         assert sent_lines <= set(result.stdout.splitlines()), (
@@ -1690,14 +1690,14 @@ class TestItemizeChanges:
         with open(untouched, "wb") as fh:
             fh.write(b"stable\n")
 
-        result, _ = run_client(source, dest, flags=["-M"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
 
         with open(changed, "wb") as fh:
             fh.write(b"edited payload\n")
 
         result, _ = run_client(source, dest,
-                               flags=["-M", "-i", "--incremental"],
+                               flags=["--preserve", "-i", "--incremental"],
                                port=shared_server.port)
         assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
         itemized = [line for line in result.stdout.splitlines() if line.startswith(">f")]
@@ -1724,7 +1724,7 @@ class TestOutFormat:
     def test_out_format_multithreaded_matches_single(self, shared_server):
         clean_dir(DEST_DIR)
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
-                               flags=["--out-format=%f %l", "-m"], port=shared_server.port)
+                               flags=["--out-format=%f %l", "--threads"], port=shared_server.port)
         assert result.returncode == 0, f"out-format -m sync failed: {result.stderr[:200]}"
         expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
         got = set(result.stdout.splitlines())
@@ -1767,7 +1767,7 @@ class TestLogFileFormat:
         result, _ = run_client(
             source,
             dest,
-            flags=["--log-file", log_path, "--log-file-format=%f %l", "-m"],
+            flags=["--log-file", log_path, "--log-file-format=%f %l", "--threads"],
             port=shared_server.port,
         )
         assert result.returncode == 0, f"log-file -m sync failed: {result.stderr[:200]}"
@@ -1812,7 +1812,7 @@ class TestDelayUpdates:
 
         result, _ = run_client(source, plain_dest, port=shared_server.port)
         assert result.returncode == 0, f"plain sync failed: {result.stderr[:200]}"
-        flags = ["--delay-updates"] + (["-m"] if mt else [])
+        flags = ["--delay-updates"] + (["--threads"] if mt else [])
         result, _ = run_client(source, delay_dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"delay-updates sync failed: {result.stderr[:200]}"
 
@@ -1834,7 +1834,7 @@ class TestDelayUpdates:
         source = self._make_source("delay_rerun_src")
         dest = os.path.join(TEST_DATA_DIR, "delay_rerun_dst")
         clean_dir(dest)
-        flags = ["--delay-updates", "-M", "--incremental"] + (["-m"] if mt else [])
+        flags = ["--delay-updates", "--preserve", "--incremental"] + (["--threads"] if mt else [])
 
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"first delayed sync failed: {result.stderr[:200]}"
@@ -1853,7 +1853,7 @@ class TestDelayUpdates:
         source = self._make_source("delay_rsf_src")
         dest = os.path.join(TEST_DATA_DIR, "delay_rsf_dst")
         clean_dir(dest)
-        flags = ["--remove-source-files", "--delay-updates"] + (["-m"] if mt else [])
+        flags = ["--remove-source-files", "--delay-updates"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"delayed remove-source sync failed: {result.stderr[:200]}"
 
@@ -1891,7 +1891,7 @@ class TestDelayUpdates:
                 fh.write(b"BBBB")
             os.remove(os.path.join(source, "extra.txt"))
 
-            flags = ["--delete", "--delay-updates"] + (["-m"] if mt else [])
+            flags = ["--delete", "--delay-updates"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"delete+delay-updates sync failed: {result.stderr[:200]}"
@@ -1945,7 +1945,7 @@ class TestDelayUpdates:
         with open(os.path.join(received, "sub"), "wb") as fh:
             fh.write(b"blocks the nested destination directory")
 
-        flags = ["--delay-updates"] + (["-m"] if mt else [])
+        flags = ["--delay-updates"] + (["--threads"] if mt else [])
         if remove_source_files:
             flags += ["--remove-source-files"]
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
@@ -1982,7 +1982,7 @@ class TestDelayUpdates:
             fh.write(b"changed on source")
         with open(os.path.join(source, "deliver.txt"), "wb") as fh:
             fh.write(b"new file")
-        flags = ["--remove-source-files", "--ignore-existing", "--delay-updates"] + (["-m"] if mt else [])
+        flags = ["--remove-source-files", "--ignore-existing", "--delay-updates"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"delayed skip sync failed: {result.stderr[:200]}"
         # keep.txt already existed at the destination: receiver skip -> source stays.
@@ -2045,7 +2045,7 @@ class TestRelativeFilesFrom:
         dest = os.path.join(TEST_DATA_DIR, "rel_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"top.txt\nsub/x.txt\n")
-        flags = ["--files-from", lst, "-R"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "-R"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"-R files-from sync failed: {result.stderr[:200]}"
         assert _read_file(os.path.join(dest, "sub", "x.txt")) == b"x\n", \
@@ -2064,7 +2064,7 @@ class TestRelativeFilesFrom:
         source = _make_relative_source("rel_only_src")
         dest = os.path.join(TEST_DATA_DIR, "rel_only_dst")
         clean_dir(dest)
-        flags = ["-R"] + (["-m"] if mt else [])
+        flags = ["-R"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"-R alone sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
@@ -2077,7 +2077,7 @@ class TestRelativeFilesFrom:
         dest = os.path.join(TEST_DATA_DIR, "rel_noR_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"sub/x.txt\n")
-        flags = ["--files-from", lst] + (["-m"] if mt else [])
+        flags = ["--files-from", lst] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"files-from sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
@@ -2140,7 +2140,7 @@ class TestMissingArgs:
         dest = os.path.join(TEST_DATA_DIR, "mg_default_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a.txt\ngone.txt\nsub/b.txt\n")
-        flags = ["--files-from", lst] + (["-m"] if mt else [])
+        flags = ["--files-from", lst] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode != 0, "a listed-but-missing entry did not fail the run"
         assert "gone.txt" in (result.stderr or result.stdout)
@@ -2154,7 +2154,7 @@ class TestMissingArgs:
         dest = os.path.join(TEST_DATA_DIR, "mg_ignore_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a.txt\ngone.txt\nsub/b.txt\n")
-        flags = ["--files-from", lst, "--ignore-missing-args"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--ignore-missing-args"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"ignore-missing-args sync failed: {result.stderr[:300]}"
         received = get_dest_received_dir(dest, source)
@@ -2171,7 +2171,7 @@ class TestMissingArgs:
         dest = os.path.join(TEST_DATA_DIR, "mg_all_missing_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"gone1.txt\ngone2.txt\n")
-        flags = ["--files-from", lst, "--ignore-missing-args"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--ignore-missing-args"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, \
             f"all-missing run should succeed (rsync parity): {result.stderr[:300]}"
@@ -2184,7 +2184,7 @@ class TestMissingArgs:
         dest = os.path.join(TEST_DATA_DIR, "mg_empty_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"")
-        flags = ["--files-from", lst, "--ignore-missing-args"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--ignore-missing-args"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode != 0, "an empty --files-from list must stay a hard error"
         assert "contains no entries" in (result.stderr or result.stdout)
@@ -2201,7 +2201,7 @@ class TestMissingArgs:
             server.start(extra_args=["--allow-delete"])
             seed = _write_rel_list(b"a.txt\nsub/b.txt\n")
             result, _ = run_client(source, dest,
-                                   flags=["--files-from", seed, "-R"] + (["-m"] if mt else []),
+                                   flags=["--files-from", seed, "-R"] + (["--threads"] if mt else []),
                                    port=server.port)
             assert result.returncode == 0, f"seed -R sync failed: {result.stderr[:200]}"
             assert os.path.isfile(os.path.join(dest, "a.txt"))
@@ -2214,7 +2214,7 @@ class TestMissingArgs:
                 fh.write("unrelated")
 
             lst = _write_rel_list(b"a.txt\ngone.txt\nsub/b.txt\n")
-            flags = ["--files-from", lst, "-R", "--delete-missing-args"] + (["-m"] if mt else [])
+            flags = ["--files-from", lst, "-R", "--delete-missing-args"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, f"delete-missing sync failed: {result.stderr[:300]}"
             assert not os.path.exists(os.path.join(dest, "gone.txt")), \
@@ -2227,7 +2227,7 @@ class TestMissingArgs:
             # Now with --delete the unrelated extra is an ordinary extra and must go.
             lst2 = _write_rel_list(b"a.txt\ngone.txt\nsub/b.txt\n")
             flags2 = ["--files-from", lst2, "-R", "--delete-missing-args", "--delete"] + \
-                     (["-m"] if mt else [])
+                     (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags2, port=server.port)
             assert result.returncode == 0, f"delete-missing + delete sync failed: {result.stderr[:300]}"
             assert not os.path.exists(os.path.join(dest, "unrelated.txt")), \
@@ -2287,7 +2287,7 @@ class TestMissingArgs:
 
             lst = _write_rel_list(b"a.txt\nprot/gone.txt\n")
             flags = ["--files-from", lst, "--filter=- prot/", "--delete-missing-args",
-                     "--delete"] + (["-m"] if mt else [])
+                     "--delete"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, f"delete-missing exclude sync failed: {result.stderr[:300]}"
             assert not os.path.exists(os.path.join(received, "prot", "gone.txt")), \
@@ -2314,7 +2314,7 @@ class TestMissingArgs:
             server.start(extra_args=["--allow-delete"])
             lst = _write_rel_list(b"a.txt\ngone.txt\ngone2.txt\n")
             flags = ["--files-from", lst, "-R", "--delete-missing-args", "--delete-before"] + \
-                    (["-m"] if mt else [])
+                    (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, f"early delete-missing sync failed: {result.stderr[:300]}"
             assert not os.path.exists(os.path.join(dest, "gone.txt")), \
@@ -2353,7 +2353,7 @@ class TestMissingArgs:
 
             lst = _write_rel_list(b"a.txt\nsub/gone.txt\n")
             flags = ["--files-from", lst, "--delete-missing-args", "--delete"] + rel_flags + \
-                    (["-m"] if mt else [])
+                    (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"deep missing-entry sync failed: {result.stderr[:300]}"
@@ -2373,7 +2373,7 @@ class TestMissingArgs:
         clean_dir(dest)
         lst = _write_rel_list(b"a.txt\ngone.txt\n")
         flags = ["--files-from", lst, "--dirs", "-R", "--ignore-missing-args"] + \
-                (["-m"] if mt else [])
+                (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"--dirs ignore-missing sync failed: {result.stderr[:300]}"
         assert _read_file(os.path.join(dest, "a.txt")) == b"a\n", \
@@ -2395,7 +2395,7 @@ class TestNoImpliedDirs:
         dest = os.path.join(TEST_DATA_DIR, "noimplied_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a/b.txt\n")  # "a" itself is not listed
-        flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode != 0, "implied parent directory was not rejected"
         assert "--no-implied-dirs" in (result.stderr or result.stdout)
@@ -2407,7 +2407,7 @@ class TestNoImpliedDirs:
         dest = os.path.join(TEST_DATA_DIR, "noimplied_ok_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a\na/b.txt\n")
-        flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"listed dir + file sync failed: {result.stderr[:200]}"
         assert _read_file(os.path.join(dest, "a", "b.txt")) == b"nested\n"
@@ -2418,7 +2418,7 @@ class TestNoImpliedDirs:
         dest = os.path.join(TEST_DATA_DIR, "noimplied_noR_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a/b.txt\n")
-        flags = ["--files-from", lst, "--no-implied-dirs"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--no-implied-dirs"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, "--no-implied-dirs without -R changed behavior"
         received = get_dest_received_dir(dest, source)
@@ -2446,7 +2446,7 @@ class TestDirs:
         source = self._make()
         dest = os.path.join(TEST_DATA_DIR, "dirs_dst")
         clean_dir(dest)
-        flags = [flag] + (["-m"] if mt else [])
+        flags = [flag] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"{flag} sync failed: {result.stderr[:200]}"
         self._assert_only_empty_mirror(dest, source)
@@ -2458,7 +2458,7 @@ class TestDirs:
         clean_dir(dest)
         # A listed directory is created empty; a listed file is transferred.
         lst = _write_rel_list(b"dir1\nsub/x.txt\n")
-        flags = ["--files-from", lst, "--dirs", "-R"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--dirs", "-R"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"dirs files-from sync failed: {result.stderr[:200]}"
         assert os.path.isdir(os.path.join(dest, "dir1")), "listed dir was not created"
@@ -2476,7 +2476,7 @@ class TestDirs:
         dest = os.path.join(TEST_DATA_DIR, "dirs_ff_noR_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"dir1\n")
-        flags = ["--files-from", lst, "--dirs"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--dirs"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"dirs files-from no-R sync failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
@@ -2495,7 +2495,7 @@ class TestDirs:
         dest = os.path.join(TEST_DATA_DIR, "dirs_s_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"dir1\nsub/x.txt\n")
-        flags = ["--files-from", lst, "--dirs", "-R", "-s"] + (["-m"] if mt else [])
+        flags = ["--files-from", lst, "--dirs", "-R", "--chunk-serialization"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"dirs -s sync failed: {result.stderr[:200]}"
         assert os.path.isdir(os.path.join(dest, "dir1")), "listed dir was not created"
@@ -2554,7 +2554,7 @@ class TestMkpath:
         shutil.rmtree(dest, ignore_errors=True)
         with ServerManager() as server:
             server.start()
-            flags = ["-m"] if mt else []
+            flags = ["--threads"] if mt else []
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode != 0, "missing destination root did not fail without --mkpath"
             assert not os.path.exists(dest), "missing root was created without --mkpath"
@@ -2566,7 +2566,7 @@ class TestMkpath:
         shutil.rmtree(os.path.join(TEST_DATA_DIR, "deep"), ignore_errors=True)
         with ServerManager() as server:
             server.start()
-            flags = ["--mkpath"] + (["-m"] if mt else [])
+            flags = ["--mkpath"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, f"--mkpath sync failed: {result.stderr[:200]}"
             received = get_dest_received_dir(dest, source)
@@ -2656,7 +2656,7 @@ class TestDeleteTiming:
             with open(extra, "wb") as fh:
                 fh.write(b"should be deleted")
 
-            flags = [flag] + (["-m"] if mt else [])
+            flags = [flag] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"{flag} sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -2687,7 +2687,7 @@ class TestDeleteTiming:
             with open(blocker, "wb") as fh:
                 fh.write(b"blocks the nested destination directory")
 
-            flags = [flag] + (["-m"] if mt else [])
+            flags = [flag] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"{flag} (early delete) did not remove the blocker in time: " \
@@ -2721,7 +2721,7 @@ class TestDeleteTiming:
             with open(blocker, "wb") as fh:
                 fh.write(b"blocks the nested destination directory")
 
-            flags = [flag] + (["-m"] if mt else [])
+            flags = [flag] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode != 0, \
                 f"{flag} (mt={mt}) unexpectedly succeeded (deletion must be deferred)"
@@ -2804,7 +2804,7 @@ class TestDeletePolicy:
             self._write(os.path.join(received, "extra.txt"), b"extra\n")
 
             # Default: the excluded mirrors survive --delete, genuine extras die.
-            flags = ["--exclude", "*.log", timing] + (["-m"] if mt else [])
+            flags = ["--exclude", "*.log", timing] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"default delete sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -2817,7 +2817,7 @@ class TestDeletePolicy:
 
             # --delete-excluded: excluded mirrors are extras again and die.
             self._write(os.path.join(received, "extra.txt"), b"extra\n")
-            flags = ["--exclude", "*.log", timing, "--delete-excluded"] + (["-m"] if mt else [])
+            flags = ["--exclude", "*.log", timing, "--delete-excluded"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"--delete-excluded sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -2846,7 +2846,7 @@ class TestDeletePolicy:
             assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
             received = get_dest_received_dir(dest, source)
 
-            flags = ["--filter=- skipdir/", "--delete"] + (["-m"] if mt else [])
+            flags = ["--filter=- skipdir/", "--delete"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"default delete sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -2855,7 +2855,7 @@ class TestDeletePolicy:
             assert os.path.exists(os.path.join(received, "skipdir", "deep", "b.log")), \
                 "nested excluded dir content was deleted under plain --delete"
 
-            flags = ["--filter=- skipdir/", "--delete", "--delete-excluded"] + (["-m"] if mt else [])
+            flags = ["--filter=- skipdir/", "--delete", "--delete-excluded"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"--delete-excluded sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -2882,7 +2882,7 @@ class TestDeletePolicy:
                 self._write(os.path.join(received, name), b"extra\n")
                 extras.append(os.path.join(received, name))
 
-            flags = ["--max-delete=2", timing] + (["-m"] if mt else [])
+            flags = ["--max-delete=2", timing] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode != 0, \
                 f"--max-delete=2 with 4 extras unexpectedly succeeded: {result.stderr[:300]}"
@@ -2906,7 +2906,7 @@ class TestDeletePolicy:
             received = get_dest_received_dir(dest, source)
             for i in range(3):
                 self._write(os.path.join(received, f"e{i}.txt"), b"extra\n")
-            flags = ["--max-delete=3", "--delete"] + (["-m"] if mt else [])
+            flags = ["--max-delete=3", "--delete"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"--max-delete=3 with 3 extras failed: {(result.stderr or result.stdout)[:300]}"
@@ -2943,7 +2943,7 @@ class TestDeletePolicy:
             assert os.path.exists(os.path.join(received, "sub", "old.txt")), \
                 "non-empty dir content was lost although the run failed without --force"
 
-            flags = ["--force"] + (["-m"] if mt else [])
+            flags = ["--force"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"--force run failed: {(result.stderr or result.stdout)[:300]}"
@@ -3000,7 +3000,7 @@ class TestDeletePolicy:
             assert os.listdir(received) == []
 
             # prune-empty-dirs: the empty mirror is pruned by --delete.
-            flags = ["--dirs", "--prune-empty-dirs", "--delete"] + (["-m"] if mt else [])
+            flags = ["--dirs", "--prune-empty-dirs", "--delete"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"--dirs --prune-empty-dirs --delete failed: {(result.stderr or result.stdout)[:300]}"
@@ -3012,7 +3012,7 @@ class TestDeletePolicy:
         clean_dir(dest2)
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            flags = ["--dirs", "--prune-empty-dirs", "-i"] + (["-m"] if mt else [])
+            flags = ["--dirs", "--prune-empty-dirs", "-i"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest2, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"--dirs --prune-empty-dirs failed: {(result.stderr or result.stdout)[:300]}"
@@ -3047,7 +3047,7 @@ class TestDeletePolicy:
             os.makedirs(os.path.join(received, "empty", "chain"))
 
             for prune in ([], ["--prune-empty-dirs"]):
-                flags = prune + ["--delete"] + (["-m"] if mt else [])
+                flags = prune + ["--delete"] + (["--threads"] if mt else [])
                 result, _ = run_client(source, dest, flags=flags, port=server.port)
                 assert result.returncode == 0, \
                     f"prune recursive sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -3058,7 +3058,7 @@ class TestDeletePolicy:
                 assert _read_file(os.path.join(received, "keep.txt")) == b"kept\n"
 
             # An excluded file's mirror is protected: the dir that holds it stays.
-            flags = ["--exclude", "*.log", "--delete", "--prune-empty-dirs"] + (["-m"] if mt else [])
+            flags = ["--exclude", "*.log", "--delete", "--prune-empty-dirs"] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"prune recursive sync failed: {(result.stderr or result.stdout)[:300]}"
@@ -3100,7 +3100,7 @@ class TestDeletePolicy:
 
                 # Default: scan error aborts the run; nothing is deleted.
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
-                flags = ["--delete"] + (["-m"] if mt else [])
+                flags = ["--delete"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
                 assert result.returncode != 0, "unreadable source dir did not fail the run"
                 assert os.path.exists(os.path.join(received, "extra.txt")), \
@@ -3108,7 +3108,7 @@ class TestDeletePolicy:
 
                 # --ignore-errors: the readable tree transfers, deletion still runs.
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
-                flags = ["--delete", "--ignore-errors"] + (["-m"] if mt else [])
+                flags = ["--delete", "--ignore-errors"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
                 assert not os.path.exists(os.path.join(received, "extra.txt")), \
                     f"--ignore-errors did not keep deletion active: {result.stderr[:300]}"
@@ -3143,7 +3143,7 @@ class TestDeletePolicy:
             try:
                 os.chmod(source, 0)
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
-                flags = [timing, "--ignore-errors"] + (["-m"] if mt else [])
+                flags = [timing, "--ignore-errors"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
                 assert result.returncode != 0, \
                     f"unreadable source root with {timing} (mt={mt}) unexpectedly succeeded"
@@ -3371,7 +3371,7 @@ class TestBasisDestDirs:
         dest = os.path.join(TEST_DATA_DIR, "basis_link_mt_dst")
         clean_dir(dest)
         basis = self._seed_basis(dest, source, "mtbasis", self._basis_tree("mt"))
-        result, _ = run_client(source, dest, flags=["--link-dest=mtbasis", "-m"],
+        result, _ = run_client(source, dest, flags=["--link-dest=mtbasis", "--threads"],
                                port=shared_server.port)
         assert result.returncode == 0, f"-m link-dest failed: {result.stderr[:300]}"
         received = get_dest_received_dir(dest, source)
@@ -3665,7 +3665,7 @@ class TestFuzzy:
         with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
             fh.write(new_bytes)
 
-        flags = ["--fuzzy"] + (["-m"] if mt else [])
+        flags = ["--fuzzy"] + (["--threads"] if mt else [])
         result, proxy = self._run_measured(source, dest, flags, shared_server.port)
         assert result.returncode == 0, \
             f"--fuzzy {'-m ' if mt else ''}rename failed: {(result.stderr or result.stdout)[:300]}"
@@ -3926,7 +3926,7 @@ class TestIdentityMapping:
         with open(os.path.join(source, "f.txt"), "wb") as f:
             f.write(b"hello identity")
         result, _ = run_client(source, dest,
-                               flags=["-M", "--numeric-ids"],
+                               flags=["--preserve", "--numeric-ids"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:200]}"
@@ -3943,7 +3943,7 @@ class TestIdentityMapping:
             f.write(b"mapped")
         result, _ = run_client(
             source, dest,
-            flags=["-M", "--usermap=@1000:@1001", "--groupmap=@100:@101", "--chown=@2000:@2001"],
+            flags=["--preserve", "--usermap=@1000:@1001", "--groupmap=@100:@101", "--chown=@2000:@2001"],
             port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:200]}"
@@ -3962,7 +3962,7 @@ class TestIdentityMapping:
             f.write(b"owner")
         os.chown(src_file, 12345, 12346)
         result, _ = run_client(source, dest,
-                               flags=["-M", "--numeric-ids"],
+                               flags=["--preserve", "--numeric-ids"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:200]}"
@@ -3984,7 +3984,7 @@ class TestIdentityMapping:
             f.write(b"root chown")
         os.chown(src_file, 1, 1)
         result, _ = run_client(source, dest,
-                               flags=["-M", "--chown=@12345:@54321"],
+                               flags=["--preserve", "--chown=@12345:@54321"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:200]}"
@@ -4013,7 +4013,7 @@ class TestHardLinks:
             fh.write(b"independent content\n" * 2000)
         return src
 
-    @pytest.mark.parametrize("flags", [[], ["-m"], ["--delay-updates"]])
+    @pytest.mark.parametrize("flags", [[], ["--threads"], ["--delay-updates"]])
     def test_hard_links_preserved(self, shared_server, flags):
         src = self._make_source("hl_src")
         dest = os.path.join(TEST_DATA_DIR, "hl_dst")
@@ -4041,7 +4041,7 @@ class TestHardLinks:
         src = self._make_source("hl_reject_src")
         dest = os.path.join(TEST_DATA_DIR, "hl_reject_dst")
         clean_dir(dest)
-        result, _ = run_client(src, dest, flags=["-H", "-s"], port=shared_server.port)
+        result, _ = run_client(src, dest, flags=["-H", "--chunk-serialization"], port=shared_server.port)
         assert result.returncode != 0, "-H with -s was accepted"
 
     def test_hard_links_rejects_append(self, shared_server):
@@ -4136,7 +4136,7 @@ class TestAtimes:
         source = os.path.join(TEST_DATA_DIR, f"atime_{'m' if mt else 's'}_src")
         dest = os.path.join(TEST_DATA_DIR, f"atime_{'m' if mt else 's'}_dst")
         src_file, atime = self._make_source(source, dest)
-        flags = ["-U"] + (["-m"] if mt else [])
+        flags = ["-U"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, \
             f"-U failed: {(result.stderr or result.stdout)[:300]}"
@@ -4158,7 +4158,7 @@ class TestAtimes:
         dest = os.path.join(TEST_DATA_DIR, f"atime_ctrl_{'m' if mt else 's'}_dst")
         src_file, atime = self._make_source(source, dest)
         now = time.time()
-        flags = (["-m"] if mt else [])
+        flags = (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"control run failed: {(result.stderr or '')[:200]}"
         received = get_dest_received_dir(dest, source)
@@ -4191,7 +4191,7 @@ class TestOpenNoatime:
         atime = 730486800  # 1993-02-11, distinct and far from now
         os.utime(path, ns=(atime * 10**9, atime * 10**9))
 
-        flags = ["--open-noatime"] + (["-m"] if mt else [])
+        flags = ["--open-noatime"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, \
             f"--open-noatime failed: {(result.stderr or result.stdout)[:300]}"
@@ -4220,7 +4220,7 @@ class TestCrtimes:
         with open(path, "wb") as f:
             f.write(payload)
 
-        flags = ["-N"] + (["-m"] if mt else [])
+        flags = ["-N"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, \
             f"-N failed: {(result.stderr or result.stdout)[:300]}"
@@ -4267,7 +4267,7 @@ class TestOmitTimes:
         clean_dir(dest)
         with open(os.path.join(source, "a.txt"), "wb") as f:
             f.write(b"omit times content\n")
-        flags = [flag] + (["-m"] if mt else [])
+        flags = [flag] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, \
             f"{flag} failed: {(result.stderr or result.stdout)[:300]}"
@@ -4289,7 +4289,7 @@ class TestOmitTimes:
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"-d -O failed: {(result.stderr or result.stdout)[:300]}"
-        result, _ = run_client(source, dest, flags=["-M", "-O", "-J"],
+        result, _ = run_client(source, dest, flags=["--preserve", "-O", "-J"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"-M -O -J failed: {(result.stderr or result.stdout)[:300]}"
@@ -4536,7 +4536,7 @@ class TestExtendedAttributes:
         if not _xattr_supported(f):
             pytest.skip("filesystem does not support user xattrs")
         os.setxattr(f, "user.k", b"v")
-        result, _ = run_client(source, dest, flags=["-X", "-m"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=["-X", "--threads"], port=shared_server.port)
         assert result.returncode == 0, \
             f"-X -m sync failed: {(result.stderr or result.stdout)[:300]}"
         received = get_dest_received_dir(dest, source)
@@ -4552,7 +4552,7 @@ class TestExtendedAttributes:
             pytest.skip("filesystem does not support xattrs")
         acl_blob = None
         if shutil.which("setfacl") is not None:
-            acl = subprocess.run(["setfacl", "-m", "o::r", f], capture_output=True, text=True)
+            acl = subprocess.run(["setfacl", "--threads", "o::r", f], capture_output=True, text=True)
             if acl.returncode == 0:
                 try:
                     acl_blob = os.getxattr(f, "system.posix_acl_access")
@@ -4662,7 +4662,7 @@ class TestConnectivityClientOptions:
         source, dest = self._source_and_dest("connopt_zlib")
         with open(os.path.join(source, "text.txt"), "wb") as f:
             f.write(b"compress me\n" * 4096)
-        result, _ = run_client(source, dest, flags=["--blocking-io", "-c"],
+        result, _ = run_client(source, dest, flags=["--blocking-io", "-z"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"--blocking-io -c failed: {(result.stderr or result.stdout)[:300]}"

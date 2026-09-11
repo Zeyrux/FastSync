@@ -231,7 +231,7 @@ class TestStopDelete:
         """-m immediate stop + --delete: the completion tail must not read the
         still-appendable manifest (no race) and must not delete the mirrors."""
         source, dest = self._seed("del_mt", shared_server.port, many=True)
-        result, _ = run_client(source, dest, flags=["-m", "--delete", "--stop-at=now+0s"],
+        result, _ = run_client(source, dest, flags=["--threads", "--delete", "--stop-at=now+0s"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"-m --delete immediate stop failed: {(result.stderr or result.stdout)[:400]}"

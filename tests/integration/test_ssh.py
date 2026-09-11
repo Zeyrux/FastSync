@@ -97,31 +97,31 @@ class TestSSHStandard:
         assert r["status"] == "Success", r["error"]
 
     def test_multithreading(self):
-        r = _run_ssh_test("SSH Multithreading (-m)", ["-m"])
+        r = _run_ssh_test("SSH Multithreading (-m)", ["--threads"])
         assert r["status"] == "Success", r["error"]
 
     def test_compression(self):
-        r = _run_ssh_test("SSH Compression (-c)", ["-c"])
+        r = _run_ssh_test("SSH Compression (-c)", ["-z"])
         assert r["status"] == "Success", r["error"]
 
     def test_chunk_serialization(self):
-        r = _run_ssh_test("SSH Chunk Serialization (-s)", ["-s"])
+        r = _run_ssh_test("SSH Chunk Serialization (-s)", ["--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_compression_chunk(self):
-        r = _run_ssh_test("SSH Compression + Chunk (-c -s)", ["-c", "-s"])
+        r = _run_ssh_test("SSH Compression + Chunk (-c -s)", ["-z", "--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_multithread_compression(self):
-        r = _run_ssh_test("SSH Multithread + Compression (-m -c)", ["-m", "-c"])
+        r = _run_ssh_test("SSH Multithread + Compression (-m -c)", ["--threads", "-z"])
         assert r["status"] == "Success", r["error"]
 
     def test_multithread_chunk(self):
-        r = _run_ssh_test("SSH Multithread + Chunk (-m -s)", ["-m", "-s"])
+        r = _run_ssh_test("SSH Multithread + Chunk (-m -s)", ["--threads", "--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
     def test_all_flags(self):
-        r = _run_ssh_test("SSH All Flags (-m -c -s)", ["-m", "-c", "-s"])
+        r = _run_ssh_test("SSH All Flags (-m -c -s)", ["--threads", "-z", "--chunk-serialization"])
         assert r["status"] == "Success", r["error"]
 
 
@@ -178,7 +178,7 @@ class TestSSHConnectivity:
         assert r["status"] == "Success", r["error"]
 
     def test_blocking_io_with_compression(self):
-        r = _run_ssh_test("SSH --blocking-io -c", ["--blocking-io", "-c"])
+        r = _run_ssh_test("SSH --blocking-io -c", ["--blocking-io", "-z"])
         assert r["status"] == "Success", r["error"]
 
     def test_trust_sender(self):

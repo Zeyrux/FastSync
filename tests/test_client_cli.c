@@ -103,19 +103,24 @@ static void test_cli_help() {
   config_delete(cfg);
 }
 
-/* Test that --archive sets compression, multithreading, and metadata */
+/* Test that --archive's config bundle matches rsync -rlptgoD semantics:
+ * links + metadata + devices + specials, and NOT compression/multithreading. */
 static void test_cli_archive_flags() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
 
-  /* Simulate --archive flag */
-  cfg->use_compression = true;
-  cfg->use_multithreading = true;
+  /* Simulate the --archive flag's implied bundle. */
+  cfg->follow_symlinks = true;
   cfg->use_metadata = true;
+  cfg->preserve_devices = true;
+  cfg->preserve_specials = true;
 
-  EXPECT_TRUE(cfg->use_compression);
-  EXPECT_TRUE(cfg->use_multithreading);
+  EXPECT_TRUE(cfg->follow_symlinks);
   EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_FALSE(cfg->use_compression);
+  EXPECT_FALSE(cfg->use_multithreading);
 
   config_delete(cfg);
 }
@@ -325,10 +330,10 @@ static void test_parse_args_fake_super() {
   config_delete(cfg);
 }
 
-/* Test parse_args with valid port */
+/* Test parse_args with valid SSH port (long form; -p is now rsync --perms) */
 static void test_parse_args_valid_port() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "-p", "2222", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--ssh-port", "2222", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -417,7 +422,7 @@ static void test_parse_args_rejects_invalid_chmod() {
 /* Test parse_args rejects port > 65535 */
 static void test_parse_args_invalid_port() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "-p", "99999", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--ssh-port", "99999", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -430,7 +435,7 @@ static void test_parse_args_invalid_port() {
 /* Test parse_args rejects non-numeric port */
 static void test_parse_args_non_numeric_port() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "-p", "abc", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--ssh-port", "abc", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -453,10 +458,10 @@ static void test_parse_args_invalid_server_port() {
   config_delete(cfg);
 }
 
-/* Test parse_args rejects invalid compression level */
+/* Test parse_args rejects invalid compression level (-z/--compress) */
 static void test_parse_args_invalid_compression_level() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "-c", "25", "/src", "/dst"};
+  char* argv[] = {"fastsync", "-z", "25", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -466,10 +471,10 @@ static void test_parse_args_invalid_compression_level() {
   config_delete(cfg);
 }
 
-/* Test parse_args accepts valid compression level */
+/* Test parse_args accepts valid compression level (-z/--compress) */
 static void test_parse_args_valid_compression_level() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "-c", "10", "/src", "/dst"};
+  char* argv[] = {"fastsync", "-z", "10", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -977,11 +982,12 @@ static void test_parse_args_hard_links() {
   config_delete(cfg);
 }
 
-/* -H/--hard-links violates the per-file streaming requirement of -s and the
- * payload-bearing tail-resume of --append: both combos are rejected up front. */
+/* -H/--hard-links violates the per-file streaming requirement of
+ * --chunk-serialization and the payload-bearing tail-resume of --append: both
+ * combos are rejected up front. */
 static void test_validate_config_hard_links_incompatible_modes() {
   Config* cfg = config_create();
-  char* argv_s[] = {"fastsync", "-H", "-s", "/src", "/dst"};
+  char* argv_s[] = {"fastsync", "-H", "--chunk-serialization", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_s, positional_args, &positional_count), 0);
@@ -1049,33 +1055,52 @@ static void test_parse_args_archive() {
 
   int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
   EXPECT_EQ_INT(ret, 0);
-  EXPECT_TRUE(cfg->use_compression);
-  EXPECT_TRUE(cfg->use_multithreading);
+  EXPECT_TRUE(cfg->follow_symlinks);
   EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_FALSE(cfg->use_compression);
+  EXPECT_FALSE(cfg->use_multithreading);
 
   config_delete(cfg);
 }
 
-/* Negations must override archive's implied options in argument order. */
+/* Negations must override archive's implied options in argument order.  Note:
+ * archive implies devices+specials, and device/special preservation itself
+ * forces metadata transmission (re-creating a node needs the metadata mode), so
+ * --no-preserve cannot turn metadata back off while archive keeps devices/specials
+ * on -- that is the correct interaction, not a bug.  A link negation does work. */
 static void test_parse_args_negations() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync",      "--archive",    "--no-compress", "--no-m",
-                  "--no-preserve", "--no-dry-run", "/src",          "/dst"};
+  char* argv[] = {"fastsync",     "--archive", "--no-links", "--no-preserve",
+                  "--no-dry-run", "/src",      "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
-  EXPECT_EQ_INT(parse_args(cfg, 8, argv, positional_args, &positional_count), 0);
-  EXPECT_FALSE(cfg->use_compression);
-  EXPECT_FALSE(cfg->use_multithreading);
-  EXPECT_FALSE(cfg->use_metadata);
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->use_metadata);
   EXPECT_FALSE(cfg->dry_run);
   EXPECT_EQ_INT(positional_count, 2);
   config_delete(cfg);
 }
 
+/* --no-preserve negates an explicit --preserve when nothing forces metadata back
+ * on (no devices/specials). */
+static void test_parse_args_negate_preserve_without_devices() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--preserve", "--no-preserve", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
 static void test_parse_args_negation_order() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--no-z", "-c", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--no-z", "-z", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -1428,9 +1453,11 @@ static void test_parse_args_secluded_args() {
   config_delete(cfg);
 }
 
-static void test_parse_args_short_s_remains_chunk_serialization() {
+static void test_parse_args_chunk_serialization_long_form() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "-s", "/src", "/dst"};
+  /* Chunk serialization is now long-form-only (the short -s is rsync's
+   * --secluded-args no-op). */
+  char* argv[] = {"fastsync", "--chunk-serialization", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
 
@@ -1651,7 +1678,7 @@ static void test_parse_args_fuzzy_respects_no_incremental() {
  * sendfile (-f) modes reject -- mirroring the --delta constraint checks. */
 static void test_validate_config_fuzzy_incompatible_modes() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--fuzzy", "-s", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--fuzzy", "--chunk-serialization", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
@@ -1662,7 +1689,7 @@ static void test_validate_config_fuzzy_incompatible_modes() {
   config_delete(cfg);
 
   cfg = config_create();
-  char* sendfile_argv[] = {"fastsync", "--fuzzy", "-f", "/src", "/dst"};
+  char* sendfile_argv[] = {"fastsync", "--fuzzy", "--sendfile", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, sendfile_argv, positional_args, &positional_count), 0);
   cfg->send_directory = str_dup("/src");
@@ -2819,18 +2846,18 @@ static void test_parse_args_remote_option_rejects_bad_values() {
   config_delete(cfg);
 }
 
-/* A short -M form must NOT be accepted as --remote-option: -M stays FastSync
- * metadata mode (documented divergence). */
-static void test_parse_args_remote_option_no_short_M() {
+/* Since the Phase-7 CLI-namespace pass, -M is rsync's --remote-option short
+ * form (FastSync metadata mode is long-only --preserve): it consumes the next
+ * argv as a remote-option value and must NOT set FastSync metadata mode. */
+static void test_parse_args_remote_option_short_M() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
-  /* -M followed by a remote-option-looking word still means metadata mode. */
-  char* argv[] = {"fastsync", "-M", "-v", "--source-dir", "/src", "--dest-dir", "/dst"};
+  char* argv[] = {"fastsync", "-M", "--trust-sender", "--source-dir", "/src", "--dest-dir", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->use_metadata);
-  EXPECT_EQ_INT(cfg->remote_option_count, 0);
+  EXPECT_FALSE(cfg->use_metadata);
+  EXPECT_EQ_INT(cfg->remote_option_count, 1);
   config_delete(cfg);
 }
 
@@ -2955,6 +2982,7 @@ void test_client_cli() {
   test_parse_args_rejects_invalid_info_flag();
   test_parse_args_archive();
   test_parse_args_negations();
+  test_parse_args_negate_preserve_without_devices();
   test_parse_args_negation_order();
   test_parse_args_no_preserve_blocks_implicit_metadata();
   test_parse_args_rejects_unsafe_negation();
@@ -2970,7 +2998,7 @@ void test_client_cli() {
   test_parse_args_stderr_modes();
   test_parse_args_rejects_unsupported_stderr_modes();
   test_parse_args_secluded_args();
-  test_parse_args_short_s_remains_chunk_serialization();
+  test_parse_args_chunk_serialization_long_form();
   test_parse_args_symlink_trust();
   test_parse_args_whole_file();
   test_parse_args_fuzzy_implies_delta();
@@ -3021,7 +3049,7 @@ void test_client_cli() {
   test_parse_args_remote_option_space_form();
   test_parse_args_remote_option_missing_value();
   test_parse_args_remote_option_rejects_bad_values();
-  test_parse_args_remote_option_no_short_M();
+  test_parse_args_remote_option_short_M();
   test_parse_args_no_motd();
   test_parse_args_password_file();
 }

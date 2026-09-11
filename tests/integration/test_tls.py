@@ -132,7 +132,7 @@ class TestTLSBasic:
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
-                flags=["-c", "--tls",
+                flags=["-z", "--tls",
                        "--cert", certs["client_cert"], "--key", certs["client_key"],
                        "--ca", certs["ca"]],
                 port=server.port,
@@ -157,7 +157,7 @@ class TestTLSBasic:
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
-                flags=["-m", "--tls",
+                flags=["--threads", "--tls",
                        "--cert", certs["client_cert"], "--key", certs["client_key"],
                        "--ca", certs["ca"]],
                 port=server.port,

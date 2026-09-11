@@ -88,16 +88,18 @@ partial, alternate, and planned behavior.
 | Argument | Description |
 |----------|-------------|
 | Positional | `<source> <dest>` — automatic SSH detection if dest contains `:` |
-| `-c [level]` | Compression with optional level (1–22, default 5) |
-| `-z [level]` | Alias for `-c` |
-| `-a, --archive` | Archive mode: enables `-c -m -M` (no `-s`) |
-| `-m` | Multithreading mode |
-| `-s` | Chunk serialization (batch all files per chunk) |
-| `--secluded-args` | Accepted as an rsync compatibility option with no effect; `-s` remains chunk serialization. |
-| `-f, --sendfile` | Sendfile zero-copy. Incompatible with `-c` / `-s`. TCP only. |
-| `-M, --preserve` | Preserve supported file metadata (mode and mtime; ownership and atime are unsupported) |
+| `-c, --checksum` | Verify content by checksum instead of size+mtime |
+| `-z, --compress [level]` | Enable streaming zstd compression (level 1–22, default 5) |
+| `-a, --archive` | rsync archive mode (`-rlptgoD`): links, metadata, devices and specials (not compression/multithreading) |
+| `-j, --threads` | Multithreading mode |
+| `-m` | rsync `--prune-empty-dirs` (short form now rsync-parity) |
+| `--chunk-serialization` | Chunk serialization (batch all files per chunk; long form only) |
+| `-s` | rsync `--secluded-args` compatibility no-op (remote SSH argv is already injection-safe) |
+| `--sendfile` | Sendfile zero-copy. Incompatible with compression / chunk serialization. TCP only. Long form only. |
+| `--preserve` | Preserve supported file metadata (mode and mtime; ownership and atime are unsupported) |
 | `-n, --dry-run` | Scan and print what would be transferred |
-| `-p <port>` | SSH port (default: 22) |
+| `-p, --perms` | Preserve permission bits (part of the metadata bundle) |
+| `--ssh-port <port>` | SSH port (default: 22) |
 | `-v, --verbose` | Enable debug logging |
 | `-q, --quiet` | Suppress non-error output |
 | `--progress` | Show real-time transfer speed |
@@ -113,7 +115,7 @@ partial, alternate, and planned behavior.
 | `--max-size <n>` | Skip files larger than n bytes |
 | `--min-size <n>` | Skip files smaller than n bytes |
 | `--max-alloc <SIZE>` | Maximum single allocation (binary units: B, K, M, G, T, P, E; default 1G) |
-| `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `-s`. |
+| `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `--chunk-serialization`. |
 | `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
@@ -350,16 +352,16 @@ features without changing the meaning of ordinary compatibility options.
 
 | Option | Purpose |
 |---|---|
-| `-m` | Enable the multithreaded scanner/loader/sender pipeline. |
-| `-c [level]`, `-z [level]` | Enable streaming zstd compression, levels 1-22. |
+| `-j`, `--threads` | Enable the multithreaded scanner/loader/sender pipeline. |
+| `-z [level]`, `--compress [level]` | Enable streaming zstd compression, levels 1-22. |
 | `--compress-level <n>` | Set the zstd compression level. |
 | `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` and `none`. |
 | `--zl <n>` | Alias for `--compress-level`. |
-| `--skip-compress <list>` | Skip compression for comma-separated suffixes; incompatible with `-s`. |
+| `--skip-compress <list>` | Skip compression for comma-separated suffixes; incompatible with `--chunk-serialization`. |
 | `--compress-threads <n>` | Use `n` zstd compression workers. Requires compression and a zstd build with threaded support; the setting affects sender CPU work only. |
 | `--chunk-size <bytes>` | Set the transfer chunk size. |
-| `-s` | Enable FastSync chunk serialization. |
-| `-f`, `--sendfile` | Use TCP `sendfile()` zero-copy transfer. Incompatible with compression and chunk serialization. |
+| `--chunk-serialization` | Enable FastSync chunk serialization (long form only; `-s` is rsync's `--secluded-args`). |
+| `--sendfile` | Use TCP `sendfile()` zero-copy transfer. Incompatible with compression and chunk serialization. Long form only. |
 | `--delta` | Use FastSync-native block delta transfer. Requires `--incremental`. |
 | `--delta-block <bytes>` | Set the FastSync delta block size. |
 | `--delta-max <bytes>` | Limit files eligible for FastSync delta transfer. |
@@ -372,15 +374,18 @@ features without changing the meaning of ordinary compatibility options.
 | `--timeout <seconds>` | Set I/O timeout. |
 | `--contimeout <seconds>` | Set connection timeout. |
 
-Current short-option conflicts are tracked as compatibility work. In
-particular, FastSync currently uses `-p` for SSH port, `-s` for chunk
-serialization, and `-S` for sparse handling. These meanings must be reconciled
-before FastSync can claim full rsync CLI compatibility.
+Short-option conflicts with rsync have been resolved for the CLI namespace
+(Phase 7): `-c` is now rsync's `--checksum`, `-m` is `--prune-empty-dirs`, `-M`
+is `--remote-option`, `-f` is `--filter`, `-s` is `--secluded-args`, `-p` is
+`--perms`, and `-T` is `--temp-dir`. FastSync's own flags were renamed to
+long-form-only or new shorts: multithreading is `-j`/`--threads`, metadata
+is `--preserve`, sendfile is `--sendfile`, chunk serialization is
+`--chunk-serialization`, timeout is `--timeout`, and SSH port is `--ssh-port`.
+`-a`/`--archive` is now real rsync archive (`-rlptgoD`).
 
-`--secluded-args` is accepted as a long-form compatibility no-op. It does not
-change FastSync's transport or protocol behavior. The rsync short form `-s` is
-intentionally not aliased because it remains FastSync's chunk-serialization
-option.
+`--secluded-args` (and its short form `-s`) is accepted as a compatibility
+no-op. It does not change FastSync's transport or protocol behavior, because
+remote SSH argv is already built injection-safe.
 
 ## Client Options
 
@@ -388,7 +393,7 @@ option.
 
 | Option | Description |
 |---|---|
-| `-a`, `--archive` | Enable current archive preset. Full rsync archive semantics are planned. |
+| `-a`, `--archive` | rsync archive mode (`-rlptgoD`): links, metadata, devices and specials. |
 | `-n`, `--dry-run` | Scan and report without writing files. |
 | `--delete` | Request removal of destination entries absent from the source. The server must allow deletion. Default timing is delete-after: extras are removed only after the whole transfer succeeded. |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`). |
@@ -417,7 +422,7 @@ use with `--partial`. |
 
 | Option | Description |
 |---|---|
-| `-M`, `--preserve` | Preserve supported file metadata, currently mode and modification time. |
+| `--preserve` | Preserve supported file metadata, currently mode and modification time (long form only). |
 | `-l`, `--links` | Request symlink preservation;
 link-target transfer remains incomplete. |
 | `--copy-links` | Copy symlink referents. |
@@ -440,7 +445,7 @@ link-target transfer remains incomplete. |
 
 | Option | Description |
 |---|---|
-| `-p <port>` | SSH port in the current CLI. This conflicts with rsync's `-p` permissions option and is planned for correction. |
+| `--ssh-port <port>` | SSH port for the SSH transport (default: 22). Note the short `-p` is now rsync's `--perms`. |
 | `--fastsync-server-path <path>` | Remote FastSync server path for SSH mode. |
 | `--source-dir <path>` | Set the source directory explicitly. |
 | `--dest-dir <path>` | Set the destination directory explicitly. |

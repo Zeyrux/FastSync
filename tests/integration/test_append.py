@@ -138,7 +138,7 @@ class TestAppend:
         self._place(source, REL, prefix + added)
         self._place(self._dest_file(source, dest, ""), REL, prefix)
 
-        result, _ = run_client(source, dest, flags=["--append", "-m"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=["--append", "--threads"], port=shared_server.port)
         assert result.returncode == 0, \
             f"--append -m failed: {(result.stderr or result.stdout)[:400]}"
         assert self._read(self._dest_file(source, dest, ""), REL) == prefix + added
