@@ -6,11 +6,11 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Status | Count | Description |
 |--------|-------|-------------|
-| ✅ Implemented | 136 | Feature works end-to-end |
+| ✅ Implemented | 141 | Feature works end-to-end |
 | 🔀 Alt Arg | 0 | Functionality exists but under different flag/semantics |
-| ⛔ Impossible/Divergence | 2 | Flag is a documented divergence or cannot be implemented on any portable filesystem call |
-| ⚠️ Partial | 4 | Flag parsed/stored but behavior incomplete |
-| 🔄 Compatibility No-op | 3 | Flag is accepted for CLI compatibility but has no effect |
+| ⛔ Impossible/Divergence | 4 | Flag is a documented divergence or cannot be implemented on any portable filesystem call |
+| ⚠️ Partial | 0 | Flag parsed/stored but behavior incomplete |
+| 🔄 Compatibility No-op | 0 | Flag is accepted for CLI compatibility but has no effect |
 | ❌ Not Implemented | 2 | Flag not recognized or no behavior |
 | **Total** | **147** | |
 
@@ -828,7 +828,7 @@ These are the last compatibility items and the closing phase toward rsync flag p
 
 **Wave E (LAST) — Privilege (deferred decision, `❌`).** `--super`, `--copy-as=USER[:GROUP]`: **deferred by explicit project decision — the privilege model must be decided when this wave starts.** Candidate directions to fix then: a **safe** receiver model — `--copy-as` performs a drop-to-uid/group only when the process is privileged (and a clear refusal otherwise, never blind elevation); `--super` lifts only within the confined receive root — versus a **full setuid/elevation** model (higher security-review burden). Recommended: the safe-subset + clear-refusal direction, consistent with FastSync's confinement philosophy. These are the only remaining `❌` rows.
 
-**Post-Phase-7 Summary targets.** The 3 `🔀 Alt Arg` rows (`-a`, `-p`, `-z`) → **✅** (real rsync semantics; `-z` divergence shrinks to "zstd-only", matching `--checksum-choice`). `⚠️ Partial` (4 after Wave B) → real `✅` or explicit **Impossible/Divergence**. `🔄 Compatibility No-op` (3) → real `✅` (dir/symlink times) or **Impossible/Divergence** (`--secluded-args`). `❌ Not Implemented` (2) → still deferred to Wave E. The **Impossible/Divergence** status bucket was added to the Summary table (Wave B: `--stderr` + `-N`); everything else lands at `✅`.
+**Post-Phase-7 Summary (after Waves A–D).** ✅141 / 🔀0 / ⛔4 / ⚠️0 / 🔄0 / ❌2 = 147. The 3 `🔀 Alt Arg` rows (`-a`, `-p`, `-z`) are ✅ (Wave A). All 10 prior `⚠️ Partial` rows are resolved to ✅ (`-S`, `-P`, `--block-size`, `--fake-super`, `--devices`, `--copy-devices`, `--write-devices`) or ⛔ (`--stderr=client`, `-N/--crtimes`, `--specials` for the impossible socket case). The 3 `🔄 Compatibility No-op` rows are resolved: `-O`/`-J` are now real ✅ (Wave D), `--secluded-args` is ⛔. The **Impossible/Divergence** bucket holds the 4 physically-impossible/divergent flags: `--stderr=client`, `-N/--crtimes`, `--specials` (sockets), `--secluded-args`. The only remaining `❌ Not Implemented` rows are `--super` and `--copy-as=USER[:GROUP]`, deferred to **Wave E** pending an explicit privilege-model decision (see that paragraph).
 
 ### Recommended Delivery Order
 

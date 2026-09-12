@@ -79,8 +79,10 @@ replacement for every rsync feature or protocol mode.
 - `--dirs` is not implemented. Its compatibility aliases `--old-dirs` and
   `--old-d` are recognized but rejected explicitly rather than silently using
   FastSync's recursive directory behavior.
-- Several rsync short options currently have FastSync-specific meanings. Do
-  not assume every short option is interchangeable yet.
+- Short-option names are now rsync-parity (Phase 7 Wave A): FastSync's former
+  collisions were renamed (`-j`/`--threads`, `--preserve`, `--sendfile`,
+  `--chunk-serialization`, `--timeout`, `--ssh-port`), so `-m`, `-M`, `-f`,
+  `-s`, `-T`, `-p`, `-c`, `-a`, and `-z` follow rsync. See `RSYNC_COMPAT.md`.
 
 The detailed flag matrix is maintained in
 [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md). It distinguishes implemented,
