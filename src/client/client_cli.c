@@ -389,6 +389,21 @@ static int parse_ull_arg(const char* val, unsigned long long* out, const char* o
   return 0;
 }
 
+/* Apply a --delta-block/--block-size value (both spellings and both the inline
+ * and separate argument forms share this one range check).  An out-of-range
+ * value warns once and leaves the configured default untouched.  Returns 0 on
+ * success, -1 on a non-numeric value. */
+static int set_delta_block_size(Config* config, const char* value) {
+  unsigned long long val;
+  if (parse_ull_arg(value, &val, "--block-size/--delta-block") != 0)
+    return -1;
+  if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
+    config->delta_block_size = (uint32_t)val;
+  else
+    log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
+  return 0;
+}
+
 /* Parse a byte count with an optional single-letter binary suffix (K/M/G/T/P/E).
  * When allow_zero is false, a bare 0 is rejected (size limits use true, since 0
  * means "no limit"). Returns 0 on success, -1 on error. */
@@ -1094,33 +1109,18 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                              "--include") != 0)
         return -1;
     } else if (strncmp(argv[i], "--delta-block=", 14) == 0) {
-      unsigned long long val;
-      if (parse_ull_arg(argv[i] + 14, &val, "--block-size/--delta-block") != 0)
+      if (set_delta_block_size(config, argv[i] + 14) != 0)
         return -1;
-      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
-        config->delta_block_size = (uint32_t)val;
-      else
-        log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
     } else if (strncmp(argv[i], "--block-size=", 13) == 0) {
-      unsigned long long val;
-      if (parse_ull_arg(argv[i] + 13, &val, "--block-size/--delta-block") != 0)
+      if (set_delta_block_size(config, argv[i] + 13) != 0)
         return -1;
-      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
-        config->delta_block_size = (uint32_t)val;
-      else
-        log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
     } else if (opt_is(argv[i], "--delta-block", "--block-size")) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      unsigned long long val;
-      if (parse_ull_arg(argv[++i], &val, "--block-size/--delta-block") != 0)
+      if (set_delta_block_size(config, argv[++i]) != 0)
         return -1;
-      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
-        config->delta_block_size = (uint32_t)val;
-      else
-        log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
     } else if (opt_is(argv[i], "--delta-max", NULL)) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
@@ -1431,7 +1431,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
     } else if (strncmp(argv[i], "--copy-as=", 10) == 0) {
       if (identity_parse_copy_as(config, argv[i] + 10) != 0)
         return -1;
-      config->use_metadata = true;
     } else if (opt_is(argv[i], "--copy-as", NULL)) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
@@ -1439,7 +1438,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       }
       if (identity_parse_copy_as(config, argv[++i]) != 0)
         return -1;
-      config->use_metadata = true;
     } else if (strncmp(argv[i], "--outbuf=", 9) == 0) {
       if (set_outbuf_option(config, argv[i] + 9) != 0)
         return -1;

@@ -104,18 +104,18 @@ static void test_cli_help() {
   config_delete(cfg);
 }
 
-/* Test that --archive's config bundle matches rsync -rlptgoD semantics:
- * links + metadata + devices + specials, and NOT compression/multithreading. */
+/* Test that the -a short spelling applies --archive's config bundle, matching
+ * rsync -rlptgoD semantics: links + metadata + devices + specials, and NOT
+ * compression/multithreading.  (--archive itself is covered by
+ * test_parse_args_archive; this guards the short alias.) */
 static void test_cli_archive_flags() {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "-a", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
 
-  /* Simulate the --archive flag's implied bundle. */
-  cfg->follow_symlinks = true;
-  cfg->use_metadata = true;
-  cfg->preserve_devices = true;
-  cfg->preserve_specials = true;
-
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->follow_symlinks);
   EXPECT_TRUE(cfg->use_metadata);
   EXPECT_TRUE(cfg->preserve_devices);
@@ -3045,12 +3045,29 @@ static void test_parse_args_block_size() {
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_eq, positional_args, &positional_count), 0);
   EXPECT_EQ_INT((int)cfg->delta_block_size, 8192);
 
-  /* Out of range: parsed, warned, and the default is kept. */
+  cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
+  char* argv_delta_eq[] = {"fastsync", "--delta-block=1024", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_delta_eq, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 1024);
+
+  /* Out of range: parsed, warned, and the default is kept (both spellings). */
   cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
   char* argv_bad[] = {"fastsync", "--block-size", "1", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_bad, positional_args, &positional_count), 0);
   EXPECT_EQ_INT((int)cfg->delta_block_size, (int)DELTA_BLOCK_SIZE_DEFAULT);
+
+  cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
+  char* argv_bad_inline[] = {"fastsync", "--delta-block=999999", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_bad_inline, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, (int)DELTA_BLOCK_SIZE_DEFAULT);
+
+  /* A non-numeric value is a hard error for both spellings. */
+  char* argv_nan[] = {"fastsync", "--delta-block=abc", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_nan, positional_args, &positional_count), -1);
 
   /* A non-default block size changes the number of signature blocks for
      identical data: block_count = ceil(size / block_size). */
