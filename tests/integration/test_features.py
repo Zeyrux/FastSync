@@ -5098,3 +5098,85 @@ class TestDirectoryAndSymlinkTimes:
         with open(blocker, "rb") as fh:
             assert fh.read() == b"pre-existing blocker\n", "the blocker file was clobbered"
         assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
+
+
+class TestCopyAs:
+    """P7 Wave E: --copy-as=USER[:GROUP] safe subset.
+
+    FastSync never switches the receiver's process credentials; the receiver
+    forces the ownership of every entry it writes to the requested ids through
+    the confined fd-relative identity path, which REQUIRES a privileged (root)
+    receiver.  An unprivileged receiver refuses the whole transfer up front at
+    the config handshake, before any file data moves.
+    """
+
+    @pytest.mark.ci
+    def test_unprivileged_receiver_refuses_copy_as(self, shared_server):
+        """The key assertable behavior: an unprivileged receiver REFUSES a
+        --copy-as transfer cleanly (non-zero exit, no data written) instead of
+        silently writing the wrong ownership."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_refuse_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_refuse_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "secret.txt"), "wb") as fh:
+            fh.write(b"must not be written\n")
+
+        captured = None
+        if os.geteuid() == 0:
+            if shutil.which("setpriv") is None:
+                pytest.skip("root runner without setpriv cannot start an unprivileged receiver")
+            os.chmod(dest, 0o777)
+            proc, port = _start_captured_server(
+                prefix=["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"])
+            captured = proc
+        else:
+            # The session server already runs unprivileged.
+            port = shared_server.port
+
+        try:
+            result, _ = run_client(source, dest,
+                                   flags=["--copy-as=@65534:@65534"], port=port)
+        finally:
+            if captured is not None:
+                out, err = _stop_captured_server(captured)
+            else:
+                out, err = "", ""
+
+        assert result.returncode != 0, (
+            f"an unprivileged receiver must refuse --copy-as: rc={result.returncode} "
+            f"out={result.stdout[:200]!r} err={result.stderr[:200]!r}"
+        )
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(os.path.join(received, "secret.txt")), (
+            "--copy-as refusal leaked file data into the destination"
+        )
+        if captured is not None:
+            assert "copy-as requires a privileged receiver" in (out + err), (
+                f"refusal reason was not logged: out={out!r} err={err!r}"
+            )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_chowns_transferred_file(self, shared_server):
+        """Root-gated: --copy-as=USER:GROUP forces the transferred file's
+        ownership to exactly that uid/gid (numeric form for determinism)."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_root_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_root_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "owned.txt"), "wb") as fh:
+            fh.write(b"owned by nobody\n")
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534"], port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as root transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        target = os.path.join(received, "owned.txt")
+        assert os.path.isfile(target), f"transferred file missing at {target}"
+        st = os.lstat(target)
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--copy-as did not force ownership: uid={st.st_uid} gid={st.st_gid}"
+        )

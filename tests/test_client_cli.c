@@ -223,7 +223,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.17.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.18.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -233,7 +233,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.17.0"};
+                        "/dst",     "--protocol",   "2.18.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -243,7 +243,8 @@ static void test_parse_args_protocol_accept_current() {
 /* Any --protocol value other than the current PROTOCOL_VERSION must end in
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
-  static const char* const bad_versions[] = {"2.16", "2.15.0", "2.16.0", "216", "31", "abc", ""};
+  static const char* const bad_versions[] = {"2.16", "2.15.0", "2.16.0", "2.17.0",
+                                             "216",  "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -2539,6 +2540,64 @@ static void test_parse_args_chown() {
   config_delete(cfg);
 }
 
+/* --copy-as=USER[:GROUP] (P7 Wave E): resolve the user/group against the local
+ * databases, imply metadata, and apply the documented group-default rule. */
+static void test_parse_args_copy_as() {
+  /* Explicit numeric user and group. */
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--copy-as=@1000:@1001", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->copy_as_set);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_EQ_INT(cfg->copy_as_uid, 1000);
+  EXPECT_EQ_INT(cfg->copy_as_gid, 1001);
+  config_delete(cfg);
+
+  /* Space form. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--copy-as", "@2000:3000", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->copy_as_uid, 2000);
+  EXPECT_EQ_INT(cfg->copy_as_gid, 3000);
+  config_delete(cfg);
+
+  /* Group omitted: a resolvable user uses its primary gid. */
+  struct passwd* self = getpwuid(geteuid());
+  if (self) {
+    cfg = config_create();
+    positional_count = 0;
+    char* argv3[] = {"fastsync", (char*)"--copy-as", (char*)self->pw_name, "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv3, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->copy_as_uid, (int32_t)self->pw_uid);
+    EXPECT_EQ_INT(cfg->copy_as_gid, (int32_t)self->pw_gid);
+    config_delete(cfg);
+  }
+
+  /* Group omitted with a numeric id that has no passwd entry: gid falls back
+   * to uid (documented divergence). */
+  if (!getpwuid((uid_t)4242)) {
+    cfg = config_create();
+    positional_count = 0;
+    char* argv4[] = {"fastsync", "--copy-as=@4242", "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->copy_as_uid, 4242);
+    EXPECT_EQ_INT(cfg->copy_as_gid, 4242);
+    config_delete(cfg);
+  }
+
+  /* '*' means the client's current euid/egid. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv5[] = {"fastsync", "--copy-as=*:*", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->copy_as_uid, (int32_t)geteuid());
+  EXPECT_EQ_INT(cfg->copy_as_gid, (int32_t)getegid());
+  config_delete(cfg);
+}
+
 /* Malformed identity specs are rejected, never silently ignored. */
 static void test_parse_args_rejects_malformed_identity() {
   struct {
@@ -2552,6 +2611,12 @@ static void test_parse_args_rejects_malformed_identity() {
       {"--groupmap", "no_such_group_qqq:x"},
       {"--chown", "a:b:c"},
       {"--chown", "no_such_user_zzz:"},
+      {"--copy-as", ""},
+      {"--copy-as", ":"},
+      {"--copy-as", "a:b:c"},
+      {"--copy-as", "@1000:"},
+      {"--copy-as", "definitely_not_a_real_user_zzz"},
+      {"--copy-as", "no_such_group_qqq_group"},
   };
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     Config* cfg = config_create();
@@ -2568,6 +2633,12 @@ static void test_parse_args_rejects_malformed_identity() {
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 2, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--copy-as"};
+  EXPECT_EQ_INT(parse_args(cfg, 2, argv2, positional_args, &positional_count), -1);
   config_delete(cfg);
 }
 
@@ -2972,6 +3043,7 @@ void test_client_cli() {
   test_parse_args_groupmap();
   test_parse_args_usermap_name_resolution();
   test_parse_args_chown();
+  test_parse_args_copy_as();
   test_parse_args_rejects_malformed_identity();
   test_parse_args_preallocate();
   test_parse_args_metadata_times();

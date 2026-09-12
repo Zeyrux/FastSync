@@ -439,6 +439,20 @@ typedef struct Config {
    * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
    * so a later privileged restore could re-apply them.  Crosses the wire. */
   bool fake_super;
+  /* --copy-as=USER[:GROUP] (P7 Wave E, protocol 2.18.0).  Safe-subset
+   * implementation, a documented divergence from rsync's real identity switch:
+   * the receiver does NOT change its process credentials (FastSync's receiver
+   * is multithreaded, so a setuid/seteuid drop would be unsafe).  Instead the
+   * receiver FORCES the ownership of every entry it writes to copy_as_uid /
+   * copy_as_gid through the existing confined, fd-relative identity path
+   * (fchown/fchownat), which REQUIRES receiver privilege (root); an
+   * unprivileged receiver REFUSES the whole transfer up front at the config
+   * handshake (never a silent wrong-ownership result).  All three fields CROSS
+   * the wire as a trailing config-frame block so the receiver learns the
+   * requested ids; see the PROTOCOL_VERSION note below. */
+  bool copy_as_set;
+  int32_t copy_as_uid;
+  int32_t copy_as_gid;
 
   // Phase 5: --trust-sender
   /* Long-form-only, receiver-local policy.  rsync's --trust-sender tells the
@@ -563,8 +577,24 @@ typedef struct Config {
  * would desynchronize on the unknown frame, and the strict same-version
  * handshake (config_receive rejects a mismatched version before parsing
  * anything else) is what keeps a 2.17 client and a 2.16 server from ever
- * reaching that state. */
-#define PROTOCOL_VERSION "2.17.0"
+ * reaching that state.
+ *
+ * Privilege Wave (P7 Wave E): 2.17.0 -> 2.18.0.
+ *
+ * WHY the bump, grounded in the wire: --copy-as=USER[:GROUP] adds a serialized
+ * field to the binary config frame.  The client sends, as a new trailing block
+ * AFTER the --iconv CONVERT_SPEC string (in config_send/config_receive), a
+ * presence int followed, when set, by the target uid and gid (both int32).
+ * The receiver needs those ids to force the ownership of every entry it writes
+ * (the safe-subset --copy-as model; see RSYNC_COMPAT.md), and it REQUIRES
+ * receiver privilege: an unprivileged receiver refuses the transfer at the
+ * config handshake (server_module_gate) instead of silently ignoring the flag.
+ * Any config-frame layout change must bump the protocol version: a peer that
+ * does not parse the new trailing bytes would desynchronize on the frame
+ * boundary, and the strict same-version handshake (config_receive rejects a
+ * mismatched version before parsing anything else) is what keeps a 2.18 client
+ * and a 2.17 server from ever reaching that state. */
+#define PROTOCOL_VERSION "2.18.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

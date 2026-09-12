@@ -34,6 +34,24 @@ int identity_parse_map(Config* config, const char* value, bool is_group);
  * on success, -1 on a malformed spec / unresolvable name. */
 int identity_parse_chown(Config* config, const char* value);
 
+/* Parse --copy-as=USER[:GROUP] (P7 Wave E).  USER is resolved with the same
+ * user-database rules as --chown (a name, @N/bare N numeric id, or '*' meaning
+ * the client's current euid); when ':GROUP' is present the group is resolved
+ * with the group database ('*' meaning the client's egid).  When the group is
+ * omitted, the user's primary gid is used (getpwuid(uid)->pw_gid); if the
+ * resolved user is a numeric id with no local passwd entry, gid falls back to
+ * uid.  On success sets copy_as_set/copy_as_uid/copy_as_gid and forces
+ * metadata transmission (ownership application needs the metadata path).
+ * Returns 0 on success, -1 on a malformed / empty / unresolvable spec (never a
+ * silent no-op). */
+int identity_parse_copy_as(Config* config, const char* value);
+
+/* True when a --copy-as request is active AND this (receiving) process is not
+ * privileged enough to honor it (euid != 0).  This is the up-front refusal
+ * predicate; the server rejects the whole transfer at the config handshake
+ * rather than silently ignoring the requested ownership. */
+bool identity_copy_as_refused(void);
+
 /* Receiver-side snapshot of the negotiated identity config.  The server calls
  * identity_set_active() once per connection (before any file write) using the
  * config received over the wire; the snapshot is a deep copy so the caller may

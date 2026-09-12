@@ -1414,6 +1414,18 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (identity_parse_chown(config, argv[++i]) != 0)
         return -1;
       config->use_metadata = true;
+    } else if (strncmp(argv[i], "--copy-as=", 10) == 0) {
+      if (identity_parse_copy_as(config, argv[i] + 10) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--copy-as", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_copy_as(config, argv[++i]) != 0)
+        return -1;
+      config->use_metadata = true;
     } else if (strncmp(argv[i], "--outbuf=", 9) == 0) {
       if (set_outbuf_option(config, argv[i] + 9) != 0)
         return -1;

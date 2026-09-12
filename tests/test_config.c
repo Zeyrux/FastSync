@@ -1669,6 +1669,90 @@ static void test_config_receive_rejects_invalid_iconv_spec() {
   }
 }
 
+/* --copy-as (P7 Wave E, protocol 2.18.0) travels as a trailing config-frame
+   block: a presence int, then the two int32 ids when set. */
+static void test_config_copy_as_wire_roundtrip() {
+  struct {
+    bool set;
+    int32_t uid;
+    int32_t gid;
+  } cases[] = {{false, 0, 0}, {true, 1000, 1001}};
+  if (is_running_under_valgrind())
+    return;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL && recv->copy_as_set == cases[i].set &&
+                (!cases[i].set ||
+                 (recv->copy_as_uid == cases[i].uid && recv->copy_as_gid == cases[i].gid));
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->copy_as_set = cases[i].set;
+      send_cfg->copy_as_uid = cases[i].uid;
+      send_cfg->copy_as_gid = cases[i].gid;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
+/* A hostile peer must not smuggle a negative (sentinel) copy-as id into the
+   ownership path: the receive side rejects it and the run fails the handshake. */
+static void test_config_receive_rejects_negative_copy_as() {
+  if (is_running_under_valgrind())
+    return;
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  send_cfg->copy_as_set = true;
+  send_cfg->copy_as_uid = -1;
+  send_cfg->copy_as_gid = 0;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(recv_cfg ? 1 : 0);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1715,6 +1799,8 @@ void test_config() {
     test_config_iconv_spec_wire_roundtrip();
     test_config_iconv_spec_empty_canonicalizes_to_null();
     test_config_receive_rejects_invalid_iconv_spec();
+    test_config_copy_as_wire_roundtrip();
+    test_config_receive_rejects_negative_copy_as();
     test_config_receive_with_validate_rejects();
   }
   test_config_delete_timing_early_helper();
