@@ -2,6 +2,7 @@
 #include "config.h"
 #include "delta.h"
 #include "file.h"
+#include "log.h"
 #include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
@@ -724,7 +725,44 @@ static void test_receiver_pending_commits_missing_args() {
   free(root);
 }
 
+/* A6: an attacker-controlled file path appearing in a log line must be escaped
+   so a control byte cannot forge a second log record.  The socket special-node
+   branch logs file->path before touching the filesystem, making it a cheap way
+   to exercise an escaped site.  The captured line must contain the escaped path
+   (`\#012` for the newline), never the raw control byte. */
+static void test_special_socket_path_log_escaped() {
+  set_log_level(LOG_LEVEL_WARNING);
+  log_set_8_bit_output(false);
+
+  FILE* capture = tmpfile();
+  EXPECT_NOT_NULL(capture);
+  log_set_file(capture);
+
+  File* file = file_create("evil\npath");
+  EXPECT_NOT_NULL(file);
+  file->is_special = true;
+  file->metadata = calloc(1, sizeof(FileMetadata));
+  EXPECT_NOT_NULL(file->metadata);
+  file->metadata->mode = S_IFSOCK | 0644;
+
+  FileSaveResult result = file_save_to_disk_full("/tmp/dst", file, NULL);
+  EXPECT_EQ_INT(result, FILE_SAVE_SKIPPED);
+
+  fflush(capture);
+  rewind(capture);
+  char output[512] = {0};
+  size_t length = fread(output, 1, sizeof(output) - 1, capture);
+  output[length] = '\0';
+
+  log_set_file(NULL);
+  fclose(capture);
+  file_destroy(file);
+
+  EXPECT_NOT_NULL(strstr(output, "socket not recreated: evil\\#012path"));
+}
+
 void test_server() {
+  test_special_socket_path_log_escaped();
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
     test_receive_files_single_file();

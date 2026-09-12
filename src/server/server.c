@@ -55,9 +55,15 @@ static CredentialStore* g_credentials = NULL;
 
 /* Opaque context threaded through to the config-frame gate: the connection's
  * SSL object (NULL over plaintext) so the gate can warn when a credential
- * exchange is not encrypted. */
+ * exchange is not encrypted, plus the super-mode override the gate decides on.
+ * The gate never mutates the received (const) Config; it records a forced
+ * SUPER_MODE_OFF here and the handler applies it exactly once after acceptance. */
 typedef struct ModuleGateContext {
   SSL* ssl;
+  /* SUPER_MODE_OFF when this connection must not attempt any super-user
+     activity (operator --no-super, or a daemon module without the
+     `client owner = yes` opt-in); -1 when the config's own mode stands. */
+  int super_mode_override;
 } ModuleGateContext;
 
 /* Aggregate payload bytes the multithreaded receiver may buffer ahead of the
@@ -182,11 +188,15 @@ static const char* server_module_gate(const Config* config, void* context) {
   if (!config)
     return "missing config frame";
   /* Operator veto: --no-super forces SUPER_MODE_OFF for this connection before
-     the copy-as gate is evaluated, and the caller clamps the accepted config
-     again after this returns so the ownership/device gates see it too. */
-  Config* effective = (Config*)config;
-  if (server_no_super)
-    effective->super_mode = SUPER_MODE_OFF;
+     the copy-as gate is evaluated.  The received config is const, so the gates
+     below evaluate a shallow effective copy (only super_mode differs); the
+     handler applies the recorded override to the accepted config exactly once. */
+  Config effective = *config;
+  if (server_no_super) {
+    effective.super_mode = SUPER_MODE_OFF;
+    if (gate_ctx)
+      gate_ctx->super_mode_override = SUPER_MODE_OFF;
+  }
   /* --copy-as (P7 Wave E, protocol 2.18.0): FastSync's safe subset forces the
      ownership of every written entry to the requested ids, which needs a
      privileged (root) receiver.  An unprivileged receiver REFUSES the whole
@@ -195,7 +205,7 @@ static const char* server_module_gate(const Config* config, void* context) {
      The daemon's per-module client-chosen-ownership refusal is enforced after
      the module lookup below (it needs the module's opt-in) and covers --copy-as
      like every other ownership flag. */
-  if (identity_copy_as_refused(effective)) {
+  if (identity_copy_as_refused(&effective)) {
     if (geteuid() != 0)
       log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
     else
@@ -247,10 +257,10 @@ static const char* server_module_gate(const Config* config, void* context) {
      standalone/SSH server has a single operator-authorized root and keeps
      honoring these. */
   if (!module->client_owner) {
-    /* Ownership: refuse the whole transfer up front (a clear failure).  Uses the
-       original config so an explicit --super is caught even though super_mode is
-       clamped to OFF below. */
-    if (identity_ownership_requested(config)) {
+    /* Ownership: refuse the whole transfer up front (a clear failure).  Evaluated
+       against the effective copy (so an operator --no-super has already
+       neutralized an explicit --super), exactly as before. */
+    if (identity_ownership_requested(&effective)) {
       log_message(LOG_LEVEL_ERROR,
                   "daemon module '%s' refuses client-chosen ownership/super-user activities "
                   "(no `client owner = yes` opt-in); refusing",
@@ -258,13 +268,14 @@ static const char* server_module_gate(const Config* config, void* context) {
       return "client-chosen ownership is not permitted by this daemon module";
     }
     /* Super-user DEVICE activities (char/block mknod and --write-devices) are
-       permitted under the default AUTO mode, so without this clamp a root daemon
-       would still let a non-opted module create arbitrary device nodes and write
-       raw devices.  Force them off for this connection: those entries are
-       skipped (never mknod'ed) while an ordinary `-a` push still succeeds
+       permitted under the default AUTO mode, so without this override a root
+       daemon would still let a non-opted module create arbitrary device nodes
+       and write raw devices.  Force them off for this connection: those entries
+       are skipped (never mknod'ed) while an ordinary `-a` push still succeeds
        without device nodes, matching the operator's least-privilege choice.
        The operator-level --no-super veto is already folded into this. */
-    effective->super_mode = SUPER_MODE_OFF;
+    if (gate_ctx)
+      gate_ctx->super_mode_override = SUPER_MODE_OFF;
   }
   if (module->auth_user_count > 0) {
     /* Auth-required module (Wave B): verify the presented credentials against
@@ -322,6 +333,7 @@ void handler(int file_descriptor) {
   protocol_session_bind(&session);
   ModuleGateContext gate_ctx;
   gate_ctx.ssl = ssl;
+  gate_ctx.super_mode_override = -1;
   Config* config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
@@ -329,12 +341,13 @@ void handler(int file_descriptor) {
     protocol_session_unbind();
     return;
   }
-  /* Operator --no-super veto: clamp the accepted config so every downstream
-   * gate (identity_apply_ownership via privilege_super_permitted, device-node
-   * creation) sees SUPER_MODE_OFF even if the gate callback did not already
-   * mutate a copy of it. */
-  if (server_no_super)
-    config->super_mode = SUPER_MODE_OFF;
+  /* Apply the super-mode veto the gate decided on (operator --no-super, or a
+   * daemon module without the `client owner = yes` opt-in) exactly once, so
+   * every downstream gate (identity_apply_ownership via privilege_super_permitted,
+   * device-node creation) sees SUPER_MODE_OFF.  The gate never mutated the
+   * received config. */
+  if (gate_ctx.super_mode_override != -1)
+    config->super_mode = gate_ctx.super_mode_override;
   protocol_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
@@ -417,8 +430,10 @@ void handler(int file_descriptor) {
      before anything else; without it the root must pre-exist.  A failure here
      aborts the connection cleanly before any file data is exchanged. */
   if (!ensure_receive_root(config)) {
+    char* escaped_root = output_escape(config->receive_root_directory, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
-                config->receive_root_directory);
+                escaped_root ? escaped_root : "<allocation failed>");
+    free(escaped_root);
     config_delete(config);
     close(file_descriptor);
     protocol_session_unbind();
@@ -440,8 +455,16 @@ void handler(int file_descriptor) {
   }
   /* Preserve the negotiated identity policy for the fd-relative ownership
      apply path.  Each connection is its own forked process, so this
-     per-process snapshot never races another connection. */
-  identity_set_active(config);
+     per-process snapshot never races another connection.  A failed deep copy
+     (allocation failure) leaves the snapshot cleared, so refuse the connection
+     rather than silently applying the wrong ownership policy. */
+  if (!identity_set_active(config)) {
+    log_message(LOG_LEVEL_ERROR, "Failed to activate identity policy");
+    config_delete(config);
+    close(file_descriptor);
+    protocol_session_unbind();
+    return;
+  }
   /* Persist the negotiated --keep-dirlinks policy once, here at config-accept,
      before any multithreaded receiver/writer threads are spawned, so the
      fd-walk reads a stable value during the whole transfer (and never bleeds
@@ -485,6 +508,7 @@ void handler(int file_descriptor) {
       config_delete(config);
       close(file_descriptor);
       protocol_session_unbind();
+      identity_clear_active();
       return;
     }
     PipelineContextReceiver* context =

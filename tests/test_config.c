@@ -1883,13 +1883,13 @@ static void test_privilege_super_permitted_modes() {
   Config* c = config_create();
   EXPECT_NOT_NULL(c);
   c->super_mode = SUPER_MODE_OFF;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_FALSE(privilege_super_permitted());
   c->super_mode = SUPER_MODE_ON;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(privilege_super_permitted());
   c->super_mode = SUPER_MODE_AUTO;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(privilege_super_permitted());
   config_delete(c);
 
@@ -1952,10 +1952,10 @@ static void test_super_does_not_imply_numeric() {
   EXPECT_NOT_NULL(c);
   c->super_mode = SUPER_MODE_ON;
   c->use_metadata = true;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_FALSE(identity_active_enabled());
   c->numeric_ids = true;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(identity_active_enabled());
   identity_clear_active();
   config_delete(c);

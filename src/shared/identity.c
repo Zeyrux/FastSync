@@ -64,10 +64,10 @@ void identity_clear_active(void) {
   identity_active_reset();
 }
 
-void identity_set_active(const Config* config) {
+bool identity_set_active(const Config* config) {
   identity_active_reset();
   if (!config)
-    return;
+    return true;
   g_identity.numeric_ids = config->numeric_ids;
   g_identity.chown_uid_set = config->chown_uid_set;
   g_identity.chown_uid = config->chown_uid;
@@ -79,19 +79,19 @@ void identity_set_active(const Config* config) {
   g_identity.copy_as_gid = config->copy_as_gid;
   if (config->usermap_count > 0) {
     g_identity.usermap = calloc((size_t)config->usermap_count, sizeof(IdentityMap));
-    if (g_identity.usermap) {
-      memcpy(g_identity.usermap, config->usermap,
-             (size_t)config->usermap_count * sizeof(IdentityMap));
-      g_identity.usermap_count = config->usermap_count;
-    }
+    if (!g_identity.usermap)
+      goto alloc_failed;
+    memcpy(g_identity.usermap, config->usermap,
+           (size_t)config->usermap_count * sizeof(IdentityMap));
+    g_identity.usermap_count = config->usermap_count;
   }
   if (config->groupmap_count > 0) {
     g_identity.groupmap = calloc((size_t)config->groupmap_count, sizeof(IdentityMap));
-    if (g_identity.groupmap) {
-      memcpy(g_identity.groupmap, config->groupmap,
-             (size_t)config->groupmap_count * sizeof(IdentityMap));
-      g_identity.groupmap_count = config->groupmap_count;
-    }
+    if (!g_identity.groupmap)
+      goto alloc_failed;
+    memcpy(g_identity.groupmap, config->groupmap,
+           (size_t)config->groupmap_count * sizeof(IdentityMap));
+    g_identity.groupmap_count = config->groupmap_count;
   }
   g_identity.set = true;
   /* A root receiver would honor any client-supplied ownership request (a
@@ -113,6 +113,15 @@ void identity_set_active(const Config* config) {
                 "--super requested but the receiver is not privileged; super-user "
                 "activities (ownership, device nodes) will be attempted but refused "
                 "by the kernel and skipped per entry");
+  return true;
+
+alloc_failed:
+  /* Never proceed with a partial (count-left-zero) map: that would silently
+     apply the WRONG ownership policy.  Fail closed and let the caller refuse
+     the connection. */
+  log_message(LOG_LEVEL_ERROR, "memory allocation failed while activating identity policy");
+  identity_active_reset();
+  return false;
 }
 
 bool privilege_super_permitted(void) {
@@ -440,6 +449,25 @@ static bool identity_id_fits_int32(unsigned long id) {
   return id <= (unsigned long)INT32_MAX;
 }
 
+/* Resolve one --copy-as id token.  A '*' token means the caller's current
+ * effective uid (user) or gid (group).  Returns 0 on success.  On failure sets
+ * *overflow when a '*' id was wider than int32 so the caller can log the
+ * specific message; otherwise the token was simply unresolvable. */
+static int identity_resolve_copy_as_id(const char* token, bool is_group, int32_t* out,
+                                       bool* overflow) {
+  *overflow = false;
+  if (strcmp(token, "*") == 0) {
+    unsigned long current = is_group ? (unsigned long)getegid() : (unsigned long)geteuid();
+    if (!identity_id_fits_int32(current)) {
+      *overflow = true;
+      return -1;
+    }
+    *out = (int32_t)current;
+    return 0;
+  }
+  return identity_resolve_token(token, is_group, out);
+}
+
 int identity_parse_copy_as(Config* config, const char* value) {
   if (!config || !value || *value == '\0') {
     log_message(LOG_LEVEL_ERROR, "--copy-as requires USER[:GROUP]");
@@ -465,7 +493,7 @@ int identity_parse_copy_as(Config* config, const char* value) {
     log_message(LOG_LEVEL_ERROR, "memory allocation failed for --copy-as");
     return -1;
   }
-  char* user_token = spec;
+  const char* user_token = spec;
   const char* group_token = NULL;
   char* colon = strchr(spec, ':');
   if (colon) {
@@ -477,57 +505,39 @@ int identity_parse_copy_as(Config* config, const char* value) {
    * (8-bit-safe) so a control byte cannot forge a log line. */
   char* escaped_spec = output_escape(value, false);
   const char* shown = escaped_spec ? escaped_spec : "<allocation failed>";
+  int ret = -1;
 
-  int32_t uid;
   if (*user_token == '\0') {
     log_message(LOG_LEVEL_ERROR, "--copy-as is missing the user (got '%s')", shown);
-    free(escaped_spec);
-    free(spec);
-    return -1;
+    goto done;
   }
-  if (strcmp(user_token, "*") == 0) {
-    /* '*' means the current/root user: the client's euid. */
-    if (!identity_id_fits_int32((unsigned long)geteuid())) {
+  bool overflow = false;
+  int32_t uid;
+  if (identity_resolve_copy_as_id(user_token, false, &uid, &overflow) != 0) {
+    if (overflow)
       log_message(LOG_LEVEL_ERROR, "--copy-as: current user id %lu exceeds INT32_MAX",
                   (unsigned long)geteuid());
-      free(escaped_spec);
-      free(spec);
-      return -1;
-    }
-    uid = (int32_t)geteuid();
-  } else if (identity_resolve_token(user_token, false, &uid) != 0) {
-    log_message(LOG_LEVEL_ERROR,
-                "--copy-as could not resolve user (use a name that exists on the "
-                "source, '*', or @N): %s",
-                shown);
-    free(escaped_spec);
-    free(spec);
-    return -1;
+    else
+      log_message(LOG_LEVEL_ERROR,
+                  "--copy-as could not resolve user (use a name that exists on the "
+                  "source, '*', or @N): %s",
+                  shown);
+    goto done;
   }
 
   int32_t gid;
   if (group_token) {
     if (*group_token == '\0') {
       log_message(LOG_LEVEL_ERROR, "--copy-as group is empty (got '%s')", shown);
-      free(escaped_spec);
-      free(spec);
-      return -1;
+      goto done;
     }
-    if (strcmp(group_token, "*") == 0) {
-      if (!identity_id_fits_int32((unsigned long)getegid())) {
+    if (identity_resolve_copy_as_id(group_token, true, &gid, &overflow) != 0) {
+      if (overflow)
         log_message(LOG_LEVEL_ERROR, "--copy-as: current group id %lu exceeds INT32_MAX",
                     (unsigned long)getegid());
-        free(escaped_spec);
-        free(spec);
-        return -1;
-      }
-      gid = (int32_t)getegid();
-    } else if (identity_resolve_token(group_token, true, &gid) != 0) {
-      log_message(LOG_LEVEL_ERROR, "--copy-as could not resolve group (got '%s'): %s", shown,
-                  shown);
-      free(escaped_spec);
-      free(spec);
-      return -1;
+      else
+        log_message(LOG_LEVEL_ERROR, "--copy-as could not resolve group (got '%s')", shown);
+      goto done;
     }
   } else {
     /* Group omitted: use the user's primary gid.  A numeric id with no local
@@ -539,9 +549,7 @@ int identity_parse_copy_as(Config* config, const char* value) {
         log_message(LOG_LEVEL_ERROR,
                     "--copy-as: primary group id %lu for the requested user exceeds INT32_MAX",
                     (unsigned long)pw->pw_gid);
-        free(escaped_spec);
-        free(spec);
-        return -1;
+        goto done;
       }
       gid = (int32_t)pw->pw_gid;
     } else {
@@ -553,12 +561,8 @@ int identity_parse_copy_as(Config* config, const char* value) {
    * identity_resolve_token. */
   if (uid < 0 || gid < 0) {
     log_message(LOG_LEVEL_ERROR, "--copy-as resolved id does not fit in int32 (got '%s')", shown);
-    free(escaped_spec);
-    free(spec);
-    return -1;
+    goto done;
   }
-  free(escaped_spec);
-  free(spec);
 
   config->copy_as_set = true;
   config->copy_as_uid = uid;
@@ -566,7 +570,12 @@ int identity_parse_copy_as(Config* config, const char* value) {
   /* Ownership application needs the metadata path (the source uid/gid must be
    * transmitted); imply it exactly like --chown/--usermap/--groupmap. */
   config->use_metadata = true;
-  return 0;
+  ret = 0;
+
+done:
+  free(escaped_spec);
+  free(spec);
+  return ret;
 }
 
 /* ---- Receiver-side ownership application ---- */
