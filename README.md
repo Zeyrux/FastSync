@@ -528,6 +528,27 @@ restart-gated enumeration channel remains (persisting a dummy key is out of
 scope); and the store iteration count is observable pre-auth by design, since
 the miss path must match a hit.
 
+An `auth users` module accepts credentials only when one of two conditions
+holds: (a) the connection is an encrypted, verified TLS connection whose client
+certificate matches the server's `--client-cn`, or (b) the connection is
+plaintext from a loopback peer **and** the operator explicitly passed
+`--allow-unauthenticated`. A remote plaintext peer is refused before any
+challenge is sent, and `--allow-unauthenticated` never permits remote plaintext
+auth: remote peers still require verified TLS regardless of the flag. Clients
+sending daemon credentials with `--password-file` to a non-loopback daemon must
+therefore use `--tls`; the client rejects a non-local plaintext credential
+destination before any network I/O. Daemon modules are a `--daemon`-only
+feature: the SSH `--stdio` path never loads a daemon config and is not an auth
+transport for them.
+
+Because the loopback allowance trusts whichever peer the kernel reports as
+`127.0.0.1`, it assumes nothing relays remote connections to the daemon. A local
+TCP forwarder or a TLS-terminating proxy in front of an auth-module listener
+makes remote clients appear as loopback and bypasses the mutual-TLS identity
+check, so do not front an auth-module listener with such a relay. Note also that
+`--client-cn` matches the certificate's CN only (not a subjectAltName), which is
+acceptable for a private CA.
+
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not
 verified. Use certificate verification for deployments where authentication

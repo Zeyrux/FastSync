@@ -1,13 +1,16 @@
 #include "utils.h"
 #include "array_list.h"
 #include "log.h"
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -542,4 +545,70 @@ bool append_tail_length(unsigned long long old_size, unsigned long long check_si
     return false;
   *tail_out = check_size - old_size;
   return true;
+}
+
+/* True when a bound/peer socket address is on the loopback interface: any
+   127.0.0.0/8 IPv4 address, IPv6 ::1, or an IPv4-mapped ::ffff:127.x.x.x.  This
+   is the transport-local test the daemon auth gate uses to decide whether a
+   plaintext connection is a trustworthy local/SSH channel. */
+bool utils_sockaddr_is_loopback(const struct sockaddr* addr) {
+  if (!addr)
+    return false;
+  if (addr->sa_family == AF_INET) {
+    const struct sockaddr_in* v4 = (const struct sockaddr_in*)addr;
+    uint32_t host = ntohl(v4->sin_addr.s_addr);
+    return (host & 0xff000000u) == 0x7f000000u;
+  }
+  if (addr->sa_family == AF_INET6) {
+    const struct sockaddr_in6* v6 = (const struct sockaddr_in6*)addr;
+    if (IN6_IS_ADDR_LOOPBACK(&v6->sin6_addr))
+      return true;
+    /* An IPv4-mapped ::ffff:127.x.x.x is loopback too. */
+    if (IN6_IS_ADDR_V4MAPPED(&v6->sin6_addr) && v6->sin6_addr.s6_addr[12] == 127)
+      return true;
+    return false;
+  }
+  return false;
+}
+
+/* True when the fd's peer is provably a loopback TCP peer: getpeername must
+   succeed AND the returned address must classify as loopback.  Everything else
+   is NOT local, including a non-socket descriptor (pipe/socketpair): a failed
+   getpeername (ENOTSOCK, ENOTCONN, ...) fails closed.  The daemon auth gate
+   must not treat "I cannot tell" as "trusted", and daemon auth modules are
+   daemon-only anyway (the --stdio path never loads a daemon config). */
+bool utils_fd_peer_is_local(int fd) {
+  if (fd < 0)
+    return false;
+  struct sockaddr_storage peer;
+  socklen_t length = sizeof(peer);
+  if (getpeername(fd, (struct sockaddr*)&peer, &length) != 0)
+    return false;
+  return utils_sockaddr_is_loopback((const struct sockaddr*)&peer);
+}
+
+/* True when a client-supplied host string names a loopback destination:
+   "localhost", any 127.0.0.0/8 literal, "::1", or "[::1]". */
+bool utils_host_is_loopback(const char* host) {
+  if (!host || host[0] == '\0')
+    return false;
+  if (strcmp(host, "localhost") == 0)
+    return true;
+  struct in_addr v4;
+  if (inet_pton(AF_INET, host, &v4) == 1)
+    return (ntohl(v4.s_addr) & 0xff000000u) == 0x7f000000u;
+  struct in6_addr addr6;
+  if (host[0] == '[') {
+    size_t len = strlen(host);
+    if (len < 3 || host[len - 1] != ']')
+      return false;
+    /* inet_pton needs the bare address, not the bracketed form. */
+    char bare[INET6_ADDRSTRLEN];
+    if (len - 2 >= sizeof(bare))
+      return false;
+    memcpy(bare, host + 1, len - 2);
+    bare[len - 2] = '\0';
+    return inet_pton(AF_INET6, bare, &addr6) == 1 && IN6_IS_ADDR_LOOPBACK(&addr6);
+  }
+  return inet_pton(AF_INET6, host, &addr6) == 1 && IN6_IS_ADDR_LOOPBACK(&addr6);
 }

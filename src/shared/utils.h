@@ -4,6 +4,7 @@
 #include "array_list.h"
 #include <stddef.h>
 #include <stdbool.h>
+#include <sys/socket.h>
 
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
@@ -66,5 +67,15 @@ bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_si
 bool append_resume_eligible(unsigned long long old_size, unsigned long long check_size);
 bool append_tail_length(unsigned long long old_size, unsigned long long check_size,
                         unsigned long long* tail_out);
+/* Loopback / local-transport classification for the daemon auth gate and the
+   client credential rule.  utils_sockaddr_is_loopback accepts 127.0.0.0/8,
+   IPv6 ::1 and IPv4-mapped ::ffff:127.x.x.x; utils_host_is_loopback additionally
+   accepts the literal "localhost".  utils_fd_peer_is_local is fail-closed: it is
+   true only when getpeername SUCCEEDS and reports a loopback peer -- a non-socket
+   descriptor (pipe/socketpair) or any getpeername error yields false.  See
+   utils.c for the exact accepted forms. */
+bool utils_sockaddr_is_loopback(const struct sockaddr* addr);
+bool utils_fd_peer_is_local(int fd);
+bool utils_host_is_loopback(const char* host);
 
 #endif
