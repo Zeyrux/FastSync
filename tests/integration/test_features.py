@@ -3,6 +3,7 @@ import filecmp
 import os
 import random
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -14,7 +15,8 @@ from common import (
     PROJECT_ROOT, BUILD_DIR, TEST_DATA_DIR,
     run_client, CountingProxy,
     generate_test_files, verify_transfer, clean_dir, make_result,
-    get_dest_received_dir, CLIENT_CMD, ServerManager,
+    get_dest_received_dir, CLIENT_CMD, SERVER_CMD, ServerManager,
+    _find_free_port, _wait_for_port,
 )
 
 SOURCE_DIR = os.path.join(TEST_DATA_DIR, "feature_source")
@@ -64,14 +66,44 @@ class TestDeviceSpecial:
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         assert stat.S_ISFIFO(os.stat(os.path.join(received, "pipe.fifo")).st_mode)
 
-    def test_copy_devices_non_crash(self, shared_server):
-        """--copy-devices treats a special/device source as a regular-file copy;
-        a FIFO (st_size 0) must transfer without hanging or crashing."""
+    def test_specials_socket_source_skipped_safely(self, shared_server):
+        """A socket cannot be recreated by any standard filesystem call, so
+        --specials must skip it with a note and still complete the run (the
+        adjacent regular file transfers normally; no socket node appears)."""
+        self._setup()
+        sock_path = os.path.join(DEVICE_SOURCE, "source.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(sock_path)
+            result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                                   flags=["--specials"], port=shared_server.port)
+        finally:
+            s.close()
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        with open(os.path.join(received, "plain.txt")) as f:
+            assert f.read() == "regular content\n"
+        assert not os.path.lexists(os.path.join(received, "source.sock")), (
+            "socket source must be skipped, not materialized"
+        )
+
+    def test_copy_devices_fifo_becomes_regular_file(self, shared_server):
+        """--copy-devices treats a special source as an ordinary regular-file
+        copy: a FIFO (st_size 0) becomes a zero-length REGULAR file on the
+        destination (never a FIFO, never a hang), and the run succeeds."""
         self._setup()
         os.mkfifo(os.path.join(DEVICE_SOURCE, "device_copy.fifo"))
         result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
                                flags=["--copy-devices"], port=shared_server.port)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        copied = os.path.join(received, "device_copy.fifo")
+        assert os.path.lexists(copied), "copy-devices source was not transferred"
+        st = os.lstat(copied)
+        assert stat.S_ISREG(st.st_mode), (
+            f"copy-devices must produce a regular file, got mode {oct(st.st_mode)}"
+        )
+        assert st.st_size == 0, f"expected a size-bounded 0-byte copy, got {st.st_size}"
 
     def test_write_devices_non_crash(self, shared_server):
         """--write-devices writes into an existing device only; when the
@@ -84,6 +116,57 @@ class TestDeviceSpecial:
         result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
                                flags=["--write-devices"], port=shared_server.port)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+
+    def test_write_devices_regular_file_target_skipped(self, shared_server):
+        """--write-devices only ever writes into an existing char/block node: a
+        pre-existing REGULAR file at the destination path is left byte-identical
+        (not clobbered) and the run still succeeds."""
+        self._setup()
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        os.makedirs(received, exist_ok=True)
+        target = os.path.join(received, "plain.txt")
+        with open(target, "wb") as f:
+            f.write(b"pre-existing local content\n")
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["--write-devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        with open(target, "rb") as f:
+            assert f.read() == b"pre-existing local content\n", (
+                "write-devices clobbered a non-device destination"
+            )
+
+    @pytest.mark.setpriv
+    def test_devices_nonroot_receiver_skips_safely(self):
+        """A receiver without CAP_MKNOD must skip a device entry with a warning
+        and never abort.  A root runner drops the receiver (server) to nobody
+        via setpriv; on a non-root runner (or without setpriv) the test skips."""
+        if os.geteuid() != 0 or shutil.which("setpriv") is None:
+            pytest.skip("requires root + setpriv to run the receiver unprivileged")
+        self._setup()
+        os.mknod(os.path.join(DEVICE_SOURCE, "chardev"), stat.S_IFCHR | 0o666,
+                 os.makedev(1, 3))
+        # The unprivileged receiver must be able to create the destination tree.
+        os.makedirs(DEVICE_DEST, exist_ok=True)
+        os.chmod(DEVICE_DEST, 0o777)
+        port = _find_free_port()
+        server = subprocess.Popen(
+            ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"] +
+            SERVER_CMD + ["-p", str(port), "--allow-unauthenticated"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_for_port(port)
+            result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                                   flags=["--devices"], port=port)
+        finally:
+            server.terminate()
+            server.wait(timeout=5)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:300]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        with open(os.path.join(received, "plain.txt")) as f:
+            assert f.read() == "regular content\n"
+        assert not os.path.lexists(os.path.join(received, "chardev")), (
+            "a receiver without CAP_MKNOD must skip the device node, not create it"
+        )
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
     def test_devices_recreates_real_char_device(self, shared_server):
