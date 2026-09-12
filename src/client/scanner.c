@@ -587,12 +587,16 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
 
 static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
   void** chunk_items = array_list_to_array(chunk_data);
-  if (!chunk_items)
+  if (!chunk_items) {
+    array_list_delete(chunk_data);
     return NULL;
+  }
   Chunk* chunk = chunk_create((File**)chunk_items, chunk_data->size);
   free(chunk_items);
-  if (!chunk)
+  if (!chunk) {
+    array_list_delete(chunk_data);
     return NULL;
+  }
   chunk_data->item_destroyer = NULL;
   array_list_delete(chunk_data);
   return chunk;
