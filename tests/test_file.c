@@ -1431,7 +1431,7 @@ static void test_receive_incremental_check_empty_path() {
   EXPECT_TRUE(send_n_data(p[1], &check_mtime_nsec, sizeof(check_mtime_nsec)));
 
   bool skipped = true;
-  File* file = receive_incremental_check(p[0], cfg, &skipped);
+  const File* file = receive_incremental_check(p[0], cfg, &skipped);
   EXPECT_NULL(file);
   EXPECT_FALSE(skipped);
 
