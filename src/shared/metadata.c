@@ -360,7 +360,7 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
 bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
                                    bool omit_link_times) {
   if (path == NULL || metadata == NULL)
-    return true;
+    return !identity_copy_as_active();
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)

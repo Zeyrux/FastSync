@@ -364,8 +364,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
        FIFO creation is unprivileged and deliberately NOT gated here. */
     if (!privilege_super_mode_permitted(config->super_mode)) {
       log_message(LOG_LEVEL_WARNING,
-                  "skipping %s: super-user device-node creation is not permitted "
-                  "(super-user activities disabled by --no-super)",
+                  "skipping %s: super-user device-node creation is not permitted on this receiver",
                   file->path);
       return FILE_SAVE_SKIPPED;
     }
@@ -598,7 +597,8 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   if (config && config->write_devices) {
     if (!privilege_super_mode_permitted(config->super_mode)) {
       log_message(LOG_LEVEL_WARNING,
-                  "write-devices: %s skipped: super-user activities disabled by --no-super",
+                  "write-devices: %s skipped: super-user activities are not permitted on this "
+                  "receiver",
                   file->path ? file->path : "(null)");
       return FILE_SAVE_SKIPPED;
     }
@@ -633,6 +633,10 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
                                            (int32_t)file->metadata->gid))
           ok = false;
         close(parent_fd);
+      } else if (identity_copy_as_active()) {
+        /* The directory exists (ok) but its required --copy-as ownership could
+           not be applied because the confined parent could not be opened. */
+        ok = false;
       }
       free(leaf);
     }
@@ -679,10 +683,13 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     }
     char* parent = str_dup(link_path);
     if (parent) {
-      file_ensure_directory_secure(dirname(parent));
+      /* Propagate a failed --copy-as ownership of the parent directory this
+         creates; every other failure mode stays best-effort as before. */
+      ok = file_ensure_directory_secure(dirname(parent));
       free(parent);
     }
-    ok = file_symlink_at_secure(link_path, target);
+    if (ok)
+      ok = file_symlink_at_secure(link_path, target);
     free(target);
     /* P7 Wave D: apply the symlink's own metadata with no-follow primitives
        (utimensat/lchown/fchmodat AT_SYMLINK_NOFOLLOW).  -J/--omit-link-times

@@ -343,10 +343,13 @@ class TestDaemonRejection:
         assert result.returncode != 0
         assert _tree_file_count(AUTH_MODULE) == 0
 
-    def _assert_ownership_refused(self, daemon, module, flags):
+    def _assert_ownership_refused(self, daemon, module, flags,
+                                  accept=("client-chosen ownership",)):
         """A daemon module without `client owner = yes` refuses every
         client-chosen ownership / super-user request at the config handshake,
-        before any data lands."""
+        before any data lands.  `accept` lists the log phrases that count as the
+        refusal (a non-root daemon refuses --copy-as earlier, at the privilege
+        check, so the caller accepts that phrase too)."""
         log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
         before_files = self._tree_files()
@@ -358,7 +361,7 @@ class TestDaemonRejection:
         with open(log_path, "rb") as f:
             f.seek(before)
             tail = f.read().decode("utf-8", "replace")
-        assert "client-chosen ownership" in tail, (
+        assert any(phrase in tail for phrase in accept), (
             f"daemon did not log the ownership refusal: {tail[-400:]!r}"
         )
 
@@ -368,7 +371,9 @@ class TestDaemonRejection:
         so even a root daemon must not honor an arbitrary client-selected owner
         by default.  The refusal happens at the config handshake, before any data
         lands."""
-        self._assert_ownership_refused(daemon, "files", ["--copy-as=@65534:@65534"])
+        self._assert_ownership_refused(
+            daemon, "files", ["--copy-as=@65534:@65534"],
+            accept=("client-chosen ownership", "requires a privileged receiver"))
 
     def test_super_refused_by_daemon(self, daemon):
         """An explicit --super is a super-user activity request, so a daemon

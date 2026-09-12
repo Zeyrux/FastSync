@@ -586,10 +586,14 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
               !identity_apply_ownership_link(fd, component, 0, 0)) {
             /* A REQUIRED --copy-as ownership that cannot be applied to a
                directory this walk just created must fail the entry rather than
-               leave that implicit parent owned by the receiver. */
+               leave that implicit parent owned by the receiver.  Preserve the
+               failing errno across the cleanup so the caller logs the real
+               reason. */
+            int saved_errno = errno;
             close(fd);
             free(copy);
             free(leaf);
+            errno = saved_errno;
             return -1;
           }
           next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -699,11 +703,23 @@ bool file_ensure_directory_secure(const char* path) {
     return false;
 
   int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  bool created = false;
   if (dir_fd < 0 && errno == ENOENT) {
-    if (mkdirat(parent_fd, leaf, 0755) == 0 || errno == EEXIST)
+    if (mkdirat(parent_fd, leaf, 0755) == 0) {
+      created = true;
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } else if (errno == EEXIST) {
+      dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
   }
   bool ok = dir_fd >= 0;
+  /* --copy-as owns a directory this call just created (the final component;
+     intermediate components were handled by file_open_secure_parent above).  A
+     failed REQUIRED ownership fails the call rather than leaving the directory
+     owned by the receiver. */
+  if (ok && created && identity_copy_as_active() &&
+      !identity_apply_ownership_link(parent_fd, leaf, 0, 0))
+    ok = false;
   if (dir_fd >= 0)
     close(dir_fd);
   close(parent_fd);

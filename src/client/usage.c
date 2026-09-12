@@ -173,7 +173,7 @@ void print_usage(void) {
   printf("                      within the confined receive root.  Never elevates\n");
   printf("                      privileges and never bypasses confinement; ownership\n");
   printf("                      is still applied only with an explicit identity flag\n");
-  printf("                      (--numeric-ids/--chown/--usermap/--groupmap)\n");
+  printf("                      (--numeric-ids/--chown/--usermap/--groupmap/--copy-as)\n");
   printf("  --no-super          Forbid those super-user activities even when the\n");
   printf("                      receiver is running as root\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
