@@ -383,6 +383,27 @@ class TestDaemonRejection:
         refusal happens at the config handshake, before any data lands."""
         self._assert_ownership_refused(daemon, "files", ["--super", "--preserve"])
 
+    def test_super_refused_by_no_super_daemon(self):
+        """A daemon started with the operator --no-super veto must still REFUSE
+        an explicit client --super on a non-opted module: the veto must not turn
+        the refusal into a silent accept."""
+        port = _find_free_port()
+        d = DaemonManager()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        try:
+            d.start(CONF_FILE, port_override=port,
+                    extra_args=["--password-file", CRED_FILE, "--no-super"])
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=d.port,
+                                   flags=["--super", "--preserve"])
+            assert result.returncode != 0, "the --no-super daemon must refuse --super"
+            with open(log_path, "rb") as f:
+                tail = f.read().decode("utf-8", "replace")
+            assert "client-chosen ownership" in tail, (
+                f"daemon did not log the --super refusal: {tail[-400:]!r}"
+            )
+        finally:
+            d.stop()
+
     def test_numeric_ids_refused_by_daemon(self, daemon):
         """P7 Wave E hardening (A1): the daemon ownership gate must cover the
         pre-existing identity flags too, not only --copy-as/--super.  A module
