@@ -766,6 +766,26 @@ class TestDaemonAuthentication:
         finally:
             os.unlink(cred_path)
 
+    @pytest.mark.ci
+    def test_remote_plaintext_credentials_rejected_client_side(self):
+        """A7-3/S1: sending daemon credentials to a clearly non-local daemon
+        WITHOUT --tls is refused by the client itself, before any network I/O
+        (192.0.2.0/24 is TEST-NET-1 and never reachable, so a network attempt
+        would time out instead of failing fast)."""
+        cred_path = os.path.join(TEST_DATA_DIR, "client_remote.pw")
+        _write_client_password_file(cred_path, "alice", ALICE_PASS)
+        try:
+            cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR,
+                                "--dest-dir", "192.0.2.1::files",
+                                "--save-to-disk", "--password-file", cred_path,
+                                "--server-port", "873"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            assert result.returncode != 0
+            combined = (result.stderr or "") + (result.stdout or "")
+            assert "--tls" in combined, combined
+        finally:
+            os.unlink(cred_path)
+
     def test_client_empty_password_file_rejected(self):
         """Client-side: an empty --password-file is rejected (no credentials)."""
         cred_path = os.path.join(TEST_DATA_DIR, "client_empty.pw")
@@ -1001,23 +1021,30 @@ class TestDaemonMotd:
             d.stop()
 
 
-def _generate_tls_certs(cert_dir):
-    """Generate a self-signed CA, server cert (with 127.0.0.1 SAN) and a client
-    cert signed by that CA, for the TLS+auth composition test."""
+def _generate_tls_certs(cert_dir, extra_san_ips=None):
+    """Generate a self-signed CA, server cert (with 127.0.0.1 SAN plus any
+    extra_san_ips) and two client certs signed by that CA: one with the
+    expected CN (fastsync-client) and one with a WRONG CN, for the TLS+auth
+    composition and wrong-identity tests."""
     os.makedirs(cert_dir, exist_ok=True)
     ca_key, ca_cert = os.path.join(cert_dir, "ca.key"), os.path.join(cert_dir, "ca.pem")
     server_key = os.path.join(cert_dir, "server.key")
     server_cert = os.path.join(cert_dir, "server.pem")
     client_key = os.path.join(cert_dir, "client.key")
     client_cert = os.path.join(cert_dir, "client.pem")
+    wrong_client_key = os.path.join(cert_dir, "wrong_client.key")
+    wrong_client_cert = os.path.join(cert_dir, "wrong_client.pem")
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", ca_key, "-out", ca_cert, "-days", "1",
                     "-subj", "/CN=FastSync Test CA"], check=True, capture_output=True)
     san = os.path.join(cert_dir, "san.conf")
+    san_ips = ["IP.1 = 127.0.0.1"]
+    for index, ip in enumerate(extra_san_ips or [], start=2):
+        san_ips.append("IP.%d = %s" % (index, ip))
     with open(san, "w") as f:
         f.write("[req]\ndistinguished_name = dn\nreq_extensions = v3_req\n\n"
                 "[dn]\nCN = localhost\n\n[v3_req]\nsubjectAltName = @an\n\n"
-                "[an]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\n")
+                "[an]\nDNS.1 = localhost\n" + "\n".join(san_ips) + "\n")
     subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", server_key, "-out", os.path.join(cert_dir, "server.csr"),
                     "-subj", "/CN=localhost", "-config", san], check=True, capture_output=True)
@@ -1031,12 +1058,20 @@ def _generate_tls_certs(cert_dir):
     subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "client.csr"),
                     "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
                     "-out", client_cert, "-days", "1"], check=True, capture_output=True)
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", wrong_client_key, "-out", os.path.join(cert_dir, "wrong_client.csr"),
+                    "-subj", "/CN=wrong-client"], check=True, capture_output=True)
+    subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "wrong_client.csr"),
+                    "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+                    "-out", wrong_client_cert, "-days", "1"], check=True, capture_output=True)
     return {
         "ca": ca_cert,
         "server_cert": server_cert,
         "server_key": server_key,
         "client_cert": client_cert,
         "client_key": client_key,
+        "wrong_client_cert": wrong_client_cert,
+        "wrong_client_key": wrong_client_key,
     }
 
 
@@ -1073,6 +1108,51 @@ class TestDaemonTLSAuth:
                                    flags=tls_flags, extra_args=["--password-file", bad_creds])
             assert result.returncode != 0
             os.unlink(bad_creds)
+        finally:
+            d.stop()
+            os.unlink(client_creds)
+            shutil.rmtree(cert_dir, ignore_errors=True)
+
+    @pytest.mark.ci
+    def test_wrong_client_cn_refused_before_auth_challenge(self):
+        """A7-3/S1: over a NON-local TLS connection an auth-required module is
+        refused at the config gate when the CA-valid client certificate does not
+        match --client-cn -- before any SCRAM challenge is sent and before any
+        file data moves.  The daemon is started WITH --allow-unauthenticated to
+        prove that flag does not relax the auth-module transport policy."""
+        try:
+            remote_ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            pytest.skip("hostname does not resolve")
+        if remote_ip.startswith("127."):
+            pytest.skip("host resolves to loopback; no non-loopback interface")
+        cert_dir = os.path.join(TEST_DATA_DIR, "daemon_tls_certs_wrong")
+        certs = _generate_tls_certs(cert_dir, extra_san_ips=[remote_ip])
+        client_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_wrong_client.pw")
+        _write_client_password_file(client_creds, "alice", ALICE_PASS)
+        d = DaemonManager()
+        port = _find_free_port()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=[
+                "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
+                "--password-file", CRED_FILE])
+            before_files = _tree_file_count(AUTH_MODULE)
+            log_before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            tls_flags = ["--tls",
+                         "--cert", certs["wrong_client_cert"], "--key",
+                         certs["wrong_client_key"], "--ca", certs["ca"]]
+            result, _ = run_client(SOURCE_DIR, "%s::locked" % remote_ip, port=port,
+                                   flags=tls_flags, extra_args=["--password-file", client_creds])
+            assert result.returncode != 0, "a wrong client CN must be refused"
+            assert _tree_file_count(AUTH_MODULE) == before_files, \
+                "a refused connection wrote file data"
+            with open(log_path, "rb") as f:
+                f.seek(log_before)
+                tail = f.read().decode("utf-8", "replace")
+            assert "requires authentication over an encrypted, verified TLS connection" in tail, \
+                tail[-400:]
         finally:
             d.stop()
             os.unlink(client_creds)

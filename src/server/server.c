@@ -173,7 +173,7 @@ static bool tls_client_identity_allowed(SSL* ssl) {
   size_t required_length = strlen(required_client_cn);
   bool allowed = length >= 0 && (size_t)length == required_length &&
                  required_length < sizeof(common_name) &&
-                 memcmp(common_name, required_client_cn, required_length) == 0;
+                 credentials_secure_equal(common_name, required_client_cn, required_length);
   X509_free(certificate);
   return allowed;
 }
@@ -382,11 +382,23 @@ static const char* server_module_gate(const Config* config, void* context) {
       return "requested daemon module requires authentication and no credential "
              "store is configured";
     }
-    if (gate_ctx && !gate_ctx->ssl) {
-      log_message(LOG_LEVEL_WARNING,
-                  "daemon module '%s' is authenticating over a plaintext connection (no --tls); "
-                  "the credential exchange is not encrypted",
+    /* Transport policy (A7-3/S1): an auth-required module only accepts
+     * credentials over an encrypted, verified TLS connection whose client
+     * certificate matches --client-cn, or over a local/SSH transport (a
+     * loopback TCP peer, or the --stdio pipe).  A remote plaintext peer is
+     * refused HERE, before the challenge is sent, so an unverified client never
+     * receives a nonce.  --allow-unauthenticated is intentionally NOT consulted:
+     * that flag relaxes the standalone plaintext gate, never this one. */
+    bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
+                  tls_client_identity_allowed(gate_ctx->ssl);
+    bool local_ok = gate_ctx && gate_ctx->fd >= 0 && utils_fd_peer_is_local(gate_ctx->fd);
+    if (!tls_ok && !local_ok) {
+      log_message(LOG_LEVEL_ERROR,
+                  "daemon module '%s' requires authentication over an encrypted, verified TLS "
+                  "connection (or a local/SSH transport); refusing",
                   config->module);
+      return "daemon module requires authentication over an encrypted, verified TLS "
+             "connection";
     }
     if (!gate_ctx || gate_ctx->fd < 0) {
       log_message(LOG_LEVEL_ERROR, "daemon module '%s': no auth transport available",

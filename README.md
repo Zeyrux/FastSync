@@ -528,6 +528,16 @@ restart-gated enumeration channel remains (persisting a dummy key is out of
 scope); and the store iteration count is observable pre-auth by design, since
 the miss path must match a hit.
 
+An `auth users` module only accepts credentials over an encrypted, verified TLS
+connection whose client certificate matches the server's `--client-cn`, or over
+a local/SSH transport (a loopback TCP peer or the `--stdio` pipe). A remote
+plaintext peer is refused before any challenge is sent, and
+`--allow-unauthenticated` does **not** relax this: that flag only relaxes the
+standalone plaintext gate. Clients sending daemon credentials with
+`--password-file` to a non-loopback daemon must therefore use `--tls`; the
+client rejects a non-local plaintext credential destination before any network
+I/O.
+
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not
 verified. Use certificate verification for deployments where authentication

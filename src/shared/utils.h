@@ -4,6 +4,7 @@
 #include "array_list.h"
 #include <stddef.h>
 #include <stdbool.h>
+#include <sys/socket.h>
 
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
@@ -66,5 +67,10 @@ bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_si
 bool append_resume_eligible(unsigned long long old_size, unsigned long long check_size);
 bool append_tail_length(unsigned long long old_size, unsigned long long check_size,
                         unsigned long long* tail_out);
+/* Loopback / local-transport classification for the daemon auth gate and the
+   client credential rule.  See utils.c for the exact accepted forms. */
+bool utils_sockaddr_is_loopback(const struct sockaddr* addr);
+bool utils_fd_peer_is_local(int fd);
+bool utils_host_is_loopback(const char* host);
 
 #endif
