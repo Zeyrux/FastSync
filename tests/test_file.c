@@ -1429,8 +1429,10 @@ static void test_keep_dirlinks_secure_open_impl() {
   int parent_fd = file_open_secure_parent(path, &leaf, false);
   EXPECT_TRUE(parent_fd >= 0);
   EXPECT_NOT_NULL(leaf);
+  // cppcheck-suppress knownConditionTrueFalse
   if (leaf)
     EXPECT_EQ_STR(leaf, "file.txt");
+  // cppcheck-suppress knownConditionTrueFalse
   if (parent_fd >= 0) {
     struct stat st;
     EXPECT_EQ_INT(fstat(parent_fd, &st), 0);
@@ -1444,6 +1446,7 @@ static void test_keep_dirlinks_secure_open_impl() {
   leaf = NULL;
   parent_fd = file_open_secure_parent(path, &leaf, false);
   EXPECT_TRUE(parent_fd >= 0);
+  // cppcheck-suppress knownConditionTrueFalse
   if (parent_fd >= 0) {
     struct stat st;
     EXPECT_EQ_INT(fstat(parent_fd, &st), 0);
