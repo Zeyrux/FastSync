@@ -5293,6 +5293,38 @@ class TestCopyAs:
 
     @pytest.mark.ci
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_owns_implicit_parent_dirs(self, shared_server):
+        """--copy-as must also own the intermediate directories that the receiver
+        creates implicitly while writing a nested file (the scanner does not emit
+        STATUS_MKDIR entries for ordinary traversal directories), not just the
+        file itself."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_nested_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_nested_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        nested = os.path.join(source, "top", "mid", "leaf")
+        os.makedirs(nested, exist_ok=True)
+        with open(os.path.join(nested, "deep.txt"), "wb") as fh:
+            fh.write(b"nested copy-as ownership\n")
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as nested transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        for rel in ("top", os.path.join("top", "mid"), os.path.join("top", "mid", "leaf")):
+            target = os.path.join(received, rel)
+            assert os.path.isdir(target), f"implicit directory missing at {target}"
+            st = os.stat(target)
+            assert (st.st_uid, st.st_gid) == (65534, 65534), (
+                f"--copy-as did not own implicit directory {rel}: "
+                f"uid={st.st_uid} gid={st.st_gid}"
+            )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
     def test_root_copy_as_owns_fifo(self, shared_server):
         """--copy-as must own a recreated FIFO special node."""
         source = os.path.join(TEST_DATA_DIR, "copyas_fifo_src")

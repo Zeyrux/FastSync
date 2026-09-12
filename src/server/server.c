@@ -195,6 +195,17 @@ static const char* server_module_gate(const Config* config, void* context) {
                                  "client-chosen ownership); refusing");
     return "--copy-as is not permitted by this daemon";
   }
+  /* --super (SUPER_MODE_ON) with no explicit identity policy implies raw
+     numeric-id ownership, i.e. a client-chosen owner.  A daemon has no
+     per-module opt-in, so refuse the explicit ON request for the same reason it
+     refuses --copy-as; the pre-existing --numeric-ids/--chown/--usermap surfaces
+     are unchanged (documented daemon trust model).  --no-super still works. */
+  if (g_daemon_conf != NULL && config->super_mode == SUPER_MODE_ON) {
+    log_message(LOG_LEVEL_ERROR,
+                "--super is refused by the daemon (no per-module opt-in for client-chosen "
+                "ownership); refusing");
+    return "--super is not permitted by this daemon";
+  }
   /* Operator veto: --no-super forces SUPER_MODE_OFF for this connection before
      the copy-as gate is evaluated, and the caller clamps the accepted config
      again after this returns so the ownership/device gates see it too. */
@@ -202,8 +213,13 @@ static const char* server_module_gate(const Config* config, void* context) {
   if (server_no_super)
     effective->super_mode = SUPER_MODE_OFF;
   if (identity_copy_as_refused(effective)) {
-    log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
-    return "--copy-as requires a privileged receiver (root)";
+    if (geteuid() != 0)
+      log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
+    else
+      log_message(LOG_LEVEL_ERROR,
+                  "--copy-as refused: super-user activities are disabled by the server "
+                  "(--no-super); refusing");
+    return "cannot perform --copy-as on this receiver";
   }
   /* --iconv (protocol 2.16.0): the receiver's exact conversion direction (the
      client spec's wire charset into this server's local charset, including a
@@ -606,6 +622,9 @@ static void print_server_usage(void) {
   printf("  -6, --ipv6          Bind an IPv6 socket\n");
   printf("  --allow-delete      Permit manifest deletion\n");
   printf("  --trust-sender      Trust the remote sender's file list\n");
+  printf("  --no-super          Operator veto: never attempt super-user activities\n");
+  printf("                      (ownership, device nodes) even as root, and refuse\n");
+  printf("                      any client --copy-as/--super request\n");
   printf("  --iconv=LOCAL[,REMOTE]  Declare this server's LOCAL charset for file-name\n");
   printf("                      conversion: received names are translated to this\n");
   printf("                      charset (the wire charset still comes from the\n");

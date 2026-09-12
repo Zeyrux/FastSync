@@ -357,13 +357,15 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     if (!config || !config->preserve_devices)
       return FILE_SAVE_SKIPPED;
     /* --super / --no-super (P7 Wave E): char/block device-node creation is a
-       super-user activity.  --no-super forbids it even for a root receiver; the
-       default AUTO only attempts it when already root.  Pure FIFO creation is
-       unprivileged and deliberately NOT gated here. */
-    if (!privilege_super_permitted()) {
+       super-user activity.  --no-super forbids it even for a root receiver;
+       AUTO and --super attempt it (an unprivileged attempt is refused by the
+       kernel and skipped).  The helper is evaluated against THIS config's mode
+       so the policy does not depend on a prior identity_set_active().  Pure
+       FIFO creation is unprivileged and deliberately NOT gated here. */
+    if (!privilege_super_mode_permitted(config->super_mode)) {
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: super-user device-node creation is not permitted "
-                  "(--no-super, or the receiver is not privileged)",
+                  "(super-user activities disabled by --no-super)",
                   file->path);
       return FILE_SAVE_SKIPPED;
     }
@@ -586,9 +588,19 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special)
     return file_save_special_to_disk(root_directory, file, config);
-  /* --write-devices: write straight into an existing device node. */
-  if (config && config->write_devices)
+  /* --write-devices: write straight into an existing device node.  Writing
+     into a device is a super-user activity, so --no-super must suppress it just
+     like device-node creation; the default AUTO/--super attempt it (the wide
+     open below keeps its own confinement and best-effort skip semantics). */
+  if (config && config->write_devices) {
+    if (!privilege_super_mode_permitted(config->super_mode)) {
+      log_message(LOG_LEVEL_WARNING,
+                  "write-devices: %s skipped: super-user activities disabled by --no-super",
+                  file->path ? file->path : "(null)");
+      return FILE_SAVE_SKIPPED;
+    }
     return file_save_write_device(root_directory, file);
+  }
 
   /* Explicit directory entries (--dirs) carry an empty payload; the entry is
      created as a directory under the receive root, applying the same secure

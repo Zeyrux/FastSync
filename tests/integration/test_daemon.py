@@ -341,6 +341,28 @@ class TestDaemonRejection:
             f"daemon did not log the copy-as refusal: {tail[-400:]!r}"
         )
 
+    def test_super_refused_by_daemon(self, daemon):
+        """P7 Wave E: --super (SUPER_MODE_ON) implies raw numeric-id ownership
+        with no explicit identity flag, so a daemon refuses it for the same
+        reason it refuses --copy-as: there is no per-module opt-in for
+        client-chosen ownership.  The refusal happens at the config handshake,
+        before any data lands."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        before_files = self._tree_files()
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=daemon.port,
+                               flags=["--super", "--preserve"])
+        assert result.returncode != 0, "the daemon must refuse --super"
+        assert self._tree_files() == before_files, \
+            "--super refusal wrote under the module root"
+        time.sleep(0.3)
+        with open(log_path, "rb") as f:
+            f.seek(before)
+            tail = f.read().decode("utf-8", "replace")
+        assert "super is refused by the daemon" in tail, (
+            f"daemon did not log the --super refusal: {tail[-400:]!r}"
+        )
+
     @pytest.mark.daemon_detach
     def test_real_detach_path(self):
         """--daemon WITHOUT --no-detach double-forks a real background daemon;

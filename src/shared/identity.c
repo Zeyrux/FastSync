@@ -93,7 +93,6 @@ void identity_set_active(const Config* config) {
       g_identity.groupmap_count = config->groupmap_count;
     }
   }
-  g_identity.super_mode = config->super_mode;
   g_identity.set = true;
   /* A root receiver would honor any client-supplied ownership request (a
      --usermap/--groupmap/--chown/--copy-as, or raw ids under --numeric-ids).
@@ -467,7 +466,7 @@ int identity_parse_copy_as(Config* config, const char* value) {
     return -1;
   }
   char* user_token = spec;
-  char* group_token = NULL;
+  const char* group_token = NULL;
   char* colon = strchr(spec, ':');
   if (colon) {
     *colon = '\0';
@@ -726,5 +725,5 @@ void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t sour
   if (!identity_resolve_targets(&st, source_uid, source_gid, &uid, &gid))
     return;
   if (fchownat(parent_fd, leaf, uid, gid, AT_SYMLINK_NOFOLLOW) != 0)
-    identity_log_chown_failure("symlink", uid, gid);
+    identity_log_chown_failure("no-follow entry", uid, gid);
 }
