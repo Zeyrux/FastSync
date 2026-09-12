@@ -26,6 +26,15 @@
  * hard-rejected with an actionable "legacy" error; there is no auto-upgrade.
  * Use `fastsync-server --hash-credentials` to generate new-format lines.
  *
+ * Alongside the store, credentials_load maintains an owner-only (0600)
+ * `<store_path>.dummykey` sidecar holding the store-wide random dummy key.  It
+ * is auto-created on first load and MUST be preserved across restarts: it makes
+ * the dummy challenge for an unknown user stable for the life of the store, so
+ * a daemon restart cannot be used as a username-enumeration oracle.  A sidecar
+ * that is not an owner-only regular file of exactly 32 bytes fails the load
+ * (fail closed); if it cannot be created (e.g. a read-only mount) the daemon
+ * warns and uses a transient per-run key instead.
+ *
  * Client --password-file format: the FIRST meaningful (non-comment, non-blank)
  * line is `user:password`, holding the literal password.  The client keeps it
  * only for the duration of the handshake and wipes it at teardown; the file
