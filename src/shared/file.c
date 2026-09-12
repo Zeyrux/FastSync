@@ -848,8 +848,8 @@ static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXat
                         (uint32_t)metadata->mode, metadata->mtime_sec, metadata->mtime_nsec);
     /* Replay: re-apply the recorded uid/gid/mode/mtime fd-relative so a save
        under --fake-super restores the attrs (when privileged) instead of only
-       recording them.  Best-effort; a non-root fchown failure is logged/skipped
-       by fake_super_restore_fd, never fatal. */
+       recording them.  Best-effort; fake_super_restore_fd silently skips a
+       non-root fchown EPERM/EACCES and never fatal. */
     fake_super_restore_fd(fd);
   }
 }

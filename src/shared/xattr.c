@@ -335,8 +335,9 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
 
 /* --fake-super replay: read the freshly-stored record and re-apply the source
  * stat fd-relative.  A privileged (root) run can actually change the owner;
- * a non-root run logs-and-skips the fchown (never fatal, mirroring the normal
- * metadata identity path) and still applies mode/mtime where permitted. */
+ * a non-root run silently skips the fchown on EPERM/EACCES (never fatal,
+ * mirroring the normal metadata identity path; other errors are logged) and
+ * still applies mode/mtime where permitted. */
 bool fake_super_restore_fd(int fd) {
   if (fd < 0)
     return false;
