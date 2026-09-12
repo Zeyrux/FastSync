@@ -1899,6 +1899,68 @@ static void test_privilege_super_permitted_modes() {
   EXPECT_TRUE(privilege_super_permitted());
 }
 
+/* P7 Wave E hardening (A1): identity_ownership_requested() is the pure,
+   config-only predicate the daemon module gate uses.  It must fire for every
+   client-chosen ownership / super-user request and stay false for a plain
+   transfer and for SUPER_MODE_AUTO (the default) alone. */
+static void test_identity_ownership_requested() {
+  EXPECT_FALSE(identity_ownership_requested(NULL));
+
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_FALSE(identity_ownership_requested(c));
+  c->super_mode = SUPER_MODE_AUTO;
+  EXPECT_FALSE(identity_ownership_requested(c)); /* AUTO alone is not ownership */
+  c->super_mode = SUPER_MODE_ON;
+  EXPECT_TRUE(identity_ownership_requested(c)); /* explicit --super is */
+  c->super_mode = SUPER_MODE_AUTO;
+
+  c->numeric_ids = true;
+  EXPECT_TRUE(identity_ownership_requested(c));
+  c->numeric_ids = false;
+  c->chown_uid_set = true;
+  EXPECT_TRUE(identity_ownership_requested(c));
+  c->chown_uid_set = false;
+  c->chown_gid_set = true;
+  EXPECT_TRUE(identity_ownership_requested(c));
+  c->chown_gid_set = false;
+  c->copy_as_set = true;
+  EXPECT_TRUE(identity_ownership_requested(c));
+  c->copy_as_set = false;
+  c->fake_super = true;
+  EXPECT_TRUE(identity_ownership_requested(c));
+  config_delete(c);
+
+  Config* um = config_create();
+  EXPECT_NOT_NULL(um);
+  EXPECT_EQ_INT(identity_parse_map(um, "@1:@2", false), 0);
+  EXPECT_TRUE(identity_ownership_requested(um));
+  config_delete(um);
+
+  Config* gm = config_create();
+  EXPECT_NOT_NULL(gm);
+  EXPECT_EQ_INT(identity_parse_map(gm, "@1:@2", true), 0);
+  EXPECT_TRUE(identity_ownership_requested(gm));
+  config_delete(gm);
+}
+
+/* P7 Wave E hardening (A3): --super no longer implies raw numeric-id
+   preservation, so it must never enable ownership application on its own; an
+   explicit identity flag is required. */
+static void test_super_does_not_imply_numeric() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->super_mode = SUPER_MODE_ON;
+  c->use_metadata = true;
+  identity_set_active(c);
+  EXPECT_FALSE(identity_active_enabled());
+  c->numeric_ids = true;
+  identity_set_active(c);
+  EXPECT_TRUE(identity_active_enabled());
+  identity_clear_active();
+  config_delete(c);
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1953,6 +2015,8 @@ void test_config() {
     test_config_receive_with_validate_rejects();
   }
   test_identity_copy_as_refused();
+  test_identity_ownership_requested();
+  test_super_does_not_imply_numeric();
   test_privilege_super_permitted_modes();
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

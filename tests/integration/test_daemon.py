@@ -16,8 +16,10 @@ import hashlib
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -41,6 +43,7 @@ FILES_MODULE = os.path.join(MODULE_ROOT, "files")
 READONLY_MODULE = os.path.join(MODULE_ROOT, "readonly")
 AUTH_MODULE = os.path.join(MODULE_ROOT, "auth")
 TEAM_MODULE = os.path.join(MODULE_ROOT, "team")
+OWNER_MODULE = os.path.join(MODULE_ROOT, "owner")
 CONF_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.conf")
 CRED_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.passwd")
 STARTFAIL_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_startfail.conf")
@@ -149,7 +152,8 @@ def _config_port(config_path):
 
 @pytest.fixture(scope="module", autouse=True)
 def daemon_env():
-    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, DETACH_MODULE):
+    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE,
+              DETACH_MODULE):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     generate_test_files(SOURCE_DIR, full=False)
@@ -184,7 +188,11 @@ def daemon_env():
             "[team]\n"
             "path = %s\n"
             "auth users = alice,bob\n"
-            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE))
+            "\n"
+            "[owner]\n"
+            "path = %s\n"
+            "client owner = yes\n"
+            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE))
 
     # A dedicated config for the fail-closed startup check: an auth-required
     # module with no credential store must refuse to start.  Its own free port
@@ -236,6 +244,21 @@ def _push_with_creds(dest, port, user, password):
 
 def _tree_file_count(root):
     return sum(len(files) for _, _, files in os.walk(root)) if os.path.exists(root) else 0
+
+
+def _can_mknod():
+    """True when this process may create a char device (needs root/CAP_MKNOD)."""
+    probe = os.path.join(tempfile.gettempdir(), "._fastsync_mknod_probe_%d" % os.getpid())
+    try:
+        os.mknod(probe, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+        os.unlink(probe)
+        return True
+    except (OSError, AttributeError):
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return False
 
 
 class TestDaemonModuleSelection:
@@ -320,48 +343,103 @@ class TestDaemonRejection:
         assert result.returncode != 0
         assert _tree_file_count(AUTH_MODULE) == 0
 
-    def test_copy_as_refused_by_daemon(self, daemon):
-        """P7 Wave E: a daemon refuses client-chosen ownership (--copy-as)
-        outright.  There is no per-module opt-in, so even a root daemon must not
-        honor an arbitrary client-selected owner.  The refusal happens at the
-        config handshake, before any data lands."""
+    def _assert_ownership_refused(self, daemon, module, flags,
+                                  accept=("client-chosen ownership",)):
+        """A daemon module without `client owner = yes` refuses every
+        client-chosen ownership / super-user request at the config handshake,
+        before any data lands.  `accept` lists the log phrases that count as the
+        refusal (a non-root daemon refuses --copy-as earlier, at the privilege
+        check, so the caller accepts that phrase too)."""
         log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
         before_files = self._tree_files()
-        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=daemon.port,
-                               flags=["--copy-as=@65534:@65534"])
-        assert result.returncode != 0, "the daemon must refuse --copy-as"
+        result, _ = run_client(SOURCE_DIR, f"127.0.0.1::{module}", port=daemon.port, flags=flags)
+        assert result.returncode != 0, f"the daemon must refuse {flags}"
         assert self._tree_files() == before_files, \
-            "--copy-as refusal wrote under the module root"
+            f"{flags} refusal wrote under the module root"
         time.sleep(0.3)
         with open(log_path, "rb") as f:
             f.seek(before)
             tail = f.read().decode("utf-8", "replace")
-        assert "copy-as is refused by the daemon" in tail, (
-            f"daemon did not log the copy-as refusal: {tail[-400:]!r}"
+        assert any(phrase in tail for phrase in accept), (
+            f"daemon did not log the ownership refusal: {tail[-400:]!r}"
         )
 
+    def test_copy_as_refused_by_daemon(self, daemon):
+        """P7 Wave E hardening: a daemon refuses client-chosen ownership
+        (--copy-as) outright unless the module opts in with `client owner = yes`,
+        so even a root daemon must not honor an arbitrary client-selected owner
+        by default.  The refusal happens at the config handshake, before any data
+        lands."""
+        self._assert_ownership_refused(
+            daemon, "files", ["--copy-as=@65534:@65534"],
+            accept=("client-chosen ownership", "requires a privileged receiver"))
+
     def test_super_refused_by_daemon(self, daemon):
-        """P7 Wave E: --super (SUPER_MODE_ON) implies raw numeric-id ownership
-        with no explicit identity flag, so a daemon refuses it for the same
-        reason it refuses --copy-as: there is no per-module opt-in for
-        client-chosen ownership.  The refusal happens at the config handshake,
-        before any data lands."""
-        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
-        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
-        before_files = self._tree_files()
-        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=daemon.port,
-                               flags=["--super", "--preserve"])
-        assert result.returncode != 0, "the daemon must refuse --super"
-        assert self._tree_files() == before_files, \
-            "--super refusal wrote under the module root"
-        time.sleep(0.3)
-        with open(log_path, "rb") as f:
-            f.seek(before)
-            tail = f.read().decode("utf-8", "replace")
-        assert "super is refused by the daemon" in tail, (
-            f"daemon did not log the --super refusal: {tail[-400:]!r}"
-        )
+        """An explicit --super is a super-user activity request, so a daemon
+        module refuses it unless it opts in with `client owner = yes`.  The
+        refusal happens at the config handshake, before any data lands."""
+        self._assert_ownership_refused(daemon, "files", ["--super", "--preserve"])
+
+    def test_numeric_ids_refused_by_daemon(self, daemon):
+        """P7 Wave E hardening (A1): the daemon ownership gate must cover the
+        pre-existing identity flags too, not only --copy-as/--super.  A module
+        without `client owner = yes` refuses --numeric-ids at the handshake."""
+        self._assert_ownership_refused(daemon, "files", ["--numeric-ids", "--preserve"])
+
+    def test_chown_refused_by_daemon(self, daemon):
+        """--chown is client-chosen ownership too and must be refused by a
+        non-opted-in module."""
+        self._assert_ownership_refused(daemon, "files", ["--chown=@65534:@65534", "--preserve"])
+
+    def test_owner_opt_in_allows_numeric_ids(self, daemon):
+        """A module that opts in with `client owner = yes` accepts the
+        client-chosen ownership flags (here --numeric-ids); the transfer
+        succeeds and lands inside that module root."""
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::owner", port=daemon.port,
+                               flags=["--numeric-ids", "--preserve"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(OWNER_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def _device_source(self, name):
+        src = os.path.join(TEST_DATA_DIR, name)
+        shutil.rmtree(src, ignore_errors=True)
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "wb") as fh:
+            fh.write(b"device gate\n")
+        os.mknod(os.path.join(src, "null"), stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        return src
+
+    @pytest.mark.skipif(not _can_mknod(), reason="device nodes need root/CAP_MKNOD")
+    def test_devices_skipped_without_owner_opt_in(self, daemon):
+        """H3: a non-opted daemon module must not create device nodes even under
+        the default AUTO super mode (a root daemon would otherwise let any client
+        mknod arbitrary devices).  An ordinary -a push still succeeds; the device
+        entry is skipped."""
+        src = self._device_source("devsrc_noowner")
+        os.makedirs(os.path.join(FILES_MODULE, "devskip"), exist_ok=True)
+        result, _ = run_client(src, "127.0.0.1::files/devskip", port=daemon.port, flags=["-a"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(os.path.join(FILES_MODULE, "devskip"), src)
+        node = os.path.join(received, "null")
+        assert not os.path.exists(node) or not stat.S_ISCHR(os.stat(node).st_mode), \
+            "non-opted daemon module created a device node"
+
+    @pytest.mark.skipif(not _can_mknod(), reason="device nodes need root/CAP_MKNOD")
+    def test_devices_created_with_owner_opt_in(self, daemon):
+        """Control: an opted-in module (`client owner = yes`) may create device
+        nodes under -a, proving the clamp is specific to non-opted modules."""
+        src = self._device_source("devsrc_owner")
+        os.makedirs(os.path.join(OWNER_MODULE, "devok"), exist_ok=True)
+        result, _ = run_client(src, "127.0.0.1::owner/devok", port=daemon.port, flags=["-a"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(os.path.join(OWNER_MODULE, "devok"), src)
+        node = os.path.join(received, "null")
+        assert os.path.exists(node) and stat.S_ISCHR(os.stat(node).st_mode), \
+            "opted-in daemon module did not create the device node"
 
     @pytest.mark.daemon_detach
     def test_real_detach_path(self):

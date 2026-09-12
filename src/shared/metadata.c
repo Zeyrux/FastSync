@@ -357,17 +357,20 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
   }
 }
 
-void file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
+bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
                                    bool omit_link_times) {
   if (path == NULL || metadata == NULL)
-    return;
+    return !identity_copy_as_active();
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)
-    return;
+    return !identity_copy_as_active();
   /* Ownership (only when the identity policy is active) via lchown semantics:
-     fchownat with AT_SYMLINK_NOFOLLOW never dereferences the link. */
-  identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid, (int32_t)metadata->gid);
+     fchownat with AT_SYMLINK_NOFOLLOW never dereferences the link.  A failed
+     REQUIRED --copy-as ownership marks the entry failed; every other policy is
+     best-effort. */
+  bool owned = identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid,
+                                             (int32_t)metadata->gid);
   /* Symlink mode: not settable on Linux (fchmodat AT_SYMLINK_NOFOLLOW returns
      EOPNOTSUPP/ENOTSUP); attempt it for platforms that support it and quietly
      ignore the unsupported case so the transfer never fails over it. */
@@ -392,6 +395,7 @@ void file_restore_symlink_metadata(const char* path, const FileMetadata* metadat
   }
   close(parent_fd);
   free(leaf);
+  return owned;
 }
 
 bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability) {
@@ -409,10 +413,14 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
      --groupmap / --chown).  identity_apply_ownership is the controlled,
      privilege-gated path: it consults the negotiated policy, resolves the
      target ids, and applies them via an fd-relative fchown() that is confined
-     to the just-written file (EPERM/EACCES are logged, never fatal).  With no
-     identity flag set it is a no-op, so a default or plain -M transfer keeps
-     FastSync's existing behavior of never applying client ownership. */
-  identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid);
+     to the just-written file (EPERM/EACCES are logged, never fatal) -- EXCEPT
+     for an active --copy-as, whose forced ownership is REQUIRED: a failure
+     marks this entry as failed instead of reporting a wrong-owner write as
+     success.  With no identity flag set it is a no-op, so a default or plain -M
+     transfer keeps FastSync's existing behavior of never applying client
+     ownership. */
+  if (!identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid))
+    ok = false;
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
                               {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
   if (metadata->atime_valid) {

@@ -44,8 +44,10 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
  * under the authorized root.  `omit_link_times` (-J/--omit-link-times)
  * suppresses the timestamps; the link's mode/ownership are still attempted
  * (ownership stays gated by the identity policy and by default is not applied).
- * A null metadata or an unfollowable parent is a harmless no-op. */
-void file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
+ * A null metadata or an unfollowable parent is a harmless no-op.  Returns false
+ * only when a REQUIRED --copy-as ownership application failed, so the caller can
+ * report the entry as failed instead of claiming a wrong-owner success. */
+bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
                                    bool omit_link_times);
 
 /* Compare timestamps using rsync's whole-second modification window. */

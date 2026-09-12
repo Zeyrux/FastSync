@@ -169,11 +169,11 @@ void print_usage(void) {
   printf("                      re-apply it (fd-relative) on a privileged run; the\n");
   printf("                      recording format diverges from rsync's user.rsync.%%stat%%\n");
   printf("  --super             Permit the receiver to attempt super-user activities\n");
-  printf("                      (ownership application, char/block device-node\n");
-  printf("                      creation) within the confined receive root.  Never\n");
-  printf("                      elevates privileges and never bypasses confinement;\n");
-  printf("                      with no explicit identity policy, ownership follows\n");
-  printf("                      raw numeric ids (as if --numeric-ids)\n");
+  printf("                      (char/block device-node creation, --write-devices)\n");
+  printf("                      within the confined receive root.  Never elevates\n");
+  printf("                      privileges and never bypasses confinement; ownership\n");
+  printf("                      is still applied only with an explicit identity flag\n");
+  printf("                      (--numeric-ids/--chown/--usermap/--groupmap/--copy-as)\n");
   printf("  --no-super          Forbid those super-user activities even when the\n");
   printf("                      receiver is running as root\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");

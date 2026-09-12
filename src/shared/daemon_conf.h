@@ -24,12 +24,16 @@
  * selects this module to this path (file_open_secure_parent /
  * has_path_traversal / path_is_within all keep the existing confinement, just
  * per-module).  There is never any client-chosen root: a module path always
- * stays confined.  A daemon also REFUSES a client --copy-as outright, because
- * there is no per-module opt-in for client-chosen ownership (unlike the
- * standalone/SSH server, which honors it for its single operator-authorized
- * root); the operator-level --no-super veto additionally forces super-user
- * activities off for every daemon connection.  See server_module_gate in
- * server.c and RSYNC_COMPAT.md.
+ * stays confined.  A daemon REFUSES every client-chosen ownership / super-user
+ * request by default -- --numeric-ids, --chown, --usermap/--groupmap,
+ * --fake-super, --copy-as and an explicit --super -- because there is no
+ * per-module opt-in unless the operator adds one.  An operator opts a single
+ * module in with `client owner = yes` (DaemonModule.client_owner), which allows
+ * that client to choose ownership within that module's root (the standalone/SSH
+ * server honors such requests for its single operator-authorized root).  The
+ * operator-level --no-super veto additionally forces super-user activities off
+ * for every daemon connection, even an opted-in module.  See server_module_gate
+ * in server.c and RSYNC_COMPAT.md.
  *
  * `auth_users` is honored by Wave B daemon authentication: a module that
  * declares auth users accepts a connection only when the presented username is
@@ -41,6 +45,11 @@ typedef struct DaemonModule {
   char* name;        /* module name, as the client requests it */
   char* path;        /* module root (daemon-side authorized root) */
   bool read_only;    /* `read only = yes/no`; default no */
+  bool client_owner; /* `client owner = yes/no`; default no.  Per-module opt-in
+                        that lets this module's clients choose ownership
+                        (--numeric-ids/--chown/--usermap/--groupmap/--fake-super/
+                        --copy-as) and request explicit --super super-user
+                        activities.  Without it the daemon refuses all of them. */
   char** auth_users; /* `auth users = a,b`; Wave B credential list */
   int auth_user_count;
 } DaemonModule;

@@ -404,18 +404,19 @@ typedef struct Config {
 
   /* --super / --no-super (P7 Wave E, protocol 2.18.0): receiver-side privilege
    * policy for super-user activities confined below the authorized receive
-   * root.  SUPER_MODE_AUTO (default) preserves the pre-existing behavior: a
-   * privileged operation is only attempted when the receiver is ALREADY root
-   * (geteuid() == 0).  SUPER_MODE_ON (--super) PERMITS the receiver to attempt
-   * those activities (ownership application, char/block device-node creation)
-   * even when it is not root -- the attempt is then confined exactly as before
-   * and simply fails/skips if the kernel refuses it.  SUPER_MODE_OFF
+   * root.  SUPER_MODE_AUTO (default) preserves the pre-existing best-effort
+   * behavior: the confined super-user operation is ALWAYS attempted and an
+   * unprivileged attempt is refused by the kernel and skipped per entry.
+   * SUPER_MODE_ON (--super) explicitly REQUESTS those activities (char/block
+   * device-node creation, --write-devices); it does NOT imply --numeric-ids and
+   * never enables ownership application on its own.  SUPER_MODE_OFF
    * (--no-super) FORBIDS them even when running as root.  FastSync NEVER
    * elevates privileges (no setuid/seteuid/setgid) and never bypasses the
    * fd-relative confinement (file_open_secure_parent, O_NOFOLLOW, root checks);
    * --super only permits an attempt that is already confined.  Crosses the wire
    * as a trailing int so the receiver can enforce the policy.  See
-   * privilege_super_permitted() in identity.h. */
+   * privilege_super_permitted() and identity_ownership_requested() in
+   * identity.h. */
   int super_mode;
 
   // Receiver-side runtime staging registry for --delay-updates.  Never sent
