@@ -1079,18 +1079,34 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       if (config_add_pattern(&config->include_patterns, &config->include_count, argv[++i],
                              "--include") != 0)
         return -1;
-    } else if (opt_is(argv[i], "--delta-block", NULL)) {
+    } else if (strncmp(argv[i], "--delta-block=", 14) == 0) {
+      unsigned long long val;
+      if (parse_ull_arg(argv[i] + 14, &val, "--block-size/--delta-block") != 0)
+        return -1;
+      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
+        config->delta_block_size = (uint32_t)val;
+      else
+        log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
+    } else if (strncmp(argv[i], "--block-size=", 13) == 0) {
+      unsigned long long val;
+      if (parse_ull_arg(argv[i] + 13, &val, "--block-size/--delta-block") != 0)
+        return -1;
+      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
+        config->delta_block_size = (uint32_t)val;
+      else
+        log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
+    } else if (opt_is(argv[i], "--delta-block", "--block-size")) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
       unsigned long long val;
-      if (parse_ull_arg(argv[++i], &val, "--delta-block") != 0)
+      if (parse_ull_arg(argv[++i], &val, "--block-size/--delta-block") != 0)
         return -1;
       if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
         config->delta_block_size = (uint32_t)val;
       else
-        log_message(LOG_LEVEL_WARNING, "--delta-block value %llu out of range, using default", val);
+        log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
     } else if (opt_is(argv[i], "--delta-max", NULL)) {
       if (i + 1 >= argc) {
         log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);

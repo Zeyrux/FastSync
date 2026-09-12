@@ -65,10 +65,13 @@ replacement for every rsync feature or protocol mode.
   modes.
 - Owner/group, ACL, xattr, hard-link, device, and special-file handling is
   incomplete or unavailable.
-- Sparse-file handling does not yet preserve all holes correctly.
-- `--partial`, `--partial-dir`, `-P`, `--append`, and `--append-verify` are not
-  yet full rsync-style resumable transfers. Interrupted files are not retained
-  for resumption.
+- Sparse-file hole preservation (`-S`, `--sparse`) is implemented receiver-side:
+  long all-zero runs are written as holes (no wire change; the full file image
+  is already in memory). 
+- `--partial`, `--partial-dir`, `-P`, `--append`, and `--append-verify` keep
+  the write atomic (temp + rename). With `--partial`, a failed/interrupted write
+  now retains the already-written temp at the destination path (best-effort) so
+  a later `--append`/`--append-verify` run can resume it.
 - `--dirs` is not implemented. Its compatibility aliases `--old-dirs` and
   `--old-d` are recognized but rejected explicitly rather than silently using
   FastSync's recursive directory behavior.
@@ -103,7 +106,7 @@ partial, alternate, and planned behavior.
 | `-v, --verbose` | Enable debug logging |
 | `-q, --quiet` | Suppress non-error output |
 | `--progress` | Show real-time transfer speed |
-| `-P` | Enables partial-transfer mode and progress output (partial retention is incomplete) |
+| `-P` | Enables partial-transfer mode + progress output; interrupted writes retain the already-written temp for resumption |
 | `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded) |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
 | `--delete-during`, `--del` | Delete extras once the keep-set is known, before data is applied (implies `--delete`) |
@@ -363,7 +366,7 @@ features without changing the meaning of ordinary compatibility options.
 | `--chunk-serialization` | Enable FastSync chunk serialization (long form only; `-s` is rsync's `--secluded-args`). |
 | `--sendfile` | Use TCP `sendfile()` zero-copy transfer. Incompatible with compression and chunk serialization. Long form only. |
 | `--delta` | Use FastSync-native block delta transfer. Requires `--incremental`. |
-| `--delta-block <bytes>` | Set the FastSync delta block size. |
+| `--delta-block <bytes>` | Set the FastSync delta block size (`--block-size` is an alias). |
 | `--delta-max <bytes>` | Limit files eligible for FastSync delta transfer. |
 | `--server-host <host>` | Select the TCP server host. |
 | `--server-port <port>` | Select the TCP server port. |
@@ -410,12 +413,13 @@ remote SSH argv is already built injection-safe.
 zero means unlimited.| | `--incremental` | Skip files matching destination size and mtime.|
     | `--checksum` | Include xxHash64 content checks in incremental comparisons.| | `--backup` |
     Back up overwritten files.| | `--backup - dir<dir>` | Store backups under a separate directory.|
-    | `--suffix<suffix>` | Set the backup filename suffix.| | `--partial` |
-    Select partial - transfer handling.With `--partial - dir`,
-    completed files are written there;
-resumable transfers are not implemented.| | `--partial - dir<dir>` |
-    Set a relative partial - transfer directory below the server destination root;
-use with `--partial`. |
+| `--suffix<suffix>` | Set the backup filename suffix.| | `--partial` |
+     Select partial - transfer handling. On failed/interrupted writes the
+     already-written temp file is retained (best-effort) for resumption.|
+     With `--partial --partial-dir <dir>`, completed files are written under the
+     partial directory and installed atomically. | | `--partial - dir<dir>` |
+     Set a relative partial - transfer directory below the server destination root.
+     Use with `--partial`. |
 | `--inplace` | Write directly to the destination instead of using a temporary file. |
 
 ### Metadata and links
@@ -428,7 +432,7 @@ link-target transfer remains incomplete. |
 | `--copy-links` | Copy symlink referents. |
 | `--safe-links` | Skip symlinks that point outside the transfer tree. |
 | `--copy-unsafe-links` | Copy unsafe symlink referents. |
-| `-S`, `--sparse` | Request sparse-file handling; full hole preservation is planned. |
+| `-S`, `--sparse` | Sparse-file handling: receiver preserves holes (zero runs are written as holes; no wire change). |
 
 ### Output and logging
 

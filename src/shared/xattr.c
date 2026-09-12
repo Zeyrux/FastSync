@@ -9,7 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/xattr.h>
+#include <time.h>
+#include <unistd.h>
 
 /* ---- lifecycle ---- */
 
@@ -328,4 +331,47 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
     log_message(LOG_LEVEL_WARNING, "--fake-super: could not store %s on destination file: %s",
                 FAKESUPER_XATTR, strerror(errno));
   }
+}
+
+/* --fake-super replay: read the freshly-stored record and re-apply the source
+ * stat fd-relative.  A privileged (root) run can actually change the owner;
+ * a non-root run silently skips the fchown on EPERM/EACCES (never fatal,
+ * mirroring the normal metadata identity path; other errors are logged) and
+ * still applies mode/mtime where permitted. */
+bool fake_super_restore_fd(int fd) {
+  if (fd < 0)
+    return false;
+  char record[128];
+  ssize_t len = fgetxattr(fd, FAKESUPER_XATTR, record, sizeof(record) - 1);
+  if (len < 0)
+    return false; /* absent or filesystem without xattrs: silent no-op */
+  record[len] = '\0';
+  unsigned long ul_uid, ul_gid, ul_mode;
+  long long mtime_sec;
+  long mtime_nsec;
+  if (sscanf(record, "%lu:%lu:%lo:%lld:%ld", &ul_uid, &ul_gid, &ul_mode, &mtime_sec, &mtime_nsec) !=
+      5)
+    return false; /* malformed record: skip, never fatal */
+
+  /* Owner is applied best-effort only: a non-root process cannot chown and
+     must not abort the transfer for that reason (FastSync identity philosophy).
+     EPERM/EACCES (expected for a non-root receiver) are skipped silently; a
+     genuine EINVAL (an impossible stored id) is logged so the corruption is
+     not hidden. */
+  if (fchown(fd, (uid_t)ul_uid, (gid_t)ul_gid) != 0 && errno != EPERM && errno != EACCES)
+    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore owner on destination file: %s",
+                strerror(errno));
+  /* Mode is applied through the same sanitization the normal metadata path
+     uses (metadata_mode): group/other write bits are never granted, so a
+     recorded source mode of 0666 restores as 0644 — identical to a non-fake-
+     super --preserve run, never a privilege-granting regression. */
+  if (fchmod(fd, (mode_t)(ul_mode & 0777U & ~(S_IWGRP | S_IWOTH))) != 0)
+    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mode on destination file: %s",
+                strerror(errno));
+  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                              {.tv_sec = (time_t)mtime_sec, .tv_nsec = mtime_nsec}};
+  if (futimens(fd, times) != 0)
+    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mtime on destination file: %s",
+                strerror(errno));
+  return true;
 }

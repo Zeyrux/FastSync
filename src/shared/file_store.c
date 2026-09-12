@@ -139,6 +139,44 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
   return true;
 }
 
+/* A run of NUL bytes at least this long is emitted as a hole (lseek) rather
+ * than written, so the resulting file is genuinely sparse on the filesystem. */
+#define SPARSE_HOLE_MIN 4096U
+
+/* Sparse-aware writer (--sparse/-S).  Walks `data`; any all-zero run of at
+ * least SPARSE_HOLE_MIN bytes is skipped with lseek(SEEK_CUR) so the block is
+ * never allocated (a real hole on the destination); every other byte is written
+ * normally.  The file is pre-sized with ftruncate by the callers before this
+ * runs, so holes are guaranteed and the offset bookkeeping stays correct
+ * (each lseek advances the fd offset exactly as a write of that many bytes
+ * would).  After the final run, ftruncate(size) guarantees the logical size is
+ * exactly `size` even when the tail was a hole.  The full file image is in
+ * memory, so no wire change is needed.  Returns false on I/O error. */
+static bool write_all_sparse(int fd, const unsigned char* data, unsigned long long size) {
+  unsigned long long i = 0;
+  while (i < size) {
+    if (data[i] == 0) {
+      unsigned long long run_start = i;
+      while (i < size && data[i] == 0)
+        i++;
+      unsigned long long run_len = i - run_start;
+      if (run_len >= SPARSE_HOLE_MIN) {
+        if (lseek(fd, (off_t)run_len, SEEK_CUR) < 0)
+          return false;
+      } else if (!write_all(fd, data + run_start, run_len)) {
+        return false;
+      }
+    } else {
+      unsigned long long run_start = i;
+      while (i < size && data[i] != 0)
+        i++;
+      if (!write_all(fd, data + run_start, i - run_start))
+        return false;
+    }
+  }
+  return ftruncate(fd, (off_t)size) == 0;
+}
+
 bool file_store_write_secure(const char* path, const void* data, unsigned long long data_size,
                              bool inplace, bool sparse, const FileMetadata* metadata,
                              bool preserve_executability) {
@@ -151,8 +189,12 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
   if (inplace) {
     fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (fd >= 0) {
-      if (!sparse || data_size == 0 || ftruncate(fd, (off_t)data_size) == 0)
+      if (sparse && data_size > 0) {
+        if (ftruncate(fd, (off_t)data_size) == 0)
+          ok = write_all_sparse(fd, data, data_size);
+      } else {
         ok = write_all(fd, data, data_size);
+      }
       if (ok && metadata)
         ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
     }
@@ -177,7 +219,8 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
       if (sparse && data_size > 0)
         ok = ftruncate(fd, (off_t)data_size) == 0;
       if (ok || (!sparse || data_size == 0))
-        ok = write_all(fd, data, data_size);
+        ok = (sparse && data_size > 0) ? write_all_sparse(fd, (const unsigned char*)data, data_size)
+                                       : write_all(fd, data, data_size);
       if (ok && metadata)
         ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
       if (close(fd) != 0)

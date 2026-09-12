@@ -36,6 +36,44 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
   return true;
 }
 
+/* A run of NUL bytes at least this long is emitted as a hole (lseek) rather
+ * than written, so the resulting file is genuinely sparse on the filesystem. */
+#define SPARSE_HOLE_MIN 4096U
+
+/* Sparse-aware writer (--sparse/-S).  Walks `data`; any all-zero run of at
+ * least SPARSE_HOLE_MIN bytes is skipped with lseek(SEEK_CUR) so the block is
+ * never allocated (a real hole on the destination); every other byte is written
+ * normally.  The file is pre-sized with ftruncate by the callers before this
+ * runs, so holes are guaranteed and the offset bookkeeping stays correct
+ * (each lseek advances the fd offset exactly as a write of that many bytes
+ * would).  After the final run, ftruncate(size) guarantees the logical size is
+ * exactly `size` even when the tail was a hole.  The full file image is in
+ * memory, so no wire change is needed.  Returns false on I/O error. */
+static bool write_all_sparse(int fd, const unsigned char* data, unsigned long long size) {
+  unsigned long long i = 0;
+  while (i < size) {
+    if (data[i] == 0) {
+      unsigned long long run_start = i;
+      while (i < size && data[i] == 0)
+        i++;
+      unsigned long long run_len = i - run_start;
+      if (run_len >= SPARSE_HOLE_MIN) {
+        if (lseek(fd, (off_t)run_len, SEEK_CUR) < 0)
+          return false;
+      } else if (!write_all(fd, data + run_start, run_len)) {
+        return false;
+      }
+    } else {
+      unsigned long long run_start = i;
+      while (i < size && data[i] != 0)
+        i++;
+      if (!write_all(fd, data + run_start, i - run_start))
+        return false;
+    }
+  }
+  return ftruncate(fd, (off_t)size) == 0;
+}
+
 /* Preallocate `size` bytes on `fd` before any data is written (--preallocate).
  * posix_fallocate reserves real disk blocks, so an out-of-space condition
  * (ENOSPC/EDQUOT) surfaces up front instead of partway through a transfer;
@@ -805,9 +843,15 @@ int file_open_private_dir(const char* dir_path) {
 static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXattrList* xattrs,
                              bool fake_super) {
   xattr_apply_fd(fd, xattrs);
-  if (fake_super && metadata)
+  if (fake_super && metadata) {
     fake_super_store_fd(fd, (uint32_t)metadata->uid, (uint32_t)metadata->gid,
                         (uint32_t)metadata->mode, metadata->mtime_sec, metadata->mtime_nsec);
+    /* Replay: re-apply the recorded uid/gid/mode/mtime fd-relative so a save
+       under --fake-super restores the attrs (when privileged) instead of only
+       recording them.  Best-effort; fake_super_restore_fd silently skips a
+       non-root fchown EPERM/EACCES and never fatal. */
+    fake_super_restore_fd(fd);
+  }
 }
 
 static bool file_to_disk_secure_impl(const char* path, const void* data,
@@ -815,7 +859,8 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                                      bool preallocate, const FileMetadata* metadata,
                                      bool preserve_executability, bool update, bool no_replace,
                                      bool use_fsync, const char* temp_dir,
-                                     const FileXattrList* xattrs, bool fake_super) {
+                                     const FileXattrList* xattrs, bool fake_super,
+                                     bool keep_partial) {
   char* leaf = NULL;
   int dirfd = file_open_secure_parent(path, &leaf, true);
   if (dirfd < 0)
@@ -837,9 +882,12 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
         ok = true;
       } else {
         /* Preallocate the expected payload size before writing so an
-           out-of-space condition fails cleanly up front (--preallocate). */
+           out-of-space condition fails cleanly up front (--preallocate).
+           --sparse takes precedence: posix_fallocate would allocate every
+           block, defeating the holes the sparse writer would create, so the
+           two never combine here (the ftruncate presize below stays). */
         int prealloc_rc = 0;
-        if (preallocate && data_size > 0) {
+        if (preallocate && !sparse && data_size > 0) {
           prealloc_rc = preallocate_fd(fd, data_size);
           if (prealloc_rc != 0)
             log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
@@ -852,7 +900,9 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
           if (sparse && data_size > 0)
             ok = ftruncate(fd, (off_t)data_size) == 0;
           if (ok || !sparse || data_size == 0)
-            ok = write_all(fd, data, data_size);
+            ok = sparse && data_size > 0
+                     ? write_all_sparse(fd, (const unsigned char*)data, data_size)
+                     : write_all(fd, data, data_size);
           if (ok)
             ok = ftruncate(fd, (off_t)data_size) == 0;
           /* Normalize the mode: apply the metadata-derived safe mode when the
@@ -875,6 +925,10 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
   } else {
     /* The --update newer-destination check runs first so a skipped file never
        creates an empty scratch directory behind it. */
+    /* True once the temp is being written: distinguishes a mid-write/metadata/
+       install failure (partial data may exist, --partial may retain it) from a
+       pre-write validation failure (nothing to retain). */
+    bool write_attempted = false;
     if (update && metadata) {
       /* This check protects the normal atomic path as far as possible.  A
          concurrent replacement can still occur before the final rename. */
@@ -940,7 +994,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (fd < 0)
         continue; /* EEXIST (or a transient open error): try a fresh name. */
       int prealloc_rc = 0;
-      if (preallocate && data_size > 0) {
+      if (preallocate && !sparse && data_size > 0) {
         prealloc_rc = preallocate_fd(fd, data_size);
         if (prealloc_rc != 0)
           log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
@@ -950,8 +1004,14 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
         lseek(fd, 0, SEEK_SET);
         if (sparse && data_size > 0)
           ok = ftruncate(fd, (off_t)data_size) == 0;
-        if (ok || (!sparse || data_size == 0))
-          ok = write_all(fd, data, data_size);
+        /* A real write attempt begins here (the ftruncate presize succeeded or
+           no presize applies): a later mid-write / metadata / fsync / install
+           failure may leave partial data that --partial retention can rename. */
+        if (ok || (!sparse || data_size == 0)) {
+          write_attempted = true;
+          ok = sparse && data_size > 0 ? write_all_sparse(fd, (const unsigned char*)data, data_size)
+                                       : write_all(fd, data, data_size);
+        }
         if (ok && metadata)
           ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
         if (ok)
@@ -986,8 +1046,21 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
           ok = false;
         }
       }
-      if (!ok)
-        unlinkat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, 0);
+      if (!ok) {
+        /* --partial retention (best-effort): on a failure that happened after
+           the temp held data (mid-write / metadata / fsync / install error),
+           keep the already-written temp at the final destination path instead
+           of unlinking it, so a later --append / --append-verify run can resume.
+           This only ever renames the already-written temp (never a corrupt
+           blend); the rename can fail (cross-device, permissions) and we then
+           fall through to the normal unlink cleanup.  Never retains when
+           keep_partial is off, when nothing was actually written, or under
+           --ignore-existing/--existing (no_replace), where the destination is
+           not ours to overwrite. */
+        if (!keep_partial || !write_attempted || no_replace ||
+            renameat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, dirfd, leaf) != 0)
+          unlinkat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, 0);
+      }
       /* Once the temp fd was created the outcome is permanent: a write,
          metadata, fsync, close, linkat or renameat failure will not be fixed
          by retrying under a fresh name, so stop here.  Only the open-failure
@@ -1010,7 +1083,7 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
                          bool preserve_executability, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   preserve_executability, false, false, false, temp_dir, NULL,
-                                  false);
+                                  false, false);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
@@ -1018,7 +1091,7 @@ bool file_to_disk_secure_update(const char* path, const void* data, unsigned lon
                                 const FileMetadata* metadata, bool preserve_executability,
                                 const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, true, false, false, temp_dir, NULL,
+                                  preserve_executability, true, false, false, temp_dir, NULL, false,
                                   false);
 }
 
@@ -1029,7 +1102,7 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   preserve_executability, false, false, use_fsync, temp_dir, NULL,
-                                  false);
+                                  false, false);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
@@ -1037,22 +1110,24 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     const FileMetadata* metadata, bool preserve_executability,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
-                                  preserve_executability, false, true, false, temp_dir, NULL,
+                                  preserve_executability, false, true, false, temp_dir, NULL, false,
                                   false);
 }
 
 /* Receiver write-path variant that also applies the per-file xattrs (-X/-A)
  * and, under --fake-super, parks the source stat in the reserved xattr, on the
  * just-written file descriptor before the final rename.  `no_replace` / `update`
- * mirror the plain wrappers; see file_to_disk_secure_impl for the semantics. */
+ * mirror the plain wrappers; `keep_partial` enables --partial retention of a
+ * failed write's temp.  See file_to_disk_secure_impl for the semantics. */
 bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
                                bool inplace, bool sparse, bool preallocate,
                                const FileMetadata* metadata, bool preserve_executability,
                                bool update, bool no_replace, bool use_fsync,
-                               const FileXattrList* xattrs, bool fake_super, const char* temp_dir) {
+                               const FileXattrList* xattrs, bool fake_super, bool keep_partial,
+                               const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   preserve_executability, update, no_replace, use_fsync, temp_dir,
-                                  xattrs, fake_super);
+                                  xattrs, fake_super, keep_partial);
 }
 
 /* Atomic --link-dest install.  The destination is replaced (via a temporary
@@ -1155,7 +1230,7 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
        by the filesystem).  Write a byte-identical local copy instead. */
     return file_to_disk_secure_attrs(path, data, data_size, false, false, preallocate, metadata,
                                      preserve_executability, false, false, use_fsync, xattrs,
-                                     fake_super, temp_dir);
+                                     fake_super, false, temp_dir);
   }
 
   if (scratch_dirfd >= 0)

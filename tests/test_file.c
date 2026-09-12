@@ -1,5 +1,9 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* SEEK_HOLE/SEEK_DATA for the sparse-hole sparseness check */
+#endif
 #include "test_file.h"
 #include "file.h"
+#include "file_store.h"
 #include "data.h"
 #include "config.h"
 #include "utils.h"
@@ -1216,6 +1220,119 @@ void test_trust_sender() {
   file_set_authorized_root(-1, NULL);
 }
 
+/* --sparse/-S hole preservation: a buffer with a long zero run written via
+ * file_store_write_secure(sparse=true) must round-trip its content exactly and
+ * have the right logical size, and should additionally be genuinely sparse on
+ * filesystems that support holes.  The sparseness assertion is tolerant: if the
+ * filesystem reports no holes (SEEK_HOLE/SEEK_DATA -> ENXIO) we skip the strict
+ * block-count check, but content and size always hold. */
+static void test_file_write_to_disk_sparse_preserves_holes() {
+  const char* path = "test_sparse_file.bin";
+  unlink(path);
+  /* 256 KiB with a 128 KiB zero run in the middle, bracketed by headers/tails. */
+  const unsigned long long size = 256u * 1024u;
+  unsigned char* buf = malloc(size);
+  EXPECT_NOT_NULL(buf);
+  /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_NOT_NULL above asserts,
+     but cppcheck cannot see through the macro; the guard is defensive. */
+  if (!buf)
+    return;
+  memset(buf, 0, size);
+  for (unsigned long long i = 0; i < 4096; i++) {
+    buf[i] = (unsigned char)(i % 251);
+    buf[size - 1 - i] = (unsigned char)((i * 7) % 253);
+  }
+
+  EXPECT_TRUE(file_store_write_secure(path, buf, size, false, true, NULL, false));
+
+  /* Logical size must equal data_size exactly. */
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, (int)size);
+
+  /* Content must round-trip exactly: the full readback must equal the original
+     buffer byte-for-byte (header, the hole region staying zero, and tail) —
+     a writer bug in the lseek-offset bookkeeping would show up here. */
+  int fd = open(path, O_RDONLY);
+  EXPECT_TRUE(fd >= 0);
+  /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_TRUE above asserts,
+     but cppcheck cannot see through the macro; the guard is defensive. */
+  if (fd >= 0) {
+    unsigned char* readback = malloc(size);
+    if (readback) {
+      unsigned long long got = 0;
+      while (got < size) {
+        ssize_t n = read(fd, readback + got, (size_t)(size - got));
+        if (n <= 0)
+          break;
+        got += (unsigned long long)n;
+      }
+      EXPECT_EQ_INT((int)got, (int)size);
+      if (got == size)
+        EXPECT_EQ_INT(memcmp(readback, buf, size), 0);
+      free(readback);
+    }
+    /* Tolerant sparseness check: seek for holes; skip if unsupported. */
+    off_t hole_off = lseek(fd, (off_t)4096, SEEK_HOLE);
+    if (hole_off >= 0 && hole_off < (off_t)size) {
+      off_t next_data = lseek(fd, hole_off, SEEK_DATA);
+      fstat(fd, &st);
+      int blocks = (int)(st.st_blocks * 512);
+      if (next_data > hole_off)
+        EXPECT_TRUE(blocks < (int)size);
+    }
+    close(fd);
+  }
+  free(buf);
+  unlink(path);
+}
+
+/* --partial retention is hard to provoke end-to-end mid-transfer (the whole
+ * image is in one in-memory write), so this drives the failure path directly:
+ * a metadata whose mtime_nsec is out of the legal [0,999999999] range makes
+ * futimens (in file_restore_metadata_fd) fail with EINVAL AFTER the temp has
+ * been fully written.  With keep_partial=true the written temp must be renamed
+ * to the destination path (a resumable partial); with keep_partial=false the
+ * same failure must leave NOTHING behind.  The retention is always best-effort
+ * (never a corrupt blend), and this asserts the both-on/off behavior. */
+static void test_file_write_to_disk_partial_retention() {
+  const char* path = "test_partial_retention.bin";
+  unlink(path);
+  const char content[] = "partial-retention payload";
+  FileMetadata m;
+  memset(&m, 0, sizeof(m));
+  m.mode = 0644;
+  m.uid = (uid_t)geteuid();
+  m.gid = (gid_t)getegid();
+  m.mtime_sec = 1700000000;
+  m.mtime_nsec = 2000000000; /* invalid: forces futimens EINVAL after the write */
+  m.atime_valid = false;
+  m.crtime_valid = false;
+  bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m, false,
+                                      false, false, false, NULL, false, true, NULL);
+  EXPECT_FALSE(ok); /* the write itself succeeded, but metadata restore failed */
+  /* Retained: the already-written temp now sits at the destination path. */
+  int fd = open(path, O_RDONLY);
+  EXPECT_TRUE(fd >= 0);
+  /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_TRUE above asserts,
+     but cppcheck cannot see through the macro; the guard is defensive. */
+  if (fd >= 0) {
+    char buf[64];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    EXPECT_EQ_INT((int)strlen(content), (int)n);
+    if (n == (ssize_t)strlen(content))
+      EXPECT_TRUE(memcmp(buf, content, strlen(content)) == 0);
+  }
+  unlink(path);
+
+  /* Same failure with keep_partial=false: temp is unlinked, nothing retained. */
+  ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m, false,
+                                 false, false, false, NULL, false, false, NULL);
+  EXPECT_FALSE(ok);
+  EXPECT_TRUE(access(path, F_OK) == -1);
+}
+
 void test_file() {
   test_file_create();
   test_file_special_rdev_valid();
@@ -1230,6 +1347,8 @@ void test_file() {
   test_file_save_to_disk_ignore_existing_entry_types();
   test_file_save_to_disk_partial_install();
   test_file_save_to_disk_reports_skips();
+  test_file_write_to_disk_sparse_preserves_holes();
+  test_file_write_to_disk_partial_retention();
   test_file_write_to_disk_basic();
   test_file_write_to_disk_with_fsync();
   test_file_write_to_disk_preallocate_atomic();

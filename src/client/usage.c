@@ -140,8 +140,8 @@ void print_usage(void) {
   printf("                    --incremental and --delta; inert with --whole-file,\n");
   printf("                    --no-delta, or --no-incremental)\n");
   printf("  --no-fuzzy          Disable --fuzzy\n");
-  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
-         DELTA_BLOCK_SIZE_DEFAULT);
+  printf("  --delta-block <n>, --block-size <n>\n");
+  printf("                    Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
          DELTA_MAX_FILE_SIZE);
   printf("  -j, --threads       Enable multithreading\n");
@@ -165,9 +165,9 @@ void print_usage(void) {
   printf("                      setting an ACL the receiver is not permitted to\n");
   printf("                      set is warned and skipped, never fatal)\n");
   printf("  --fake-super        Store the source uid/gid/mode/mtime in a reserved\n");
-  printf("                      user.fastsync.stat xattr on each written file instead\n");
-  printf("                      of applying ownership (for a later privileged restore);\n");
-  printf("                      partial: full rsync fake-super replay is out of scope\n");
+  printf("                      user.fastsync.stat xattr on each written file and\n");
+  printf("                      re-apply it (fd-relative) on a privileged run; the\n");
+  printf("                      recording format diverges from rsync's user.rsync.%%stat%%\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
   printf("  --numeric-ids       Do not map uid/gid by name: use the source numeric\n");
   printf("                      ids directly when applying ownership\n");
