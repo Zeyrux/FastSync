@@ -73,8 +73,10 @@ typedef struct ModuleGateContext {
  * 2.19.0).  Sends STATUS_AUTH_CHALLENGE (iteration count, base64 salt, base64
  * server nonce), expects STATUS_AUTH_RESPONSE (base64 client nonce, base64
  * ClientProof), verifies the proof constant-time and answers STATUS_AUTH_OK
- * with the base64 ServerSignature.  On any failure it sends exactly one generic
- * STATUS_AUTH_FAILED and returns false.  The verifier for an unknown/off-list
+ * with the base64 ServerSignature.  On any failure BEFORE the success response
+ * it sends exactly one generic STATUS_AUTH_FAILED and returns false; a failure
+ * while writing the success signature cannot send a status and just drops an
+ * already-broken connection.  The verifier for an unknown/off-list
  * user is a dummy (deterministic per-username salt, store-wide iterations, dummy
  * keys, found=false) so the same math runs and no user-enumeration/timing oracle
  * is exposed. */
@@ -368,9 +370,10 @@ static const char* server_module_gate(const Config* config, void* context) {
     /* Auth-required module (A7, protocol 2.19.0): run the SCRAM challenge/
      * response BEFORE the module root is installed and before any data moves.
      * Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR);
-     * a failed handshake writes exactly one STATUS_AUTH_FAILED (on every
-     * failure path) before signalling ALREADY_TERMINATED.  The username may be
-     * logged (never the password or any derived proof). */
+     * a handshake that fails before the success response writes exactly one
+     * STATUS_AUTH_FAILED before signalling ALREADY_TERMINATED (a failure while
+     * writing the success signature instead just drops the broken connection).
+     * The username may be logged (never the password or any derived proof). */
     if (g_credentials == NULL) {
       log_message(LOG_LEVEL_ERROR,
                   "daemon module '%s' requires authentication but no credential store is "

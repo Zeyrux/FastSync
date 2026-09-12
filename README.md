@@ -522,7 +522,11 @@ deterministic per-username dummy challenge, so probing the daemon cannot
 enumerate users. Store lines are generated with
 `fastsync-server --hash-credentials <plaintext-file>` (see `RSYNC_COMPAT.md`);
 redirect that output to an owner-only (mode 0600) file, and note that legacy
-`user:SHA256HEX` stores are rejected.
+`user:SHA256HEX` stores are rejected. Two residuals are accepted: the dummy salt
+is stable within one daemon lifetime but changes across restarts, so a
+restart-gated enumeration channel remains (persisting a dummy key is out of
+scope); and the store iteration count is observable pre-auth by design, since
+the miss path must match a hit.
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not

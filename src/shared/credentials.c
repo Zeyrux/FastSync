@@ -658,6 +658,9 @@ void credentials_free(CredentialStore* store) {
     credentials_burn((char*)store->entries[i].server_key, CREDENTIAL_KEY_LEN);
     free(store->entries[i].user);
   }
+  /* The store-wide dummy key is secret (it shapes the miss challenge), so wipe
+   * it before releasing the store. */
+  credentials_burn((char*)store->dummy_key, sizeof(store->dummy_key));
   free(store->entries);
   free(store);
 }
@@ -716,28 +719,30 @@ bool credentials_get_verifier(const CredentialStore* store, const char* user,
    * reached in production) falls back to the all-zero static key. */
   const uint8_t* dummy_key = store ? store->dummy_key : k_dummy_stored_key;
   uint8_t mac[CREDENTIAL_KEY_LEN];
-  if (!hmac_sha256(dummy_key, CREDENTIAL_KEY_LEN, (const uint8_t*)uname, strlen(uname), mac))
+  if (!hmac_sha256(dummy_key, CREDENTIAL_KEY_LEN, (const uint8_t*)uname, strlen(uname), mac)) {
+    credentials_burn((char*)mac, sizeof(mac));
     return false;
+  }
   memcpy(out->salt, mac, CREDENTIAL_SALT_LEN);
   credentials_burn((char*)mac, sizeof(mac));
-  if (!store || !user || n < 0)
-    return true;
   /* Module-list membership: constant-time full scan, no early break, so the
    * list is not a username-enumeration oracle. */
   bool on_list = false;
   for (int i = 0; i < n; i++) {
-    if (module_users && module_users[i] && username_secure_equal(module_users[i], user))
-      on_list = true;
+    const char* listed = (module_users && user) ? module_users[i] : NULL;
+    on_list |= listed ? username_secure_equal(listed, user) : false;
   }
-  if (!on_list)
-    return true;
-  /* Store lookup is also a constant-time full scan. */
+  /* Store lookup is an unconditional constant-time full scan, executed even for
+   * an off-list user so a probe that is not on the module list still pays the
+   * same O(store) cost as one that is; skipping it would reopen an off-list
+   * timing channel.  The real verifier is selected only when the user is both
+   * on the list and matched in the store. */
   const CredentialEntry* match = NULL;
-  for (int i = 0; i < store->count; i++) {
+  for (int i = 0; store && user && i < store->count; i++) {
     if (username_secure_equal(store->entries[i].user, user))
       match = &store->entries[i];
   }
-  if (match) {
+  if (on_list && match) {
     memcpy(out->salt, match->salt, CREDENTIAL_SALT_LEN);
     out->iters = match->iters;
     memcpy(out->stored_key, match->stored_key, CREDENTIAL_KEY_LEN);
