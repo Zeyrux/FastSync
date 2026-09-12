@@ -1370,6 +1370,123 @@ static void test_dir_time_list() {
   rmdir(root);
 }
 
+/* -K/--keep-dirlinks secure open: with an authorized root, a destination path
+ * component that is a symlink to an IN-ROOT directory is used as that directory
+ * (its referent is opened through a relative O_NOFOLLOW walk from the root fd,
+ * not by re-opening an absolute realpath() result), while a symlink resolving
+ * OUTSIDE the root is rejected.  With -K off, even the in-root link is not
+ * followed. */
+static void test_keep_dirlinks_secure_open_impl() {
+  const char* root = "test_keep_dirlinks_root";
+  const char* real = "test_keep_dirlinks_root/realdir";
+  const char* link = "test_keep_dirlinks_root/linkdir";
+  const char* abslink = "test_keep_dirlinks_root/abslink";
+  const char* escape = "test_keep_dirlinks_root/escape";
+  const char* outside = "test_keep_dirlinks_outside";
+  unlink(link);
+  unlink(abslink);
+  unlink(escape);
+  rmdir(real);
+  rmdir(root);
+  rmdir(outside);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(real, 0755), 0);
+  EXPECT_EQ_INT(mkdir(outside, 0755), 0);
+
+  char root_abs[PATH_MAX];
+  char real_abs[PATH_MAX];
+  char outside_abs[PATH_MAX];
+  EXPECT_NOT_NULL(realpath(root, root_abs));
+  EXPECT_NOT_NULL(realpath(real, real_abs));
+  EXPECT_NOT_NULL(realpath(outside, outside_abs));
+  EXPECT_EQ_INT(symlink("realdir", link), 0);   /* relative, in-root */
+  EXPECT_EQ_INT(symlink(real_abs, abslink), 0); /* absolute, in-root */
+  /* cppcheck-suppress knownConditionTrueFalse */
+  EXPECT_EQ_INT(symlink(outside_abs, escape), 0); /* absolute, outside root */
+
+  int root_fd = open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  EXPECT_TRUE(root_fd >= 0);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (root_fd < 0) {
+    unlink(link);
+    unlink(abslink);
+    unlink(escape);
+    rmdir(real);
+    rmdir(root);
+    rmdir(outside);
+    return;
+  }
+  EXPECT_TRUE(file_set_authorized_root(root_fd, root_abs));
+  file_set_keep_dirlinks(true);
+
+  struct stat real_st;
+  EXPECT_EQ_INT(fstatat(root_fd, "realdir", &real_st, 0), 0);
+
+  /* Relative in-root symlink-to-directory: followed to the referent dir. */
+  char path[PATH_MAX + 64];
+  snprintf(path, sizeof(path), "%s/linkdir/file.txt", root_abs);
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  EXPECT_TRUE(parent_fd >= 0);
+  EXPECT_NOT_NULL(leaf);
+  if (leaf)
+    EXPECT_EQ_STR(leaf, "file.txt");
+  if (parent_fd >= 0) {
+    struct stat st;
+    EXPECT_EQ_INT(fstat(parent_fd, &st), 0);
+    EXPECT_TRUE(st.st_dev == real_st.st_dev && st.st_ino == real_st.st_ino);
+    close(parent_fd);
+  }
+  free(leaf);
+
+  /* Absolute-but-in-root symlink-to-directory is followed the same way. */
+  snprintf(path, sizeof(path), "%s/abslink/file.txt", root_abs);
+  leaf = NULL;
+  parent_fd = file_open_secure_parent(path, &leaf, false);
+  EXPECT_TRUE(parent_fd >= 0);
+  if (parent_fd >= 0) {
+    struct stat st;
+    EXPECT_EQ_INT(fstat(parent_fd, &st), 0);
+    EXPECT_TRUE(st.st_dev == real_st.st_dev && st.st_ino == real_st.st_ino);
+    close(parent_fd);
+  }
+  free(leaf);
+
+  /* A symlink resolving outside the authorized root is rejected. */
+  snprintf(path, sizeof(path), "%s/escape/file.txt", root_abs);
+  leaf = NULL;
+  EXPECT_EQ_INT(file_open_secure_parent(path, &leaf, false), -1);
+  free(leaf);
+
+  /* With -K off the in-root symlink is not followed either. */
+  file_set_keep_dirlinks(false);
+  snprintf(path, sizeof(path), "%s/linkdir/file.txt", root_abs);
+  leaf = NULL;
+  EXPECT_EQ_INT(file_open_secure_parent(path, &leaf, false), -1);
+  free(leaf);
+
+  file_set_keep_dirlinks(false);
+  file_set_authorized_root(-1, NULL);
+  close(root_fd);
+  unlink(link);
+  unlink(abslink);
+  unlink(escape);
+  rmdir(real);
+  rmdir(root);
+  rmdir(outside);
+}
+
+/* Wrapper guarantees the process-wide keep-dirlinks/authorized-root policy is
+ * cleared even when an EXPECT inside the body returns early (a failing EXPECT
+ * returns from its own function, so the body's trailing resets may be skipped). */
+static void test_keep_dirlinks_secure_open() {
+  file_set_authorized_root(-1, NULL);
+  file_set_keep_dirlinks(false);
+  test_keep_dirlinks_secure_open_impl();
+  file_set_authorized_root(-1, NULL);
+  file_set_keep_dirlinks(false);
+}
+
 void test_file() {
   test_file_create();
   test_file_special_rdev_valid();
@@ -1411,6 +1528,7 @@ void test_file() {
   }
   test_file_metadata_create();
   test_dir_time_list();
+  test_keep_dirlinks_secure_open();
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();
   test_inplace_overwrite_truncates_shorter_payload();

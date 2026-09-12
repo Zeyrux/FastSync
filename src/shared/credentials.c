@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* One store entry: a username and its password's SHA-256 hex digest.  The
  * plaintext password never appears here (and never on the daemon host). */
@@ -33,6 +34,23 @@ static void set_error(char* err, size_t err_size, const char* fmt, ...) {
 
 static bool is_comment_char(char c) {
   return c == '#' || c == ';';
+}
+
+/* A --password-file / --early-input carries plaintext or credential material
+ * and must not be accessible to group or other, mirroring the TLS private-key
+ * check in transport_tls.c.  Reject any group/other permission bit (including
+ * execute) with a clear error.  A stat failure is left for the caller's fopen
+ * to report, so a missing file keeps its existing "cannot open" message. */
+static bool secret_file_is_private(const char* path, char* err, size_t err_size) {
+  struct stat st;
+  if (stat(path, &st) != 0)
+    return true;
+  if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    set_error(err, err_size,
+              "refusing to read secret file '%s': permissions must be owner-only (0600)", path);
+    return false;
+  }
+  return true;
 }
 
 /* Trim leading/trailing ASCII space and tab in place; returns the new start. */
@@ -123,6 +141,11 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
   }
   if (!path)
     return store;
+
+  if (!secret_file_is_private(path, err, err_size)) {
+    credentials_free(store);
+    return NULL;
+  }
 
   FILE* fp = fopen(path, "r");
   if (!fp) {
@@ -305,6 +328,8 @@ int credentials_read_secret_file(const char* path, char** user_out, char** passw
     set_error(err, err_size, "no --password-file path");
     return -1;
   }
+  if (!secret_file_is_private(path, err, err_size))
+    return -1;
   FILE* fp = fopen(path, "r");
   if (!fp) {
     set_error(err, err_size, "cannot open password file '%s': %s", path, strerror(errno));

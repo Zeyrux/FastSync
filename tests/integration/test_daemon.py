@@ -66,6 +66,7 @@ def _pw_hash(password):
 def _write_client_password_file(path, user, password):
     with open(path, "w") as f:
         f.write("%s:%s\n" % (user, password))
+    os.chmod(path, 0o600)
     return path
 
 
@@ -164,6 +165,7 @@ def daemon_env():
         f.write("# daemon credential store (Wave B)\n")
         f.write("alice:%s\n" % _pw_hash(ALICE_PASS))
         f.write("bob:%s\n" % _pw_hash(BOB_PASS))
+    os.chmod(CRED_FILE, 0o600)
 
     # The config's port is a free port chosen per worker; the `daemon` fixture
     # boots on it (the config-port path) and the --dparam override test boots a
@@ -582,6 +584,7 @@ class TestDaemonAuthentication:
         cred_path = os.path.join(TEST_DATA_DIR, "client_empty.pw")
         with open(cred_path, "w") as f:
             f.write("# nothing here\n")
+        os.chmod(cred_path, 0o600)
         try:
             cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR,
                                 "--dest-dir", "127.0.0.1::files",

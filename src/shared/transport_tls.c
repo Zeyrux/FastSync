@@ -48,6 +48,15 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     return NULL;
   }
 
+  /* Harden the context: never negotiate TLS compression (the CRIME attack
+   * vector) and never honour a post-handshake renegotiation request.
+   * SSL_OP_NO_RENEGOTIATION is only available from OpenSSL 1.1.1, so it is
+   * guarded to keep older headers building. */
+  SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+#ifdef SSL_OP_NO_RENEGOTIATION
+  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+#endif
+
   if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
     SSL_CTX_free(ctx);
     return NULL;

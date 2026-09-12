@@ -3,6 +3,7 @@
 #include "test_utils.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
+#include <openssl/ssl.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -17,6 +18,12 @@ static void test_server_create_tls_without_certs() {
   bool ok = server_create_tls(s, NULL, NULL, NULL);
   EXPECT_TRUE(ok);
   EXPECT_NOT_NULL(s->ssl_ctx);
+  /* The context must disable TLS compression (CRIME) and renegotiation. */
+  SSL_CTX* ctx = (SSL_CTX*)s->ssl_ctx;
+  EXPECT_TRUE((SSL_CTX_get_options(ctx) & SSL_OP_NO_COMPRESSION) != 0);
+#ifdef SSL_OP_NO_RENEGOTIATION
+  EXPECT_TRUE((SSL_CTX_get_options(ctx) & SSL_OP_NO_RENEGOTIATION) != 0);
+#endif
   server_delete(&s);
   EXPECT_NULL(s);
 }
