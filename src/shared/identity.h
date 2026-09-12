@@ -67,8 +67,13 @@ bool identity_copy_as_active(void);
 /* Receiver-side snapshot of the negotiated identity config.  The server calls
  * identity_set_active() once per connection (before any file write) using the
  * config received over the wire; the snapshot is a deep copy so the caller may
- * free its Config immediately.  identity_clear_active() releases it. */
-void identity_set_active(const Config* config);
+ * free its Config immediately.  identity_clear_active() releases it.
+ *
+ * Returns true on success.  On an allocation failure while deep-copying a
+ * requested usermap/groupmap it logs a LOG_LEVEL_ERROR, leaves the snapshot
+ * cleared (never a partial/wrong policy) and returns false; the caller must
+ * refuse the connection. */
+bool identity_set_active(const Config* config);
 void identity_clear_active(void);
 
 /* True when any ownership-affecting identity option is present in the active

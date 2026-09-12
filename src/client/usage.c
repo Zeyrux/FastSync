@@ -246,8 +246,8 @@ void print_usage(void) {
   printf("  -T, --temp-dir <dir>  Scratch dir for temp files before atomic install\n");
   printf("  --fastsync-server-path <path>\n");
   printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
-  printf(
-      "  --old-args          Disable safe SSH command argument quoting (legacy compatibility)\n");
+  printf("  --old-args          Accepted for rsync CLI compatibility; no effect (the\n");
+  printf("                      remote server path is always safely quoted now)\n");
   printf("  -M, --remote-option=OPT  Append OPT to the REMOTE server invocation over SSH\n");
   printf("                      (repeatable; each value is single-quote-escaped on the remote\n");
   printf("                      command line; empty values and values with control characters\n");

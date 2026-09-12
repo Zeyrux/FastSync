@@ -430,10 +430,14 @@ static bool protocol_send_str_impl(ProtocolSession* session, const char* data, b
     return false;
   if (!protocol_send_n_data(session, data, size))
     return false;
-  if (redact)
+  if (redact) {
     log_debug_message(LOG_DEBUG_PROTO, "Send String: <redacted>");
-  else
-    log_debug_message(LOG_DEBUG_PROTO, "Send String: %s", data);
+  } else {
+    char* escaped_data = output_escape(data, log_get_8_bit_output());
+    log_debug_message(LOG_DEBUG_PROTO, "Send String: %s",
+                      escaped_data ? escaped_data : "<allocation failed>");
+    free(escaped_data);
+  }
   return true;
 }
 
@@ -459,10 +463,14 @@ static char* protocol_receive_str_impl(ProtocolSession* session, bool redact) {
     return NULL;
   }
   data[size] = '\0';
-  if (redact)
+  if (redact) {
     log_debug_message(LOG_DEBUG_PROTO, "Received String: <redacted>");
-  else
-    log_debug_message(LOG_DEBUG_PROTO, "Received String: %s", data);
+  } else {
+    char* escaped_data = output_escape(data, log_get_8_bit_output());
+    log_debug_message(LOG_DEBUG_PROTO, "Received String: %s",
+                      escaped_data ? escaped_data : "<allocation failed>");
+    free(escaped_data);
+  }
   return data;
 }
 

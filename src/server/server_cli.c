@@ -64,6 +64,7 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
   server_cli_options_default(opts);
 
   for (int i = 1; i < argc; i++) {
+    const char* inline_value = NULL;
     if (arg_is(argv[i], "--help")) {
       opts->show_help = true;
       return 1;
@@ -108,18 +109,24 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       }
       opts->destination_root = argv[++i];
       opts->destination_root_set = true;
-    } else if (arg_is(argv[i], "--password-file")) {
-      if (i + 1 >= argc) {
-        set_error(err, err_size, "missing argument for --password-file");
-        return -1;
+    } else if (arg_has_value(argv[i], "--password-file", &inline_value)) {
+      if (!inline_value) {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for --password-file");
+          return -1;
+        }
+        inline_value = argv[++i];
       }
-      opts->password_file = argv[++i];
-    } else if (arg_is(argv[i], "--early-input")) {
-      if (i + 1 >= argc) {
-        set_error(err, err_size, "missing argument for --early-input");
-        return -1;
+      opts->password_file = inline_value;
+    } else if (arg_has_value(argv[i], "--early-input", &inline_value)) {
+      if (!inline_value) {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for --early-input");
+          return -1;
+        }
+        inline_value = argv[++i];
       }
-      opts->early_input_file = argv[++i];
+      opts->early_input_file = inline_value;
     } else if (arg_is(argv[i], "--address")) {
       if (i + 1 >= argc) {
         set_error(err, err_size, "missing argument for --address");
@@ -146,12 +153,15 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       opts->no_super = true;
     } else if (arg_is(argv[i], "--allow-unauthenticated")) {
       opts->allow_unauthenticated = true;
-    } else if (arg_is(argv[i], "--iconv")) {
-      if (i + 1 >= argc) {
-        set_error(err, err_size, "missing argument for --iconv");
-        return -1;
+    } else if (arg_has_value(argv[i], "--iconv", &inline_value)) {
+      if (!inline_value) {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for --iconv");
+          return -1;
+        }
+        inline_value = argv[++i];
       }
-      opts->iconv_spec = argv[++i];
+      opts->iconv_spec = inline_value;
     } else if (arg_is(argv[i], "-p")) {
       if (i + 1 >= argc) {
         set_error(err, err_size, "missing argument for -p");
@@ -161,7 +171,6 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       if (parse_port_arg(argv[++i], &opts->port, err, err_size) != 0)
         return -1;
     } else {
-      const char* inline_value = NULL;
       if (arg_has_value(argv[i], "--config", &inline_value)) {
         if (!inline_value) {
           if (i + 1 >= argc) {
@@ -171,33 +180,6 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
           inline_value = argv[++i];
         }
         opts->config_path = inline_value;
-      } else if (arg_has_value(argv[i], "--password-file", &inline_value)) {
-        if (!inline_value) {
-          if (i + 1 >= argc) {
-            set_error(err, err_size, "missing argument for --password-file");
-            return -1;
-          }
-          inline_value = argv[++i];
-        }
-        opts->password_file = inline_value;
-      } else if (arg_has_value(argv[i], "--early-input", &inline_value)) {
-        if (!inline_value) {
-          if (i + 1 >= argc) {
-            set_error(err, err_size, "missing argument for --early-input");
-            return -1;
-          }
-          inline_value = argv[++i];
-        }
-        opts->early_input_file = inline_value;
-      } else if (arg_has_value(argv[i], "--iconv", &inline_value)) {
-        if (!inline_value) {
-          if (i + 1 >= argc) {
-            set_error(err, err_size, "missing argument for --iconv");
-            return -1;
-          }
-          inline_value = argv[++i];
-        }
-        opts->iconv_spec = inline_value;
       } else if (arg_has_value(argv[i], "--dparam", &inline_value)) {
         if (!inline_value) {
           if (i + 1 >= argc) {

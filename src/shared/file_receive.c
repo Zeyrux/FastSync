@@ -350,7 +350,10 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   }
   if (is_sock) {
     /* No standard filesystem call recreates a socket; best-effort unsupported. */
-    log_message(LOG_LEVEL_WARNING, "socket not recreated: %s (unsupported; skipped)", file->path);
+    char* escaped_path = output_escape(file->path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "socket not recreated: %s (unsupported; skipped)",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
     return FILE_SAVE_SKIPPED;
   }
   if (is_char || is_blk) {
@@ -363,9 +366,11 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
        so the policy does not depend on a prior identity_set_active().  Pure
        FIFO creation is unprivileged and deliberately NOT gated here. */
     if (!privilege_super_mode_permitted(config->super_mode)) {
+      char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: super-user device-node creation is not permitted on this receiver",
-                  file->path);
+                  escaped_path ? escaped_path : "<allocation failed>");
+      free(escaped_path);
       return FILE_SAVE_SKIPPED;
     }
   } else if (is_fifo) {
@@ -438,18 +443,26 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
         free(destination);
         return FILE_SAVE_SKIPPED;
       }
+      char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING, "refusing to replace existing entry with %s: %s (skipped)",
-                  is_fifo ? "FIFO" : "device", file->path);
+                  is_fifo ? "FIFO" : "device", escaped_path ? escaped_path : "<allocation failed>");
+      free(escaped_path);
     } else if (errno == EPERM || errno == EACCES) {
       /* Missing CAP_MKNOD / parent write permission: the environment cannot
          create the node, so skip instead of failing the whole run. */
+      char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: cannot create %s node (%s)\n"
                   "  --devices/--specials node creation needs privilege (CAP_MKNOD)",
-                  file->path, is_fifo ? "FIFO" : "device", strerror(errno));
+                  escaped_path ? escaped_path : "<allocation failed>", is_fifo ? "FIFO" : "device",
+                  strerror(errno));
+      free(escaped_path);
     } else {
+      char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING, "failed to create %s %s: %s (skipped)",
-                  is_fifo ? "FIFO" : "device", file->path, strerror(errno));
+                  is_fifo ? "FIFO" : "device", escaped_path ? escaped_path : "<allocation failed>",
+                  strerror(errno));
+      free(escaped_path);
     }
     close(parent_fd);
     free(leaf);
@@ -512,22 +525,28 @@ static FileSaveResult file_save_write_device(const char* root_directory, const F
   close(parent_fd);
   if (fd < 0) {
     free(destination);
+    char* escaped_path = output_escape(file->path, log_get_8_bit_output());
+    const char* shown_path = escaped_path ? escaped_path : "<allocation failed>";
     if (saved_errno == ENXIO || saved_errno == EAGAIN) {
       /* A FIFO with no reader / an unreadable special: skip like every other
          unusable write-devices target instead of blocking or failing. */
-      log_message(LOG_LEVEL_WARNING, "write-devices: %s not writable (%s); skipped", file->path,
+      log_message(LOG_LEVEL_WARNING, "write-devices: %s not writable (%s); skipped", shown_path,
                   strerror(saved_errno));
     } else {
-      log_message(LOG_LEVEL_WARNING, "write-devices: cannot open %s (%s); skipped", file->path,
+      log_message(LOG_LEVEL_WARNING, "write-devices: cannot open %s (%s); skipped", shown_path,
                   strerror(saved_errno));
     }
+    free(escaped_path);
     return FILE_SAVE_SKIPPED;
   }
   struct stat st;
   if (fstat(fd, &st) != 0 || !(S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {
     close(fd);
     free(destination);
-    log_message(LOG_LEVEL_WARNING, "write-devices: %s is not a device node; skipped", file->path);
+    char* escaped_path = output_escape(file->path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "write-devices: %s is not a device node; skipped",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
     return FILE_SAVE_SKIPPED;
   }
   bool ok = true;
@@ -596,10 +615,12 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      open below keeps its own confinement and best-effort skip semantics). */
   if (config && config->write_devices) {
     if (!privilege_super_mode_permitted(config->super_mode)) {
+      char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "write-devices: %s skipped: super-user activities are not permitted on this "
                   "receiver",
-                  file->path ? file->path : "(null)");
+                  escaped_path ? escaped_path : "(null)");
+      free(escaped_path);
       return FILE_SAVE_SKIPPED;
     }
     return file_save_write_device(root_directory, file);

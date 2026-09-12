@@ -152,7 +152,7 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
  * would).  After the final run, ftruncate(size) guarantees the logical size is
  * exactly `size` even when the tail was a hole.  The full file image is in
  * memory, so no wire change is needed.  Returns false on I/O error. */
-static bool write_all_sparse(int fd, const unsigned char* data, unsigned long long size) {
+bool file_store_write_sparse(int fd, const unsigned char* data, unsigned long long size) {
   unsigned long long i = 0;
   while (i < size) {
     if (data[i] == 0) {
@@ -191,7 +191,7 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
     if (fd >= 0) {
       if (sparse && data_size > 0) {
         if (ftruncate(fd, (off_t)data_size) == 0)
-          ok = write_all_sparse(fd, data, data_size);
+          ok = file_store_write_sparse(fd, data, data_size);
       } else {
         ok = write_all(fd, data, data_size);
       }
@@ -219,8 +219,9 @@ bool file_store_write_secure(const char* path, const void* data, unsigned long l
       if (sparse && data_size > 0)
         ok = ftruncate(fd, (off_t)data_size) == 0;
       if (ok || (!sparse || data_size == 0))
-        ok = (sparse && data_size > 0) ? write_all_sparse(fd, (const unsigned char*)data, data_size)
-                                       : write_all(fd, data, data_size);
+        ok = (sparse && data_size > 0)
+                 ? file_store_write_sparse(fd, (const unsigned char*)data, data_size)
+                 : write_all(fd, data, data_size);
       if (ok && metadata)
         ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
       if (close(fd) != 0)

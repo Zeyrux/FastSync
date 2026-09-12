@@ -16,6 +16,7 @@
 #include "data.h"
 #include "delta.h"
 #include "file.h"
+#include "file_store.h"
 #include "identity.h"
 #include "log.h"
 #include "metadata.h"
@@ -35,44 +36,6 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
     done += (unsigned long long)n;
   }
   return true;
-}
-
-/* A run of NUL bytes at least this long is emitted as a hole (lseek) rather
- * than written, so the resulting file is genuinely sparse on the filesystem. */
-#define SPARSE_HOLE_MIN 4096U
-
-/* Sparse-aware writer (--sparse/-S).  Walks `data`; any all-zero run of at
- * least SPARSE_HOLE_MIN bytes is skipped with lseek(SEEK_CUR) so the block is
- * never allocated (a real hole on the destination); every other byte is written
- * normally.  The file is pre-sized with ftruncate by the callers before this
- * runs, so holes are guaranteed and the offset bookkeeping stays correct
- * (each lseek advances the fd offset exactly as a write of that many bytes
- * would).  After the final run, ftruncate(size) guarantees the logical size is
- * exactly `size` even when the tail was a hole.  The full file image is in
- * memory, so no wire change is needed.  Returns false on I/O error. */
-static bool write_all_sparse(int fd, const unsigned char* data, unsigned long long size) {
-  unsigned long long i = 0;
-  while (i < size) {
-    if (data[i] == 0) {
-      unsigned long long run_start = i;
-      while (i < size && data[i] == 0)
-        i++;
-      unsigned long long run_len = i - run_start;
-      if (run_len >= SPARSE_HOLE_MIN) {
-        if (lseek(fd, (off_t)run_len, SEEK_CUR) < 0)
-          return false;
-      } else if (!write_all(fd, data + run_start, run_len)) {
-        return false;
-      }
-    } else {
-      unsigned long long run_start = i;
-      while (i < size && data[i] != 0)
-        i++;
-      if (!write_all(fd, data + run_start, i - run_start))
-        return false;
-    }
-  }
-  return ftruncate(fd, (off_t)size) == 0;
 }
 
 /* Preallocate `size` bytes on `fd` before any data is written (--preallocate).
@@ -515,6 +478,50 @@ out:
   return ok;
 }
 
+/* Open the directory named by canonical absolute `resolved`, which the caller
+ * has already verified lies beneath `root` (the canonical authorized root).
+ * Each component is opened relative to the authorized-root fd with O_NOFOLLOW,
+ * so a directory swapped for a symlink after the realpath() check cannot
+ * redirect the open outside the root -- the walk simply fails.  This replaces
+ * re-opening the absolute resolved path (TOCTOU).  Returns an O_DIRECTORY fd,
+ * or -1 (the root itself and any error are refused). */
+static int open_dir_beneath_root(const char* resolved, const char* root) {
+  size_t root_len = strlen(root);
+  const char* rel = resolved + root_len;
+  while (*rel == '/')
+    rel++;
+  if (*rel == '\0')
+    return -1;
+  int fd = dup(authorized_root_fd);
+  if (fd < 0)
+    return -1;
+  char* copy = str_dup(rel);
+  if (!copy) {
+    close(fd);
+    return -1;
+  }
+  char* save = NULL;
+  for (char* component = strtok_r(copy, "/", &save); component;
+       component = strtok_r(NULL, "/", &save)) {
+    if (strcmp(component, ".") == 0)
+      continue;
+    /* A canonical realpath() output never contains "." or ".."; refuse ".."
+       defensively rather than let it climb toward the root. */
+    int next = strcmp(component, "..") == 0
+                   ? -1
+                   : openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (next < 0) {
+      close(fd);
+      free(copy);
+      return -1;
+    }
+    close(fd);
+    fd = next;
+  }
+  free(copy);
+  return fd;
+}
+
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs) {
   char* copy = str_dup(path);
   if (!copy)
@@ -619,16 +626,13 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
                 (resolved[strlen(root)] == '/' || resolved[strlen(root)] == '\0')) {
               struct stat rst;
               if (stat(resolved, &rst) == 0 && S_ISDIR(rst.st_mode)) {
-                /* Re-open the resolved directory WITHOUT following a symlink and
-                   re-verify it is still a directory inode, so a symlink swapped
-                   in between realpath() and open() (TOCTOU) cannot redirect this
-                   fd outside the root. */
-                next = open(resolved, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-                struct stat ofst;
-                if (next >= 0 && (fstat(next, &ofst) != 0 || !S_ISDIR(ofst.st_mode))) {
-                  close(next);
-                  next = -1;
-                }
+                /* Open the resolved directory through a relative no-follow walk
+                   from the authorized-root fd instead of re-opening the
+                   absolute `resolved` path: swapping an intermediate directory
+                   for a symlink between realpath() and open() (TOCTOU) then
+                   merely fails the walk rather than redirecting the fd outside
+                   the root. */
+                next = open_dir_beneath_root(resolved, root);
               }
             }
           }
@@ -926,9 +930,12 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
         int prealloc_rc = 0;
         if (preallocate && !sparse && data_size > 0) {
           prealloc_rc = preallocate_fd(fd, data_size);
-          if (prealloc_rc != 0)
-            log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
-                        strerror(prealloc_rc));
+          if (prealloc_rc != 0) {
+            char* escaped_path = output_escape(path, log_get_8_bit_output());
+            log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted",
+                        escaped_path ? escaped_path : "<allocation failed>", strerror(prealloc_rc));
+            free(escaped_path);
+          }
         }
         if (prealloc_rc == 0) {
           /* posix_fallocate does not guarantee the fd's file offset is left
@@ -938,7 +945,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
             ok = ftruncate(fd, (off_t)data_size) == 0;
           if (ok || !sparse || data_size == 0)
             ok = sparse && data_size > 0
-                     ? write_all_sparse(fd, (const unsigned char*)data, data_size)
+                     ? file_store_write_sparse(fd, (const unsigned char*)data, data_size)
                      : write_all(fd, data, data_size);
           if (ok)
             ok = ftruncate(fd, (off_t)data_size) == 0;
@@ -1033,9 +1040,12 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       int prealloc_rc = 0;
       if (preallocate && !sparse && data_size > 0) {
         prealloc_rc = preallocate_fd(fd, data_size);
-        if (prealloc_rc != 0)
-          log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
-                      strerror(prealloc_rc));
+        if (prealloc_rc != 0) {
+          char* escaped_path = output_escape(path, log_get_8_bit_output());
+          log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted",
+                      escaped_path ? escaped_path : "<allocation failed>", strerror(prealloc_rc));
+          free(escaped_path);
+        }
       }
       if (prealloc_rc == 0) {
         lseek(fd, 0, SEEK_SET);
@@ -1046,8 +1056,9 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
            failure may leave partial data that --partial retention can rename. */
         if (ok || (!sparse || data_size == 0)) {
           write_attempted = true;
-          ok = sparse && data_size > 0 ? write_all_sparse(fd, (const unsigned char*)data, data_size)
-                                       : write_all(fd, data, data_size);
+          ok = sparse && data_size > 0
+                   ? file_store_write_sparse(fd, (const unsigned char*)data, data_size)
+                   : write_all(fd, data, data_size);
         }
         if (ok && metadata)
           ok = file_restore_metadata_fd(fd, metadata, preserve_executability);

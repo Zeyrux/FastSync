@@ -311,7 +311,7 @@ static void test_fake_super_owner_gate() {
 
   /* --no-super: the owner leg is skipped even as root. */
   c->super_mode = SUPER_MODE_OFF;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(fake_super_restore_fd(fd));
   struct stat st;
   EXPECT_EQ_INT(fstat(fd, &st), 0);
@@ -320,7 +320,7 @@ static void test_fake_super_owner_gate() {
 
   /* AUTO with an identity policy: the recorded source owner is applied. */
   c->super_mode = SUPER_MODE_AUTO;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(fake_super_restore_fd(fd));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)st.st_uid, 12345);
@@ -331,7 +331,7 @@ static void test_fake_super_owner_gate() {
   EXPECT_EQ_INT(fchown(fd, 0, 0), 0);
   c->numeric_ids = false;
   c->super_mode = SUPER_MODE_ON;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(fake_super_restore_fd(fd));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)st.st_uid, 0);
@@ -342,7 +342,7 @@ static void test_fake_super_owner_gate() {
   c->copy_as_set = true;
   c->copy_as_uid = 777;
   c->copy_as_gid = 778;
-  identity_set_active(c);
+  EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(fake_super_restore_fd(fd));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)st.st_uid, 0);

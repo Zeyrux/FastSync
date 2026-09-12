@@ -2,12 +2,15 @@
 #include "utils.h"
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <openssl/evp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* One store entry: a username and its password's SHA-256 hex digest.  The
  * plaintext password never appears here (and never on the daemon host). */
@@ -33,6 +36,46 @@ static void set_error(char* err, size_t err_size, const char* fmt, ...) {
 
 static bool is_comment_char(char c) {
   return c == '#' || c == ';';
+}
+
+/* Open a --password-file / --early-input after verifying the EXACT inode we
+ * will read: it must be owned by the effective user and grant no group/other
+ * permission bit (mode 0600), mirroring the TLS private-key check.  We open by
+ * path and then fstat the resulting fd (rather than stat()ing the path first
+ * and reopening it), so the permission decision is made on the same inode that
+ * is read and cannot be raced by swapping the path between check and open.
+ * The path may be a process-substitution pipe (`<(...)` -> /dev/fd/N), so
+ * regular files and FIFOs are accepted when the ownership/mode checks pass.
+ *
+ * Returns a FILE* the caller must fclose, or NULL with `err` filled. */
+static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    set_error(err, err_size, "cannot open secret file '%s': %s", path, strerror(errno));
+    return NULL;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    set_error(err, err_size, "cannot stat secret file '%s': %s", path, strerror(errno));
+    close(fd);
+    return NULL;
+  }
+  bool is_readable_kind = S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode);
+  if (!is_readable_kind || st.st_uid != geteuid() || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    set_error(err, err_size,
+              "refusing to read secret file '%s': it must be owned by the current user and "
+              "owner-only (0600), not accessible to group/other",
+              path);
+    close(fd);
+    return NULL;
+  }
+  FILE* fp = fdopen(fd, "r");
+  if (!fp) {
+    set_error(err, err_size, "cannot read secret file '%s': %s", path, strerror(errno));
+    close(fd);
+    return NULL;
+  }
+  return fp;
 }
 
 /* Trim leading/trailing ASCII space and tab in place; returns the new start. */
@@ -124,9 +167,8 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
   if (!path)
     return store;
 
-  FILE* fp = fopen(path, "r");
+  FILE* fp = secret_file_open(path, err, err_size);
   if (!fp) {
-    set_error(err, err_size, "cannot open credential file '%s': %s", path, strerror(errno));
     credentials_free(store);
     return NULL;
   }
@@ -305,11 +347,9 @@ int credentials_read_secret_file(const char* path, char** user_out, char** passw
     set_error(err, err_size, "no --password-file path");
     return -1;
   }
-  FILE* fp = fopen(path, "r");
-  if (!fp) {
-    set_error(err, err_size, "cannot open password file '%s': %s", path, strerror(errno));
+  FILE* fp = secret_file_open(path, err, err_size);
+  if (!fp)
     return -1;
-  }
 
   int line_no = 0;
   char line[CREDENTIAL_MAX_LINE + 2];

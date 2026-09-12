@@ -33,6 +33,9 @@ static char* make_tmp_file(const char* contents) {
     return NULL;
   }
   fclose(fp);
+  /* Credential/password files are owner-only; the reader rejects group/other
+   * permission bits, so create temp files 0600 like the real ones. */
+  chmod(path, 0600);
   return strdup(path);
 }
 
@@ -353,6 +356,47 @@ static void test_credentials_gate_allows() {
   free(path);
 }
 
+static void test_credentials_rejects_group_or_other_accessible() {
+  char err[512];
+  char* path =
+      make_tmp_file("alice:9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3\n");
+  EXPECT_NOT_NULL(path);
+
+  /* 0600 is accepted by the server store loader. */
+  EXPECT_EQ_INT(chmod(path, 0600), 0);
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  credentials_free(store);
+
+  /* Group-readable and world-readable are both refused, with a clear error. */
+  EXPECT_EQ_INT(chmod(path, 0640), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(strstr(err, "owner-only") != NULL);
+  EXPECT_EQ_INT(chmod(path, 0604), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+
+  /* The client --password-file reader enforces the same rule. */
+  EXPECT_EQ_INT(chmod(path, 0644), 0);
+  char* user = NULL;
+  char* password = NULL;
+  EXPECT_EQ_INT(credentials_read_secret_file(path, &user, &password, err, sizeof(err)), -1);
+  EXPECT_NULL(user);
+  EXPECT_NULL(password);
+  EXPECT_TRUE(strstr(err, "owner-only") != NULL);
+
+  /* An --early-input file is checked too. */
+  char* pw =
+      make_tmp_file("bob:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b\n");
+  EXPECT_NOT_NULL(pw);
+  EXPECT_EQ_INT(chmod(path, 0644), 0);
+  EXPECT_NULL(credentials_load(pw, path, err, sizeof(err)));
+
+  rm_temp(pw);
+  rm_temp(path);
+  free(pw);
+  free(path);
+}
+
 static void test_credentials_burn() {
   char secret[32];
   memcpy(secret, "supersecretvalue", 17);
@@ -374,6 +418,7 @@ void test_credentials(void) {
   test_credentials_early_input_merge();
   test_credentials_read_secret_file();
   test_credentials_read_secret_file_bad();
+  test_credentials_rejects_group_or_other_accessible();
   test_credentials_gate_allows();
   test_credentials_burn();
 }

@@ -55,8 +55,14 @@ static void test_ssh_remote_command_argument_modes() {
   EXPECT_EQ_STR(command, "'fast'\\''sync' --stdio");
   free(command);
 
+  /* --old-args no longer disables injection-safe quoting: the path is still one
+     single-quoted word, even when it carries shell metacharacters. */
   command = ssh_build_remote_command("fast sync; touch /tmp/pwned", true, NULL, 0);
-  EXPECT_EQ_STR(command, "fast sync; touch /tmp/pwned --stdio");
+  EXPECT_EQ_STR(command, "'fast sync; touch /tmp/pwned' --stdio");
+  free(command);
+
+  command = ssh_build_remote_command("fast'sync; rm -rf /", true, NULL, 0);
+  EXPECT_EQ_STR(command, "'fast'\\''sync; rm -rf /' --stdio");
   free(command);
 }
 
@@ -131,9 +137,9 @@ static void test_ssh_remote_command_with_remote_options() {
   free(command);
   free(val);
 
-  /* --old-args leaves the server path unquoted but still quotes remote options. */
+  /* --old-args still quotes both the server path and the remote options. */
   command = ssh_build_remote_command("srv", true, multi, 2);
-  EXPECT_EQ_STR(command, "srv --stdio '-v' '--allow-delete'");
+  EXPECT_EQ_STR(command, "'srv' --stdio '-v' '--allow-delete'");
   free(command);
 }
 
