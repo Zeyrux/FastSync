@@ -384,16 +384,18 @@ static const char* server_module_gate(const Config* config, void* context) {
     }
     /* Transport policy (A7-3/S1): an auth-required module only accepts
      * credentials over (a) an encrypted, verified TLS connection whose client
-     * certificate matches --client-cn, or (b) a plaintext connection from a
-     * loopback peer that the operator explicitly opted into with
-     * --allow-unauthenticated.  A remote plaintext peer and an un-flagged
-     * loopback plaintext peer are both refused HERE, before the challenge is
-     * sent, so an unverified client never receives a nonce.  The operator flag
-     * never permits REMOTE plaintext auth: remote peers still require verified
-     * TLS regardless of the flag. */
+     * certificate matches --client-cn, or (b) an actual PLAINTEXT connection
+     * from a loopback peer that the operator explicitly opted into with
+     * --allow-unauthenticated.  A remote plaintext peer, an un-flagged loopback
+     * plaintext peer, and a loopback TLS peer whose certificate does not match
+     * --client-cn are all refused HERE, before the challenge is sent, so an
+     * unverified client never receives a nonce: the loopback allowance requires
+     * !gate_ctx->ssl, so --tls + --allow-unauthenticated can never be used to
+     * bypass the client-CN check.  The operator flag never permits REMOTE
+     * plaintext auth: remote peers still require verified TLS regardless. */
     bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
                   tls_client_identity_allowed(gate_ctx->ssl);
-    bool local_ok = allow_unauthenticated && gate_ctx && gate_ctx->fd >= 0 &&
+    bool local_ok = allow_unauthenticated && gate_ctx && !gate_ctx->ssl && gate_ctx->fd >= 0 &&
                     utils_fd_peer_is_local(gate_ctx->fd);
     if (!tls_ok && !local_ok) {
       log_message(LOG_LEVEL_ERROR,
@@ -403,6 +405,10 @@ static const char* server_module_gate(const Config* config, void* context) {
       return "daemon module requires authentication over an encrypted, verified TLS "
              "connection";
     }
+    /* Belt-and-braces: the transport policy above already guarantees a context
+     * with a usable socket (verified TLS implies a live SSL object and loopback
+     * allowance requires gate_ctx->fd >= 0), so this is unreachable today; keep
+     * the guard so the handshake can never be driven over an invalid fd. */
     if (!gate_ctx || gate_ctx->fd < 0) {
       log_message(LOG_LEVEL_ERROR, "daemon module '%s': no auth transport available",
                   config->module);
@@ -756,7 +762,7 @@ static void print_server_usage(void) {
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
   printf("  --ca <path>         TLS CA certificate file (PEM)\n");
-  printf("  --client-cn <name>  Required TLS client certificate CN\n");
+  printf("  --client-cn <name>  TLS client certificate CN (mandatory with --tls)\n");
   printf("  --destination-root <path>  Authorized destination root (default: .)\n");
   printf("  --address <addr>    Bind the listening socket to this address\n");
   printf("  -4, --ipv4          Bind an IPv4 socket (default)\n");
@@ -772,6 +778,8 @@ static void print_server_usage(void) {
   printf("                      client's CONVERT_SPEC).  A name that cannot be\n");
   printf("                      represented fails the run cleanly\n");
   printf("  --allow-unauthenticated  Allow plaintext/anonymous network clients\n");
+  printf("                      (an auth-required module still accepts only opted-in\n");
+  printf("                      loopback plaintext; remote auth requires verified TLS)\n");
   printf("  --hash-credentials <file>  Read <file>'s user:password lines and print\n");
   printf("                      PBKDF2 credential-store lines to stdout, then exit.\n");
   printf("                      Use the output as --password-file for --daemon;\n");

@@ -32,10 +32,11 @@
  * the dummy challenge for an unknown user stable for the life of the store, so
  * a daemon restart cannot be used as a username-enumeration oracle.  A sidecar
  * that is not an exact-mode-0600 regular file of exactly 32 bytes fails the load
- * (fail closed); if it cannot be created (e.g. a read-only mount or a restrictive
- * umask the fchmod cannot repair) the daemon warns and uses a transient per-run
- * key instead.  NOTE: the sidecar requires EXACT 0600, whereas the store /
- * password files only reject group/other bits (a deliberate difference).
+ * (fail closed); creation forces exact 0600 with fchmod (so a restrictive umask
+ * cannot leave the sidecar unreadable), and only a create/write/fsync/link or
+ * fchmod failure degrades to a transient per-run key with a warning.  NOTE: the
+ * sidecar requires EXACT 0600, whereas the store / password files only reject
+ * group/other bits (a deliberate difference).
  *
  * Client --password-file format: the FIRST meaningful (non-comment, non-blank)
  * line is `user:password`, holding the literal password.  The client keeps it

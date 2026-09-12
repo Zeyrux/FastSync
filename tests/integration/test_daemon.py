@@ -1154,20 +1154,16 @@ class TestDaemonTLSAuth:
 
     @pytest.mark.ci
     def test_wrong_client_cn_refused_before_auth_challenge(self):
-        """A7-3/S1: over a NON-local TLS connection an auth-required module is
-        refused at the config gate when the CA-valid client certificate does not
-        match --client-cn -- before any SCRAM challenge is sent and before any
-        file data moves.  The daemon is started WITH --allow-unauthenticated to
-        prove that flag never relaxes the remote auth-module transport policy
-        (it only opts in plaintext from a loopback peer)."""
-        try:
-            remote_ip = socket.gethostbyname(socket.gethostname())
-        except OSError:
-            pytest.skip("hostname does not resolve")
-        if remote_ip.startswith("127."):
-            pytest.skip("host resolves to loopback; no non-loopback interface")
+        """A7-3/S1: with --tls AND --allow-unauthenticated, a loopback TLS peer
+        whose CA-valid client certificate does not match --client-cn is still
+        refused at the config gate -- before any SCRAM challenge is sent and
+        before any file data moves.  The --allow-unauthenticated flag only opts
+        in loopback PLAINTEXT; it must never turn a wrong-CN TLS peer into an
+        accepted auth transport.  Runs over 127.0.0.1 so it is deterministic and
+        never skips; the gate log line (emitted before server_auth_handshake)
+        plus the unchanged module tree prove the refusal preceded any challenge."""
         cert_dir = os.path.join(TEST_DATA_DIR, "daemon_tls_certs_wrong")
-        certs = _generate_tls_certs(cert_dir, extra_san_ips=[remote_ip])
+        certs = _generate_tls_certs(cert_dir)
         client_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_wrong_client.pw")
         _write_client_password_file(client_creds, "alice", ALICE_PASS)
         d = DaemonManager()
@@ -1183,7 +1179,7 @@ class TestDaemonTLSAuth:
             tls_flags = ["--tls",
                          "--cert", certs["wrong_client_cert"], "--key",
                          certs["wrong_client_key"], "--ca", certs["ca"]]
-            result, _ = run_client(SOURCE_DIR, "%s::locked" % remote_ip, port=port,
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::locked", port=port,
                                    flags=tls_flags, extra_args=["--password-file", client_creds])
             assert result.returncode != 0, "a wrong client CN must be refused"
             assert _tree_file_count(AUTH_MODULE) == before_files, \

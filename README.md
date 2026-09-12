@@ -145,7 +145,7 @@ partial, alternate, and planned behavior.
 | `--cert <path>` | TLS certificate file (PEM) |
 | `--key <path>` | TLS private key file (PEM) |
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
-| `--client-cn <name>` | Required TLS client certificate common name |
+| `--client-cn <name>` | TLS client certificate common name; mandatory with `--tls` (a TLS connection always verifies the client CN) |
 
 ### Server
 
@@ -159,7 +159,7 @@ partial, alternate, and planned behavior.
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
 | `--destination-root <path>` | Authorized destination root (default: `.`) |
 | `--allow-delete` | Permit manifest deletion |
-| `--allow-unauthenticated` | Permit plaintext TCP clients |
+| `--allow-unauthenticated` | Permit plaintext TCP clients. For an `auth users` module this opts in **loopback plaintext only**; remote auth still requires verified TLS, so the flag never permits remote plaintext auth. |
 | `-v, --verbose` | Enable debug logging |
 | `--help` | Show help |
 
@@ -526,11 +526,14 @@ redirect that output to an owner-only (mode 0600) file, and note that legacy
 (mode 0600) `<store>.dummykey` sidecar next to the store: it holds the store-wide
 dummy key, is auto-created on first load, and must be preserved across daemon
 restarts so the dummy challenge for an unknown user stays stable (the key is
-never regenerated while the sidecar exists). If the sidecar cannot be created
-(process-substitution/FIFO store path such as `/dev/fd/N`, a read-only
-filesystem, or a missing directory), the daemon logs a warning and uses a
-transient key, so the cross-restart guarantee does not hold for those
-deployments. One residual is accepted: the store
+never regenerated while the sidecar exists). The sidecar is secret material and
+must be protected like the credential store: keep it owner-only (mode 0600) and
+include it with the store in backups and credential rotation. If the sidecar
+cannot be created (a process-substitution/FIFO store path such as `/dev/fd/N`, a
+read-only filesystem, a missing directory, or a create, write, fsync, link, or
+fchmod failure), the daemon logs a warning and uses a transient key, so the
+cross-restart guarantee does not hold for those deployments. One residual is
+accepted: the store
 iteration count is observable pre-auth by design, since the miss path must match
 a hit.
 
@@ -551,9 +554,10 @@ Because the loopback allowance trusts whichever peer the kernel reports as
 `127.0.0.1`, it assumes nothing relays remote connections to the daemon. A local
 TCP forwarder or a TLS-terminating proxy in front of an auth-module listener
 makes remote clients appear as loopback and bypasses the mutual-TLS identity
-check, so do not front an auth-module listener with such a relay. Note also that
-`--client-cn` matches the certificate's CN only (not a subjectAltName), which is
-acceptable for a private CA.
+check, so do not front an auth-module listener with such a relay. `--tls` always
+mandates `--client-cn`, so a TLS connection to an auth-required module always
+has its client CN verified (`--client-cn` matches the certificate's CN only, not
+a subjectAltName, which is acceptable for a private CA).
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not
