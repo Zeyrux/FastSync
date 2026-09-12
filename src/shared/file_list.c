@@ -2,6 +2,7 @@
 #include "log.h"
 #include "utils.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,7 +52,8 @@ static int normalize_entry(const char* raw, size_t len, bool strip_line_endings,
   if (len == 0)
     return 0;
   if (raw[0] == '/') {
-    snprintf(err, err_size, "absolute path entries are not allowed: '%.*s'", (int)len, raw);
+    int print_len = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+    snprintf(err, err_size, "absolute path entries are not allowed: '%.*s'", print_len, raw);
     return -1;
   }
   /* Reject NUL bytes inside a token defensively (NUL-delimited mode splits on

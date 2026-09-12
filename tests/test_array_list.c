@@ -1,6 +1,7 @@
 #include "test_array_list.h"
 #include "array_list.h"
 #include "test_utils.h"
+#include <limits.h>
 #include <stdlib.h>
 
 static int destroyer_calls = 0;
@@ -9,7 +10,7 @@ static void test_destroyer(void* item) {
   free(item);
 }
 
-void test_array_list() {
+static void test_array_list_basic() {
   ArrayList* list = array_list_create(free);
   EXPECT_NOT_NULL(list);
   EXPECT_EQ_INT(list->size, 0);
@@ -53,4 +54,21 @@ void test_array_list() {
   list->item_destroyer = test_destroyer;
   array_list_delete(list);
   EXPECT_EQ_INT(destroyer_calls, 106);
+}
+
+/* A capacity that would overflow `capacity * 2` must be refused instead of
+ * wrapping into signed-overflow UB; array_list_add surfaces the failure. */
+static void test_array_list_extend_overflow_guard() {
+  ArrayList* list = array_list_create(NULL);
+  EXPECT_NOT_NULL(list);
+  list->capacity = INT_MAX / 2 + 1;
+  list->size = list->capacity;
+  EXPECT_FALSE(array_list_add(list, NULL));
+  list->size = 0;
+  array_list_delete(list);
+}
+
+void test_array_list() {
+  test_array_list_basic();
+  test_array_list_extend_overflow_guard();
 }

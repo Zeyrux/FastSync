@@ -1,6 +1,7 @@
 #include "log.h"
 #include "array_list.h"
 #include "protocol.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,8 @@ void array_list_delete(ArrayList* array_list) {
 
 static bool array_list_extend(ArrayList* array_list) {
   if (array_list == NULL)
+    return false;
+  if (array_list->capacity > INT_MAX / 2)
     return false;
   int new_capacity = array_list->capacity * 2;
   if (new_capacity == 0)
