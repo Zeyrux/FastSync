@@ -3,7 +3,10 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <openssl/evp.h>
+#include <openssl/params.h>
+#include <openssl/rand.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,11 +15,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* One store entry: a username and its password's SHA-256 hex digest.  The
- * plaintext password never appears here (and never on the daemon host). */
+/* One store entry: a username and its salted PBKDF2 verifier.  The plaintext
+ * password never appears here (and never on the daemon host); the verifier is
+ * not replayable because the proof is bound to a per-connection nonce. */
 typedef struct CredentialEntry {
   char* user;
-  char* password_hex; /* CREDENTIAL_HASH_HEX_LEN lowercase hex chars */
+  uint8_t salt[CREDENTIAL_SALT_LEN];
+  uint32_t iters;
+  uint8_t stored_key[CREDENTIAL_KEY_LEN];
+  uint8_t server_key[CREDENTIAL_KEY_LEN];
 } CredentialEntry;
 
 struct CredentialStore {
@@ -24,6 +31,15 @@ struct CredentialStore {
   int count;
   int capacity;
 };
+
+/* Exact marker prefix of the new store verifier field. */
+#define CREDENTIAL_STORE_PREFIX "$fastsync$1$pbkdf2-sha256$"
+#define CREDENTIAL_AUTH_PREFIX "FastSync-Auth-v1"
+
+/* Fixed dummy keys used when a user is unknown or off the module's list.  They
+ * can never authenticate because acceptance additionally requires found=true. */
+static const uint8_t k_dummy_stored_key[CREDENTIAL_KEY_LEN] = {0};
+static const uint8_t k_dummy_server_key[CREDENTIAL_KEY_LEN] = {0};
 
 static void set_error(char* err, size_t err_size, const char* fmt, ...) {
   if (!err || err_size == 0)
@@ -106,6 +122,10 @@ static bool username_wellformed(const char* user) {
   return true;
 }
 
+bool credentials_username_valid(const char* user) {
+  return username_wellformed(user);
+}
+
 static int hex_value(char c) {
   if (c >= '0' && c <= '9')
     return c - '0';
@@ -114,17 +134,235 @@ static int hex_value(char c) {
   return -1;
 }
 
-bool credentials_hash_valid(const char* hash_hex) {
-  if (!hash_hex)
+/* True for the OLD `user:SHA256HEX` secret form: exactly 64 lowercase hex
+ * digits.  Such a line is refused loudly (and never accepted) so an operator
+ * cannot keep a replayable bearer digest in place after the protocol bump. */
+static bool secret_is_legacy_hex(const char* s) {
+  if (!s)
     return false;
-  for (int i = 0; i < CREDENTIAL_HASH_HEX_LEN; i++) {
-    if (hex_value(hash_hex[i]) < 0)
+  for (int i = 0; i < 64; i++) {
+    if (hex_value(s[i]) < 0)
       return false;
   }
-  return hash_hex[CREDENTIAL_HASH_HEX_LEN] == '\0';
+  return s[64] == '\0';
 }
 
-static bool append_entry(CredentialStore* store, const char* user, const char* password_hex) {
+bool credentials_b64_encode(const uint8_t* in, size_t n, char* out, size_t out_sz) {
+  if (!in || !out)
+    return false;
+  if (n > (size_t)INT_MAX)
+    return false;
+  size_t encoded_len = 4 * ((n + 2) / 3);
+  if (out_sz < encoded_len + 1)
+    return false;
+  int written = EVP_EncodeBlock((unsigned char*)out, in, (int)n);
+  if (written < 0 || (size_t)written != encoded_len)
+    return false;
+  out[encoded_len] = '\0';
+  return true;
+}
+
+bool credentials_b64_decode(const char* in, uint8_t* out, size_t out_sz, size_t* out_len) {
+  if (!in || !out || !out_len)
+    return false;
+  size_t len = strlen(in);
+  /* Every value we decode is short (a 32-byte key is 44 chars); refusing long
+   * input keeps the scratch buffer fixed and bounds a hostile frame. */
+  if (len == 0 || (len % 4) != 0 || len > 256)
+    return false;
+  size_t padded_len = (len / 4) * 3;
+  size_t decoded_len = padded_len;
+  if (in[len - 1] == '=')
+    decoded_len--;
+  if (len >= 2 && in[len - 2] == '=')
+    decoded_len--;
+  if (decoded_len > out_sz)
+    return false;
+  /* EVP_DecodeBlock writes the full (padded) quantum, so decode into a scratch
+   * buffer sized for it and copy only the real bytes out. */
+  uint8_t scratch[192];
+  int n = EVP_DecodeBlock(scratch, (const unsigned char*)in, (int)len);
+  if (n < 0 || (size_t)n != padded_len)
+    return false;
+  memcpy(out, scratch, decoded_len);
+  credentials_burn((char*)scratch, sizeof(scratch));
+  *out_len = decoded_len;
+  return true;
+}
+
+bool credentials_random_bytes(uint8_t* out, size_t n) {
+  if (!out || n == 0 || n > (size_t)INT_MAX)
+    return false;
+  return RAND_bytes(out, (int)n) == 1;
+}
+
+/* HMAC-SHA256 via the OpenSSL 3 EVP_MAC API (HMAC() is deprecated). */
+static bool hmac_sha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t data_len,
+                        uint8_t out[CREDENTIAL_KEY_LEN]) {
+  EVP_MAC* mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+  if (!mac)
+    return false;
+  EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
+  EVP_MAC_free(mac);
+  if (!ctx)
+    return false;
+  OSSL_PARAM params[2];
+  params[0] = OSSL_PARAM_construct_utf8_string("digest", (char*)"SHA256", 0);
+  params[1] = OSSL_PARAM_construct_end();
+  size_t out_len = 0;
+  bool ok =
+      EVP_MAC_init(ctx, key, key_len, params) == 1 && EVP_MAC_update(ctx, data, data_len) == 1 &&
+      EVP_MAC_final(ctx, out, &out_len, CREDENTIAL_KEY_LEN) == 1 && out_len == CREDENTIAL_KEY_LEN;
+  EVP_MAC_CTX_free(ctx);
+  return ok;
+}
+
+static bool sha256(const uint8_t* data, size_t len, uint8_t out[CREDENTIAL_KEY_LEN]) {
+  unsigned int out_len = 0;
+  if (EVP_Digest(data, len, out, &out_len, EVP_sha256(), NULL) != 1)
+    return false;
+  return out_len == CREDENTIAL_KEY_LEN;
+}
+
+bool credentials_compute_keys(const char* password, const uint8_t salt[CREDENTIAL_SALT_LEN],
+                              uint32_t iters, uint8_t client_key[CREDENTIAL_KEY_LEN],
+                              uint8_t stored_key[CREDENTIAL_KEY_LEN],
+                              uint8_t server_key[CREDENTIAL_KEY_LEN]) {
+  if (!password || !salt)
+    return false;
+  /* The caller (store parser / client clamp) is responsible for the
+   * [MIN,MAX] policy; this primitive only refuses a zero/unbounded work
+   * factor.  Tests exercise the known-answer vector at a smaller count. */
+  if (iters == 0 || iters > CREDENTIAL_MAX_ITERS)
+    return false;
+  size_t password_len = strlen(password);
+  if (password_len > CREDENTIAL_MAX_PASSWORD_LEN || password_len > (size_t)INT_MAX)
+    return false;
+  uint8_t k[CREDENTIAL_KEY_LEN];
+  if (PKCS5_PBKDF2_HMAC(password, (int)password_len, salt, CREDENTIAL_SALT_LEN, (int)iters,
+                        EVP_sha256(), CREDENTIAL_KEY_LEN, k) != 1) {
+    credentials_burn((char*)k, sizeof(k));
+    return false;
+  }
+  uint8_t derived_client[CREDENTIAL_KEY_LEN];
+  uint8_t derived_server[CREDENTIAL_KEY_LEN];
+  bool ok = hmac_sha256(k, sizeof(k), (const uint8_t*)"Client Key", 10, derived_client) &&
+            hmac_sha256(k, sizeof(k), (const uint8_t*)"Server Key", 10, derived_server);
+  if (ok && stored_key)
+    ok = sha256(derived_client, sizeof(derived_client), stored_key);
+  if (ok && client_key)
+    memcpy(client_key, derived_client, CREDENTIAL_KEY_LEN);
+  if (ok && server_key)
+    memcpy(server_key, derived_server, CREDENTIAL_KEY_LEN);
+  credentials_burn((char*)k, sizeof(k));
+  credentials_burn((char*)derived_client, sizeof(derived_client));
+  credentials_burn((char*)derived_server, sizeof(derived_server));
+  return ok;
+}
+
+static void write_be32(uint8_t* out, uint32_t value) {
+  out[0] = (uint8_t)(value >> 24);
+  out[1] = (uint8_t)(value >> 16);
+  out[2] = (uint8_t)(value >> 8);
+  out[3] = (uint8_t)value;
+}
+
+bool credentials_build_auth_message(const char* user, const uint8_t* snonce, const uint8_t* cnonce,
+                                    uint8_t* out, size_t out_sz, size_t* out_len) {
+  if (!user || !snonce || !cnonce || !out || !out_len)
+    return false;
+  size_t user_len = strlen(user);
+  if (user_len > CREDENTIAL_MAX_USER_LEN)
+    return false;
+  size_t total = 16 + 4 + user_len + 4 + CREDENTIAL_NONCE_LEN + 4 + CREDENTIAL_NONCE_LEN;
+  if (out_sz < total)
+    return false;
+  size_t off = 0;
+  memcpy(out + off, CREDENTIAL_AUTH_PREFIX, 16);
+  off += 16;
+  write_be32(out + off, (uint32_t)user_len);
+  off += 4;
+  memcpy(out + off, user, user_len);
+  off += user_len;
+  write_be32(out + off, CREDENTIAL_NONCE_LEN);
+  off += 4;
+  memcpy(out + off, snonce, CREDENTIAL_NONCE_LEN);
+  off += CREDENTIAL_NONCE_LEN;
+  write_be32(out + off, CREDENTIAL_NONCE_LEN);
+  off += 4;
+  memcpy(out + off, cnonce, CREDENTIAL_NONCE_LEN);
+  off += CREDENTIAL_NONCE_LEN;
+  *out_len = off;
+  return true;
+}
+
+bool credentials_client_proof(const uint8_t client_key[CREDENTIAL_KEY_LEN],
+                              const uint8_t stored_key[CREDENTIAL_KEY_LEN],
+                              const uint8_t server_key[CREDENTIAL_KEY_LEN], const uint8_t* auth_msg,
+                              size_t msg_len, uint8_t proof[CREDENTIAL_KEY_LEN],
+                              uint8_t server_sig[CREDENTIAL_KEY_LEN]) {
+  if (!client_key || !stored_key || !server_key || !auth_msg || !proof || !server_sig)
+    return false;
+  uint8_t client_sig[CREDENTIAL_KEY_LEN];
+  bool ok = hmac_sha256(stored_key, CREDENTIAL_KEY_LEN, auth_msg, msg_len, client_sig);
+  if (ok) {
+    for (size_t i = 0; i < CREDENTIAL_KEY_LEN; i++)
+      proof[i] = client_key[i] ^ client_sig[i];
+    ok = hmac_sha256(server_key, CREDENTIAL_KEY_LEN, auth_msg, msg_len, server_sig);
+  }
+  credentials_burn((char*)client_sig, sizeof(client_sig));
+  return ok;
+}
+
+bool credentials_verify_response(const CredentialVerifier* v, const char* user,
+                                 const uint8_t* snonce, const uint8_t* cnonce,
+                                 const uint8_t proof[CREDENTIAL_KEY_LEN],
+                                 uint8_t server_sig_out[CREDENTIAL_KEY_LEN]) {
+  if (!v || !user || !snonce || !cnonce || !proof || !server_sig_out)
+    return false;
+  uint8_t auth_msg[CREDENTIAL_AUTH_MESSAGE_MAX];
+  size_t msg_len = 0;
+  if (!credentials_build_auth_message(user, snonce, cnonce, auth_msg, sizeof(auth_msg), &msg_len))
+    return false;
+  uint8_t client_sig[CREDENTIAL_KEY_LEN];
+  uint8_t client_key[CREDENTIAL_KEY_LEN];
+  uint8_t recovered[CREDENTIAL_KEY_LEN];
+  uint8_t server_sig[CREDENTIAL_KEY_LEN];
+  bool computed = hmac_sha256(v->stored_key, CREDENTIAL_KEY_LEN, auth_msg, msg_len, client_sig);
+  if (computed) {
+    for (size_t i = 0; i < CREDENTIAL_KEY_LEN; i++)
+      client_key[i] = proof[i] ^ client_sig[i];
+    computed = sha256(client_key, CREDENTIAL_KEY_LEN, recovered);
+  }
+  if (computed)
+    computed = hmac_sha256(v->server_key, CREDENTIAL_KEY_LEN, auth_msg, msg_len, server_sig);
+  if (computed)
+    memcpy(server_sig_out, server_sig, CREDENTIAL_KEY_LEN);
+  /* Constant-time compare over the fixed 32-byte keys; a tampered nonce
+   * changes the AuthMessage and so the recovered key. */
+  bool accept = computed && v->found &&
+                credentials_secure_equal((const char*)recovered, (const char*)v->stored_key,
+                                         CREDENTIAL_KEY_LEN);
+  credentials_burn((char*)auth_msg, sizeof(auth_msg));
+  credentials_burn((char*)client_sig, sizeof(client_sig));
+  credentials_burn((char*)client_key, sizeof(client_key));
+  credentials_burn((char*)recovered, sizeof(recovered));
+  credentials_burn((char*)server_sig, sizeof(server_sig));
+  return accept;
+}
+
+static bool entries_equal(const CredentialEntry* a, const CredentialEntry* b) {
+  return a->iters == b->iters &&
+         credentials_secure_equal((const char*)a->salt, (const char*)b->salt,
+                                  CREDENTIAL_SALT_LEN) &&
+         credentials_secure_equal((const char*)a->stored_key, (const char*)b->stored_key,
+                                  CREDENTIAL_KEY_LEN) &&
+         credentials_secure_equal((const char*)a->server_key, (const char*)b->server_key,
+                                  CREDENTIAL_KEY_LEN);
+}
+
+static bool append_entry(CredentialStore* store, const char* user, const uint8_t* salt,
+                         uint32_t iters, const uint8_t* stored_key, const uint8_t* server_key) {
   if (store->count == store->capacity) {
     int new_capacity = store->capacity == 0 ? 8 : store->capacity * 2;
     CredentialEntry* grown =
@@ -134,15 +372,15 @@ static bool append_entry(CredentialStore* store, const char* user, const char* p
     store->entries = grown;
     store->capacity = new_capacity;
   }
-  store->entries[store->count].user = str_dup(user);
-  store->entries[store->count].password_hex = str_dup(password_hex);
-  if (!store->entries[store->count].user || !store->entries[store->count].password_hex) {
-    free(store->entries[store->count].user);
-    free(store->entries[store->count].password_hex);
-    store->entries[store->count].user = NULL;
-    store->entries[store->count].password_hex = NULL;
+  CredentialEntry* entry = &store->entries[store->count];
+  memset(entry, 0, sizeof(*entry));
+  entry->user = str_dup(user);
+  if (!entry->user)
     return false;
-  }
+  memcpy(entry->salt, salt, CREDENTIAL_SALT_LEN);
+  entry->iters = iters;
+  memcpy(entry->stored_key, stored_key, CREDENTIAL_KEY_LEN);
+  memcpy(entry->server_key, server_key, CREDENTIAL_KEY_LEN);
   store->count++;
   return true;
 }
@@ -155,9 +393,75 @@ static int find_user(const CredentialStore* store, const char* user) {
   return -1;
 }
 
-/* Parse one credential store file (user:SHA256HEX per line) into a fresh
- * store.  Duplicate usernames WITHIN one file are an error (ambiguous).  A
- * NULL path yields an empty store. */
+/* Parse the new `$fastsync$1$pbkdf2-sha256$...` verifier field in place. */
+static bool parse_verifier_secret(char* secret, CredentialEntry* entry, const char* path,
+                                  int line_no, const char* user, char* err, size_t err_size) {
+  if (secret_is_legacy_hex(secret)) {
+    set_error(err, err_size,
+              "credential file '%s' line %d: legacy unsalted SHA-256 secret for user '%s' is not "
+              "accepted (protocol 2.19.0 uses a salted PBKDF2 verifier); regenerate the store "
+              "with --hash-credentials",
+              path, line_no, user);
+    return false;
+  }
+  const char* prefix = CREDENTIAL_STORE_PREFIX;
+  size_t prefix_len = strlen(prefix);
+  if (strncmp(secret, prefix, prefix_len) != 0) {
+    set_error(err, err_size,
+              "credential file '%s' line %d: expected a '%s...' verifier for user '%s' (regenerate "
+              "a legacy line with --hash-credentials)",
+              path, line_no, prefix, user);
+    return false;
+  }
+  char* cursor = secret + prefix_len;
+  const char* iters_str = cursor;
+  char* sep = strchr(cursor, '$');
+  if (!sep)
+    goto malformed;
+  *sep = '\0';
+  const char* salt_str = sep + 1;
+  sep = strchr(salt_str, '$');
+  if (!sep)
+    goto malformed;
+  *sep = '\0';
+  const char* stored_str = sep + 1;
+  sep = strchr(stored_str, '$');
+  if (!sep)
+    goto malformed;
+  *sep = '\0';
+  const char* server_str = sep + 1;
+  if (*iters_str == '\0' || *salt_str == '\0' || *stored_str == '\0' || *server_str == '\0')
+    goto malformed;
+
+  char* end = NULL;
+  unsigned long parsed = strtoul(iters_str, &end, 10);
+  if (!end || *end != '\0' || parsed < CREDENTIAL_MIN_ITERS || parsed > CREDENTIAL_MAX_ITERS)
+    goto malformed;
+  entry->iters = (uint32_t)parsed;
+
+  size_t decoded = 0;
+  if (!credentials_b64_decode(salt_str, entry->salt, CREDENTIAL_SALT_LEN, &decoded) ||
+      decoded != CREDENTIAL_SALT_LEN)
+    goto malformed;
+  if (!credentials_b64_decode(stored_str, entry->stored_key, CREDENTIAL_KEY_LEN, &decoded) ||
+      decoded != CREDENTIAL_KEY_LEN)
+    goto malformed;
+  if (!credentials_b64_decode(server_str, entry->server_key, CREDENTIAL_KEY_LEN, &decoded) ||
+      decoded != CREDENTIAL_KEY_LEN)
+    goto malformed;
+  return true;
+
+malformed:
+  set_error(err, err_size,
+            "credential file '%s' line %d: malformed verifier for user '%s' (expected "
+            "'%s<iters>$<salt_b64>$<stored_key_b64>$<server_key_b64>')",
+            path, line_no, user, prefix);
+  return false;
+}
+
+/* Parse one credential store file into a fresh store.  Duplicate usernames
+ * WITHIN one file are an error (ambiguous).  A NULL path yields an empty
+ * store. */
 static CredentialStore* load_store_file(const char* path, char* err, size_t err_size) {
   CredentialStore* store = calloc(1, sizeof(CredentialStore));
   if (!store) {
@@ -200,14 +504,14 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
     char* colon = strchr(cursor, ':');
     if (!colon) {
       set_error(err, err_size,
-                "credential file '%s' line %d: expected 'user:SHA256HEX' (no ':' found)", path,
+                "credential file '%s' line %d: expected 'user:$fastsync$...' (no ':' found)", path,
                 line_no);
       ok = false;
       break;
     }
     *colon = '\0';
     const char* user = trim_space(cursor);
-    const char* secret = trim_space(colon + 1);
+    char* secret = trim_space(colon + 1);
     if (!username_wellformed(user)) {
       set_error(err, err_size,
                 "credential file '%s' line %d: invalid username (must be 1-%d "
@@ -216,11 +520,9 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
       ok = false;
       break;
     }
-    if (!credentials_hash_valid(secret)) {
-      set_error(err, err_size,
-                "credential file '%s' line %d: secret for user '%s' must be %d "
-                "lowercase hex characters (the SHA-256 of the password)",
-                path, line_no, user, CREDENTIAL_HASH_HEX_LEN);
+    CredentialEntry parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (!parse_verifier_secret(secret, &parsed, path, line_no, user, err, err_size)) {
       ok = false;
       break;
     }
@@ -230,7 +532,8 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
       ok = false;
       break;
     }
-    if (!append_entry(store, user, secret)) {
+    if (!append_entry(store, user, parsed.salt, parsed.iters, parsed.stored_key,
+                      parsed.server_key)) {
       set_error(err, err_size, "out of memory reading credential file '%s'", path);
       ok = false;
       break;
@@ -242,6 +545,7 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
     ok = false;
   }
   fclose(fp);
+  credentials_burn(line, sizeof(line));
   if (!ok) {
     credentials_free(store);
     return NULL;
@@ -264,14 +568,14 @@ CredentialStore* credentials_load(const char* password_file, const char* early_i
     credentials_free(store);
     return NULL;
   }
-  /* Layer early input over the password file: same secret dedupes, a differing
-   * secret for the same user is ambiguous and fails closed. */
+  /* Layer early input over the password file: an identical verifier dedupes, a
+   * differing verifier for the same user is ambiguous and fails closed. */
   for (int i = 0; i < early->count; i++) {
     int existing = find_user(store, early->entries[i].user);
     if (existing >= 0) {
-      if (strcmp(store->entries[existing].password_hex, early->entries[i].password_hex) != 0) {
+      if (!entries_equal(&store->entries[existing], &early->entries[i])) {
         set_error(err, err_size,
-                  "credential file '%s' and early-input file '%s' disagree on the secret for "
+                  "credential file '%s' and early-input file '%s' disagree on the verifier for "
                   "user '%s'",
                   password_file, early_input_file, early->entries[i].user);
         credentials_free(early);
@@ -280,7 +584,9 @@ CredentialStore* credentials_load(const char* password_file, const char* early_i
       }
       continue; /* identical; nothing to merge */
     }
-    if (!append_entry(store, early->entries[i].user, early->entries[i].password_hex)) {
+    if (!append_entry(store, early->entries[i].user, early->entries[i].salt,
+                      early->entries[i].iters, early->entries[i].stored_key,
+                      early->entries[i].server_key)) {
       set_error(err, err_size, "out of memory merging early-input credentials");
       credentials_free(early);
       credentials_free(store);
@@ -295,8 +601,11 @@ void credentials_free(CredentialStore* store) {
   if (!store)
     return;
   for (int i = 0; i < store->count; i++) {
+    /* Wipe the derived keys before releasing the entry (A7-4). */
+    credentials_burn((char*)store->entries[i].salt, CREDENTIAL_SALT_LEN);
+    credentials_burn((char*)store->entries[i].stored_key, CREDENTIAL_KEY_LEN);
+    credentials_burn((char*)store->entries[i].server_key, CREDENTIAL_KEY_LEN);
     free(store->entries[i].user);
-    free(store->entries[i].password_hex);
   }
   free(store->entries);
   free(store);
@@ -317,22 +626,195 @@ bool credentials_secure_equal(const char* a, const char* b, size_t len) {
   return diff == 0;
 }
 
-bool credentials_hash_password(const char* password, char* out_hex) {
-  if (!password || !out_hex)
+/* Constant-time equality over two usernames.  Compares a fixed
+ * CREDENTIAL_MAX_USER_LEN-byte window (padding with zeros past each string's
+ * own length) and folds the length difference into the accumulator, so no byte
+ * returns early.  This closes the byte-wise username-enumeration timing oracle
+ * that a plain strcmp (which short-circuits on the first differing byte)
+ * would otherwise expose.  Over-long inputs are refused (length differs), which
+ * is a non-secret branch: usernames are bounded in every caller anyway. */
+static bool username_secure_equal(const char* a, const char* b) {
+  size_t alen = strlen(a);
+  size_t blen = strlen(b);
+  if (alen > CREDENTIAL_MAX_USER_LEN || blen > CREDENTIAL_MAX_USER_LEN)
     return false;
-  uint8_t digest[EVP_MAX_MD_SIZE];
-  unsigned int digest_len = 0;
-  if (EVP_Digest(password, strlen(password), digest, &digest_len, EVP_sha256(), NULL) != 1)
-    return false;
-  if (digest_len != 32)
-    return false;
-  static const char hex[] = "0123456789abcdef";
-  for (unsigned int i = 0; i < digest_len; i++) {
-    out_hex[2 * i] = hex[digest[i] >> 4];
-    out_hex[2 * i + 1] = hex[digest[i] & 0x0f];
+  size_t diff = alen ^ blen;
+  for (size_t i = 0; i < CREDENTIAL_MAX_USER_LEN; i++) {
+    unsigned char ac = i < alen ? (unsigned char)a[i] : 0u;
+    unsigned char bc = i < blen ? (unsigned char)b[i] : 0u;
+    diff |= (size_t)(ac ^ bc);
   }
-  out_hex[2 * digest_len] = '\0';
+  return diff == 0;
+}
+
+bool credentials_get_verifier(const CredentialStore* store, const char* user,
+                              const char* const* module_users, int n, CredentialVerifier* out) {
+  if (!out)
+    return false;
+  memset(out, 0, sizeof(*out));
+  /* Start from the dummy verifier: a fresh random salt and the default
+   * iteration count, so a miss is shaped exactly like a hit. */
+  if (!credentials_random_bytes(out->salt, CREDENTIAL_SALT_LEN))
+    return false;
+  out->iters = CREDENTIAL_DEFAULT_ITERS;
+  memcpy(out->stored_key, k_dummy_stored_key, CREDENTIAL_KEY_LEN);
+  memcpy(out->server_key, k_dummy_server_key, CREDENTIAL_KEY_LEN);
+  out->found = false;
+  if (!store || !user || n < 0)
+    return true;
+  /* Module-list membership: constant-time full scan, no early break, so the
+   * list is not a username-enumeration oracle. */
+  bool on_list = false;
+  for (int i = 0; i < n; i++) {
+    if (module_users && module_users[i] && username_secure_equal(module_users[i], user))
+      on_list = true;
+  }
+  if (!on_list)
+    return true;
+  /* Store lookup is also a constant-time full scan. */
+  const CredentialEntry* match = NULL;
+  for (int i = 0; i < store->count; i++) {
+    if (username_secure_equal(store->entries[i].user, user))
+      match = &store->entries[i];
+  }
+  if (match) {
+    memcpy(out->salt, match->salt, CREDENTIAL_SALT_LEN);
+    out->iters = match->iters;
+    memcpy(out->stored_key, match->stored_key, CREDENTIAL_KEY_LEN);
+    memcpy(out->server_key, match->server_key, CREDENTIAL_KEY_LEN);
+    out->found = true;
+  }
   return true;
+}
+
+bool credentials_hash_store_line(const char* user, const char* password, uint32_t iters, char* out,
+                                 size_t out_sz, char* err, size_t err_size) {
+  if (err && err_size)
+    err[0] = '\0';
+  if (!username_wellformed(user)) {
+    set_error(err, err_size, "invalid username (1-%d non-whitespace characters)",
+              CREDENTIAL_MAX_USER_LEN);
+    return false;
+  }
+  if (!password || !out || out_sz == 0) {
+    set_error(err, err_size, "missing password or output buffer");
+    return false;
+  }
+  if (strlen(password) > CREDENTIAL_MAX_PASSWORD_LEN) {
+    set_error(err, err_size, "password exceeds %d characters", CREDENTIAL_MAX_PASSWORD_LEN);
+    return false;
+  }
+  if (iters < CREDENTIAL_MIN_ITERS || iters > CREDENTIAL_MAX_ITERS) {
+    set_error(err, err_size, "iterations %u out of range [%u,%u]", iters, CREDENTIAL_MIN_ITERS,
+              CREDENTIAL_MAX_ITERS);
+    return false;
+  }
+  uint8_t salt[CREDENTIAL_SALT_LEN];
+  uint8_t client_key[CREDENTIAL_KEY_LEN];
+  uint8_t stored_key[CREDENTIAL_KEY_LEN];
+  uint8_t server_key[CREDENTIAL_KEY_LEN];
+  char salt_b64[25];
+  char stored_b64[45];
+  char server_b64[45];
+  bool ok =
+      credentials_random_bytes(salt, sizeof(salt)) &&
+      credentials_compute_keys(password, salt, iters, client_key, stored_key, server_key) &&
+      credentials_b64_encode(salt, sizeof(salt), salt_b64, sizeof(salt_b64)) &&
+      credentials_b64_encode(stored_key, sizeof(stored_key), stored_b64, sizeof(stored_b64)) &&
+      credentials_b64_encode(server_key, sizeof(server_key), server_b64, sizeof(server_b64));
+  int written = -1;
+  if (ok) {
+    written = snprintf(out, out_sz, "%s:%s%u$%s$%s$%s", user, CREDENTIAL_STORE_PREFIX, iters,
+                       salt_b64, stored_b64, server_b64);
+  }
+  credentials_burn((char*)client_key, sizeof(client_key));
+  credentials_burn((char*)stored_key, sizeof(stored_key));
+  credentials_burn((char*)server_key, sizeof(server_key));
+  credentials_burn((char*)salt, sizeof(salt));
+  if (!ok)
+    return false;
+  if (written < 0 || (size_t)written >= out_sz) {
+    set_error(err, err_size, "output buffer too small for the credential line");
+    return false;
+  }
+  return true;
+}
+
+int credentials_hash_file(const char* path, uint32_t iters, FILE* out, char* err, size_t err_size) {
+  if (err && err_size)
+    err[0] = '\0';
+  if (!path || !out) {
+    set_error(err, err_size, "missing plaintext file or output stream");
+    return -1;
+  }
+  if (iters < CREDENTIAL_MIN_ITERS || iters > CREDENTIAL_MAX_ITERS) {
+    set_error(err, err_size, "iterations %u out of range [%u,%u]", iters, CREDENTIAL_MIN_ITERS,
+              CREDENTIAL_MAX_ITERS);
+    return -1;
+  }
+  FILE* fp = secret_file_open(path, err, err_size);
+  if (!fp)
+    return -1;
+  int line_no = 0;
+  int result = 0;
+  char line[CREDENTIAL_MAX_LINE + 2];
+  while (fgets(line, sizeof(line), fp)) {
+    line_no++;
+    size_t len = strlen(line);
+    if (len == CREDENTIAL_MAX_LINE + 1 && line[len - 1] != '\n' && !feof(fp)) {
+      set_error(err, err_size, "plaintext file '%s' line %d exceeds the %d-byte limit", path,
+                line_no, CREDENTIAL_MAX_LINE);
+      result = -1;
+      break;
+    }
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+    char* cursor = line;
+    while (*cursor == ' ' || *cursor == '\t')
+      cursor++;
+    if (*cursor == '\0' || is_comment_char(*cursor))
+      continue;
+    char* colon = strchr(cursor, ':');
+    if (!colon) {
+      set_error(err, err_size, "plaintext file '%s' line %d: expected 'user:password'", path,
+                line_no);
+      result = -1;
+      break;
+    }
+    *colon = '\0';
+    const char* user = trim_space(cursor);
+    const char* password = colon + 1;
+    if (!username_wellformed(user)) {
+      set_error(err, err_size, "plaintext file '%s' line %d: invalid username", path, line_no);
+      result = -1;
+      break;
+    }
+    if (*password == '\0') {
+      set_error(err, err_size, "plaintext file '%s' line %d: empty password", path, line_no);
+      result = -1;
+      break;
+    }
+    char store_line[CREDENTIAL_MAX_LINE];
+    if (!credentials_hash_store_line(user, password, iters, store_line, sizeof(store_line), err,
+                                     err_size)) {
+      result = -1;
+      break;
+    }
+    if (fprintf(out, "%s\n", store_line) < 0) {
+      set_error(err, err_size, "cannot write hashed credentials: %s", strerror(errno));
+      credentials_burn(store_line, sizeof(store_line));
+      result = -1;
+      break;
+    }
+    credentials_burn(store_line, sizeof(store_line));
+  }
+  if (result == 0 && ferror(fp)) {
+    set_error(err, err_size, "error reading plaintext file '%s': %s", path, strerror(errno));
+    result = -1;
+  }
+  credentials_burn(line, sizeof(line));
+  fclose(fp);
+  return result;
 }
 
 int credentials_read_secret_file(const char* path, char** user_out, char** password_out, char* err,
@@ -446,67 +928,4 @@ void credentials_burn(char* secret, size_t len) {
   volatile char* p = (volatile char*)secret;
   for (size_t i = 0; i < len; i++)
     p[i] = '\0';
-}
-
-/* Constant-time equality over two usernames.  Compares a fixed
- * CREDENTIAL_MAX_USER_LEN-byte window (padding with zeros past each string's
- * own length) and folds the length difference into the accumulator, so no byte
- * returns early.  This closes the byte-wise username-enumeration timing oracle
- * that a plain strcmp (which short-circuits on the first differing byte)
- * would otherwise expose.  Over-long inputs are refused (length differs), which
- * is a non-secret branch: usernames are bounded in every caller anyway. */
-static bool username_secure_equal(const char* a, const char* b) {
-  size_t alen = strlen(a);
-  size_t blen = strlen(b);
-  if (alen > CREDENTIAL_MAX_USER_LEN || blen > CREDENTIAL_MAX_USER_LEN)
-    return false;
-  size_t diff = alen ^ blen;
-  for (size_t i = 0; i < CREDENTIAL_MAX_USER_LEN; i++) {
-    unsigned char ac = i < alen ? (unsigned char)a[i] : 0u;
-    unsigned char bc = i < blen ? (unsigned char)b[i] : 0u;
-    diff |= (size_t)(ac ^ bc);
-  }
-  return diff == 0;
-}
-
-/* Fixed 64-lowercase-hex dummy used for a constant-time digest comparison when
- * the presented user is unknown, so the verify path takes the same time for an
- * unknown user and a wrong password.  Value chosen arbitrarily; it can never
- * authenticate because a real store entry is preferred when it exists. */
-static const char k_dummy_hash[CREDENTIAL_HASH_HEX_LEN + 1] =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-
-bool credentials_verify(const CredentialStore* store, const char* user,
-                        const char* presented_hash_hex) {
-  if (!store || !user || !presented_hash_hex || !credentials_hash_valid(presented_hash_hex))
-    return false;
-  const char* stored = k_dummy_hash;
-  for (int i = 0; i < store->count; i++) {
-    /* Constant-time username match: no early return, so time depends on the
-     * fixed compare window and a byte-wise prefix match cannot be observed. */
-    if (username_secure_equal(store->entries[i].user, user))
-      stored = store->entries[i].password_hex;
-  }
-  return credentials_secure_equal(presented_hash_hex, stored, CREDENTIAL_HASH_HEX_LEN);
-}
-
-bool credentials_gate_allows(const CredentialStore* store, const char* const* module_users,
-                             int module_user_count, const char* presented_user,
-                             const char* presented_hash_hex) {
-  if (!store || module_user_count < 0)
-    return false; /* fail closed: an auth-required module without a store refuses */
-  if (!presented_user || !presented_hash_hex)
-    return false; /* no credentials presented */
-  bool on_module_list = false;
-  for (int i = 0; i < module_user_count; i++) {
-    /* Constant-time match against the module's auth-users list, for the same
-     * reason as credentials_verify, so the list is not an enumeration oracle. */
-    if (module_users[i] && username_secure_equal(module_users[i], presented_user)) {
-      on_module_list = true;
-      break;
-    }
-  }
-  if (!on_module_list)
-    return false;
-  return credentials_verify(store, presented_user, presented_hash_hex);
 }

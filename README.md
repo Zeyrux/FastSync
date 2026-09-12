@@ -507,12 +507,18 @@ defaults to the current directory. |
 
 ## Protocol and Security
 
-FastSync protocol version `2.18.0` is shared by the client and server. The
+FastSync protocol version `2.19.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
 manifests, keep-alives, abort handling, per-file remove-source results, and
 FastSync-native delta messages.
 Client and server versions must currently match exactly.
+
+Daemon modules that declare `auth users` authenticate with a SCRAM-SHA-256-style
+challenge/response against a salted PBKDF2 verifier store: no password and no
+replayable bearer credential crosses the wire or is stored on the daemon. Store
+lines are generated with `fastsync-server --hash-credentials <plaintext-file>`
+(see `RSYNC_COMPAT.md`); legacy `user:SHA256HEX` stores are rejected.
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not

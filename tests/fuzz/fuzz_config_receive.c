@@ -26,10 +26,12 @@
  * pre-loaded into a second pipe so a single thread suffices.
  */
 #include "config.h"
+#include "credentials.h"
 #include "protocol.h"
 #include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/evp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +52,7 @@ static unsigned char* g_frame;
 static size_t g_frame_len;
 static size_t g_version_len;       /* length of the leading version-string frame */
 static size_t g_usermap_count_off; /* offset of the usermap count int, 0 = unknown */
+static size_t g_auth_off;          /* offset of the auth presence int, 0 = unknown */
 static bool g_frame_ready;
 
 /* Read the canonical frame from the send peer.  The producer shuts down its
@@ -97,6 +100,10 @@ static void build_canonical_frame(void) {
     return;
   cfg->send_directory = str_dup("/src");
   cfg->receive_root_directory = str_dup("/dst");
+  /* Force the shortened auth block (`[present][username]`) to be present so the
+   * fuzzer can mutate it. */
+  cfg->auth_user = str_dup("alice");
+  cfg->auth_password = str_dup("alice-s3cret");
   /* Force the three P8 tail fields to be present (copy-as requires metadata). */
   cfg->copy_as_set = true;
   cfg->copy_as_uid = 0;
@@ -171,6 +178,94 @@ out:
       }
     }
   }
+
+  /* Locate the auth username string (a size_t length followed by its bytes);
+   * the presence int sits one int before the length. */
+  const char* auth_name = "alice";
+  size_t auth_name_len = strlen(auth_name);
+  if (g_frame_len >= sizeof(size_t) + auth_name_len + sizeof(int)) {
+    for (size_t i = sizeof(size_t); i + auth_name_len <= g_frame_len; i++) {
+      if (memcmp(g_frame + i, auth_name, auth_name_len) != 0)
+        continue;
+      size_t found_len = 0;
+      memcpy(&found_len, g_frame + i - sizeof(size_t), sizeof(size_t));
+      if (found_len == auth_name_len) {
+        g_auth_off = i - sizeof(size_t) - sizeof(int);
+        break;
+      }
+    }
+  }
+}
+
+/* Fuzz the A7 auth crypto primitives directly: arbitrary bytes through the
+ * base64 decoder, plus a self-consistent SCRAM property (a proof built from a
+ * chosen client key must verify, while a tampered proof, a proof replayed
+ * against a different nonce, and a not-found verifier must all be refused). */
+static uint8_t pick_byte(const uint8_t* data, size_t size, size_t index) {
+  return size ? data[index % size] : 0;
+}
+
+static void fuzz_credentials(const uint8_t* data, size_t size) {
+  char b64[300];
+  size_t n = size < sizeof(b64) - 1 ? size : sizeof(b64) - 1;
+  memcpy(b64, data, n);
+  b64[n] = '\0';
+  uint8_t decoded[64];
+  size_t decoded_len = 0;
+  (void)credentials_b64_decode(b64, decoded, sizeof(decoded), &decoded_len);
+
+  uint8_t client_key[CREDENTIAL_KEY_LEN];
+  uint8_t stored_key[CREDENTIAL_KEY_LEN];
+  uint8_t server_key[CREDENTIAL_KEY_LEN];
+  uint8_t snonce[CREDENTIAL_NONCE_LEN];
+  uint8_t cnonce[CREDENTIAL_NONCE_LEN];
+  for (size_t i = 0; i < CREDENTIAL_KEY_LEN; i++) {
+    client_key[i] = pick_byte(data, size, i);
+    server_key[i] = pick_byte(data, size, i + CREDENTIAL_KEY_LEN);
+  }
+  for (size_t i = 0; i < CREDENTIAL_NONCE_LEN; i++) {
+    snonce[i] = pick_byte(data, size, i + 2 * CREDENTIAL_KEY_LEN);
+    cnonce[i] = pick_byte(data, size, i + 2 * CREDENTIAL_KEY_LEN + CREDENTIAL_NONCE_LEN);
+  }
+  unsigned int stored_len = 0;
+  if (EVP_Digest(client_key, sizeof(client_key), stored_key, &stored_len, EVP_sha256(), NULL) !=
+          1 ||
+      stored_len != CREDENTIAL_KEY_LEN)
+    return;
+  uint8_t auth_msg[CREDENTIAL_AUTH_MESSAGE_MAX];
+  size_t msg_len = 0;
+  if (!credentials_build_auth_message("alice", snonce, cnonce, auth_msg, sizeof(auth_msg),
+                                      &msg_len))
+    return;
+  uint8_t proof[CREDENTIAL_KEY_LEN];
+  uint8_t server_sig[CREDENTIAL_KEY_LEN];
+  if (!credentials_client_proof(client_key, stored_key, server_key, auth_msg, msg_len, proof,
+                                server_sig))
+    return;
+  CredentialVerifier verifier;
+  memset(&verifier, 0, sizeof(verifier));
+  verifier.found = true;
+  verifier.iters = CREDENTIAL_DEFAULT_ITERS;
+  memcpy(verifier.stored_key, stored_key, CREDENTIAL_KEY_LEN);
+  memcpy(verifier.server_key, server_key, CREDENTIAL_KEY_LEN);
+  uint8_t out_sig[CREDENTIAL_KEY_LEN];
+  if (!credentials_verify_response(&verifier, "alice", snonce, cnonce, proof, out_sig))
+    abort();
+  if (memcmp(out_sig, server_sig, CREDENTIAL_KEY_LEN) != 0)
+    abort();
+  uint8_t bad_proof[CREDENTIAL_KEY_LEN];
+  memcpy(bad_proof, proof, CREDENTIAL_KEY_LEN);
+  bad_proof[pick_byte(data, size, 0) % CREDENTIAL_KEY_LEN] ^= 0x01;
+  if (credentials_verify_response(&verifier, "alice", snonce, cnonce, bad_proof, out_sig))
+    abort();
+  uint8_t other_cnonce[CREDENTIAL_NONCE_LEN];
+  memcpy(other_cnonce, cnonce, CREDENTIAL_NONCE_LEN);
+  other_cnonce[pick_byte(data, size, 1) % CREDENTIAL_NONCE_LEN] ^= 0x80;
+  if (credentials_verify_response(&verifier, "alice", snonce, other_cnonce, proof, out_sig))
+    abort();
+  verifier.found = false;
+  if (credentials_verify_response(&verifier, "alice", snonce, cnonce, proof, out_sig))
+    abort();
 }
 
 /* Best-effort non-blocking write: an oversized fuzz input is truncated rather
@@ -219,6 +314,8 @@ static void receive_stream(const unsigned char* prefix, size_t prefix_len, const
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+  fuzz_credentials(data, size);
+
   if (!g_frame_ready)
     build_canonical_frame();
 
@@ -228,6 +325,10 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (g_frame) {
     /* Keep the valid version prefix, fuzz everything after it. */
     receive_stream(g_frame, g_version_len, data, size);
+
+    /* Keep the valid frame up to the shortened auth block, fuzz it. */
+    if (g_auth_off > 0)
+      receive_stream(g_frame, g_auth_off, data, size);
 
     /* Keep the valid frame up to the P8 tail, fuzz super_mode + copy-as. */
     if (g_frame_len > P8_TAIL_BYTES)

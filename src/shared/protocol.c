@@ -413,6 +413,14 @@ static const char* status_to_string(Status status) {
     return "SPECIAL";
   case STATUS_DIR_TIMES:
     return "DIR_TIMES";
+  case STATUS_AUTH_CHALLENGE:
+    return "AUTH_CHALLENGE";
+  case STATUS_AUTH_RESPONSE:
+    return "AUTH_RESPONSE";
+  case STATUS_AUTH_OK:
+    return "AUTH_OK";
+  case STATUS_AUTH_FAILED:
+    return "AUTH_FAILED";
   default:
     return "UNKNOWN";
   }

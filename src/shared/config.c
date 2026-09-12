@@ -41,7 +41,7 @@ static void config_set_defaults(Config* config) {
   config->ssh_destination = NULL;
   config->module = NULL;
   config->auth_user = NULL;
-  config->auth_password_hash = NULL;
+  config->auth_password = NULL;
   config->password_file = NULL;
   config->iconv_spec = NULL;
   config->fastsync_server_path = NULL;
@@ -630,6 +630,20 @@ void config_parse_ssh_dest(Config* config) {
   config->receive_root_directory = path;
 }
 
+void config_burn_auth(Config* config) {
+  if (!config)
+    return;
+  if (config->auth_password) {
+    credentials_burn(config->auth_password, strlen(config->auth_password));
+    free(config->auth_password);
+    config->auth_password = NULL;
+  }
+  if (config->auth_user) {
+    free(config->auth_user);
+    config->auth_user = NULL;
+  }
+}
+
 void config_delete(Config* config) {
   if (config == NULL)
     return;
@@ -642,8 +656,7 @@ void config_delete(Config* config) {
   free(config->receive_root_directory);
   free(config->ssh_destination);
   free(config->module);
-  free(config->auth_user);
-  free(config->auth_password_hash);
+  config_burn_auth(config);
   free(config->password_file);
   free(config->iconv_spec);
   free(config->write_batch);
@@ -1128,23 +1141,18 @@ static bool receive_daemon_module(int fd, Config* c) {
   return true;
 }
 
-/* Daemon password credentials (Wave B, within protocol 2.15.0 -- see the
- * PROTOCOL_VERSION note in config.h: this rides the Wave A trailing-string
- * area, symmetric sender+receiver in every 2.15.0 build, so it is not a frame
- * layout that needs its own bump).  A single presence int is followed, when
- * set, by the username and the SHA-256 hex digest of the password.  The
- * literal password never crosses the wire. */
+/* Daemon password credentials (A7 remediation, protocol 2.19.0).  A single
+ * presence int is followed, when set, by ONLY the username; the password is
+ * never serialized.  The daemon answers an auth-required module with the SCRAM
+ * challenge (see the auth exchange below). */
 static bool send_daemon_auth(int fd, const Config* c) {
-  bool present = c->auth_user != NULL && c->auth_password_hash != NULL && c->auth_user[0] != '\0' &&
-                 c->auth_password_hash[0] != '\0';
+  bool present = c->auth_user != NULL && c->auth_user[0] != '\0';
   if (!send_int(fd, present ? 1 : 0))
     return false;
   if (!present)
     return true;
-  /* Redacted send: the username and hard-wired digest must never reach a
-   * --verbose debug log (they are replayable), while normal protocol strings
-   * keep their debug trace. */
-  return send_str_redacted(fd, c->auth_user) && send_str_redacted(fd, c->auth_password_hash);
+  /* Redacted send: the username must never reach a --verbose debug log. */
+  return send_str_redacted(fd, c->auth_user);
 }
 
 static bool receive_daemon_auth(int fd, Config* c) {
@@ -1153,25 +1161,105 @@ static bool receive_daemon_auth(int fd, Config* c) {
     return false;
   if (!present)
     return true;
-  /* Redacted receive: never log the incoming username/digest bodies. */
+  /* Redacted receive: never log the incoming username body. */
   char* user = receive_str_redacted(fd);
-  char* hash = receive_str_redacted(fd);
-  if (!user || !hash) {
-    free(user);
-    free(hash);
+  if (!user)
     return false;
-  }
-  size_t user_len = strlen(user);
-  bool valid = user_len > 0 && user_len <= CREDENTIAL_MAX_USER_LEN && credentials_hash_valid(hash);
-  if (!valid) {
+  if (!credentials_username_valid(user)) {
     free(user);
-    free(hash);
     log_message(LOG_LEVEL_WARNING, "Daemon client sent malformed auth credentials");
     return false;
   }
   c->auth_user = user;
-  c->auth_password_hash = hash;
   return true;
+}
+
+/* Client half of the SCRAM challenge/response (A7 remediation).  Called by
+ * config_send after the config frame is written and the server answered
+ * STATUS_AUTH_CHALLENGE.  The plaintext password lives only in
+ * config->auth_password and every derived buffer is wiped on the way out. */
+static bool client_auth_exchange(int fd, const Config* c) {
+  if (!c->auth_user || !c->auth_password)
+    return false;
+  int iters = 0;
+  if (!receive_int(fd, &iters))
+    return false;
+  if (iters < (int)CREDENTIAL_MIN_ITERS || iters > (int)CREDENTIAL_MAX_ITERS) {
+    log_message(LOG_LEVEL_ERROR, "Daemon sent an out-of-range auth iteration count");
+    return false;
+  }
+  char* salt_b64 = receive_str(fd);
+  char* snonce_b64 = receive_str(fd);
+  uint8_t salt[CREDENTIAL_SALT_LEN];
+  uint8_t snonce[CREDENTIAL_NONCE_LEN];
+  uint8_t cnonce[CREDENTIAL_NONCE_LEN];
+  size_t salt_len = 0;
+  size_t snonce_len = 0;
+  bool ok = salt_b64 && snonce_b64 &&
+            credentials_b64_decode(salt_b64, salt, sizeof(salt), &salt_len) &&
+            salt_len == CREDENTIAL_SALT_LEN &&
+            credentials_b64_decode(snonce_b64, snonce, sizeof(snonce), &snonce_len) &&
+            snonce_len == CREDENTIAL_NONCE_LEN && credentials_random_bytes(cnonce, sizeof(cnonce));
+  credentials_burn(salt_b64, salt_b64 ? strlen(salt_b64) : 0);
+  credentials_burn(snonce_b64, snonce_b64 ? strlen(snonce_b64) : 0);
+  free(salt_b64);
+  free(snonce_b64);
+  if (!ok) {
+    log_message(LOG_LEVEL_ERROR, "Daemon sent a malformed auth challenge");
+    return false;
+  }
+  uint8_t client_key[CREDENTIAL_KEY_LEN];
+  uint8_t stored_key[CREDENTIAL_KEY_LEN];
+  uint8_t server_key[CREDENTIAL_KEY_LEN];
+  uint8_t auth_msg[CREDENTIAL_AUTH_MESSAGE_MAX];
+  size_t msg_len = 0;
+  uint8_t proof[CREDENTIAL_KEY_LEN];
+  uint8_t expected_sig[CREDENTIAL_KEY_LEN];
+  ok = credentials_compute_keys(c->auth_password, salt, (uint32_t)iters, client_key, stored_key,
+                                server_key) &&
+       credentials_build_auth_message(c->auth_user, snonce, cnonce, auth_msg, sizeof(auth_msg),
+                                      &msg_len) &&
+       credentials_client_proof(client_key, stored_key, server_key, auth_msg, msg_len, proof,
+                                expected_sig);
+  char cnonce_b64[45];
+  char proof_b64[45];
+  if (ok)
+    ok = credentials_b64_encode(cnonce, sizeof(cnonce), cnonce_b64, sizeof(cnonce_b64)) &&
+         credentials_b64_encode(proof, sizeof(proof), proof_b64, sizeof(proof_b64));
+  if (!ok) {
+    log_message(LOG_LEVEL_ERROR, "Failed to compute the daemon auth response");
+  } else {
+    ok = send_status(fd, STATUS_AUTH_RESPONSE) && send_str_redacted(fd, cnonce_b64) &&
+         send_str_redacted(fd, proof_b64);
+  }
+  if (ok) {
+    Status status = STATUS_ERROR;
+    char* sig_b64 = NULL;
+    uint8_t sig[CREDENTIAL_KEY_LEN];
+    size_t sig_len = 0;
+    ok = receive_status(fd, &status) && status == STATUS_AUTH_OK &&
+         (sig_b64 = receive_str_redacted(fd)) != NULL &&
+         credentials_b64_decode(sig_b64, sig, sizeof(sig), &sig_len) &&
+         sig_len == CREDENTIAL_KEY_LEN &&
+         credentials_secure_equal((const char*)sig, (const char*)expected_sig, CREDENTIAL_KEY_LEN);
+    if (!ok)
+      log_message(LOG_LEVEL_ERROR, "Daemon authentication failed");
+    credentials_burn(sig_b64, sig_b64 ? strlen(sig_b64) : 0);
+    credentials_burn((char*)sig, sizeof(sig));
+    free(sig_b64);
+  }
+  credentials_burn((char*)client_key, sizeof(client_key));
+  credentials_burn((char*)stored_key, sizeof(stored_key));
+  credentials_burn((char*)server_key, sizeof(server_key));
+  credentials_burn((char*)auth_msg, sizeof(auth_msg));
+  credentials_burn((char*)proof, sizeof(proof));
+  credentials_burn((char*)expected_sig, sizeof(expected_sig));
+  credentials_burn((char*)salt, sizeof(salt));
+  credentials_burn((char*)snonce, sizeof(snonce));
+  credentials_burn((char*)cnonce, sizeof(cnonce));
+  credentials_burn(cnonce_b64, sizeof(cnonce_b64));
+  credentials_burn(proof_b64, sizeof(proof_b64));
+  return ok;
 }
 
 /* --iconv CONVERT_SPEC (protocol 2.16.0).  Trailing string on the config frame,
@@ -1268,6 +1356,14 @@ bool config_send(int file_descriptor, const Config* config) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return false;
+  if (status == STATUS_AUTH_CHALLENGE) {
+    /* Daemon auth (protocol 2.19.0): run the SCRAM exchange, then wait for the
+     * ordinary STATUS_OK the server sends once authentication succeeded. */
+    if (!client_auth_exchange(file_descriptor, config))
+      return false;
+    if (!receive_status(file_descriptor, &status))
+      return false;
+  }
   if (status != STATUS_OK) {
     log_message(LOG_LEVEL_ERROR, "Error transmitting config");
     return false;
@@ -1329,9 +1425,14 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
     if (rejection != NULL) {
       /* Daemon module gate (unknown module / read-only module / auth-required
        * module): refuse BEFORE the STATUS_OK so the client aborts at the
-       * config handshake and no file data is ever exchanged. */
-      fprintf(stderr, "%s\n", rejection);
-      send_status(file_descriptor, STATUS_ERROR);
+       * config handshake and no file data is ever exchanged.  The auth
+       * handshake already sent STATUS_AUTH_FAILED when it failed, signalled by
+       * the CONFIG_VALIDATE_ALREADY_TERMINATED sentinel, so no second status is
+       * written. */
+      if (rejection != CONFIG_VALIDATE_ALREADY_TERMINATED) {
+        fprintf(stderr, "%s\n", rejection);
+        send_status(file_descriptor, STATUS_ERROR);
+      }
       goto error;
     }
   }

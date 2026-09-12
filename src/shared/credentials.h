@@ -3,45 +3,68 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 
-/* Daemon password authentication (Wave B).
+/* Daemon password authentication (A7 remediation, protocol 2.19.0).
  *
- * FastSync authenticates a daemon connection with a username plus a SHA-256
- * hex digest of that username's password.  The digest is what crosses the
- * wire: a challenge-less credential exchange, so the literal password is never
- * transmitted (and never stored on the daemon host).  A module that declares
- * `auth users` demands that the presented username is on its list AND that the
- * presented digest matches the credential store's entry for that username.
- * The digest comparison is constant-time; a module with `auth users` whose
- * store is missing/misconfigured fails CLOSED (never falls open).
+ * FastSync authenticates a daemon connection with a SCRAM-SHA-256-style
+ * challenge/response handshake.  The daemon stores only a salted PBKDF2
+ * verifier (never the password, and never a value that can be replayed as a
+ * bearer credential): the client proves knowledge of the password against a
+ * per-connection server nonce, and the server proves the same shared secret
+ * back.  See credentials.c for the exact derivation.
  *
- * Credential store format (server --password-file and --early-input): one
- * `user:SHA256HEX` entry per line.  SHA256HEX is the lowercase hex SHA-256 of
- * the user's password -- the exact value a FastSync client transmits.  Blank
- * lines and lines whose first non-space character is '#' or ';' are comments.
- * The parser is STRICT: a malformed line (no ':', an empty/whitespace user, a
- * secret that is not 64 lowercase hex chars, a line longer than
- * CREDENTIAL_MAX_LINE) fails the whole load so a typo can never silently
- * change who may log in.
+ * Server credential store format (--password-file and --early-input): one line
+ * per entry,
+ *   user:$fastsync$1$pbkdf2-sha256$<iters>$<salt_b64>$<stored_key_b64>$<server_key_b64>
+ * with standard base64, a 16-byte salt and 32-byte keys, and iters in
+ * [CREDENTIAL_MIN_ITERS, CREDENTIAL_MAX_ITERS].  Blank lines and lines whose
+ * first non-space character is '#' or ';' are comments.  The parser is STRICT:
+ * a malformed line fails the whole load so a typo can never silently change who
+ * may log in.  A line holding the legacy (unsalted SHA-256 hex) secret is
+ * hard-rejected with an actionable "legacy" error; there is no auto-upgrade.
+ * Use `fastsync-server --hash-credentials` to generate new-format lines.
  *
  * Client --password-file format: the FIRST meaningful (non-comment, non-blank)
- * line is `user:password`, holding the literal password.  The client hashes it
- * and sends only the digest; the file should be mode 0600 and readable only by
- * its owner.
- */
+ * line is `user:password`, holding the literal password.  The client keeps it
+ * only for the duration of the handshake and wipes it at teardown; the file
+ * should be mode 0600 and readable only by its owner. */
 
-/* Lowercase hex length of a SHA-256 digest (what travels on the wire and what
- * the server store holds). */
-#define CREDENTIAL_HASH_HEX_LEN 64
 /* Longest accepted credential-file line (excluding the trailing newline). */
 #define CREDENTIAL_MAX_LINE 4096
 /* Upper bound on a username in a credential file and on the wire.  Kept well
  * below MAX_STRING_SIZE so a wire username can never exhaust anything. */
 #define CREDENTIAL_MAX_USER_LEN 256
-/* Upper bound on a client-file password (before hashing). */
+/* Upper bound on a client-file password (before derivation). */
 #define CREDENTIAL_MAX_PASSWORD_LEN 1024
 
+/* SCRAM-SHA-256 parameters.  Salt and client nonce sizes are fixed by the
+ * shared-auth-message framing; keys are always 32 bytes (SHA-256). */
+#define CREDENTIAL_SALT_LEN 16
+#define CREDENTIAL_NONCE_LEN 32
+#define CREDENTIAL_KEY_LEN 32
+#define CREDENTIAL_DEFAULT_ITERS 600000u
+#define CREDENTIAL_MIN_ITERS 100000u
+#define CREDENTIAL_MAX_ITERS 10000000u
+/* Buffer size for the full AuthMessage (prefix + three length-prefixed fields).
+ * Worst case: 16 + 4 + 256 + 4 + 32 + 4 + 32. */
+#define CREDENTIAL_AUTH_MESSAGE_MAX                                                                \
+  (16 + 4 + CREDENTIAL_MAX_USER_LEN + 4 + CREDENTIAL_NONCE_LEN + 4 + CREDENTIAL_NONCE_LEN)
+
 typedef struct CredentialStore CredentialStore;
+
+/* One resolved verifier.  `found` is false for an unknown user or a user not on
+ * a module's auth list; the remaining fields then hold a fresh random salt, the
+ * default iteration count and fixed dummy keys, so the server can run the same
+ * challenge/response math with no enumeration/timing oracle. */
+typedef struct {
+  uint8_t salt[CREDENTIAL_SALT_LEN];
+  uint32_t iters;
+  uint8_t stored_key[CREDENTIAL_KEY_LEN];
+  uint8_t server_key[CREDENTIAL_KEY_LEN];
+  bool found;
+} CredentialVerifier;
 
 /* Load the daemon credential store.
  *
@@ -52,69 +75,105 @@ typedef struct CredentialStore CredentialStore;
  * module with a partial store.  Both files may be NULL, which yields an empty
  * store (every auth-required module then refuses connections).  When both are
  * given, the --early-input file is layered over --password-file: a duplicate
- * username whose secret matches is deduplicated; one whose secret differs is
- * an error (the two sources disagree), never a silent pick.
+ * username whose verifier matches is deduplicated; one whose verifier differs
+ * is an error (the two sources disagree), never a silent pick.
  *
  * The returned store is heap-owned; free it with credentials_free. */
 CredentialStore* credentials_load(const char* password_file, const char* early_input_file,
                                   char* err, size_t err_size);
 
+/* Wipe every stored key/salt and free the store. */
 void credentials_free(CredentialStore* store);
 
-/* True when `hash_hex` is exactly CREDENTIAL_HASH_HEX_LEN lowercase hex digits
- * (the wire/store digest form).  Used to reject a malformed presented digest
- * before it reaches the comparison. */
-bool credentials_hash_valid(const char* hash_hex);
+/* True when `user` is a single bounded token free of whitespace/control bytes
+ * (the rule applied to store users, client-file users and the module list). */
+bool credentials_username_valid(const char* user);
 
-/* Compute the lowercase hex SHA-256 of `password` into out_hex, which must
- * hold at least CREDENTIAL_HASH_HEX_LEN + 1 bytes.  Returns false on a NULL
- * password or a hashing failure.  The output is NUL-terminated. */
-bool credentials_hash_password(const char* password, char* out_hex);
+/* Standard base64.  encode writes NUL-terminated output to out (size out_sz).
+ * decode writes the raw bytes to out (capacity out_sz) and stores the length;
+ * the input must be a well-formed padded base64 string.  Both return false on
+ * NULL arguments, a bad character/length, or insufficient output space. */
+bool credentials_b64_encode(const uint8_t* in, size_t n, char* out, size_t out_sz);
+bool credentials_b64_decode(const char* in, uint8_t* out, size_t out_sz, size_t* out_len);
+
+/* Fill out[0..n) from the CSPRNG (RAND_bytes).  Returns false on failure. */
+bool credentials_random_bytes(uint8_t* out, size_t n);
+
+/* Resolve `user` against the store AND the module's auth-user list.  The list
+ * scan is a constant-time full-length comparison with no early break.  On a
+ * miss, *out is filled with a dummy verifier (fresh random salt, default
+ * iterations, fixed dummy keys, found=false).  Returns false only on invalid
+ * arguments/allocation failure. */
+bool credentials_get_verifier(const CredentialStore* store, const char* user,
+                              const char* const* module_users, int n, CredentialVerifier* out);
+
+/* Derive the SCRAM keys from a plaintext password:
+ *   K = PBKDF2-HMAC-SHA256(password, salt, iters, 32)
+ *   ClientKey = HMAC-SHA256(K, "Client Key"); StoredKey = SHA256(ClientKey)
+ *   ServerKey = HMAC-SHA256(K, "Server Key")
+ * Any of client_key/stored_key/server_key may be NULL when not needed. */
+bool credentials_compute_keys(const char* password, const uint8_t salt[CREDENTIAL_SALT_LEN],
+                              uint32_t iters, uint8_t client_key[CREDENTIAL_KEY_LEN],
+                              uint8_t stored_key[CREDENTIAL_KEY_LEN],
+                              uint8_t server_key[CREDENTIAL_KEY_LEN]);
+
+/* Serialize the shared AuthMessage:
+ *   "FastSync-Auth-v1" || be32(len(user)) || user
+ *                      || be32(32) || server_nonce
+ *                      || be32(32) || client_nonce
+ * out must hold at least CREDENTIAL_AUTH_MESSAGE_MAX bytes.  *out_len receives
+ * the number of bytes written. */
+bool credentials_build_auth_message(const char* user, const uint8_t* snonce, const uint8_t* cnonce,
+                                    uint8_t* out, size_t out_sz, size_t* out_len);
+
+/* Client side: ClientProof = ClientKey XOR HMAC(StoredKey, AuthMessage), and
+ * the expected ServerSignature = HMAC(ServerKey, AuthMessage). */
+bool credentials_client_proof(const uint8_t client_key[CREDENTIAL_KEY_LEN],
+                              const uint8_t stored_key[CREDENTIAL_KEY_LEN],
+                              const uint8_t server_key[CREDENTIAL_KEY_LEN], const uint8_t* auth_msg,
+                              size_t msg_len, uint8_t proof[CREDENTIAL_KEY_LEN],
+                              uint8_t server_sig[CREDENTIAL_KEY_LEN]);
+
+/* Server side: recompute ClientSig' = HMAC(StoredKey, AuthMessage) and
+ * ClientKey' = proof XOR ClientSig', then accept iff v->found AND
+ * SHA256(ClientKey') equals StoredKey (constant-time over the 32-byte keys).
+ * Always computes server_sig_out = HMAC(ServerKey, AuthMessage).  Returns the
+ * accept decision. */
+bool credentials_verify_response(const CredentialVerifier* v, const char* user,
+                                 const uint8_t* snonce, const uint8_t* cnonce,
+                                 const uint8_t proof[CREDENTIAL_KEY_LEN],
+                                 uint8_t server_sig_out[CREDENTIAL_KEY_LEN]);
+
+/* Derive a new-format store line for `user`/`password` and write it (without a
+ * trailing newline) into out.  A random 16-byte salt is used.  On failure err is
+ * filled.  Used by --hash-credentials and by tests. */
+bool credentials_hash_store_line(const char* user, const char* password, uint32_t iters, char* out,
+                                 size_t out_sz, char* err, size_t err_size);
+
+/* Read `user:password` lines from `path` (the same owner-only check as the
+ * other secret files) and write one new-format store line per entry to `out`.
+ * Blank/comment lines are skipped; a malformed line fails the whole run.
+ * Returns 0 on success, -1 on error (err filled).  Used by
+ * `--hash-credentials`. */
+int credentials_hash_file(const char* path, uint32_t iters, FILE* out, char* err, size_t err_size);
 
 /* Read the CLIENT-side secret file: the first meaningful line is
  * `user:password` (the literal password).  *user_out and *password_out are
- * freshly allocated on success (password is plaintext -- the caller hashes it
- * and then burns/frees it); both are NULL on error.  Returns 0 on success, -1
- * on failure (err filled: the path is named, never the credential itself).
- * Only the line's trailing CR/LF are stripped: the password's bytes are
- * otherwise preserved exactly, so a password with leading/trailing whitespace
- * (after the ':') is kept usable.  The username is trimmed of surrounding
- * space/tabs. */
+ * freshly allocated on success (password is plaintext -- the caller derives the
+ * proof and then burns/frees it); both are NULL on error.  Returns 0 on
+ * success, -1 on failure (err filled: the path is named, never the credential
+ * itself).  Only the line's trailing CR/LF are stripped: the password's bytes
+ * are otherwise preserved exactly, so a password with leading/trailing
+ * whitespace (after the ':') is kept usable.  The username is trimmed of
+ * surrounding space/tabs. */
 int credentials_read_secret_file(const char* path, char** user_out, char** password_out, char* err,
                                  size_t err_size);
 
-/* Constant-time equality over exactly len bytes.  Returns true when the two
- * buffers match.  No early exit: the whole length is always scanned, so a
- * timing side-channel cannot reveal how many leading bytes matched. */
+/* Constant-time equality over exactly len bytes. */
 bool credentials_secure_equal(const char* a, const char* b, size_t len);
 
-/* Overwrite secret[0..len) with zeros (best-effort wipe of a plaintext
- * password that is about to be freed). */
+/* Overwrite secret[0..len) with zeros (best-effort wipe). */
 void credentials_burn(char* secret, size_t len);
-
-/* Verify a presented (user, digest) against the store.  Returns true only when
- * the store holds an entry for `user` whose stored digest equals the presented
- * one.  A NULL store, NULL user/digest, unknown user and wrong digest all
- * return false.  The digest comparison runs over a fixed dummy whenever the
- * user is absent, and the username lookup is a single constant-time
- * full-length compare (no byte-wise early exit), so neither "unknown user" vs
- * "wrong password" nor a username prefix match can be distinguished by timing
- * (no user-enumeration oracle in the comparison path). */
-bool credentials_verify(const CredentialStore* store, const char* user,
-                        const char* presented_hash_hex);
-
-/* The daemon's per-module auth decision, in one pure, unit-testable function.
- * `module_users`/`module_user_count` are the module's `auth users` list; a
- * module that declares auth users requires the presented user to be ON that
- * list AND to verify against the store.  Returns false (fail closed) when the
- * store is NULL, when no credential was presented, when the user is not on the
- * module's list, or when verification fails.  This is the single decision the
- * server_module_gate seam applies to an auth-required module.  Like
- * credentials_verify, username matches here use a constant-time full-length
- * compare rather than a byte-wise-short-circuiting strcmp. */
-bool credentials_gate_allows(const CredentialStore* store, const char* const* module_users,
-                             int module_user_count, const char* presented_user,
-                             const char* presented_hash_hex);
 
 /* Number of entries currently in the store (tests/introspection). */
 int credentials_store_size(const CredentialStore* store);

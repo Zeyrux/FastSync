@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Parsed fastsync-server command line.  All string members are borrowed
  * pointers into the original argv (valid for the life of the argv array the
@@ -26,7 +27,13 @@ typedef struct ServerCliOptions {
   const char* config_path;      /* --config value, or NULL */
   const char* password_file;    /* --password-file value, or NULL (daemon) */
   const char* early_input_file; /* --early-input value, or NULL (daemon) */
-  const char** dparams;         /* raw --dparam override strings */
+  /* --hash-credentials=FILE: read `user:password` lines from FILE and print
+   * new-format credential-store lines to stdout, then exit.  Standalone mode
+   * (mutually exclusive with --daemon/--stdio). */
+  const char* hash_credentials_file;
+  bool hash_iterations_set; /* an explicit --iterations was given */
+  uint32_t hash_iterations; /* --iterations value (default CREDENTIAL_DEFAULT_ITERS) */
+  const char** dparams;     /* raw --dparam override strings */
   int dparam_count;
   const char* bind_address;   /* --address */
   int bind_family;            /* AF_UNSPEC / AF_INET / AF_INET6 */

@@ -113,7 +113,20 @@ enum NET_STATUS {
    * than MAX_MANIFEST_ENTRIES is split across repeated frames.  The receiver
    * defers the actual utimensat until its own delete/publish phase has
    * committed, then skips the whole set when -O/--omit-dir-times is set. */
-  STATUS_DIR_TIMES
+  STATUS_DIR_TIMES,
+  /* Daemon SCRAM-SHA-256 authentication (A7 remediation, protocol 2.19.0).
+   * STATUS_AUTH_CHALLENGE: the server requires auth and is about to send the
+   * iteration count, the base64 salt and the base64 server nonce.
+   * STATUS_AUTH_RESPONSE: the client's reply, followed by the base64 client
+   * nonce and the base64 ClientProof.  STATUS_AUTH_OK: the client proof
+   * verified, followed by the base64 ServerSignature.  STATUS_AUTH_FAILED:
+   * a single generic refusal (unknown user, off-list user, wrong proof,
+   * missing/malformed credentials) after which the server closes without
+   * writing any data. */
+  STATUS_AUTH_CHALLENGE,
+  STATUS_AUTH_RESPONSE,
+  STATUS_AUTH_OK,
+  STATUS_AUTH_FAILED
 };
 
 void io_set_fds(int read_fd, int write_fd);
