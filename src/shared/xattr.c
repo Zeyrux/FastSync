@@ -352,13 +352,19 @@ bool fake_super_restore_fd(int fd) {
       5)
     return false; /* malformed record: skip, never fatal */
 
-  /* Owner is applied best-effort only: a non-root process cannot chown and must
-     not abort the transfer for that reason (FastSync identity philosophy). */
-  if (fchown(fd, (uid_t)ul_uid, (gid_t)ul_gid) != 0 && errno != EPERM && errno != EACCES &&
-      errno != EINVAL)
+  /* Owner is applied best-effort only: a non-root process cannot chown and
+     must not abort the transfer for that reason (FastSync identity philosophy).
+     EPERM/EACCES (expected for a non-root receiver) are skipped silently; a
+     genuine EINVAL (an impossible stored id) is logged so the corruption is
+     not hidden. */
+  if (fchown(fd, (uid_t)ul_uid, (gid_t)ul_gid) != 0 && errno != EPERM && errno != EACCES)
     log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore owner on destination file: %s",
                 strerror(errno));
-  if (fchmod(fd, (mode_t)(ul_mode & 07777U)) != 0)
+  /* Mode is applied through the same sanitization the normal metadata path
+     uses (metadata_mode): group/other write bits are never granted, so a
+     recorded source mode of 0666 restores as 0644 — identical to a non-fake-
+     super --preserve run, never a privilege-granting regression. */
+  if (fchmod(fd, (mode_t)(ul_mode & 0777U & ~(S_IWGRP | S_IWOTH))) != 0)
     log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mode on destination file: %s",
                 strerror(errno));
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},

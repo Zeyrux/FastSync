@@ -89,9 +89,11 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
 /* --fake-super replay: parse the FAKESUPER_XATTR record previously written on
  * `fd` by fake_super_store_fd and re-apply uid/gid/mode/mtime fd-relative.
  * Best-effort: absence of the xattr or a malformed record is a silent no-op
- * that never fails the transfer, and fchown is applied only when permitted
- * (a non-root EPERM is logged and skipped, matching FastSync's identity
- * philosophy).  Returns true when the xattr was present and parsed. */
+ * that never fails the transfer; fchown is applied only when permitted (a
+ * non-root EPERM/EACCES is skipped silently, matching FastSync's identity
+ * philosophy), and the mode is sanitized exactly like the normal metadata path
+ * (group/other write bits never granted).  Returns true when the xattr was
+ * present and parsed. */
 bool fake_super_restore_fd(int fd);
 
 #endif

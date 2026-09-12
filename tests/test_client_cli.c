@@ -2930,6 +2930,13 @@ static void test_parse_args_block_size() {
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_delta, positional_args, &positional_count), 0);
   EXPECT_EQ_INT((int)cfg->delta_block_size, 2048);
 
+  /* Inline =SIZE forms (the documented rsync spelling) are accepted too. */
+  cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
+  char* argv_eq[] = {"fastsync", "--block-size=8192", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_eq, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 8192);
+
   /* Out of range: parsed, warned, and the default is kept. */
   cfg->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
   char* argv_bad[] = {"fastsync", "--block-size", "1", "/src", "/dst"};

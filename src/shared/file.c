@@ -882,9 +882,12 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
         ok = true;
       } else {
         /* Preallocate the expected payload size before writing so an
-           out-of-space condition fails cleanly up front (--preallocate). */
+           out-of-space condition fails cleanly up front (--preallocate).
+           --sparse takes precedence: posix_fallocate would allocate every
+           block, defeating the holes the sparse writer would create, so the
+           two never combine here (the ftruncate presize below stays). */
         int prealloc_rc = 0;
-        if (preallocate && data_size > 0) {
+        if (preallocate && !sparse && data_size > 0) {
           prealloc_rc = preallocate_fd(fd, data_size);
           if (prealloc_rc != 0)
             log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
@@ -991,20 +994,24 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (fd < 0)
         continue; /* EEXIST (or a transient open error): try a fresh name. */
       int prealloc_rc = 0;
-      if (preallocate && data_size > 0) {
+      if (preallocate && !sparse && data_size > 0) {
         prealloc_rc = preallocate_fd(fd, data_size);
         if (prealloc_rc != 0)
           log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
                       strerror(prealloc_rc));
       }
       if (prealloc_rc == 0) {
-        write_attempted = true;
         lseek(fd, 0, SEEK_SET);
         if (sparse && data_size > 0)
           ok = ftruncate(fd, (off_t)data_size) == 0;
-        if (ok || (!sparse || data_size == 0))
+        /* A real write attempt begins here (the ftruncate presize succeeded or
+           no presize applies): a later mid-write / metadata / fsync / install
+           failure may leave partial data that --partial retention can rename. */
+        if (ok || (!sparse || data_size == 0)) {
+          write_attempted = true;
           ok = sparse && data_size > 0 ? write_all_sparse(fd, (const unsigned char*)data, data_size)
                                        : write_all(fd, data, data_size);
+        }
         if (ok && metadata)
           ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
         if (ok)
@@ -1047,8 +1054,10 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
            This only ever renames the already-written temp (never a corrupt
            blend); the rename can fail (cross-device, permissions) and we then
            fall through to the normal unlink cleanup.  Never retains when
-           keep_partial is off. */
-        if (!keep_partial || !write_attempted ||
+           keep_partial is off, when nothing was actually written, or under
+           --ignore-existing/--existing (no_replace), where the destination is
+           not ours to overwrite. */
+        if (!keep_partial || !write_attempted || no_replace ||
             renameat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, dirfd, leaf) != 0)
           unlinkat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, 0);
       }

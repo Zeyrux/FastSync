@@ -1244,14 +1244,15 @@ static void test_file_write_to_disk_sparse_preserves_holes() {
   }
 
   EXPECT_TRUE(file_store_write_secure(path, buf, size, false, true, NULL, false));
-  free(buf);
 
   /* Logical size must equal data_size exactly. */
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)size);
 
-  /* Content must round-trip exactly. */
+  /* Content must round-trip exactly: the full readback must equal the original
+     buffer byte-for-byte (header, the hole region staying zero, and tail) —
+     a writer bug in the lseek-offset bookkeeping would show up here. */
   int fd = open(path, O_RDONLY);
   EXPECT_TRUE(fd >= 0);
   /* cppcheck-suppress knownConditionTrueFalse -- EXPECT_TRUE above asserts,
@@ -1267,14 +1268,8 @@ static void test_file_write_to_disk_sparse_preserves_holes() {
         got += (unsigned long long)n;
       }
       EXPECT_EQ_INT((int)got, (int)size);
-      if (got == size) {
-        /* The middle hole region stays all-zero. */
-        for (unsigned long long i = 4096; i < size - 4096; i++)
-          if (readback[i] != 0) {
-            EXPECT_EQ_INT(0, 1);
-            break;
-          }
-      }
+      if (got == size)
+        EXPECT_EQ_INT(memcmp(readback, buf, size), 0);
       free(readback);
     }
     /* Tolerant sparseness check: seek for holes; skip if unsupported. */
@@ -1288,6 +1283,7 @@ static void test_file_write_to_disk_sparse_preserves_holes() {
     }
     close(fd);
   }
+  free(buf);
   unlink(path);
 }
 

@@ -4350,22 +4350,23 @@ class TestBlockSize:
         payload = os.urandom(300 * 1024)  # enough for several 1 KiB blocks
         with open(os.path.join(source, "big.bin"), "wb") as f:
             f.write(payload)
-        # First run installs the file; second run with delta + a small block size.
-        result, _ = run_client(source, dest, flags=["-S"],
-                               port=shared_server.port)
+        # First run installs the file as the destination basis (do NOT wipe it
+        # afterwards: the second run's delta must be computed against it).
+        result, _ = run_client(source, dest, port=shared_server.port)
         assert result.returncode == 0
         received = get_dest_received_dir(dest, source)
-        # Change the source, then delta-transfer with a non-default block size.
+        # Extend the source so it differs from the installed basis: the second
+        # run with --delta must compute a real delta against that basis.
         with open(os.path.join(source, "big.bin"), "ab") as f:
             f.write(os.urandom(4096))
-        clean_dir(dest)
         result, _ = run_client(source, dest,
                                flags=["--incremental", "--delta", flag, "1024"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"{flag} 1024 delta transfer failed: {(result.stderr or result.stdout)[:300]}"
         with open(os.path.join(received, "big.bin"), "rb") as f:
-            assert f.read() == open(os.path.join(source, "big.bin"), "rb").read()
+            with open(os.path.join(source, "big.bin"), "rb") as expect:
+                assert f.read() == expect.read()
 
 class TestOmitTimes:
     """-O/--omit-dir-times and -J/--omit-link-times are recognized and cross the
