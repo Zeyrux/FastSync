@@ -67,6 +67,13 @@ typedef struct {
    * before it reads the manifest, so no additional synchronization is needed
    * to suppress the manifest. */
   bool scan_stopped_early;
+  /* P7 Wave D: captured source directory times, filled by the scanner thread
+   * (and its parallel workers, guarded by dir_entries_mutex) and drained by the
+   * sender thread in the terminal STATUS_DIR_TIMES frame.  Owned by the
+   * context; NULL for non-metadata transfers. */
+  ArrayList* dir_entries;
+  mtx_t dir_entries_mutex;
+  bool dir_entries_mutex_init;
 } PipelineContextSender;
 
 typedef struct PipelineContextReceiver {
@@ -94,9 +101,13 @@ typedef struct PipelineContextReceiver {
      protocol stream but hands the manifest here instead of deleting while the
      disk writer may still be draining; the caller (server.c) commits the
      deletion after both threads have joined, so no extra is removed unless the
-      transfer truly succeeded.  NULL in the early delete modes (which delete at
-      the manifest). */
+     transfer truly succeeded.  NULL in the early delete modes (which delete at
+     the manifest). */
   DeleteManifest* deferred_manifest;
+  /* P7 Wave D: directory metadata collected by write_thread from received
+     directory entries.  Only write_thread mutates it (before it joins); the
+     caller (server.c) applies it after the delete/delay-updates phase. */
+  DirTimeList dir_times;
 } PipelineContextReceiver;
 
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,

@@ -103,7 +103,16 @@ enum NET_STATUS {
    * int32 rdev major/minor fields.  The receiver validates the kind and rdev,
    * confines the node below the receive root, and recreates it (mknod/mkfifo),
    * privilege-gating the mknod.  Protocol 2.13.0. */
-  STATUS_SPECIAL
+  STATUS_SPECIAL,
+  /* Directory-time superstructure (P7 Wave D, protocol 2.17.0): a single
+   * terminal frame sent after all file data (and after the optional delete
+   * manifest) carrying every source directory's captured metadata so the
+   * receiver can apply directory mtimes/atimes AFTER all of a directory's
+   * children have been written.  Payload: an int count, then count repetitions
+   * of (wire path string, metadata frame).  The receiver defers the actual
+   * utimensat until its own delete/publish phase has committed, then skips the
+   * whole set when -O/--omit-dir-times is set. */
+  STATUS_DIR_TIMES
 };
 
 void io_set_fds(int read_fd, int write_fd);

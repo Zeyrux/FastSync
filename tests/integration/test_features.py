@@ -4672,3 +4672,128 @@ class TestConnectivityClientOptions:
             f"--blocking-io -c failed: {(result.stderr or result.stdout)[:300]}"
         mismatches, missing = verify_transfer(source, get_dest_received_dir(dest, source))
         assert not mismatches and not missing
+
+
+DISTINCT_MTIME = 1_000_000_000  # 2001-09-09T01:46:40Z; a whole second
+
+
+class TestDirectoryAndSymlinkTimes:
+    """P7 Wave D: -O/--omit-dir-times and -J/--omit-link-times are real.
+
+    FastSync now captures and applies directory mtimes (deferred to the end of
+    the transfer, after children) and symlink mtimes (immediate, via no-follow
+    primitives).  -O/-J suppress exactly their own class of times.
+    """
+
+    def _tree(self, name):
+        source = os.path.join(TEST_DATA_DIR, name + "_src")
+        dest = os.path.join(TEST_DATA_DIR, name + "_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "sub", "deep"), exist_ok=True)
+        with open(os.path.join(source, "sub", "file.txt"), "wb") as fh:
+            fh.write(b"content\n")
+        with open(os.path.join(source, "sub", "deep", "deep.txt"), "wb") as fh:
+            fh.write(b"deeper\n")
+        dirs = (source, os.path.join(source, "sub"), os.path.join(source, "sub", "deep"))
+        for d in dirs:
+            os.utime(d, (DISTINCT_MTIME, DISTINCT_MTIME))
+        if abs(os.stat(source).st_mtime - DISTINCT_MTIME) > 2:
+            pytest.skip("filesystem does not preserve directory mtimes")
+        return source, dest, ("", "sub", os.path.join("sub", "deep"))
+
+    def _link_tree(self, name):
+        source = os.path.join(TEST_DATA_DIR, name + "_src")
+        dest = os.path.join(TEST_DATA_DIR, name + "_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "sub"), exist_ok=True)
+        with open(os.path.join(source, "sub", "file.txt"), "wb") as fh:
+            fh.write(b"target\n")
+        link = os.path.join(source, "sub", "link")
+        # A same-directory relative target (no ".."): FastSync refuses an
+        # escaping/ambiguous symlink target, and ".." is a deliberate divergence.
+        os.symlink("file.txt", link)
+        os.utime(link, (DISTINCT_MTIME, DISTINCT_MTIME), follow_symlinks=False)
+        if abs(os.lstat(link).st_mtime - DISTINCT_MTIME) > 2:
+            pytest.skip("filesystem does not preserve symlink mtimes")
+        return source, dest, os.path.join("sub", "link")
+
+    def _run(self, source, dest, flags, shared_server):
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"{flags} failed: {(result.stderr or result.stdout)[:400]}"
+        return get_dest_received_dir(dest, source)
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_directory_mtime_round_trip(self, shared_server, mt):
+        source, dest, rels = self._tree("dirtime")
+        flags = ["-a"] + (["--threads"] if mt else [])
+        received = self._run(source, dest, flags, shared_server)
+        for rel in rels:
+            src_m = os.stat(os.path.join(source, rel)).st_mtime
+            dst_m = os.stat(os.path.join(received, rel)).st_mtime
+            assert abs(dst_m - src_m) < 2, \
+                f"dir '{rel}': source={src_m} dest={dst_m} (flags={flags})"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_omit_dir_times_suppresses_only_dirs(self, shared_server, mt):
+        source, dest, rels = self._tree("omitdir")
+        flags = ["-a", "-O"] + (["--threads"] if mt else [])
+        received = self._run(source, dest, flags, shared_server)
+        for rel in rels:
+            dst_m = os.stat(os.path.join(received, rel)).st_mtime
+            assert abs(dst_m - DISTINCT_MTIME) > 5, \
+                f"-O must not apply directory times ('{rel}' got {dst_m})"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_symlink_mtime_round_trip(self, shared_server, mt):
+        source, dest, rel = self._link_tree("linktime")
+        flags = ["-a"] + (["--threads"] if mt else [])
+        received = self._run(source, dest, flags, shared_server)
+        src_link = os.path.join(source, rel)
+        dst_link = os.path.join(received, rel)
+        assert os.path.islink(dst_link), f"{dst_link} is not a symlink"
+        src_m = os.lstat(src_link).st_mtime
+        dst_m = os.lstat(dst_link).st_mtime
+        assert abs(dst_m - src_m) < 2, f"symlink times: source={src_m} dest={dst_m}"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_omit_link_times_suppresses_only_links(self, shared_server, mt):
+        source, dest, rel = self._link_tree("omitlink")
+        flags = ["-a", "-J"] + (["--threads"] if mt else [])
+        received = self._run(source, dest, flags, shared_server)
+        dst_link = os.path.join(received, rel)
+        assert os.path.islink(dst_link), f"{dst_link} is not a symlink"
+        dst_m = os.lstat(dst_link).st_mtime
+        assert abs(dst_m - DISTINCT_MTIME) > 5, \
+            f"-J must not apply symlink times (got {dst_m})"
+
+    @pytest.mark.ci
+    def test_omit_flags_are_independent(self, shared_server):
+        """-O suppresses only directory times and -J only symlink times: with
+        -O the symlink time is still preserved, and with -J the dir times are."""
+        source, dest, rel = self._link_tree("omitindep")
+        # Add a subdirectory mtime to check alongside the symlink.
+        sub = os.path.join(source, "sub")
+        os.utime(sub, (DISTINCT_MTIME, DISTINCT_MTIME))
+
+        # -O => dir times omitted, symlink time preserved.
+        clean_dir(dest + "_o")
+        recv_o = self._run(source, dest + "_o", ["-a", "-O"], shared_server)
+        assert abs(os.lstat(os.path.join(recv_o, rel)).st_mtime - DISTINCT_MTIME) < 2, \
+            "-O must not suppress symlink times"
+        assert abs(os.stat(os.path.join(recv_o, "sub")).st_mtime - DISTINCT_MTIME) > 5, \
+            "-O must suppress directory times"
+
+        # -J => symlink times omitted, dir times preserved.
+        clean_dir(dest + "_j")
+        recv_j = self._run(source, dest + "_j", ["-a", "-J"], shared_server)
+        assert abs(os.lstat(os.path.join(recv_j, rel)).st_mtime - DISTINCT_MTIME) > 5, \
+            "-J must suppress symlink times"
+        assert abs(os.stat(os.path.join(recv_j, "sub")).st_mtime - DISTINCT_MTIME) < 2, \
+            "-J must not suppress directory times"

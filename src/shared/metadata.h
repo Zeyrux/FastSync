@@ -39,6 +39,14 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok);
 void file_restore_metadata(const char* path, const FileMetadata* metadata,
                            bool preserve_executability);
 bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability);
+/* P7 Wave D: apply a SYMLINK's own metadata using no-follow primitives only
+ * (utimensat/lchown/fchmodat with AT_SYMLINK_NOFOLLOW), confined fd-relative
+ * under the authorized root.  `omit_link_times` (-J/--omit-link-times)
+ * suppresses the timestamps; the link's mode/ownership are still attempted
+ * (ownership stays gated by the identity policy and by default is not applied).
+ * A null metadata or an unfollowable parent is a harmless no-op. */
+void file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
+                                   bool omit_link_times);
 
 /* Compare timestamps using rsync's whole-second modification window. */
 bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, long right_nsec,

@@ -98,6 +98,18 @@ typedef struct {
    * (without marking the scan as failed), so a busy scan itself stops early.
    * Client-only, never serialized to the wire. */
   const StopCondition* stop_condition;
+  /* P7 Wave D (protocol 2.17.0): directory-time capture sink.  When
+   * `capture_dir_times` is true the recursive scan appends one is_dir File
+   * (with metadata, no payload) per source directory it traverses to
+   * `dir_entries`, so the sender can transmit a single trailing
+   * STATUS_DIR_TIMES frame and the receiver can apply directory mtimes AFTER
+   * all children are written.  `dir_entries_mutex` (optional) guards the list
+   * for the parallel scanner's shared worker threads; the caller owns both.
+   * The --dirs generator does not use this (its directory entries carry their
+   * metadata inline through STATUS_MKDIR). */
+  bool capture_dir_times;
+  ArrayList* dir_entries;
+  mtx_t* dir_entries_mutex;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -173,6 +185,10 @@ typedef struct {
   HardLinkTable* hardlinks;
   /* Phase 6: sender stop deadline (from ScannerOptions). */
   const StopCondition* stop_condition;
+  /* P7 Wave D directory-time capture (see ScannerOptions). */
+  bool capture_dir_times;
+  ArrayList* dir_entries;
+  mtx_t* dir_entries_mutex;
 } DirectoryScanner;
 
 typedef struct {

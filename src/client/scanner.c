@@ -488,6 +488,9 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   scanner->hardlinks = options->hardlinks;
   scanner->prune_empty_dirs = options->prune_empty_dirs;
   scanner->stop_condition = options->stop_condition;
+  scanner->capture_dir_times = options->capture_dir_times;
+  scanner->dir_entries = options->dir_entries;
+  scanner->dir_entries_mutex = options->dir_entries_mutex;
   scanner->dirs_root_emitted = false;
   scanner->list_index = 0;
   scanner->dirs_batch = NULL;
@@ -595,6 +598,63 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
   return chunk;
 }
 
+/* P7 Wave D: append one traversed source directory's captured metadata to the
+ * shared pending-directory-time list.  The File carries no payload; only the
+ * wire path (absolute fs path normally, the bare relative path under
+ * -R + --files-from) and its metadata are used, and the sender transmits them
+ * in one terminal STATUS_DIR_TIMES frame.  `mutex` (optional) serializes the
+ * append for the parallel scanner's shared workers.  An unstattable or
+ * non-directory path is silently skipped (the transfer is unaffected); an
+ * allocation failure is fatal and reported to the caller. */
+static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const char* root_path,
+                                     const char* fs_path, bool relative_mode, bool preserve_atimes,
+                                     bool preserve_crtimes) {
+  if (!dir_entries || !root_path || !fs_path)
+    return true;
+  struct stat st;
+  if (stat(fs_path, &st) != 0 || !S_ISDIR(st.st_mode))
+    return true;
+  char* rel = scanner_path_relative(root_path, fs_path);
+  if (!rel)
+    return true;
+  if (relative_mode && rel[0] == '\0') {
+    /* -R + --files-from: the transfer root itself has no bare relative wire
+       path (matches the -R scan, which never emits the root). */
+    free(rel);
+    return true;
+  }
+  File* file = file_create(fs_path);
+  if (!file) {
+    free(rel);
+    return false;
+  }
+  file->is_dir = true;
+  file->metadata = file_metadata_create(fs_path, &st, preserve_atimes, preserve_crtimes);
+  if (!file->metadata) {
+    free(rel);
+    file_destroy(file);
+    return false;
+  }
+  if (relative_mode) {
+    file->send_path = rel;
+    rel = NULL;
+  }
+  free(rel);
+  bool added;
+  if (mutex) {
+    mtx_lock(mutex);
+    added = array_list_add(dir_entries, file);
+    mtx_unlock(mutex);
+  } else {
+    added = array_list_add(dir_entries, file);
+  }
+  if (!added) {
+    file_destroy(file);
+    return false;
+  }
+  return true;
+}
+
 /* Open the next queued directory and set up its filter context.  Returns 1 when
    a directory is open, 0 when the queue is exhausted, and -1 on a fatal error.
    A directory that cannot be opened is an I/O error: it is recorded on the
@@ -659,6 +719,17 @@ static int open_next_directory(DirectoryScanner* scanner) {
       scanner->current_dir = NULL;
       free(scanner->current_path);
       scanner->current_path = NULL;
+      return -1;
+    }
+    if (scanner->capture_dir_times &&
+        !scanner_capture_dir_time(scanner->dir_entries, scanner->dir_entries_mutex,
+                                  scanner->root_path, scanner->current_path, scanner->relative_mode,
+                                  scanner->preserve_atimes, scanner->preserve_crtimes)) {
+      closedir(scanner->current_dir);
+      scanner->current_dir = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
+      scanner->failed = true;
       return -1;
     }
     return 1;
@@ -1579,6 +1650,18 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   ps->root_filter_node = root_node;
 
   if (!scan_root_directory(ps, root_directory, options, root_node, root_dev, root_files, subdirs)) {
+    array_list_delete(root_files);
+    array_list_delete(subdirs);
+    parallel_scanner_destroy(ps);
+    return NULL;
+  }
+  /* P7 Wave D: the parallel scanner never runs a DirectoryScanner over the
+     transfer root itself (it hands the root's immediate subdirectories to
+     workers), so capture the root's directory time here. */
+  if (options->capture_dir_times &&
+      !scanner_capture_dir_time(options->dir_entries, options->dir_entries_mutex, root_directory,
+                                root_directory, options->relative && options->file_list != NULL,
+                                options->preserve_atimes, options->preserve_crtimes)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);

@@ -493,6 +493,12 @@ void handler(int file_descriptor) {
           !delay_updates_publish(config->delay_context, config)) {
         transfer_ok = false;
       }
+      /* P7 Wave D: all writers have joined and the late deletion (and
+         --delay-updates publication) has committed above, so it is finally safe
+         to stamp directory times; a directory's mtime must not be clobbered by
+         its children or by an extra removal. */
+      if (transfer_ok)
+        dir_time_list_apply(&context->dir_times, config->receive_root_directory);
     }
     if (transfer_ok) {
       if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))

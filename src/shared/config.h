@@ -543,8 +543,27 @@ typedef struct Config {
  * new trailing bytes would desynchronize on the frame boundary, and the strict
  * same-version handshake (config_receive rejects a mismatched version before
  * parsing anything else) is what keeps a 2.16 client and a 2.15 server from
- * ever reaching that state. */
-#define PROTOCOL_VERSION "2.16.0"
+ * ever reaching that state.
+ *
+ * Times Wave (P7 Wave D): 2.16.0 -> 2.17.0.
+ *
+ * WHY the bump, grounded in the wire: this wave makes -O/--omit-dir-times and
+ * -J/--omit-link-times REAL by adding directory and symlink time preservation.
+ * The config-frame LAYOUT is unchanged (the omit flags already crossed the
+ * wire), but the FRAME STREAM gains a new terminal frame: after all file data
+ * and the optional delete manifest, the sender transmits one STATUS_DIR_TIMES
+ * frame (a count followed by (path, metadata) pairs) carrying every source
+ * directory's captured times, so the receiver can apply them AFTER all of a
+ * directory's children have been written (writing a child bumps the parent's
+ * mtime).  Symlink entries already carry their metadata on the STATUS_SYMLINK
+ * frame; the receiver now applies it (utimensat/lchown with
+ * AT_SYMLINK_NOFOLLOW) unless -J is set.  Any change to the frame sequence must
+ * bump the protocol version: a 2.16 peer that does not know STATUS_DIR_TIMES
+ * would desynchronize on the unknown frame, and the strict same-version
+ * handshake (config_receive rejects a mismatched version before parsing
+ * anything else) is what keeps a 2.17 client and a 2.16 server from ever
+ * reaching that state. */
+#define PROTOCOL_VERSION "2.17.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

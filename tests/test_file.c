@@ -1,5 +1,6 @@
 #include "test_file.h"
 #include "file.h"
+#include "file_receive.h"
 #include "data.h"
 #include "config.h"
 #include "utils.h"
@@ -1216,6 +1217,39 @@ void test_trust_sender() {
   file_set_authorized_root(-1, NULL);
 }
 
+/* P7 Wave D: the deferred directory-time list deep-copies entries and applies
+ * them (fd-relative, no-follow) to an existing directory, then frees cleanly. */
+static void test_dir_time_list() {
+  const char* root = "test_dir_time_root";
+  const char* sub = "test_dir_time_root/sub";
+  file_set_authorized_root(-1, NULL);
+  rmdir(sub);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+
+  DirTimeList list;
+  dir_time_list_init(&list);
+  EXPECT_EQ_INT((int)list.count, 0);
+  FileMetadata metadata = {.mtime_sec = 1000000000, .mtime_nsec = 0};
+  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
+  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
+  EXPECT_EQ_INT((int)list.count, 2);
+
+  dir_time_list_apply(&list, root);
+  struct stat st;
+  EXPECT_EQ_INT(stat(sub, &st), 0);
+  EXPECT_EQ_INT((int)st.st_mtime, 1000000000);
+
+  dir_time_list_free(&list);
+  EXPECT_EQ_INT((int)list.count, 0);
+  EXPECT_NULL(list.paths);
+  EXPECT_NULL(list.entries);
+
+  rmdir(sub);
+  rmdir(root);
+}
+
 void test_file() {
   test_file_create();
   test_file_special_rdev_valid();
@@ -1254,6 +1288,7 @@ void test_file() {
     test_file_send_single_calls_metadata_and_path();
   }
   test_file_metadata_create();
+  test_dir_time_list();
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();
   test_inplace_overwrite_truncates_shorter_payload();

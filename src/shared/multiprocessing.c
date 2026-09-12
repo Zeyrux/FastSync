@@ -39,7 +39,14 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   atomic_init(&context->cancelled, false);
   protocol_session_init(&context->allocation_session, -1, -1);
   protocol_session_set_max_alloc(&context->allocation_session, config->max_alloc);
+  context->dir_entries = NULL;
+  context->dir_entries_mutex_init = false;
   int init = 0;
+  if (config->use_metadata) {
+    context->dir_entries = array_list_create(file_destroy);
+    if (!context->dir_entries)
+      goto fail;
+  }
   if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success)
     goto fail;
   init++;
@@ -62,10 +69,17 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
     goto fail;
   // cppcheck-suppress unreadVariable
   init++;
+  if (mtx_init(&context->dir_entries_mutex, mtx_plain) != thrd_success)
+    goto fail;
+  context->dir_entries_mutex_init = true;
   return context;
 
 fail:
   log_perror("Error initializing synchronization objects");
+  if (context->dir_entries_mutex_init)
+    mtx_destroy(&context->dir_entries_mutex);
+  if (context->dir_entries)
+    array_list_delete(context->dir_entries);
   if (init >= 6)
     cnd_destroy(&context->condition_not_empty_loader);
   if (init >= 5)
@@ -92,6 +106,10 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
     array_list_delete(context->missing_args);
   if (context->remove_source_files)
     array_list_delete(context->remove_source_files);
+  if (context->dir_entries)
+    array_list_delete(context->dir_entries);
+  if (context->dir_entries_mutex_init)
+    mtx_destroy(&context->dir_entries_mutex);
   config_delete(context->config);
   queue_destroy(context->queue_scanner);
   queue_destroy(context->queue_loader);
@@ -117,6 +135,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->outcomes.entries = NULL;
   context->outcomes.count = 0;
   context->outcomes.capacity = 0;
+  dir_time_list_init(&context->dir_times);
   protocol_session_init(&context->session, file_descriptor, file_descriptor);
   protocol_session_set_ssl(&context->session, ssl);
   context->receiver_done = false;
@@ -155,6 +174,7 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
     delete_manifest_free(context->deferred_manifest);
   queue_destroy(context->queue);
   receiver_outcomes_destroy(&context->outcomes);
+  dir_time_list_free(&context->dir_times);
   mtx_destroy(&context->mutex);
   cnd_destroy(&context->condition_not_full);
   cnd_destroy(&context->condition_not_empty);
@@ -306,6 +326,24 @@ int write_thread(void* pipeline_context) {
         protocol_session_unbind();
         return thrd_error;
       }
+    }
+    /* P7 Wave D: a directory's times are never applied inline (a later child
+       write would clobber them); accumulate the metadata here and let the
+       caller apply it once every writer has drained. */
+    if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
+        context->config->use_metadata && !context->config->omit_dir_times &&
+        !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+      file_destroy(file);
+      pipeline_context_receiver_note_bytes_released(context, file_bytes);
+      mtx_lock(&context->mutex);
+      atomic_store(&context->cancelled, true);
+      context->receiver_done = true;
+      cnd_broadcast(&context->condition_not_full);
+      cnd_broadcast(&context->condition_not_empty);
+      mtx_unlock(&context->mutex);
+      free(root_directory);
+      protocol_session_unbind();
+      return thrd_error;
     }
     /* Record the per-file outcome so a --remove-source-files sender learns
        which sources were actually written versus skipped on the receiver.
