@@ -164,19 +164,26 @@ static void test_server_cli_invalid() {
 }
 
 static void test_server_cli_password_and_early_input() {
-  const char* args[] = {"s", "--daemon", "--password-file=/etc/fast.pw", "--early-input",
-                        "/run/secrets"};
+  const char* args[] = {"s",
+                        "--daemon",
+                        "--password-file=/etc/fast.pw",
+                        "--early-input",
+                        "/run/secrets",
+                        "--iconv=utf-8"};
   ServerCliOptions opts;
-  EXPECT_EQ_INT(parse_ok(args, 5, &opts), 0);
+  EXPECT_EQ_INT(parse_ok(args, 6, &opts), 0);
   EXPECT_EQ_STR(opts.password_file, "/etc/fast.pw");
   EXPECT_EQ_STR(opts.early_input_file, "/run/secrets");
+  EXPECT_EQ_STR(opts.iconv_spec, "utf-8");
 
-  const char* args2[] = {"s", "--daemon", "--password-file", "/etc/fast.pw",
-                         "--early-input=/secrets"};
+  const char* args2[] = {
+      "s",       "--daemon",        "--password-file", "/etc/fast.pw", "--early-input=/secrets",
+      "--iconv", "utf-8,iso-8859-1"};
   ServerCliOptions opts2;
-  EXPECT_EQ_INT(parse_ok(args2, 5, &opts2), 0);
+  EXPECT_EQ_INT(parse_ok(args2, 7, &opts2), 0);
   EXPECT_EQ_STR(opts2.password_file, "/etc/fast.pw");
   EXPECT_EQ_STR(opts2.early_input_file, "/secrets");
+  EXPECT_EQ_STR(opts2.iconv_spec, "utf-8,iso-8859-1");
   server_cli_options_free(&opts);
   server_cli_options_free(&opts2);
 }
