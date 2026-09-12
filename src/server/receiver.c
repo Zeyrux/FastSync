@@ -74,11 +74,12 @@ static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
   return true;
 }
 
-/* P7 Wave D: read the single terminal STATUS_DIR_TIMES frame (a count followed
- * by that many (path, metadata) directory entries) and route every directory
- * through the regular store_file sink.  The sink's write path creates each
- * directory (idempotent -- the recursive transfer already created it as a
- * parent) and accumulates its metadata for end-of-transfer application.  A
+/* P7 Wave D: read one STATUS_DIR_TIMES frame (a count followed by that many
+ * (path, metadata) directory entries) and route every entry through the regular
+ * store_file sink.  A dir-time entry is RECORD-ONLY (file->dir_time_only): the
+ * sink accumulates its metadata for end-of-transfer application but creates
+ * nothing, so an empty/pruned source directory is never resurrected.  A large
+ * tree arrives as repeated frames, each bounded by MAX_MANIFEST_ENTRIES; a
  * malformed count or entry is a hard error. */
 static bool receiver_process_dir_times(int fd, const Config* config, const ReceiverSink* sink) {
   int count;

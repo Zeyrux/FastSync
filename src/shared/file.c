@@ -111,6 +111,7 @@ File* file_create(const char* path) {
   file->metadata = NULL;
   file->skip = false;
   file->is_dir = false;
+  file->dir_time_only = false;
   file->basis_link = NULL;
   file->link_group = 0;
   file->link_first = false;

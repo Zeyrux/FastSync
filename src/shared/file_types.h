@@ -42,6 +42,14 @@ typedef struct {
   /* True when this entry is an explicit directory entry (--dirs mode): the
    * receiver creates the directory instead of writing a regular file. */
   bool is_dir;
+  /* Receiver-only (P7 Wave D): this is a STATUS_DIR_TIMES entry.  It carries a
+   * traversed source directory's metadata for DEFERRED application, but must
+   * NEVER create the directory: the scanner captures every traversed directory
+   * (including empty ones whose parents no child write created), so creation
+   * would resurrect the empty dirs that FastSync deliberately never transfers.
+   * file_save_to_disk_full short-circuits such an entry as FILE_SAVE_SKIPPED,
+   * and the sink still accumulates the metadata into its DirTimeList. */
+  bool dir_time_only;
   /* Receiver-only, --link-dest: when set, install the destination entry as a
    * hard link to this absolute (root-confined) path instead of writing
    * `data`.  The matching code has already verified the link target's content

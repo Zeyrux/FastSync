@@ -602,7 +602,7 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
  * shared pending-directory-time list.  The File carries no payload; only the
  * wire path (absolute fs path normally, the bare relative path under
  * -R + --files-from) and its metadata are used, and the sender transmits them
- * in one terminal STATUS_DIR_TIMES frame.  `mutex` (optional) serializes the
+ * in trailing STATUS_DIR_TIMES frame(s).  `mutex` (optional) serializes the
  * append for the parallel scanner's shared workers.  An unstattable or
  * non-directory path is silently skipped (the transfer is unaffected); an
  * allocation failure is fatal and reported to the caller. */

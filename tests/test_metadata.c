@@ -303,9 +303,11 @@ static void test_chmod_changes() {
 }
 
 /* P7 Wave D: symlink metadata is applied with no-follow primitives, and -J
- * (omit_link_times) suppresses the timestamp.  The test is robust to
- * filesystems that silently ignore symlink timestamps: it mainly proves the
- * omit path never touches the stored time. */
+ * (omit_link_times) suppresses the timestamp.  The positive apply path is
+ * asserted when the filesystem actually stores symlink timestamps; a filesystem
+ * that silently ignores them (or a platform where utimensat AT_SYMLINK_NOFOLLOW
+ * is unsupported) is tolerated, in which case only the omit-path invariant is
+ * checked. */
 static void test_file_restore_symlink_metadata() {
   const char* dir = "temp_symlink_md_test";
   const char* target = "temp_symlink_md_test/target";
@@ -317,11 +319,13 @@ static void test_file_restore_symlink_metadata() {
   fclose(f);
   EXPECT_EQ_INT(symlink("target", link), 0);
 
+  /* Positive path: a non-omitted apply stamps the link's own mtime. */
   FileMetadata applied = {.mtime_sec = 1000000000, .mtime_nsec = 0};
   file_restore_symlink_metadata(link, &applied, false);
   struct stat st;
   EXPECT_EQ_INT(lstat(link, &st), 0);
   EXPECT_TRUE(S_ISLNK(st.st_mode));
+  bool symlink_times_supported = ((int)st.st_mtime == 1000000000);
   time_t t1 = st.st_mtime;
 
   /* -J: a different time must be left untouched. */
@@ -329,6 +333,8 @@ static void test_file_restore_symlink_metadata() {
   file_restore_symlink_metadata(link, &newer, true);
   EXPECT_EQ_INT(lstat(link, &st), 0);
   EXPECT_EQ_INT((int)st.st_mtime, (int)t1);
+  if (symlink_times_supported)
+    EXPECT_EQ_INT((int)st.st_mtime, 1000000000);
 
   unlink(link);
   unlink(target);

@@ -69,7 +69,7 @@ typedef struct {
   bool scan_stopped_early;
   /* P7 Wave D: captured source directory times, filled by the scanner thread
    * (and its parallel workers, guarded by dir_entries_mutex) and drained by the
-   * sender thread in the terminal STATUS_DIR_TIMES frame.  Owned by the
+   * sender thread in trailing STATUS_DIR_TIMES frame(s).  Owned by the
    * context; NULL for non-metadata transfers. */
   ArrayList* dir_entries;
   mtx_t dir_entries_mutex;

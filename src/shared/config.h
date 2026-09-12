@@ -551,9 +551,10 @@ typedef struct Config {
  * -J/--omit-link-times REAL by adding directory and symlink time preservation.
  * The config-frame LAYOUT is unchanged (the omit flags already crossed the
  * wire), but the FRAME STREAM gains a new terminal frame: after all file data
- * and the optional delete manifest, the sender transmits one STATUS_DIR_TIMES
- * frame (a count followed by (path, metadata) pairs) carrying every source
- * directory's captured times, so the receiver can apply them AFTER all of a
+ * and the optional delete manifest, the sender transmits STATUS_DIR_TIMES
+ * frame(s) (each a count followed by (path, metadata) pairs, chunked so no
+ * frame exceeds the receiver's MAX_MANIFEST_ENTRIES bound) carrying every
+ * source directory's captured times, so the receiver can apply them AFTER all of a
  * directory's children have been written (writing a child bumps the parent's
  * mtime).  Symlink entries already carry their metadata on the STATUS_SYMLINK
  * frame; the receiver now applies it (utimensat/lchown with

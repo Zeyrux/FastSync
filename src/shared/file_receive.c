@@ -551,6 +551,18 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return FILE_SAVE_ERROR;
   }
 
+  /* P7 Wave D #1: a STATUS_DIR_TIMES entry is RECORD-ONLY.  The scanner
+     captures every traversed directory -- including empty ones whose parents
+     were never created by a child write and directories pruned by
+     -m/--prune-empty-dirs.  Creating them here would resurrect empty
+     directories (an -a behavior change) and could abort the whole transfer on a
+     pre-existing regular file/symlink at the mirror path.  Short-circuit before
+     any device/write-devices/directory branch and report it as skipped so the
+     sink still accumulates its metadata for the deferred DirTimeList
+     application, but create nothing. */
+  if (file->dir_time_only)
+    return FILE_SAVE_SKIPPED;
+
   /* Device/special node (--devices/--specials): recreate the node instead of
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special)
@@ -2174,6 +2186,12 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
     size_t new_capacity = list->capacity == 0 ? 16 : list->capacity * 2;
     if (new_capacity < list->capacity)
       return false;
+    /* Assign each grown array as soon as its realloc succeeds: the old block is
+       already freed by then, so discarding the pointer would dangle.  capacity
+       is advanced only after BOTH reallocs succeed, so a partial failure leaves
+       capacity no larger than the entries allocation (the paths array may be
+       over-allocated, which is harmless) -- never a mismatched list the next
+       add could write past. */
     char** grown_paths = realloc(list->paths, new_capacity * sizeof(char*));
     if (!grown_paths)
       return false;
@@ -2202,11 +2220,23 @@ void dir_time_list_apply(const DirTimeList* list, const char* root_directory) {
       continue;
     char* leaf = NULL;
     /* The parent walk is fd-relative and O_NOFOLLOW, so a symlink planted in a
-       parent component can never redirect the utimensat outside the root.  The
-       final component is a directory; AT_SYMLINK_NOFOLLOW additionally refuses
-       to follow a same-named symlink (a --keep-dirlinks style path). */
+       parent component can never redirect the utimensat outside the root. */
     int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
     if (parent_fd < 0) {
+      free(dir_path);
+      continue;
+    }
+    /* A dir-time entry only records metadata: the directory is (deliberately)
+       not created from it, so an empty source directory (or one pruned by
+       -m/--prune-empty-dirs) may well not exist here.  Skip absent paths
+       QUIETLY rather than warning for every one, and apply the times only to a
+       real directory that does exist.  AT_SYMLINK_NOFOLLOW keeps a same-named
+       symlink from being followed; a pre-existing regular file/symlink is not a
+       directory, so it is left completely untouched. */
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode)) {
+      close(parent_fd);
+      free(leaf);
       free(dir_path);
       continue;
     }
@@ -2265,11 +2295,13 @@ File* file_receive_directory(int file_descriptor, const Config* config) {
   return file;
 }
 
-/* Receive one directory-time entry from the terminal STATUS_DIR_TIMES frame:
- * the destination-relative wire path and (when metadata is negotiated) the
- * directory's metadata frame.  The created File is an is_dir entry routed
- * through the regular store_file sink, exactly like a STATUS_MKDIR entry, so
- * the same deferred DirTimeList application covers both. */
+/* Receive one directory-time entry from a STATUS_DIR_TIMES frame: the
+ * destination-relative wire path and (when metadata is negotiated) the
+ * directory's metadata frame.  The created File is an is_dir, dir_time_only
+ * entry routed through the regular store_file sink: the sink records its
+ * metadata into the deferred DirTimeList but never creates the directory (the
+ * scanner captures every traversed directory, including empty ones).  Unlike a
+ * STATUS_MKDIR entry, this one must not create anything. */
 File* file_receive_dir_time(int file_descriptor, const Config* config) {
   char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
@@ -2287,6 +2319,7 @@ File* file_receive_dir_time(int file_descriptor, const Config* config) {
   if (!file)
     return NULL;
   file->is_dir = true;
+  file->dir_time_only = true;
   if (config && config->use_metadata) {
     int meta_ok = 1;
     file->metadata = metadata_receive(file_descriptor, &meta_ok);

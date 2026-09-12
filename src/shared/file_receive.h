@@ -18,7 +18,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 
 /* P7 Wave D directory-time accumulator.  The receiver collects the metadata of
  * every directory it creates/receives (STATUS_MKDIR with metadata and/or the
- * terminal STATUS_DIR_TIMES frame) and applies the times only at the END of the
+ * trailing STATUS_DIR_TIMES frame(s)) and applies the times only at the END of the
  * transfer, after all children have been written and after the delete /
  * --delay-updates phases have committed (writing or removing a child bumps the
  * parent's mtime).  -O/--omit-dir-times skips the application entirely.  The
@@ -36,8 +36,10 @@ void dir_time_list_free(DirTimeList* list);
  * allocation failure (the caller fails the transfer). */
 bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata);
 /* Apply every accumulated directory's mtime (and atime when captured) beneath
- * `root_directory`, confined fd-relative.  Best-effort per entry: a missing or
- * unreachable directory is skipped with a warning, never fatal. */
+ * `root_directory`, confined fd-relative.  Best-effort per entry: an absent
+ * directory (an empty/pruned source dir that was deliberately not created) or a
+ * non-directory at the path is skipped QUIETLY, an unreachable one with a
+ * warning, and never fatal. */
 void dir_time_list_apply(const DirTimeList* list, const char* root_directory);
 
 /* A received delete-manifest frame: the keep-set (`keeps`, destination-relative

@@ -4797,3 +4797,72 @@ class TestDirectoryAndSymlinkTimes:
             "-J must suppress symlink times"
         assert abs(os.stat(os.path.join(recv_j, "sub")).st_mtime - DISTINCT_MTIME) < 2, \
             "-J must not suppress directory times"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_preserve_does_not_create_empty_source_dir(self, shared_server, mt):
+        """P7 Wave D #1: a captured-but-EMPTY source directory is never created
+        at the destination.  The scanner records its time (it is transmitted via
+        STATUS_DIR_TIMES), but the receiver treats that entry as record-only, so
+        `-a` keeps the documented "empty dirs are never transferred" behavior."""
+        source = os.path.join(TEST_DATA_DIR, f"empty_dir_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"empty_dir_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "keep.txt"), "wb") as fh:
+            fh.write(b"regular file\n")
+        os.makedirs(os.path.join(source, "empty_sub"))
+        flags = ["-a"] + (["--threads"] if mt else [])
+        received = self._run(source, dest, flags, shared_server)
+        assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
+        assert not os.path.lexists(os.path.join(received, "empty_sub")), \
+            f"-a created an empty source directory at {received}/empty_sub"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_prune_empty_dirs_still_does_not_create_empty_dir(self, shared_server, mt):
+        """P7 Wave D #1: `-a -m` (--prune-empty-dirs) keeps its semantics -- a
+        captured empty directory is never created even though its time is
+        recorded."""
+        source = os.path.join(TEST_DATA_DIR, f"prune_empty_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"prune_empty_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "keep.txt"), "wb") as fh:
+            fh.write(b"regular file\n")
+        os.makedirs(os.path.join(source, "empty_sub"))
+        flags = ["-a", "-m"] + (["--threads"] if mt else [])
+        received = self._run(source, dest, flags, shared_server)
+        assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
+        assert not os.path.lexists(os.path.join(received, "empty_sub")), \
+            f"-a -m created an empty source directory at {received}/empty_sub"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_collision_at_dir_time_path_does_not_abort(self, shared_server, mt):
+        """P7 Wave D #1: a pre-existing regular file at a source-empty-dir's
+        mirror path must not abort the transfer (the old mkdir failed and failed
+        the run) and must not be clobbered."""
+        source = os.path.join(TEST_DATA_DIR, f"dirtime_collide_{'m' if mt else 's'}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"dirtime_collide_{'m' if mt else 's'}_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "keep.txt"), "wb") as fh:
+            fh.write(b"regular file\n")
+        os.makedirs(os.path.join(source, "collide"))
+        # Plant a regular file at exactly the mirror path of source/collide.
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(received, exist_ok=True)
+        blocker = os.path.join(received, "collide")
+        with open(blocker, "wb") as fh:
+            fh.write(b"pre-existing blocker\n")
+        flags = ["-a"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-a aborted on a pre-existing file at an empty-dir path: " \
+            f"{(result.stderr or result.stdout)[:400]}"
+        assert os.path.isfile(blocker) and not os.path.islink(blocker), \
+            "the pre-existing blocker was replaced by a directory"
+        with open(blocker, "rb") as fh:
+            assert fh.read() == b"pre-existing blocker\n", "the blocker file was clobbered"
+        assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"

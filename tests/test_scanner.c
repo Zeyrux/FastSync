@@ -1265,13 +1265,17 @@ static void test_files_from_relative_send_path() {
 
 /* P7 Wave D: the recursive scan captures every traversed source directory as an
  * is_dir File (metadata, no payload) in the shared dir_entries list, including
- * the transfer root, so the sender can transmit directory times at the end. */
+ * the transfer root and an EMPTY directory.  The empty dir is captured even
+ * though the receiver deliberately never creates it, so its time can still be
+ * applied when the destination already holds that directory. */
 static void test_scanner_captures_directory_times() {
   const char* root = "test_scan_dirtime";
   const char* sub = "test_scan_dirtime/sub";
+  const char* empty = "test_scan_dirtime/empty";
   const char* file1 = "test_scan_dirtime/sub/a.txt";
   EXPECT_EQ_INT(mkdir(root, 0755), 0);
   EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  EXPECT_EQ_INT(mkdir(empty, 0755), 0);
   create_test_file(file1, "x");
 
   ArrayList* dirs = array_list_create(file_destroy);
@@ -1289,6 +1293,7 @@ static void test_scanner_captures_directory_times() {
 
   int found_root = 0;
   int found_sub = 0;
+  int found_empty = 0;
   for (int i = 0; i < dirs->size; i++) {
     const File* file = (const File*)dirs->items[i];
     EXPECT_TRUE(file->is_dir);
@@ -1297,13 +1302,17 @@ static void test_scanner_captures_directory_times() {
       found_root = 1;
     if (strcmp(file->path, sub) == 0)
       found_sub = 1;
+    if (strcmp(file->path, empty) == 0)
+      found_empty = 1;
   }
   EXPECT_TRUE(found_root);
   EXPECT_TRUE(found_sub);
+  EXPECT_TRUE(found_empty);
 
   directory_scanner_destroy(scanner);
   array_list_delete(dirs);
   unlink(file1);
+  rmdir(empty);
   rmdir(sub);
   rmdir(root);
 }

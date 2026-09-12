@@ -1133,26 +1133,36 @@ static bool send_directory_entry(const Client* client, File* file, const Config*
   return !config->use_metadata || metadata_send(client->file_descriptor, file->metadata);
 }
 
-/* P7 Wave D: transmit every captured source directory's metadata in one
-   terminal STATUS_DIR_TIMES frame (count, then (path, metadata) pairs) after all
-   file data and the optional delete manifest.  The receiver applies them at the
-   END of its own transfer (after deletion and --delay-updates publication) so a
+/* P7 Wave D: transmit every captured source directory's metadata in terminal
+   STATUS_DIR_TIMES frames (count, then (path, metadata) pairs) after all file
+   data and the optional delete manifest.  The receiver applies them at the END
+   of its own transfer (after deletion and --delay-updates publication) so a
    directory's mtime is not clobbered by writing its children.  A non-metadata
-   transfer (or an empty set) sends nothing, keeping the stream byte-identical. */
+   transfer (or an empty set) sends nothing, keeping the stream byte-identical.
+
+   The receiver rejects a frame whose count exceeds MAX_MANIFEST_ENTRIES, so a
+   huge tree is CHUNKED into repeated frames of at most that many entries each
+   (the receiver's loop handles repeated STATUS_DIR_TIMES frames).  Every frame
+   stays within the receiver's bound, and a frame that would exceed it is never
+   emitted. */
 static bool send_dir_times(const Client* client, const Config* config, ArrayList* dir_entries) {
   if (!client || !config || !config->use_metadata || !dir_entries || dir_entries->size == 0)
     return true;
-  if (dir_entries->size > INT_MAX)
-    return false;
   int fd = client->file_descriptor;
-  if (!send_status(fd, STATUS_DIR_TIMES) || !send_int(fd, dir_entries->size))
-    return false;
-  for (int i = 0; i < dir_entries->size; i++) {
-    File* file = (File*)dir_entries->items[i];
-    if (!file || !file_wire_path(file))
+  int index = 0;
+  while (index < dir_entries->size) {
+    int remaining = dir_entries->size - index;
+    int chunk = remaining > MAX_MANIFEST_ENTRIES ? MAX_MANIFEST_ENTRIES : remaining;
+    if (!send_status(fd, STATUS_DIR_TIMES) || !send_int(fd, chunk))
       return false;
-    if (!send_wire_str(fd, file_wire_path(file)) || !metadata_send(fd, file->metadata))
-      return false;
+    for (int i = 0; i < chunk; i++) {
+      File* file = (File*)dir_entries->items[index + i];
+      if (!file || !file_wire_path(file))
+        return false;
+      if (!send_wire_str(fd, file_wire_path(file)) || !metadata_send(fd, file->metadata))
+        return false;
+    }
+    index += chunk;
   }
   return true;
 }
@@ -1872,8 +1882,8 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
   ArrayList* remove_sources = NULL;
-  /* P7 Wave D: captured source directory times, transmitted in one terminal
-     STATUS_DIR_TIMES frame (only when metadata rides the wire). */
+  /* P7 Wave D: captured source directory times, transmitted in trailing
+     STATUS_DIR_TIMES frame(s) (only when metadata rides the wire). */
   ArrayList* dir_entries = NULL;
   /* Protected excluded prefixes (delete-excluded default protection). */
   ArrayList* excluded = NULL;
