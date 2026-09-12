@@ -104,14 +104,15 @@ enum NET_STATUS {
    * confines the node below the receive root, and recreates it (mknod/mkfifo),
    * privilege-gating the mknod.  Protocol 2.13.0. */
   STATUS_SPECIAL,
-  /* Directory-time superstructure (P7 Wave D, protocol 2.17.0): a single
-   * terminal frame sent after all file data (and after the optional delete
-   * manifest) carrying every source directory's captured metadata so the
+  /* Directory-time superstructure (P7 Wave D, protocol 2.17.0): one or more
+   * trailing frames sent after all file data (and after the optional delete
+   * manifest) carrying the source directories' captured metadata so the
    * receiver can apply directory mtimes/atimes AFTER all of a directory's
-   * children have been written.  Payload: an int count, then count repetitions
-   * of (wire path string, metadata frame).  The receiver defers the actual
-   * utimensat until its own delete/publish phase has committed, then skips the
-   * whole set when -O/--omit-dir-times is set. */
+   * children have been written.  Payload per frame: an int count, then count
+   * repetitions of (wire path string, metadata frame); an entry count larger
+   * than MAX_MANIFEST_ENTRIES is split across repeated frames.  The receiver
+   * defers the actual utimensat until its own delete/publish phase has
+   * committed, then skips the whole set when -O/--omit-dir-times is set. */
   STATUS_DIR_TIMES
 };
 
