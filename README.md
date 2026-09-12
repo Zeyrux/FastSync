@@ -526,7 +526,11 @@ redirect that output to an owner-only (mode 0600) file, and note that legacy
 (mode 0600) `<store>.dummykey` sidecar next to the store: it holds the store-wide
 dummy key, is auto-created on first load, and must be preserved across daemon
 restarts so the dummy challenge for an unknown user stays stable (the key is
-never regenerated while the sidecar exists). One residual is accepted: the store
+never regenerated while the sidecar exists). If the sidecar cannot be created
+(process-substitution/FIFO store path such as `/dev/fd/N`, a read-only
+filesystem, or a missing directory), the daemon logs a warning and uses a
+transient key, so the cross-restart guarantee does not hold for those
+deployments. One residual is accepted: the store
 iteration count is observable pre-auth by design, since the miss path must match
 a hit.
 

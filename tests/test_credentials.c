@@ -74,13 +74,21 @@ static void rm_temp(const char* path) {
     return;
   unlink(path);
   /* Every successfully loaded store auto-creates an owner-only
-   * `<store>.dummykey` sidecar; remove it too so tests leave no stray key. */
+   * `<store>.dummykey` sidecar; remove it too so tests leave no stray key.  The
+   * atomic-publish temp name is also removed defensively. */
   size_t n = strlen(path) + strlen(".dummykey") + 1;
   char* sidecar = malloc(n);
   if (sidecar) {
     snprintf(sidecar, n, "%s.dummykey", path);
     unlink(sidecar);
     free(sidecar);
+  }
+  n = strlen(path) + strlen(".dummykey.tmp.") + 32;
+  char* tmp = malloc(n);
+  if (tmp) {
+    snprintf(tmp, n, "%s.dummykey.tmp.%ld", path, (long)getpid());
+    unlink(tmp);
+    free(tmp);
   }
 }
 
@@ -862,6 +870,113 @@ static void test_credentials_dummy_key_rejects_bad_sidecar() {
   rm_temp(path);
   free(path);
   free(sidecar);
+
+  /* Exact-mode rule: 0400 has no group/other bits but is not 0600, so it is
+   * rejected now (the mode must be exactly owner read+write). */
+  path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+  fp = fopen(sidecar, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(sidecar, 0400), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A pre-existing valid sidecar is adopted verbatim (no regeneration): the
+ * unknown-user dummy salt must equal HMAC-SHA256(known key, username), and a
+ * reload must yield the same salt. */
+static void test_credentials_dummy_key_existing_sidecar_adopted() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  /* Pre-create a valid owner-only sidecar with a known key. */
+  uint8_t key[CREDENTIAL_KEY_LEN];
+  memset(key, 0x5a, sizeof(key));
+  FILE* fp = fopen(sidecar, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(sidecar, 0600), 0);
+
+  char err[512];
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  CredentialVerifier v1;
+  EXPECT_TRUE(credentials_get_verifier(store, "unknown-user", NULL, 0, &v1));
+  EXPECT_FALSE(v1.found);
+  /* HMAC-SHA256(0x5a * 32, "unknown-user")[:16], computed independently. */
+  uint8_t expect[CREDENTIAL_SALT_LEN];
+  unhex("4b0d2e6b73025cc2fcb41d0a710ff469", expect, sizeof(expect));
+  EXPECT_TRUE(memcmp(v1.salt, expect, sizeof(expect)) == 0);
+  credentials_free(store);
+
+  /* The adopted sidecar still holds exactly the pre-created key (not a fresh
+   * random one). */
+  uint8_t readback[CREDENTIAL_KEY_LEN];
+  fp = fopen(sidecar, "rb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fread(readback, 1, sizeof(readback), fp) == sizeof(readback));
+  fclose(fp);
+  EXPECT_TRUE(memcmp(readback, key, sizeof(key)) == 0);
+
+  /* Persisted across a reload. */
+  CredentialVerifier v2;
+  store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  EXPECT_TRUE(credentials_get_verifier(store, "unknown-user", NULL, 0, &v2));
+  EXPECT_TRUE(memcmp(v1.salt, v2.salt, sizeof(v1.salt)) == 0);
+  credentials_free(store);
+
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A symlink planted at the sidecar path must fail the load closed (O_NOFOLLOW),
+ * even when it resolves to a valid owner-only key file. */
+static void test_credentials_dummy_key_symlink_rejected() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  char target[256];
+  snprintf(target, sizeof(target), "/tmp/fs_cred_key_%d_%d", (int)getpid(), g_file_counter++);
+  uint8_t key[CREDENTIAL_KEY_LEN];
+  memset(key, 0x5a, sizeof(key));
+  FILE* fp = fopen(target, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(target, 0600), 0);
+  EXPECT_EQ_INT(symlink(target, sidecar), 0);
+
+  char err[512];
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+
+  unlink(sidecar); /* remove the symlink itself, not its target */
+  unlink(target);
+  rm_temp(path);
+  free(path);
+  free(sidecar);
 }
 
 /* A NULL store path has nowhere to persist a key, so each load gets a fresh
@@ -923,6 +1038,8 @@ void test_credentials(void) {
   test_credentials_rejects_group_or_other_accessible();
   test_credentials_dummy_key_persisted();
   test_credentials_dummy_key_rejects_bad_sidecar();
+  test_credentials_dummy_key_existing_sidecar_adopted();
+  test_credentials_dummy_key_symlink_rejected();
   test_credentials_dummy_key_null_store_ephemeral();
   test_credentials_burn();
 }

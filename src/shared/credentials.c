@@ -601,11 +601,11 @@ static bool read_dummy_key_fd(int fd, const char* path, uint8_t out[CREDENTIAL_K
     set_error(err, err_size, "cannot stat dummy key file '%s': %s", path, strerror(errno));
     return false;
   }
-  if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & (S_IRWXG | S_IRWXO)) != 0 ||
+  if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 07777) != 0600 ||
       st.st_size != (off_t)CREDENTIAL_KEY_LEN) {
     set_error(err, err_size,
-              "refusing to read dummy key file '%s': it must be an owner-only (0600) regular file "
-              "of exactly %d bytes",
+              "refusing to read dummy key file '%s': it must be an owned regular file with exact "
+              "mode 0600 and exactly %d bytes",
               path, CREDENTIAL_KEY_LEN);
     return false;
   }
@@ -629,12 +629,42 @@ static bool read_dummy_key_fd(int fd, const char* path, uint8_t out[CREDENTIAL_K
   return true;
 }
 
+/* fsync the directory containing `path` (best effort).  After publishing the
+ * sidecar with link(2), syncing the directory makes the new name durable so a
+ * crash cannot leave a restart without the key it just started using. */
+static void fsync_containing_dir(const char* path) {
+  char* dir = str_dup(path);
+  if (!dir)
+    return;
+  char* slash = strrchr(dir, '/');
+  if (!slash) {
+    free(dir);
+    dir = str_dup(".");
+    if (!dir)
+      return;
+  } else if (slash == dir) {
+    slash[1] = '\0'; /* keep the leading '/' */
+  } else {
+    *slash = '\0';
+  }
+  int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  free(dir);
+  if (dfd < 0)
+    return;
+  fsync(dfd);
+  close(dfd);
+}
+
 /* Load the persistent dummy key for `store_path` from its `<store_path>.dummykey`
  * sidecar, creating it (mode 0600, 32 random bytes) if absent.  A NULL
  * store_path (empty store) yields a fresh ephemeral key.  Reading an existing
  * sidecar fails CLOSED on any validation error; only the CREATE path degrades
  * to an ephemeral key (with a warning) when the filesystem cannot hold the
- * sidecar (e.g. read-only mount), so a daemon still starts.  Returns false only
+ * sidecar (e.g. read-only mount), so a daemon still starts.
+ *
+ * Creation is ATOMIC: the key is written to a private same-directory temp file
+ * and hard-linked into place, so a concurrent starter (or reader) never observes
+ * a partial/zero sidecar that would fail the load closed.  Returns false only
  * when the CSPRNG itself fails (or a present-but-invalid sidecar is found). */
 static bool load_or_create_dummy_key(const char* store_path, uint8_t out[CREDENTIAL_KEY_LEN],
                                      char* err, size_t err_size) {
@@ -664,7 +694,10 @@ static bool load_or_create_dummy_key(const char* store_path, uint8_t out[CREDENT
     return false;
   }
 
-  int fd = open(sidecar, O_RDONLY | O_CLOEXEC);
+  /* Readers reject a planted symlink (O_NOFOLLOW) and never block on a planted
+   * FIFO (O_NONBLOCK; fstat rejects the non-regular file before any data read).
+   * Any open error other than ENOENT fails closed. */
+  int fd = open(sidecar, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (fd >= 0) {
     bool ok = read_dummy_key_fd(fd, sidecar, out, err, err_size);
     close(fd);
@@ -672,48 +705,55 @@ static bool load_or_create_dummy_key(const char* store_path, uint8_t out[CREDENT
     return ok;
   }
   if (errno != ENOENT) {
-    /* The sidecar exists but cannot be opened for reading (e.g. EACCES): fail
-     * closed rather than substituting a different key. */
+    /* The sidecar exists but cannot be opened for reading (EACCES, or ELOOP
+     * from a symlink): fail closed rather than substituting a different key. */
     set_error(err, err_size, "cannot open dummy key file '%s': %s", sidecar, strerror(errno));
     free(sidecar);
     return false;
   }
 
-  uint8_t fresh[CREDENTIAL_KEY_LEN];
-  if (!credentials_random_bytes(fresh, CREDENTIAL_KEY_LEN)) {
-    set_error(err, err_size, "failed to generate the credential store dummy key");
+  /* Publish atomically: write a private same-directory temp file, fsync it,
+   * then hard-link it into place.  A concurrent reader therefore only ever
+   * sees a complete 32-byte sidecar (or none), never a partial/zero file. */
+  char pid_suffix[32];
+  int pn = snprintf(pid_suffix, sizeof(pid_suffix), ".tmp.%ld", (long)getpid());
+  if (pn < 0 || (size_t)pn >= sizeof(pid_suffix)) {
+    set_error(err, err_size, "failed to build the dummy key temp path");
     free(sidecar);
     return false;
   }
-  fd = open(sidecar, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  size_t sidecar_len = (size_t)n;
+  size_t tmp_len = sidecar_len + (size_t)pn;
+  char* tmp = malloc(tmp_len + 1);
+  if (!tmp) {
+    set_error(err, err_size, "out of memory building the dummy key temp path");
+    free(sidecar);
+    return false;
+  }
+  snprintf(tmp, tmp_len + 1, "%s%s", sidecar, pid_suffix);
+
+  uint8_t fresh[CREDENTIAL_KEY_LEN];
+  if (!credentials_random_bytes(fresh, CREDENTIAL_KEY_LEN)) {
+    set_error(err, err_size, "failed to generate the credential store dummy key");
+    free(tmp);
+    free(sidecar);
+    return false;
+  }
+
+  fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) {
-    int open_errno = errno;
-    if (open_errno == EEXIST) {
-      /* A racing instance created the sidecar first; adopt its key. */
-      int rfd = open(sidecar, O_RDONLY | O_CLOEXEC);
-      if (rfd < 0) {
-        set_error(err, err_size, "cannot open dummy key file '%s': %s", sidecar, strerror(errno));
-        free(sidecar);
-        credentials_burn((char*)fresh, sizeof(fresh));
-        return false;
-      }
-      bool ok = read_dummy_key_fd(rfd, sidecar, out, err, err_size);
-      close(rfd);
-      free(sidecar);
-      credentials_burn((char*)fresh, sizeof(fresh));
-      return ok;
-    }
-    /* Creation failed for another reason (read-only filesystem, missing
-     * directory, ...).  Warn and fall back to an ephemeral key: unknown-user
-     * challenges stay deterministic within this daemon lifetime but will change
-     * on the next restart. */
-    char* escaped = output_escape(sidecar, log_get_8_bit_output());
+    /* Creation failed (read-only filesystem, missing directory, ...).  Warn and
+     * fall back to an ephemeral key: unknown-user challenges stay deterministic
+     * within this daemon lifetime but will change on the next restart. */
+    int create_errno = errno;
+    char* escaped = output_escape(tmp, log_get_8_bit_output());
     log_message(LOG_LEVEL_WARNING,
                 "cannot create dummy key file %s: %s; using a transient dummy key so unknown-user "
                 "challenges will change across restarts",
-                escaped ? escaped : sidecar, strerror(open_errno));
+                escaped ? escaped : tmp, strerror(create_errno));
     free(escaped);
     memcpy(out, fresh, CREDENTIAL_KEY_LEN);
+    free(tmp);
     free(sidecar);
     credentials_burn((char*)fresh, sizeof(fresh));
     return true;
@@ -721,42 +761,92 @@ static bool load_or_create_dummy_key(const char* store_path, uint8_t out[CREDENT
 
   size_t written = 0;
   bool write_ok = true;
+  int write_errno = 0;
   while (written < CREDENTIAL_KEY_LEN) {
     ssize_t w = write(fd, fresh + written, CREDENTIAL_KEY_LEN - written);
     if (w < 0) {
       if (errno == EINTR)
         continue;
       write_ok = false;
+      write_errno = errno;
       break;
     }
     if (w == 0) {
+      /* A zero-length write is not a system error; errno is stale here, so
+       * report a clear short-write instead of a bogus strerror(errno). */
       write_ok = false;
+      write_errno = 0;
       break;
     }
     written += (size_t)w;
   }
-  int write_errno = errno;
   if (write_ok && fsync(fd) != 0) {
     write_ok = false;
     write_errno = errno;
   }
   close(fd);
   if (!write_ok) {
-    /* Do not leave a truncated sidecar behind that would fail-closed a later
-     * restart; fall back to an ephemeral key instead. */
-    unlink(sidecar);
-    char* escaped = output_escape(sidecar, log_get_8_bit_output());
+    /* Do not leave a truncated temp file behind; fall back to an ephemeral key
+     * instead of failing closed on the next restart. */
+    unlink(tmp);
+    char* escaped = output_escape(tmp, log_get_8_bit_output());
+    const char* why = write_errno != 0 ? strerror(write_errno) : "short write";
     log_message(LOG_LEVEL_WARNING,
                 "cannot write dummy key file %s: %s; using a transient dummy key so unknown-user "
                 "challenges will change across restarts",
-                escaped ? escaped : sidecar, strerror(write_errno));
+                escaped ? escaped : tmp, why);
     free(escaped);
     memcpy(out, fresh, CREDENTIAL_KEY_LEN);
+    free(tmp);
     free(sidecar);
     credentials_burn((char*)fresh, sizeof(fresh));
     return true;
   }
+
+  if (link(tmp, sidecar) != 0) {
+    int link_errno = errno;
+    if (link_errno == EEXIST) {
+      /* A concurrent starter published first; adopt its key.  Read it back
+       * through the same hardened path (no symlink, no block, exact mode). */
+      int rfd = open(sidecar, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+      if (rfd < 0) {
+        set_error(err, err_size, "cannot open dummy key file '%s': %s", sidecar, strerror(errno));
+        unlink(tmp);
+        free(tmp);
+        free(sidecar);
+        credentials_burn((char*)fresh, sizeof(fresh));
+        return false;
+      }
+      bool ok = read_dummy_key_fd(rfd, sidecar, out, err, err_size);
+      close(rfd);
+      unlink(tmp);
+      free(tmp);
+      free(sidecar);
+      credentials_burn((char*)fresh, sizeof(fresh));
+      return ok;
+    }
+    /* Linking failed for another reason (e.g. no hard-link support on this
+     * filesystem).  Warn and fall back to an ephemeral key. */
+    unlink(tmp);
+    char* escaped = output_escape(sidecar, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING,
+                "cannot publish dummy key file %s: %s; using a transient dummy key so unknown-user "
+                "challenges will change across restarts",
+                escaped ? escaped : sidecar, strerror(link_errno));
+    free(escaped);
+    memcpy(out, fresh, CREDENTIAL_KEY_LEN);
+    free(tmp);
+    free(sidecar);
+    credentials_burn((char*)fresh, sizeof(fresh));
+    return true;
+  }
+
+  /* Published: make the new directory entry durable, then drop the private
+   * temp name (the sidecar keeps the inode alive). */
+  fsync_containing_dir(sidecar);
+  unlink(tmp);
   memcpy(out, fresh, CREDENTIAL_KEY_LEN);
+  free(tmp);
   free(sidecar);
   credentials_burn((char*)fresh, sizeof(fresh));
   return true;
