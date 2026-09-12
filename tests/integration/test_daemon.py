@@ -597,6 +597,9 @@ class _AuthReplayProxy:
         self.server.settimeout(20)
         self.port = self.server.getsockname()[1]
         self.stolen = None
+        # Set when a relayed connection received a SCRAM challenge from the
+        # backend; lets a test assert the daemon refused before any challenge.
+        self.saw_challenge = False
 
     def close(self):
         try:
@@ -634,6 +637,7 @@ class _AuthReplayProxy:
                     if len(buf_s) >= 4:
                         (status,) = struct.unpack_from("<i", buf_s, 0)
                         if status == STATUS_AUTH_CHALLENGE:
+                            self.saw_challenge = True
                             off = 4 + 4  # status int + iteration int
                             for _ in range(2):
                                 frame = _wire_string_frame_len(buf_s, off)
@@ -785,6 +789,41 @@ class TestDaemonAuthentication:
             assert "--tls" in combined, combined
         finally:
             os.unlink(cred_path)
+
+    @pytest.mark.ci
+    def test_loopback_plaintext_refused_before_challenge_without_flag(self):
+        """A7-3/S1: an auth-required module reached over loopback plaintext is
+        refused at the config gate -- before any SCRAM challenge is sent -- when
+        the operator did NOT pass --allow-unauthenticated.  That flag is the
+        explicit opt-in that makes loopback plaintext an accepted auth
+        transport; it never permits remote plaintext auth.  A relay records the
+        daemon's first status frame so a challenge is directly observable."""
+        d = DaemonManager()
+        port = _find_free_port()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_noauth_auth.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", CONF_FILE, "--no-detach",
+                            "--password-file", CRED_FILE, "--dparam", f"port={port}"]
+        d._proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+        d._port = port
+        _wait_for_port(port, timeout=10)
+        proxy = _AuthReplayProxy(port)
+        try:
+            before = _tree_file_count(AUTH_MODULE)
+            cred = os.path.join(TEST_DATA_DIR, "noauth_loopback.pw")
+            _write_client_password_file(cred, "alice", ALICE_PASS)
+            proc = subprocess.Popen(_client_cmd("127.0.0.1::locked", proxy.port, cred),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proxy._run_connection(capture=True)
+            out, err = proc.communicate(timeout=30)
+            assert proc.returncode != 0, "auth over unflagged loopback plaintext must be refused"
+            assert not proxy.saw_challenge, "daemon sent a SCRAM challenge before the refusal"
+            assert _tree_file_count(AUTH_MODULE) == before, "a refused connection wrote data"
+            os.unlink(cred)
+        finally:
+            proxy.close()
+            d.stop()
 
     def test_client_empty_password_file_rejected(self):
         """Client-side: an empty --password-file is rejected (no credentials)."""
@@ -1119,7 +1158,8 @@ class TestDaemonTLSAuth:
         refused at the config gate when the CA-valid client certificate does not
         match --client-cn -- before any SCRAM challenge is sent and before any
         file data moves.  The daemon is started WITH --allow-unauthenticated to
-        prove that flag does not relax the auth-module transport policy."""
+        prove that flag never relaxes the remote auth-module transport policy
+        (it only opts in plaintext from a loopback peer)."""
         try:
             remote_ip = socket.gethostbyname(socket.gethostname())
         except OSError:

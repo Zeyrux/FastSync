@@ -571,17 +571,19 @@ bool utils_sockaddr_is_loopback(const struct sockaddr* addr) {
   return false;
 }
 
-/* True when the fd's peer is a local channel: a loopback TCP peer, or a
-   non-socket descriptor (the --stdio SSH transport is a pipe, so a failed
-   getpeername with ENOTSOCK counts as local).  Any other socket peer is not
-   local. */
+/* True when the fd's peer is provably a loopback TCP peer: getpeername must
+   succeed AND the returned address must classify as loopback.  Everything else
+   is NOT local, including a non-socket descriptor (pipe/socketpair): a failed
+   getpeername (ENOTSOCK, ENOTCONN, ...) fails closed.  The daemon auth gate
+   must not treat "I cannot tell" as "trusted", and daemon auth modules are
+   daemon-only anyway (the --stdio path never loads a daemon config). */
 bool utils_fd_peer_is_local(int fd) {
   if (fd < 0)
     return false;
   struct sockaddr_storage peer;
   socklen_t length = sizeof(peer);
   if (getpeername(fd, (struct sockaddr*)&peer, &length) != 0)
-    return errno == ENOTSOCK;
+    return false;
   return utils_sockaddr_is_loopback((const struct sockaddr*)&peer);
 }
 

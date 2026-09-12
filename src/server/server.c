@@ -383,19 +383,22 @@ static const char* server_module_gate(const Config* config, void* context) {
              "store is configured";
     }
     /* Transport policy (A7-3/S1): an auth-required module only accepts
-     * credentials over an encrypted, verified TLS connection whose client
-     * certificate matches --client-cn, or over a local/SSH transport (a
-     * loopback TCP peer, or the --stdio pipe).  A remote plaintext peer is
-     * refused HERE, before the challenge is sent, so an unverified client never
-     * receives a nonce.  --allow-unauthenticated is intentionally NOT consulted:
-     * that flag relaxes the standalone plaintext gate, never this one. */
+     * credentials over (a) an encrypted, verified TLS connection whose client
+     * certificate matches --client-cn, or (b) a plaintext connection from a
+     * loopback peer that the operator explicitly opted into with
+     * --allow-unauthenticated.  A remote plaintext peer and an un-flagged
+     * loopback plaintext peer are both refused HERE, before the challenge is
+     * sent, so an unverified client never receives a nonce.  The operator flag
+     * never permits REMOTE plaintext auth: remote peers still require verified
+     * TLS regardless of the flag. */
     bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
                   tls_client_identity_allowed(gate_ctx->ssl);
-    bool local_ok = gate_ctx && gate_ctx->fd >= 0 && utils_fd_peer_is_local(gate_ctx->fd);
+    bool local_ok = allow_unauthenticated && gate_ctx && gate_ctx->fd >= 0 &&
+                    utils_fd_peer_is_local(gate_ctx->fd);
     if (!tls_ok && !local_ok) {
       log_message(LOG_LEVEL_ERROR,
                   "daemon module '%s' requires authentication over an encrypted, verified TLS "
-                  "connection (or a local/SSH transport); refusing",
+                  "connection (or an opted-in loopback plaintext transport); refusing",
                   config->module);
       return "daemon module requires authentication over an encrypted, verified TLS "
              "connection";

@@ -315,14 +315,23 @@ static void test_loopback_helpers() {
 
   EXPECT_FALSE(utils_sockaddr_is_loopback(NULL));
 
-  /* A pipe has no socket peer: getpeername fails with ENOTSOCK, which is the
-     --stdio/SSH case and must count as local. */
+  /* A pipe has no socket peer: getpeername fails with ENOTSOCK.  The helper is
+     fail-closed, so an unprovable channel is NOT local (daemon auth modules are
+     daemon-only and never run over the --stdio pipe). */
   int pipe_fds[2];
   EXPECT_EQ_INT(pipe(pipe_fds), 0);
-  EXPECT_TRUE(utils_fd_peer_is_local(pipe_fds[0]));
+  EXPECT_FALSE(utils_fd_peer_is_local(pipe_fds[0]));
   close(pipe_fds[0]);
   close(pipe_fds[1]);
   EXPECT_FALSE(utils_fd_peer_is_local(-1));
+
+  /* A connected AF_UNIX socketpair is a socket, but its peer is not a loopback
+     IP address, so it is not local either. */
+  int pair_fds[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, pair_fds), 0);
+  EXPECT_FALSE(utils_fd_peer_is_local(pair_fds[0]));
+  close(pair_fds[0]);
+  close(pair_fds[1]);
 
   /* A real loopback TCP peer is local. */
   int listener = socket(AF_INET, SOCK_STREAM, 0);
