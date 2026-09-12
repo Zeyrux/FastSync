@@ -30,6 +30,12 @@ typedef struct {
   size_t capacity;
 } DirTimeList;
 
+/* Capture gate shared by the sender-side and receiver-side sinks: directory
+ * metadata is accumulated only when --times/--metadata is in effect and
+ * -O/--omit-dir-times does not suppress it.  Kept here, next to the accumulator
+ * it guards, so both call sites express the same condition. */
+bool dir_times_should_capture(const Config* config);
+
 void dir_time_list_init(DirTimeList* list);
 void dir_time_list_free(DirTimeList* list);
 /* Deep-copy one directory's path + metadata into the list.  Returns false on
