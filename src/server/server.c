@@ -251,6 +251,155 @@ static bool configure_authorization(const char* root) {
   return true;
 }
 
+/* Discriminates the outcome of the A7 auth gate so the dispatcher can map it
+ * back to the config_receive_with_validate contract: accepted (including
+ * "module needs no auth"), a config-level refusal carrying an error string, or
+ * a handshake that already wrote its own terminal status frame. */
+typedef enum {
+  MODULE_AUTH_ACCEPTED = 0,
+  MODULE_AUTH_REFUSED,
+  MODULE_AUTH_TERMINATED,
+} ModuleAuthResult;
+
+/* Looks up the daemon module selected by the client's config frame and rejects
+ * a `read only` one (every FastSync network transfer writes; there is no
+ * read-only wire operation yet).  Returns the module, or NULL with *error set
+ * to the caller-facing rejection message. */
+static const DaemonModule* module_gate_lookup_module(const Config* config, const char** error) {
+  const DaemonModule* module = daemon_conf_find_module(g_daemon_conf, config->module);
+  if (module == NULL) {
+    char* escaped_module = output_escape(config->module, config->eight_bit_output);
+    log_message(LOG_LEVEL_ERROR, "unknown daemon module '%s' requested",
+                escaped_module ? escaped_module : "<allocation failed>");
+    free(escaped_module);
+    *error = "requested daemon module does not exist";
+    return NULL;
+  }
+  if (module->read_only) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
+                config->module);
+    *error = "requested daemon module is read only";
+    return NULL;
+  }
+  return module;
+}
+
+/* Per-module client-chosen ownership / super-user policy (P7 Wave E hardening):
+ * a daemon module refuses EVERY ownership-affecting request (--numeric-ids,
+ * --chown, --usermap/--groupmap, --fake-super, --copy-as, explicit --super)
+ * unless the operator opted THIS module in with `client owner = yes`.
+ * Otherwise any client could force arbitrary ownership inside the module root.
+ * The ownership check is evaluated against the ORIGINAL config so an explicit
+ * --super is refused even when an operator --no-super veto already forced the
+ * effective copy to OFF (the veto must not silently convert a refusal into an
+ * accept); when no ownership flag is present, super-user DEVICE activities are
+ * forced off for this connection instead.  Returns an error string on refusal,
+ * NULL on acceptance. */
+static const char* module_gate_check_ownership(const Config* config, const DaemonModule* module,
+                                               ModuleGateContext* gate_ctx) {
+  if (module->client_owner)
+    return NULL;
+  /* Ownership: refuse the whole transfer up front (a clear failure). */
+  if (identity_ownership_requested(config)) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' refuses client-chosen ownership/super-user activities "
+                "(no `client owner = yes` opt-in); refusing",
+                config->module);
+    return "client-chosen ownership is not permitted by this daemon module";
+  }
+  /* Super-user DEVICE activities (char/block mknod and --write-devices) are
+     permitted under the default AUTO mode, so without this override a root
+     daemon would still let a non-opted module create arbitrary device nodes
+     and write raw devices.  Force them off for this connection: those entries
+     are skipped (never mknod'ed) while an ordinary `-a` push still succeeds
+     without device nodes, matching the operator's least-privilege choice.
+     The operator-level --no-super veto is already folded into this. */
+  if (gate_ctx)
+    gate_ctx->super_mode_override = SUPER_MODE_OFF;
+  return NULL;
+}
+
+/* A7 auth gate: runs the SCRAM challenge/response for an auth-required module
+ * BEFORE the module root is installed and before any data moves.  Returns
+ * MODULE_AUTH_ACCEPTED when the module needs no auth or the handshake succeeds,
+ * MODULE_AUTH_REFUSED with *error set on a config-level rejection, or
+ * MODULE_AUTH_TERMINATED when the handshake already wrote a terminal status. */
+static ModuleAuthResult module_gate_authenticate(const Config* config, const DaemonModule* module,
+                                                 ModuleGateContext* gate_ctx, const char** error) {
+  if (module->auth_user_count == 0)
+    return MODULE_AUTH_ACCEPTED;
+  /* Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR). */
+  if (g_credentials == NULL) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' requires authentication but no credential store is "
+                "configured (--password-file/--early-input); refusing",
+                config->module);
+    *error = "requested daemon module requires authentication and no credential "
+             "store is configured";
+    return MODULE_AUTH_REFUSED;
+  }
+  /* Transport policy (A7-3/S1): an auth-required module only accepts
+   * credentials over (a) an encrypted, verified TLS connection whose client
+   * certificate matches --client-cn, or (b) an actual PLAINTEXT connection
+   * from a loopback peer that the operator explicitly opted into with
+   * --allow-unauthenticated.  A remote plaintext peer, an un-flagged loopback
+   * plaintext peer, and a loopback TLS peer whose certificate does not match
+   * --client-cn are all refused HERE, before the challenge is sent, so an
+   * unverified client never receives a nonce: the loopback allowance requires
+   * !gate_ctx->ssl, so --tls + --allow-unauthenticated can never be used to
+   * bypass the client-CN check.  The operator flag never permits REMOTE
+   * plaintext auth: remote peers still require verified TLS regardless. */
+  bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
+                tls_client_identity_allowed(gate_ctx->ssl);
+  bool local_ok = allow_unauthenticated && gate_ctx && !gate_ctx->ssl && gate_ctx->fd >= 0 &&
+                  utils_fd_peer_is_local(gate_ctx->fd);
+  if (!tls_ok && !local_ok) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' requires authentication over an encrypted, verified TLS "
+                "connection (or an opted-in loopback plaintext transport); refusing",
+                config->module);
+    *error = "daemon module requires authentication over an encrypted, verified TLS "
+             "connection";
+    return MODULE_AUTH_REFUSED;
+  }
+  /* Belt-and-braces: the transport policy above already guarantees a context
+   * with a usable socket (verified TLS implies a live SSL object and loopback
+   * allowance requires gate_ctx->fd >= 0), so this is unreachable today; keep
+   * the guard so the handshake can never be driven over an invalid fd. */
+  if (!gate_ctx || gate_ctx->fd < 0) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s': no auth transport available", config->module);
+    *error = "authentication failed for the requested daemon module";
+    return MODULE_AUTH_REFUSED;
+  }
+  /* The handshake writes exactly one terminal status on failure and signals so
+   * via MODULE_AUTH_TERMINATED; the username may be logged (never the password
+   * or any derived proof). */
+  if (!server_auth_handshake(gate_ctx->fd, config, module)) {
+    char* escaped_user =
+        config->auth_user ? output_escape(config->auth_user, config->eight_bit_output) : NULL;
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s': authentication failed for user '%s'",
+                config->module, escaped_user ? escaped_user : "(none)");
+    free(escaped_user);
+    return MODULE_AUTH_TERMINATED;
+  }
+  char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
+  log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' authenticated", config->module,
+              escaped_user ? escaped_user : "<allocation failed>");
+  free(escaped_user);
+  return MODULE_AUTH_ACCEPTED;
+}
+
+/* Installs the module's configured path as the connection's authorized root.
+ * Returns an error string when the root is unusable, NULL on success. */
+static const char* module_gate_install_root(const Config* config, const DaemonModule* module) {
+  if (!configure_authorization(module->path)) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s' path '%s' is not usable", config->module,
+                module->path ? module->path : "(null)");
+    return "requested daemon module root is not usable";
+  }
+  return NULL;
+}
+
 /* Config-frame gate (runs inside config_receive_with_validate, BEFORE the
  * STATUS_OK ack, so a rejected connection is refused at the config handshake
  * and no file data is ever exchanged).
@@ -324,115 +473,23 @@ static const char* server_module_gate(const Config* config, void* context) {
     return "daemon connection did not select a module (expected a "
            "host::module/path destination)";
 
-  const DaemonModule* module = daemon_conf_find_module(g_daemon_conf, config->module);
-  if (module == NULL) {
-    char* escaped_module = output_escape(config->module, config->eight_bit_output);
-    log_message(LOG_LEVEL_ERROR, "unknown daemon module '%s' requested",
-                escaped_module ? escaped_module : "<allocation failed>");
-    free(escaped_module);
-    return "requested daemon module does not exist";
+  const char* error = NULL;
+  const DaemonModule* module = module_gate_lookup_module(config, &error);
+  if (!module)
+    return error;
+  error = module_gate_check_ownership(config, module, gate_ctx);
+  if (error)
+    return error;
+  switch (module_gate_authenticate(config, module, gate_ctx, &error)) {
+  case MODULE_AUTH_REFUSED:
+    return error;
+  case MODULE_AUTH_TERMINATED:
+    return CONFIG_VALIDATE_ALREADY_TERMINATED;
+  case MODULE_AUTH_ACCEPTED:
+    break;
   }
-  if (module->read_only) {
-    log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
-                config->module);
-    return "requested daemon module is read only";
-  }
-  /* Client-chosen ownership / super-user policy (P7 Wave E hardening): a daemon
-     module refuses EVERY ownership-affecting request (--numeric-ids, --chown,
-     --usermap/--groupmap, --fake-super, --copy-as, explicit --super) unless the
-     operator opted THIS module in with `client owner = yes`.  Otherwise any
-     client could force arbitrary ownership inside the module root.  The
-     standalone/SSH server has a single operator-authorized root and keeps
-     honoring these. */
-  if (!module->client_owner) {
-    /* Ownership: refuse the whole transfer up front (a clear failure).
-       Evaluated against the ORIGINAL config so an explicit --super is refused
-       even when an operator --no-super veto already forced the effective copy
-       to OFF (the veto must not silently convert a refusal into an accept). */
-    if (identity_ownership_requested(config)) {
-      log_message(LOG_LEVEL_ERROR,
-                  "daemon module '%s' refuses client-chosen ownership/super-user activities "
-                  "(no `client owner = yes` opt-in); refusing",
-                  config->module);
-      return "client-chosen ownership is not permitted by this daemon module";
-    }
-    /* Super-user DEVICE activities (char/block mknod and --write-devices) are
-       permitted under the default AUTO mode, so without this override a root
-       daemon would still let a non-opted module create arbitrary device nodes
-       and write raw devices.  Force them off for this connection: those entries
-       are skipped (never mknod'ed) while an ordinary `-a` push still succeeds
-       without device nodes, matching the operator's least-privilege choice.
-       The operator-level --no-super veto is already folded into this. */
-    if (gate_ctx)
-      gate_ctx->super_mode_override = SUPER_MODE_OFF;
-  }
-  if (module->auth_user_count > 0) {
-    /* Auth-required module (A7, protocol 2.19.0): run the SCRAM challenge/
-     * response BEFORE the module root is installed and before any data moves.
-     * Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR);
-     * a handshake that fails before the success response writes exactly one
-     * STATUS_AUTH_FAILED before signalling ALREADY_TERMINATED (a failure while
-     * writing the success signature instead just drops the broken connection).
-     * The username may be logged (never the password or any derived proof). */
-    if (g_credentials == NULL) {
-      log_message(LOG_LEVEL_ERROR,
-                  "daemon module '%s' requires authentication but no credential store is "
-                  "configured (--password-file/--early-input); refusing",
-                  config->module);
-      return "requested daemon module requires authentication and no credential "
-             "store is configured";
-    }
-    /* Transport policy (A7-3/S1): an auth-required module only accepts
-     * credentials over (a) an encrypted, verified TLS connection whose client
-     * certificate matches --client-cn, or (b) an actual PLAINTEXT connection
-     * from a loopback peer that the operator explicitly opted into with
-     * --allow-unauthenticated.  A remote plaintext peer, an un-flagged loopback
-     * plaintext peer, and a loopback TLS peer whose certificate does not match
-     * --client-cn are all refused HERE, before the challenge is sent, so an
-     * unverified client never receives a nonce: the loopback allowance requires
-     * !gate_ctx->ssl, so --tls + --allow-unauthenticated can never be used to
-     * bypass the client-CN check.  The operator flag never permits REMOTE
-     * plaintext auth: remote peers still require verified TLS regardless. */
-    bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
-                  tls_client_identity_allowed(gate_ctx->ssl);
-    bool local_ok = allow_unauthenticated && gate_ctx && !gate_ctx->ssl && gate_ctx->fd >= 0 &&
-                    utils_fd_peer_is_local(gate_ctx->fd);
-    if (!tls_ok && !local_ok) {
-      log_message(LOG_LEVEL_ERROR,
-                  "daemon module '%s' requires authentication over an encrypted, verified TLS "
-                  "connection (or an opted-in loopback plaintext transport); refusing",
-                  config->module);
-      return "daemon module requires authentication over an encrypted, verified TLS "
-             "connection";
-    }
-    /* Belt-and-braces: the transport policy above already guarantees a context
-     * with a usable socket (verified TLS implies a live SSL object and loopback
-     * allowance requires gate_ctx->fd >= 0), so this is unreachable today; keep
-     * the guard so the handshake can never be driven over an invalid fd. */
-    if (!gate_ctx || gate_ctx->fd < 0) {
-      log_message(LOG_LEVEL_ERROR, "daemon module '%s': no auth transport available",
-                  config->module);
-      return "authentication failed for the requested daemon module";
-    }
-    if (!server_auth_handshake(gate_ctx->fd, config, module)) {
-      char* escaped_user =
-          config->auth_user ? output_escape(config->auth_user, config->eight_bit_output) : NULL;
-      log_message(LOG_LEVEL_ERROR, "daemon module '%s': authentication failed for user '%s'",
-                  config->module, escaped_user ? escaped_user : "(none)");
-      free(escaped_user);
-      return CONFIG_VALIDATE_ALREADY_TERMINATED;
-    }
-    char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
-    log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' authenticated", config->module,
-                escaped_user ? escaped_user : "<allocation failed>");
-    free(escaped_user);
-  }
-  if (!configure_authorization(module->path)) {
-    log_message(LOG_LEVEL_ERROR, "daemon module '%s' path '%s' is not usable", config->module,
-                module->path ? module->path : "(null)");
-    return "requested daemon module root is not usable";
-  }
-  return NULL; /* accepted; authorized root is now the module's path */
+  /* accepted; the authorized root is now the module's path */
+  return module_gate_install_root(config, module);
 }
 
 void handler(int file_descriptor) {
