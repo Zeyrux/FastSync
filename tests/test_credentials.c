@@ -3,6 +3,7 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <errno.h>
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,9 +74,10 @@ static void rm_temp(const char* path) {
   if (!path)
     return;
   unlink(path);
-  /* Every successfully loaded store auto-creates an owner-only
+  /* Every successfully loaded store auto-creates an exact-mode-0600
    * `<store>.dummykey` sidecar; remove it too so tests leave no stray key.  The
-   * atomic-publish temp name is also removed defensively. */
+   * atomic-publish temps carry a random suffix, so glob them all and remove any
+   * that a failing path may have left behind. */
   size_t n = strlen(path) + strlen(".dummykey") + 1;
   char* sidecar = malloc(n);
   if (sidecar) {
@@ -83,12 +85,18 @@ static void rm_temp(const char* path) {
     unlink(sidecar);
     free(sidecar);
   }
-  n = strlen(path) + strlen(".dummykey.tmp.") + 32;
-  char* tmp = malloc(n);
-  if (tmp) {
-    snprintf(tmp, n, "%s.dummykey.tmp.%ld", path, (long)getpid());
-    unlink(tmp);
-    free(tmp);
+  n = strlen(path) + strlen(".dummykey.tmp.*") + 1;
+  char* pattern = malloc(n);
+  if (pattern) {
+    snprintf(pattern, n, "%s.dummykey.tmp.*", path);
+    glob_t matches;
+    memset(&matches, 0, sizeof(matches));
+    if (glob(pattern, 0, NULL, &matches) == 0) {
+      for (size_t i = 0; i < matches.gl_pathc; i++)
+        unlink(matches.gl_pathv[i]);
+    }
+    globfree(&matches);
+    free(pattern);
   }
 }
 
@@ -815,6 +823,38 @@ static void test_credentials_dummy_key_persisted() {
   free(sidecar);
 }
 
+/* A restrictive umask must not leave the freshly published sidecar with owner
+ * bits cleared: creation forces exact 0600 with fchmod (the reader requires an
+ * exact 0600), so the daemon cannot lock itself out on the next restart. */
+static void test_credentials_dummy_key_exact_mode_under_umask() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  /* Clear every permission bit the O_CREAT mode would otherwise provide; only
+   * the explicit fchmod can restore the exact 0600 the reader demands. */
+  mode_t old_umask = umask(0777);
+  char err[512];
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  umask(old_umask);
+  EXPECT_NOT_NULL(store);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(sidecar, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 07777), 0600);
+  EXPECT_EQ_INT((int)st.st_size, CREDENTIAL_KEY_LEN);
+  credentials_free(store);
+
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
 /* A sidecar that is group/other accessible, the wrong size, or not a regular
  * file must fail the load closed. */
 static void test_credentials_dummy_key_rejects_bad_sidecar() {
@@ -1037,6 +1077,7 @@ void test_credentials(void) {
   test_credentials_hash_file();
   test_credentials_rejects_group_or_other_accessible();
   test_credentials_dummy_key_persisted();
+  test_credentials_dummy_key_exact_mode_under_umask();
   test_credentials_dummy_key_rejects_bad_sidecar();
   test_credentials_dummy_key_existing_sidecar_adopted();
   test_credentials_dummy_key_symlink_rejected();
