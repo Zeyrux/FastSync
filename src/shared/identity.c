@@ -31,6 +31,11 @@ typedef struct {
    * per connection so privilege_super_permitted() can gate super-user
    * activities without a Config argument. */
   int super_mode;
+  /* --copy-as=USER[:GROUP]: snapshotted so the ownership resolver can force the
+   * target ids without a Config argument. */
+  bool copy_as_set;
+  int32_t copy_as_uid;
+  int32_t copy_as_gid;
   bool set;
 } IdentityActive;
 
@@ -49,6 +54,9 @@ static void identity_active_reset(void) {
   g_identity.chown_gid_set = false;
   g_identity.chown_gid = 0;
   g_identity.super_mode = SUPER_MODE_AUTO;
+  g_identity.copy_as_set = false;
+  g_identity.copy_as_uid = 0;
+  g_identity.copy_as_gid = 0;
   g_identity.set = false;
 }
 
@@ -65,6 +73,10 @@ void identity_set_active(const Config* config) {
   g_identity.chown_uid = config->chown_uid;
   g_identity.chown_gid_set = config->chown_gid_set;
   g_identity.chown_gid = config->chown_gid;
+  g_identity.super_mode = config->super_mode;
+  g_identity.copy_as_set = config->copy_as_set;
+  g_identity.copy_as_uid = config->copy_as_uid;
+  g_identity.copy_as_gid = config->copy_as_gid;
   if (config->usermap_count > 0) {
     g_identity.usermap = calloc((size_t)config->usermap_count, sizeof(IdentityMap));
     if (g_identity.usermap) {
@@ -84,33 +96,37 @@ void identity_set_active(const Config* config) {
   g_identity.super_mode = config->super_mode;
   g_identity.set = true;
   /* A root receiver would honor any client-supplied ownership request (a
-     --usermap/--groupmap/--chown, or raw ids under --numeric-ids).  Surface
-     that prominently; a privileged daemon applying arbitrary client ownership
-     is a deliberate, opt-in choice the operator should be aware of. */
+     --usermap/--groupmap/--chown/--copy-as, or raw ids under --numeric-ids).
+     Surface that prominently; a privileged daemon applying arbitrary client
+     ownership is a deliberate, opt-in choice the operator should be aware of. */
   if (geteuid() == 0)
     log_message(LOG_LEVEL_WARNING,
                 "identity mapping active and running as root: client-supplied "
                 "ownership (usermap/groupmap/chown/numeric-ids) will be honored; "
                 "run the daemon as an unprivileged user unless intended");
   /* --super explicitly requests super-user activities, but FastSync never
-     elevates privileges: when the receiver is not already root those confined
-     attempts cannot succeed.  Warn exactly once at activation time (never
-     abort) so the operator knows the flag is inert on this host. */
+     elevates privileges: when the receiver is not already root the kernel will
+     refuse those confined attempts and each is skipped per entry.  Warn exactly
+     once at activation time (never abort) so the operator knows the flag cannot
+     succeed on this host. */
   if (g_identity.super_mode == SUPER_MODE_ON && geteuid() != 0)
     log_message(LOG_LEVEL_WARNING,
                 "--super requested but the receiver is not privileged; super-user "
-                "activities (ownership, device nodes) cannot be performed and will "
-                "be skipped");
+                "activities (ownership, device nodes) will be attempted but refused "
+                "by the kernel and skipped per entry");
 }
 
 bool privilege_super_permitted(void) {
-  if (g_identity.super_mode == SUPER_MODE_OFF)
-    return false;
-  if (g_identity.super_mode == SUPER_MODE_ON)
-    return true;
-  /* SUPER_MODE_AUTO (the default): only attempt super-user activities when the
-     receiver is already root. */
-  return geteuid() == 0;
+  return privilege_super_mode_permitted(g_identity.super_mode);
+}
+
+bool privilege_super_mode_permitted(int mode) {
+  /* AUTO and ON both attempt the confined operation; OFF forbids it even for a
+   * root receiver.  AUTO is the historical FastSync behavior (always attempt
+   * and let the kernel refuse an unprivileged call, which the caller skips), so
+   * it must stay permissive or a group-only chown that a non-root receiver is
+   * allowed to make would regress. */
+  return mode != SUPER_MODE_OFF;
 }
 
 /* --super with NO explicit identity policy implies raw numeric-id preservation,
@@ -134,7 +150,8 @@ bool identity_active_enabled(void) {
      with no explicit identity policy acts like --numeric-ids here. */
   return g_identity.set && (g_identity.numeric_ids || g_identity.chown_uid_set ||
                             g_identity.chown_gid_set || g_identity.usermap_count > 0 ||
-                            g_identity.groupmap_count > 0 || identity_super_implies_numeric());
+                            g_identity.groupmap_count > 0 || g_identity.copy_as_set ||
+                            identity_super_implies_numeric());
 }
 
 bool identity_wire_valid(const Config* config) {
@@ -396,6 +413,87 @@ done:
   return ret;
 }
 
+int identity_parse_copy_as(Config* config, const char* value) {
+  if (!config || !value || *value == '\0') {
+    log_message(LOG_LEVEL_ERROR, "--copy-as requires USER[:GROUP]");
+    return -1;
+  }
+  /* --copy-as=USER[:GROUP] is the whole grammar: at most one field separator.
+   * (Unlike --chown there is no escaped-colon form; a name containing ':' is
+   * simply not expressible, and the extra colon is a clear parse error.) */
+  int colons = 0;
+  for (const char* p = value; *p; p++)
+    if (*p == ':')
+      colons++;
+  if (colons > 1) {
+    log_message(LOG_LEVEL_ERROR, "--copy-as must be USER[:GROUP] (got '%s')", value);
+    return -1;
+  }
+
+  char* spec = str_dup(value);
+  if (!spec) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --copy-as");
+    return -1;
+  }
+  char* user_token = spec;
+  char* group_token = NULL;
+  char* colon = strchr(spec, ':');
+  if (colon) {
+    *colon = '\0';
+    group_token = colon + 1;
+  }
+
+  int32_t uid;
+  if (*user_token == '\0') {
+    log_message(LOG_LEVEL_ERROR, "--copy-as is missing the user (got '%s')", value);
+    free(spec);
+    return -1;
+  }
+  if (strcmp(user_token, "*") == 0) {
+    /* '*' means the current/root user: the client's euid. */
+    uid = (int32_t)geteuid();
+  } else if (identity_resolve_token(user_token, false, &uid) != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--copy-as could not resolve user '%s' (use a name that exists "
+                "on the source, '*', or @N)",
+                value);
+    free(spec);
+    return -1;
+  }
+
+  int32_t gid;
+  if (group_token) {
+    if (*group_token == '\0') {
+      log_message(LOG_LEVEL_ERROR, "--copy-as group is empty (got '%s')", value);
+      free(spec);
+      return -1;
+    }
+    if (strcmp(group_token, "*") == 0) {
+      gid = (int32_t)getegid();
+    } else if (identity_resolve_token(group_token, true, &gid) != 0) {
+      log_message(LOG_LEVEL_ERROR, "--copy-as could not resolve group '%s' (got '%s')", group_token,
+                  value);
+      free(spec);
+      return -1;
+    }
+  } else {
+    /* Group omitted: use the user's primary gid.  A numeric id with no local
+     * passwd entry has no primary gid to look up, so fall back to gid == uid
+     * (the rsync-style numeric convention; documented divergence). */
+    struct passwd* pw = getpwuid((uid_t)uid);
+    gid = pw ? (int32_t)pw->pw_gid : uid;
+  }
+  free(spec);
+
+  config->copy_as_set = true;
+  config->copy_as_uid = uid;
+  config->copy_as_gid = gid;
+  /* Ownership application needs the metadata path (the source uid/gid must be
+   * transmitted); imply it exactly like --chown/--usermap/--groupmap. */
+  config->use_metadata = true;
+  return 0;
+}
+
 /* ---- Receiver-side ownership application ---- */
 
 static bool identity_map_lookup(const IdentityMap* map, int count, int32_t source_id,
@@ -418,6 +516,20 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
   bool set_gid = false;
   uid_t uid = 0;
   gid_t gid = 0;
+
+  /* --copy-as (P7 Wave E) has the highest priority: it forces BOTH the owner
+   * and group of every written entry to the requested ids, beating usermap /
+   * groupmap / --chown / --numeric-ids and the best-effort name lookup.  Only
+   * skip when the entry already carries exactly those ids. */
+  if (g_identity.copy_as_set) {
+    uid = (uid_t)g_identity.copy_as_uid;
+    gid = (gid_t)g_identity.copy_as_gid;
+    if (st->st_uid == uid && st->st_gid == gid)
+      return false;
+    *out_uid = uid;
+    *out_gid = gid;
+    return true;
+  }
 
   int32_t target;
   if (identity_map_lookup(g_identity.usermap, g_identity.usermap_count, source_uid, &target)) {

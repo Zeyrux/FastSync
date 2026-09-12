@@ -178,6 +178,9 @@ static void config_set_defaults(Config* config) {
   config->open_noatime = false;
   config->use_xattrs = false;
   config->fake_super = false;
+  config->copy_as_set = false;
+  config->copy_as_uid = 0;
+  config->copy_as_gid = 0;
   config->trust_sender = false;
   config->stop_after_mins = 0;
   config->stop_at = 0;
@@ -242,6 +245,7 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
          valid_wire_bool(config->fake_super) &&
+         (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -1208,6 +1212,38 @@ static bool receive_privilege_options(int fd, Config* c) {
   return true;
 }
 
+/* --copy-as=USER[:GROUP] (P7 Wave E, protocol 2.18.0).  Trailing block on the
+ * config frame, sent after the --super int and before the ack: a presence int,
+ * then (when set) the target uid and gid as int32.  The receiver forces the
+ * ownership of every entry it writes to these ids through the confined
+ * fd-relative identity path and requires privilege; both ids are validated
+ * `>= 0` on receive so a hostile peer cannot smuggle a negative (sentinel)
+ * value into the ownership path. */
+static bool send_copy_as_options(int fd, const Config* c) {
+  if (!send_int(fd, c->copy_as_set ? 1 : 0))
+    return false;
+  if (!c->copy_as_set)
+    return true;
+  return send_int(fd, c->copy_as_uid) && send_int(fd, c->copy_as_gid);
+}
+
+static bool receive_copy_as_options(int fd, Config* c) {
+  int present;
+  if (!receive_int(fd, &present) || !valid_wire_bool(present))
+    return false;
+  if (!present) {
+    c->copy_as_set = false;
+    return true;
+  }
+  int uid, gid;
+  if (!receive_int(fd, &uid) || !receive_int(fd, &gid) || uid < 0 || gid < 0)
+    return false;
+  c->copy_as_set = true;
+  c->copy_as_uid = uid;
+  c->copy_as_gid = gid;
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -1221,7 +1257,9 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_symlink_trust_options(file_descriptor, config) ||
       !send_phase4_xattr_options(file_descriptor, config) ||
       !send_daemon_module(file_descriptor, config) || !send_daemon_auth(file_descriptor, config) ||
-      !send_iconv_spec(file_descriptor, config) || !send_privilege_options(file_descriptor, config))
+      !send_iconv_spec(file_descriptor, config) ||
+      !send_privilege_options(file_descriptor, config) ||
+      !send_copy_as_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -1265,7 +1303,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_daemon_module(file_descriptor, config) ||
       !receive_daemon_auth(file_descriptor, config) ||
       !receive_iconv_spec(file_descriptor, config) ||
-      !receive_privilege_options(file_descriptor, config))
+      !receive_privilege_options(file_descriptor, config) ||
+      !receive_copy_as_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

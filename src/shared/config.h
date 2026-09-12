@@ -455,6 +455,20 @@ typedef struct Config {
    * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
    * so a later privileged restore could re-apply them.  Crosses the wire. */
   bool fake_super;
+  /* --copy-as=USER[:GROUP] (P7 Wave E, protocol 2.18.0).  Safe-subset
+   * implementation, a documented divergence from rsync's real identity switch:
+   * the receiver does NOT change its process credentials (FastSync's receiver
+   * is multithreaded, so a setuid/seteuid drop would be unsafe).  Instead the
+   * receiver FORCES the ownership of every entry it writes to copy_as_uid /
+   * copy_as_gid through the existing confined, fd-relative identity path
+   * (fchown/fchownat), which REQUIRES receiver privilege (root); an
+   * unprivileged receiver REFUSES the whole transfer up front at the config
+   * handshake (never a silent wrong-ownership result).  All three fields CROSS
+   * the wire as a trailing config-frame block so the receiver learns the
+   * requested ids; see the PROTOCOL_VERSION note below. */
+  bool copy_as_set;
+  int32_t copy_as_uid;
+  int32_t copy_as_gid;
 
   // Phase 5: --trust-sender
   /* Long-form-only, receiver-local policy.  rsync's --trust-sender tells the
@@ -584,18 +598,25 @@ typedef struct Config {
  * Privilege Wave (P7 Wave E): 2.17.0 -> 2.18.0.
  *
  * WHY the bump, grounded in the wire: this wave adds the receiver-side
- * --super / --no-super privilege policy.  The config-frame layout gains a new
- * trailing int (Config->super_mode) sent immediately AFTER the --iconv
- * CONVERT_SPEC block (send_privilege_options / receive_privilege_options in
- * config.c), so the receiver knows whether it may attempt super-user
- * activities (ownership application, char/block device-node creation) that are
- * already confined below the authorized receive root.  Any config-frame layout
- * change must bump the protocol version: a peer that does not parse the new
- * trailing bytes would desynchronize on the frame boundary, and the strict
- * same-version handshake (config_receive rejects a mismatched version before
- * parsing anything else) is what keeps a 2.18 client and a 2.17 server from
- * ever reaching that state.  --super never elevates privileges; it only
- * permits a confined attempt, so no new capability is granted. */
+ * privilege flags --super/--no-super and --copy-as=USER[:GROUP].  The
+ * config-frame layout gains two new trailing blocks AFTER the --iconv
+ * CONVERT_SPEC string, in this fixed order: (1) send_privilege_options /
+ * receive_privilege_options send one int (Config->super_mode, 0..2), then
+ * (2) send_copy_as_options / receive_copy_as_options send a presence int and,
+ * when set, the target uid and gid (both int32).  The receiver uses
+ * super_mode to decide whether it may attempt super-user activities
+ * (ownership application, char/block device-node creation) already confined
+ * below the authorized receive root, and the copy-as ids to force the
+ * ownership of every entry it writes (the safe-subset --copy-as model).  The
+ * receiver REQUIRES privilege for copy-as: an unprivileged receiver refuses
+ * the transfer at the config handshake (server_module_gate) instead of silently
+ * ignoring the flag.  Any config-frame layout change must bump the protocol
+ * version: a peer that does not parse the new trailing bytes would
+ * desynchronize on the frame boundary, and the strict same-version handshake
+ * (config_receive rejects a mismatched version before parsing anything else) is
+ * what keeps a 2.18 client and a 2.17 server from ever reaching that state.
+ * --super never elevates privileges; it only permits a confined attempt, and
+ * --copy-as never switches process credentials (see RSYNC_COMPAT.md). */
 #define PROTOCOL_VERSION "2.18.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
@@ -609,11 +630,11 @@ typedef struct Config {
 #define IDENTITY_CURRENT (-1)
 #define MAX_IDENTITY_MAP 128
 
-/* --super / --no-super tri-state (Config->super_mode).  AUTO preserves the
- * pre-existing behavior (a privileged attempt only when already root); ON
- * permits confined privileged attempts; OFF forbids them even as root.  See the
- * Config->super_mode comment above and privilege_super_permitted() in
- * identity.h. */
+/* --super / --no-super tri-state (Config->super_mode).  AUTO (default) and ON
+ * both permit a confined super-user attempt (AUTO preserves FastSync's
+ * historical best-effort behavior; an unprivileged attempt is refused by the
+ * kernel and skipped per entry); OFF forbids the attempt even for root.  See
+ * privilege_super_mode_permitted() in identity.h. */
 #define SUPER_MODE_AUTO 0
 #define SUPER_MODE_ON 1
 #define SUPER_MODE_OFF 2

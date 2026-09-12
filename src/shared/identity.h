@@ -34,6 +34,28 @@ int identity_parse_map(Config* config, const char* value, bool is_group);
  * on success, -1 on a malformed spec / unresolvable name. */
 int identity_parse_chown(Config* config, const char* value);
 
+/* Parse --copy-as=USER[:GROUP] (P7 Wave E).  USER is resolved with the same
+ * user-database rules as --chown (a name, @N/bare N numeric id, or '*' meaning
+ * the client's current euid); when ':GROUP' is present the group is resolved
+ * with the group database ('*' meaning the client's egid).  When the group is
+ * omitted, the user's primary gid is used (getpwuid(uid)->pw_gid); if the
+ * resolved user is a numeric id with no local passwd entry, gid falls back to
+ * uid.  On success sets copy_as_set/copy_as_uid/copy_as_gid and forces
+ * metadata transmission (ownership application needs the metadata path).
+ * Returns 0 on success, -1 on a malformed / empty / unresolvable spec (never a
+ * silent no-op). */
+int identity_parse_copy_as(Config* config, const char* value);
+
+/* True when a --copy-as request is active but the receiver is not permitted to
+ * perform the privileged ownership application it needs.  This is the up-front
+ * refusal predicate: the server rejects the whole transfer at the config
+ * handshake rather than silently ignoring the requested ownership.  It is a
+ * pure function of the config mode and the current effective uid (it does NOT
+ * read the active snapshot, so it is valid at the pre-STATUS_OK gate, before
+ * identity_set_active() has run).  `super_mode` is the EFFECTIVE mode after any
+ * server-side policy veto. */
+bool identity_copy_as_refused(const Config* config);
+
 /* Receiver-side snapshot of the negotiated identity config.  The server calls
  * identity_set_active() once per connection (before any file write) using the
  * config received over the wire; the snapshot is a deep copy so the caller may
@@ -66,13 +88,15 @@ void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t sour
 bool identity_wire_valid(const Config* config);
 
 /* P7 Wave E receiver-side permission gate for super-user activities (ownership
- * application and char/block device-node creation).  Returns false when the
- * active config is --no-super (SUPER_MODE_OFF); true when it is --super
- * (SUPER_MODE_ON); and otherwise (SUPER_MODE_AUTO, the default, or before
- * identity_set_active() has been called) only when the receiver is ALREADY root
- * (geteuid() == 0).  This NEVER elevates privileges: it only reports whether an
- * attempt that is already confined below the authorized receive root may be
- * made. */
+ * application and char/block device-node creation).  `privilege_super_permitted`
+ * consults the per-connection snapshot (call identity_set_active() first);
+ * `privilege_super_mode_permitted` is the pure mode predicate and is what
+ * callers holding a Config use (the config-frame gate, file_receive).  Both
+ * return false only for SUPER_MODE_OFF; SUPER_MODE_ON and SUPER_MODE_AUTO (the
+ * default) permit a confined attempt, matching FastSync's historical
+ * best-effort behavior where an unprivileged attempt is refused by the kernel
+ * and skipped.  Neither EVER elevates privileges. */
 bool privilege_super_permitted(void);
+bool privilege_super_mode_permitted(int mode);
 
 #endif

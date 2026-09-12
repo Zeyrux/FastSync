@@ -175,6 +175,16 @@ static const char* server_module_gate(const Config* config, void* context) {
   ModuleGateContext* gate_ctx = (ModuleGateContext*)context;
   if (!config)
     return "missing config frame";
+  /* --copy-as (P7 Wave E, protocol 2.18.0): FastSync's safe subset forces the
+     ownership of every written entry to the requested ids, which needs a
+     privileged (root) receiver.  An unprivileged receiver REFUSES the whole
+     transfer here, at the config handshake and BEFORE the STATUS_OK ack, so no
+     file data is exchanged and there is never a silent wrong-ownership result.
+     Placed first so it applies to the standalone server and daemon alike. */
+  if (config->copy_as_set && geteuid() != 0) {
+    log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
+    return "--copy-as requires a privileged receiver (root)";
+  }
   /* --iconv (protocol 2.16.0): the receiver's exact conversion direction (the
      client spec's wire charset into this server's local charset, including a
      server-side --iconv override) must be usable BEFORE the STATUS_OK ack, so
