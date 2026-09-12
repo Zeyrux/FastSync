@@ -8,12 +8,39 @@
 /* Server-side file receive/save path. */
 
 File* file_receive(const Config* config, int file_descriptor);
-File* file_receive_directory(int file_descriptor);
+File* file_receive_directory(int file_descriptor, const Config* config);
+File* file_receive_dir_time(int file_descriptor, const Config* config);
 File* file_receive_hardlink(int file_descriptor);
 File* file_receive_symlink(int file_descriptor, const Config* config);
 File* file_receive_special(int file_descriptor);
 bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
+
+/* P7 Wave D directory-time accumulator.  The receiver collects the metadata of
+ * every directory it creates/receives (STATUS_MKDIR with metadata and/or the
+ * trailing STATUS_DIR_TIMES frame(s)) and applies the times only at the END of the
+ * transfer, after all children have been written and after the delete /
+ * --delay-updates phases have committed (writing or removing a child bumps the
+ * parent's mtime).  -O/--omit-dir-times skips the application entirely.  The
+ * list owns deep copies of the paths and metadata; freed on every path. */
+typedef struct {
+  char** paths;          /* owned, destination-relative wire paths */
+  FileMetadata* entries; /* owned, parallel to paths */
+  size_t count;
+  size_t capacity;
+} DirTimeList;
+
+void dir_time_list_init(DirTimeList* list);
+void dir_time_list_free(DirTimeList* list);
+/* Deep-copy one directory's path + metadata into the list.  Returns false on
+ * allocation failure (the caller fails the transfer). */
+bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata);
+/* Apply every accumulated directory's mtime (and atime when captured) beneath
+ * `root_directory`, confined fd-relative.  Best-effort per entry: an absent
+ * directory (an empty/pruned source dir that was deliberately not created) or a
+ * non-directory at the path is skipped QUIETLY, an unreachable one with a
+ * warning, and never fatal. */
+void dir_time_list_apply(const DirTimeList* list, const char* root_directory);
 
 /* A received delete-manifest frame: the keep-set (`keeps`, destination-relative
    paths the sender transferred/keeps) plus `protected`, destination-relative

@@ -55,6 +55,13 @@ bool identity_active_enabled(void);
  * never fatal (rsync parity: the transfer must not abort). */
 void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid);
 
+/* P7 Wave D: the no-follow (symlink) counterpart.  Resolves the same
+ * usermap/groupmap/chown/numeric-ids policy but applies it with
+ * fchownat(..., AT_SYMLINK_NOFOLLOW) so a symlink's own ownership is changed
+ * without ever dereferencing it.  A no-op unless an identity flag is active. */
+void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
+                                   int32_t source_gid);
+
 /* Receiver-side wire validation of the resolved identity fields. */
 bool identity_wire_valid(const Config* config);
 

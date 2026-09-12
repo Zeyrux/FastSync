@@ -551,6 +551,18 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return FILE_SAVE_ERROR;
   }
 
+  /* P7 Wave D #1: a STATUS_DIR_TIMES entry is RECORD-ONLY.  The scanner
+     captures every traversed directory -- including empty ones whose parents
+     were never created by a child write and directories pruned by
+     -m/--prune-empty-dirs.  Creating them here would resurrect empty
+     directories (an -a behavior change) and could abort the whole transfer on a
+     pre-existing regular file/symlink at the mirror path.  Short-circuit before
+     any device/write-devices/directory branch and report it as skipped so the
+     sink still accumulates its metadata for the deferred DirTimeList
+     application, but create nothing. */
+  if (file->dir_time_only)
+    return FILE_SAVE_SKIPPED;
+
   /* Device/special node (--devices/--specials): recreate the node instead of
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special)
@@ -621,6 +633,12 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     }
     ok = file_symlink_at_secure(link_path, target);
     free(target);
+    /* P7 Wave D: apply the symlink's own metadata with no-follow primitives
+       (utimensat/lchown/fchmodat AT_SYMLINK_NOFOLLOW).  -J/--omit-link-times
+       suppresses the timestamps; ownership stays gated by the identity policy.
+       A symlink has no children, so this can be applied immediately. */
+    if (ok && config && config->use_metadata)
+      file_restore_symlink_metadata(link_path, file->metadata, config->omit_link_times);
     free(link_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
@@ -2137,12 +2155,119 @@ File* file_receive(const Config* config, int file_descriptor) {
   return file;
 }
 
+/* ---- P7 Wave D: deferred directory times ---- */
+
+void dir_time_list_init(DirTimeList* list) {
+  if (!list)
+    return;
+  list->paths = NULL;
+  list->entries = NULL;
+  list->count = 0;
+  list->capacity = 0;
+}
+
+void dir_time_list_free(DirTimeList* list) {
+  if (!list)
+    return;
+  for (size_t i = 0; i < list->count; i++)
+    free(list->paths[i]);
+  free(list->paths);
+  free(list->entries);
+  list->paths = NULL;
+  list->entries = NULL;
+  list->count = 0;
+  list->capacity = 0;
+}
+
+bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata) {
+  if (!list || !wire_path || !metadata)
+    return true; /* nothing to remember; never a hard error */
+  if (list->count == list->capacity) {
+    size_t new_capacity = list->capacity == 0 ? 16 : list->capacity * 2;
+    if (new_capacity < list->capacity)
+      return false;
+    /* Assign each grown array as soon as its realloc succeeds: the old block is
+       already freed by then, so discarding the pointer would dangle.  capacity
+       is advanced only after BOTH reallocs succeed, so a partial failure leaves
+       capacity no larger than the entries allocation (the paths array may be
+       over-allocated, which is harmless) -- never a mismatched list the next
+       add could write past. */
+    char** grown_paths = realloc(list->paths, new_capacity * sizeof(char*));
+    if (!grown_paths)
+      return false;
+    list->paths = grown_paths;
+    FileMetadata* grown_entries = realloc(list->entries, new_capacity * sizeof(FileMetadata));
+    if (!grown_entries)
+      return false;
+    list->entries = grown_entries;
+    list->capacity = new_capacity;
+  }
+  char* copy = str_dup(wire_path);
+  if (!copy)
+    return false;
+  list->paths[list->count] = copy;
+  list->entries[list->count] = *metadata;
+  list->count++;
+  return true;
+}
+
+void dir_time_list_apply(const DirTimeList* list, const char* root_directory) {
+  if (!list || !root_directory)
+    return;
+  for (size_t i = 0; i < list->count; i++) {
+    char* dir_path = path_cat(root_directory, list->paths[i]);
+    if (!dir_path)
+      continue;
+    char* leaf = NULL;
+    /* The parent walk is fd-relative and O_NOFOLLOW, so a symlink planted in a
+       parent component can never redirect the utimensat outside the root. */
+    int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
+    if (parent_fd < 0) {
+      free(dir_path);
+      continue;
+    }
+    /* A dir-time entry only records metadata: the directory is (deliberately)
+       not created from it, so an empty source directory (or one pruned by
+       -m/--prune-empty-dirs) may well not exist here.  Skip absent paths
+       QUIETLY rather than warning for every one, and apply the times only to a
+       real directory that does exist.  AT_SYMLINK_NOFOLLOW keeps a same-named
+       symlink from being followed; a pre-existing regular file/symlink is not a
+       directory, so it is left completely untouched. */
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode)) {
+      close(parent_fd);
+      free(leaf);
+      free(dir_path);
+      continue;
+    }
+    struct timespec times[2] = {
+        {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+        {.tv_sec = list->entries[i].mtime_sec, .tv_nsec = list->entries[i].mtime_nsec}};
+    if (list->entries[i].atime_valid) {
+      times[0].tv_sec = list->entries[i].atime_sec;
+      times[0].tv_nsec = list->entries[i].atime_nsec;
+    }
+    if (utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to set directory timestamps on %s: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+      free(escaped_path);
+    }
+    close(parent_fd);
+    free(leaf);
+    free(dir_path);
+  }
+}
+
 /* Receive an explicit directory entry (--dirs): a STATUS_MKDIR frame carries
-   only the destination path; the entry carries no payload.  The same path
-   validation as a regular file applies (non-empty, relative-or-mirrored, no
-   traversal), and the created File is routed through the regular store_file
-   sink so single-threaded and -m receivers handle directories identically. */
-File* file_receive_directory(int file_descriptor) {
+   the destination path and, when metadata is negotiated, the directory's
+   metadata frame.  The same path validation as a regular file applies
+   (non-empty, relative-or-mirrored, no traversal), and the created File is
+   routed through the regular store_file sink so single-threaded and -m
+   receivers handle directories identically.  The metadata is NOT applied here:
+   the sink accumulates it into a DirTimeList that is applied only after the
+   whole transfer (children would otherwise clobber the directory mtime). */
+File* file_receive_directory(int file_descriptor, const Config* config) {
   char* path = receive_wire_str(file_descriptor);
   if (path == NULL)
     return NULL;
@@ -2159,6 +2284,50 @@ File* file_receive_directory(int file_descriptor) {
   if (file == NULL)
     return NULL;
   file->is_dir = true;
+  if (config && config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(file_descriptor, &meta_ok);
+    if (!meta_ok) {
+      file_destroy(file);
+      return NULL;
+    }
+  }
+  return file;
+}
+
+/* Receive one directory-time entry from a STATUS_DIR_TIMES frame: the
+ * destination-relative wire path and (when metadata is negotiated) the
+ * directory's metadata frame.  The created File is an is_dir, dir_time_only
+ * entry routed through the regular store_file sink: the sink records its
+ * metadata into the deferred DirTimeList but never creates the directory (the
+ * scanner captures every traversed directory, including empty ones).  Unlike a
+ * STATUS_MKDIR entry, this one must not create anything. */
+File* file_receive_dir_time(int file_descriptor, const Config* config) {
+  char* path = receive_wire_str(file_descriptor);
+  if (path == NULL)
+    return NULL;
+  if (path[0] == '\0' || (!file_get_trust_sender() && has_path_traversal(path))) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "Invalid received directory-time path: %s",
+                escaped_path ? escaped_path : "<allocation failed>");
+    free(escaped_path);
+    free(path);
+    return NULL;
+  }
+  File* file = file_create(path);
+  free(path);
+  if (!file)
+    return NULL;
+  file->is_dir = true;
+  file->dir_time_only = true;
+  if (config && config->use_metadata) {
+    int meta_ok = 1;
+    file->metadata = metadata_receive(file_descriptor, &meta_ok);
+    if (!meta_ok) {
+      file_destroy(file);
+      return NULL;
+    }
+  }
   return file;
 }
 

@@ -94,14 +94,14 @@ def _seed_protocol_source(source):
 class TestProtocol:
     @pytest.mark.ci
     def test_protocol_current_version_accepted(self, shared_server):
-        """--protocol=2.16.0 (the current PROTOCOL_VERSION) is accepted and the
+        """--protocol=2.17.0 (the current PROTOCOL_VERSION) is accepted and the
         transfer completes normally."""
         source = os.path.join(TEST_DATA_DIR, "proto_ok_src")
         dest = os.path.join(TEST_DATA_DIR, "proto_ok_dst")
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
         _seed_protocol_source(source)
-        result, _ = run_client(source, dest, flags=["--protocol=2.16.0"],
+        result, _ = run_client(source, dest, flags=["--protocol=2.17.0"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"--protocol current run failed: {(result.stderr or result.stdout)[:400]}"
@@ -118,7 +118,7 @@ class TestProtocol:
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
         _seed_protocol_source(source)
-        for bad in ("2.15.0", "2.17.0", "216", "31"):
+        for bad in ("2.15.0", "2.16.0", "216", "31"):
             result, _ = run_client(source, dest, flags=[f"--protocol={bad}"],
                                    port=shared_server.port)
             assert result.returncode != 0, f"--protocol={bad} should be rejected"

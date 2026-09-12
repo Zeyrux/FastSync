@@ -74,6 +74,25 @@ static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
   return true;
 }
 
+/* P7 Wave D: read one STATUS_DIR_TIMES frame (a count followed by that many
+ * (path, metadata) directory entries) and route every entry through the regular
+ * store_file sink.  A dir-time entry is RECORD-ONLY (file->dir_time_only): the
+ * sink accumulates its metadata for end-of-transfer application but creates
+ * nothing, so an empty/pruned source directory is never resurrected.  A large
+ * tree arrives as repeated frames, each bounded by MAX_MANIFEST_ENTRIES; a
+ * malformed count or entry is a hard error. */
+static bool receiver_process_dir_times(int fd, const Config* config, const ReceiverSink* sink) {
+  int count;
+  if (!receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
+    return false;
+  for (int i = 0; i < count; i++) {
+    File* dir = file_receive_dir_time(fd, config);
+    if (!dir || !sink->store_file(dir, sink->context))
+      return false;
+  }
+  return true;
+}
+
 static bool receiver_process_batch(Config* config, int file_descriptor) {
   int count;
   if (config->checksum || !receive_int(file_descriptor, &count) || count < 0 ||
@@ -161,7 +180,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
          status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK ||
-         status == STATUS_SYMLINK || status == STATUS_SPECIAL) {
+         status == STATUS_SYMLINK || status == STATUS_SPECIAL || status == STATUS_DIR_TIMES) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
         goto fail;
@@ -185,8 +204,11 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         goto fail;
       goto next_status;
     } else if (status == STATUS_MKDIR) {
-      File* dir = file_receive_directory(file_descriptor);
+      File* dir = file_receive_directory(file_descriptor, config);
       if (!dir || !sink->store_file(dir, sink->context))
+        goto receive_error;
+    } else if (status == STATUS_DIR_TIMES) {
+      if (!receiver_process_dir_times(file_descriptor, config, sink))
         goto receive_error;
     } else if (status == STATUS_HARDLINK) {
       File* file = file_receive_hardlink(file_descriptor);
@@ -311,6 +333,10 @@ receive_error:
 typedef struct {
   Config* config;
   ReceiverOutcomes outcomes;
+  /* P7 Wave D: directory metadata accumulated during the stream, applied only
+     after the whole transfer (and its delete/publication phases) has run so a
+     child write never clobbers a directory mtime. */
+  DirTimeList dir_times;
 } ReceiverSaveContext;
 
 static bool receiver_save_file(File* file, void* context_pointer) {
@@ -322,6 +348,15 @@ static bool receiver_save_file(File* file, void* context_pointer) {
     result = FILE_SAVE_SKIPPED;
   } else {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
+  }
+  /* A directory's times are deferred, never applied inline: collect the
+     metadata now and apply it at the end.  -O/--omit-dir-times is honored by
+     dir_time_list_apply's caller (see receiver_send_success_frame). */
+  if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
+      context->config->use_metadata && !context->config->omit_dir_times &&
+      !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+    file_destroy(file);
+    return false;
   }
   if (result != FILE_SAVE_ERROR && context->config->remove_source_files && !file->is_dir &&
       !file->is_special && !file->skip &&
@@ -346,15 +381,22 @@ static bool receiver_send_success_frame(int fd, void* context_pointer) {
       return false;
     }
   }
+  /* P7 Wave D: every child is now written and the delete / --delay-updates
+     phases have committed, so it is finally safe to stamp directory times.
+     This runs after the deferred deletion because receiver_process commits it
+     before calling this success frame. */
+  dir_time_list_apply(&context->dir_times, context->config->receive_root_directory);
   return receiver_send_final_success(fd, context->config, &context->outcomes);
 }
 
 int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
+  dir_time_list_init(&context.dir_times);
   ReceiverSink sink = {receiver_save_file, &context, true, true, receiver_send_success_frame};
   int ret = receiver_process(config, file_descriptor, &sink);
   if (ret != 0 && config->delay_updates && config->delay_context)
     delay_updates_cleanup(config->delay_context);
   receiver_outcomes_destroy(&context.outcomes);
+  dir_time_list_free(&context.dir_times);
   return ret;
 }

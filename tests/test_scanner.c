@@ -1,5 +1,6 @@
 #include "test_utils.h"
 #include "scanner.h"
+#include "array_list.h"
 #include "file.h"
 #include "file_list.h"
 #include "filter.h"
@@ -1262,6 +1263,60 @@ static void test_files_from_relative_send_path() {
   rmdir(root);
 }
 
+/* P7 Wave D: the recursive scan captures every traversed source directory as an
+ * is_dir File (metadata, no payload) in the shared dir_entries list, including
+ * the transfer root and an EMPTY directory.  The empty dir is captured even
+ * though the receiver deliberately never creates it, so its time can still be
+ * applied when the destination already holds that directory. */
+static void test_scanner_captures_directory_times() {
+  const char* root = "test_scan_dirtime";
+  const char* sub = "test_scan_dirtime/sub";
+  const char* empty = "test_scan_dirtime/empty";
+  const char* file1 = "test_scan_dirtime/sub/a.txt";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  EXPECT_EQ_INT(mkdir(empty, 0755), 0);
+  create_test_file(file1, "x");
+
+  ArrayList* dirs = array_list_create(file_destroy);
+  EXPECT_NOT_NULL(dirs);
+  ScannerOptions options = {0};
+  options.use_metadata = true;
+  options.capture_dir_times = true;
+  options.dir_entries = dirs;
+  DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+  EXPECT_NOT_NULL(scanner);
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL)
+    chunk_destroy(chunk);
+  EXPECT_FALSE(directory_scanner_failed(scanner));
+
+  int found_root = 0;
+  int found_sub = 0;
+  int found_empty = 0;
+  for (int i = 0; i < dirs->size; i++) {
+    const File* file = (const File*)dirs->items[i];
+    EXPECT_TRUE(file->is_dir);
+    EXPECT_NOT_NULL(file->metadata);
+    if (strcmp(file->path, root) == 0)
+      found_root = 1;
+    if (strcmp(file->path, sub) == 0)
+      found_sub = 1;
+    if (strcmp(file->path, empty) == 0)
+      found_empty = 1;
+  }
+  EXPECT_TRUE(found_root);
+  EXPECT_TRUE(found_sub);
+  EXPECT_TRUE(found_empty);
+
+  directory_scanner_destroy(scanner);
+  array_list_delete(dirs);
+  unlink(file1);
+  rmdir(empty);
+  rmdir(sub);
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1297,4 +1352,5 @@ void test_scanner() {
   test_dirs_no_descent();
   test_dirs_files_from();
   test_files_from_relative_send_path();
+  test_scanner_captures_directory_times();
 }

@@ -127,6 +127,11 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
   options->hardlinks = NULL;
+  /* P7 Wave D: capture source directory times whenever metadata rides the
+     wire.  Whether they are APPLIED is decided receiver-side (-O skips). */
+  options->capture_dir_times = config->use_metadata;
+  options->dir_entries = NULL;
+  options->dir_entries_mutex = NULL;
   if (config->preserve_hard_links) {
     out->hardlinks = hardlink_table_create();
     if (!out->hardlinks) {
@@ -1115,14 +1120,51 @@ static bool send_file_direct(File* file, int fd, bool use_metadata, int compress
 }
 
 /* Transmit one explicit directory entry (--dirs): a STATUS_MKDIR frame whose
-   payload is only the destination path.  The receiver validates the path and
-   creates the directory under the receive root. */
-static bool send_directory_entry(Client* client, File* file) {
+   payload is the destination path and, when metadata is negotiated, the
+   directory's metadata frame.  The receiver validates the path, creates the
+   directory under the receive root, and (metadata case) defers applying its
+   times to the end of the transfer so -O/--omit-dir-times is honored. */
+static bool send_directory_entry(const Client* client, File* file, const Config* config) {
   if (!file || !file_wire_path(file))
     return false;
-  if (!send_status(client->file_descriptor, STATUS_MKDIR))
+  if (!send_status(client->file_descriptor, STATUS_MKDIR) ||
+      !send_wire_str(client->file_descriptor, file_wire_path(file)))
     return false;
-  return send_wire_str(client->file_descriptor, file_wire_path(file));
+  return !config->use_metadata || metadata_send(client->file_descriptor, file->metadata);
+}
+
+/* P7 Wave D: transmit every captured source directory's metadata in terminal
+   STATUS_DIR_TIMES frames (count, then (path, metadata) pairs) after all file
+   data and the optional delete manifest.  The receiver applies them at the END
+   of its own transfer (after deletion and --delay-updates publication) so a
+   directory's mtime is not clobbered by writing its children.  A non-metadata
+   transfer (or an empty set) sends nothing, keeping the stream byte-identical.
+
+   The receiver rejects a frame whose count exceeds MAX_MANIFEST_ENTRIES, so a
+   huge tree is CHUNKED into repeated frames of at most that many entries each
+   (the receiver's loop handles repeated STATUS_DIR_TIMES frames).  Every frame
+   stays within the receiver's bound, and a frame that would exceed it is never
+   emitted. */
+static bool send_dir_times(const Client* client, const Config* config, ArrayList* dir_entries) {
+  if (!client || !config || !config->use_metadata || !dir_entries || dir_entries->size == 0)
+    return true;
+  int fd = client->file_descriptor;
+  int index = 0;
+  while (index < dir_entries->size) {
+    int remaining = dir_entries->size - index;
+    int chunk = remaining > MAX_MANIFEST_ENTRIES ? MAX_MANIFEST_ENTRIES : remaining;
+    if (!send_status(fd, STATUS_DIR_TIMES) || !send_int(fd, chunk))
+      return false;
+    for (int i = 0; i < chunk; i++) {
+      File* file = (File*)dir_entries->items[index + i];
+      if (!file || !file_wire_path(file))
+        return false;
+      if (!send_wire_str(fd, file_wire_path(file)) || !metadata_send(fd, file->metadata))
+        return false;
+    }
+    index += chunk;
+  }
+  return true;
 }
 
 /* Transmit one symlink entry: a STATUS_SYMLINK frame carrying the destination
@@ -1313,10 +1355,10 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     if (f == NULL)
       continue;
     if (f->is_dir) {
-      /* Explicit directory entry (--dirs): a MKDIR frame carrying only the
-         destination path.  Directories have no source to remove and no
-         incremental check. */
-      if (!send_directory_entry(client, f))
+      /* Explicit directory entry (--dirs): a MKDIR frame carrying the
+         destination path (and metadata when negotiated).  Directories have no
+         source to remove and no incremental check. */
+      if (!send_directory_entry(client, f, config))
         return -1;
       change_emit_dir_sent(config, f);
       continue;
@@ -1501,6 +1543,13 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     if (send_delete_manifest(client->file_descriptor, NULL, NULL, context->missing_args) != 0)
       goto send_fail;
   }
+  /* P7 Wave D: transmit the captured directory times last.  The scanner thread
+     (and all parallel workers) has been joined before scanner_done was set, so
+     the list is complete and race-free; on an early stop the list may be
+     incomplete and is deliberately not sent. */
+  if (!context->scan_stopped_early &&
+      !send_dir_times(client, context->config, context->dir_entries))
+    goto send_fail;
   bool ok = finalize_transfer(client, context->config, context->remove_source_files);
   if (!ok && context->config->use_delete)
     log_message(LOG_LEVEL_ERROR,
@@ -1542,6 +1591,10 @@ static int scan_directory_multithreaded(void* pipeline_context) {
     return thrd_error;
   }
   prepared.options.stop_condition = &context->stop_condition;
+  /* P7 Wave D: the recursive scan feeds the shared directory-time list; the
+     parallel workers append under the context's dedicated mutex. */
+  prepared.options.dir_entries = context->dir_entries;
+  prepared.options.dir_entries_mutex = &context->dir_entries_mutex;
   /* The keep-set manifest for the late modes is built from this data pass, so
      the parallel scanner records the protected excluded prefixes here.  The
      early modes already transmitted the pre-scan keep-set and its protected
@@ -1843,6 +1896,9 @@ int send_files(Config* config) {
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
   ArrayList* remove_sources = NULL;
+  /* P7 Wave D: captured source directory times, transmitted in trailing
+     STATUS_DIR_TIMES frame(s) (only when metadata rides the wire). */
+  ArrayList* dir_entries = NULL;
   /* Protected excluded prefixes (delete-excluded default protection). */
   ArrayList* excluded = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
@@ -1855,6 +1911,11 @@ int send_files(Config* config) {
   receive_daemon_motd(client, config);
   if (!prepare_scanner(config, 0, &prepared))
     goto send_fail;
+  if (config->use_metadata) {
+    dir_entries = array_list_create(file_destroy);
+    if (!dir_entries)
+      goto send_fail;
+  }
   if (config->remove_source_files)
     remove_sources = array_list_create(source_file_destroy);
   if (config->remove_source_files && !remove_sources)
@@ -1919,6 +1980,10 @@ int send_files(Config* config) {
   StopCondition stop = stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins,
                                            config->stop_at_set, config->stop_at, now_mono);
   prepared.options.stop_condition = &stop;
+  /* The early-delete pre-scan above already ran; only the data pass should feed
+     the directory-time list (otherwise every directory would be captured
+     twice). */
+  prepared.options.dir_entries = dir_entries;
   scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
   if (!scanner)
     goto send_fail;
@@ -2037,6 +2102,11 @@ int send_files(Config* config) {
       }
     }
   }
+  /* P7 Wave D: every directory has now been traversed (or the scan stopped
+     early), so transmit the captured directory times last.  The receiver defers
+     applying them until after its own deletion/publication phase. */
+  if (!send_dir_times(client, config, dir_entries))
+    goto send_fail;
   bool ok = finalize_transfer(client, config, remove_sources);
   if (!ok && config->use_delete)
     log_message(LOG_LEVEL_ERROR,
@@ -2078,6 +2148,8 @@ send_fail:
     array_list_delete(missing_args);
   if (remove_sources)
     array_list_delete(remove_sources);
+  if (dir_entries)
+    array_list_delete(dir_entries);
   if (scanner)
     directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);

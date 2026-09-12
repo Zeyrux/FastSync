@@ -357,6 +357,43 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
   }
 }
 
+void file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
+                                   bool omit_link_times) {
+  if (path == NULL || metadata == NULL)
+    return;
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return;
+  /* Ownership (only when the identity policy is active) via lchown semantics:
+     fchownat with AT_SYMLINK_NOFOLLOW never dereferences the link. */
+  identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid, (int32_t)metadata->gid);
+  /* Symlink mode: not settable on Linux (fchmodat AT_SYMLINK_NOFOLLOW returns
+     EOPNOTSUPP/ENOTSUP); attempt it for platforms that support it and quietly
+     ignore the unsupported case so the transfer never fails over it. */
+  mode_t link_mode = metadata->mode & 0777;
+  if (fchmodat(parent_fd, leaf, link_mode, AT_SYMLINK_NOFOLLOW) != 0 && errno != EOPNOTSUPP &&
+      errno != ENOTSUP && errno != ENOSYS) {
+    log_message(LOG_LEVEL_DEBUG, "Could not set symlink mode on %s: %s", path, strerror(errno));
+  }
+  if (!omit_link_times) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
+    if (metadata->atime_valid) {
+      times[0].tv_sec = metadata->atime_sec;
+      times[0].tv_nsec = metadata->atime_nsec;
+    }
+    if (utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+      char* escaped_path = output_escape(path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to set symlink timestamps on %s: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+      free(escaped_path);
+    }
+  }
+  close(parent_fd);
+  free(leaf);
+}
+
 bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;

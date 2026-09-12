@@ -407,6 +407,12 @@ static const char* status_to_string(Status status) {
     return "APPEND_DATA";
   case STATUS_HARDLINK:
     return "HARDLINK";
+  case STATUS_SYMLINK:
+    return "SYMLINK";
+  case STATUS_SPECIAL:
+    return "SPECIAL";
+  case STATUS_DIR_TIMES:
+    return "DIR_TIMES";
   default:
     return "UNKNOWN";
   }

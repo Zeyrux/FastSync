@@ -2,6 +2,7 @@
 #include "log.h"
 #include "utils.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
@@ -370,16 +371,11 @@ static bool identity_map_lookup(const IdentityMap* map, int count, int32_t sourc
   return false;
 }
 
-void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
-  /* Ownership application is OFF unless the client requested an identity flag.
-   * This is the controlled gate: a default (or plain -M) transfer never changes
-   * ownership, byte-for-byte preserving FastSync's existing behavior. */
-  if (!identity_active_enabled() || fd < 0)
-    return;
-  struct stat st;
-  if (fstat(fd, &st) != 0)
-    return;
-
+/* Resolve the target ownership from the negotiated policy against the entry's
+ * current stat.  Shared by the fd (regular file) and no-follow (symlink) apply
+ * paths.  Returns false when no side is to be changed. */
+static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, int32_t source_gid,
+                                     uid_t* out_uid, gid_t* out_gid) {
   bool set_uid = false;
   bool set_gid = false;
   uid_t uid = 0;
@@ -431,29 +427,62 @@ void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
   }
 
   if (!set_uid && !set_gid)
-    return;
+    return false;
   /* An unset side keeps the file's current id so the other side can change. */
   if (!set_uid)
-    uid = st.st_uid;
+    uid = st->st_uid;
   if (!set_gid)
-    gid = st.st_gid;
+    gid = st->st_gid;
+  /* Only change ownership when the target differs (avoid needless syscalls and
+   * any chance of clearing setuid/setgid on an already-correct entry). */
+  if (st->st_uid == uid && st->st_gid == gid)
+    return false;
+  *out_uid = uid;
+  *out_gid = gid;
+  return true;
+}
 
-  /* Only call fchown when the target differs (avoid needless syscalls and any
-   * chance of clearing setuid/setgid on an already-correct file). */
-  if (st.st_uid == uid && st.st_gid == gid)
+static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
+  /* EPERM/EACCES are expected when the receiver is not privileged (e.g. the CI
+   * `nobody` user): warn and continue, never abort the transfer.  Any other
+   * error (EIO/EROFS/ENOSPC/...) is a real failure and must not be silently
+   * downgraded to a warning. */
+  if (errno == EPERM || errno == EACCES)
+    log_message(LOG_LEVEL_WARNING, "could not apply ownership (uid=%ld gid=%ld): %s; leaving as-is",
+                (long)uid, (long)gid, strerror(errno));
+  else
+    log_message(LOG_LEVEL_ERROR, "failed to apply ownership on %s (uid=%ld gid=%ld): %s", what,
+                (long)uid, (long)gid, strerror(errno));
+}
+
+void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
+  /* Ownership application is OFF unless the client requested an identity flag.
+   * This is the controlled gate: a default (or plain -M) transfer never changes
+   * ownership, byte-for-byte preserving FastSync's existing behavior. */
+  if (!identity_active_enabled() || fd < 0)
     return;
+  struct stat st;
+  if (fstat(fd, &st) != 0)
+    return;
+  uid_t uid;
+  gid_t gid;
+  if (!identity_resolve_targets(&st, source_uid, source_gid, &uid, &gid))
+    return;
+  if (fchown(fd, uid, gid) != 0)
+    identity_log_chown_failure("file", uid, gid);
+}
 
-  if (fchown(fd, uid, gid) != 0) {
-    /* EPERM/EACCES are expected when the receiver is not privileged (e.g. the
-     * CI `nobody` user): warn and continue, never abort the transfer.  Any
-     * other error (EIO/EROFS/ENOSPC/...) is a real failure and must not be
-     * silently downgraded to a warning. */
-    if (errno == EPERM || errno == EACCES)
-      log_message(LOG_LEVEL_WARNING,
-                  "could not apply ownership (uid=%ld gid=%ld): %s; leaving as-is", (long)uid,
-                  (long)gid, strerror(errno));
-    else
-      log_message(LOG_LEVEL_ERROR, "failed to apply ownership (uid=%ld gid=%ld): %s", (long)uid,
-                  (long)gid, strerror(errno));
-  }
+void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
+                                   int32_t source_gid) {
+  if (!identity_active_enabled() || parent_fd < 0 || !leaf)
+    return;
+  struct stat st;
+  if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    return;
+  uid_t uid;
+  gid_t gid;
+  if (!identity_resolve_targets(&st, source_uid, source_gid, &uid, &gid))
+    return;
+  if (fchownat(parent_fd, leaf, uid, gid, AT_SYMLINK_NOFOLLOW) != 0)
+    identity_log_chown_failure("symlink", uid, gid);
 }
