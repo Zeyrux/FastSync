@@ -5207,6 +5207,17 @@ class TestCopyAs:
         if os.geteuid() == 0:
             if shutil.which("setpriv") is None:
                 pytest.skip("root runner without setpriv cannot start an unprivileged receiver")
+            # The unprivileged receiver must execute the server binary out of the
+            # test workspace, so the workspace path has to be traversable by uid
+            # 65534.  A checkout under a 0700 directory (e.g. /root) is not; skip
+            # rather than fail — CI runs from a traversable workspace and still
+            # exercises this behavior.
+            probe = subprocess.run(
+                ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
+                 "test", "-x", os.path.abspath(SERVER_CMD[0])],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode != 0:
+                pytest.skip("workspace is not traversable by the unprivileged receiver uid")
             os.chmod(dest, 0o777)
             proc, port = _start_captured_server(
                 prefix=["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"])
