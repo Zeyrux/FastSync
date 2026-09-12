@@ -1,4 +1,5 @@
 #include "daemon_conf.h"
+#include "credentials.h"
 #include "utils.h"
 #include <ctype.h>
 #include <errno.h>
@@ -192,6 +193,12 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
       const char* user = trim_ws(token);
       if (*user == '\0')
         continue;
+      if (!credentials_username_valid(user)) {
+        set_error(err, err_size, "module '%s': invalid 'auth users' entry '%s'", module->name,
+                  user);
+        free(list);
+        return false;
+      }
       char** grown =
           realloc(module->auth_users, (size_t)(module->auth_user_count + 1) * sizeof(char*));
       if (!grown) {
