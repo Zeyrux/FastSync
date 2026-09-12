@@ -202,6 +202,51 @@ static bool receive_wire_bool(int fd, bool* value) {
   return true;
 }
 
+/* Cumulative budget for the strings retained by one received Config (see
+ * MAX_CONFIG_STRING_BYTES).  Config strings are received once per connection
+ * before authentication and live for its whole lifetime, so the charge is never
+ * released. */
+typedef struct {
+  unsigned long long used;
+} ConfigStringBudget;
+
+/* Charge `bytes` (the retained allocation: string body plus NUL) against the
+ * aggregate config-string budget.  Returns false when the ceiling would be
+ * exceeded, letting the caller reject the frame with a clear error instead of
+ * retaining unbounded pre-auth memory. */
+static bool config_string_budget_charge(ConfigStringBudget* budget, size_t bytes) {
+  if ((unsigned long long)bytes > MAX_CONFIG_STRING_BYTES ||
+      budget->used > MAX_CONFIG_STRING_BYTES - (unsigned long long)bytes) {
+    log_message(LOG_LEVEL_ERROR, "Config string budget exceeded (%llu + %zu > %llu bytes)",
+                budget->used, bytes, (unsigned long long)MAX_CONFIG_STRING_BYTES);
+    return false;
+  }
+  budget->used += (unsigned long long)bytes;
+  return true;
+}
+
+static char* config_receive_str(int fd, ConfigStringBudget* budget) {
+  char* value = receive_str(fd);
+  if (!value)
+    return NULL;
+  if (!config_string_budget_charge(budget, strlen(value) + 1)) {
+    free(value);
+    return NULL;
+  }
+  return value;
+}
+
+static char* config_receive_str_redacted(int fd, ConfigStringBudget* budget) {
+  char* value = receive_str_redacted(fd);
+  if (!value)
+    return NULL;
+  if (!config_string_budget_charge(budget, strlen(value) + 1)) {
+    free(value);
+    return NULL;
+  }
+  return value;
+}
+
 static bool validate_received_config(const Config* config) {
   return valid_wire_bool(config->save_to_disk) && valid_wire_bool(config->use_multithreading) &&
          valid_wire_bool(config->use_chunk_serialization) &&
@@ -257,7 +302,7 @@ static bool validate_received_config(const Config* config) {
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
          config->max_delete >= -1 && config->skip_compress_count >= 0 &&
-         config->skip_compress_count <= 10000 && config->max_alloc > 0 &&
+         config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES && config->max_alloc > 0 &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
          /* The received --iconv CONVERT_SPEC is untrusted input that drives
@@ -819,7 +864,7 @@ static bool send_checksum_options(int fd, const Config* c) {
          send_n_data(fd, &c->checksum_seed, sizeof(c->checksum_seed));
 }
 
-static bool receive_core_fields(int fd, Config* c) {
+static bool receive_core_fields(int fd, Config* c, ConfigStringBudget* budget) {
   int value;
   if (!receive_wire_bool(fd, &c->eight_bit_output))
     return false;
@@ -829,8 +874,8 @@ static bool receive_core_fields(int fd, Config* c) {
   if (c->max_alloc > MAX_SERVER_ALLOC)
     c->max_alloc = MAX_SERVER_ALLOC;
   protocol_session_set_max_alloc(NULL, c->max_alloc);
-  c->send_directory = receive_str(fd);
-  c->receive_root_directory = receive_str(fd);
+  c->send_directory = config_receive_str(fd, budget);
+  c->receive_root_directory = config_receive_str(fd, budget);
   if (!c->send_directory || !c->receive_root_directory)
     return false;
   if (!receive_wire_bool(fd, &c->save_to_disk) || !receive_wire_bool(fd, &c->use_multithreading) ||
@@ -863,10 +908,10 @@ static bool receive_delta_fields(int fd, Config* c) {
          receive_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
 }
 
-static bool receive_file_options(int fd, Config* c) {
+static bool receive_file_options(int fd, Config* c, ConfigStringBudget* budget) {
   if (!receive_wire_bool(fd, &c->backup))
     return false;
-  char* backup_dir = receive_str(fd);
+  char* backup_dir = config_receive_str(fd, budget);
   if (!backup_dir)
     return false;
   if (*backup_dir != '\0') {
@@ -920,8 +965,8 @@ static bool receive_selection_options(int fd, Config* c) {
   return receive_wire_bool(fd, &c->delete_delay);
 }
 
-static bool receive_resume_options(int fd, Config* c) {
-  char* temp_dir = receive_str(fd);
+static bool receive_resume_options(int fd, Config* c, ConfigStringBudget* budget) {
+  char* temp_dir = config_receive_str(fd, budget);
   if (!temp_dir)
     return false;
   if (*temp_dir != '\0') {
@@ -935,7 +980,7 @@ static bool receive_resume_options(int fd, Config* c) {
      string for "unset".  Canonicalize the empty wire value back to NULL so
      receivers observe exactly what the client configured (plain --backup, for
      example, must not look like --backup-dir ""). */
-  char* partial_dir = receive_str(fd);
+  char* partial_dir = config_receive_str(fd, budget);
   if (!partial_dir)
     return false;
   if (*partial_dir != '\0') {
@@ -943,7 +988,7 @@ static bool receive_resume_options(int fd, Config* c) {
   } else {
     free(partial_dir);
   }
-  char* suffix = receive_str(fd);
+  char* suffix = config_receive_str(fd, budget);
   if (!suffix)
     return false;
   if (*suffix != '\0') {
@@ -957,20 +1002,20 @@ static bool receive_resume_options(int fd, Config* c) {
     return false;
   if (!receive_n_data(fd, &c->modify_window, sizeof(c->modify_window)))
     return false;
-  c->compress_choice = receive_str(fd);
+  c->compress_choice = config_receive_str(fd, budget);
   if (!c->compress_choice)
     return false;
-  c->chmod_spec = receive_str(fd);
+  c->chmod_spec = config_receive_str(fd, budget);
   if (!c->chmod_spec || !receive_wire_bool(fd, &c->skip_compress_set) ||
       !receive_int(fd, &c->skip_compress_count) || c->skip_compress_count < 0 ||
-      c->skip_compress_count > 10000)
+      c->skip_compress_count > MAX_SKIP_COMPRESS_SUFFIXES)
     return false;
   if (c->skip_compress_count > 0) {
     c->skip_compress_suffixes = calloc((size_t)c->skip_compress_count, sizeof(char*));
     if (!c->skip_compress_suffixes)
       return false;
     for (int i = 0; i < c->skip_compress_count; i++) {
-      c->skip_compress_suffixes[i] = receive_str(fd);
+      c->skip_compress_suffixes[i] = config_receive_str(fd, budget);
       if (!c->skip_compress_suffixes[i])
         return false;
     }
@@ -978,7 +1023,7 @@ static bool receive_resume_options(int fd, Config* c) {
   return true;
 }
 
-static bool receive_basis_options(int fd, Config* c) {
+static bool receive_basis_options(int fd, Config* c, ConfigStringBudget* budget) {
   int count;
   if (!receive_int(fd, &count))
     return false;
@@ -988,7 +1033,7 @@ static bool receive_basis_options(int fd, Config* c) {
     int type;
     if (!receive_int(fd, &type) || type <= BASIS_DEST_NONE || type > BASIS_DEST_LINK)
       return false;
-    char* path = receive_str(fd);
+    char* path = config_receive_str(fd, budget);
     if (!path)
       return false;
     /* config_basis_append validates and canonicalizes the path; a rejected
@@ -1119,8 +1164,8 @@ static bool send_daemon_module(int fd, const Config* c) {
   return send_str(fd, c->module ? c->module : "");
 }
 
-static bool receive_daemon_module(int fd, Config* c) {
-  char* module = receive_str(fd);
+static bool receive_daemon_module(int fd, Config* c, ConfigStringBudget* budget) {
+  char* module = config_receive_str(fd, budget);
   if (!module)
     return false;
   /* Guard against a hostile client flooding the log with an over-long module
@@ -1155,14 +1200,14 @@ static bool send_daemon_auth(int fd, const Config* c) {
   return send_str_redacted(fd, c->auth_user);
 }
 
-static bool receive_daemon_auth(int fd, Config* c) {
+static bool receive_daemon_auth(int fd, Config* c, ConfigStringBudget* budget) {
   int present;
   if (!receive_int(fd, &present) || !valid_wire_bool(present))
     return false;
   if (!present)
     return true;
   /* Redacted receive: never log the incoming username body. */
-  char* user = receive_str_redacted(fd);
+  char* user = config_receive_str_redacted(fd, budget);
   if (!user)
     return false;
   if (!credentials_username_valid(user)) {
@@ -1272,8 +1317,8 @@ static bool send_iconv_spec(int fd, const Config* c) {
   return send_str(fd, c->iconv_spec ? c->iconv_spec : "");
 }
 
-static bool receive_iconv_spec(int fd, Config* c) {
-  char* spec = receive_str(fd);
+static bool receive_iconv_spec(int fd, Config* c, ConfigStringBudget* budget) {
+  char* spec = config_receive_str(fd, budget);
   if (!spec)
     return false;
   if (*spec == '\0') {
@@ -1376,8 +1421,9 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
   Config* config = config_create();
   if (!config)
     return NULL;
+  ConfigStringBudget budget = {0};
   free(config->version);
-  config->version = receive_str(file_descriptor);
+  config->version = config_receive_str(file_descriptor, &budget);
   if (!config->version)
     goto error;
   if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
@@ -1388,21 +1434,21 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
-  if (!receive_core_fields(file_descriptor, config) ||
+  if (!receive_core_fields(file_descriptor, config, &budget) ||
       !receive_delta_fields(file_descriptor, config) ||
-      !receive_file_options(file_descriptor, config) ||
+      !receive_file_options(file_descriptor, config, &budget) ||
       !receive_selection_options(file_descriptor, config) ||
-      !receive_resume_options(file_descriptor, config) ||
-      !receive_basis_options(file_descriptor, config) ||
+      !receive_resume_options(file_descriptor, config, &budget) ||
+      !receive_basis_options(file_descriptor, config, &budget) ||
       !receive_fuzzy_option(file_descriptor, config) ||
       !receive_checksum_options(file_descriptor, config) ||
       !receive_identity_options(file_descriptor, config) ||
       !receive_metadata_times_options(file_descriptor, config) ||
       !receive_symlink_trust_options(file_descriptor, config) ||
       !receive_phase4_xattr_options(file_descriptor, config) ||
-      !receive_daemon_module(file_descriptor, config) ||
-      !receive_daemon_auth(file_descriptor, config) ||
-      !receive_iconv_spec(file_descriptor, config) ||
+      !receive_daemon_module(file_descriptor, config, &budget) ||
+      !receive_daemon_auth(file_descriptor, config, &budget) ||
+      !receive_iconv_spec(file_descriptor, config, &budget) ||
       !receive_privilege_options(file_descriptor, config) ||
       !receive_copy_as_options(file_descriptor, config))
     goto error;
