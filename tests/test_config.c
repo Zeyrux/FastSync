@@ -1672,7 +1672,7 @@ static void test_config_receive_rejects_invalid_iconv_spec() {
 static void test_config_super_mode_wire_roundtrip() {
   if (is_running_under_valgrind())
     return;
-  int modes[] = {SUPER_MODE_AUTO, SUPER_MODE_ON, SUPER_MODE_OFF};
+  SuperMode modes[] = {SUPER_MODE_AUTO, SUPER_MODE_ON, SUPER_MODE_OFF};
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
     int p[2];
     EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);

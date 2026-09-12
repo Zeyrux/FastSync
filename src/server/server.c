@@ -458,7 +458,7 @@ void handler(int file_descriptor) {
    * device-node creation) sees SUPER_MODE_OFF.  The gate never mutated the
    * received config. */
   if (gate_ctx.super_mode_override != -1)
-    config->super_mode = gate_ctx.super_mode_override;
+    config->super_mode = (SuperMode)gate_ctx.super_mode_override;
   protocol_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
