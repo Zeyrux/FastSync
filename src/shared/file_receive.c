@@ -2236,6 +2236,10 @@ File* file_receive(const Config* config, int file_descriptor) {
 
 /* ---- P7 Wave D: deferred directory times ---- */
 
+bool dir_times_should_capture(const Config* config) {
+  return config->use_metadata && !config->omit_dir_times;
+}
+
 void dir_time_list_init(DirTimeList* list) {
   if (!list)
     return;

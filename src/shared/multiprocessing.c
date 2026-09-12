@@ -6,6 +6,7 @@
 #include "config.h"
 #include "data.h"
 #include "file.h"
+#include "file_receive.h"
 #include "log.h"
 #include "protocol.h"
 #include "queue.h"
@@ -331,7 +332,7 @@ int write_thread(void* pipeline_context) {
        write would clobber them); accumulate the metadata here and let the
        caller apply it once every writer has drained. */
     if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
-        context->config->use_metadata && !context->config->omit_dir_times &&
+        dir_times_should_capture(context->config) &&
         !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
       file_destroy(file);
       pipeline_context_receiver_note_bytes_released(context, file_bytes);

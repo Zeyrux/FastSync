@@ -353,7 +353,7 @@ static bool receiver_save_file(File* file, void* context_pointer) {
      metadata now and apply it at the end.  -O/--omit-dir-times is honored by
      dir_time_list_apply's caller (see receiver_send_success_frame). */
   if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
-      context->config->use_metadata && !context->config->omit_dir_times &&
+      dir_times_should_capture(context->config) &&
       !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
     file_destroy(file);
     return false;

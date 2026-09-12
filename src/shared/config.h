@@ -68,6 +68,13 @@ typedef struct {
   int value;    /* 0/1 for booleans, byte count for SO_RCVBUF/SO_SNDBUF */
 } SockOptEntry;
 
+/* --super / --no-super tri-state (Config->super_mode).  AUTO (default) and ON
+ * both permit a confined super-user attempt (AUTO preserves FastSync's
+ * historical best-effort behavior; an unprivileged attempt is refused by the
+ * kernel and skipped per entry); OFF forbids the attempt even for root.  See
+ * privilege_super_mode_permitted() in identity.h. */
+typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
+
 typedef struct Config {
   char* version;
   char* send_directory;
@@ -416,7 +423,7 @@ typedef struct Config {
    * as a trailing int so the receiver can enforce the policy.  See
    * privilege_super_permitted() and identity_ownership_requested() in
    * identity.h. */
-  int super_mode;
+  SuperMode super_mode;
 
   // Receiver-side runtime staging registry for --delay-updates.  Never sent
   // over the wire and never set on the sender side.
@@ -643,15 +650,6 @@ typedef struct Config {
 #define IDENTITY_MATCH_ANY (-1)
 #define IDENTITY_CURRENT (-1)
 #define MAX_IDENTITY_MAP 128
-
-/* --super / --no-super tri-state (Config->super_mode).  AUTO (default) and ON
- * both permit a confined super-user attempt (AUTO preserves FastSync's
- * historical best-effort behavior; an unprivileged attempt is refused by the
- * kernel and skipped per entry); OFF forbids the attempt even for root.  See
- * privilege_super_mode_permitted() in identity.h. */
-#define SUPER_MODE_AUTO 0
-#define SUPER_MODE_ON 1
-#define SUPER_MODE_OFF 2
 
 Config* config_create(void);
 void config_delete(Config* config);
