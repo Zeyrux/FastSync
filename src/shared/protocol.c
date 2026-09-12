@@ -432,7 +432,7 @@ static bool protocol_send_str_impl(ProtocolSession* session, const char* data, b
     return false;
   if (redact) {
     log_debug_message(LOG_DEBUG_PROTO, "Send String: <redacted>");
-  } else {
+  } else if (log_debug_enabled(LOG_DEBUG_PROTO)) {
     char* escaped_data = output_escape(data, log_get_8_bit_output());
     log_debug_message(LOG_DEBUG_PROTO, "Send String: %s",
                       escaped_data ? escaped_data : "<allocation failed>");
@@ -465,7 +465,7 @@ static char* protocol_receive_str_impl(ProtocolSession* session, bool redact) {
   data[size] = '\0';
   if (redact) {
     log_debug_message(LOG_DEBUG_PROTO, "Received String: <redacted>");
-  } else {
+  } else if (log_debug_enabled(LOG_DEBUG_PROTO)) {
     char* escaped_data = output_escape(data, log_get_8_bit_output());
     log_debug_message(LOG_DEBUG_PROTO, "Received String: %s",
                       escaped_data ? escaped_data : "<allocation failed>");
