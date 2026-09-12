@@ -11,17 +11,21 @@
 #include <unistd.h>
 
 /* Known-answer vector, independently recomputed with Python
- * (hashlib.pbkdf2_hmac / hmac / hashlib.sha256). */
+ * (hashlib.pbkdf2_hmac / hmac / hashlib.sha256) at the default work factor. */
 #define KAT_PASSWORD "alice-s3cret"
 #define KAT_USER "alice"
-#define KAT_ITERS 4096u
-#define KAT_CLIENT_KEY "80f0e0af43e34e8aeec1738609c5d1eac8646601b4f244cef5a04a9f13563cf8"
-#define KAT_STORED_KEY "5b3b489437085a11fe594ab99154da4cb4ebab4ae8c2edf51fbaa9277e9f9099"
-#define KAT_SERVER_KEY "38f668736210bd4dbcb5193b9a514c5b1047174eff5f5a80ee4c2b1e8b2c76a1"
-#define KAT_CLIENT_PROOF "c9b0d397b853176b842a751b9af327270ae0c5e286cb77d16e59fa42245270f6"
-#define KAT_SERVER_SIG "93c0d94b9ee29798ffd42734a9becb2168bad1f69e492d2ccb042a43db13bffc"
+#define KAT_ITERS CREDENTIAL_DEFAULT_ITERS
+#define KAT_CLIENT_KEY "845891d65ab3c9807f7ae5c123ab70714cc8b56173fccfce6a758993e858e17c"
+#define KAT_STORED_KEY "d192f6da1c54bf73768f0a7c713995212d303c46f809de1b2e407fb3ad1c206b"
+#define KAT_SERVER_KEY "508ad587574f59700c2d0bbec8417d6fe94bf8e39669adbabe7cbbd8700f86ce"
+#define KAT_CLIENT_PROOF "e0cb4b894a7438d75cbb3066aa135d10200b76eea78137c5c04059895eed9242"
+#define KAT_SERVER_SIG "f564e00fa6368e78d35b7116c7624d6cb047a950d87e3799e4e6e8c8954b618a"
 #define KAT_SALT_B64 "AAECAwQFBgcICQoLDA0ODw=="
 #define KAT_NAME_PREFIX "$fastsync$1$pbkdf2-sha256$"
+/* The exact store line for the KAT user/password at the KAT salt/count. */
+#define KAT_STORE_LINE                                                                             \
+  "alice:$fastsync$1$pbkdf2-sha256$600000$AAECAwQFBgcICQoLDA0ODw==$"                               \
+  "0ZL22hxUv3N2jwp8cTmVIS0wPEb4Cd4bLkB/s60cIGs=$UIrVh1dPWXAMLQu+yEF9b+lL+OOWaa26vny72HAPhs4="
 
 static int g_file_counter = 0;
 
@@ -133,6 +137,10 @@ static void test_credentials_compute_keys_kat() {
   unhex(KAT_SERVER_KEY, expect, sizeof(expect));
   EXPECT_TRUE(memcmp(server_key, expect, sizeof(expect)) == 0);
   EXPECT_FALSE(credentials_compute_keys(KAT_PASSWORD, salt, 0, client_key, stored_key, server_key));
+  EXPECT_FALSE(credentials_compute_keys(KAT_PASSWORD, salt, CREDENTIAL_MIN_ITERS - 1, client_key,
+                                        stored_key, server_key));
+  EXPECT_FALSE(credentials_compute_keys(KAT_PASSWORD, salt, CREDENTIAL_MAX_ITERS + 1, client_key,
+                                        stored_key, server_key));
   EXPECT_FALSE(credentials_compute_keys(NULL, salt, KAT_ITERS, client_key, stored_key, server_key));
 }
 
@@ -166,9 +174,9 @@ static void test_credentials_auth_message_and_proof_kat() {
   uint8_t server_sig[CREDENTIAL_KEY_LEN];
   EXPECT_TRUE(credentials_client_proof(client_key, stored_key, server_key, auth_msg, msg_len, proof,
                                        server_sig));
-  unhex(KAT_CLIENT_PROOF, expect, sizeof(expect));
+  unhex(KAT_CLIENT_PROOF, expect, CREDENTIAL_KEY_LEN);
   EXPECT_TRUE(memcmp(proof, expect, CREDENTIAL_KEY_LEN) == 0);
-  unhex(KAT_SERVER_SIG, expect, sizeof(expect));
+  unhex(KAT_SERVER_SIG, expect, CREDENTIAL_KEY_LEN);
   EXPECT_TRUE(memcmp(server_sig, expect, CREDENTIAL_KEY_LEN) == 0);
 }
 
@@ -274,6 +282,35 @@ static void test_credentials_hash_store_line_roundtrip() {
   free(path);
 }
 
+/* The golden store line (KAT user/password/salt/count) parses back to exactly
+ * the KAT verifier keys, pinning the on-disk encoding independently. */
+static void test_credentials_store_line_golden() {
+  char* path = make_tmp_file(KAT_STORE_LINE "\n");
+  EXPECT_NOT_NULL(path);
+  char err[512];
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  EXPECT_TRUE(credentials_store_has(store, "alice"));
+
+  CredentialVerifier v;
+  const char* module_users[] = {"alice"};
+  EXPECT_TRUE(credentials_get_verifier(store, "alice", module_users, 1, &v));
+  EXPECT_TRUE(v.found);
+  EXPECT_EQ_INT((int)v.iters, (int)KAT_ITERS);
+  uint8_t expect[CREDENTIAL_KEY_LEN];
+  unhex(KAT_STORED_KEY, expect, CREDENTIAL_KEY_LEN);
+  EXPECT_TRUE(memcmp(v.stored_key, expect, CREDENTIAL_KEY_LEN) == 0);
+  unhex(KAT_SERVER_KEY, expect, CREDENTIAL_KEY_LEN);
+  EXPECT_TRUE(memcmp(v.server_key, expect, CREDENTIAL_KEY_LEN) == 0);
+  uint8_t salt[CREDENTIAL_SALT_LEN];
+  ramp(salt, sizeof(salt), 0x00);
+  EXPECT_TRUE(memcmp(v.salt, salt, sizeof(salt)) == 0);
+
+  credentials_free(store);
+  rm_temp(path);
+  free(path);
+}
+
 static void test_credentials_store_parse_valid() {
   char line_alice[CREDENTIAL_MAX_LINE];
   char line_bob[CREDENTIAL_MAX_LINE];
@@ -308,14 +345,27 @@ static void test_credentials_store_parse_valid() {
   EXPECT_TRUE(credentials_get_verifier(store, "mallory", module_users, 1, &v));
   EXPECT_TRUE(memcmp(v.stored_key, zero, CREDENTIAL_KEY_LEN) == 0);
   EXPECT_TRUE(memcmp(v.server_key, zero, CREDENTIAL_KEY_LEN) == 0);
-  /* Miss salt is fresh random on each call. */
+  /* Deterministic dummy challenge: the same unknown username always yields the
+   * same salt and iteration count, while different usernames differ, so probing
+   * the store twice cannot reveal membership. */
   uint8_t salt_a[CREDENTIAL_SALT_LEN];
   uint8_t salt_b[CREDENTIAL_SALT_LEN];
+  uint8_t salt_c[CREDENTIAL_SALT_LEN];
+  uint32_t miss_iters_a = 0;
+  uint32_t miss_iters_b = 0;
   EXPECT_TRUE(credentials_get_verifier(store, "mallory", module_users, 1, &v));
   memcpy(salt_a, v.salt, sizeof(salt_a));
+  miss_iters_a = v.iters;
   EXPECT_TRUE(credentials_get_verifier(store, "mallory", module_users, 1, &v));
   memcpy(salt_b, v.salt, sizeof(salt_b));
-  EXPECT_TRUE(memcmp(salt_a, salt_b, sizeof(salt_a)) != 0);
+  miss_iters_b = v.iters;
+  EXPECT_TRUE(memcmp(salt_a, salt_b, sizeof(salt_a)) == 0);
+  EXPECT_EQ_INT((int)miss_iters_a, (int)miss_iters_b);
+  /* A miss is answered with the store-wide uniform iteration count. */
+  EXPECT_EQ_INT((int)miss_iters_a, (int)CREDENTIAL_MIN_ITERS);
+  EXPECT_TRUE(credentials_get_verifier(store, "trudy", module_users, 1, &v));
+  memcpy(salt_c, v.salt, sizeof(salt_c));
+  EXPECT_TRUE(memcmp(salt_a, salt_c, sizeof(salt_a)) != 0);
 
   credentials_free(store);
   rm_temp(path);
@@ -357,8 +407,8 @@ static void test_credentials_store_parse_rejects_malformed() {
       short_key,
       empty_field,
       "ali "
-      "ce:$fastsync$1$pbkdf2-sha256$600000$AAECAwQFBgcICQoLDA0ODw==$WztIlDcIWhH+"
-      "WUq5kVTaTLTrq0rowu31H7qpJ36fkJk=$OPZoc2IQvU28tRk7mlFMWxBHF07/X1qA7kwrHossdqE=\n",
+      "ce:$fastsync$1$pbkdf2-sha256$600000$AAECAwQFBgcICQoLDA0ODw==$0ZL22hxUv3N2jwp8"
+      "cTmVIS0wPEb4Cd4bLkB/s60cIGs=$UIrVh1dPWXAMLQu+yEF9b+lL+OOWaa26vny72HAPhs4=\n",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     char* path = make_tmp_file(cases[i]);
@@ -401,6 +451,25 @@ static void test_credentials_store_duplicate_rejected() {
   free(path);
 }
 
+/* A store must be uniform in its iteration count so a miss can be challenged
+ * with the store-wide count without leaking membership. */
+static void test_credentials_store_rejects_nonuniform_iters() {
+  char line_a[CREDENTIAL_MAX_LINE];
+  char line_b[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line_a, sizeof(line_a)));
+  EXPECT_TRUE(
+      make_store_line("bob", "bob-s3cret", CREDENTIAL_MIN_ITERS * 2, line_b, sizeof(line_b)));
+  char contents[2 * CREDENTIAL_MAX_LINE + 8];
+  snprintf(contents, sizeof(contents), "%s\n%s\n", line_a, line_b);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char err[512];
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(strstr(err, "uniform") != NULL);
+  rm_temp(path);
+  free(path);
+}
+
 static void test_credentials_store_parse_missing_file() {
   char err[512];
   const CredentialStore* store =
@@ -414,6 +483,11 @@ static void test_credentials_store_empty_and_null() {
   CredentialStore* store = credentials_load(NULL, NULL, err, sizeof(err));
   EXPECT_NOT_NULL(store);
   EXPECT_EQ_INT(credentials_store_size(store), 0);
+  /* An empty store answers a miss with the default work factor. */
+  CredentialVerifier v;
+  EXPECT_TRUE(credentials_get_verifier(store, "nobody", NULL, 0, &v));
+  EXPECT_FALSE(v.found);
+  EXPECT_EQ_INT((int)v.iters, (int)CREDENTIAL_DEFAULT_ITERS);
   credentials_free(store);
 
   char* path = make_tmp_file("# nothing here\n; nor here\n");
@@ -449,19 +523,24 @@ static void test_credentials_early_input_merge() {
   char alice_file[CREDENTIAL_MAX_LINE + 2];
   char bob_file[CREDENTIAL_MAX_LINE + 2];
   char alice_other[CREDENTIAL_MAX_LINE];
+  char bob_other_iters[CREDENTIAL_MAX_LINE];
   snprintf(alice_file, sizeof(alice_file), "%s\n", alice);
   snprintf(bob_file, sizeof(bob_file), "%s\n", bob);
   EXPECT_TRUE(make_store_line("alice", "different-s3cret", CREDENTIAL_MIN_ITERS, alice_other,
                               sizeof(alice_other)));
+  EXPECT_TRUE(make_store_line("carol", "carol-s3cret", CREDENTIAL_MIN_ITERS * 2, bob_other_iters,
+                              sizeof(bob_other_iters)));
 
   char* pw = make_tmp_file(alice_file);
   char* early = make_tmp_file(bob_file);
   char* early_same = make_tmp_file(alice_file); /* byte-identical verifier dedupes */
   char* early_diff = make_tmp_file(alice_other);
+  char* early_iters = make_tmp_file(bob_other_iters);
   EXPECT_NOT_NULL(pw);
   EXPECT_NOT_NULL(early);
   EXPECT_NOT_NULL(early_same);
   EXPECT_NOT_NULL(early_diff);
+  EXPECT_NOT_NULL(early_iters);
   char err[512];
 
   /* A second file adds a new user. */
@@ -483,14 +562,21 @@ static void test_credentials_early_input_merge() {
   EXPECT_NULL(store);
   EXPECT_TRUE(err[0] != '\0');
 
+  /* A layered store must stay uniform in its iteration count. */
+  store = credentials_load(pw, early_iters, err, sizeof(err));
+  EXPECT_NULL(store);
+  EXPECT_TRUE(strstr(err, "uniform") != NULL);
+
   rm_temp(pw);
   rm_temp(early);
   rm_temp(early_same);
   rm_temp(early_diff);
+  rm_temp(early_iters);
   free(pw);
   free(early);
   free(early_same);
   free(early_diff);
+  free(early_iters);
 }
 
 static void test_credentials_read_secret_file() {
@@ -677,10 +763,12 @@ void test_credentials(void) {
   test_credentials_verify_response_kat();
   test_credentials_username_valid();
   test_credentials_hash_store_line_roundtrip();
+  test_credentials_store_line_golden();
   test_credentials_store_parse_valid();
   test_credentials_store_parse_rejects_malformed();
   test_credentials_store_rejects_legacy_hex();
   test_credentials_store_duplicate_rejected();
+  test_credentials_store_rejects_nonuniform_iters();
   test_credentials_store_parse_missing_file();
   test_credentials_store_empty_and_null();
   test_credentials_store_overlong_line_rejected();

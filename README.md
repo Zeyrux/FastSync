@@ -516,9 +516,13 @@ Client and server versions must currently match exactly.
 
 Daemon modules that declare `auth users` authenticate with a SCRAM-SHA-256-style
 challenge/response against a salted PBKDF2 verifier store: no password and no
-replayable bearer credential crosses the wire or is stored on the daemon. Store
-lines are generated with `fastsync-server --hash-credentials <plaintext-file>`
-(see `RSYNC_COMPAT.md`); legacy `user:SHA256HEX` stores are rejected.
+replayable bearer credential crosses the wire or is stored on the daemon. All
+store entries share one iteration count, and an unknown user is answered with a
+deterministic per-username dummy challenge, so probing the daemon cannot
+enumerate users. Store lines are generated with
+`fastsync-server --hash-credentials <plaintext-file>` (see `RSYNC_COMPAT.md`);
+redirect that output to an owner-only (mode 0600) file, and note that legacy
+`user:SHA256HEX` stores are rejected.
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not

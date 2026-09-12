@@ -427,9 +427,10 @@ static const char* status_to_string(Status status) {
 }
 
 /* Shared string send/receive implementation.  `redact` selects whether the
- * payload body is written to the LOG_DEBUG_PROTO debug log: secrets (daemon
- * auth username/digest) set it so a --verbose log never captures a replayable
- * credential, while every other string keeps its normal debug trace. */
+ * payload body is written to the LOG_DEBUG_PROTO debug log: daemon auth material
+ * (the username and the proof/signature fields) sets it so a --verbose log never
+ * captures a replayable credential, while every other string keeps its normal
+ * debug trace. */
 static bool protocol_send_str_impl(ProtocolSession* session, const char* data, bool redact) {
   if (data == NULL)
     return false;
@@ -602,7 +603,8 @@ char* receive_str(int fd) {
   return protocol_receive_str(legacy_session(fd, -1));
 }
 /* Redacted variants: identical framing, but the string body is never written to
-   the debug protocol log.  Used for the daemon auth username/digest. */
+   the debug protocol log.  Used for daemon auth material (username, proof,
+   signature). */
 bool send_str_redacted(int fd, const char* data) {
   return protocol_send_str_redacted(legacy_session(-1, fd), data);
 }

@@ -1,5 +1,6 @@
 #include "server_cli.h"
 #include "charset.h"
+#include "credentials.h"
 #include "utils.h"
 #include <limits.h>
 #include <stdarg.h>
@@ -146,8 +147,10 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       }
       char* end = NULL;
       long n = strtol(inline_value, &end, 10);
-      if (!end || *end != '\0' || n < 0 || n > 10000000L) {
-        set_error(err, err_size, "invalid --iterations '%s'", inline_value);
+      if (!end || *end != '\0' || n < (long)CREDENTIAL_MIN_ITERS ||
+          n > (long)CREDENTIAL_MAX_ITERS) {
+        set_error(err, err_size, "--iterations must be in [%u,%u], got '%s'", CREDENTIAL_MIN_ITERS,
+                  CREDENTIAL_MAX_ITERS, inline_value);
         return -1;
       }
       opts->hash_iterations = (uint32_t)n;

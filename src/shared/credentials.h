@@ -55,9 +55,11 @@
 typedef struct CredentialStore CredentialStore;
 
 /* One resolved verifier.  `found` is false for an unknown user or a user not on
- * a module's auth list; the remaining fields then hold a fresh random salt, the
- * default iteration count and fixed dummy keys, so the server can run the same
- * challenge/response math with no enumeration/timing oracle. */
+ * a module's auth list; the remaining fields then hold a deterministic dummy
+ * salt (HMAC of the store-wide dummy key over the username), the store-wide
+ * uniform iteration count (default for an empty store) and fixed dummy keys, so
+ * the server can run the same challenge/response math with no enumeration or
+ * timing oracle. */
 typedef struct {
   uint8_t salt[CREDENTIAL_SALT_LEN];
   uint32_t iters;
@@ -73,8 +75,10 @@ typedef struct {
  * opened or that fails the strict grammar is a hard error (err filled, NULL
  * returned) -- the daemon fails CLOSED rather than serving an auth-required
  * module with a partial store.  Both files may be NULL, which yields an empty
- * store (every auth-required module then refuses connections).  When both are
- * given, the --early-input file is layered over --password-file: a duplicate
+ * store (every auth-required module then refuses connections).  Every entry in
+ * the resulting store must agree on the iteration count; entries that disagree
+ * (within one file or across the two layered sources) are rejected.  When both
+ * are given, the --early-input file is layered over --password-file: a duplicate
  * username whose verifier matches is deduplicated; one whose verifier differs
  * is an error (the two sources disagree), never a silent pick.
  *
@@ -101,9 +105,10 @@ bool credentials_random_bytes(uint8_t* out, size_t n);
 
 /* Resolve `user` against the store AND the module's auth-user list.  The list
  * scan is a constant-time full-length comparison with no early break.  On a
- * miss, *out is filled with a dummy verifier (fresh random salt, default
- * iterations, fixed dummy keys, found=false).  Returns false only on invalid
- * arguments/allocation failure. */
+ * miss, *out is filled with a dummy verifier (a deterministic per-username salt
+ * derived from the store's dummy key, the store-wide uniform iteration count,
+ * fixed dummy keys, found=false).  Returns false on invalid arguments or an
+ * HMAC/crypto primitive failure. */
 bool credentials_get_verifier(const CredentialStore* store, const char* user,
                               const char* const* module_users, int n, CredentialVerifier* out);
 
@@ -111,7 +116,8 @@ bool credentials_get_verifier(const CredentialStore* store, const char* user,
  *   K = PBKDF2-HMAC-SHA256(password, salt, iters, 32)
  *   ClientKey = HMAC-SHA256(K, "Client Key"); StoredKey = SHA256(ClientKey)
  *   ServerKey = HMAC-SHA256(K, "Server Key")
- * Any of client_key/stored_key/server_key may be NULL when not needed. */
+ * Any of client_key/stored_key/server_key may be NULL when not needed.
+ * `iters` must lie in [CREDENTIAL_MIN_ITERS, CREDENTIAL_MAX_ITERS]. */
 bool credentials_compute_keys(const char* password, const uint8_t salt[CREDENTIAL_SALT_LEN],
                               uint32_t iters, uint8_t client_key[CREDENTIAL_KEY_LEN],
                               uint8_t stored_key[CREDENTIAL_KEY_LEN],

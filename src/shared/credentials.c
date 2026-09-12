@@ -30,6 +30,16 @@ struct CredentialStore {
   CredentialEntry* entries;
   int count;
   int capacity;
+  /* Store-wide uniform PBKDF2 iteration count.  Every entry must agree on it
+   * (the parser refuses a store whose entries disagree), so a miss can be
+   * challenged with the same count as a hit and the count itself never leaks
+   * membership.  Unused (0) for an empty store. */
+  uint32_t iters;
+  /* Random secret generated once at load.  The dummy salt handed out for an
+   * unknown/off-list user is HMAC-SHA256(dummy_key, username)[:SALT_LEN], so
+   * repeated probes of the same username always see an identical challenge
+   * while different usernames differ -- with no fresh-random tell. */
+  uint8_t dummy_key[CREDENTIAL_KEY_LEN];
 };
 
 /* Exact marker prefix of the new store verifier field. */
@@ -179,15 +189,20 @@ bool credentials_b64_decode(const char* in, uint8_t* out, size_t out_sz, size_t*
   if (decoded_len > out_sz)
     return false;
   /* EVP_DecodeBlock writes the full (padded) quantum, so decode into a scratch
-   * buffer sized for it and copy only the real bytes out. */
-  uint8_t scratch[192];
+   * buffer sized for it and copy only the real bytes out.  The single `done`
+   * path burns the scratch on failure as well as success, so no partial secret
+   * survives an early return. */
+  uint8_t scratch[192] = {0};
+  bool ok = false;
   int n = EVP_DecodeBlock(scratch, (const unsigned char*)in, (int)len);
   if (n < 0 || (size_t)n != padded_len)
-    return false;
+    goto done;
   memcpy(out, scratch, decoded_len);
-  credentials_burn((char*)scratch, sizeof(scratch));
   *out_len = decoded_len;
-  return true;
+  ok = true;
+done:
+  credentials_burn((char*)scratch, sizeof(scratch));
+  return ok;
 }
 
 bool credentials_random_bytes(uint8_t* out, size_t n) {
@@ -230,10 +245,9 @@ bool credentials_compute_keys(const char* password, const uint8_t salt[CREDENTIA
                               uint8_t server_key[CREDENTIAL_KEY_LEN]) {
   if (!password || !salt)
     return false;
-  /* The caller (store parser / client clamp) is responsible for the
-   * [MIN,MAX] policy; this primitive only refuses a zero/unbounded work
-   * factor.  Tests exercise the known-answer vector at a smaller count. */
-  if (iters == 0 || iters > CREDENTIAL_MAX_ITERS)
+  /* Enforce the full [MIN,MAX] policy here so no caller can derive a verifier
+   * with a work factor outside the validated store range. */
+  if (iters < CREDENTIAL_MIN_ITERS || iters > CREDENTIAL_MAX_ITERS)
     return false;
   size_t password_len = strlen(password);
   if (password_len > CREDENTIAL_MAX_PASSWORD_LEN || password_len > (size_t)INT_MAX)
@@ -338,11 +352,15 @@ bool credentials_verify_response(const CredentialVerifier* v, const char* user,
     computed = hmac_sha256(v->server_key, CREDENTIAL_KEY_LEN, auth_msg, msg_len, server_sig);
   if (computed)
     memcpy(server_sig_out, server_sig, CREDENTIAL_KEY_LEN);
-  /* Constant-time compare over the fixed 32-byte keys; a tampered nonce
-   * changes the AuthMessage and so the recovered key. */
-  bool accept = computed && v->found &&
-                credentials_secure_equal((const char*)recovered, (const char*)v->stored_key,
+  /* Always run the constant-time key compare (even when `found` is false) and
+   * fold the accept decision with bitwise AND so no short-circuit reveals
+   * whether the user was found.  A tampered nonce changes the AuthMessage and
+   * so the recovered key. */
+  bool key_match = false;
+  if (computed)
+    key_match = credentials_secure_equal((const char*)recovered, (const char*)v->stored_key,
                                          CREDENTIAL_KEY_LEN);
+  bool accept = computed & v->found & key_match;
   credentials_burn((char*)auth_msg, sizeof(auth_msg));
   credentials_burn((char*)client_sig, sizeof(client_sig));
   credentials_burn((char*)client_key, sizeof(client_key));
@@ -526,6 +544,18 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
       ok = false;
       break;
     }
+    /* Every entry must agree on the iteration count, so a miss can be answered
+     * with the store-wide count without leaking membership. */
+    if (store->count == 0) {
+      store->iters = parsed.iters;
+    } else if (store->iters != parsed.iters) {
+      set_error(err, err_size,
+                "credential file '%s' line %d: iteration count %u disagrees with the store-wide %u "
+                "(the store must be uniform)",
+                path, line_no, parsed.iters, store->iters);
+      ok = false;
+      break;
+    }
     if (find_user(store, user) >= 0) {
       set_error(err, err_size, "credential file '%s' line %d: duplicate entry for user '%.*s'",
                 path, line_no, (int)strlen(user), user);
@@ -560,6 +590,15 @@ CredentialStore* credentials_load(const char* password_file, const char* early_i
   CredentialStore* store = load_store_file(password_file, err, err_size);
   if (!store)
     return NULL;
+  /* Generate the store-wide dummy key once for the final (possibly merged)
+   * store.  It makes an unknown-user challenge deterministic, so fail the load
+   * if the CSPRNG is unavailable rather than degrading the anti-enumeration
+   * property. */
+  if (!credentials_random_bytes(store->dummy_key, sizeof(store->dummy_key))) {
+    set_error(err, err_size, "failed to generate the credential store dummy key");
+    credentials_free(store);
+    return NULL;
+  }
   if (!early_input_file)
     return store;
 
@@ -568,6 +607,18 @@ CredentialStore* credentials_load(const char* password_file, const char* early_i
     credentials_free(store);
     return NULL;
   }
+  /* A layered store must stay uniform too. */
+  if (store->count > 0 && early->count > 0 && store->iters != early->iters) {
+    set_error(err, err_size,
+              "credential file '%s' and early-input file '%s' disagree on the iteration count "
+              "(%u vs %u); the store must be uniform",
+              password_file, early_input_file, store->iters, early->iters);
+    credentials_free(early);
+    credentials_free(store);
+    return NULL;
+  }
+  if (store->count == 0 && early->count > 0)
+    store->iters = early->iters;
   /* Layer early input over the password file: an identical verifier dedupes, a
    * differing verifier for the same user is ambiguous and fails closed. */
   for (int i = 0; i < early->count; i++) {
@@ -652,14 +703,23 @@ bool credentials_get_verifier(const CredentialStore* store, const char* user,
   if (!out)
     return false;
   memset(out, 0, sizeof(*out));
-  /* Start from the dummy verifier: a fresh random salt and the default
-   * iteration count, so a miss is shaped exactly like a hit. */
-  if (!credentials_random_bytes(out->salt, CREDENTIAL_SALT_LEN))
-    return false;
-  out->iters = CREDENTIAL_DEFAULT_ITERS;
+  const char* uname = user ? user : "";
+  /* The dummy verifier is shaped exactly like a hit: the store-wide uniform
+   * iteration count (default for an empty store) and fixed dummy keys. */
+  out->iters = (store && store->count > 0) ? store->iters : CREDENTIAL_DEFAULT_ITERS;
   memcpy(out->stored_key, k_dummy_stored_key, CREDENTIAL_KEY_LEN);
   memcpy(out->server_key, k_dummy_server_key, CREDENTIAL_KEY_LEN);
   out->found = false;
+  /* Deterministic per-username dummy salt: HMAC-SHA256(dummy_key, username)
+   * truncated to the salt length.  Two probes of the same unknown username see
+   * an identical challenge; distinct usernames differ.  A NULL store (never
+   * reached in production) falls back to the all-zero static key. */
+  const uint8_t* dummy_key = store ? store->dummy_key : k_dummy_stored_key;
+  uint8_t mac[CREDENTIAL_KEY_LEN];
+  if (!hmac_sha256(dummy_key, CREDENTIAL_KEY_LEN, (const uint8_t*)uname, strlen(uname), mac))
+    return false;
+  memcpy(out->salt, mac, CREDENTIAL_SALT_LEN);
+  credentials_burn((char*)mac, sizeof(mac));
   if (!store || !user || n < 0)
     return true;
   /* Module-list membership: constant-time full scan, no early break, so the
@@ -731,10 +791,17 @@ bool credentials_hash_store_line(const char* user, const char* password, uint32_
   credentials_burn((char*)stored_key, sizeof(stored_key));
   credentials_burn((char*)server_key, sizeof(server_key));
   credentials_burn((char*)salt, sizeof(salt));
-  if (!ok)
+  /* The base64 encodings of the salt/keys are secret material too (A7-4). */
+  credentials_burn(salt_b64, sizeof(salt_b64));
+  credentials_burn(stored_b64, sizeof(stored_b64));
+  credentials_burn(server_b64, sizeof(server_b64));
+  if (!ok) {
+    credentials_burn(out, out_sz);
     return false;
+  }
   if (written < 0 || (size_t)written >= out_sz) {
     set_error(err, err_size, "output buffer too small for the credential line");
+    credentials_burn(out, out_sz);
     return false;
   }
   return true;
@@ -797,6 +864,7 @@ int credentials_hash_file(const char* path, uint32_t iters, FILE* out, char* err
     char store_line[CREDENTIAL_MAX_LINE];
     if (!credentials_hash_store_line(user, password, iters, store_line, sizeof(store_line), err,
                                      err_size)) {
+      credentials_burn(store_line, sizeof(store_line));
       result = -1;
       break;
     }

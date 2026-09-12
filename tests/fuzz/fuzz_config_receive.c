@@ -53,6 +53,7 @@ static size_t g_frame_len;
 static size_t g_version_len;       /* length of the leading version-string frame */
 static size_t g_usermap_count_off; /* offset of the usermap count int, 0 = unknown */
 static size_t g_auth_off;          /* offset of the auth presence int, 0 = unknown */
+static bool g_auth_found;          /* whether g_auth_off is valid */
 static bool g_frame_ready;
 
 /* Read the canonical frame from the send peer.  The producer shuts down its
@@ -180,17 +181,20 @@ out:
   }
 
   /* Locate the auth username string (a size_t length followed by its bytes);
-   * the presence int sits one int before the length. */
+   * the presence int sits one int before the length.  The username bytes cannot
+   * start before sizeof(size_t)+sizeof(int) without the presence-int offset
+   * underflowing, so begin the scan there. */
   const char* auth_name = "alice";
   size_t auth_name_len = strlen(auth_name);
   if (g_frame_len >= sizeof(size_t) + auth_name_len + sizeof(int)) {
-    for (size_t i = sizeof(size_t); i + auth_name_len <= g_frame_len; i++) {
+    for (size_t i = sizeof(size_t) + sizeof(int); i + auth_name_len <= g_frame_len; i++) {
       if (memcmp(g_frame + i, auth_name, auth_name_len) != 0)
         continue;
       size_t found_len = 0;
       memcpy(&found_len, g_frame + i - sizeof(size_t), sizeof(size_t));
       if (found_len == auth_name_len) {
         g_auth_off = i - sizeof(size_t) - sizeof(int);
+        g_auth_found = true;
         break;
       }
     }
@@ -327,7 +331,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     receive_stream(g_frame, g_version_len, data, size);
 
     /* Keep the valid frame up to the shortened auth block, fuzz it. */
-    if (g_auth_off > 0)
+    if (g_auth_found)
       receive_stream(g_frame, g_auth_off, data, size);
 
     /* Keep the valid frame up to the P8 tail, fuzz super_mode + copy-as. */

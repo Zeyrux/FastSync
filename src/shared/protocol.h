@@ -151,8 +151,9 @@ bool protocol_send_str(ProtocolSession* session, const char* data);
 char* protocol_receive_str(ProtocolSession* session);
 /* Redacted string variants: identical wire framing to protocol_send_str /
  * protocol_receive_str, but the payload body is replaced by `<redacted>` in the
- * LOG_DEBUG_PROTO debug log.  Used for secrets (daemon auth username/digest) so
- * a --verbose log can never capture a replayable credential. */
+ * LOG_DEBUG_PROTO debug log.  Used for daemon auth material (the username and
+ * the proof/signature fields) so a --verbose log can never capture a credential
+ * that could be replayed. */
 bool protocol_send_str_redacted(ProtocolSession* session, const char* data);
 char* protocol_receive_str_redacted(ProtocolSession* session);
 bool protocol_send_data(ProtocolSession* session, const Data* data);

@@ -73,65 +73,68 @@ typedef struct ModuleGateContext {
  * 2.19.0).  Sends STATUS_AUTH_CHALLENGE (iteration count, base64 salt, base64
  * server nonce), expects STATUS_AUTH_RESPONSE (base64 client nonce, base64
  * ClientProof), verifies the proof constant-time and answers STATUS_AUTH_OK
- * with the base64 ServerSignature.  On any failure it sends a single generic
+ * with the base64 ServerSignature.  On any failure it sends exactly one generic
  * STATUS_AUTH_FAILED and returns false.  The verifier for an unknown/off-list
- * user is a dummy (random salt, dummy keys, found=false) so the same math runs
- * and no user-enumeration/timing oracle is exposed. */
+ * user is a dummy (deterministic per-username salt, store-wide iterations, dummy
+ * keys, found=false) so the same math runs and no user-enumeration/timing oracle
+ * is exposed. */
 static bool server_auth_handshake(int fd, const Config* config, const DaemonModule* module) {
-  if (!config->auth_user) {
-    send_status(fd, STATUS_AUTH_FAILED);
-    return false;
-  }
+  bool result = false;
   CredentialVerifier verifier;
+  memset(&verifier, 0, sizeof(verifier));
+  uint8_t snonce[CREDENTIAL_NONCE_LEN] = {0};
+  char salt_b64[25] = {0};
+  char snonce_b64[45] = {0};
+  char* cnonce_b64 = NULL;
+  char* proof_b64 = NULL;
+  uint8_t cnonce[CREDENTIAL_NONCE_LEN] = {0};
+  uint8_t proof[CREDENTIAL_KEY_LEN] = {0};
+  uint8_t server_sig[CREDENTIAL_KEY_LEN] = {0};
+  char sig_b64[45] = {0};
+  size_t cnonce_len = 0;
+  size_t proof_len = 0;
+
+  if (!config->auth_user)
+    goto fail; /* no username: generic failure, no challenge */
   if (!credentials_get_verifier(g_credentials, config->auth_user,
                                 (const char* const*)module->auth_users, module->auth_user_count,
                                 &verifier))
-    return false;
-  uint8_t snonce[CREDENTIAL_NONCE_LEN];
-  char salt_b64[25];
-  char snonce_b64[45];
-  bool ok =
-      credentials_random_bytes(snonce, sizeof(snonce)) &&
-      credentials_b64_encode(verifier.salt, CREDENTIAL_SALT_LEN, salt_b64, sizeof(salt_b64)) &&
-      credentials_b64_encode(snonce, sizeof(snonce), snonce_b64, sizeof(snonce_b64));
-  if (!ok) {
-    send_status(fd, STATUS_AUTH_FAILED);
-    return false;
-  }
-  ok = send_status(fd, STATUS_AUTH_CHALLENGE) && send_int(fd, (int)verifier.iters) &&
-       send_str(fd, salt_b64) && send_str(fd, snonce_b64);
+    goto fail; /* a crypto failure still owes the gate a terminal frame */
+  if (!(credentials_random_bytes(snonce, sizeof(snonce)) &&
+        credentials_b64_encode(verifier.salt, CREDENTIAL_SALT_LEN, salt_b64, sizeof(salt_b64)) &&
+        credentials_b64_encode(snonce, sizeof(snonce), snonce_b64, sizeof(snonce_b64))))
+    goto fail;
+  if (!(send_status(fd, STATUS_AUTH_CHALLENGE) && send_int(fd, (int)verifier.iters) &&
+        send_str(fd, salt_b64) && send_str(fd, snonce_b64)))
+    goto fail;
+
   Status status = STATUS_ERROR;
-  char* cnonce_b64 = NULL;
-  char* proof_b64 = NULL;
-  uint8_t cnonce[CREDENTIAL_NONCE_LEN];
-  uint8_t proof[CREDENTIAL_KEY_LEN];
-  uint8_t server_sig[CREDENTIAL_KEY_LEN];
-  size_t cnonce_len = 0;
-  size_t proof_len = 0;
-  bool verified = false;
-  if (ok) {
-    ok = receive_status(fd, &status) && status == STATUS_AUTH_RESPONSE;
-    if (ok) {
-      cnonce_b64 = receive_str_redacted(fd);
-      proof_b64 = receive_str_redacted(fd);
-      ok = cnonce_b64 && proof_b64 &&
-           credentials_b64_decode(cnonce_b64, cnonce, sizeof(cnonce), &cnonce_len) &&
-           cnonce_len == CREDENTIAL_NONCE_LEN &&
-           credentials_b64_decode(proof_b64, proof, sizeof(proof), &proof_len) &&
-           proof_len == CREDENTIAL_KEY_LEN;
-    }
-    verified = ok && credentials_verify_response(&verifier, config->auth_user, snonce, cnonce,
-                                                 proof, server_sig);
-  }
-  if (verified) {
-    char sig_b64[45];
-    ok = credentials_b64_encode(server_sig, sizeof(server_sig), sig_b64, sizeof(sig_b64)) &&
-         send_status(fd, STATUS_AUTH_OK) && send_str_redacted(fd, sig_b64);
-    credentials_burn(sig_b64, sizeof(sig_b64));
-  } else {
-    send_status(fd, STATUS_AUTH_FAILED);
-    ok = false;
-  }
+  if (!(receive_status(fd, &status) && status == STATUS_AUTH_RESPONSE))
+    goto fail;
+  cnonce_b64 = receive_str_redacted(fd);
+  proof_b64 = receive_str_redacted(fd);
+  if (!(cnonce_b64 && proof_b64 &&
+        credentials_b64_decode(cnonce_b64, cnonce, sizeof(cnonce), &cnonce_len) &&
+        cnonce_len == CREDENTIAL_NONCE_LEN &&
+        credentials_b64_decode(proof_b64, proof, sizeof(proof), &proof_len) &&
+        proof_len == CREDENTIAL_KEY_LEN))
+    goto fail;
+  if (!credentials_verify_response(&verifier, config->auth_user, snonce, cnonce, proof, server_sig))
+    goto fail;
+
+  /* Success writes exactly one terminal frame (STATUS_AUTH_OK).  A broken pipe
+   * while sending the signature just drops the connection; it must never emit a
+   * second terminal status. */
+  result = credentials_b64_encode(server_sig, sizeof(server_sig), sig_b64, sizeof(sig_b64)) &&
+           send_status(fd, STATUS_AUTH_OK) && send_str_redacted(fd, sig_b64);
+  goto cleanup;
+
+fail:
+  /* Every failure path writes exactly one generic terminal status, satisfying
+   * the gate's CONFIG_VALIDATE_ALREADY_TERMINATED contract. */
+  send_status(fd, STATUS_AUTH_FAILED);
+
+cleanup:
   credentials_burn(cnonce_b64, cnonce_b64 ? strlen(cnonce_b64) : 0);
   credentials_burn(proof_b64, proof_b64 ? strlen(proof_b64) : 0);
   free(cnonce_b64);
@@ -142,10 +145,11 @@ static bool server_auth_handshake(int fd, const Config* config, const DaemonModu
   credentials_burn((char*)cnonce, sizeof(cnonce));
   credentials_burn((char*)proof, sizeof(proof));
   credentials_burn((char*)server_sig, sizeof(server_sig));
+  credentials_burn(sig_b64, sizeof(sig_b64));
   credentials_burn((char*)verifier.salt, sizeof(verifier.salt));
   credentials_burn((char*)verifier.stored_key, sizeof(verifier.stored_key));
   credentials_burn((char*)verifier.server_key, sizeof(verifier.server_key));
-  return verified && ok;
+  return result;
 }
 
 /* Aggregate payload bytes the multithreaded receiver may buffer ahead of the
@@ -364,7 +368,8 @@ static const char* server_module_gate(const Config* config, void* context) {
     /* Auth-required module (A7, protocol 2.19.0): run the SCRAM challenge/
      * response BEFORE the module root is installed and before any data moves.
      * Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR);
-     * a failed handshake already sent STATUS_AUTH_FAILED.  The username may be
+     * a failed handshake writes exactly one STATUS_AUTH_FAILED (on every
+     * failure path) before signalling ALREADY_TERMINATED.  The username may be
      * logged (never the password or any derived proof). */
     if (g_credentials == NULL) {
       log_message(LOG_LEVEL_ERROR,
@@ -751,7 +756,8 @@ static void print_server_usage(void) {
   printf("  --allow-unauthenticated  Allow plaintext/anonymous network clients\n");
   printf("  --hash-credentials <file>  Read <file>'s user:password lines and print\n");
   printf("                      PBKDF2 credential-store lines to stdout, then exit.\n");
-  printf("                      Use the output as --password-file for --daemon\n");
+  printf("                      Use the output as --password-file for --daemon;\n");
+  printf("                      redirect it to an owner-only (0600) file\n");
   printf("  --iterations N      PBKDF2 iteration count for --hash-credentials\n");
   printf("                      (default %u, range %u-%u)\n", CREDENTIAL_DEFAULT_ITERS,
          CREDENTIAL_MIN_ITERS, CREDENTIAL_MAX_ITERS);
@@ -828,6 +834,14 @@ int main(int argc, char* argv[]) {
    * emit new-format credential-store lines, then exit. */
   if (opts.hash_credentials_file) {
     uint32_t iters = opts.hash_iterations_set ? opts.hash_iterations : CREDENTIAL_DEFAULT_ITERS;
+    /* The output is secret material: if it is redirected to a regular file,
+     * warn when that file is group/other-accessible (the store must be 0600). */
+    struct stat out_st;
+    if (fstat(STDOUT_FILENO, &out_st) == 0 && S_ISREG(out_st.st_mode) &&
+        (out_st.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+      fprintf(stderr,
+              "Warning: credential-store output is a group/other-accessible file; restrict it to "
+              "mode 0600 (chmod 600)\n");
     char hash_err[512];
     if (credentials_hash_file(opts.hash_credentials_file, iters, stdout, hash_err,
                               sizeof(hash_err)) != 0) {
