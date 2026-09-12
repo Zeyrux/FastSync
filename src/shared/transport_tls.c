@@ -65,6 +65,18 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     SSL_CTX_free(ctx);
     return NULL;
   }
+  /* TLS 1.3 ciphersuites are configured separately from the TLS 1.2 and below
+   * cipher list above.  Pin the three AEAD suites OpenSSL offers, dropping
+   * TLS_AES_128_CCM_SHA256 and the CCM_8 variant, and fail closed if the
+   * library rejects the policy.  SSL_CTX_set_ciphersuites needs OpenSSL 1.1.1;
+   * earlier versions have no TLS 1.3, so the call is compile-guarded. */
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+  if (SSL_CTX_set_ciphersuites(
+          ctx, "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256") != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
+#endif
 
   if (cert && key) {
     struct stat key_stat;

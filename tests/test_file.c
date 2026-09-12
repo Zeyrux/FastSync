@@ -1370,6 +1370,76 @@ static void test_dir_time_list() {
   rmdir(root);
 }
 
+/* A hostile sender can stream unbounded STATUS_DIR_TIMES frames; the
+ * accumulator must bound the CUMULATIVE path bytes (not just one frame) and
+ * reject the add that would cross the cap, leaving the list untouched. */
+static void test_dir_time_list_cap() {
+  DirTimeList list;
+  dir_time_list_init(&list);
+  EXPECT_EQ_INT((int)list.bytes, 0);
+  FileMetadata metadata = {.mtime_sec = 1, .mtime_nsec = 0};
+
+  size_t path_len = MAX_STRING_SIZE - 1;
+  char* path = malloc(path_len + 1);
+  EXPECT_NOT_NULL(path);
+  memset(path, 'a', path_len);
+  path[path_len] = '\0';
+
+  bool rejected = false;
+  for (size_t i = 0; i < MAX_DIR_TIME_ENTRIES + 1 && !rejected; i++) {
+    size_t before_count = list.count;
+    size_t before_bytes = list.bytes;
+    if (!dir_time_list_add(&list, path, &metadata)) {
+      rejected = true;
+      /* The rejected add must not have partially mutated the list. */
+      EXPECT_TRUE(list.count == before_count);
+      EXPECT_TRUE(list.bytes == before_bytes);
+    } else {
+      EXPECT_TRUE(list.count == before_count + 1);
+      EXPECT_TRUE(list.bytes == before_bytes + path_len + sizeof(FileMetadata) + sizeof(char*));
+    }
+  }
+  EXPECT_TRUE(rejected);
+  EXPECT_TRUE(list.count <= MAX_DIR_TIME_ENTRIES);
+  EXPECT_TRUE(list.bytes <= MAX_DIR_TIME_BYTES);
+
+  /* The retained entries are still intact and freeable after the rejection. */
+  EXPECT_TRUE(list.count > 0);
+  EXPECT_TRUE(strcmp(list.paths[0], path) == 0);
+  dir_time_list_free(&list);
+  EXPECT_EQ_INT((int)list.bytes, 0);
+  free(path);
+}
+
+/* receive_incremental_check must reject an empty check_path; every other
+ * receive path rejects path[0]=='\0'.  Feed the check header (empty wire path
+ * + size/mtime/nsec) and assert the check is refused without being skipped. */
+static void test_receive_incremental_check_empty_path() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->checksum = false;
+
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  size_t wire_len = 0;
+  unsigned long long check_size = 0;
+  long long check_mtime = 0;
+  long long check_mtime_nsec = 0;
+  EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+  EXPECT_TRUE(send_n_data(p[1], &check_size, sizeof(check_size)));
+  EXPECT_TRUE(send_n_data(p[1], &check_mtime, sizeof(check_mtime)));
+  EXPECT_TRUE(send_n_data(p[1], &check_mtime_nsec, sizeof(check_mtime_nsec)));
+
+  bool skipped = true;
+  File* file = receive_incremental_check(p[0], cfg, &skipped);
+  EXPECT_NULL(file);
+  EXPECT_FALSE(skipped);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
 /* -K/--keep-dirlinks secure open: with an authorized root, a destination path
  * component that is a symlink to an IN-ROOT directory is used as that directory
  * (its referent is opened through a relative O_NOFOLLOW walk from the root fd,
@@ -1531,6 +1601,8 @@ void test_file() {
   }
   test_file_metadata_create();
   test_dir_time_list();
+  test_dir_time_list_cap();
+  test_receive_incremental_check_empty_path();
   test_keep_dirlinks_secure_open();
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();

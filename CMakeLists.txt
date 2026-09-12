@@ -38,11 +38,24 @@ if(ENABLE_COVERAGE)
 	add_link_options(--coverage)
 endif()
 
+# --- Build hardening option ---
+# Production hardening is applied to the shipping server/client binaries only,
+# and only when no sanitizer or coverage instrumentation is active: sanitizers
+# carry their own instrumentation, and _FORTIFY_SOURCE requires an optimising
+# build (never the -O0 used for coverage).
+option(ENABLE_HARDENING "Enable compiler/linker hardening for production targets" ON)
+set(HARDENING_ACTIVE OFF)
+if(ENABLE_HARDENING AND SANITIZER STREQUAL "none" AND NOT ENABLE_COVERAGE)
+	set(HARDENING_ACTIVE ON)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(
   xxhash
   GIT_REPOSITORY https://github.com/Cyan4973/xxHash
-  GIT_TAG v0.8.3
+  # v0.8.3 is a lightweight tag pointing at this exact commit (no ^{} peel
+  # entry); pin the commit SHA instead of the mutable tag.
+  GIT_TAG e626a72bc2321cd320e953a0ccf1584cad60f363 # v0.8.3
   SOURCE_SUBDIR cmake_unofficial
 )
 FetchContent_MakeAvailable(xxhash)
@@ -72,6 +85,33 @@ target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::S
 add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS} ${FILE_STORE_SRCS} ${SERVER_RECEIVER_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
 target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+
+# --- Production hardening ---
+# Each compile flag is probed so a compiler/architecture that lacks it still
+# configures cleanly.  _FORTIFY_SOURCE is guarded separately because it only
+# works in an optimising build.  xxHash is a static archive built by
+# FetchContent, so it must be position-independent for the -pie link.
+if(HARDENING_ACTIVE)
+	set_target_properties(xxhash PROPERTIES POSITION_INDEPENDENT_CODE ON)
+	include(CheckCCompilerFlag)
+	foreach(flag -fstack-protector-strong -fstack-clash-protection -fPIE)
+		string(MAKE_C_IDENTIFIER "HARDEN_${flag}" _harden_var)
+		check_c_compiler_flag("${flag}" ${_harden_var})
+	endforeach()
+	check_c_compiler_flag("-D_FORTIFY_SOURCE=2" HARDEN_FORTIFY_SOURCE)
+	foreach(target server client)
+		foreach(flag -fstack-protector-strong -fstack-clash-protection -fPIE)
+			string(MAKE_C_IDENTIFIER "HARDEN_${flag}" _harden_var)
+			if(${_harden_var})
+				target_compile_options(${target} PRIVATE ${flag})
+			endif()
+		endforeach()
+		if(HARDEN_FORTIFY_SOURCE)
+			target_compile_options(${target} PRIVATE -D_FORTIFY_SOURCE=2)
+		endif()
+		target_link_options(${target} PRIVATE -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+	endforeach()
+endif()
 
 # --- Testing ---
 enable_testing()

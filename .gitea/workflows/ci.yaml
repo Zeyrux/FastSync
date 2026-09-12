@@ -12,7 +12,7 @@ jobs:
     container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: clang-format check
         run: find src/ tests/ -name '*.c' -o -name '*.h' | xargs clang-format --dry-run --Werror
@@ -30,7 +30,7 @@ jobs:
     needs: lint
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure
         run: cmake -B build -S . -DSTRICT_WARNINGS=ON
@@ -59,7 +59,7 @@ jobs:
         sanitizer: [address, undefined]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure
         run: cmake -B build-${{ matrix.sanitizer }} -S . -DSANITIZER=${{ matrix.sanitizer }}
@@ -77,7 +77,7 @@ jobs:
     if: github.event_name == 'push'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure (clang + fuzz)
         run: CC=clang CXX=clang++ cmake -B build-fuzz -S . -DENABLE_FUZZ=ON
@@ -99,7 +99,7 @@ jobs:
     if: github.event_name == 'push'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure
         run: cmake -B build -S . -DENABLE_COVERAGE=ON
@@ -123,7 +123,7 @@ jobs:
     if: github.event_name == 'push'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure
         run: cmake -B build -S . -DSTRICT_WARNINGS=ON

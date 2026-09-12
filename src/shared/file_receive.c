@@ -1696,9 +1696,9 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     return NULL;
   }
 
-  if (has_path_traversal(check_path)) {
+  if (check_path[0] == '\0' || has_path_traversal(check_path)) {
     char* escaped_path = output_escape(check_path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_ERROR, "Path traversal detected: %s",
+    log_message(LOG_LEVEL_ERROR, "Invalid received check path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");
     free(escaped_path);
     free(check_path);
@@ -1832,6 +1832,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
            existing/ignore-existing/update/backup/delay-updates policy. */
         File* materialized = file_create(check_path);
         if (materialized && basis.content) {
+          data_destroy(materialized->data);
           materialized->data = basis.content;
           basis.content = NULL;
           materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
@@ -2095,6 +2096,7 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
       file->metadata = meta;
       file->xattrs = append_xattrs;
       append_xattrs = NULL;
+      data_destroy(file->data);
       file->data = data_create(full, full_size);
       if (!file->data) { /* data_create already freed full on failure */
         file_destroy(file);
@@ -2247,6 +2249,7 @@ void dir_time_list_init(DirTimeList* list) {
   list->entries = NULL;
   list->count = 0;
   list->capacity = 0;
+  list->bytes = 0;
 }
 
 void dir_time_list_free(DirTimeList* list) {
@@ -2260,11 +2263,23 @@ void dir_time_list_free(DirTimeList* list) {
   list->entries = NULL;
   list->count = 0;
   list->capacity = 0;
+  list->bytes = 0;
 }
 
 bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata) {
   if (!list || !wire_path || !metadata)
     return true; /* nothing to remember; never a hard error */
+  /* Cumulative, not per-frame: the sender may stream a tree across unbounded
+     STATUS_DIR_TIMES frames, so bound the TOTAL retained here.  Reject before
+     touching the list, leaving it exactly as it was (the caller fails the
+     transfer, which becomes a clean protocol error). */
+  size_t path_len = strlen(wire_path);
+  /* Charge the whole per-entry cost (path copy + pointer slot + metadata
+     struct), not just the path, so the array growth is bounded by the same
+     cumulative budget. */
+  size_t entry_cost = path_len + sizeof(FileMetadata) + sizeof(char*);
+  if (list->count >= MAX_DIR_TIME_ENTRIES || entry_cost > MAX_DIR_TIME_BYTES - list->bytes)
+    return false;
   if (list->count == list->capacity) {
     size_t new_capacity = list->capacity == 0 ? 16 : list->capacity * 2;
     if (new_capacity < list->capacity)
@@ -2291,6 +2306,7 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
   list->paths[list->count] = copy;
   list->entries[list->count] = *metadata;
   list->count++;
+  list->bytes += entry_cost;
   return true;
 }
 

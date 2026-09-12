@@ -7,6 +7,15 @@
 
 /* Server-side file receive/save path. */
 
+/* Cumulative caps for the deferred directory-time accumulator.  The sender may
+ * legitimately split a large tree across repeated STATUS_DIR_TIMES frames, so a
+ * per-frame bound is not enough: the receiver must bound the TOTAL it retains
+ * against a hostile sender.  Mirror the delete-manifest limits
+ * (MAX_MANIFEST_ENTRIES / MAX_MANIFEST_BYTES): the entry count bounds the
+ * metadata array and the byte budget bounds the concatenated path strings. */
+#define MAX_DIR_TIME_ENTRIES (1024 * 1024)
+#define MAX_DIR_TIME_BYTES (16ULL * 1024 * 1024)
+
 File* file_receive(const Config* config, int file_descriptor);
 File* file_receive_directory(int file_descriptor, const Config* config);
 File* file_receive_dir_time(int file_descriptor, const Config* config);
@@ -28,6 +37,7 @@ typedef struct {
   FileMetadata* entries; /* owned, parallel to paths */
   size_t count;
   size_t capacity;
+  size_t bytes; /* cumulative strlen of every retained path */
 } DirTimeList;
 
 /* Capture gate shared by the sender-side and receiver-side sinks: directory
@@ -39,7 +49,8 @@ bool dir_times_should_capture(const Config* config);
 void dir_time_list_init(DirTimeList* list);
 void dir_time_list_free(DirTimeList* list);
 /* Deep-copy one directory's path + metadata into the list.  Returns false on
- * allocation failure (the caller fails the transfer). */
+ * allocation failure OR when the cumulative entry/byte caps would be exceeded
+ * (the caller fails the transfer). */
 bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata);
 /* Apply every accumulated directory's mtime (and atime when captured) beneath
  * `root_directory`, confined fd-relative.  Best-effort per entry: an absent

@@ -643,6 +643,24 @@ typedef struct Config {
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
 
+/* Upper bound on the number of --skip-compress suffixes accepted from the wire.
+ * Each suffix is an independent wire string (up to MAX_STRING_SIZE = 64 KiB), so
+ * without this a hostile pre-auth client could otherwise retain
+ * skip_count * MAX_STRING_SIZE bytes on the server before authentication; 256
+ * covers any realistic suffix list while keeping the worst case small. */
+#define MAX_SKIP_COMPRESS_SUFFIXES 256
+
+/* Aggregate ceiling on the bytes retained by ALL strings in one received config
+ * frame (version, send/receive roots, backup/temp/partial/suffix, compression
+ * choice, chmod spec, skip-compress suffixes, basis paths, module, auth user,
+ * iconv spec, ...).  The config frame is parsed BEFORE authentication and every
+ * one of these strings lives for the whole connection, so this cumulative
+ * (never released) budget bounds the pre-auth memory a single connection can
+ * pin.  MAX_SKIP_COMPRESS_SUFFIXES / MAX_BASIS_DIRS bound the individual
+ * repeatable counts; this budget bounds their product and any single oversized
+ * field. */
+#define MAX_CONFIG_STRING_BYTES (1ULL * 1024 * 1024)
+
 /* Identity-mapping sentinels and bounds (see identity.h for semantics).
  * IDENTITY_MATCH_ANY is a usermap/groupmap FROM '*' (matches any id);
  * IDENTITY_CURRENT is a chown / map TO '*' (resolve to the receiver's current

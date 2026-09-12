@@ -128,7 +128,7 @@ char* ssh_build_remote_command(const char* server_path, bool old_args, char* con
         q++;
       len++;
     }
-    if (len > SIZE_MAX - q * 3 || len + q * 3 + 3 > SIZE_MAX - command_len)
+    if (q > (SIZE_MAX - len) / 3 || len + q * 3 + 3 > SIZE_MAX - command_len)
       return NULL;
     command_len += len + q * 3 + 3;
   }

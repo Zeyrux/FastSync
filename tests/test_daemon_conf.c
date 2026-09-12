@@ -1,4 +1,5 @@
 #include "test_daemon_conf.h"
+#include "credentials.h"
 #include "daemon_conf.h"
 #include "test_utils.h"
 #include <stdio.h>
@@ -320,6 +321,51 @@ static void test_daemon_conf_dparam_override() {
   daemon_conf_free(conf);
 }
 
+/* Each `auth users` entry is validated with the same username rule as the
+ * credential store, so invisible whitespace/control characters can never make
+ * an exact strcmp match ambiguous. */
+static void test_daemon_conf_auth_users_validated() {
+  char* path;
+  char err[256];
+  const DaemonConf* conf;
+
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nauth users = alice, bad user\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "invalid 'auth users' entry") != NULL);
+
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nauth users = good\tbad\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "invalid 'auth users' entry") != NULL);
+
+  /* An over-long name exceeds CREDENTIAL_MAX_USER_LEN and is rejected. */
+  {
+    char body[CREDENTIAL_MAX_USER_LEN + 128];
+    int n = snprintf(body, sizeof(body), "[m]\npath = /x\nauth users = ");
+    memset(body + n, 'a', CREDENTIAL_MAX_USER_LEN + 1);
+    body[n + CREDENTIAL_MAX_USER_LEN + 1] = '\n';
+    body[n + CREDENTIAL_MAX_USER_LEN + 2] = '\0';
+    EXPECT_EQ_INT(write_conf(body, &path), 0);
+    conf = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NULL(conf);
+    EXPECT_TRUE(strstr(err, "invalid 'auth users' entry") != NULL);
+  }
+
+  /* Empty entries between commas are skipped, not treated as invalid. */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nauth users = alice,, bob\n", &path), 0);
+  DaemonConf* ok_conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(ok_conf);
+  EXPECT_EQ_INT(ok_conf->modules[0].auth_user_count, 2);
+  EXPECT_EQ_STR(ok_conf->modules[0].auth_users[0], "alice");
+  EXPECT_EQ_STR(ok_conf->modules[0].auth_users[1], "bob");
+  daemon_conf_free(ok_conf);
+}
+
 static void test_daemon_module_name_valid() {
   EXPECT_TRUE(daemon_module_name_valid("backup"));
   EXPECT_TRUE(daemon_module_name_valid("Backup_2"));
@@ -351,5 +397,6 @@ void test_daemon_conf() {
   test_daemon_conf_missing_file_rejected();
   test_daemon_conf_find_module();
   test_daemon_conf_dparam_override();
+  test_daemon_conf_auth_users_validated();
   test_daemon_module_name_valid();
 }

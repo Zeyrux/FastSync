@@ -338,9 +338,10 @@ static bool basis_oversize_preflight(const Config* config) {
     return false;
   DirectoryScanner* scanner =
       directory_scanner_create_with_options(config->send_directory, &prepared.options);
-  prepared_scanner_destroy(&prepared);
-  if (!scanner)
+  if (!scanner) {
+    prepared_scanner_destroy(&prepared);
     return false;
+  }
   bool ok = true;
   Chunk* chunk;
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
@@ -364,7 +365,10 @@ static bool basis_oversize_preflight(const Config* config) {
   }
   if (directory_scanner_failed(scanner) || directory_scanner_had_io_error(scanner))
     ok = false;
+  /* The scanner borrows prepared.options' base_filters/hardlinks pointers, so
+     prepared must outlive the scanner. */
   directory_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
   return ok;
 }
 
@@ -1886,6 +1890,8 @@ int send_files(Config* config) {
     if (config->transport == TRANSPORT_TCP)
       log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
                   config->use_tls ? " via TLS" : "");
+    if (missing_args)
+      array_list_delete(missing_args);
     return 1;
   }
   ProtocolSession session;

@@ -517,6 +517,11 @@ static int parse_skip_compress(Config* config, const char* value) {
       token[--len] = '\0';
     if (len == 0)
       continue;
+    if (config->skip_compress_count >= MAX_SKIP_COMPRESS_SUFFIXES) {
+      fprintf(stderr, "--skip-compress supports at most %d suffixes\n", MAX_SKIP_COMPRESS_SUFFIXES);
+      free(list);
+      return -1;
+    }
     if (config_add_pattern(&config->skip_compress_suffixes, &config->skip_compress_count, token,
                            "--skip-compress") != 0) {
       free(list);
