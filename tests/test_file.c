@@ -1396,7 +1396,7 @@ static void test_dir_time_list_cap() {
       EXPECT_TRUE(list.bytes == before_bytes);
     } else {
       EXPECT_TRUE(list.count == before_count + 1);
-      EXPECT_TRUE(list.bytes == before_bytes + path_len);
+      EXPECT_TRUE(list.bytes == before_bytes + path_len + sizeof(FileMetadata) + sizeof(char*));
     }
   }
   EXPECT_TRUE(rejected);

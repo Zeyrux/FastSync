@@ -2274,7 +2274,11 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
      touching the list, leaving it exactly as it was (the caller fails the
      transfer, which becomes a clean protocol error). */
   size_t path_len = strlen(wire_path);
-  if (list->count >= MAX_DIR_TIME_ENTRIES || path_len > MAX_DIR_TIME_BYTES - list->bytes)
+  /* Charge the whole per-entry cost (path copy + pointer slot + metadata
+     struct), not just the path, so the array growth is bounded by the same
+     cumulative budget. */
+  size_t entry_cost = path_len + sizeof(FileMetadata) + sizeof(char*);
+  if (list->count >= MAX_DIR_TIME_ENTRIES || entry_cost > MAX_DIR_TIME_BYTES - list->bytes)
     return false;
   if (list->count == list->capacity) {
     size_t new_capacity = list->capacity == 0 ? 16 : list->capacity * 2;
@@ -2302,7 +2306,7 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
   list->paths[list->count] = copy;
   list->entries[list->count] = *metadata;
   list->count++;
-  list->bytes += path_len;
+  list->bytes += entry_cost;
   return true;
 }
 
