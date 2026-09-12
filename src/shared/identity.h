@@ -7,7 +7,7 @@
 #include <sys/types.h>
 
 /*
- * Identity mapping: --numeric-ids / --usermap / --groupmap / --chown.
+ * Identity mapping: --numeric-ids / --usermap / --groupmap / --chown / --copy-as.
  *
  * FastSync transmits uid/gid numerically (int32 on the wire) and, by design,
  * NEVER applies client-supplied ownership unless a user explicitly opts in with
@@ -87,9 +87,10 @@ bool identity_ownership_requested(const Config* config);
 
 /* Apply the negotiated ownership to an already-written file descriptor.
  * source_uid/source_gid are the transmitted numeric ids.  Resolution order:
- * a matching usermap/groupmap rule, then --chown, then --numeric-ids (raw),
- * then a best-effort name lookup on the receiver's own databases (skipped when
- * the transmitted id has no name on this system).  Only calls fchown() when the
+ * --copy-as (highest priority, forces both ids), then a matching
+ * usermap/groupmap rule, then --chown, then --numeric-ids (raw), then a
+ * best-effort name lookup on the receiver's own databases (skipped when the
+ * transmitted id has no name on this system).  Only calls fchown() when the
  * result differs from the current value.
  *
  * Returns false ONLY when an active --copy-as ownership application failed: its

@@ -357,17 +357,20 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
   }
 }
 
-void file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
+bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
                                    bool omit_link_times) {
   if (path == NULL || metadata == NULL)
-    return;
+    return true;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)
-    return;
+    return !identity_copy_as_active();
   /* Ownership (only when the identity policy is active) via lchown semantics:
-     fchownat with AT_SYMLINK_NOFOLLOW never dereferences the link. */
-  identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid, (int32_t)metadata->gid);
+     fchownat with AT_SYMLINK_NOFOLLOW never dereferences the link.  A failed
+     REQUIRED --copy-as ownership marks the entry failed; every other policy is
+     best-effort. */
+  bool owned = identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid,
+                                             (int32_t)metadata->gid);
   /* Symlink mode: not settable on Linux (fchmodat AT_SYMLINK_NOFOLLOW returns
      EOPNOTSUPP/ENOTSUP); attempt it for platforms that support it and quietly
      ignore the unsupported case so the transfer never fails over it. */
@@ -392,6 +395,7 @@ void file_restore_symlink_metadata(const char* path, const FileMetadata* metadat
   }
   close(parent_fd);
   free(leaf);
+  return owned;
 }
 
 bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability) {

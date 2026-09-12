@@ -246,12 +246,25 @@ static const char* server_module_gate(const Config* config, void* context) {
      client could force arbitrary ownership inside the module root.  The
      standalone/SSH server has a single operator-authorized root and keeps
      honoring these. */
-  if (!module->client_owner && identity_ownership_requested(effective)) {
-    log_message(LOG_LEVEL_ERROR,
-                "daemon module '%s' refuses client-chosen ownership/super-user activities "
-                "(no `client owner = yes` opt-in); refusing",
-                config->module);
-    return "client-chosen ownership is not permitted by this daemon module";
+  if (!module->client_owner) {
+    /* Ownership: refuse the whole transfer up front (a clear failure).  Uses the
+       original config so an explicit --super is caught even though super_mode is
+       clamped to OFF below. */
+    if (identity_ownership_requested(config)) {
+      log_message(LOG_LEVEL_ERROR,
+                  "daemon module '%s' refuses client-chosen ownership/super-user activities "
+                  "(no `client owner = yes` opt-in); refusing",
+                  config->module);
+      return "client-chosen ownership is not permitted by this daemon module";
+    }
+    /* Super-user DEVICE activities (char/block mknod and --write-devices) are
+       permitted under the default AUTO mode, so without this clamp a root daemon
+       would still let a non-opted module create arbitrary device nodes and write
+       raw devices.  Force them off for this connection: those entries are
+       skipped (never mknod'ed) while an ordinary `-a` push still succeeds
+       without device nodes, matching the operator's least-privilege choice.
+       The operator-level --no-super veto is already folded into this. */
+    effective->super_mode = SUPER_MODE_OFF;
   }
   if (module->auth_user_count > 0) {
     /* Auth-required module (Wave B): verify the presented credentials against
@@ -769,9 +782,10 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < g_daemon_conf->module_count; i++) {
       if (g_daemon_conf->modules[i].client_owner)
         log_message(LOG_LEVEL_WARNING,
-                    "daemon module '%s' allows client-chosen ownership "
-                    "(`client owner = yes`); clients may request arbitrary owner ids within "
-                    "that module root",
+                    "daemon module '%s' allows client-chosen ownership and super-user device "
+                    "activities (`client owner = yes`); clients may request arbitrary owner ids "
+                    "and device nodes within that module root -- pair it with `auth users` "
+                    "unless the module is intentionally open to the network",
                     g_daemon_conf->modules[i].name);
     }
     /* Daemon credential store (Wave B).  --password-file and --early-input

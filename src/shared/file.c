@@ -582,8 +582,16 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
              (a pre-existing destination directory is left alone, matching
              rsync's transferred-entry scope); the helper is a no-op unless an
              identity policy is active. */
-          if (created && identity_copy_as_active())
-            identity_apply_ownership_link(fd, component, 0, 0);
+          if (created && identity_copy_as_active() &&
+              !identity_apply_ownership_link(fd, component, 0, 0)) {
+            /* A REQUIRED --copy-as ownership that cannot be applied to a
+               directory this walk just created must fail the entry rather than
+               leave that implicit parent owned by the receiver. */
+            close(fd);
+            free(copy);
+            free(leaf);
+            return -1;
+          }
           next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         }
       }

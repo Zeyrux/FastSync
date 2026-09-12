@@ -16,8 +16,10 @@ import hashlib
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -244,6 +246,21 @@ def _tree_file_count(root):
     return sum(len(files) for _, _, files in os.walk(root)) if os.path.exists(root) else 0
 
 
+def _can_mknod():
+    """True when this process may create a char device (needs root/CAP_MKNOD)."""
+    probe = os.path.join(tempfile.gettempdir(), "._fastsync_mknod_probe_%d" % os.getpid())
+    try:
+        os.mknod(probe, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+        os.unlink(probe)
+        return True
+    except (OSError, AttributeError):
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return False
+
+
 class TestDaemonModuleSelection:
     @pytest.mark.ci
     def test_module_transfer(self, daemon):
@@ -381,6 +398,43 @@ class TestDaemonRejection:
         mismatches, missing = verify_transfer(SOURCE_DIR, received)
         assert not missing, f"missing: {missing[:5]}"
         assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def _device_source(self, name):
+        src = os.path.join(TEST_DATA_DIR, name)
+        shutil.rmtree(src, ignore_errors=True)
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "wb") as fh:
+            fh.write(b"device gate\n")
+        os.mknod(os.path.join(src, "null"), stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        return src
+
+    @pytest.mark.skipif(not _can_mknod(), reason="device nodes need root/CAP_MKNOD")
+    def test_devices_skipped_without_owner_opt_in(self, daemon):
+        """H3: a non-opted daemon module must not create device nodes even under
+        the default AUTO super mode (a root daemon would otherwise let any client
+        mknod arbitrary devices).  An ordinary -a push still succeeds; the device
+        entry is skipped."""
+        src = self._device_source("devsrc_noowner")
+        os.makedirs(os.path.join(FILES_MODULE, "devskip"), exist_ok=True)
+        result, _ = run_client(src, "127.0.0.1::files/devskip", port=daemon.port, flags=["-a"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(os.path.join(FILES_MODULE, "devskip"), src)
+        node = os.path.join(received, "null")
+        assert not os.path.exists(node) or not stat.S_ISCHR(os.stat(node).st_mode), \
+            "non-opted daemon module created a device node"
+
+    @pytest.mark.skipif(not _can_mknod(), reason="device nodes need root/CAP_MKNOD")
+    def test_devices_created_with_owner_opt_in(self, daemon):
+        """Control: an opted-in module (`client owner = yes`) may create device
+        nodes under -a, proving the clamp is specific to non-opted modules."""
+        src = self._device_source("devsrc_owner")
+        os.makedirs(os.path.join(OWNER_MODULE, "devok"), exist_ok=True)
+        result, _ = run_client(src, "127.0.0.1::owner/devok", port=daemon.port, flags=["-a"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(os.path.join(OWNER_MODULE, "devok"), src)
+        node = os.path.join(received, "null")
+        assert os.path.exists(node) and stat.S_ISCHR(os.stat(node).st_mode), \
+            "opted-in daemon module did not create the device node"
 
     @pytest.mark.daemon_detach
     def test_real_detach_path(self):

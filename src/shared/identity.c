@@ -679,8 +679,8 @@ static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
    * restricted root, root-squash, or a read-only mount) the run would be
    * silently producing the WRONG ownership, so surface it at ERROR.  The
    * caller (identity_apply_ownership*) then reports the ENTRY as failed rather
-   * than as written; the receiver never claims a --copy-as success it did not
-   * achieve, but a single entry failure does not abort the whole run. */
+   * than as written, which becomes a FILE_SAVE_ERROR and fails the transfer
+   * (fail-fast) instead of reporting overall success with the wrong owner. */
   if (errno == EPERM || errno == EACCES) {
     if (identity_copy_as_active())
       log_message(LOG_LEVEL_ERROR,

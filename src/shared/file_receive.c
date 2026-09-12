@@ -689,7 +689,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
        suppresses the timestamps; ownership stays gated by the identity policy.
        A symlink has no children, so this can be applied immediately. */
     if (ok && config && config->use_metadata)
-      file_restore_symlink_metadata(link_path, file->metadata, config->omit_link_times);
+      ok = file_restore_symlink_metadata(link_path, file->metadata, config->omit_link_times);
     free(link_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
