@@ -1573,14 +1573,14 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
 }
 
 #ifndef FASTSYNC_TEST_BUILD
-/* Daemon auth (Wave B): read --password-file and derive the wire credentials
- * (username + SHA-256 hex digest of the password).  Runs once the destination
- * form is known: the credentials only make sense for a daemon
- * (host::module/path) destination, so a --password-file without one is a hard
- * error here rather than a silently-ignored flag.  The literal password is
- * hashed immediately and wiped from memory; only the digest (and username) are
- * kept on the Config for config_send.  Returns 0 on success, -1 on error (the
- * reason is logged; neither the password nor its digest is ever logged). */
+/* Daemon auth (A7, protocol 2.19.0): read --password-file and keep the
+ * username plus the LITERAL password (client-only, never serialized).  Runs
+ * once the destination form is known: the credentials only make sense for a
+ * daemon (host::module/path) destination, so a --password-file without one is a
+ * hard error here rather than a silently-ignored flag.  The password is handed
+ * to the SCRAM challenge/response in config_send and burned by
+ * config_burn_auth/config_delete at teardown.  Returns 0 on success, -1 on
+ * error (the reason is logged; the password is never logged). */
 static int load_daemon_credentials(Config* config) {
   if (!config->password_file)
     return 0;
@@ -1597,27 +1597,10 @@ static int load_daemon_credentials(Config* config) {
     log_message(LOG_LEVEL_ERROR, "%s", err);
     return -1;
   }
-  char hash[CREDENTIAL_HASH_HEX_LEN + 1];
-  if (!credentials_hash_password(password, hash)) {
-    log_message(LOG_LEVEL_ERROR, "failed to hash the password from '%s'", config->password_file);
-    credentials_burn(password, strlen(password));
-    free(password);
-    free(user);
-    return -1;
-  }
-  credentials_burn(password, strlen(password));
-  free(password);
 
-  free(config->auth_user);
-  free(config->auth_password_hash);
+  config_burn_auth(config);
   config->auth_user = user;
-  config->auth_password_hash = str_dup(hash);
-  if (!config->auth_password_hash) {
-    log_message(LOG_LEVEL_ERROR, "memory allocation failed reading '%s'", config->password_file);
-    free(config->auth_user);
-    config->auth_user = NULL;
-    return -1;
-  }
+  config->auth_password = password;
   log_info_message(LOG_INFO_MISC, "Loaded daemon credentials for user '%s'", config->auth_user);
   return 0;
 }

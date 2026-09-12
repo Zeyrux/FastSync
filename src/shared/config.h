@@ -96,19 +96,18 @@ typedef struct Config {
    * string so the daemon can look the module up in its own config and confine
    * the connection to the module's root (never a client-chosen root). */
   char* module;
-  /* Daemon password authentication (Wave B, protocol 2.15.0, WITHIN the Wave A
-   * frame layout -- see the PROTOCOL_VERSION note below for why this is not a
-   * bump).  Client-composed from a --password-file whose first meaningful line
-   * is `user:password`: the client sends ONLY the username and a SHA-256 hex
-   * digest of the password (auth_user + auth_password_hash), never the literal
-   * password.  Both are NULL when the client has no credentials to present; a
-   * module WITHOUT `auth users` stays open and the server ignores any
-   * credentials that do arrive (the client sends them opportunistically and
-   * the server decides). */
+  /* Daemon password authentication (A7 remediation, protocol 2.19.0).
+   * Client-composed from a --password-file whose first meaningful line is
+   * `user:password`: the client sends ONLY the username in the config frame
+   * (auth_user); the literal password is kept in auth_password CLIENT-SIDE for
+   * the duration of the SCRAM challenge/response and is NEVER serialized.  Both
+   * are NULL when the client has no credentials to present; a module WITHOUT
+   * `auth users` stays open and the server ignores any credentials that do
+   * arrive (the client sends them opportunistically and the server decides). */
   char* auth_user;
-  char* auth_password_hash;
+  char* auth_password;
   /* Client-only path of --password-file (never crosses the wire; it is read to
-   * populate auth_user/auth_password_hash before connecting). */
+   * populate auth_user/auth_password before connecting). */
   char* password_file;
   char* fastsync_server_path;
   /* --iconv=CONVERT_SPEC (protocol 2.16.0, rsync compatibility): convert the
@@ -546,8 +545,8 @@ typedef struct Config {
  * is what keeps a 2.15 client and a 2.14 server from ever reaching that state.
  *
  * NOTE: daemon module-selection bump owned by Wave A (2.15.0); later daemon
- * waves (auth, motd) must not bump PROTOCOL_VERSION.  Wave B (auth) adds the
- * credential fields (auth_user/auth_password_hash) as further trailing
+ * waves (auth, motd) must not bump PROTOCOL_VERSION.  Wave B (auth) added the
+ * credential fields (auth_user + password digest) as further trailing
  * config-frame strings AFTER the Wave A module string, with a presence int
  * prefix.  This is not a new frame version: sender and receiver of a 2.15.0
  * build always read and write the same full layout (the strict same-version
@@ -617,8 +616,22 @@ typedef struct Config {
  * (config_receive rejects a mismatched version before parsing anything else) is
  * what keeps a 2.18 client and a 2.17 server from ever reaching that state.
  * --super never elevates privileges; it only permits a confined attempt, and
- * --copy-as never switches process credentials (see RSYNC_COMPAT.md). */
-#define PROTOCOL_VERSION "2.18.0"
+ * --copy-as never switches process credentials (see RSYNC_COMPAT.md).
+ *
+ * A7 Auth Wave: 2.18.0 -> 2.19.0.
+ *
+ * WHY the bump, grounded in the wire: the daemon auth block on the config frame
+ * loses the hard-wired password digest (it becomes `[int present][str_redacted
+ * username]`), and the frame stream gains the SCRAM challenge/response
+ * (STATUS_AUTH_CHALLENGE -> STATUS_AUTH_RESPONSE -> STATUS_AUTH_OK) between the
+ * config frame and the STATUS_OK ack.  A 2.18 peer would desynchronize on both
+ * the shorter auth block and the new status frames, so the strict same-version
+ * handshake (config_receive rejects a mismatched version before parsing
+ * anything else) is what keeps a 2.19 client and a 2.18 server from ever
+ * reaching that state.  SECURITY: a 2.19 store holds a salted PBKDF2 verifier
+ * and cannot verify (and refuses to load) a legacy unsalted-SHA-256 store line,
+ * so an old bearer digest can never be replayed against a 2.19 daemon. */
+#define PROTOCOL_VERSION "2.19.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
@@ -642,10 +655,24 @@ typedef struct Config {
 
 Config* config_create(void);
 void config_delete(Config* config);
+
+/* Wipe the client-side plaintext auth password (and username) from a Config
+ * before it is freed or handed off.  Safe on a NULL/empty Config and idempotent
+ * (it clears the pointers after burning).  config_delete calls this
+ * automatically; a caller that drops a Config earlier may call it explicitly. */
+void config_burn_auth(Config* config);
+
 bool config_send(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
 bool config_is_remote_dest(const char* s);
 void config_parse_ssh_dest(Config* config);
+
+/* A ConfigValidateFunc may return this sentinel to tell
+ * config_receive_with_validate that the callback ALREADY sent a terminal status
+ * frame (e.g. STATUS_AUTH_FAILED, then closed) and the frame must be abandoned
+ * without an additional STATUS_ERROR.  A normal rejection returns a message
+ * string (logged, then STATUS_ERROR); NULL accepts. */
+#define CONFIG_VALIDATE_ALREADY_TERMINATED ((const char*)-1)
 
 /* Server-side config-frame gate (daemon module selection, Wave A).  A server
  * that needs to make an accept/reject decision about a received Config BEFORE
@@ -653,10 +680,11 @@ void config_parse_ssh_dest(Config* config);
  * no data transferred) passes a callback here; it runs after the frame parses
  * and validates but before the STATUS_OK/STATUS_ERROR ack.  Return NULL to
  * accept the connection; return a non-NULL message to reject it (the message
- * is logged server-side and STATUS_ERROR is sent in place of STATUS_OK).  The
- * callback runs in the connection's own process, so it may set up per-module
- * process state (e.g. the authorized root).  context is an opaque caller
- * pointer. */
+ * is logged server-side and STATUS_ERROR is sent in place of STATUS_OK), or the
+ * CONFIG_VALIDATE_ALREADY_TERMINATED sentinel when the callback already sent
+ * its own terminal status.  The callback runs in the connection's own process,
+ * so it may set up per-module process state (e.g. the authorized root) and
+ * drive the daemon auth handshake.  context is an opaque caller pointer. */
 typedef const char* (*ConfigValidateFunc)(const Config* config, void* context);
 Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc validate,
                                      void* context);

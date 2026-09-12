@@ -246,9 +246,9 @@ static void test_config_module_wire_empty_canonicalizes_to_null() {
   }
 }
 
-/* Daemon auth credentials (Wave B) ride the config frame: username + SHA-256
- * hex digest are present together, or both are absent.  Round-trip a present
- * pair. */
+/* Daemon auth credentials (A7, protocol 2.19.0) ride the config frame as the
+ * username ONLY; the literal password never crosses the wire.  Round-trip a
+ * present username. */
 static void test_config_daemon_auth_wire_roundtrip() {
   Config* send_cfg = config_create();
   EXPECT_NOT_NULL(send_cfg);
@@ -256,8 +256,7 @@ static void test_config_daemon_auth_wire_roundtrip() {
   send_cfg->receive_root_directory = str_dup("rel/path");
   send_cfg->module = str_dup("backup");
   send_cfg->auth_user = str_dup("alice");
-  send_cfg->auth_password_hash =
-      str_dup("9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3");
+  send_cfg->auth_password = str_dup("alice-s3cret");
 
   int p[2];
   EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
@@ -269,10 +268,9 @@ static void test_config_daemon_auth_wire_roundtrip() {
     close(p[1]);
     io_set_fds(p[0], p[0]);
     Config* recv_cfg = config_receive(p[0]);
+    /* The plaintext password is client-only: it is never serialized. */
     bool ok = recv_cfg != NULL && recv_cfg->auth_user != NULL &&
-              strcmp(recv_cfg->auth_user, "alice") == 0 && recv_cfg->auth_password_hash != NULL &&
-              strcmp(recv_cfg->auth_password_hash,
-                     "9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3") == 0;
+              strcmp(recv_cfg->auth_user, "alice") == 0 && recv_cfg->auth_password == NULL;
     config_delete(recv_cfg);
     close(p[0]);
     _exit(ok ? 0 : 1);
@@ -289,7 +287,7 @@ static void test_config_daemon_auth_wire_roundtrip() {
   }
 }
 
-/* The receive side validates the auth payload: a present-but-malformed digest
+/* The receive side validates the auth payload: a present-but-malformed username
  * is refused (config_receive returns NULL), so a hostile peer cannot slip a
  * garbage credential past the receive guard into the module gate. */
 static void test_config_daemon_auth_wire_rejects_malformed() {
@@ -298,8 +296,7 @@ static void test_config_daemon_auth_wire_rejects_malformed() {
   send_cfg->send_directory = str_dup("/src");
   send_cfg->receive_root_directory = str_dup("/dst");
   send_cfg->module = str_dup("m");
-  send_cfg->auth_user = str_dup("alice");
-  send_cfg->auth_password_hash = str_dup("not-a-valid-sha256-hex-digest!!");
+  send_cfg->auth_user = str_dup("bad user");
 
   int p[2];
   EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);

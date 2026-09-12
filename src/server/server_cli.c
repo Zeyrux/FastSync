@@ -1,5 +1,6 @@
 #include "server_cli.h"
 #include "charset.h"
+#include "credentials.h"
 #include "utils.h"
 #include <limits.h>
 #include <stdarg.h>
@@ -127,6 +128,33 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
         inline_value = argv[++i];
       }
       opts->early_input_file = inline_value;
+    } else if (arg_has_value(argv[i], "--hash-credentials", &inline_value)) {
+      if (!inline_value) {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for --hash-credentials");
+          return -1;
+        }
+        inline_value = argv[++i];
+      }
+      opts->hash_credentials_file = inline_value;
+    } else if (arg_has_value(argv[i], "--iterations", &inline_value)) {
+      if (!inline_value) {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for --iterations");
+          return -1;
+        }
+        inline_value = argv[++i];
+      }
+      char* end = NULL;
+      long n = strtol(inline_value, &end, 10);
+      if (!end || *end != '\0' || n < (long)CREDENTIAL_MIN_ITERS ||
+          n > (long)CREDENTIAL_MAX_ITERS) {
+        set_error(err, err_size, "--iterations must be in [%u,%u], got '%s'", CREDENTIAL_MIN_ITERS,
+                  CREDENTIAL_MAX_ITERS, inline_value);
+        return -1;
+      }
+      opts->hash_iterations = (uint32_t)n;
+      opts->hash_iterations_set = true;
     } else if (arg_is(argv[i], "--address")) {
       if (i + 1 >= argc) {
         set_error(err, err_size, "missing argument for --address");
@@ -225,6 +253,14 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
     set_error(err, err_size,
               "--config, --dparam, --no-detach, --password-file, and --early-input require "
               "--daemon");
+    return -1;
+  }
+  if (opts->hash_credentials_file != NULL && (opts->daemon_mode || opts->stdio_mode)) {
+    set_error(err, err_size, "--hash-credentials cannot be combined with --daemon or --stdio");
+    return -1;
+  }
+  if (opts->hash_iterations_set && opts->hash_credentials_file == NULL) {
+    set_error(err, err_size, "--iterations requires --hash-credentials");
     return -1;
   }
   /* --iconv: reject a malformed CONVERT_SPEC or an unsupported charset name at
