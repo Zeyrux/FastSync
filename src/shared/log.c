@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <threads.h>
 #include <time.h>
 
 static const char* log_level_strings[] = {"DEBUG", "INFO", "WARN", "ERROR"};
@@ -14,6 +15,18 @@ static bool info_flags_explicit = false;
 static FILE* log_fp = NULL;
 static _Thread_local bool eight_bit_output;
 static LogStderrMode stderr_mode = LOG_STDERR_ERRORS;
+
+/* Serializes access to log_fp and makes each emitted line atomic: the
+ * timestamp prefix, formatted body, and trailing newline are written as one
+ * critical section so concurrent threads cannot interleave partial lines.
+ * Initialized lazily (matching the protocol.c bw_mutex idiom) because logging
+ * can happen before main() installs any synchronization. */
+static mtx_t log_mutex;
+static once_flag log_mutex_once = ONCE_FLAG_INIT;
+
+static void log_mutex_init(void) {
+  mtx_init(&log_mutex, mtx_plain);
+}
 
 void set_log_level(LogLevel level) {
   current_log_level = level;
@@ -41,7 +54,10 @@ uint32_t get_log_info_flags(void) {
 }
 
 void log_set_file(FILE* fp) {
+  call_once(&log_mutex_once, log_mutex_init);
+  mtx_lock(&log_mutex);
   log_fp = fp;
+  mtx_unlock(&log_mutex);
 }
 
 void log_set_8_bit_output(bool enabled) {
@@ -79,6 +95,9 @@ void log_message(LogLevel log_level, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
+  call_once(&log_mutex_once, log_mutex_init);
+  mtx_lock(&log_mutex);
+
   FILE* dest_io = stdout;
   if (stderr_mode == LOG_STDERR_ALL || log_level == LOG_LEVEL_ERROR) {
     dest_io = stderr;
@@ -94,6 +113,8 @@ void log_message(LogLevel log_level, const char* format, ...) {
     write_message(log_fp, log_level, t, format, args);
     va_end(args);
   }
+
+  mtx_unlock(&log_mutex);
 }
 
 void log_debug_message(LogDebugFlag flag, const char* format, ...) {
@@ -105,6 +126,9 @@ void log_debug_message(LogDebugFlag flag, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
+  call_once(&log_mutex_once, log_mutex_init);
+  mtx_lock(&log_mutex);
+
   va_list args;
   va_start(args, format);
   write_message(stdout, LOG_LEVEL_DEBUG, t, format, args);
@@ -115,6 +139,8 @@ void log_debug_message(LogDebugFlag flag, const char* format, ...) {
     write_message(log_fp, LOG_LEVEL_DEBUG, t, format, args);
     va_end(args);
   }
+
+  mtx_unlock(&log_mutex);
 }
 
 void log_info_message(LogInfoFlag flag, const char* format, ...) {
@@ -127,6 +153,9 @@ void log_info_message(LogInfoFlag flag, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
+  call_once(&log_mutex_once, log_mutex_init);
+  mtx_lock(&log_mutex);
+
   va_list args;
   va_start(args, format);
   write_message(stdout, LOG_LEVEL_INFO, t, format, args);
@@ -137,6 +166,8 @@ void log_info_message(LogInfoFlag flag, const char* format, ...) {
     write_message(log_fp, LOG_LEVEL_INFO, t, format, args);
     va_end(args);
   }
+
+  mtx_unlock(&log_mutex);
 }
 
 void log_perror(const char* context) {
