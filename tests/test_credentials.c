@@ -3,6 +3,7 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <errno.h>
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,8 +71,43 @@ static char* make_tmp_file(const char* contents) {
 }
 
 static void rm_temp(const char* path) {
-  if (path)
-    unlink(path);
+  if (!path)
+    return;
+  unlink(path);
+  /* Every successfully loaded store auto-creates an exact-mode-0600
+   * `<store>.dummykey` sidecar; remove it too so tests leave no stray key.  The
+   * atomic-publish temps carry a random suffix, so glob them all and remove any
+   * that a failing path may have left behind. */
+  size_t n = strlen(path) + strlen(".dummykey") + 1;
+  char* sidecar = malloc(n);
+  if (sidecar) {
+    snprintf(sidecar, n, "%s.dummykey", path);
+    unlink(sidecar);
+    free(sidecar);
+  }
+  n = strlen(path) + strlen(".dummykey.tmp.*") + 1;
+  char* pattern = malloc(n);
+  if (pattern) {
+    snprintf(pattern, n, "%s.dummykey.tmp.*", path);
+    glob_t matches;
+    memset(&matches, 0, sizeof(matches));
+    if (glob(pattern, 0, NULL, &matches) == 0) {
+      for (size_t i = 0; i < matches.gl_pathc; i++)
+        unlink(matches.gl_pathv[i]);
+    }
+    globfree(&matches);
+    free(pattern);
+  }
+}
+
+/* `<store>.dummykey` sidecar path (caller frees). */
+static char* dummy_sidecar_path(const char* store_path) {
+  size_t n = strlen(store_path) + strlen(".dummykey") + 1;
+  char* out = malloc(n);
+  if (!out)
+    return NULL;
+  snprintf(out, n, "%s.dummykey", store_path);
+  return out;
 }
 
 /* Build a valid new-format line for user/password at iters. */
@@ -745,6 +781,269 @@ static void test_credentials_rejects_group_or_other_accessible() {
   free(path);
 }
 
+/* Loading a store auto-creates an owner-only `<store>.dummykey` sidecar whose
+ * key is stable across reloads, so an unknown-user dummy salt is identical
+ * across two loads (the anti-restart enumeration property). */
+static void test_credentials_dummy_key_persisted() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  char err[512];
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(sidecar, &st), 0);
+  EXPECT_TRUE(S_ISREG(st.st_mode));
+  EXPECT_TRUE((st.st_mode & (S_IRWXG | S_IRWXO)) == 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 07777), 0600);
+  EXPECT_EQ_INT((int)st.st_size, CREDENTIAL_KEY_LEN);
+
+  CredentialVerifier v1;
+  EXPECT_TRUE(credentials_get_verifier(store, "unknown-user", NULL, 0, &v1));
+  EXPECT_FALSE(v1.found);
+  credentials_free(store);
+
+  store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  CredentialVerifier v2;
+  EXPECT_TRUE(credentials_get_verifier(store, "unknown-user", NULL, 0, &v2));
+  EXPECT_FALSE(v2.found);
+  EXPECT_TRUE(memcmp(v1.salt, v2.salt, sizeof(v1.salt)) == 0);
+  credentials_free(store);
+
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A restrictive umask must not leave the freshly published sidecar with owner
+ * bits cleared: creation forces exact 0600 with fchmod (the reader requires an
+ * exact 0600), so the daemon cannot lock itself out on the next restart. */
+static void test_credentials_dummy_key_exact_mode_under_umask() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  /* Clear every permission bit the O_CREAT mode would otherwise provide; only
+   * the explicit fchmod can restore the exact 0600 the reader demands. */
+  mode_t old_umask = umask(0777);
+  char err[512];
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  umask(old_umask);
+  EXPECT_NOT_NULL(store);
+
+  struct stat st;
+  EXPECT_EQ_INT(stat(sidecar, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 07777), 0600);
+  EXPECT_EQ_INT((int)st.st_size, CREDENTIAL_KEY_LEN);
+  credentials_free(store);
+
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A sidecar that is group/other accessible, the wrong size, or not a regular
+ * file must fail the load closed. */
+static void test_credentials_dummy_key_rejects_bad_sidecar() {
+  char err[512];
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+
+  /* Group/other permission bits on the sidecar. */
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+  uint8_t key[CREDENTIAL_KEY_LEN];
+  memset(key, 0x5a, sizeof(key));
+  FILE* fp = fopen(sidecar, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(sidecar, 0640), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+
+  /* Wrong size (not exactly 32 bytes). */
+  path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+  fp = fopen(sidecar, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, CREDENTIAL_SALT_LEN, fp) == CREDENTIAL_SALT_LEN);
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(sidecar, 0600), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+
+  /* Non-regular file (a directory at the sidecar path). */
+  path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+  EXPECT_EQ_INT(mkdir(sidecar, 0700), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+  rmdir(sidecar);
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+
+  /* Exact-mode rule: 0400 has no group/other bits but is not 0600, so it is
+   * rejected now (the mode must be exactly owner read+write). */
+  path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+  fp = fopen(sidecar, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(sidecar, 0400), 0);
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A pre-existing valid sidecar is adopted verbatim (no regeneration): the
+ * unknown-user dummy salt must equal HMAC-SHA256(known key, username), and a
+ * reload must yield the same salt. */
+static void test_credentials_dummy_key_existing_sidecar_adopted() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  /* Pre-create a valid owner-only sidecar with a known key. */
+  uint8_t key[CREDENTIAL_KEY_LEN];
+  memset(key, 0x5a, sizeof(key));
+  FILE* fp = fopen(sidecar, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(sidecar, 0600), 0);
+
+  char err[512];
+  CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  CredentialVerifier v1;
+  EXPECT_TRUE(credentials_get_verifier(store, "unknown-user", NULL, 0, &v1));
+  EXPECT_FALSE(v1.found);
+  /* HMAC-SHA256(0x5a * 32, "unknown-user")[:16], computed independently. */
+  uint8_t expect[CREDENTIAL_SALT_LEN];
+  unhex("4b0d2e6b73025cc2fcb41d0a710ff469", expect, sizeof(expect));
+  EXPECT_TRUE(memcmp(v1.salt, expect, sizeof(expect)) == 0);
+  credentials_free(store);
+
+  /* The adopted sidecar still holds exactly the pre-created key (not a fresh
+   * random one). */
+  uint8_t readback[CREDENTIAL_KEY_LEN];
+  fp = fopen(sidecar, "rb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fread(readback, 1, sizeof(readback), fp) == sizeof(readback));
+  fclose(fp);
+  EXPECT_TRUE(memcmp(readback, key, sizeof(key)) == 0);
+
+  /* Persisted across a reload. */
+  CredentialVerifier v2;
+  store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  EXPECT_TRUE(credentials_get_verifier(store, "unknown-user", NULL, 0, &v2));
+  EXPECT_TRUE(memcmp(v1.salt, v2.salt, sizeof(v1.salt)) == 0);
+  credentials_free(store);
+
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A symlink planted at the sidecar path must fail the load closed (O_NOFOLLOW),
+ * even when it resolves to a valid owner-only key file. */
+static void test_credentials_dummy_key_symlink_rejected() {
+  char line[CREDENTIAL_MAX_LINE];
+  EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
+  char contents[CREDENTIAL_MAX_LINE + 2];
+  snprintf(contents, sizeof(contents), "%s\n", line);
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char* sidecar = dummy_sidecar_path(path);
+  EXPECT_NOT_NULL(sidecar);
+
+  char target[256];
+  snprintf(target, sizeof(target), "/tmp/fs_cred_key_%d_%d", (int)getpid(), g_file_counter++);
+  uint8_t key[CREDENTIAL_KEY_LEN];
+  memset(key, 0x5a, sizeof(key));
+  FILE* fp = fopen(target, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_TRUE(fwrite(key, 1, sizeof(key), fp) == sizeof(key));
+  fclose(fp);
+  EXPECT_EQ_INT(chmod(target, 0600), 0);
+  EXPECT_EQ_INT(symlink(target, sidecar), 0);
+
+  char err[512];
+  EXPECT_NULL(credentials_load(path, NULL, err, sizeof(err)));
+  EXPECT_TRUE(err[0] != '\0');
+
+  unlink(sidecar); /* remove the symlink itself, not its target */
+  unlink(target);
+  rm_temp(path);
+  free(path);
+  free(sidecar);
+}
+
+/* A NULL store path has nowhere to persist a key, so each load gets a fresh
+ * ephemeral key (and creates no sidecar). */
+static void test_credentials_dummy_key_null_store_ephemeral() {
+  char err[512];
+  CredentialStore* store = credentials_load(NULL, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  CredentialVerifier v1;
+  CredentialVerifier v1b;
+  EXPECT_TRUE(credentials_get_verifier(store, "nobody", NULL, 0, &v1));
+  EXPECT_FALSE(v1.found);
+  /* Within one store the dummy challenge is still deterministic. */
+  EXPECT_TRUE(credentials_get_verifier(store, "nobody", NULL, 0, &v1b));
+  EXPECT_TRUE(memcmp(v1.salt, v1b.salt, sizeof(v1.salt)) == 0);
+  credentials_free(store);
+
+  store = credentials_load(NULL, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  CredentialVerifier v2;
+  EXPECT_TRUE(credentials_get_verifier(store, "nobody", NULL, 0, &v2));
+  /* No persistence path, so the second load's random key differs (and with it
+   * the dummy salt). */
+  EXPECT_TRUE(memcmp(v1.salt, v2.salt, sizeof(v1.salt)) != 0);
+  credentials_free(store);
+}
+
 static void test_credentials_burn() {
   char secret[32];
   memcpy(secret, "supersecretvalue", 17);
@@ -777,5 +1076,11 @@ void test_credentials(void) {
   test_credentials_read_secret_file_bad();
   test_credentials_hash_file();
   test_credentials_rejects_group_or_other_accessible();
+  test_credentials_dummy_key_persisted();
+  test_credentials_dummy_key_exact_mode_under_umask();
+  test_credentials_dummy_key_rejects_bad_sidecar();
+  test_credentials_dummy_key_existing_sidecar_adopted();
+  test_credentials_dummy_key_symlink_rejected();
+  test_credentials_dummy_key_null_store_ephemeral();
   test_credentials_burn();
 }

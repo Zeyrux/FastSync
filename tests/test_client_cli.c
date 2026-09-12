@@ -69,6 +69,42 @@ static void test_validate_config_tls_requirements() {
   config_delete(cfg);
 }
 
+/* A7-3/S1: --password-file sends daemon credentials, so it is only allowed
+   over TLS (which itself mandates a verified --cert/--key/--ca) or to a
+   loopback destination.  A remote plaintext daemon is refused up front. */
+static void test_validate_config_credentials_require_tls_or_loopback() {
+  /* Default host is 127.0.0.1 (loopback), so plaintext credentials are fine. */
+  Config* cfg = valid_client_config();
+  cfg->password_file = str_dup("creds.pw");
+  EXPECT_TRUE(validate_config(cfg));
+
+  /* localhost is loopback too. */
+  free(cfg->server_host);
+  cfg->server_host = str_dup("localhost");
+  EXPECT_TRUE(validate_config(cfg));
+
+  /* A clearly remote host over plaintext is refused before any network I/O. */
+  free(cfg->server_host);
+  cfg->server_host = str_dup("192.0.2.1");
+  EXPECT_FALSE(validate_config(cfg));
+
+  /* TLS makes the remote destination acceptable (cert/key/ca are required). */
+  cfg->use_tls = true;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->tls_cert = str_dup("cert.pem");
+  cfg->tls_key = str_dup("key.pem");
+  cfg->tls_ca = str_dup("ca.pem");
+  EXPECT_TRUE(validate_config(cfg));
+
+  /* No credentials: the remote plaintext rule does not apply. */
+  cfg->use_tls = false;
+  char* creds = cfg->password_file;
+  cfg->password_file = NULL;
+  EXPECT_TRUE(validate_config(cfg));
+  cfg->password_file = creds;
+  config_delete(cfg);
+}
+
 static void test_validate_config_delta_sendfile_constraints() {
   Config* cfg = valid_client_config();
   cfg->use_delta = true;
@@ -3117,6 +3153,7 @@ void test_client_cli() {
   test_validate_config_append_verify_rejects_whole_file();
   test_validate_config_incompatible_options();
   test_validate_config_tls_requirements();
+  test_validate_config_credentials_require_tls_or_loopback();
   test_validate_config_delta_sendfile_constraints();
   test_cli_help();
   test_cli_archive_flags();

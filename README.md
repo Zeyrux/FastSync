@@ -145,7 +145,7 @@ partial, alternate, and planned behavior.
 | `--cert <path>` | TLS certificate file (PEM) |
 | `--key <path>` | TLS private key file (PEM) |
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
-| `--client-cn <name>` | Required TLS client certificate common name |
+| `--client-cn <name>` | TLS client certificate common name; mandatory with `--tls` (a TLS connection always verifies the client CN) |
 
 ### Server
 
@@ -159,7 +159,7 @@ partial, alternate, and planned behavior.
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
 | `--destination-root <path>` | Authorized destination root (default: `.`) |
 | `--allow-delete` | Permit manifest deletion |
-| `--allow-unauthenticated` | Permit plaintext TCP clients |
+| `--allow-unauthenticated` | Permit plaintext TCP clients. For an `auth users` module this opts in **loopback plaintext only**; remote auth still requires verified TLS, so the flag never permits remote plaintext auth. |
 | `-v, --verbose` | Enable debug logging |
 | `--help` | Show help |
 
@@ -522,11 +522,42 @@ deterministic per-username dummy challenge, so probing the daemon cannot
 enumerate users. Store lines are generated with
 `fastsync-server --hash-credentials <plaintext-file>` (see `RSYNC_COMPAT.md`);
 redirect that output to an owner-only (mode 0600) file, and note that legacy
-`user:SHA256HEX` stores are rejected. Two residuals are accepted: the dummy salt
-is stable within one daemon lifetime but changes across restarts, so a
-restart-gated enumeration channel remains (persisting a dummy key is out of
-scope); and the store iteration count is observable pre-auth by design, since
-the miss path must match a hit.
+`user:SHA256HEX` stores are rejected. FastSync also maintains an owner-only
+(mode 0600) `<store>.dummykey` sidecar next to the store: it holds the store-wide
+dummy key, is auto-created on first load, and must be preserved across daemon
+restarts so the dummy challenge for an unknown user stays stable (the key is
+never regenerated while the sidecar exists). The sidecar is secret material and
+must be protected like the credential store: keep it owner-only (mode 0600) and
+include it with the store in backups and credential rotation. If the sidecar
+cannot be created (a process-substitution/FIFO store path such as `/dev/fd/N`, a
+read-only filesystem, a missing directory, or a create, write, fsync, link, or
+fchmod failure), the daemon logs a warning and uses a transient key, so the
+cross-restart guarantee does not hold for those deployments. One residual is
+accepted: the store
+iteration count is observable pre-auth by design, since the miss path must match
+a hit.
+
+An `auth users` module accepts credentials only when one of two conditions
+holds: (a) the connection is an encrypted, verified TLS connection whose client
+certificate matches the server's `--client-cn`, or (b) the connection is
+plaintext from a loopback peer **and** the operator explicitly passed
+`--allow-unauthenticated`. A remote plaintext peer is refused before any
+challenge is sent, and `--allow-unauthenticated` never permits remote plaintext
+auth: remote peers still require verified TLS regardless of the flag. Clients
+sending daemon credentials with `--password-file` to a non-loopback daemon must
+therefore use `--tls`; the client rejects a non-local plaintext credential
+destination before any network I/O. Daemon modules are a `--daemon`-only
+feature: the SSH `--stdio` path never loads a daemon config and is not an auth
+transport for them.
+
+Because the loopback allowance trusts whichever peer the kernel reports as
+`127.0.0.1`, it assumes nothing relays remote connections to the daemon. A local
+TCP forwarder or a TLS-terminating proxy in front of an auth-module listener
+makes remote clients appear as loopback and bypasses the mutual-TLS identity
+check, so do not front an auth-module listener with such a relay. `--tls` always
+mandates `--client-cn`, so a TLS connection to an auth-required module always
+has its client CN verified (`--client-cn` matches the certificate's CN only, not
+a subjectAltName, which is acceptable for a private CA).
 
 TLS provides encrypted TCP transport. Supplying `--ca` enables certificate
 verification; without it, traffic is encrypted but peer identity is not

@@ -3,6 +3,7 @@
 #include "delay_updates.h"
 #include "log.h"
 #include "usage.h"
+#include "utils.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -135,6 +136,15 @@ bool validate_config(const Config* config) {
       log_message(LOG_LEVEL_ERROR, "--tls requires --cert, --key, and --ca");
       return false;
     }
+  }
+  /* Daemon credentials (A7, protocol 2.19.0): a --password-file would send the
+     username in the clear and derive a SCRAM proof a network sniffer could
+     attack offline, so it is only allowed over TLS (which itself mandates a
+     verified --cert/--key/--ca set above) or to a loopback destination.  A
+     remote plaintext daemon is refused here, before any network I/O. */
+  if (config->password_file && !config->use_tls && !utils_host_is_loopback(config->server_host)) {
+    log_message(LOG_LEVEL_ERROR, "sending daemon credentials to a non-local server requires --tls");
+    return false;
   }
   if (config->delay_updates && config->inplace) {
     log_message(LOG_LEVEL_ERROR, "--delay-updates does not work with --inplace");

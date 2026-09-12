@@ -2,12 +2,15 @@
 #include "utils.h"
 #include "protocol.h"
 #include "test_utils.h"
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <threads.h>
 #include <unistd.h>
@@ -269,12 +272,97 @@ static int escape_thread(void* arg) {
   return 0;
 }
 
+/* A7-3/S1 transport classification: the daemon auth gate and the client
+   credential rule both key off these helpers, so cover the exact accepted
+   forms plus the negative cases. */
+static void test_loopback_helpers() {
+  /* Host strings. */
+  EXPECT_TRUE(utils_host_is_loopback("localhost"));
+  EXPECT_TRUE(utils_host_is_loopback("127.0.0.1"));
+  EXPECT_TRUE(utils_host_is_loopback("127.255.255.254"));
+  EXPECT_TRUE(utils_host_is_loopback("127.0.0.0"));
+  EXPECT_TRUE(utils_host_is_loopback("::1"));
+  EXPECT_TRUE(utils_host_is_loopback("[::1]"));
+  EXPECT_FALSE(utils_host_is_loopback("128.0.0.1"));
+  EXPECT_FALSE(utils_host_is_loopback("10.0.0.1"));
+  EXPECT_FALSE(utils_host_is_loopback("0.0.0.0"));
+  EXPECT_FALSE(utils_host_is_loopback("example.com"));
+  EXPECT_FALSE(utils_host_is_loopback(""));
+  EXPECT_FALSE(utils_host_is_loopback(NULL));
+
+  /* Raw sockaddr classification. */
+  struct sockaddr_in v4;
+  memset(&v4, 0, sizeof(v4));
+  v4.sin_family = AF_INET;
+  EXPECT_TRUE(inet_pton(AF_INET, "127.0.0.1", &v4.sin_addr) == 1);
+  EXPECT_TRUE(utils_sockaddr_is_loopback((const struct sockaddr*)&v4));
+  EXPECT_TRUE(inet_pton(AF_INET, "127.5.5.5", &v4.sin_addr) == 1);
+  EXPECT_TRUE(utils_sockaddr_is_loopback((const struct sockaddr*)&v4));
+  EXPECT_TRUE(inet_pton(AF_INET, "128.0.0.1", &v4.sin_addr) == 1);
+  EXPECT_FALSE(utils_sockaddr_is_loopback((const struct sockaddr*)&v4));
+
+  struct sockaddr_in6 v6;
+  memset(&v6, 0, sizeof(v6));
+  v6.sin6_family = AF_INET6;
+  EXPECT_TRUE(inet_pton(AF_INET6, "::1", &v6.sin6_addr) == 1);
+  EXPECT_TRUE(utils_sockaddr_is_loopback((const struct sockaddr*)&v6));
+  EXPECT_TRUE(inet_pton(AF_INET6, "::ffff:127.0.0.1", &v6.sin6_addr) == 1);
+  EXPECT_TRUE(utils_sockaddr_is_loopback((const struct sockaddr*)&v6));
+  EXPECT_TRUE(inet_pton(AF_INET6, "::ffff:127.255.255.254", &v6.sin6_addr) == 1);
+  EXPECT_TRUE(utils_sockaddr_is_loopback((const struct sockaddr*)&v6));
+  EXPECT_TRUE(inet_pton(AF_INET6, "::ffff:10.0.0.1", &v6.sin6_addr) == 1);
+  EXPECT_FALSE(utils_sockaddr_is_loopback((const struct sockaddr*)&v6));
+
+  EXPECT_FALSE(utils_sockaddr_is_loopback(NULL));
+
+  /* A pipe has no socket peer: getpeername fails with ENOTSOCK.  The helper is
+     fail-closed, so an unprovable channel is NOT local (daemon auth modules are
+     daemon-only and never run over the --stdio pipe). */
+  int pipe_fds[2];
+  EXPECT_EQ_INT(pipe(pipe_fds), 0);
+  EXPECT_FALSE(utils_fd_peer_is_local(pipe_fds[0]));
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  EXPECT_FALSE(utils_fd_peer_is_local(-1));
+
+  /* A connected AF_UNIX socketpair is a socket, but its peer is not a loopback
+     IP address, so it is not local either. */
+  int pair_fds[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, pair_fds), 0);
+  EXPECT_FALSE(utils_fd_peer_is_local(pair_fds[0]));
+  close(pair_fds[0]);
+  close(pair_fds[1]);
+
+  /* A real loopback TCP peer is local. */
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(listener >= 0);
+  struct sockaddr_in bind_addr;
+  memset(&bind_addr, 0, sizeof(bind_addr));
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bind_addr.sin_port = 0;
+  EXPECT_EQ_INT(bind(listener, (const struct sockaddr*)&bind_addr, sizeof(bind_addr)), 0);
+  EXPECT_EQ_INT(listen(listener, 1), 0);
+  socklen_t addr_len = sizeof(bind_addr);
+  EXPECT_EQ_INT(getsockname(listener, (struct sockaddr*)&bind_addr, &addr_len), 0);
+  int dialer = socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(dialer >= 0);
+  EXPECT_EQ_INT(connect(dialer, (const struct sockaddr*)&bind_addr, sizeof(bind_addr)), 0);
+  int accepted = accept(listener, NULL, NULL);
+  EXPECT_TRUE(accepted >= 0);
+  EXPECT_TRUE(utils_fd_peer_is_local(accepted));
+  close(accepted);
+  close(dialer);
+  close(listener);
+}
+
 void test_shared_utils() {
   test_walker_removes_extras_keeps_manifest_and_protected();
   test_walker_max_delete_exceeded_deletes_nothing();
   test_walker_max_delete_exact_bound_deletes();
   test_walker_unlimited_deletes_all();
   test_walker_hard_bound_all_or_nothing();
+  test_loopback_helpers();
 
   /* --append / --append-verify tail-resume math: a resume is eligible only for
      a shorter existing destination, and the tail length is then the difference. */

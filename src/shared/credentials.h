@@ -26,6 +26,18 @@
  * hard-rejected with an actionable "legacy" error; there is no auto-upgrade.
  * Use `fastsync-server --hash-credentials` to generate new-format lines.
  *
+ * Alongside the store, credentials_load maintains an exact-mode-0600
+ * `<store_path>.dummykey` sidecar holding the store-wide random dummy key.  It
+ * is auto-created on first load and MUST be preserved across restarts: it makes
+ * the dummy challenge for an unknown user stable for the life of the store, so
+ * a daemon restart cannot be used as a username-enumeration oracle.  A sidecar
+ * that is not an exact-mode-0600 regular file of exactly 32 bytes fails the load
+ * (fail closed); creation forces exact 0600 with fchmod (so a restrictive umask
+ * cannot leave the sidecar unreadable), and only a create/write/fsync/link or
+ * fchmod failure degrades to a transient per-run key with a warning.  NOTE: the
+ * sidecar requires EXACT 0600, whereas the store / password files only reject
+ * group/other bits (a deliberate difference).
+ *
  * Client --password-file format: the FIRST meaningful (non-comment, non-blank)
  * line is `user:password`, holding the literal password.  The client keeps it
  * only for the duration of the handshake and wipes it at teardown; the file
@@ -156,8 +168,9 @@ bool credentials_verify_response(const CredentialVerifier* v, const char* user,
 bool credentials_hash_store_line(const char* user, const char* password, uint32_t iters, char* out,
                                  size_t out_sz, char* err, size_t err_size);
 
-/* Read `user:password` lines from `path` (the same owner-only check as the
- * other secret files) and write one new-format store line per entry to `out`.
+/* Read `user:password` lines from `path` (the same no-group/other-bits check as
+ * the other secret files) and write one new-format store line per entry to
+ * `out`.
  * Blank/comment lines are skipped; a malformed line fails the whole run.
  * Returns 0 on success, -1 on error (err filled).  Used by
  * `--hash-credentials`. */
