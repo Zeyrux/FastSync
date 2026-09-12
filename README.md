@@ -6,6 +6,10 @@ source/destination model and rsync-style options while adding optional
 multithreading, streaming zstd compression, chunking, zero-copy TCP transfers,
 and native TCP/TLS transports.
 
+The release version is FastSync's client/server protocol version (printed by
+`fastsync --version`); client and server must match. See
+[CHANGELOG.md](CHANGELOG.md) for the history.
+
 The compatibility target is straightforward:
 
 - Existing rsync commands should keep the same meaning.
