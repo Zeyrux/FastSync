@@ -826,8 +826,6 @@ typedef struct {
   Config* config;
   int argc;
   char** argv;
-  int* positional_args;
-  int* positional_count;
   int i;               /* index of the argument currently being examined */
   int exit_code;       /* nonzero when a matched handler wants parse_args to return */
   bool verbose;        /* "-v"/"--verbose" seen (drives the final log level) */
@@ -1855,8 +1853,6 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       .config = config,
       .argc = argc,
       .argv = argv,
-      .positional_args = positional_args,
-      .positional_count = positional_count,
       .i = 1,
       .exit_code = 0,
       .verbose = false,
