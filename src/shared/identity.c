@@ -128,29 +128,29 @@ bool privilege_super_mode_permitted(int mode) {
   return mode != SUPER_MODE_OFF;
 }
 
-/* --super with NO explicit identity policy implies raw numeric-id preservation,
- * exactly as if --numeric-ids had been given.  An explicit usermap/groupmap/
- * --chown/--numeric-ids always wins: identity_resolve_targets() checks those
- * before the numeric fallback, and this predicate is false whenever any of them
- * is present.  In AUTO (the default) no implication is made, preserving the
- * opt-in-only behavior. */
-static bool identity_super_implies_numeric(void) {
-  return g_identity.super_mode == SUPER_MODE_ON && !g_identity.numeric_ids &&
-         !g_identity.chown_uid_set && !g_identity.chown_gid_set && g_identity.usermap_count == 0 &&
-         g_identity.groupmap_count == 0;
-}
-
 bool identity_active_enabled(void) {
   /* numeric_ids is included: this set only gates identity_apply_ownership,
      which runs only when metadata is present (a -M/--preserve transfer).  A
      standalone --numeric-ids (no ownership-affecting flag) carries no
      metadata, never reaches identity_apply_ownership, and therefore correctly
-     stays inert; combined with -M it activates raw-id application.  --super
-     with no explicit identity policy acts like --numeric-ids here. */
+     stays inert; combined with -M it activates raw-id application.  --super /
+     --no-super does NOT enable ownership: it only permits or forbids the
+     already-requested super-user activities, so a --super with no explicit
+     identity flag must never silently apply client-chosen ownership. */
   return g_identity.set &&
          (g_identity.numeric_ids || g_identity.chown_uid_set || g_identity.chown_gid_set ||
-          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0 || g_identity.copy_as_set ||
-          identity_super_implies_numeric());
+          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0 || g_identity.copy_as_set);
+}
+
+bool identity_ownership_requested(const Config* config) {
+  if (!config)
+    return false;
+  /* Every value that makes the receiver act on a client-chosen owner, plus an
+   * explicit --super (super-user device-node activities).  Pure config, so the
+   * daemon gate can evaluate it before identity_set_active(). */
+  return config->numeric_ids || config->chown_uid_set || config->chown_gid_set ||
+         config->usermap_count > 0 || config->groupmap_count > 0 || config->copy_as_set ||
+         config->fake_super || config->super_mode == SUPER_MODE_ON;
 }
 
 bool identity_copy_as_active(void) {
@@ -613,7 +613,7 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
   } else if (g_identity.chown_uid_set) {
     uid = g_identity.chown_uid == IDENTITY_CURRENT ? geteuid() : (uid_t)g_identity.chown_uid;
     set_uid = true;
-  } else if (g_identity.numeric_ids || identity_super_implies_numeric()) {
+  } else if (g_identity.numeric_ids) {
     uid = (uid_t)source_uid;
     set_uid = true;
   } else {
@@ -637,7 +637,7 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
   } else if (g_identity.chown_gid_set) {
     gid = g_identity.chown_gid == IDENTITY_CURRENT ? getegid() : (gid_t)g_identity.chown_gid;
     set_gid = true;
-  } else if (g_identity.numeric_ids || identity_super_implies_numeric()) {
+  } else if (g_identity.numeric_ids) {
     gid = (gid_t)source_gid;
     set_gid = true;
   } else {
@@ -676,9 +676,11 @@ static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
    * --copy-as is different: the whole point of the flag is that the target
    * ownership is REQUIRED (the pre-flight gate already refused an unprivileged
    * receiver).  If the chown still fails with EPERM/EACCES (a capability-
-   * restricted root, root-squash, or a read-only mount) the run is silently
-   * producing the WRONG ownership, so surface it at ERROR.  It stays
-   * non-fatal: never abort the multithreaded receiver mid-transfer. */
+   * restricted root, root-squash, or a read-only mount) the run would be
+   * silently producing the WRONG ownership, so surface it at ERROR.  The
+   * caller (identity_apply_ownership*) then reports the ENTRY as failed rather
+   * than as written; the receiver never claims a --copy-as success it did not
+   * achieve, but a single entry failure does not abort the whole run. */
   if (errno == EPERM || errno == EACCES) {
     if (identity_copy_as_active())
       log_message(LOG_LEVEL_ERROR,
@@ -695,35 +697,43 @@ static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
   }
 }
 
-void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
+bool identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
   /* Ownership application is OFF unless the client requested an identity flag.
    * This is the controlled gate: a default (or plain -M) transfer never changes
    * ownership, byte-for-byte preserving FastSync's existing behavior.  --no-super
    * additionally forbids it even when the receiver is root. */
   if (!identity_active_enabled() || !privilege_super_permitted() || fd < 0)
-    return;
+    return true;
   struct stat st;
   if (fstat(fd, &st) != 0)
-    return;
+    return !identity_copy_as_active();
   uid_t uid;
   gid_t gid;
   if (!identity_resolve_targets(&st, source_uid, source_gid, &uid, &gid))
-    return;
-  if (fchown(fd, uid, gid) != 0)
+    return true;
+  if (fchown(fd, uid, gid) != 0) {
     identity_log_chown_failure("file", uid, gid);
+    /* A required --copy-as ownership that did not land is a per-entry failure;
+     * every other policy stays best-effort (rsync parity). */
+    return !identity_copy_as_active();
+  }
+  return true;
 }
 
-void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
+bool identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
                                    int32_t source_gid) {
   if (!identity_active_enabled() || !privilege_super_permitted() || parent_fd < 0 || !leaf)
-    return;
+    return true;
   struct stat st;
   if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
-    return;
+    return !identity_copy_as_active();
   uid_t uid;
   gid_t gid;
   if (!identity_resolve_targets(&st, source_uid, source_gid, &uid, &gid))
-    return;
-  if (fchownat(parent_fd, leaf, uid, gid, AT_SYMLINK_NOFOLLOW) != 0)
+    return true;
+  if (fchownat(parent_fd, leaf, uid, gid, AT_SYMLINK_NOFOLLOW) != 0) {
     identity_log_chown_failure("no-follow entry", uid, gid);
+    return !identity_copy_as_active();
+  }
+  return true;
 }

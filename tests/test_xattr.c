@@ -305,6 +305,10 @@ static void test_fake_super_owner_gate() {
   Config* c = config_create();
   EXPECT_NOT_NULL(c);
 
+  /* An explicit ownership policy is required before fake-super replay may
+     chown; --fake-super alone only records the source owner (A2). */
+  c->numeric_ids = true;
+
   /* --no-super: the owner leg is skipped even as root. */
   c->super_mode = SUPER_MODE_OFF;
   identity_set_active(c);
@@ -314,7 +318,7 @@ static void test_fake_super_owner_gate() {
   EXPECT_EQ_INT((int)st.st_uid, 0);
   EXPECT_EQ_INT((int)st.st_gid, 0);
 
-  /* AUTO: the recorded source owner is applied. */
+  /* AUTO with an identity policy: the recorded source owner is applied. */
   c->super_mode = SUPER_MODE_AUTO;
   identity_set_active(c);
   EXPECT_TRUE(fake_super_restore_fd(fd));
@@ -322,10 +326,19 @@ static void test_fake_super_owner_gate() {
   EXPECT_EQ_INT((int)st.st_uid, 12345);
   EXPECT_EQ_INT((int)st.st_gid, 12346);
 
+  /* --super / --fake-super with NO explicit identity flag must NOT apply a
+     client-chosen owner: super_mode alone never enables ownership. */
+  EXPECT_EQ_INT(fchown(fd, 0, 0), 0);
+  c->numeric_ids = false;
+  c->super_mode = SUPER_MODE_ON;
+  identity_set_active(c);
+  EXPECT_TRUE(fake_super_restore_fd(fd));
+  EXPECT_EQ_INT(fstat(fd, &st), 0);
+  EXPECT_EQ_INT((int)st.st_uid, 0);
+  EXPECT_EQ_INT((int)st.st_gid, 0);
+
   /* Active --copy-as is authoritative: the recorded source owner must not
      override it, even with AUTO/ON. */
-  EXPECT_EQ_INT(fchown(fd, 0, 0), 0);
-  c->super_mode = SUPER_MODE_ON;
   c->copy_as_set = true;
   c->copy_as_uid = 777;
   c->copy_as_gid = 778;

@@ -468,13 +468,16 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
      every entry (a char/block node path is already privilege-gated above).  The
      no-follow helper changes the node's own ownership without dereferencing it;
      it is a no-op unless an identity policy is active. */
+  bool owner_ok = true;
   if (identity_active_enabled())
-    identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
-                                  (int32_t)file->metadata->gid);
+    owner_ok = identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
+                                             (int32_t)file->metadata->gid);
   close(parent_fd);
   free(leaf);
   free(destination);
-  return FILE_SAVE_WRITTEN;
+  /* A failed required --copy-as ownership marks the node as failed; every other
+   * identity policy stays best-effort. */
+  return owner_ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
 }
 
 /* --write-devices (receiver): write the received data directly into an EXISTING
@@ -626,8 +629,9 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
       char* leaf = NULL;
       int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
       if (parent_fd >= 0) {
-        identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
-                                      (int32_t)file->metadata->gid);
+        if (!identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
+                                           (int32_t)file->metadata->gid))
+          ok = false;
         close(parent_fd);
       }
       free(leaf);

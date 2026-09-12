@@ -43,6 +43,7 @@ static void test_daemon_conf_full_parse() {
                            "[backup]\n"
                            "path = /srv/backup\n"
                            "read only = yes\n"
+                           "client owner = yes\n"
                            "auth users = alice, bob\n",
                            &path),
                 0);
@@ -57,6 +58,7 @@ static void test_daemon_conf_full_parse() {
   EXPECT_EQ_STR(conf->modules[0].name, "backup");
   EXPECT_EQ_STR(conf->modules[0].path, "/srv/backup");
   EXPECT_TRUE(conf->modules[0].read_only);
+  EXPECT_TRUE(conf->modules[0].client_owner);
   EXPECT_EQ_INT(conf->modules[0].auth_user_count, 2);
   EXPECT_EQ_STR(conf->modules[0].auth_users[0], "alice");
   EXPECT_EQ_STR(conf->modules[0].auth_users[1], "bob");
@@ -84,6 +86,10 @@ static void test_daemon_conf_comments_and_blank_lines() {
   EXPECT_EQ_INT(conf->module_count, 2);
   EXPECT_EQ_STR(conf->modules[0].name, "alpha");
   EXPECT_EQ_STR(conf->modules[1].name, "beta");
+  /* `client owner` defaults to off: a module must opt in to client-chosen
+     ownership. */
+  EXPECT_FALSE(conf->modules[0].client_owner);
+  EXPECT_FALSE(conf->modules[1].client_owner);
   daemon_conf_free(conf);
 }
 
@@ -206,6 +212,12 @@ static void test_daemon_conf_malformed_rejected() {
   free(path);
   EXPECT_NULL(conf);
   EXPECT_TRUE(strstr(err, "read only") != NULL);
+
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nclient owner = maybe\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "client owner") != NULL);
 
   EXPECT_EQ_INT(write_conf("= value\n", &path), 0);
   conf = daemon_conf_load(path, err, sizeof(err));

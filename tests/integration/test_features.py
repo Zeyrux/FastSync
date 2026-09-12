@@ -4165,11 +4165,11 @@ class TestSuperPrivilege:
             f"--no-super must not apply ownership (uid={st.st_uid} gid={st.st_gid})"
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
-    def test_super_applies_ownership_as_root(self, shared_server):
-        """Control/proof the flag is not inert for root: --super with no explicit
-        identity policy treats ownership as raw numeric ids (as --numeric-ids),
-        applying the very ownership --no-super suppressed."""
-        source, dest = self._seed("super")
+    def test_super_alone_does_not_apply_ownership_as_root(self, shared_server):
+        """A3: --super no longer implies --numeric-ids, so --super alone must NOT
+        apply client-chosen ownership even for root; the destination keeps the
+        receiver's owner (the exact ownership --no-super would also suppress)."""
+        source, dest = self._seed("superonly")
         os.chown(os.path.join(source, "f.txt"), 12345, 12346)
         result, _ = run_client(source, dest,
                                flags=["--preserve", "--super"],
@@ -4178,8 +4178,25 @@ class TestSuperPrivilege:
             f"exit {result.returncode}: {(result.stderr or '')[:300]}"
         received = get_dest_received_dir(dest, source)
         st = os.stat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) != (12345, 12346), \
+            f"--super alone must not apply ownership (uid={st.st_uid} gid={st.st_gid})"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_super_with_numeric_ids_applies_ownership_as_root(self, shared_server):
+        """Control: an explicit identity policy is what enables ownership, so
+        --numeric-ids --super still applies the raw ids as root (the very
+        ownership --no-super suppresses)."""
+        source, dest = self._seed("supernumeric")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "--numeric-ids", "--super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.stat(os.path.join(received, "f.txt"))
         assert (st.st_uid, st.st_gid) == (12345, 12346), \
-            f"--super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
+            f"--numeric-ids --super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
 
     @pytest.mark.ci
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")

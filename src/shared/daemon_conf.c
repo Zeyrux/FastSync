@@ -170,6 +170,17 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     module->read_only = parsed;
     return true;
   }
+  if (key_equals(key, "client owner")) {
+    bool parsed;
+    if (!parse_bool_value(value, &parsed)) {
+      set_error(err, err_size,
+                "module '%s': 'client owner' must be yes/no (or true/false/1/0), got '%s'",
+                module->name, value);
+      return false;
+    }
+    module->client_owner = parsed;
+    return true;
+  }
   if (key_equals(key, "auth users")) {
     char* list = str_dup(value);
     if (!list) {

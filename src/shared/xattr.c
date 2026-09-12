@@ -340,7 +340,12 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
  * mirroring the normal metadata identity path; other errors are logged) and
  * still applies mode/mtime where permitted.
  *
- * The OWNER leg additionally honors two policies:
+ * The OWNER leg additionally honors three policies:
+ *   - an explicit ownership identity policy must be active (numeric-ids /
+ *     chown / usermap / groupmap / copy-as).  --fake-super on its own only
+ *     RECORDS the source owner; replaying that owner as a live chown without an
+ *     explicit ownership opt-in would be an un-gated client-chosen-ownership
+ *     primitive.
  *   - --no-super (privilege_super_permitted() false) suppresses it even for a
  *     root receiver, exactly like the normal metadata identity path.
  *   - an active --copy-as is AUTHORITATIVE: the identity path already forced the
@@ -370,7 +375,7 @@ bool fake_super_restore_fd(int fd) {
      not hidden.  --no-super suppresses the owner leg even for root, and an
      active --copy-as is authoritative so its forced owner must not be
      overwritten by the recorded source owner. */
-  if (privilege_super_permitted() && !identity_copy_as_active() &&
+  if (identity_active_enabled() && privilege_super_permitted() && !identity_copy_as_active() &&
       fchown(fd, (uid_t)ul_uid, (gid_t)ul_gid) != 0 && errno != EPERM && errno != EACCES)
     log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore owner on destination file: %s",
                 strerror(errno));

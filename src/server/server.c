@@ -172,46 +172,29 @@ static bool configure_authorization(const char* root) {
  * --destination-root, but per-module and NEVER client-chosen.  The module is
  * refused (with a clear log) when it is unknown, when it is `read only` (every
  * FastSync network transfer writes; there is no read-only wire operation yet),
- * or when the presented daemon credentials fail for a module that declares
- * `auth users`.  Wave A refused every auth-required module (auth was not yet
- * implemented); Wave B authenticates the client instead (see below). */
+ * when it requests client-chosen ownership without the module's
+ * `client owner = yes` opt-in (P7 Wave E hardening), or when the presented
+ * daemon credentials fail for a module that declares `auth users`.  Wave A
+ * refused every auth-required module (auth was not yet implemented); Wave B
+ * authenticates the client instead (see below). */
 static const char* server_module_gate(const Config* config, void* context) {
   ModuleGateContext* gate_ctx = (ModuleGateContext*)context;
   if (!config)
     return "missing config frame";
-  /* --copy-as (P7 Wave E, protocol 2.18.0): FastSync's safe subset forces the
-     ownership of every written entry to the requested ids, which needs a
-     privileged (root) receiver.  An unprivileged receiver REFUSES the whole
-     transfer here, at the config handshake and BEFORE the STATUS_OK ack, so no
-     file data is exchanged and there is never a silent wrong-ownership result.
-     Placed first so it applies to the standalone server and daemon alike. */
-  /* Daemon divergence (P7 Wave E): a daemon has no per-module opt-in for
-     client-chosen ownership, so it refuses --copy-as outright even when running
-     as root -- otherwise any anonymous client could pick an arbitrary owner.
-     The standalone listener and the SSH-launched --stdio server keep honoring
-     it (they serve exactly one operator-authorized root). */
-  if (g_daemon_conf != NULL && config->copy_as_set) {
-    log_message(LOG_LEVEL_ERROR, "--copy-as is refused by the daemon (no per-module opt-in for "
-                                 "client-chosen ownership); refusing");
-    return "--copy-as is not permitted by this daemon";
-  }
-  /* --super (SUPER_MODE_ON) with no explicit identity policy implies raw
-     numeric-id ownership, i.e. a client-chosen owner.  A daemon has no
-     per-module opt-in, so refuse the explicit ON request for the same reason it
-     refuses --copy-as; the pre-existing --numeric-ids/--chown/--usermap surfaces
-     are unchanged (documented daemon trust model).  --no-super still works. */
-  if (g_daemon_conf != NULL && config->super_mode == SUPER_MODE_ON) {
-    log_message(LOG_LEVEL_ERROR,
-                "--super is refused by the daemon (no per-module opt-in for client-chosen "
-                "ownership); refusing");
-    return "--super is not permitted by this daemon";
-  }
   /* Operator veto: --no-super forces SUPER_MODE_OFF for this connection before
      the copy-as gate is evaluated, and the caller clamps the accepted config
      again after this returns so the ownership/device gates see it too. */
   Config* effective = (Config*)config;
   if (server_no_super)
     effective->super_mode = SUPER_MODE_OFF;
+  /* --copy-as (P7 Wave E, protocol 2.18.0): FastSync's safe subset forces the
+     ownership of every written entry to the requested ids, which needs a
+     privileged (root) receiver.  An unprivileged receiver REFUSES the whole
+     transfer here, at the config handshake and BEFORE the STATUS_OK ack, so no
+     file data is exchanged and there is never a silent wrong-ownership result.
+     The daemon's per-module client-chosen-ownership refusal is enforced after
+     the module lookup below (it needs the module's opt-in) and covers --copy-as
+     like every other ownership flag. */
   if (identity_copy_as_refused(effective)) {
     if (geteuid() != 0)
       log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
@@ -255,6 +238,20 @@ static const char* server_module_gate(const Config* config, void* context) {
     log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
                 config->module);
     return "requested daemon module is read only";
+  }
+  /* Client-chosen ownership / super-user policy (P7 Wave E hardening): a daemon
+     module refuses EVERY ownership-affecting request (--numeric-ids, --chown,
+     --usermap/--groupmap, --fake-super, --copy-as, explicit --super) unless the
+     operator opted THIS module in with `client owner = yes`.  Otherwise any
+     client could force arbitrary ownership inside the module root.  The
+     standalone/SSH server has a single operator-authorized root and keeps
+     honoring these. */
+  if (!module->client_owner && identity_ownership_requested(effective)) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' refuses client-chosen ownership/super-user activities "
+                "(no `client owner = yes` opt-in); refusing",
+                config->module);
+    return "client-chosen ownership is not permitted by this daemon module";
   }
   if (module->auth_user_count > 0) {
     /* Auth-required module (Wave B): verify the presented credentials against
@@ -766,6 +763,17 @@ int main(int argc, char* argv[]) {
     if (g_daemon_conf->module_count == 0)
       log_message(LOG_LEVEL_WARNING,
                   "daemon config has no modules; every connection will be refused");
+    /* Surface the operator's client-chosen-ownership opt-in prominently: an
+       opted-in module lets its clients request arbitrary owner ids inside that
+       module root. */
+    for (int i = 0; i < g_daemon_conf->module_count; i++) {
+      if (g_daemon_conf->modules[i].client_owner)
+        log_message(LOG_LEVEL_WARNING,
+                    "daemon module '%s' allows client-chosen ownership "
+                    "(`client owner = yes`); clients may request arbitrary owner ids within "
+                    "that module root",
+                    g_daemon_conf->modules[i].name);
+    }
     /* Daemon credential store (Wave B).  --password-file and --early-input
      * feed the same store, loaded BEFORE the listener forks so every
      * connection child shares one read-only store.  Fail closed at startup: a

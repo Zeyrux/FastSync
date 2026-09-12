@@ -409,10 +409,14 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
      --groupmap / --chown).  identity_apply_ownership is the controlled,
      privilege-gated path: it consults the negotiated policy, resolves the
      target ids, and applies them via an fd-relative fchown() that is confined
-     to the just-written file (EPERM/EACCES are logged, never fatal).  With no
-     identity flag set it is a no-op, so a default or plain -M transfer keeps
-     FastSync's existing behavior of never applying client ownership. */
-  identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid);
+     to the just-written file (EPERM/EACCES are logged, never fatal) -- EXCEPT
+     for an active --copy-as, whose forced ownership is REQUIRED: a failure
+     marks this entry as failed instead of reporting a wrong-owner write as
+     success.  With no identity flag set it is a no-op, so a default or plain -M
+     transfer keeps FastSync's existing behavior of never applying client
+     ownership. */
+  if (!identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid))
+    ok = false;
   struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
                               {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
   if (metadata->atime_valid) {

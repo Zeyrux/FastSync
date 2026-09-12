@@ -73,23 +73,40 @@ void identity_clear_active(void);
 
 /* True when any ownership-affecting identity option is present in the active
  * snapshot.  Ownership stays OFF ("do not apply") for every transfer that
- * requests none of them, preserving FastSync's existing behavior. */
+ * requests none of them, preserving FastSync's existing behavior.  --super /
+ * --no-super alone does NOT enable ownership; an explicit identity flag
+ * (--numeric-ids / --chown / --usermap / --groupmap / --copy-as) is required. */
 bool identity_active_enabled(void);
+
+/* Pure, config-only predicate: true when the client requested ANY
+ * client-chosen ownership or super-user activity (--numeric-ids, --chown,
+ * --usermap/--groupmap, --copy-as, --fake-super, or an explicit --super).  Used
+ * by the daemon module gate to decide whether a module's per-module opt-in is
+ * required; it never reads the per-connection snapshot. */
+bool identity_ownership_requested(const Config* config);
 
 /* Apply the negotiated ownership to an already-written file descriptor.
  * source_uid/source_gid are the transmitted numeric ids.  Resolution order:
  * a matching usermap/groupmap rule, then --chown, then --numeric-ids (raw),
  * then a best-effort name lookup on the receiver's own databases (skipped when
  * the transmitted id has no name on this system).  Only calls fchown() when the
- * result differs from the current value; EPERM/EACCES are logged and ignored,
- * never fatal (rsync parity: the transfer must not abort). */
-void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid);
+ * result differs from the current value.
+ *
+ * Returns false ONLY when an active --copy-as ownership application failed: its
+ * forced ownership is REQUIRED, so the caller must treat the entry as failed
+ * rather than reporting success with the wrong owner.  For every other identity
+ * policy an fchown EPERM/EACCES is logged and ignored and true is returned
+ * (rsync parity: the transfer must not abort).  A no-op when no identity policy
+ * is active returns true. */
+bool identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid);
 
 /* P7 Wave D: the no-follow (symlink) counterpart.  Resolves the same
- * usermap/groupmap/chown/numeric-ids policy but applies it with
+ * usermap/groupmap/chown/numeric-ids/copy-as policy but applies it with
  * fchownat(..., AT_SYMLINK_NOFOLLOW) so a symlink's own ownership is changed
- * without ever dereferencing it.  A no-op unless an identity flag is active. */
-void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
+ * without ever dereferencing it.  A no-op unless an identity flag is active.
+ * The return value follows identity_apply_ownership(): false only when an
+ * active --copy-as application failed. */
+bool identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
                                    int32_t source_gid);
 
 /* Receiver-side wire validation of the resolved identity fields. */
