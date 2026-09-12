@@ -37,6 +37,7 @@ static void test_file_special_rdev_valid() {
   mode_t fake_char = S_IFCHR | 0600;
   mode_t fake_blk = S_IFBLK | 0600;
   mode_t fake_fifo = S_IFIFO | 0600;
+  mode_t fake_sock = S_IFSOCK | 0600;
   /* char/block devices: accept a legal pair, reject negative / oversized. */
   EXPECT_TRUE(file_special_rdev_valid(1, 3, fake_char));
   EXPECT_TRUE(file_special_rdev_valid(0xffff, 0x00ffffff, fake_blk));
@@ -47,6 +48,8 @@ static void test_file_special_rdev_valid() {
   /* FIFOs/sockets must carry an empty rdev. */
   EXPECT_TRUE(file_special_rdev_valid(0, 0, fake_fifo));
   EXPECT_FALSE(file_special_rdev_valid(1, 0, fake_fifo));
+  EXPECT_TRUE(file_special_rdev_valid(0, 0, fake_sock));
+  EXPECT_FALSE(file_special_rdev_valid(0, 1, fake_sock));
   EXPECT_FALSE(file_special_rdev_valid(0, 0, (mode_t)(S_IFREG | 0600)));
 }
 

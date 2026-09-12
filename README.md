@@ -63,11 +63,15 @@ replacement for every rsync feature or protocol mode.
 - Archive mode does not yet provide all of rsync's `-rlptgoD` behavior.
 - Symlink transfer is incomplete; link targets are not yet recreated in all
   modes.
-- Owner/group, ACL, xattr, hard-link, device, and special-file handling is
-  incomplete or unavailable.
+- Owner/group, ACL, xattr, and hard-link handling is incomplete or
+  unavailable.
+- Device and special-file preservation is implemented with documented
+  divergences: recreated device nodes require `CAP_MKNOD` on the receiver (a
+  non-root receiver skips the entry), and sockets cannot be recreated (FIFOs
+  are).
 - Sparse-file hole preservation (`-S`, `--sparse`) is implemented receiver-side:
   long all-zero runs are written as holes (no wire change; the full file image
-  is already in memory). 
+  is already in memory).
 - `--partial`, `--partial-dir`, `-P`, `--append`, and `--append-verify` keep
   the write atomic (temp + rename). With `--partial`, a failed/interrupted write
   now retains the already-written temp at the destination path (best-effort) so
