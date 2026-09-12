@@ -1,4 +1,6 @@
+#include "log.h"
 #include <stdbool.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,9 +9,12 @@
 #include "queue.h"
 
 Queue* queue_create(int capacity, void (*destroyer)(void* item)) {
+  if (capacity <= 0)
+    return NULL;
+
   Queue* queue = (Queue*)malloc(sizeof(Queue));
   if (queue == NULL) {
-    perror("ERROR: Could not allocate memory for queue structure");
+    log_perror("ERROR: Could not allocate memory for queue structure");
     return NULL;
   }
 
@@ -61,12 +66,14 @@ bool queue_is_full(const Queue* queue) {
 static bool queue_double_capacity(Queue* queue) {
   if (queue == NULL)
     return false;
-  unsigned int new_capacity = queue->capacity * 2;
+  if (queue->capacity > INT_MAX / 2)
+    return false;
+  int new_capacity = queue->capacity * 2;
   if (new_capacity <= 1)
     new_capacity = 100;
   void** new_items = malloc(new_capacity * sizeof(void*));
   if (new_items == NULL) {
-    perror("ERROR: Could not allocate memory for doubling capacity of queue.");
+    log_perror("ERROR: Could not allocate memory for doubling capacity of queue.");
     return false;
   }
   for (int i = 0; i < queue->size; i++)
@@ -103,9 +110,25 @@ bool queue_enqueue_multithreaded(Queue* queue, void* item, mtx_t* mutex, cnd_t* 
   return ok;
 }
 
+bool queue_enqueue_multithreaded_cancel(Queue* queue, void* item, mtx_t* mutex,
+                                        cnd_t* condition_not_empty, cnd_t* condition_not_full,
+                                        const atomic_bool* cancelled) {
+  mtx_lock(mutex);
+  while (queue_is_full(queue) && (cancelled == NULL || !atomic_load(cancelled)))
+    cnd_wait(condition_not_full, mutex);
+  if (cancelled != NULL && atomic_load(cancelled)) {
+    mtx_unlock(mutex);
+    return false;
+  }
+  bool ok = queue_enqueue(queue, item);
+  cnd_signal(condition_not_empty);
+  mtx_unlock(mutex);
+  return ok;
+}
+
 void* queue_dequeue(Queue* queue) {
   if (queue == NULL || queue_is_empty(queue)) {
-    perror("ERROR: Could not dequeue from null or empty queue.");
+    log_perror("ERROR: Could not dequeue from null or empty queue.");
     return NULL;
   }
 

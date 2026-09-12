@@ -56,6 +56,11 @@ static void test_queue_basic() {
   queue_destroy(q);
 }
 
+static void test_queue_rejects_invalid_capacity() {
+  EXPECT_NULL(queue_create(0, NULL));
+  EXPECT_NULL(queue_create(-1, NULL));
+}
+
 static void test_queue_resize() {
   Queue* q = queue_create(3, NULL);
   EXPECT_NOT_NULL(q);
@@ -117,6 +122,8 @@ static void test_queue_destroyer() {
 
   for (int i = 0; i < 3; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      break;
     *val = i;
     queue_enqueue(q, val);
   }
@@ -176,6 +183,8 @@ static void test_queue_multithreaded() {
 
   for (int i = 1; i <= 100; i++) {
     int* val = malloc(sizeof(int));
+    if (!val)
+      break;
     *val = i;
     queue_enqueue_multithreaded(q, val, &mutex, &cnd_empty, &cnd_full);
   }
@@ -199,6 +208,7 @@ static void test_queue_multithreaded() {
 
 void test_queue() {
   test_queue_basic();
+  test_queue_rejects_invalid_capacity();
   test_queue_resize();
   test_queue_destroyer();
   test_queue_multithreaded();

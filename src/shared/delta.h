@@ -56,12 +56,22 @@ typedef struct {
 
 DeltaSignature* delta_signature_create(const void* old_file_data, uint64_t old_file_size,
                                        uint32_t block_size);
+/* Seeded equivalent of delta_signature_create: the per-block strong (xxHash32)
+ * checksum uses `seed` (the low 32 bits of --checksum-seed).  Passing seed 0 is
+ * identical to the unseeded function. */
+DeltaSignature* delta_signature_create_seeded(const void* old_file_data, uint64_t old_file_size,
+                                              uint32_t block_size, uint32_t seed);
 Data* delta_signature_serialize(const DeltaSignature* sig);
 DeltaSignature* delta_signature_deserialize(const Data* data);
 void delta_signature_destroy(DeltaSignature* sig);
 
 Delta* delta_compute(const void* new_file_data, uint64_t new_file_size, const DeltaSignature* sig,
                      uint32_t block_size);
+/* Seeded equivalent of delta_compute: the per-window strong (xxHash32) check
+ * uses `seed` (the low 32 bits of --checksum-seed).  The receiver's signature
+ * must have been built with the same seed for matching. */
+Delta* delta_compute_seeded(const void* new_file_data, uint64_t new_file_size,
+                            const DeltaSignature* sig, uint32_t block_size, uint32_t seed);
 Data* delta_serialize(const Delta* delta);
 Delta* delta_deserialize(const Data* data);
 void* delta_apply(const void* old_data, uint64_t old_size, const Delta* delta, uint32_t block_size);
@@ -72,5 +82,7 @@ bool delta_is_worthwhile(const Delta* delta, uint64_t new_file_size);
 
 uint32_t delta_adler32(const void* data, uint32_t len);
 uint32_t delta_xxhash32(const void* data, uint32_t len);
+uint32_t delta_xxhash32_seeded(const void* data, uint32_t len, uint32_t seed);
+uint64_t delta_xxhash64(const void* data, size_t len);
 
 #endif

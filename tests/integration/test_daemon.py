@@ -1,0 +1,1195 @@
+"""Daemon mode (--daemon + module config + host::module/path destinations) tests.
+
+These exercise the Wave A daemon foundation end to end: a fastsync-server
+started with --daemon reads a FastSync-native module config file, the client
+asks for a module with a host::module/path destination, and the transfer lands
+in the configured module root only.  Read-only modules, unknown modules, and
+auth-required modules without valid credentials are all refused cleanly before
+any data moves.  The A7 auth wave adds the real credential round-trips exercised
+in TestDaemonAuthentication: modules that declare `auth users` accept only a
+client whose --password-file presents a username on the module's list, proven
+through a SCRAM-SHA-256-style challenge/response against a salted PBKDF2
+verifier.  The daemon refuses to start when such a module has no credential
+store, a legacy SHA-256 store line is hard-rejected, and a replayed response
+from another connection is refused.
+"""
+import base64
+import glob
+import hashlib
+import hmac
+import os
+import select
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(__file__))
+from common import (
+    TEST_DATA_DIR,
+    CLIENT_CMD,
+    SERVER_CMD,
+    generate_test_files,
+    run_client,
+    get_dest_received_dir,
+    verify_transfer,
+    _find_free_port,
+    _wait_for_port,
+)
+
+SOURCE_DIR = os.path.join(TEST_DATA_DIR, "daemon_source")
+MODULE_ROOT = os.path.join(TEST_DATA_DIR, "daemon_modules")
+FILES_MODULE = os.path.join(MODULE_ROOT, "files")
+READONLY_MODULE = os.path.join(MODULE_ROOT, "readonly")
+AUTH_MODULE = os.path.join(MODULE_ROOT, "auth")
+TEAM_MODULE = os.path.join(MODULE_ROOT, "team")
+OWNER_MODULE = os.path.join(MODULE_ROOT, "owner")
+CONF_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.conf")
+CRED_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.passwd")
+STARTFAIL_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_startfail.conf")
+STARTFAIL_PORT = None
+DETACH_MODULE = os.path.join(MODULE_ROOT, "detach")
+DETACH_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.conf")
+DETACH_PORT = None
+
+# Passwords are never sent as plaintext and never logged; these literals are
+# only hashed into the server credential file / client password file.
+ALICE_PASS = "alice-s3cret"
+BOB_PASS = "bob-s3cret"
+WRONG_PASS = "wrong-password"
+
+# The store holds a salted PBKDF2 verifier (A7 SCRAM); this is the exact
+# derivation the C implementation performs, recomputed here so the tests are an
+# independent reference.  100000 keeps the module import fast while staying at
+# the validation minimum.
+CRED_ITERS = 100000
+
+
+def _verifier(password, salt, iters=CRED_ITERS):
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters, 32)
+    client_key = hmac.new(key, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(key, b"Server Key", hashlib.sha256).digest()
+    return stored_key, server_key
+
+
+def _store_line(user, password, iters=CRED_ITERS, salt=None):
+    if salt is None:
+        salt = os.urandom(16)
+    stored_key, server_key = _verifier(password, salt, iters)
+    return "%s:$fastsync$1$pbkdf2-sha256$%d$%s$%s$%s" % (
+        user, iters, base64.b64encode(salt).decode(),
+        base64.b64encode(stored_key).decode(), base64.b64encode(server_key).decode())
+
+
+def _store_secrets(line):
+    """The base64 stored_key/server_key fields of a store line (the values that
+    must never appear in a log)."""
+    parts = line.split("$")
+    return parts[-2], parts[-1]
+
+
+ALICE_LINE = _store_line("alice", ALICE_PASS)
+BOB_LINE = _store_line("bob", BOB_PASS)
+
+
+def _write_client_password_file(path, user, password):
+    with open(path, "w") as f:
+        f.write("%s:%s\n" % (user, password))
+    os.chmod(path, 0o600)
+    return path
+
+
+def _kill_by_cmdline_marker(marker):
+    """Send SIGTERM to every running process whose cmdline contains `marker`
+    (used to clean up the double-forked --daemon, which is orphaned to init and
+    no longer a child of the test's own process).  Portable over /proc so the
+    tests do not depend on pgrep being present."""
+    for proc_path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(proc_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        if marker.encode() in data:
+            try:
+                os.kill(int(proc_path.split("/")[2]), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+    time.sleep(0.5)
+
+
+class DaemonManager:
+    """Boots one fastsync-server --daemon from a config file and tears it down
+    (including its accept-loop children) on exit."""
+
+    def __init__(self):
+        self._proc = None
+        self._port = None
+
+    def start(self, config_path, port_override=None, extra_args=None):
+        self.stop()
+        # When no override is given the daemon binds the config file's `port`
+        # (the plain config-port path); with an override the --dparam path.
+        self._port = port_override if port_override is not None else _config_port(config_path)
+        cmd = (SERVER_CMD + ["--daemon", "--config", config_path, "--allow-unauthenticated",
+                             "--no-detach"])
+        if port_override is not None:
+            cmd += ["--dparam", f"port={port_override}"]
+        if extra_args:
+            cmd += extra_args
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        log = open(log_path, "w")
+        self._proc = subprocess.Popen(
+            cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        _wait_for_port(self._port, timeout=10)
+
+    def stop(self):
+        if self._proc:
+            try:
+                os.killpg(self._proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(self._proc.pid, signal.SIGKILL)
+                self._proc.wait()
+            self._proc = None
+
+    @property
+    def port(self):
+        return self._port
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
+    def __del__(self):
+        self.stop()
+
+
+def _config_port(config_path):
+    """Read the explicit `port = N` line out of the daemon config file."""
+    with open(config_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("port") and "=" in stripped:
+                return int(stripped.split("=", 1)[1].strip())
+    raise RuntimeError(f"no port= in {config_path}")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def daemon_env():
+    for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE,
+              DETACH_MODULE):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+    generate_test_files(SOURCE_DIR, full=False)
+
+    # Server-side credential store: alice and bob (salted PBKDF2 verifiers only;
+    # the plaintext passwords never appear on the daemon host or in any log).
+    with open(CRED_FILE, "w") as f:
+        f.write("# daemon credential store (A7 SCRAM)\n")
+        f.write(ALICE_LINE + "\n")
+        f.write(BOB_LINE + "\n")
+    os.chmod(CRED_FILE, 0o600)
+
+    # The config's port is a free port chosen per worker; the `daemon` fixture
+    # boots on it (the config-port path) and the --dparam override test boots a
+    # second daemon on a different port.
+    config_port = _find_free_port()
+    with open(CONF_FILE, "w") as f:
+        f.write(
+            "# FastSync-native daemon config (Wave A grammar)\n"
+            "port = %d\n"
+            "\n"
+            "[files]\n"
+            "path = %s\n"
+            "\n"
+            "[readonly]\n"
+            "path = %s\n"
+            "read only = yes\n"
+            "\n"
+            "[locked]\n"
+            "path = %s\n"
+            "auth users = alice\n"
+            "\n"
+            "[team]\n"
+            "path = %s\n"
+            "auth users = alice,bob\n"
+            "\n"
+            "[owner]\n"
+            "path = %s\n"
+            "client owner = yes\n"
+            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE))
+
+    # A dedicated config for the fail-closed startup check: an auth-required
+    # module with no credential store must refuse to start.  Its own free port
+    # keeps it independent of the running daemon.
+    global STARTFAIL_PORT
+    STARTFAIL_PORT = _find_free_port()
+    with open(STARTFAIL_CONF, "w") as f:
+        f.write("port = %d\n\n[locked]\npath = %s\nauth users = alice\n"
+                % (STARTFAIL_PORT, AUTH_MODULE))
+
+    # A dedicated config for the real (double-fork) detach test: an unique path
+    # lets cleanup identify and kill the orphaned background daemon by cmdline.
+    global DETACH_PORT
+    DETACH_PORT = _find_free_port()
+    with open(DETACH_CONF, "w") as f:
+        f.write("port = %d\n\n[detach]\npath = %s\n" % (DETACH_PORT, DETACH_MODULE))
+
+    yield
+    _kill_by_cmdline_marker(DETACH_CONF)
+    shutil.rmtree(MODULE_ROOT, ignore_errors=True)
+    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def daemon():
+    d = DaemonManager()
+    d.start(CONF_FILE, extra_args=["--password-file", CRED_FILE])
+    yield d
+    d.stop()
+
+
+def _push(dest, port):
+    result, _ = run_client(SOURCE_DIR, dest, port=port)
+    return result
+
+
+def _push_with_creds(dest, port, user, password):
+    """Push using a --password-file carrying user:password (a fresh temp file
+    each call so tests never share mutable state)."""
+    cred_path = os.path.join(TEST_DATA_DIR, f"client_{user}_{os.getpid()}_{time.time_ns()}.pw")
+    _write_client_password_file(cred_path, user, password)
+    try:
+        result, _ = run_client(SOURCE_DIR, dest, port=port,
+                               extra_args=["--password-file", cred_path])
+        return result
+    finally:
+        os.unlink(cred_path)
+
+
+def _tree_file_count(root):
+    return sum(len(files) for _, _, files in os.walk(root)) if os.path.exists(root) else 0
+
+
+def _can_mknod():
+    """True when this process may create a char device (needs root/CAP_MKNOD)."""
+    probe = os.path.join(tempfile.gettempdir(), "._fastsync_mknod_probe_%d" % os.getpid())
+    try:
+        os.mknod(probe, stat.S_IFCHR | 0o600, os.makedev(1, 3))
+        os.unlink(probe)
+        return True
+    except (OSError, AttributeError):
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return False
+
+
+class TestDaemonModuleSelection:
+    @pytest.mark.ci
+    def test_module_transfer(self, daemon):
+        """A host::module/path destination lands inside the module root only."""
+        result = _push("127.0.0.1::files", daemon.port)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(FILES_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def test_module_subtree(self, daemon):
+        """The /path part of host::module/path is relative inside the module."""
+        sub = os.path.join(FILES_MODULE, "subtree")
+        os.makedirs(sub, exist_ok=True)
+        result = _push("127.0.0.1::files/subtree", daemon.port)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(sub, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+
+class TestDaemonRejection:
+    def _tree_files(self):
+        """Snapshot every file path (module-relative) currently under the module
+        root tree, so confinement can be asserted by diff rather than by an
+        absolute 'empty' check (other tests legitimately populate modules)."""
+        files = set()
+        for root, _, names in os.walk(MODULE_ROOT):
+            for name in names:
+                full = os.path.join(root, name)
+                files.add(os.path.relpath(full, MODULE_ROOT))
+        return files
+
+    def test_read_only_module_blocked(self, daemon):
+        result = _push("127.0.0.1::readonly", daemon.port)
+        assert result.returncode != 0
+        assert _tree_file_count(READONLY_MODULE) == 0, "read-only module must not receive a file"
+
+    def test_read_only_no_write_anywhere(self, daemon):
+        """A refused read-only transfer must not add a single file anywhere under
+        the module root tree (negative confinement, not just the target)."""
+        before = self._tree_files()
+        result = _push("127.0.0.1::readonly", daemon.port)
+        assert result.returncode != 0
+        assert self._tree_files() == before, "read-only rejection wrote under the module root"
+
+    def test_unknown_module_rejected(self, daemon):
+        result = _push("127.0.0.1::no-such-module", daemon.port)
+        assert result.returncode != 0
+
+    def test_unknown_module_no_write_anywhere(self, daemon):
+        """An unknown module must be refused cleanly before any file lands
+        anywhere beneath the module root tree."""
+        before = self._tree_files()
+        result = _push("127.0.0.1::no-such-module", daemon.port)
+        assert result.returncode != 0
+        assert self._tree_files() == before, "unknown-module rejection wrote under the module root"
+
+    def test_module_less_destination_rejected(self, daemon):
+        """A daemon destination with no module name (host::/path) is refused at
+        parse time, before any connection payload is sent."""
+        result = _push("127.0.0.1::", daemon.port)
+        assert result.returncode != 0
+        result = _push("127.0.0.1::/sub", daemon.port)
+        assert result.returncode != 0
+
+    def test_dotdot_destination_rejected(self, daemon):
+        """A '..' path expansion in the module-relative path is refused at parse
+        time so a client cannot escape the module root while it is still on the
+        client side of the wire."""
+        result = _push("127.0.0.1::files/../..", daemon.port)
+        assert result.returncode != 0
+
+    def test_auth_module_without_credentials_rejected(self, daemon):
+        """Wave B: an auth-required module refuses a client that presents no
+        credentials (the daemon does not fall open)."""
+        result = _push("127.0.0.1::locked", daemon.port)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == 0
+
+    def _assert_ownership_refused(self, daemon, module, flags,
+                                  accept=("client-chosen ownership",)):
+        """A daemon module without `client owner = yes` refuses every
+        client-chosen ownership / super-user request at the config handshake,
+        before any data lands.  `accept` lists the log phrases that count as the
+        refusal (a non-root daemon refuses --copy-as earlier, at the privilege
+        check, so the caller accepts that phrase too)."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        before_files = self._tree_files()
+        result, _ = run_client(SOURCE_DIR, f"127.0.0.1::{module}", port=daemon.port, flags=flags)
+        assert result.returncode != 0, f"the daemon must refuse {flags}"
+        assert self._tree_files() == before_files, \
+            f"{flags} refusal wrote under the module root"
+        time.sleep(0.3)
+        with open(log_path, "rb") as f:
+            f.seek(before)
+            tail = f.read().decode("utf-8", "replace")
+        assert any(phrase in tail for phrase in accept), (
+            f"daemon did not log the ownership refusal: {tail[-400:]!r}"
+        )
+
+    def test_copy_as_refused_by_daemon(self, daemon):
+        """P7 Wave E hardening: a daemon refuses client-chosen ownership
+        (--copy-as) outright unless the module opts in with `client owner = yes`,
+        so even a root daemon must not honor an arbitrary client-selected owner
+        by default.  The refusal happens at the config handshake, before any data
+        lands."""
+        self._assert_ownership_refused(
+            daemon, "files", ["--copy-as=@65534:@65534"],
+            accept=("client-chosen ownership", "requires a privileged receiver"))
+
+    def test_super_refused_by_daemon(self, daemon):
+        """An explicit --super is a super-user activity request, so a daemon
+        module refuses it unless it opts in with `client owner = yes`.  The
+        refusal happens at the config handshake, before any data lands."""
+        self._assert_ownership_refused(daemon, "files", ["--super", "--preserve"])
+
+    def test_super_refused_by_no_super_daemon(self):
+        """A daemon started with the operator --no-super veto must still REFUSE
+        an explicit client --super on a non-opted module: the veto must not turn
+        the refusal into a silent accept."""
+        port = _find_free_port()
+        d = DaemonManager()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        try:
+            d.start(CONF_FILE, port_override=port,
+                    extra_args=["--password-file", CRED_FILE, "--no-super"])
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=d.port,
+                                   flags=["--super", "--preserve"])
+            assert result.returncode != 0, "the --no-super daemon must refuse --super"
+            with open(log_path, "rb") as f:
+                tail = f.read().decode("utf-8", "replace")
+            assert "client-chosen ownership" in tail, (
+                f"daemon did not log the --super refusal: {tail[-400:]!r}"
+            )
+        finally:
+            d.stop()
+
+    def test_numeric_ids_refused_by_daemon(self, daemon):
+        """P7 Wave E hardening (A1): the daemon ownership gate must cover the
+        pre-existing identity flags too, not only --copy-as/--super.  A module
+        without `client owner = yes` refuses --numeric-ids at the handshake."""
+        self._assert_ownership_refused(daemon, "files", ["--numeric-ids", "--preserve"])
+
+    def test_chown_refused_by_daemon(self, daemon):
+        """--chown is client-chosen ownership too and must be refused by a
+        non-opted-in module."""
+        self._assert_ownership_refused(daemon, "files", ["--chown=@65534:@65534", "--preserve"])
+
+    def test_owner_opt_in_allows_numeric_ids(self, daemon):
+        """A module that opts in with `client owner = yes` accepts the
+        client-chosen ownership flags (here --numeric-ids); the transfer
+        succeeds and lands inside that module root."""
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::owner", port=daemon.port,
+                               flags=["--numeric-ids", "--preserve"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(OWNER_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def _device_source(self, name):
+        src = os.path.join(TEST_DATA_DIR, name)
+        shutil.rmtree(src, ignore_errors=True)
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "wb") as fh:
+            fh.write(b"device gate\n")
+        os.mknod(os.path.join(src, "null"), stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        return src
+
+    @pytest.mark.skipif(not _can_mknod(), reason="device nodes need root/CAP_MKNOD")
+    def test_devices_skipped_without_owner_opt_in(self, daemon):
+        """H3: a non-opted daemon module must not create device nodes even under
+        the default AUTO super mode (a root daemon would otherwise let any client
+        mknod arbitrary devices).  An ordinary -a push still succeeds; the device
+        entry is skipped."""
+        src = self._device_source("devsrc_noowner")
+        os.makedirs(os.path.join(FILES_MODULE, "devskip"), exist_ok=True)
+        result, _ = run_client(src, "127.0.0.1::files/devskip", port=daemon.port, flags=["-a"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(os.path.join(FILES_MODULE, "devskip"), src)
+        node = os.path.join(received, "null")
+        assert not os.path.exists(node) or not stat.S_ISCHR(os.stat(node).st_mode), \
+            "non-opted daemon module created a device node"
+
+    @pytest.mark.skipif(not _can_mknod(), reason="device nodes need root/CAP_MKNOD")
+    def test_devices_created_with_owner_opt_in(self, daemon):
+        """Control: an opted-in module (`client owner = yes`) may create device
+        nodes under -a, proving the clamp is specific to non-opted modules."""
+        src = self._device_source("devsrc_owner")
+        os.makedirs(os.path.join(OWNER_MODULE, "devok"), exist_ok=True)
+        result, _ = run_client(src, "127.0.0.1::owner/devok", port=daemon.port, flags=["-a"])
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(os.path.join(OWNER_MODULE, "devok"), src)
+        node = os.path.join(received, "null")
+        assert os.path.exists(node) and stat.S_ISCHR(os.stat(node).st_mode), \
+            "opted-in daemon module did not create the device node"
+
+    @pytest.mark.daemon_detach
+    def test_real_detach_path(self):
+        """--daemon WITHOUT --no-detach double-forks a real background daemon;
+        a client can still transfer into the module root, and the orphaned
+        process is terminated cleanly (via SIGTERM after polling the port)."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", DETACH_CONF, "--allow-unauthenticated"]
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+        try:
+            _wait_for_port(DETACH_PORT, timeout=15)
+            result = _push("127.0.0.1::detach", DETACH_PORT)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(DETACH_MODULE, SOURCE_DIR)
+            _, missing = verify_transfer(SOURCE_DIR, received)
+            assert not missing, f"missing: {missing[:5]}"
+        finally:
+            _kill_by_cmdline_marker(DETACH_CONF)
+
+    def test_plaintext_requires_allow_unauthenticated(self):
+        """Secure default: a daemon started WITHOUT --allow-unauthenticated must
+        refuse a plaintext client (same posture as the standalone server)."""
+        d = DaemonManager()
+        port = _find_free_port()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_noauth.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", CONF_FILE, "--no-detach",
+                            "--password-file", CRED_FILE,
+                            "--dparam", f"port={port}"]
+        d._proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+        d._port = port
+        _wait_for_port(port, timeout=10)
+        try:
+            result = _push("127.0.0.1::files", port)
+            assert result.returncode != 0
+        finally:
+            d.stop()
+
+    def test_dparam_port_override(self):
+        """--dparam port=N overrides the config's port and the daemon serves on N."""
+        override = _find_free_port()
+        d = DaemonManager()
+        d.start(CONF_FILE, port_override=override, extra_args=["--password-file", CRED_FILE])
+        try:
+            result = _push("127.0.0.1::files", override)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(FILES_MODULE, SOURCE_DIR)
+            _, missing = verify_transfer(SOURCE_DIR, received)
+            assert not missing, f"missing: {missing[:5]}"
+        finally:
+            d.stop()
+
+
+# Numeric status values (must match the enum order in src/shared/protocol.h).
+STATUS_AUTH_CHALLENGE = 21
+STATUS_AUTH_RESPONSE = 22
+_AUTH_FRAME_MAX = 1 << 20
+
+
+def _wire_string_frame_len(buf, off):
+    """Return the total byte length of the wire string at buf[off], or None when
+    more bytes are needed."""
+    if len(buf) < off + 8:
+        return None
+    (length,) = struct.unpack_from("<Q", buf, off)
+    if length > _AUTH_FRAME_MAX:
+        raise ValueError("oversized auth frame string")
+    if len(buf) < off + 8 + length:
+        return None
+    return 8 + length
+
+
+def _client_cmd(dest, port, cred_path):
+    return CLIENT_CMD + ["--source-dir", SOURCE_DIR, "--dest-dir", dest,
+                         "--save-to-disk", "--server-port", str(port),
+                         "--password-file", cred_path]
+
+
+class _AuthReplayProxy:
+    """A one-connection-at-a-time TCP relay in front of the daemon.
+
+    The capture connection records the client's STATUS_AUTH_RESPONSE frame (the
+    status, the client nonce string and the proof string); the replay connection
+    substitutes that recorded frame for its own response, so the daemon sees a
+    proof bound to the FIRST connection's challenge nonce."""
+
+    def __init__(self, backend_port):
+        self.backend = ("127.0.0.1", backend_port)
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        self.server.settimeout(20)
+        self.port = self.server.getsockname()[1]
+        self.stolen = None
+        # Set when a relayed connection received a SCRAM challenge from the
+        # backend; lets a test assert the daemon refused before any challenge.
+        self.saw_challenge = False
+
+    def close(self):
+        try:
+            self.server.close()
+        except OSError:
+            pass
+
+    def _run_connection(self, capture):
+        client, _ = self.server.accept()
+        backend = socket.create_connection(self.backend, timeout=20)
+        client.settimeout(20)
+        backend.settimeout(20)
+        buf_c = b""
+        buf_s = b""
+        state = "config"
+        try:
+            while True:
+                ready, _, _ = select.select([client, backend], [], [], 20)
+                if not ready:
+                    break
+                eof = False
+                for sock in ready:
+                    data = sock.recv(65536)
+                    if not data:
+                        eof = True
+                        continue
+                    if sock is client:
+                        buf_c += data
+                    else:
+                        buf_s += data
+                if state == "config":
+                    if buf_c:
+                        backend.sendall(buf_c)
+                        buf_c = b""
+                    if len(buf_s) >= 4:
+                        (status,) = struct.unpack_from("<i", buf_s, 0)
+                        if status == STATUS_AUTH_CHALLENGE:
+                            self.saw_challenge = True
+                            off = 4 + 4  # status int + iteration int
+                            for _ in range(2):
+                                frame = _wire_string_frame_len(buf_s, off)
+                                if frame is None:
+                                    break
+                                off += frame
+                            else:
+                                client.sendall(buf_s[:off])
+                                buf_s = buf_s[off:]
+                                state = "auth"
+                        else:
+                            if buf_s:
+                                client.sendall(buf_s)
+                                buf_s = b""
+                            state = "relay"
+                elif state == "auth":
+                    if len(buf_c) >= 4:
+                        off = 4
+                        for _ in range(2):
+                            frame = _wire_string_frame_len(buf_c, off)
+                            if frame is None:
+                                break
+                            off += frame
+                        else:
+                            response = buf_c[:off]
+                            buf_c = buf_c[off:]
+                            if capture:
+                                self.stolen = response
+                                backend.sendall(response)
+                            else:
+                                assert self.stolen is not None
+                                backend.sendall(self.stolen)
+                            state = "relay"
+                    if buf_s:
+                        client.sendall(buf_s)
+                        buf_s = b""
+                else:
+                    if buf_c:
+                        backend.sendall(buf_c)
+                        buf_c = b""
+                    if buf_s:
+                        client.sendall(buf_s)
+                        buf_s = b""
+                if eof:
+                    break
+        finally:
+            client.close()
+            backend.close()
+
+
+class TestDaemonAuthentication:
+    """Wave B password authentication round-trips on the shared daemon (its
+    config declares `locked` with `auth users = alice` and `team` with
+    `auth users = alice,bob`; the server runs with CRED_FILE holding alice and
+    bob digest entries)."""
+
+    def test_correct_password_succeeds(self, daemon):
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "alice", ALICE_PASS)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(AUTH_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def test_wrong_password_rejected_no_data(self, daemon):
+        before = _tree_file_count(AUTH_MODULE)
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "alice", WRONG_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == before, "wrong password must not write a file"
+
+    def test_unknown_user_rejected(self, daemon):
+        """A user with a valid-shaped password but no store entry is refused
+        (the daemon must not fall open for unknown users)."""
+        before = _tree_file_count(AUTH_MODULE)
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "mallory", WRONG_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == before
+
+    def test_user_not_on_module_list_rejected(self, daemon):
+        """bob's credentials verify against the store, but bob is not on the
+        `locked` module's auth users list, so the connection is refused."""
+        before = _tree_file_count(AUTH_MODULE)
+        result = _push_with_creds("127.0.0.1::locked", daemon.port, "bob", BOB_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(AUTH_MODULE) == before
+
+    def test_second_module_user_succeeds(self, daemon):
+        """bob IS on the `team` module's list, so his correct password works
+        there (module list + credential store both gate)."""
+        result = _push_with_creds("127.0.0.1::team", daemon.port, "bob", BOB_PASS)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(TEAM_MODULE, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"missing: {missing[:5]}"
+        assert not mismatches, f"mismatch: {mismatches[:5]}"
+
+    def test_missing_password_file_rejected(self, daemon):
+        """A client with no --password-file at all is refused by an auth-required
+        module (no credentials on the wire)."""
+        result = _push("127.0.0.1::locked", daemon.port)
+        assert result.returncode != 0
+
+    def test_open_module_ignores_credentials(self, daemon):
+        """A module WITHOUT `auth users` stays open: credentials sent
+        opportunistically (even wrong ones) are ignored, not required."""
+        result = _push_with_creds("127.0.0.1::files", daemon.port, "alice", WRONG_PASS)
+        assert result.returncode == 0, result.stderr or result.stdout
+
+    def test_read_only_still_refuses_authenticated_client(self, daemon):
+        """Read-only is orthogonal to auth: an authenticated push to a read-only
+        module is still refused with no data written (Wave A behavior)."""
+        before = _tree_file_count(READONLY_MODULE)
+        result = _push_with_creds("127.0.0.1::readonly", daemon.port, "alice", ALICE_PASS)
+        assert result.returncode != 0
+        assert _tree_file_count(READONLY_MODULE) == before
+
+    def test_password_file_requires_daemon_dest(self, daemon):
+        """Client-side: --password-file without a host::module/path destination is
+        a client error (fail fast), not a silently ignored flag."""
+        cred_path = os.path.join(TEST_DATA_DIR, "client_local.pw")
+        _write_client_password_file(cred_path, "alice", ALICE_PASS)
+        try:
+            # A plain (non-::) destination with --password-file is rejected client-side.
+            cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR, "--dest-dir", "/tmp/local-dest-xyz",
+                                "--save-to-disk", "--password-file", cred_path,
+                                "--server-port", str(daemon.port)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            assert result.returncode != 0
+            assert "host::module/path" in (result.stderr or result.stdout)
+        finally:
+            os.unlink(cred_path)
+
+    @pytest.mark.ci
+    def test_remote_plaintext_credentials_rejected_client_side(self):
+        """A7-3/S1: sending daemon credentials to a clearly non-local daemon
+        WITHOUT --tls is refused by the client itself, before any network I/O
+        (192.0.2.0/24 is TEST-NET-1 and never reachable, so a network attempt
+        would time out instead of failing fast)."""
+        cred_path = os.path.join(TEST_DATA_DIR, "client_remote.pw")
+        _write_client_password_file(cred_path, "alice", ALICE_PASS)
+        try:
+            cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR,
+                                "--dest-dir", "192.0.2.1::files",
+                                "--save-to-disk", "--password-file", cred_path,
+                                "--server-port", "873"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            assert result.returncode != 0
+            combined = (result.stderr or "") + (result.stdout or "")
+            assert "--tls" in combined, combined
+        finally:
+            os.unlink(cred_path)
+
+    @pytest.mark.ci
+    def test_loopback_plaintext_refused_before_challenge_without_flag(self):
+        """A7-3/S1: an auth-required module reached over loopback plaintext is
+        refused at the config gate -- before any SCRAM challenge is sent -- when
+        the operator did NOT pass --allow-unauthenticated.  That flag is the
+        explicit opt-in that makes loopback plaintext an accepted auth
+        transport; it never permits remote plaintext auth.  A relay records the
+        daemon's first status frame so a challenge is directly observable."""
+        d = DaemonManager()
+        port = _find_free_port()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_noauth_auth.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", CONF_FILE, "--no-detach",
+                            "--password-file", CRED_FILE, "--dparam", f"port={port}"]
+        d._proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+        d._port = port
+        _wait_for_port(port, timeout=10)
+        proxy = _AuthReplayProxy(port)
+        try:
+            before = _tree_file_count(AUTH_MODULE)
+            cred = os.path.join(TEST_DATA_DIR, "noauth_loopback.pw")
+            _write_client_password_file(cred, "alice", ALICE_PASS)
+            proc = subprocess.Popen(_client_cmd("127.0.0.1::locked", proxy.port, cred),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proxy._run_connection(capture=True)
+            out, err = proc.communicate(timeout=30)
+            assert proc.returncode != 0, "auth over unflagged loopback plaintext must be refused"
+            assert not proxy.saw_challenge, "daemon sent a SCRAM challenge before the refusal"
+            assert _tree_file_count(AUTH_MODULE) == before, "a refused connection wrote data"
+            os.unlink(cred)
+        finally:
+            proxy.close()
+            d.stop()
+
+    def test_client_empty_password_file_rejected(self):
+        """Client-side: an empty --password-file is rejected (no credentials)."""
+        cred_path = os.path.join(TEST_DATA_DIR, "client_empty.pw")
+        with open(cred_path, "w") as f:
+            f.write("# nothing here\n")
+        os.chmod(cred_path, 0o600)
+        try:
+            cmd = CLIENT_CMD + ["--source-dir", SOURCE_DIR,
+                                "--dest-dir", "127.0.0.1::files",
+                                "--save-to-disk", "--password-file", cred_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            assert result.returncode != 0
+            assert "no 'user:password'" in (result.stderr or result.stdout)
+        finally:
+            os.unlink(cred_path)
+
+    def test_daemon_fails_closed_without_credential_store(self):
+        """Fail-closed startup: a config with an auth-required module but no
+        --password-file/--early-input refuses to start (never serves open)."""
+        proc = subprocess.run(
+            SERVER_CMD + ["--daemon", "--config", STARTFAIL_CONF, "--no-detach"],
+            capture_output=True, text=True, timeout=15)
+        assert proc.returncode != 0
+        assert "fail closed" in (proc.stderr or proc.stdout)
+
+    def test_daemon_early_input_feeds_credential_store(self):
+        """--early-input is an alternative credential store source: a daemon
+        started with --early-input (and no --password-file) authenticates alice."""
+        d = DaemonManager()
+        port = _find_free_port()
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=["--early-input", CRED_FILE])
+            result = _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
+            assert result.returncode == 0, result.stderr or result.stdout
+            # Wrong password over the early-input store is still rejected.
+            result = _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
+            assert result.returncode != 0
+        finally:
+            d.stop()
+
+    @pytest.mark.ci
+    def test_replayed_auth_response_rejected(self, daemon):
+        """A7 replay defense: an auth response captured from one connection is
+        refused on a second connection (the proof is bound to the challenge
+        nonce), and nothing is written to the module root."""
+        proxy = _AuthReplayProxy(daemon.port)
+        try:
+            cred_a = os.path.join(TEST_DATA_DIR, "replay_a.pw")
+            _write_client_password_file(cred_a, "alice", ALICE_PASS)
+            proc_a = subprocess.Popen(_client_cmd("127.0.0.1::locked", proxy.port, cred_a),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proxy._run_connection(capture=True)
+            out_a, err_a = proc_a.communicate(timeout=30)
+            assert proc_a.returncode == 0, err_a or out_a
+            assert proxy.stolen is not None
+            os.unlink(cred_a)
+
+            before = _tree_file_count(AUTH_MODULE)
+            cred_b = os.path.join(TEST_DATA_DIR, "replay_b.pw")
+            _write_client_password_file(cred_b, "alice", ALICE_PASS)
+            proc_b = subprocess.Popen(_client_cmd("127.0.0.1::locked", proxy.port, cred_b),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proxy._run_connection(capture=False)
+            out_b, err_b = proc_b.communicate(timeout=30)
+            assert proc_b.returncode != 0, "a replayed auth response must be refused"
+            assert _tree_file_count(AUTH_MODULE) == before, \
+                "a replayed auth response wrote data"
+            os.unlink(cred_b)
+        finally:
+            proxy.close()
+
+    def test_legacy_store_refuses_to_start(self):
+        """A legacy `user:SHA256HEX` store is hard-rejected: the daemon must not
+        start and must never accept a replayable bearer digest."""
+        legacy = os.path.join(TEST_DATA_DIR, "fastsyncd_legacy.passwd")
+        with open(legacy, "w") as f:
+            f.write("alice:9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3\n")
+        os.chmod(legacy, 0o600)
+        conf = os.path.join(TEST_DATA_DIR, "fastsyncd_legacy.conf")
+        port = _find_free_port()
+        with open(conf, "w") as f:
+            f.write("port = %d\n\n[locked]\npath = %s\nauth users = alice\n" % (port, AUTH_MODULE))
+        try:
+            proc = subprocess.run(
+                SERVER_CMD + ["--daemon", "--config", conf, "--no-detach",
+                              "--password-file", legacy],
+                capture_output=True, text=True, timeout=15)
+            assert proc.returncode != 0
+            combined = (proc.stderr or "") + (proc.stdout or "")
+            assert "legacy" in combined
+            assert "alice" in combined
+        finally:
+            os.unlink(legacy)
+            os.unlink(conf)
+
+    def test_auth_log_does_not_leak_password(self, daemon):
+        """The daemon log must never contain the password or the store verifier."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        _push_with_creds("127.0.0.1::locked", daemon.port, "alice", WRONG_PASS)
+        _push_with_creds("127.0.0.1::locked", daemon.port, "alice", ALICE_PASS)
+        time.sleep(0.3)
+        with open(log_path, "rb") as f:
+            f.seek(before)
+            tail = f.read().decode("utf-8", "replace")
+        assert ALICE_PASS not in tail
+        assert WRONG_PASS not in tail
+        for secret in _store_secrets(ALICE_LINE):
+            assert secret not in tail
+        assert "$fastsync$" not in tail
+
+    def test_auth_secrets_not_logged_at_debug_level(self):
+        """Under --verbose the daemon enables LOG_DEBUG_ALL, which normally
+        traces every protocol string -- the auth username/proof/signature must
+        NOT leak into that trace even then.  The redacted marker is logged
+        instead, while debug protocol logging is actually proving itself active."""
+        d = DaemonManager()
+        port = _find_free_port()
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=["--verbose",
+                                                               "--password-file", CRED_FILE])
+            _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
+            _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
+            time.sleep(0.3)
+            log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+            with open(log_path, "rb") as f:
+                log = f.read().decode("utf-8", "replace")
+        finally:
+            d.stop()
+        # Debug protocol tracing is genuinely active on the server: the auth
+        # fields were received (redacted marker) so the leak path is exercised.
+        assert "Received String: <redacted>" in log
+        # The secret-worthy fields must never appear, at any log level.
+        assert ALICE_PASS not in log
+        assert WRONG_PASS not in log
+        for secret in _store_secrets(ALICE_LINE):
+            assert secret not in log
+        assert "$fastsync$" not in log
+
+
+class TestDaemonMotd:
+    """Wave C MOTD: a daemon configured with a global `motd file` sends it to a
+    host::module/path client right after the config/auth handshake; the client
+    shows it on stdout unless --no-motd suppresses the display.  The MOTD is
+    escaped at display time so a hostile motd cannot inject terminal escapes.
+
+    Each test boots its own motd-configured daemon (the shared `daemon` fixture
+    config has no `motd file`).  The MOTD is only sent on the daemon listener
+    path; these all exercise `host::module` connections.
+    """
+
+    MOTD_MODULE = os.path.join(MODULE_ROOT, "motd_module")
+    MOTD_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_motd.conf")
+
+    def _start(self, motd_path):
+        port = _find_free_port()
+        motd_line = "motd file = %s\n" % motd_path if motd_path else ""
+        os.makedirs(self.MOTD_MODULE, exist_ok=True)
+        with open(self.MOTD_CONF, "w") as f:
+            f.write("port = %d\n%s\n[files]\npath = %s\n" % (port, motd_line, self.MOTD_MODULE))
+        d = DaemonManager()
+        d.start(self.MOTD_CONF, port_override=port)
+        return d, port
+
+    def _push(self, port, extra_args=None):
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=port,
+                               extra_args=extra_args)
+        return result
+
+    @pytest.mark.ci
+    def test_motd_displayed(self):
+        motd_path = os.path.join(TEST_DATA_DIR, "fastsyncd_motd_banner.txt")
+        banner = "Welcome to the FastSync test daemon\nSecond line here.\n"
+        with open(motd_path, "w") as f:
+            f.write(banner)
+        d, port = self._start(motd_path)
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "Welcome to the FastSync test daemon" in (result.stdout or "")
+            assert "Second line here." in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_no_motd_suppresses_display(self):
+        motd_path = os.path.join(TEST_DATA_DIR, "fastsyncd_motd_banner2.txt")
+        banner = "This banner must never be shown.\n"
+        with open(motd_path, "w") as f:
+            f.write(banner)
+        d, port = self._start(motd_path)
+        try:
+            result = self._push(port, extra_args=["--no-motd"])
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert banner.strip() not in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_absent_motd_file_no_error(self):
+        d, port = self._start(os.path.join(TEST_DATA_DIR, "no-such-motd-file.txt"))
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "no-such-motd" not in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_no_config_key_sends_no_banner(self):
+        d, port = self._start(None)
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "FastSync test daemon" not in (result.stdout or "")
+            assert "banner" not in (result.stdout or "")
+        finally:
+            d.stop()
+
+    def test_motd_control_bytes_are_escaped(self):
+        """A hostile motd (ANSI escape sequences) is displayed with every
+        control byte escaped octal-style, so no terminal escape reaches the
+        controlling terminal.  The transfer still succeeds (the motd is only
+        display text, never a wire/transfer hazard)."""
+        motd_path = os.path.join(TEST_DATA_DIR, "fastsyncd_motd_hostile.txt")
+        with open(motd_path, "w") as f:
+            f.write("hello\033[31mred\033[0m\n")
+        d, port = self._start(motd_path)
+        try:
+            result = self._push(port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            assert "\x1b" not in (result.stdout or ""), "raw ESC byte leaked to stdout"
+            assert "\\#033[31m" in (result.stdout or ""), result.stdout
+            assert "\\#033[0m" in (result.stdout or ""), result.stdout
+        finally:
+            d.stop()
+
+
+def _generate_tls_certs(cert_dir, extra_san_ips=None):
+    """Generate a self-signed CA, server cert (with 127.0.0.1 SAN plus any
+    extra_san_ips) and two client certs signed by that CA: one with the
+    expected CN (fastsync-client) and one with a WRONG CN, for the TLS+auth
+    composition and wrong-identity tests."""
+    os.makedirs(cert_dir, exist_ok=True)
+    ca_key, ca_cert = os.path.join(cert_dir, "ca.key"), os.path.join(cert_dir, "ca.pem")
+    server_key = os.path.join(cert_dir, "server.key")
+    server_cert = os.path.join(cert_dir, "server.pem")
+    client_key = os.path.join(cert_dir, "client.key")
+    client_cert = os.path.join(cert_dir, "client.pem")
+    wrong_client_key = os.path.join(cert_dir, "wrong_client.key")
+    wrong_client_cert = os.path.join(cert_dir, "wrong_client.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", ca_key, "-out", ca_cert, "-days", "1",
+                    "-subj", "/CN=FastSync Test CA"], check=True, capture_output=True)
+    san = os.path.join(cert_dir, "san.conf")
+    san_ips = ["IP.1 = 127.0.0.1"]
+    for index, ip in enumerate(extra_san_ips or [], start=2):
+        san_ips.append("IP.%d = %s" % (index, ip))
+    with open(san, "w") as f:
+        f.write("[req]\ndistinguished_name = dn\nreq_extensions = v3_req\n\n"
+                "[dn]\nCN = localhost\n\n[v3_req]\nsubjectAltName = @an\n\n"
+                "[an]\nDNS.1 = localhost\n" + "\n".join(san_ips) + "\n")
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", server_key, "-out", os.path.join(cert_dir, "server.csr"),
+                    "-subj", "/CN=localhost", "-config", san], check=True, capture_output=True)
+    subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "server.csr"),
+                    "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+                    "-out", server_cert, "-days", "1",
+                    "-extfile", san, "-extensions", "v3_req"], check=True, capture_output=True)
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", client_key, "-out", os.path.join(cert_dir, "client.csr"),
+                    "-subj", "/CN=fastsync-client"], check=True, capture_output=True)
+    subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "client.csr"),
+                    "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+                    "-out", client_cert, "-days", "1"], check=True, capture_output=True)
+    subprocess.run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", wrong_client_key, "-out", os.path.join(cert_dir, "wrong_client.csr"),
+                    "-subj", "/CN=wrong-client"], check=True, capture_output=True)
+    subprocess.run(["openssl", "x509", "-req", "-in", os.path.join(cert_dir, "wrong_client.csr"),
+                    "-CA", ca_cert, "-CAkey", ca_key, "-CAcreateserial",
+                    "-out", wrong_client_cert, "-days", "1"], check=True, capture_output=True)
+    return {
+        "ca": ca_cert,
+        "server_cert": server_cert,
+        "server_key": server_key,
+        "client_cert": client_cert,
+        "client_key": client_key,
+        "wrong_client_cert": wrong_client_cert,
+        "wrong_client_key": wrong_client_key,
+    }
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None,
+                    reason="openssl CLI required to mint test certificates")
+class TestDaemonTLSAuth:
+    """TLS + password-auth composition: --client-cn (TLS client identity) and
+    the module password credential check are independent; both can be required
+    on the same auth-required module.  Env-dependent: needs the openssl CLI."""
+
+    def test_tls_and_password_auth_compose(self):
+        cert_dir = os.path.join(TEST_DATA_DIR, "daemon_tls_certs")
+        certs = _generate_tls_certs(cert_dir)
+        client_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_client.pw")
+        _write_client_password_file(client_creds, "alice", ALICE_PASS)
+        d = DaemonManager()
+        port = _find_free_port()
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=[
+                "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
+                "--password-file", CRED_FILE])
+            tls_flags = ["--tls",
+                         "--cert", certs["client_cert"], "--key", certs["client_key"],
+                         "--ca", certs["ca"]]
+            # Correct password over TLS, with the right client CN: succeeds.
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::locked", port=port,
+                                   flags=tls_flags, extra_args=["--password-file", client_creds])
+            assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+            # Wrong password over TLS is still refused by the credential check.
+            bad_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_client_bad.pw")
+            _write_client_password_file(bad_creds, "alice", WRONG_PASS)
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::locked", port=port,
+                                   flags=tls_flags, extra_args=["--password-file", bad_creds])
+            assert result.returncode != 0
+            os.unlink(bad_creds)
+        finally:
+            d.stop()
+            os.unlink(client_creds)
+            shutil.rmtree(cert_dir, ignore_errors=True)
+
+    @pytest.mark.ci
+    def test_wrong_client_cn_refused_before_auth_challenge(self):
+        """A7-3/S1: with --tls AND --allow-unauthenticated, a loopback TLS peer
+        whose CA-valid client certificate does not match --client-cn is still
+        refused at the config gate -- before any SCRAM challenge is sent and
+        before any file data moves.  The --allow-unauthenticated flag only opts
+        in loopback PLAINTEXT; it must never turn a wrong-CN TLS peer into an
+        accepted auth transport.  Runs over 127.0.0.1 so it is deterministic and
+        never skips; the gate log line (emitted before server_auth_handshake)
+        plus the unchanged module tree prove the refusal preceded any challenge."""
+        cert_dir = os.path.join(TEST_DATA_DIR, "daemon_tls_certs_wrong")
+        certs = _generate_tls_certs(cert_dir)
+        client_creds = os.path.join(TEST_DATA_DIR, "daemon_tls_wrong_client.pw")
+        _write_client_password_file(client_creds, "alice", ALICE_PASS)
+        d = DaemonManager()
+        port = _find_free_port()
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        try:
+            d.start(CONF_FILE, port_override=port, extra_args=[
+                "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
+                "--password-file", CRED_FILE])
+            before_files = _tree_file_count(AUTH_MODULE)
+            log_before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            tls_flags = ["--tls",
+                         "--cert", certs["wrong_client_cert"], "--key",
+                         certs["wrong_client_key"], "--ca", certs["ca"]]
+            result, _ = run_client(SOURCE_DIR, "127.0.0.1::locked", port=port,
+                                   flags=tls_flags, extra_args=["--password-file", client_creds])
+            assert result.returncode != 0, "a wrong client CN must be refused"
+            assert _tree_file_count(AUTH_MODULE) == before_files, \
+                "a refused connection wrote file data"
+            with open(log_path, "rb") as f:
+                f.seek(log_before)
+                tail = f.read().decode("utf-8", "replace")
+            assert "requires authentication over an encrypted, verified TLS connection" in tail, \
+                tail[-400:]
+        finally:
+            d.stop()
+            os.unlink(client_creds)
+            shutil.rmtree(cert_dir, ignore_errors=True)

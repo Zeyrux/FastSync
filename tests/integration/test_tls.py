@@ -92,16 +92,19 @@ def setup_test_data():
     generate_test_files(SOURCE_DIR, full=False)
     clean_dir(DEST_DIR)
     yield
-    shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(SOURCE_DIR, ignore_errors=True)
+    shutil.rmtree(DEST_DIR, ignore_errors=True)
 
 
 class TestTLSBasic:
+    @pytest.mark.ci
     def test_tls_server_client(self, certs):
         """Basic TLS: server with cert/key, client with cert/key + CA."""
         clean_dir(DEST_DIR)
         with ServerManager() as server:
             server.start(extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
@@ -125,10 +128,11 @@ class TestTLSBasic:
         with ServerManager() as server:
             server.start(extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
-                flags=["-c", "--tls",
+                flags=["-z", "--tls",
                        "--cert", certs["client_cert"], "--key", certs["client_key"],
                        "--ca", certs["ca"]],
                 port=server.port,
@@ -149,10 +153,11 @@ class TestTLSBasic:
         with ServerManager() as server:
             server.start(extra_args=[
                 "--tls", "--cert", certs["server_cert"], "--key", certs["server_key"],
+                "--ca", certs["ca"], "--client-cn", "fastsync-client",
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
-                flags=["-m", "--tls",
+                flags=["--threads", "--tls",
                        "--cert", certs["client_cert"], "--key", certs["client_key"],
                        "--ca", certs["ca"]],
                 port=server.port,

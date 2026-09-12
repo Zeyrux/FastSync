@@ -14,6 +14,8 @@
 static Data* random_data(int min_size, int max_size) {
   int size = min_size + rand() % (max_size - min_size + 1);
   char* buf = malloc(size);
+  if (!buf)
+    return NULL;
   for (int i = 0; i < size; i++)
     buf[i] = (char)(rand() % 256);
   return data_create(buf, size);
@@ -81,10 +83,12 @@ static void test_property_chunk_roundtrip() {
 
     int content_len = 1 + rand() % 4096;
     char* content = malloc(content_len);
+    if (!content)
+      return;
     for (int i = 0; i < content_len; i++)
       content[i] = (char)(rand() % 256);
 
-    to_disk(path, content, content_len);
+    file_write_to_disk(path, content, content_len, false, false);
 
     struct stat st;
     stat(path, &st);

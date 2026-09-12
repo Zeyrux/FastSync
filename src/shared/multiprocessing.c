@@ -1,4 +1,6 @@
 #include "multiprocessing.h"
+#include "receiver.h"
+
 #include "array_list.h"
 #include "chunk.h"
 #include "config.h"
@@ -24,23 +26,90 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scanner_done = false;
   context->loader_done = false;
   context->manifest = NULL;
-  if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_full_scanner) != thrd_success ||
-      cnd_init(&context->condition_not_empty_scanner) != thrd_success ||
-      mtx_init(&context->mutex_loader, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_full_loader) != thrd_success ||
-      cnd_init(&context->condition_not_empty_loader) != thrd_success) {
-    perror("Error initializing synchronization objects");
-    free(context);
-    return NULL;
+  context->excluded_paths = NULL;
+  context->missing_args = NULL;
+  context->scan_had_io_error = false;
+  context->remove_source_files = NULL;
+  context->early_delete = false;
+  context->scan_stopped_early = false;
+  context->total_files = 0;
+  context->progress_bytes = 0;
+  context->total_bytes = 0;
+  context->sender_done = false;
+  atomic_init(&context->cancelled, false);
+  protocol_session_init(&context->allocation_session, -1, -1);
+  protocol_session_set_max_alloc(&context->allocation_session, config->max_alloc);
+  context->dir_entries = NULL;
+  context->dir_entries_mutex_init = false;
+  int init = 0;
+  if (config->use_metadata) {
+    context->dir_entries = array_list_create(file_destroy);
+    if (!context->dir_entries)
+      goto fail;
   }
+  if (mtx_init(&context->mutex_scanner, mtx_plain) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_full_scanner) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_empty_scanner) != thrd_success)
+    goto fail;
+  init++;
+  if (mtx_init(&context->mutex_loader, mtx_plain) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_full_loader) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_empty_loader) != thrd_success)
+    goto fail;
+  init++;
+  if (mtx_init(&context->mutex_progress, mtx_plain) != thrd_success)
+    goto fail;
+  // cppcheck-suppress unreadVariable
+  init++;
+  if (mtx_init(&context->dir_entries_mutex, mtx_plain) != thrd_success)
+    goto fail;
+  context->dir_entries_mutex_init = true;
   return context;
+
+fail:
+  log_perror("Error initializing synchronization objects");
+  if (context->dir_entries_mutex_init)
+    mtx_destroy(&context->dir_entries_mutex);
+  if (context->dir_entries)
+    array_list_delete(context->dir_entries);
+  if (init >= 6)
+    cnd_destroy(&context->condition_not_empty_loader);
+  if (init >= 5)
+    cnd_destroy(&context->condition_not_full_loader);
+  if (init >= 4)
+    mtx_destroy(&context->mutex_loader);
+  if (init >= 3)
+    cnd_destroy(&context->condition_not_empty_scanner);
+  if (init >= 2)
+    cnd_destroy(&context->condition_not_full_scanner);
+  if (init >= 1)
+    mtx_destroy(&context->mutex_scanner);
+  free(context);
+  return NULL;
 }
 
 void pipeline_context_sender_destroy(PipelineContextSender* context) {
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
+  if (context->excluded_paths)
+    array_list_delete(context->excluded_paths);
+  if (context->missing_args)
+    array_list_delete(context->missing_args);
+  if (context->remove_source_files)
+    array_list_delete(context->remove_source_files);
+  if (context->dir_entries)
+    array_list_delete(context->dir_entries);
+  if (context->dir_entries_mutex_init)
+    mtx_destroy(&context->dir_entries_mutex);
   config_delete(context->config);
   queue_destroy(context->queue_scanner);
   queue_destroy(context->queue_loader);
@@ -50,6 +119,7 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   mtx_destroy(&context->mutex_loader);
   cnd_destroy(&context->condition_not_full_loader);
   cnd_destroy(&context->condition_not_empty_loader);
+  mtx_destroy(&context->mutex_progress);
   free(context);
 }
 
@@ -62,136 +132,173 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->queue = queue;
   context->file_descriptor = file_descriptor;
   context->ssl = ssl;
+  context->outcomes.entries = NULL;
+  context->outcomes.count = 0;
+  context->outcomes.capacity = 0;
+  dir_time_list_init(&context->dir_times);
+  protocol_session_init(&context->session, file_descriptor, file_descriptor);
+  protocol_session_set_ssl(&context->session, ssl);
   context->receiver_done = false;
-  if (mtx_init(&context->mutex, mtx_plain) != thrd_success ||
-      cnd_init(&context->condition_not_full) != thrd_success ||
-      cnd_init(&context->condition_not_empty) != thrd_success) {
-    perror("Error initializing synchronization objects");
-    free(context);
-    return NULL;
-  }
+  context->queued_bytes = 0;
+  context->max_queue_bytes = 0;
+  context->deferred_manifest = NULL;
+  atomic_init(&context->cancelled, false);
+  int init = 0;
+  if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_full) != thrd_success)
+    goto fail;
+  init++;
+  if (cnd_init(&context->condition_not_empty) != thrd_success)
+    goto fail;
+  // cppcheck-suppress unreadVariable
+  init++;
   return context;
+
+fail:
+  log_perror("Error initializing synchronization objects");
+  if (init >= 3)
+    cnd_destroy(&context->condition_not_empty);
+  if (init >= 2)
+    cnd_destroy(&context->condition_not_full);
+  if (init >= 1)
+    mtx_destroy(&context->mutex);
+  free(context);
+  return NULL;
 }
 
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   config_delete(context->config);
+  if (context->deferred_manifest)
+    delete_manifest_free(context->deferred_manifest);
   queue_destroy(context->queue);
+  receiver_outcomes_destroy(&context->outcomes);
+  dir_time_list_free(&context->dir_times);
   mtx_destroy(&context->mutex);
   cnd_destroy(&context->condition_not_full);
   cnd_destroy(&context->condition_not_empty);
   free(context);
 }
 
-static bool receive_chunk_enqueue(int file_descriptor, PipelineContextReceiver* context) {
-  Chunk* chunk = receive_chunk_data(file_descriptor, context->config);
-  if (chunk == NULL)
-    return false;
+void pipeline_context_receiver_set_queue_byte_limit(PipelineContextReceiver* context,
+                                                    size_t max_bytes) {
+  if (context == NULL)
+    return;
+  mtx_lock(&context->mutex);
+  context->max_queue_bytes = max_bytes;
+  context->queued_bytes = 0;
+  cnd_broadcast(&context->condition_not_full);
+  mtx_unlock(&context->mutex);
+}
 
-  for (int i = 0; i < chunk->element_count; i++) {
-    File* file = chunk->items[i];
-    chunk->items[i] = NULL;
-    queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                &context->condition_not_empty, &context->condition_not_full);
+void pipeline_context_receiver_note_bytes_released(PipelineContextReceiver* context,
+                                                   size_t released_bytes) {
+  if (context == NULL || context->max_queue_bytes == 0 || released_bytes == 0)
+    return;
+  mtx_lock(&context->mutex);
+  if (released_bytes >= context->queued_bytes)
+    context->queued_bytes = 0;
+  else
+    context->queued_bytes -= released_bytes;
+  cnd_signal(&context->condition_not_full);
+  mtx_unlock(&context->mutex);
+}
+
+bool pipeline_context_receiver_enqueue_file(PipelineContextReceiver* context, File* file) {
+  if (context == NULL || file == NULL)
+    return false;
+  size_t file_bytes = file->data ? file->data->size : 0;
+  mtx_lock(&context->mutex);
+  while (!atomic_load(&context->cancelled)) {
+    bool blocked_by_count = queue_is_full(context->queue);
+    bool blocked_by_budget = false;
+    if (context->max_queue_bytes > 0) {
+      size_t budget = context->max_queue_bytes;
+      size_t used = context->queued_bytes;
+      if (used >= budget) {
+        blocked_by_budget = true;
+      } else if (file_bytes > budget - used) {
+        /* A single payload larger than the whole budget (not possible with
+           the per-file receive cap) is only admitted to an empty pipeline so
+           the wait can never deadlock. */
+        blocked_by_budget = used != 0;
+      }
+    }
+    if (!blocked_by_count && !blocked_by_budget)
+      break;
+    cnd_wait(&context->condition_not_full, &context->mutex);
   }
-  chunk_destroy(chunk);
+  if (atomic_load(&context->cancelled)) {
+    mtx_unlock(&context->mutex);
+    file_destroy(file);
+    return false;
+  }
+  if (!queue_enqueue(context->queue, file)) {
+    mtx_unlock(&context->mutex);
+    file_destroy(file);
+    return false;
+  }
+  context->queued_bytes += file_bytes;
+  cnd_signal(&context->condition_not_empty);
+  mtx_unlock(&context->mutex);
   return true;
+}
+
+static bool receiver_enqueue_file(File* file, void* context_pointer) {
+  PipelineContextReceiver* context = (PipelineContextReceiver*)context_pointer;
+  return pipeline_context_receiver_enqueue_file(context, file);
+}
+
+static void receiver_thread_fail(PipelineContextReceiver* context) {
+  mtx_lock(&context->mutex);
+  atomic_store(&context->cancelled, true);
+  context->receiver_done = true;
+  cnd_broadcast(&context->condition_not_empty);
+  cnd_broadcast(&context->condition_not_full);
+  mtx_unlock(&context->mutex);
 }
 
 int receive_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
-  if (context->ssl)
-    io_set_ssl(context->ssl);
+  protocol_session_bind(&context->session);
   mtx_lock(&context->mutex);
   int file_descriptor = context->file_descriptor;
   const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
-  Status status;
-  if (!receive_status(file_descriptor, &status))
+  ReceiverSink sink = {receiver_enqueue_file, context, false, false, NULL};
+  if (receiver_process_pending((Config*)config, file_descriptor, &sink,
+                               &context->deferred_manifest) != 0) {
+    receiver_thread_fail(context);
+    protocol_session_unbind();
     return thrd_error;
-  while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
-         status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH) {
-    if (status == STATUS_KEEPALIVE) {
-      send_status(file_descriptor, STATUS_KEEPALIVE);
-      goto next;
-    }
-    if (status == STATUS_ABORT) {
-      log_message(LOG_LEVEL_INFO, "Received abort from client, cleaning up");
-      return thrd_error;
-    }
-    if (status == STATUS_CHECK) {
-      bool skipped;
-      File* file = receive_incremental_check(file_descriptor, config, &skipped);
-      if (!skipped) {
-        if (file == NULL)
-          return thrd_error;
-        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                    &context->condition_not_empty, &context->condition_not_full);
-      }
-    } else if (status == STATUS_CHUNK) {
-      if (!receive_chunk_enqueue(file_descriptor, context))
-        return thrd_error;
-    } else if (status == STATUS_CHECK_BATCH) {
-      int count;
-      if (!receive_int(file_descriptor, &count))
-        return thrd_error;
-      for (int i = 0; i < count; i++) {
-        char* check_path = receive_str(file_descriptor);
-        if (!check_path)
-          return thrd_error;
-        unsigned long long check_size;
-        long long check_mtime;
-        if (!receive_n_data(file_descriptor, &check_size, sizeof(check_size)) ||
-            !receive_n_data(file_descriptor, &check_mtime, sizeof(check_mtime))) {
-          free(check_path);
-          return thrd_error;
-        }
-        char* full_path = path_cat(config->receive_root_directory, check_path);
-        struct stat st;
-        bool has_old = full_path && lstat(full_path, &st) == 0;
-        bool match = has_old && (unsigned long long)st.st_size == check_size &&
-                     (long long)st.st_mtime == check_mtime;
-        if (match)
-          send_status(file_descriptor, STATUS_OK);
-        else
-          send_status(file_descriptor, STATUS_NEXT);
-        free(full_path);
-        free(check_path);
-      }
-      goto next;
-    } else {
-      File* file = file_receive(config, file_descriptor);
-      if (file) {
-        queue_enqueue_multithreaded(context->queue, file, &context->mutex,
-                                    &context->condition_not_empty, &context->condition_not_full);
-      } else {
-        log_message(LOG_LEVEL_ERROR, "Failed to receive file");
-        return thrd_error;
-      }
-    }
-  next:
-    if (!receive_status(file_descriptor, &status))
-      return thrd_error;
-  }
-  if (status == STATUS_MANIFEST) {
-    if (receive_manifest(file_descriptor, config, &status) != 0)
-      return thrd_error;
   }
   mtx_lock(&context->mutex);
   context->receiver_done = true;
   cnd_signal(&context->condition_not_empty);
   mtx_unlock(&context->mutex);
+  protocol_session_unbind();
   return thrd_success;
 }
 
 int write_thread(void* pipeline_context) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)pipeline_context;
-  if (context->ssl)
-    io_set_ssl(context->ssl);
+  protocol_session_bind(&context->session);
   mtx_lock(&context->mutex);
   bool save_to_disk = context->config->save_to_disk;
   char* root_directory = str_dup(context->config->receive_root_directory);
   mtx_unlock(&context->mutex);
+  if (save_to_disk && !root_directory) {
+    mtx_lock(&context->mutex);
+    atomic_store(&context->cancelled, true);
+    context->receiver_done = true;
+    cnd_broadcast(&context->condition_not_full);
+    cnd_broadcast(&context->condition_not_empty);
+    mtx_unlock(&context->mutex);
+    protocol_session_unbind();
+    return thrd_error;
+  }
 
   while (true) {
     File* file =
@@ -199,10 +306,64 @@ int write_thread(void* pipeline_context) {
                                     &context->condition_not_full, &context->receiver_done);
     if (file == NULL) {
       free(root_directory);
+      protocol_session_unbind();
       return thrd_success;
     }
-    if (save_to_disk)
-      file_save_to_disk(root_directory, file, context->config);
+    size_t file_bytes = file->data ? file->data->size : 0;
+    FileSaveResult result = FILE_SAVE_SKIPPED;
+    if (save_to_disk) {
+      result = file_save_to_disk_full(root_directory, file, context->config);
+      if (result == FILE_SAVE_ERROR) {
+        file_destroy(file);
+        pipeline_context_receiver_note_bytes_released(context, file_bytes);
+        mtx_lock(&context->mutex);
+        atomic_store(&context->cancelled, true);
+        context->receiver_done = true;
+        cnd_broadcast(&context->condition_not_full);
+        cnd_broadcast(&context->condition_not_empty);
+        mtx_unlock(&context->mutex);
+        free(root_directory);
+        protocol_session_unbind();
+        return thrd_error;
+      }
+    }
+    /* P7 Wave D: a directory's times are never applied inline (a later child
+       write would clobber them); accumulate the metadata here and let the
+       caller apply it once every writer has drained. */
+    if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
+        context->config->use_metadata && !context->config->omit_dir_times &&
+        !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+      file_destroy(file);
+      pipeline_context_receiver_note_bytes_released(context, file_bytes);
+      mtx_lock(&context->mutex);
+      atomic_store(&context->cancelled, true);
+      context->receiver_done = true;
+      cnd_broadcast(&context->condition_not_full);
+      cnd_broadcast(&context->condition_not_empty);
+      mtx_unlock(&context->mutex);
+      free(root_directory);
+      protocol_session_unbind();
+      return thrd_error;
+    }
+    /* Record the per-file outcome so a --remove-source-files sender learns
+       which sources were actually written versus skipped on the receiver.
+       Explicit directory entries and recreated device/special nodes have no
+       source and are never acknowledged (mirrors receiver.c). */
+    if (context->config->remove_source_files && !file->is_dir && !file->is_special && !file->skip &&
+        !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
+      file_destroy(file);
+      pipeline_context_receiver_note_bytes_released(context, file_bytes);
+      mtx_lock(&context->mutex);
+      atomic_store(&context->cancelled, true);
+      context->receiver_done = true;
+      cnd_broadcast(&context->condition_not_full);
+      cnd_broadcast(&context->condition_not_empty);
+      mtx_unlock(&context->mutex);
+      free(root_directory);
+      protocol_session_unbind();
+      return thrd_error;
+    }
     file_destroy(file);
+    pipeline_context_receiver_note_bytes_released(context, file_bytes);
   }
 }

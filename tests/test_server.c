@@ -1,21 +1,22 @@
 #include "test_server.h"
 #include "config.h"
+#include "delta.h"
 #include "file.h"
+#include "log.h"
 #include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
-/* Include server.c but rename main to avoid conflict with test runner's main */
-#define main server_main_
-#define FASTSYNC_SERVER_AS_LIB
-#include "server.c"
-#undef main
+#include "receiver.h"
 
 /* Test receive_files with immediate FINISHED status */
 static void test_receive_files_finished() {
@@ -36,7 +37,7 @@ static void test_receive_files_finished() {
     /* Child: use p[0] for both read and write */
     close(p[1]);
     io_set_fds(p[0], p[0]);
-    int ret = receive_files(cfg, p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     _exit(ret == 0 ? 0 : 1);
@@ -88,7 +89,7 @@ static void test_receive_files_single_file() {
     /* Child: use p[0] for both read and write */
     close(p[1]);
     io_set_fds(p[0], p[0]);
-    int ret = receive_files(cfg, p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     _exit(ret == 0 ? 0 : 1);
@@ -149,7 +150,7 @@ static void test_receive_files_abort() {
   if (pid == 0) {
     close(p[1]);
     io_set_fds(p[0], p[0]);
-    int ret = receive_files(cfg, p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
     close(p[0]);
     config_delete(cfg);
     /* Should return -1 on abort */
@@ -171,10 +172,611 @@ static void test_receive_files_abort() {
   }
 }
 
+static void test_receive_manifest_rejects_traversal() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "../outside"));
+  EXPECT_NULL(receive_manifest_entries(p[0]));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+static void test_receive_incremental_check_rejects_invalid_nanoseconds() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  EXPECT_TRUE(send_str(p[1], "file.txt"));
+  unsigned long long size = 0;
+  long long mtime = 100;
+  long long mtime_nsec = 1000000000LL;
+  EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+  EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+  EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+
+  bool skipped = false;
+  EXPECT_NULL(receive_incremental_check(p[0], cfg, &skipped));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
+  EXPECT_FALSE(skipped);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+static char* make_check_root(const char* tag) {
+  char tmpl[128];
+  snprintf(tmpl, sizeof(tmpl), "/tmp/fastsync_%s_XXXXXX", tag);
+  char* path = str_dup(tmpl);
+  if (!path)
+    return NULL;
+  if (!mkdtemp(path)) {
+    free(path);
+    return NULL;
+  }
+  return path;
+}
+
+static void write_check_file(const char* dir, const char* name, const char* content) {
+  /* Sized so a caller that passes a PATH_MAX-bounded `dir` (e.g. one of the
+     test's own char[1024] stack buffers) still provably fits with the joined
+     name, keeping -Werror=format-truncation quiet. */
+  char path[4096];
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd >= 0) {
+    size_t len = strlen(content);
+    if (write(fd, content, len) != (ssize_t)len) {
+      /* intentionally ignored in tests */
+    }
+    close(fd);
+  }
+}
+
+/* Issue #255: a same-size/mtime match is decided from metadata alone, so the
+   receiver answers STATUS_OK (skip) and never asks for a data body. */
+static void test_incremental_check_quick_skip_by_mtime() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* root = make_check_root("qskip");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+  write_check_file(root, "file.txt", "0123456789abcdef");
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/file.txt", root);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    File* file = receive_incremental_check(p[0], cfg, &skipped);
+    bool ok = file == NULL && skipped;
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = (unsigned long long)st.st_size;
+    long long mtime = (long long)st.st_mtime;
+    long long mtime_nsec = 0;
+#ifdef __linux__
+    mtime_nsec = (long long)st.st_mtim.tv_nsec;
+#endif
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_OK);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    unlink(path);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* Issue #255: a size mismatch cannot be a skip, so the receiver answers
+   STATUS_NEXT and consumes the full data body that follows. */
+static void test_incremental_check_size_mismatch_full_transfer() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* root = make_check_root("qnext");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+  write_check_file(root, "file.txt", "0123456789abcdef");
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/file.txt", root);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    File* file = receive_incremental_check(p[0], cfg, &skipped);
+    bool ok = file != NULL && !skipped && file->path != NULL && strcmp(file->path, "file.txt") == 0;
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = (unsigned long long)st.st_size + 1;
+    long long mtime = (long long)st.st_mtime;
+    long long mtime_nsec = 0;
+#ifdef __linux__
+    mtime_nsec = (long long)st.st_mtim.tv_nsec;
+#endif
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_NEXT);
+
+    Data* body = data_create_reserve(8);
+    EXPECT_NOT_NULL(body);
+    body->data = malloc(8);
+    EXPECT_NOT_NULL(body->data);
+    memcpy(body->data, "replaced", 8);
+    body->size = 8;
+    EXPECT_TRUE(send_data(p[1], body));
+    data_destroy(body);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    unlink(path);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* Issue #256: when a received delta claims a result above the whole-file cap,
+   receive_delta_file must mark the operation failed so the caller aborts with
+   STATUS_ERROR instead of emitting STATUS_NEXT and waiting for a body that
+   never arrives. */
+static void test_incremental_check_delta_oversize_reports_failure() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* root = make_check_root("qdelta");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delta = true;
+
+  char content[20000];
+  memset(content, 'a', sizeof(content));
+  content[sizeof(content) - 1] = '\0';
+  write_check_file(root, "file.txt", content);
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/file.txt", root);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)st.st_size, 19999);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    File* file = receive_incremental_check(p[0], cfg, &skipped);
+    bool ok = file == NULL && !skipped;
+    if (ok)
+      send_status(p[0], STATUS_ERROR); /* mirror the server error path */
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = (unsigned long long)st.st_size;
+    long long mtime = 1; /* different from the file mtime: force a transfer */
+    long long mtime_nsec = 0;
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_DELTA_SIGNATURE);
+    Data* sig_data = receive_data(p[1]);
+    EXPECT_NOT_NULL(sig_data);
+    DeltaSignature* sig = delta_signature_deserialize(sig_data);
+    EXPECT_NOT_NULL(sig);
+    delta_signature_destroy(sig);
+    data_destroy(sig_data);
+
+    /* Send a delta whose claimed output size exceeds the whole-file cap. */
+    Delta delta;
+    memset(&delta, 0, sizeof(delta));
+    delta.new_file_size = MAX_RECEIVE_WHOLE_FILE_SIZE + 1;
+    Data* bogus = delta_serialize(&delta);
+    EXPECT_NOT_NULL(bogus);
+    EXPECT_TRUE(send_status(p[1], STATUS_DELTA_DATA));
+    EXPECT_TRUE(bogus != NULL && send_data(p[1], bogus));
+    data_destroy(bogus);
+
+    /* The receiver must answer with an error, never with STATUS_NEXT. */
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_ERROR);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    unlink(path);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* Late-timing keep-set leak guard: a manifest parked by the commit path must
+   be freed on every error exit, never leaked.  These tests drive
+   receiver_process_pending() through an error AFTER the manifest was parked and
+   are exercised under ASan/valgrind to prove the list is released. */
+
+static Config* make_late_delete_config(const char* root) {
+  Config* cfg = config_create();
+  if (!cfg)
+    return NULL;
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  cfg->delete_after = true;
+  return cfg;
+}
+
+static int run_pending_receiver(Config* cfg, int fd, DeleteManifest** pending) {
+  ReceiverSink sink = {0};
+  return receiver_process_pending(cfg, fd, &sink, pending);
+}
+
+static void test_late_manifest_abort_frees_keepset() {
+  Config* cfg = make_late_delete_config("/tmp/fastsync_late_abort");
+  EXPECT_NOT_NULL(cfg);
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  EXPECT_TRUE(send_status(p[1], STATUS_ABORT));
+
+  DeleteManifest* pending = NULL;
+  EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
+  EXPECT_NULL(pending);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+static void test_late_manifest_eof_frees_keepset() {
+  Config* cfg = make_late_delete_config("/tmp/fastsync_late_eof");
+  EXPECT_NOT_NULL(cfg);
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  shutdown(p[1], SHUT_WR);
+
+  DeleteManifest* pending = NULL;
+  EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
+  EXPECT_NULL(pending);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+static void test_late_second_manifest_frees_both() {
+  Config* cfg = make_late_delete_config("/tmp/fastsync_late_second");
+  EXPECT_NOT_NULL(cfg);
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "first.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "second.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+
+  DeleteManifest* pending = NULL;
+  EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
+  EXPECT_NULL(pending);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+/* A delete-manifest frame with a third (missing-args) section round-trips: the
+   receiver keeps all three sections and the missing paths are confined exactly
+   like the keep-set (a traversal entry in the missing section is rejected).
+   receive_manifest_entries() reads the counts directly (the leading
+   STATUS_MANIFEST code is consumed by the caller, so these frames do not send
+   it). */
+static void test_receive_manifest_three_sections() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "protected.txt"));
+  EXPECT_TRUE(send_int(p[1], 2));
+  EXPECT_TRUE(send_str(p[1], "gone.txt"));
+  EXPECT_TRUE(send_str(p[1], "dir/gone.bin"));
+
+  DeleteManifest* manifest = receive_manifest_entries(p[0]);
+  EXPECT_NOT_NULL(manifest);
+  EXPECT_EQ_INT(manifest->keeps->size, 1);
+  EXPECT_EQ_STR((char*)manifest->keeps->items[0], "keep.txt");
+  EXPECT_EQ_INT(manifest->protected->size, 1);
+  EXPECT_EQ_STR((char*)manifest->protected->items[0], "protected.txt");
+  EXPECT_EQ_INT(manifest->missing->size, 2);
+  EXPECT_EQ_STR((char*)manifest->missing->items[0], "gone.txt");
+  EXPECT_EQ_STR((char*)manifest->missing->items[1], "dir/gone.bin");
+  delete_manifest_free(manifest);
+
+  /* A traversal entry in the third section is rejected like every other. */
+  EXPECT_TRUE(send_int(p[1], 0));
+  EXPECT_TRUE(send_int(p[1], 0));
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "../escape"));
+  EXPECT_NULL(receive_manifest_entries(p[0]));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
+/* --delete-missing-args exact-path deletions: regular files and empty
+   directories are removed, a non-empty directory survives without
+   --force/--delete and is recursively removed with --force or --delete, and a
+   missing mirror is a no-op. */
+static void test_manifest_delete_missing_args() {
+  char* root = make_check_root("qmissing");
+  EXPECT_NOT_NULL(root);
+  write_check_file(root, "gone.txt", "stale");
+  char empty_dir[1024], full_dir[1024], inner[1024];
+  snprintf(empty_dir, sizeof(empty_dir), "%s/empty_dir", root);
+  snprintf(full_dir, sizeof(full_dir), "%s/full_dir", root);
+  snprintf(inner, sizeof(inner), "%s/full_dir/inner.txt", root);
+  EXPECT_EQ_INT(mkdir(empty_dir, 0755), 0);
+  EXPECT_EQ_INT(mkdir(full_dir, 0755), 0);
+  write_check_file(full_dir, "inner.txt", "content");
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->delete_missing_args = true;
+
+  DeleteManifest* manifest = calloc(1, sizeof(DeleteManifest));
+  EXPECT_NOT_NULL(manifest);
+  manifest->keeps = array_list_create(free);
+  manifest->protected = array_list_create(free);
+  manifest->missing = array_list_create(free);
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("gone.txt")));
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("empty_dir")));
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("full_dir")));
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("never_here.txt")));
+  /* A deeper entry whose destination parent directory does not exist is a
+     no-op (nothing to delete), never a failure. */
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("no_parent_here/gone.txt")));
+
+  /* Without --delete/--force the non-empty directory survives (rsync parity). */
+  EXPECT_TRUE(manifest_delete_missing_args(cfg, manifest));
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/gone.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/empty_dir", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/full_dir", root);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+  EXPECT_EQ_INT(access(inner, F_OK), 0);
+
+  /* With --force the non-empty directory mirror is removed recursively. */
+  cfg->force_delete = true;
+  EXPECT_TRUE(array_list_add(manifest->missing, str_dup("full_dir")));
+  EXPECT_TRUE(manifest_delete_missing_args(cfg, manifest));
+  EXPECT_EQ_INT(access(full_dir, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/no_parent_here", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+
+  delete_manifest_free(manifest);
+  config_delete(cfg);
+  remove(full_dir);
+  rmdir(empty_dir);
+  rmdir(root);
+  free(root);
+}
+
+/* A delete-missing-args manifest parked by the commit path is committed after
+   STATUS_FINISHED: the mirror that exists is removed, a missing mirror is a
+   no-op, and unrelated destination content is untouched (no --delete). */
+static void test_receiver_pending_commits_missing_args() {
+  char* root = make_check_root("qmisscomm");
+  EXPECT_NOT_NULL(root);
+  write_check_file(root, "gone.txt", "stale");
+  write_check_file(root, "extra.txt", "unrelated");
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->delete_missing_args = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
+  EXPECT_TRUE(send_int(p[1], 0)); /* keep-set empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected empty */
+  EXPECT_TRUE(send_int(p[1], 2));
+  EXPECT_TRUE(send_str(p[1], "gone.txt"));
+  EXPECT_TRUE(send_str(p[1], "never_here.txt"));
+  EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
+
+  /* NULL pending: the single-threaded commit path deletes at FINISHED.  The
+     sink sends the terminal STATUS_OK success frame. */
+  ReceiverSink sink = {.send_success = true};
+  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL), 0);
+  Status ack;
+  EXPECT_TRUE(receive_status(p[1], &ack));
+  EXPECT_EQ_INT(ack, STATUS_OK);
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/gone.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), -1);
+  snprintf(path, sizeof(path), "%s/extra.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+  {
+    /* remove fixtures */
+    char pth[1024];
+    snprintf(pth, sizeof(pth), "%s/extra.txt", root);
+    remove(pth);
+    rmdir(root);
+  }
+  free(root);
+}
+
+/* A6: an attacker-controlled file path appearing in a log line must be escaped
+   so a control byte cannot forge a second log record.  The socket special-node
+   branch logs file->path before touching the filesystem, making it a cheap way
+   to exercise an escaped site.  The captured line must contain the escaped path
+   (`\#012` for the newline), never the raw control byte. */
+static void test_special_socket_path_log_escaped() {
+  set_log_level(LOG_LEVEL_WARNING);
+  log_set_8_bit_output(false);
+
+  FILE* capture = tmpfile();
+  EXPECT_NOT_NULL(capture);
+  log_set_file(capture);
+
+  File* file = file_create("evil\npath");
+  EXPECT_NOT_NULL(file);
+  file->is_special = true;
+  file->metadata = calloc(1, sizeof(FileMetadata));
+  EXPECT_NOT_NULL(file->metadata);
+  file->metadata->mode = S_IFSOCK | 0644;
+
+  FileSaveResult result = file_save_to_disk_full("/tmp/dst", file, NULL);
+  EXPECT_EQ_INT(result, FILE_SAVE_SKIPPED);
+
+  fflush(capture);
+  rewind(capture);
+  char output[512] = {0};
+  size_t length = fread(output, 1, sizeof(output) - 1, capture);
+  output[length] = '\0';
+
+  log_set_file(NULL);
+  fclose(capture);
+  file_destroy(file);
+
+  EXPECT_NOT_NULL(strstr(output, "socket not recreated: evil\\#012path"));
+}
+
 void test_server() {
+  test_special_socket_path_log_escaped();
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
     test_receive_files_single_file();
     test_receive_files_abort();
+    test_receive_manifest_rejects_traversal();
+    test_receive_incremental_check_rejects_invalid_nanoseconds();
+    test_incremental_check_quick_skip_by_mtime();
+    test_incremental_check_size_mismatch_full_transfer();
+    test_incremental_check_delta_oversize_reports_failure();
+    test_late_manifest_abort_frees_keepset();
+    test_late_manifest_eof_frees_keepset();
+    test_late_second_manifest_frees_both();
+    test_receive_manifest_three_sections();
+    test_manifest_delete_missing_args();
+    test_receiver_pending_commits_missing_args();
   }
 }

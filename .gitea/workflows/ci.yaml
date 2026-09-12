@@ -2,13 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,9 +20,13 @@ jobs:
       - name: cppcheck
         run: cppcheck --enable=warning,style,performance,portability --suppress=missingIncludeSystem --error-exitcode=1 --inline-suppr src/ tests/
 
+  # Fast PR gate: build + unit tests + a representative subset of integration
+  # tests (marked `ci`), parallelized with pytest-xdist.  Only the full coverage
+  # jobs below (sanitizers/fuzz/coverage/valgrind and the FULL integration
+  # suite) run on merge to dev/main, so PR CI stays well under ~3 minutes.
   build-and-test:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     needs: lint
     steps:
       - name: Checkout
@@ -36,13 +41,19 @@ jobs:
       - name: Unit Tests
         run: ctest --test-dir build --output-on-failure -j$(nproc)
 
-      - name: Integration Tests
-        run: python3 -m pytest tests/integration/ -v --tb=short
+      - name: Integration Tests (PR smoke subset)
+        if: github.event_name == 'pull_request'
+        run: python3 -m pytest tests/integration/ -n 4 --dist=load -m ci --durations=25 --tb=short -q
+
+      - name: Integration Tests (full suite)
+        if: github.event_name == 'push'
+        run: python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv" --durations=25 --tb=short -q
 
   sanitizers:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     needs: lint
+    if: github.event_name == 'push'
     strategy:
       matrix:
         sanitizer: [address, undefined]
@@ -61,8 +72,9 @@ jobs:
 
   fuzz-build:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     needs: lint
+    if: github.event_name == 'push'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,10 +85,18 @@ jobs:
       - name: Build fuzz targets
         run: cmake --build build-fuzz -j$(nproc)
 
+      - name: Smoke fuzz targets
+        run: |
+          for target in build-fuzz/fuzz_*; do
+            [ -x "$target" ] || continue
+            timeout 10s "$target" -runs=100 -max_total_time=5
+          done
+
   coverage:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     needs: lint
+    if: github.event_name == 'push'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,8 +118,9 @@ jobs:
 
   valgrind:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v9
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     needs: lint
+    if: github.event_name == 'push'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

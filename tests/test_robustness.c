@@ -13,7 +13,7 @@
 static void test_chunk_deserialize_truncated() {
   char* path = "test_rob_trunc.txt";
   char* content = "hello";
-  to_disk(path, content, strlen(content));
+  file_write_to_disk(path, content, strlen(content), false, false);
 
   struct stat st;
   stat(path, &st);
@@ -107,6 +107,20 @@ static void test_delta_deserialize_garbage() {
   EXPECT_NULL(result);
 
   data_destroy(d);
+}
+
+static void test_delta_deserialize_respects_max_alloc() {
+  unsigned char serialized[sizeof(uint64_t) + sizeof(uint32_t)] = {0};
+  Data data = {.data = serialized, .size = sizeof(serialized)};
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_set_max_alloc(&session, sizeof(Delta) - 1);
+  protocol_session_bind(&session);
+
+  const Delta* result = delta_deserialize(&data);
+  EXPECT_NULL(result);
+
+  protocol_session_unbind();
 }
 
 static void test_delta_signature_deserialize_truncated() {
@@ -206,6 +220,7 @@ void test_robustness() {
   test_delta_deserialize_truncated();
   test_delta_deserialize_empty();
   test_delta_deserialize_garbage();
+  test_delta_deserialize_respects_max_alloc();
   test_delta_deserialize_truncated_instructions();
   test_delta_signature_deserialize_truncated();
   test_delta_apply_null();

@@ -1,16 +1,18 @@
+#include "log.h"
 #include "array_list.h"
+#include "protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 ArrayList* array_list_create(void (*item_destroyer)(void* item)) {
-  ArrayList* list = (ArrayList*)malloc(sizeof(ArrayList));
+  ArrayList* list = (ArrayList*)protocol_alloc(sizeof(ArrayList));
   if (list == NULL) {
-    perror("ERROR: Could not allocate memory for array list struct");
+    log_perror("ERROR: Could not allocate memory for array list struct");
     return NULL;
   }
 
-  list->items = malloc(INITIAL_ARRAY_SIZE * sizeof(void*));
+  list->items = protocol_alloc(INITIAL_ARRAY_SIZE * sizeof(void*));
   if (list->items == NULL) {
     free(list);
     return NULL;
@@ -34,15 +36,15 @@ void array_list_delete(ArrayList* array_list) {
   free(array_list);
 }
 
-bool array_list_extend(ArrayList* array_list) {
+static bool array_list_extend(ArrayList* array_list) {
   if (array_list == NULL)
     return false;
   int new_capacity = array_list->capacity * 2;
   if (new_capacity == 0)
     new_capacity = INITIAL_ARRAY_SIZE;
-  void* new_items = realloc(array_list->items, new_capacity * sizeof(void*));
+  void* new_items = protocol_realloc(array_list->items, new_capacity * sizeof(void*));
   if (new_items == NULL) {
-    perror("ERROR: Could not reallocate memory for array list items");
+    log_perror("ERROR: Could not reallocate memory for array list items");
     return false;
   }
   array_list->items = new_items;
@@ -66,9 +68,9 @@ void** array_list_to_array(const ArrayList* array_list) {
   if (array_list == NULL) {
     return NULL;
   }
-  void** array = malloc(array_list->size * sizeof(void*));
+  void** array = protocol_alloc(array_list->size * sizeof(void*));
   if (array == NULL) {
-    perror("Could not malloc space for array from array list!");
+    log_perror("Could not malloc space for array from array list!");
     return NULL;
   }
   memcpy(array, array_list->items, array_list->size * sizeof(void*));

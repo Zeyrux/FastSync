@@ -2,10 +2,11 @@
 import subprocess
 import sys
 import os
+import shutil
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import BUILD_DIR, CLIENT_CMD, SERVER_CMD
+from common import BUILD_DIR, CLIENT_CMD, SERVER_CMD, TEST_DATA_DIR, run_client, verify_transfer
 
 
 class TestHelp:
@@ -79,3 +80,58 @@ class TestServerPort:
         finally:
             proc.terminate()
             proc.wait(timeout=5)
+
+
+def _seed_protocol_source(source):
+    os.makedirs(source, exist_ok=True)
+    with open(os.path.join(source, "p.txt"), "w") as fh:
+        fh.write("protocol test\n")
+    os.makedirs(os.path.join(source, "nested"), exist_ok=True)
+    with open(os.path.join(source, "nested", "deep.txt"), "w") as fh:
+        fh.write("deep file\n")
+
+
+class TestProtocol:
+    @pytest.mark.ci
+    def test_protocol_current_version_accepted(self, shared_server):
+        """--protocol=2.19.0 (the current PROTOCOL_VERSION) is accepted and the
+        transfer completes normally."""
+        source = os.path.join(TEST_DATA_DIR, "proto_ok_src")
+        dest = os.path.join(TEST_DATA_DIR, "proto_ok_dst")
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest)
+        _seed_protocol_source(source)
+        result, _ = run_client(source, dest, flags=["--protocol=2.19.0"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--protocol current run failed: {(result.stderr or result.stdout)[:400]}"
+        received = os.path.join(dest, os.path.abspath(source).lstrip(os.sep))
+        mismatches, missing = verify_transfer(source, received)
+        assert not mismatches and not missing, \
+            f"transfer mismatch: missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_protocol_rejects_other_versions(self, shared_server):
+        """Other versions are rejected up front, before connecting."""
+        source = os.path.join(TEST_DATA_DIR, "proto_reject_src")
+        dest = os.path.join(TEST_DATA_DIR, "proto_reject_dst")
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest)
+        _seed_protocol_source(source)
+        for bad in ("2.18.0", "2.17.0", "2.15.0", "2.16.0", "216", "31"):
+            result, _ = run_client(source, dest, flags=[f"--protocol={bad}"],
+                                   port=shared_server.port)
+            assert result.returncode != 0, f"--protocol={bad} should be rejected"
+
+    @pytest.mark.ci
+    def test_protocol_rejects_garbage(self, shared_server):
+        """Garbage/empty --protocol values are rejected up front."""
+        source = os.path.join(TEST_DATA_DIR, "proto_garbage_src")
+        dest = os.path.join(TEST_DATA_DIR, "proto_garbage_dst")
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest)
+        _seed_protocol_source(source)
+        for bad in ("abc", ""):
+            result, _ = run_client(source, dest, flags=[f"--protocol={bad}"],
+                                   port=shared_server.port)
+            assert result.returncode != 0, f"--protocol={bad} should be rejected"

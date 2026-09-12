@@ -1,17 +1,33 @@
 #include "client_send.h"
+#include "client_validation.h"
+#include "charset.h"
+#include "chmod.h"
+#include "compression.h"
 #include "config.h"
+#include "credentials.h"
 #include "delta.h"
+#include "file.h"
+#include "file_list.h"
+#include "filter.h"
+#include "identity.h"
 #include "log.h"
 #include "protocol.h"
+#include "stop_condition.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
+#include "usage.h"
 #include "utils.h"
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef FASTSYNC_TEST_BUILD
 /* Parse environment variables for source/destination directories and save-to-disk flag. */
 static void parse_environment(const char** out_env_source, const char** out_env_dest,
                               bool* out_save_to_disk) {
@@ -22,19 +38,7 @@ static void parse_environment(const char** out_env_source, const char** out_env_
   if (env_save && (strcmp(env_save, "true") == 0 || strcmp(env_save, "1") == 0))
     *out_save_to_disk = true;
 }
-
-/* Parse a string as a positive integer, returning true on success. */
-static bool parse_positive_int(const char* s, int* out_val) {
-  if (!s || *s == '\0')
-    return false;
-  char* endptr;
-  errno = 0;
-  long val = strtol(s, &endptr, 10);
-  if (errno != 0 || *endptr != '\0' || val <= 0 || val > INT_MAX)
-    return false;
-  *out_val = (int)val;
-  return true;
-}
+#endif
 
 /* Parse a string as a non-negative integer, returning true on success. */
 static bool parse_nonneg_int(const char* s, int* out_val) {
@@ -49,520 +53,1504 @@ static bool parse_nonneg_int(const char* s, int* out_val) {
   return true;
 }
 
-static void print_usage(void);
+/* Parse a string as a positive integer, returning true on success. */
+static bool parse_positive_int(const char* s, int* out_val) {
+  int temp;
+  if (!parse_nonneg_int(s, &temp)) {
+    return false;
+  }
+  if (temp == 0) {
+    return false;
+  }
+  *out_val = temp;
+  return true;
+}
+
+/* Duplicate a string argument into *dest, freeing the old value. Returns 0 on success, -1 on
+ * failure. */
+static int set_string_option(char** dest, const char* value, const char* option_name) {
+  char* dup = str_dup(value);
+  if (!dup) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", option_name);
+    return -1;
+  }
+  free(*dest);
+  *dest = dup;
+  return 0;
+}
+
+/* Parse a string as a positive integer into *dest. Returns 0 on success, -1 on error. */
+static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
+  if (!parse_positive_int(value, dest)) {
+    log_message(LOG_LEVEL_ERROR, "%s must be a positive integer", option_name);
+    return -1;
+  }
+  return 0;
+}
+
+/* Set and validate the compression algorithm selected by the client. */
+static int set_compression_choice(Config* config, const char* value) {
+  if (strcmp(value, "zstd") != 0 && strcmp(value, "none") != 0) {
+    log_message(LOG_LEVEL_ERROR, "--compress-choice must be zstd or none");
+    return -1;
+  }
+  if (set_string_option(&config->compress_choice, value, "--compress-choice") != 0)
+    return -1;
+  config->use_compression = strcmp(value, "zstd") == 0;
+  return 0;
+}
+
+/* Validate and store the --checksum-choice/--cc algorithm.  Only the algorithms
+ * the engine genuinely supports are accepted (xxHash64 and md5); anything else
+ * is a clear error, never a silent no-op.  "xxhash" is accepted as rsync's
+ * spelling of xxHash64. */
+static int set_checksum_choice(Config* config, const char* value) {
+  int algo = checksum_algo_from_name(value);
+  if (algo < 0) {
+    log_message(LOG_LEVEL_ERROR, "--checksum-choice must be xxh64 (or xxhash) or md5 (got '%s')",
+                value);
+    return -1;
+  }
+  config->checksum_algo = algo;
+  return 0;
+}
+
+/* parse_ull_arg is defined later in this file; declared here for the seed
+   parser below. */
+static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname);
+
+/* Parse --checksum-seed=NUM as a strict decimal 0..UINT64_MAX.  A blank value,
+ * a sign, or any non-digit (which parse_ull_arg's strtoull would silently
+ * coerce) is rejected: an explicit seed must be an exact unsigned integer or
+ * the run fails with a clear error rather than quietly ignoring the value. */
+static int set_checksum_seed(Config* config, const char* value) {
+  if (!value || *value == '\0') {
+    log_message(LOG_LEVEL_ERROR, "--checksum-seed must be a non-negative integer");
+    return -1;
+  }
+  for (const char* p = value; *p; p++) {
+    if (*p < '0' || *p > '9') {
+      log_message(LOG_LEVEL_ERROR, "--checksum-seed must be a non-negative integer");
+      return -1;
+    }
+  }
+  unsigned long long seed;
+  if (parse_ull_arg(value, &seed, "--checksum-seed") != 0)
+    return -1;
+  config->checksum_seed = seed;
+  return 0;
+}
+
+static int set_compression_threads_option(int* dest, const char* value) {
+  if (set_positive_int_option(dest, value, "--compress-threads") != 0)
+    return -1;
+  if (*dest > COMPRESSION_MAX_THREADS) {
+    log_message(LOG_LEVEL_ERROR, "--compress-threads must be between 1 and %d",
+                COMPRESSION_MAX_THREADS);
+    return -1;
+  }
+  return 0;
+}
+
+/* Parse and validate --sockopts=OPTIONS into the config.  The strict allowlist
+ * (config_sockopts_parse) rejects an unknown option name or an invalid value
+ * up front, so a typo never silently disables a socket option. */
+static int set_sockopts_option(Config* config, const char* value) {
+  SockOptEntry* entries = NULL;
+  int count = 0;
+  if (config_sockopts_parse(value, &entries, &count) != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--sockopts must be a comma-separated OPT=VAL list of supported options "
+                "(TCP_NODELAY, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF, SO_REUSEADDR)");
+    return -1;
+  }
+  free(config->sockopts);
+  config->sockopt_count = count;
+  config->sockopts = entries;
+  return 0;
+}
+
+/* Parse a string as a non-negative integer into *dest. Returns 0 on success, -1 on error. */
+static int set_nonneg_int_option(int* dest, const char* value, const char* option_name) {
+  if (!parse_nonneg_int(value, dest)) {
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", option_name);
+    return -1;
+  }
+  return 0;
+}
+
+/* Forward decl: config_add_pattern is defined below, but the --remote-option
+ * helper above needs it. */
+static int config_add_pattern(char*** patterns, int* count, const char* value, const char* optname);
+
+/* Validate and append one --remote-option=OPT value.  OPT is forwarded to the
+ * remote server invocation (over SSH) by appending it to the remote command
+ * line, so it must be a single safe shell word: it must be non-empty and must
+ * contain no control characters that could break the single-quoted command
+ * word ssh_build_remote_command wraps it in (newline/CR and other ASCII
+ * control chars are rejected up front).  Ordinary shell metacharacters
+ * (; & | ` $ () etc.) need not be rejected because they are neutralized by the
+ * single-quoting boundary, but rejecting control characters keeps the
+ * quoting scheme airtight regardless of the remote shell.  Returns 0 on
+ * success, -1 on a rejected value. */
+static int config_add_remote_option(Config* config, const char* value, const char* optname) {
+  if (!value || value[0] == '\0') {
+    log_message(LOG_LEVEL_ERROR, "%s requires a non-empty option value", optname);
+    return -1;
+  }
+  for (const unsigned char* p = (const unsigned char*)value; *p; p++) {
+    if (*p < 0x20 || *p == 0x7f) {
+      log_message(LOG_LEVEL_ERROR,
+                  "%s value contains a control character that could break the remote shell "
+                  "quoting; rejecting",
+                  optname);
+      return -1;
+    }
+  }
+  if (config_add_pattern(&config->remote_options, &config->remote_option_count, value, optname) !=
+      0)
+    return -1;
+  return 0;
+}
+
+/* Validate and append one --compare-dest/--copy-dest/--link-dest directory.
+ * The path is interpreted on the receiver relative to the destination root,
+ * so it must be a non-empty relative path with no "." / ".." components (an
+ * absolute or escaping path is rejected up front instead of failing on the
+ * server). Returns 0 on success, -1 on error. */
+static int set_basis_dest_option(Config* config, BasisDestType type, const char* value,
+                                 const char* option_name) {
+  if (!value || !value[0]) {
+    log_message(LOG_LEVEL_ERROR, "missing argument for %s", option_name);
+    return -1;
+  }
+  if (config_basis_append(config, type, value) != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "%s requires a non-empty relative directory name with no '.', '..', or absolute "
+                "path (resolved below the destination root)",
+                option_name);
+    return -1;
+  }
+  return 0;
+}
+
+static int set_stderr_mode(const char* value) {
+  if (strcmp(value, "errors") == 0 || strcmp(value, "e") == 0)
+    log_set_stderr_mode(LOG_STDERR_ERRORS);
+  else if (strcmp(value, "all") == 0 || strcmp(value, "a") == 0)
+    log_set_stderr_mode(LOG_STDERR_ALL);
+  else if (strcmp(value, "client") == 0 || strcmp(value, "c") == 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--stderr=client is not supported: FastSync has no client message channel");
+    return -1;
+  } else {
+    log_message(LOG_LEVEL_ERROR, "--stderr must be errors or all");
+    return -1;
+  }
+  return 0;
+}
+
+/* Parse --outbuf=N|L|B into the config's OutbufMode.  N=none (unbuffered),
+ * L=line-buffered, B=block-buffered (the stdio default).  Anything else is a
+ * clear error, never a silent fallback. */
+static int set_outbuf_option(Config* config, const char* value) {
+  if (strcmp(value, "N") == 0 || strcmp(value, "n") == 0)
+    config->outbuf = OUTBUF_NONE;
+  else if (strcmp(value, "L") == 0 || strcmp(value, "l") == 0)
+    config->outbuf = OUTBUF_LINE;
+  else if (strcmp(value, "B") == 0 || strcmp(value, "b") == 0)
+    config->outbuf = OUTBUF_BLOCK;
+  else {
+    log_message(LOG_LEVEL_ERROR, "--outbuf must be N (none), L (line), or B (block)");
+    return -1;
+  }
+  return 0;
+}
+
+#ifndef FASTSYNC_TEST_BUILD
+/* Apply the parsed --outbuf style to stdout/stderr via setvbuf, matching stdio
+ * semantics: N -> _IONBF (unbuffered), L -> _IOLBF (line), B -> _IOFBF (block,
+ * the default). */
+static void apply_output_buffering(const Config* config) {
+  int mode = config->outbuf;
+  int stdio_mode = (mode == OUTBUF_NONE) ? _IONBF : (mode == OUTBUF_LINE) ? _IOLBF : _IOFBF;
+  setvbuf(stdout, NULL, stdio_mode, 0);
+  setvbuf(stderr, NULL, stdio_mode, 0);
+}
+#endif
+
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
 
+static int parse_debug_flags(const char* value, Config* config) {
+  if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
+      strstr(value, ",,")) {
+    log_message(LOG_LEVEL_ERROR, "--debug requires at least one flag");
+    return -1;
+  }
+
+  char* flags = str_dup(value);
+  if (!flags) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --debug");
+    return -1;
+  }
+  uint32_t parsed = (uint32_t)config->debug_level;
+  char* saveptr = NULL;
+  for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
+       token = strtok_r(NULL, ",", &saveptr)) {
+    uint32_t flag = 0;
+    if (strcmp(token, "help") == 0) {
+      print_debug_usage();
+      free(flags);
+      return 1;
+    } else if (strcmp(token, "all") == 0) {
+      parsed = LOG_DEBUG_ALL;
+      continue;
+    } else if (strcmp(token, "none") == 0) {
+      parsed = 0;
+      continue;
+    } else if (strcmp(token, "io") == 0) {
+      flag = LOG_DEBUG_IO;
+    } else if (strcmp(token, "proto") == 0) {
+      flag = LOG_DEBUG_PROTO;
+    } else if (strcmp(token, "pack") == 0) {
+      flag = LOG_DEBUG_PACK;
+    } else if (strcmp(token, "util") == 0) {
+      flag = LOG_DEBUG_UTIL;
+    } else {
+      log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    parsed |= flag;
+  }
+  free(flags);
+  config->debug_level = (int)parsed;
+  set_log_debug_flags(parsed);
+  set_log_level(LOG_LEVEL_DEBUG);
+  return 0;
+}
+
+static int parse_info_flags(const char* value, Config* config) {
+  if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
+      strstr(value, ",,")) {
+    log_message(LOG_LEVEL_ERROR, "--info requires at least one flag");
+    return -1;
+  }
+  char* flags = str_dup(value);
+  if (!flags) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --info");
+    return -1;
+  }
+
+  uint32_t parsed = (uint32_t)config->info_level;
+  char* saveptr = NULL;
+  for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
+       token = strtok_r(NULL, ",", &saveptr)) {
+    uint32_t flag = 0;
+    if (strcmp(token, "all") == 0) {
+      parsed = LOG_INFO_ALL;
+      continue;
+    }
+    if (strcmp(token, "none") == 0) {
+      parsed = 0;
+      continue;
+    }
+    if (strcmp(token, "copy") == 0)
+      flag = LOG_INFO_COPY;
+    else if (strcmp(token, "misc") == 0)
+      flag = LOG_INFO_MISC;
+    else if (strcmp(token, "skip") == 0)
+      flag = LOG_INFO_SKIP;
+    else if (strcmp(token, "stats") == 0)
+      flag = LOG_INFO_STATS;
+    else {
+      log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    parsed |= flag;
+  }
+  free(flags);
+  config->info_level = (int)parsed;
+  set_log_info_flags(parsed);
+  return 0;
+}
+
+/* Parse a string as an unsigned long long. Returns 0 on success, -1 on error. */
+static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname) {
+  char* end;
+  errno = 0;
+  unsigned long long v = strtoull(val, &end, 10);
+  if (errno != 0 || *end != '\0') {
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", optname);
+    return -1;
+  }
+  *out = v;
+  return 0;
+}
+
+/* Apply a --delta-block/--block-size value (both spellings and both the inline
+ * and separate argument forms share this one range check).  An out-of-range
+ * value warns once and leaves the configured default untouched.  Returns 0 on
+ * success, -1 on a non-numeric value. */
+static int set_delta_block_size(Config* config, const char* value) {
+  unsigned long long val;
+  if (parse_ull_arg(value, &val, "--block-size/--delta-block") != 0)
+    return -1;
+  if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
+    config->delta_block_size = (uint32_t)val;
+  else
+    log_message(LOG_LEVEL_WARNING, "block size value %llu out of range, using default", val);
+  return 0;
+}
+
+/* Parse a byte count with an optional single-letter binary suffix (K/M/G/T/P/E).
+ * When allow_zero is false, a bare 0 is rejected (size limits use true, since 0
+ * means "no limit"). Returns 0 on success, -1 on error. */
+static int parse_size_arg_allow_zero(const char* value, unsigned long long* out, bool allow_zero) {
+  if (!value || *value < '0' || *value > '9')
+    return -1;
+  char* end;
+  errno = 0;
+  unsigned long long number = strtoull(value, &end, 10);
+  if (errno != 0 || end == value)
+    return -1;
+  unsigned long long multiplier = 1;
+  if (*end != '\0') {
+    if (end[1] != '\0')
+      return -1;
+    switch (*end) {
+    case 'b':
+    case 'B':
+      break;
+    case 'k':
+    case 'K':
+      multiplier = 1024ULL;
+      break;
+    case 'm':
+    case 'M':
+      multiplier = 1024ULL * 1024;
+      break;
+    case 'g':
+    case 'G':
+      multiplier = 1024ULL * 1024 * 1024;
+      break;
+    case 't':
+    case 'T':
+      multiplier = 1024ULL * 1024 * 1024 * 1024;
+      break;
+    case 'p':
+    case 'P':
+      multiplier = 1024ULL * 1024 * 1024 * 1024 * 1024;
+      break;
+    case 'e':
+    case 'E':
+      multiplier = 1024ULL * 1024 * 1024 * 1024 * 1024 * 1024;
+      break;
+    default:
+      return -1;
+    }
+  }
+  if ((!allow_zero && number == 0) || number > ULLONG_MAX / multiplier)
+    return -1;
+  *out = number * multiplier;
+  return 0;
+}
+
+static int parse_size_arg(const char* value, unsigned long long* out) {
+  return parse_size_arg_allow_zero(value, out, false);
+}
+
+/* Append a duplicated pattern to a growable pattern array. Returns 0 on success, -1 on error. */
+static int config_add_pattern(char*** patterns, int* count, const char* value,
+                              const char* optname) {
+  char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
+  if (!tmp) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
+    return -1;
+  }
+  *patterns = tmp;
+  char* dup = str_dup(value);
+  if (!dup) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
+    return -1;
+  }
+  (*patterns)[(*count)++] = dup;
+  return 0;
+}
+
+/* Validate and append one --filter=RULE string. Returns 0 on success, -1 on error. */
+static int config_add_filter(Config* config, const char* rule) {
+  char err[160];
+  FilterRule* parsed = filter_rule_parse(rule, err, sizeof(err));
+  if (!parsed) {
+    log_message(LOG_LEVEL_ERROR, "invalid --filter rule '%s': %s", rule, err);
+    return -1;
+  }
+  filter_rule_free(parsed);
+  if (!config->filters) {
+    config->filters = array_list_create(free);
+    if (!config->filters) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed for --filter");
+      return -1;
+    }
+  }
+  char* dup = str_dup(rule);
+  if (!dup || !array_list_add(config->filters, dup)) {
+    free(dup);
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --filter");
+    return -1;
+  }
+  return 0;
+}
+
+static int parse_skip_compress(Config* config, const char* value) {
+  char* list = str_dup(value);
+  if (!list)
+    return -1;
+  config->skip_compress_set = true;
+  for (char* token = strtok(list, ","); token; token = strtok(NULL, ",")) {
+    while (*token == ' ' || *token == '\t')
+      token++;
+    size_t len = strlen(token);
+    while (len > 0 && (token[len - 1] == ' ' || token[len - 1] == '\t'))
+      token[--len] = '\0';
+    if (len == 0)
+      continue;
+    if (config_add_pattern(&config->skip_compress_suffixes, &config->skip_compress_count, token,
+                           "--skip-compress") != 0) {
+      free(list);
+      return -1;
+    }
+  }
+  free(list);
+  return 0;
+}
+
+typedef enum {
+  OPT_FLAG,
+  OPT_NOOP,
+  OPT_STRING,
+  OPT_POS_INT,
+  OPT_NONNEG_INT,
+  OPT_ULL,
+} OptKind;
+
+typedef struct {
+  const char* name;
+  const char* alias;
+  OptKind kind;
+  size_t offset; /* offsetof of the target field in Config, or 0 for OPT_NOOP */
+} OptionEntry;
+
+/* Options parsed directly into Config, plus compatibility options with no effect. */
+typedef struct {
+  const char* name;
+  const char* alias;
+  size_t offset; /* offsetof of the boolean target field in Config */
+} NegatableOption;
+
+/* Options that map directly onto a Config field with no side effects. */
+static const OptionEntry OPTION_TABLE[] = {
+    {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
+    {"--remove-source-files", NULL, OPT_FLAG, offsetof(Config, remove_source_files)},
+    {"--delete", NULL, OPT_FLAG, offsetof(Config, use_delete)},
+    {"--incremental", NULL, OPT_FLAG, offsetof(Config, use_incremental)},
+    {"--size-only", NULL, OPT_FLAG, offsetof(Config, size_only)},
+    {"--ignore-times", "-I", OPT_FLAG, offsetof(Config, ignore_times)},
+    {"--modify-window", "-@", OPT_NONNEG_INT, offsetof(Config, modify_window)},
+    {"--delta", NULL, OPT_FLAG, offsetof(Config, use_delta)},
+    {"--whole-file", "-W", OPT_FLAG, offsetof(Config, whole_file)},
+    {"--fuzzy", "-y", OPT_FLAG, offsetof(Config, fuzzy)},
+    {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
+    {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
+    {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},
+    {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
+    {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
+    {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
+    {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
+    {"--secluded-args", "-s", OPT_NOOP, 0},
+    {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
+    {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
+    {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
+    {"--blocking-io", NULL, OPT_FLAG, offsetof(Config, blocking_io)},
+    {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
+    {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
+    {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
+    {"--copy-unsafe-links", NULL, OPT_FLAG, offsetof(Config, copy_unsafe_links)},
+    {"--copy-dirlinks", "-k", OPT_FLAG, offsetof(Config, copy_dirlinks)},
+    {"--keep-dirlinks", "-K", OPT_FLAG, offsetof(Config, keep_dirlinks)},
+    {"--munge-links", NULL, OPT_FLAG, offsetof(Config, munge_links)},
+    {"--hard-links", "-H", OPT_FLAG, offsetof(Config, preserve_hard_links)},
+    {"--sparse", "-S", OPT_FLAG, offsetof(Config, preserve_sparse)},
+    {"--inplace", NULL, OPT_FLAG, offsetof(Config, inplace)},
+    {"--preallocate", NULL, OPT_FLAG, offsetof(Config, preallocate)},
+    {"--append", NULL, OPT_FLAG, offsetof(Config, append)},
+    {"--append-verify", NULL, OPT_FLAG, offsetof(Config, append_verify)},
+    {"--fsync", NULL, OPT_FLAG, offsetof(Config, use_fsync)},
+    {"--checksum", "-c", OPT_FLAG, offsetof(Config, checksum)},
+    {"--8-bit-output", "-8", OPT_FLAG, offsetof(Config, eight_bit_output)},
+    {"--itemize-changes", "-i", OPT_FLAG, offsetof(Config, itemize_changes)},
+    {"--list-only", NULL, OPT_FLAG, offsetof(Config, list_only)},
+    {"--out-format", NULL, OPT_STRING, offsetof(Config, out_format)},
+    {"--log-file-format", NULL, OPT_STRING, offsetof(Config, log_file_format)},
+    {"--existing", NULL, OPT_FLAG, offsetof(Config, existing)},
+    {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
+    {"--delay-updates", NULL, OPT_FLAG, offsetof(Config, delay_updates)},
+    {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
+    {"--dirs", "-d", OPT_FLAG, offsetof(Config, dirs)},
+    {"--old-dirs", NULL, OPT_FLAG, offsetof(Config, dirs)},
+    {"--old-d", NULL, OPT_FLAG, offsetof(Config, dirs)},
+    {"--relative", "-R", OPT_FLAG, offsetof(Config, relative)},
+    {"--mkpath", NULL, OPT_FLAG, offsetof(Config, mkpath)},
+    /* --password-file: client-only path to a `user:password` secret file used
+     * to authenticate a daemon (host::module/path) destination.  Stored as a
+     * path; main() reads it (after the destination form is known) and derives
+     * the wire credentials.  Never crosses the wire. */
+    {"--password-file", NULL, OPT_STRING, offsetof(Config, password_file)},
+    /* --iconv (protocol 2.16.0): convert file-NAME charsets at the wire
+     * boundary.  The CONVERT_SPEC (LOCAL[,REMOTE]) is validated for real iconv
+     * charsets at startup (client_validation.c) and the full spec rides the
+     * config frame so the receiver derives the wire charset symmetrically. */
+    {"--iconv", NULL, OPT_STRING, offsetof(Config, iconv_spec)},
+    /* --protocol=NUM: rsync-compatible flag that forces the wire protocol
+     * version to the current value.  FastSync has exactly one wire format, so
+     * any value other than PROTOCOL_VERSION is rejected at validation, before
+     * any network I/O.  Client-only: the server does not negotiate, it just
+     * enforces an exact match. */
+    {"--protocol", NULL, OPT_STRING, offsetof(Config, version)},
+    /* Phase 6 residual-batch (client-only): --write-batch=FILE runs the normal
+     * live transfer AND also emits the self-contained batch FILE;
+     * --only-write-batch=FILE emits FILE only (no destination, no server);
+     * --read-batch=FILE applies FILE to the destination (no source, no server).
+     * All three are LOCAL driver flags and never cross the wire. */
+    {"--write-batch", NULL, OPT_STRING, offsetof(Config, write_batch)},
+    {"--only-write-batch", NULL, OPT_STRING, offsetof(Config, only_write_batch)},
+    {"--read-batch", NULL, OPT_STRING, offsetof(Config, read_batch)},
+    {"--delete-before", NULL, OPT_FLAG, offsetof(Config, delete_before)},
+    {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
+    {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
+    {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
+    {"--delete-excluded", NULL, OPT_FLAG, offsetof(Config, delete_excluded)},
+    {"--max-delete", NULL, OPT_NONNEG_INT, offsetof(Config, max_delete)},
+    {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
+    {"--force", NULL, OPT_FLAG, offsetof(Config, force_delete)},
+    {"--prune-empty-dirs", "-m", OPT_FLAG, offsetof(Config, prune_empty_dirs)},
+    {"--ignore-missing-args", NULL, OPT_FLAG, offsetof(Config, ignore_missing_args)},
+    {"--delete-missing-args", NULL, OPT_FLAG, offsetof(Config, delete_missing_args)},
+
+    {"--source-dir", NULL, OPT_STRING, offsetof(Config, send_directory)},
+    {"--dest-dir", NULL, OPT_STRING, offsetof(Config, receive_root_directory)},
+    {"--server-host", NULL, OPT_STRING, offsetof(Config, server_host)},
+    {"--cert", NULL, OPT_STRING, offsetof(Config, tls_cert)},
+    {"--key", NULL, OPT_STRING, offsetof(Config, tls_key)},
+    {"--ca", NULL, OPT_STRING, offsetof(Config, tls_ca)},
+    {"--backup-dir", NULL, OPT_STRING, offsetof(Config, backup_dir)},
+    {"--fastsync-server-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
+    /* --rsync-path is rsync's spelling for the same "server program path"; it
+     * is a pure alias for fastsync_server_path (never a distinct field). */
+    {"--rsync-path", NULL, OPT_STRING, offsetof(Config, fastsync_server_path)},
+    {"--temp-dir", "-T", OPT_STRING, offsetof(Config, temp_dir)},
+    {"--partial-dir", NULL, OPT_STRING, offsetof(Config, partial_dir)},
+    {"--suffix", NULL, OPT_STRING, offsetof(Config, suffix)},
+    {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},
+    {"--compress-level", "--zl", OPT_POS_INT, offsetof(Config, compression_level)},
+
+    {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
+    {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
+    {"--max-depth", NULL, OPT_NONNEG_INT, offsetof(Config, max_depth)},
+    {"--address", NULL, OPT_STRING, offsetof(Config, address)},
+    {"--ipv4", "-4", OPT_FLAG, offsetof(Config, ipv4)},
+    {"--ipv6", "-6", OPT_FLAG, offsetof(Config, ipv6)},
+
+    {"--max-size", NULL, OPT_ULL, offsetof(Config, max_size)},
+    {"--min-size", NULL, OPT_ULL, offsetof(Config, min_size)},
+    {"--one-file-system", "-x", OPT_FLAG, offsetof(Config, one_file_system)},
+    {"--from0", "-0", OPT_FLAG, offsetof(Config, from0)},
+    {"--cvs-exclude", "-C", OPT_FLAG, offsetof(Config, cvs_exclude)},
+    {"-F", NULL, OPT_FLAG, offsetof(Config, per_dir_filter)},
+    {"--numeric-ids", NULL, OPT_FLAG, offsetof(Config, numeric_ids)},
+    {"--atimes", "-U", OPT_FLAG, offsetof(Config, preserve_atimes)},
+    {"--crtimes", "-N", OPT_FLAG, offsetof(Config, preserve_crtimes)},
+    /* -D is handled separately (it implies both --devices and --specials). */
+    {"--devices", NULL, OPT_FLAG, offsetof(Config, preserve_devices)},
+    {"--specials", NULL, OPT_FLAG, offsetof(Config, preserve_specials)},
+    {"--copy-devices", NULL, OPT_FLAG, offsetof(Config, copy_devices)},
+    {"--write-devices", NULL, OPT_FLAG, offsetof(Config, write_devices)},
+    {"--omit-dir-times", "-O", OPT_FLAG, offsetof(Config, omit_dir_times)},
+    {"--omit-link-times", "-J", OPT_FLAG, offsetof(Config, omit_link_times)},
+    {"--open-noatime", NULL, OPT_FLAG, offsetof(Config, open_noatime)},
+    {"--xattrs", "-X", OPT_FLAG, offsetof(Config, preserve_xattrs)},
+    {"--acls", "-A", OPT_FLAG, offsetof(Config, preserve_acls)},
+    {"--fake-super", NULL, OPT_FLAG, offsetof(Config, fake_super)},
+    /* rsync's -M/--remote-option: -M is now the short alias for --remote-option
+     * (metadata mode is long-only --preserve), handled in the parse loop where
+     * --remote-option is parsed.  --trust-sender is a local receiver policy and
+     * never travels to the remote peer. */
+    {"--trust-sender", NULL, OPT_FLAG, offsetof(Config, trust_sender)},
+};
+
+/* Only boolean options with no required argument are safe to negate. */
+static const NegatableOption NEGATABLE_OPTIONS[] = {
+    {"dry-run", "n", offsetof(Config, dry_run)},
+    {"delete", NULL, offsetof(Config, use_delete)},
+    {"incremental", NULL, offsetof(Config, use_incremental)},
+    {"delta", NULL, offsetof(Config, use_delta)},
+    {"fuzzy", NULL, offsetof(Config, fuzzy)},
+    {"save-to-disk", NULL, offsetof(Config, save_to_disk)},
+    {"progress", NULL, offsetof(Config, show_progress)},
+    {"tls", NULL, offsetof(Config, use_tls)},
+    {"backup", NULL, offsetof(Config, backup)},
+    {"stats", NULL, offsetof(Config, stats)},
+    {"partial", NULL, offsetof(Config, partial)},
+    {"links", "l", offsetof(Config, follow_symlinks)},
+    {"copy-links", NULL, offsetof(Config, copy_links)},
+    {"safe-links", NULL, offsetof(Config, safe_links)},
+    {"copy-unsafe-links", NULL, offsetof(Config, copy_unsafe_links)},
+    {"hard-links", "H", offsetof(Config, preserve_hard_links)},
+    {"sparse", "S", offsetof(Config, preserve_sparse)},
+    {"inplace", NULL, offsetof(Config, inplace)},
+    {"preallocate", NULL, offsetof(Config, preallocate)},
+    {"checksum", "c", offsetof(Config, checksum)},
+    {"from0", NULL, offsetof(Config, from0)},
+    {"cvs-exclude", NULL, offsetof(Config, cvs_exclude)},
+
+    /* These options are also implied by --archive or handled outside the table. */
+    {"compress", NULL, offsetof(Config, use_compression)},
+    {"compress", "z", offsetof(Config, use_compression)},
+    {"multithreading", "j", offsetof(Config, use_multithreading)},
+    {"preserve", NULL, offsetof(Config, use_metadata)},
+    {"sendfile", NULL, offsetof(Config, use_sendfile)},
+    {"chunk-serialization", NULL, offsetof(Config, use_chunk_serialization)},
+    {"xattrs", "X", offsetof(Config, preserve_xattrs)},
+    {"acls", "A", offsetof(Config, preserve_acls)},
+    {"fake-super", NULL, offsetof(Config, fake_super)},
+};
+
+static bool opt_is(const char* arg, const char* name, const char* alias) {
+  return strcmp(arg, name) == 0 || (alias && strcmp(arg, alias) == 0);
+}
+
+static const OptionEntry* find_table_option(const char* arg) {
+  for (size_t i = 0; i < sizeof(OPTION_TABLE) / sizeof(OPTION_TABLE[0]); i++)
+    if (opt_is(arg, OPTION_TABLE[i].name, OPTION_TABLE[i].alias))
+      return &OPTION_TABLE[i];
+  return NULL;
+}
+
+/* Match a "--opt=value" argument against table options that take a value. Flags,
+ * no-ops, and unsupported options do not accept an inline "=" value. */
+static const OptionEntry* find_table_option_with_equals(const char* arg, const char** value) {
+  const char* equals = strchr(arg, '=');
+  if (!equals || equals == arg)
+    return NULL;
+  size_t name_len = (size_t)(equals - arg);
+  for (size_t i = 0; i < sizeof(OPTION_TABLE) / sizeof(OPTION_TABLE[0]); i++) {
+    const OptionEntry* entry = &OPTION_TABLE[i];
+    if ((strlen(entry->name) == name_len && strncmp(arg, entry->name, name_len) == 0) ||
+        (entry->alias && strlen(entry->alias) == name_len &&
+         strncmp(arg, entry->alias, name_len) == 0)) {
+      if (entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
+          entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL) {
+        *value = equals + 1;
+        return entry;
+      }
+    }
+  }
+  return NULL;
+}
+
+static const NegatableOption* find_negatable_option(const char* name) {
+  for (size_t i = 0; i < sizeof(NEGATABLE_OPTIONS) / sizeof(NEGATABLE_OPTIONS[0]); i++)
+    if (strcmp(name, NEGATABLE_OPTIONS[i].name) == 0 ||
+        (NEGATABLE_OPTIONS[i].alias && strcmp(name, NEGATABLE_OPTIONS[i].alias) == 0))
+      return &NEGATABLE_OPTIONS[i];
+  return NULL;
+}
+
+static int apply_negation(Config* config, const char* arg) {
+  const char* name = arg + strlen("--no-");
+  if (*name == '\0') {
+    fprintf(stderr, "Cannot negate an empty option name: %s\n", arg);
+    return -1;
+  }
+  const NegatableOption* entry = find_negatable_option(name);
+  if (!entry) {
+    fprintf(stderr, "Cannot negate unsupported or unsafe option: %s\n", arg);
+    return -1;
+  }
+  *(bool*)((char*)config + entry->offset) = false;
+  if (entry->offset == offsetof(Config, use_metadata))
+    config->metadata_explicitly_disabled = true;
+  return 0;
+}
+
+static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
+  if (entry->kind == OPT_NOOP)
+    return 0;
+  void* field = (char*)config + entry->offset;
+  switch (entry->kind) {
+  case OPT_FLAG:
+    *(bool*)field = true;
+    if (entry->offset == offsetof(Config, update))
+      config->use_metadata = true;
+    return 0;
+  case OPT_NOOP:
+    return 0;
+  case OPT_STRING:
+    return set_string_option((char**)field, value, entry->name);
+  case OPT_POS_INT:
+    return set_positive_int_option((int*)field, value, entry->name);
+  case OPT_NONNEG_INT:
+    return set_nonneg_int_option((int*)field, value, entry->name);
+  case OPT_ULL: {
+    unsigned long long v;
+    /* Size-limit options accept rsync-style suffixes (e.g. --max-size=2G); a
+     * plain byte count, including 0 ("no limit"), stays valid. */
+    if (parse_size_arg_allow_zero(value, &v, true) != 0) {
+      log_message(LOG_LEVEL_ERROR, "%s must be a non-negative size (B, K, M, G, T, P, or E)",
+                  entry->name);
+      return -1;
+    }
+    *(unsigned long long*)field = v;
+    return 0;
+  }
+  }
+  return -1;
+}
+
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
-static int parse_args(Config* config, int argc, char* argv[], int* positional_args,
-                      int* positional_count) {
+int parse_args(Config* config, int argc, char* argv[], int* positional_args,
+               int* positional_count) {
+  bool verbose = false;
+  /* Explicit --no-delta / --no-incremental seen on the command line: the user
+     switched part of the delta machinery off, so the --fuzzy implication must
+     not silently turn it back on. */
+  bool no_delta = false;
+  bool no_incremental = false;
+  protocol_set_8_bit_output(config->eight_bit_output);
+
+  /* Apply output controls before processing other options so their order is irrelevant. */
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0) {
+    if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+      set_log_level(LOG_LEVEL_DEBUG);
+    } else if (strncmp(argv[i], "--info=", 7) == 0) {
+      if (parse_info_flags(argv[i] + 7, config) != 0)
+        return -1;
+    } else if (strcmp(argv[i], "--info") == 0) {
+      if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
+        return -1;
+    }
+  }
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-P") == 0) {
+      config->partial = true;
+      config->show_progress = true;
+      continue;
+    }
+    /* "--no-implied-dirs" is a real rsync option name, not a negation of
+     * "--implied-dirs", so it must be handled before the generic --no-*
+     * negation branch. */
+    if (strcmp(argv[i], "--no-implied-dirs") == 0) {
+      config->no_implied_dirs = true;
+      continue;
+    }
+    /* "--no-motd" is a real rsync option name (client-side daemon MOTD display
+     * suppression), not a negation of a "--motd" flag, so it is handled before
+     * the generic --no-* negation branch. */
+    if (strcmp(argv[i], "--no-motd") == 0) {
+      config->no_motd = true;
+      continue;
+    }
+    /* "--super" / "--no-super" are real rsync option names controlling the
+     * receiver's super-user activity policy (ownership, device nodes), not a
+     * Boolean pair for the generic --no-* negation branch: both map onto the
+     * Config->super_mode tri-state.  Handle them explicitly (exact match only,
+     * so a malformed "--super=x" still falls through to the unknown-option
+     * error) before the generic negation branch would mis-reject "--no-super". */
+    if (strcmp(argv[i], "--super") == 0) {
+      config->super_mode = SUPER_MODE_ON;
+      continue;
+    }
+    if (strcmp(argv[i], "--no-super") == 0) {
+      config->super_mode = SUPER_MODE_OFF;
+      continue;
+    }
+    if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {
+      if (strcmp(argv[i], "--no-delta") == 0)
+        no_delta = true;
+      else if (strcmp(argv[i], "--no-incremental") == 0)
+        no_incremental = true;
+      if (apply_negation(config, argv[i]) != 0)
+        return -1;
+      continue;
+    }
+    const char* modify_window_prefix = "--modify-window=";
+    if (strncmp(argv[i], modify_window_prefix, strlen(modify_window_prefix)) == 0) {
+      if (set_nonneg_int_option(&config->modify_window, argv[i] + strlen(modify_window_prefix),
+                                "--modify-window") != 0)
+        return -1;
+      continue;
+    }
+    if (strncmp(argv[i], "-@", 2) == 0 && argv[i][2] != '\0') {
+      if (set_nonneg_int_option(&config->modify_window, argv[i] + 2, "-@") != 0)
+        return -1;
+      continue;
+    }
+    /* --stop-after/--stop-at are client-only sender-side stop deadlines.  They
+     * are parsed by stop_condition (so the unit tests exercise the same validate
+     * that production uses) and never serialized into the config frame. */
+    if (strncmp(argv[i], "--stop-after=", 13) == 0) {
+      if (!stop_parse_after_minutes(argv[i] + 13, &config->stop_after_mins)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-after must be a positive number of minutes");
+        return -1;
+      }
+      continue;
+    }
+    if (strcmp(argv[i], "--stop-after") == 0) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --stop-after");
+        return -1;
+      }
+      if (!stop_parse_after_minutes(argv[++i], &config->stop_after_mins)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-after must be a positive number of minutes");
+        return -1;
+      }
+      continue;
+    }
+    if (strncmp(argv[i], "--stop-at=", 10) == 0) {
+      if (!stop_parse_at_time(argv[i] + 10, time(NULL), &config->stop_at)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+        return -1;
+      }
+      config->stop_at_set = true;
+      continue;
+    }
+    if (strcmp(argv[i], "--stop-at") == 0) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --stop-at");
+        return -1;
+      }
+      if (!stop_parse_at_time(argv[++i], time(NULL), &config->stop_at)) {
+        log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+        return -1;
+      }
+      config->stop_at_set = true;
+      continue;
+    }
+    const char* threads_prefix = "--compress-threads=";
+    if (strncmp(argv[i], threads_prefix, strlen(threads_prefix)) == 0) {
+      if (set_compression_threads_option(&config->compression_threads,
+                                         argv[i] + strlen(threads_prefix)) != 0)
+        return -1;
+      continue;
+    }
+    if (strncmp(argv[i], "--max-alloc=", 12) == 0 || strcmp(argv[i], "--max-alloc") == 0) {
+      const char* value = strcmp(argv[i], "--max-alloc") == 0 ? "" : argv[i] + 12;
+      if (*value == '\0') {
+        if (i + 1 >= argc) {
+          log_message(LOG_LEVEL_ERROR, "missing argument for --max-alloc");
+          return -1;
+        }
+        value = argv[++i];
+      }
+      if (parse_size_arg(value, &config->max_alloc) != 0) {
+        log_message(LOG_LEVEL_ERROR,
+                    "--max-alloc must be a positive size (B, K, M, G, T, P, or E)");
+        return -1;
+      }
+      continue;
+    }
+
+    const OptionEntry* entry = find_table_option(argv[i]);
+    const char* inline_value = NULL;
+    if (!entry)
+      entry = find_table_option_with_equals(argv[i], &inline_value);
+    if (entry) {
+      const char* value = NULL;
+      if (entry->kind != OPT_FLAG) {
+        value = inline_value;
+        if (!value && i + 1 < argc)
+          value = argv[++i];
+        if (!value) {
+          log_message(LOG_LEVEL_ERROR, "missing argument for %s", entry->name);
+          return -1;
+        }
+        if (strcmp(entry->name, "--compress-choice") == 0) {
+          if (set_compression_choice(config, value) != 0)
+            return -1;
+        } else {
+          if (apply_table_option(config, entry, value) != 0)
+            return -1;
+          if (strcmp(entry->name, "--compress-level") == 0 &&
+              (config->compression_level < 1 || config->compression_level > 22)) {
+            log_message(LOG_LEVEL_ERROR, "--compress-level must be between 1 and 22");
+            return -1;
+          }
+          if (entry->offset == offsetof(Config, chmod_spec)) {
+            mode_t ignored;
+            if (!chmod_apply(0, config->chmod_spec, &ignored)) {
+              log_message(LOG_LEVEL_ERROR, "--chmod has invalid permission changes");
+              return -1;
+            }
+            config->use_metadata = true;
+          }
+        }
+      } else if (apply_table_option(config, entry, NULL) != 0) {
+        return -1;
+      }
+      if (entry->offset == offsetof(Config, eight_bit_output))
+        protocol_set_8_bit_output(true);
+      /* A delete-timing flag selects when --delete removes extras, so it
+         implies --delete exactly like the rsync options do. */
+      if (entry->offset == offsetof(Config, delete_before) ||
+          entry->offset == offsetof(Config, delete_during) ||
+          entry->offset == offsetof(Config, delete_delay) ||
+          entry->offset == offsetof(Config, delete_after))
+        config->use_delete = true;
+      /* --delete-missing-args implies --ignore-missing-args (missing entries
+         are skipped for deletion instead of failing the run).  The implication
+         is order-independent because it is applied over the final parsed
+         config. */
+      if (entry->offset == offsetof(Config, delete_missing_args))
+        config->ignore_missing_args = true;
+      /* -U/--atimes and -N/--crtimes carry their times inside the metadata
+         payload, which is only transmitted when use_metadata is set, so either
+         one implies metadata transmission.  This is FastSync's broad -M bundle
+         (mode/mtime travel too); it does NOT enable ownership application,
+         which stays opt-in via the identity flags. */
+      if (entry->offset == offsetof(Config, preserve_atimes) ||
+          entry->offset == offsetof(Config, preserve_crtimes))
+        config->use_metadata = true;
+      if (entry->offset == offsetof(Config, preserve_xattrs) ||
+          entry->offset == offsetof(Config, preserve_acls)) {
+        config->use_metadata = true;
+        config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
+      }
+      if (entry->offset == offsetof(Config, fake_super))
+        config->use_metadata = true;
+      continue;
+    }
+
+    if (strncmp(argv[i], "--chmod=", 8) == 0) {
+      if (set_string_option(&config->chmod_spec, argv[i] + 8, "--chmod") != 0)
+        return -1;
+      mode_t ignored;
+      if (!chmod_apply(0, config->chmod_spec, &ignored)) {
+        log_message(LOG_LEVEL_ERROR, "--chmod has invalid permission changes");
+        return -1;
+      }
+      config->use_metadata = true;
+      continue;
+    }
+
+    if (opt_is(argv[i], "--help", NULL)) {
       print_usage();
       return 1;
-    } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--archive") == 0) {
-      config->use_compression = true;
-      config->use_multithreading = true;
+    } else if (opt_is(argv[i], "-V", "--version")) {
+      printf("fastsync version %s\n", PROTOCOL_VERSION);
+      return 1;
+    } else if (opt_is(argv[i], "-D", NULL)) {
+      /* rsync -D == --devices --specials.  -D is otherwise unassigned in
+         FastSync (verified: no collision), so it is free to imply both. */
+      config->preserve_devices = true;
+      config->preserve_specials = true;
+      log_info_message(LOG_INFO_MISC, "Enabled preservation of device and special files (-D)");
+    } else if (opt_is(argv[i], "-a", "--archive")) {
+      /* Real rsync archive (-rlptgoD).  FastSync is always recursive and always
+       * preserves hard-link/other transfer semantics per its own flags, so -a
+       * implies links, full metadata (perms/times/group/owner as FastSync's
+       * broad bundle), devices and specials.  Compression and multithreading
+       * are NOT implied (they are no longer part of archive mode). */
+      config->follow_symlinks = true;
       config->use_metadata = true;
-      log_message(LOG_LEVEL_INFO, "Enabled archive mode (-c -m -M)");
-    } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
-      config->dry_run = true;
-    } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-      if (!parse_positive_int(argv[++i], &config->ssh_port)) {
-        fprintf(stderr, "Error: invalid --port/-p value: %s\n", argv[i]);
+      config->preserve_devices = true;
+      config->preserve_specials = true;
+      log_info_message(LOG_INFO_MISC,
+                       "Enabled archive mode (-rlptgoD: links, metadata, devices, specials)");
+    } else if (opt_is(argv[i], "-p", "--perms")) {
+      /* rsync -p/--perms: preserve permission bits.  Folded into FastSync's
+       * broad metadata bundle (mode/mtime travel together). */
+      config->use_metadata = true;
+      log_info_message(LOG_INFO_MISC, "Enabled permission preservation");
+    } else if (opt_is(argv[i], "--ssh-port", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-    } else if (strcmp(argv[i], "--delete") == 0) {
-      config->use_delete = true;
-    } else if (strcmp(argv[i], "--exclude") == 0 && i + 1 < argc) {
-      char** tmp = realloc(config->exclude_patterns, (config->exclude_count + 1) * sizeof(char*));
-      if (!tmp) {
-        fprintf(stderr, "Error: memory allocation failed for --exclude\n");
+      if (set_positive_int_option(&config->ssh_port, argv[++i], "--ssh-port") != 0)
+        return -1;
+      if (config->ssh_port > 65535) {
+        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
         return -1;
       }
-      config->exclude_patterns = tmp;
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --exclude\n");
+    } else if (strncmp(argv[i], "--ssh-port=", 11) == 0) {
+      if (set_positive_int_option(&config->ssh_port, argv[i] + 11, "--ssh-port") != 0)
+        return -1;
+      if (config->ssh_port > 65535) {
+        log_message(LOG_LEVEL_ERROR, "SSH port must be 1-65535");
         return -1;
       }
-      config->exclude_patterns[config->exclude_count++] = dup;
-    } else if (strcmp(argv[i], "--include") == 0 && i + 1 < argc) {
-      char** tmp = realloc(config->include_patterns, (config->include_count + 1) * sizeof(char*));
-      if (!tmp) {
-        fprintf(stderr, "Error: memory allocation failed for --include\n");
+    } else if (opt_is(argv[i], "--exclude", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      config->include_patterns = tmp;
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --include\n");
+      if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, argv[++i],
+                             "--exclude") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--include", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      config->include_patterns[config->include_count++] = dup;
-    } else if (strcmp(argv[i], "--max-size") == 0 && i + 1 < argc) {
-      config->max_size = strtoull(argv[++i], NULL, 10);
-    } else if (strcmp(argv[i], "--min-size") == 0 && i + 1 < argc) {
-      config->min_size = strtoull(argv[++i], NULL, 10);
-    } else if (strcmp(argv[i], "--incremental") == 0) {
-      config->use_incremental = true;
-    } else if (strcmp(argv[i], "--delta") == 0) {
-      config->use_delta = true;
-    } else if (strcmp(argv[i], "--delta-block") == 0 && i + 1 < argc) {
-      unsigned long long val = strtoull(argv[++i], NULL, 10);
-      if (val >= DELTA_BLOCK_SIZE_MIN && val <= DELTA_BLOCK_SIZE_MAX)
-        config->delta_block_size = (uint32_t)val;
-      else
-        fprintf(stderr, "Warning: --delta-block value %llu out of range, using default\n", val);
-    } else if (strcmp(argv[i], "--delta-max") == 0 && i + 1 < argc) {
-      unsigned long long val = strtoull(argv[++i], NULL, 10);
+      if (config_add_pattern(&config->include_patterns, &config->include_count, argv[++i],
+                             "--include") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--delta-block=", 14) == 0) {
+      if (set_delta_block_size(config, argv[i] + 14) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--block-size=", 13) == 0) {
+      if (set_delta_block_size(config, argv[i] + 13) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--delta-block", "--block-size")) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_delta_block_size(config, argv[++i]) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--delta-max", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      unsigned long long val;
+      if (parse_ull_arg(argv[++i], &val, "--delta-max") != 0)
+        return -1;
       if (val >= DELTA_MIN_FILE_SIZE)
         config->delta_max_file_size = val;
       else
-        fprintf(stderr, "Warning: --delta-max value %llu too small, using default\n", val);
-    } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-z") == 0) {
-      config->use_compression = true;
-      log_message(LOG_LEVEL_INFO, "Enabled Compression");
+        log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
+    } else if (opt_is(argv[i], "-z", "--compress")) {
+      config->use_compression =
+          !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
+      log_info_message(LOG_INFO_MISC, "Enabled Compression");
       if (i + 1 < argc) {
         char* end_ptr;
         long level = strtol(argv[i + 1], &end_ptr, 10);
         if (*end_ptr == '\0') {
+          if (level < 1 || level > 22) {
+            log_message(LOG_LEVEL_ERROR, "compression level must be 1-22");
+            return -1;
+          }
           config->compression_level = (int)level;
-          log_message(LOG_LEVEL_INFO, "Set Compression level to %ld", level);
+          log_info_message(LOG_INFO_MISC, "Set Compression level to %ld", level);
           i++;
         }
       }
-    } else if (strcmp(argv[i], "--source-dir") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --source-dir\n");
-        return -1;
-      }
-      free(config->send_directory);
-      config->send_directory = dup;
-    } else if (strcmp(argv[i], "--dest-dir") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --dest-dir\n");
-        return -1;
-      }
-      free(config->receive_root_directory);
-      config->receive_root_directory = dup;
-    } else if (strcmp(argv[i], "--save-to-disk") == 0) {
-      config->save_to_disk = true;
-    } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--preserve") == 0) {
+    } else if (opt_is(argv[i], "--preserve", NULL)) {
       config->use_metadata = true;
-      log_message(LOG_LEVEL_INFO, "Enabled metadata preservation");
-    } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--sendfile") == 0) {
+      log_info_message(LOG_INFO_MISC, "Enabled metadata preservation");
+    } else if (opt_is(argv[i], "-E", "--executability")) {
+      config->use_metadata = true;
+      config->use_executability = true;
+      log_info_message(LOG_INFO_MISC, "Enabled executable permission preservation");
+    } else if (opt_is(argv[i], "--sendfile", NULL)) {
       config->use_sendfile = true;
-      log_message(LOG_LEVEL_INFO, "Enabled sendfile");
-    } else if (strcmp(argv[i], "-m") == 0) {
+      log_info_message(LOG_INFO_MISC, "Enabled sendfile");
+    } else if (opt_is(argv[i], "-j", "--threads")) {
       config->use_multithreading = true;
-      log_message(LOG_LEVEL_INFO, "Enabled Multithreading");
-    } else if (strcmp(argv[i], "-s") == 0) {
+      log_info_message(LOG_INFO_MISC, "Enabled Multithreading");
+    } else if (opt_is(argv[i], "--chunk-serialization", NULL)) {
       config->use_chunk_serialization = true;
-      log_message(LOG_LEVEL_INFO, "Enabled Chunk Serialization");
-    } else if (strcmp(argv[i], "--server-host") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --server-host\n");
+      log_info_message(LOG_INFO_MISC, "Enabled Chunk Serialization");
+    } else if (opt_is(argv[i], "--server-port", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      free(config->server_host);
-      config->server_host = dup;
-    } else if (strcmp(argv[i], "--server-port") == 0 && i + 1 < argc) {
       if (!parse_positive_int(argv[++i], &config->server_port)) {
-        fprintf(stderr, "Error: invalid --server-port value: %s\n", argv[i]);
+        char* escaped = output_escape(argv[i], false);
+        log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s",
+                    escaped ? escaped : "<allocation failed>");
+        free(escaped);
         return -1;
       }
-    } else if (strcmp(argv[i], "--bwlimit") == 0 && i + 1 < argc) {
-      char* end;
-      errno = 0;
-      unsigned long long kbps = strtoull(argv[++i], &end, 10);
-      if (errno != 0 || *end != '\0' || kbps == 0) {
-        fprintf(stderr, "Error: --bwlimit must be a positive integer\n");
+      if (config->server_port > 65535) {
+        log_message(LOG_LEVEL_ERROR, "server port must be 1-65535");
+        return -1;
+      }
+    } else if (opt_is(argv[i], "--bwlimit", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      unsigned long long kbps;
+      if (parse_ull_arg(argv[++i], &kbps, "--bwlimit") != 0)
+        return -1;
+      if (kbps == 0) {
+        log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
         return -1;
       }
       if (kbps > ULLONG_MAX / 1024) {
-        fprintf(stderr, "Error: --bwlimit value too large\n");
+        log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
         return -1;
       }
       io_set_bwlimit(kbps * 1024);
-      log_message(LOG_LEVEL_INFO, "Set bandwidth limit to %llu KB/s", kbps);
-    } else if (strcmp(argv[i], "--progress") == 0) {
-      config->show_progress = true;
-    } else if (strcmp(argv[i], "--chunk-size") == 0 && i + 1 < argc) {
-      unsigned long long val = strtoull(argv[++i], NULL, 10);
-      if (val > 0)
-        config->chunk_size = val;
-    } else if (strcmp(argv[i], "--tls") == 0) {
-      config->use_tls = true;
-    } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --cert\n");
+      log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
+    } else if (opt_is(argv[i], "--chunk-size", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      free(config->tls_cert);
-      config->tls_cert = dup;
-    } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --key\n");
+      unsigned long long val;
+      if (parse_ull_arg(argv[++i], &val, "--chunk-size") != 0)
+        return -1;
+      if (val == 0) {
+        log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
         return -1;
       }
-      free(config->tls_key);
-      config->tls_key = dup;
-    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --ca\n");
+      config->chunk_size = val;
+    } else if (opt_is(argv[i], "--log-file", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      free(config->tls_ca);
-      config->tls_ca = dup;
-    } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
-      int val;
-      if (!parse_positive_int(argv[++i], &val)) {
-        fprintf(stderr, "Error: --timeout must be a positive integer\n");
-        return -1;
+      if (config->log_file) {
+        fclose(config->log_file);
+        config->log_file = NULL;
+        log_set_file(NULL);
       }
-      config->timeout = val;
-    } else if (strcmp(argv[i], "--contimeout") == 0 && i + 1 < argc) {
-      int val;
-      if (!parse_positive_int(argv[++i], &val)) {
-        fprintf(stderr, "Error: --contimeout must be a positive integer\n");
-        return -1;
-      }
-      config->contimeout = val;
-    } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0 ||
-               strcmp(argv[i], "--silent") == 0) {
-      config->quiet = true;
-    } else if (strcmp(argv[i], "--backup") == 0) {
-      config->backup = true;
-    } else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --backup-dir\n");
-        return -1;
-      }
-      free(config->backup_dir);
-      config->backup_dir = dup;
-    } else if (strcmp(argv[i], "--stats") == 0) {
-      config->stats = true;
-    } else if (strcmp(argv[i], "--max-depth") == 0 && i + 1 < argc) {
-      if (!parse_nonneg_int(argv[++i], &config->max_depth)) {
-        fprintf(stderr, "Error: --max-depth must be a non-negative integer\n");
-        return -1;
-      }
-    } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
       FILE* lf = fopen(argv[++i], "a");
       if (!lf) {
-        fprintf(stderr, "Error: could not open log file '%s': %s\n", argv[i], strerror(errno));
+        char* escaped = output_escape(argv[i], false);
+        log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
+                    escaped ? escaped : "<allocation failed>", strerror(errno));
+        free(escaped);
         return -1;
       }
       config->log_file = lf;
       log_set_file(lf);
-    } else if (strcmp(argv[i], "--queue-size") == 0 && i + 1 < argc) {
-      int val;
-      if (!parse_positive_int(argv[++i], &val)) {
-        fprintf(stderr, "Error: --queue-size must be a positive integer\n");
+    } else if (strncmp(argv[i], "--stderr=", 9) == 0) {
+      if (set_stderr_mode(argv[i] + 9) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--stderr", NULL)) {
+      if (i + 1 >= argc || set_stderr_mode(argv[++i]) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--exclude-from", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      config->queue_size = val;
-    } else if (strcmp(argv[i], "--exclude-from") == 0 && i + 1 < argc) {
       if (read_patterns_from_file(argv[++i], &config->exclude_patterns, &config->exclude_count) !=
           0)
         return -1;
-    } else if (strcmp(argv[i], "--include-from") == 0 && i + 1 < argc) {
+    } else if (opt_is(argv[i], "--include-from", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
       if (read_patterns_from_file(argv[++i], &config->include_patterns, &config->include_count) !=
           0)
         return -1;
-    } else if (strcmp(argv[i], "--partial") == 0) {
-      config->partial = true;
-    } else if (strcmp(argv[i], "--fastsync-server-path") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup) {
-        fprintf(stderr, "Error: memory allocation failed for --fastsync-server-path\n");
+    } else if (strncmp(argv[i], "--filter=", 9) == 0) {
+      if (config_add_filter(config, argv[i] + 9) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "-f=", 3) == 0) {
+      if (config_add_filter(config, argv[i] + 3) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--filter", "-f")) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      free(config->fastsync_server_path);
-      config->fastsync_server_path = dup;
-    } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+      if (config_add_filter(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--files-from=", 13) == 0) {
+      if (set_string_option(&config->files_from, argv[i] + 13, "--files-from") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--files-from", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_string_option(&config->files_from, argv[++i], "--files-from") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "-v", "--verbose")) {
+      verbose = true;
       set_log_level(LOG_LEVEL_DEBUG);
-    } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--links") == 0) {
-      config->follow_symlinks = true;
-    } else if (strcmp(argv[i], "--copy-links") == 0) {
-      config->copy_links = true;
-    } else if (strcmp(argv[i], "--safe-links") == 0) {
-      config->safe_links = true;
-    } else if (strcmp(argv[i], "--copy-unsafe-links") == 0) {
-      config->copy_unsafe_links = true;
-    } else if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--hard-links") == 0) {
-      config->preserve_hard_links = true;
-    } else if (strcmp(argv[i], "-A") == 0 || strcmp(argv[i], "--acls") == 0) {
-      config->preserve_acls = true;
-    } else if (strcmp(argv[i], "-X") == 0 || strcmp(argv[i], "--xattrs") == 0) {
-      config->preserve_xattrs = true;
-    } else if (strcmp(argv[i], "-D") == 0 || strcmp(argv[i], "--devices") == 0) {
-      config->preserve_devices = true;
-    } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--sparse") == 0) {
-      config->preserve_sparse = true;
-    } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--itemize-changes") == 0) {
-      config->itemize_changes = true;
-    } else if (strcmp(argv[i], "--out-format") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+    } else if (opt_is(argv[i], "-q", "--quiet")) {
+      config->quiet = true;
+    } else if (strncmp(argv[i], "--debug=", 8) == 0) {
+      int debug_ret = parse_debug_flags(argv[i] + 8, config);
+      if (debug_ret != 0)
+        return debug_ret;
+    } else if (opt_is(argv[i], "--debug", NULL)) {
+      if (i + 1 >= argc)
+        return parse_debug_flags(NULL, config);
+      int debug_ret = parse_debug_flags(argv[++i], config);
+      if (debug_ret != 0)
+        return debug_ret;
+    } else if (strncmp(argv[i], "--info=", 7) == 0) {
+      if (parse_info_flags(argv[i] + 7, config) != 0)
         return -1;
-      free(config->out_format);
-      config->out_format = dup;
-    } else if (strcmp(argv[i], "--info") == 0 && i + 1 < argc) {
-      config->info_level = atoi(argv[++i]);
-    } else if (strcmp(argv[i], "--debug") == 0 && i + 1 < argc) {
-      config->debug_level = atoi(argv[++i]);
-    } else if (strcmp(argv[i], "--list-only") == 0) {
-      config->list_only = true;
-    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--human-readable") == 0) {
-      config->human_readable = true;
-    } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--update") == 0) {
-      config->update = true;
-    } else if (strcmp(argv[i], "--inplace") == 0) {
-      config->inplace = true;
-    } else if (strcmp(argv[i], "--append") == 0) {
-      config->append = true;
-    } else if (strcmp(argv[i], "--append-verify") == 0) {
-      config->append_verify = true;
-    } else if (strcmp(argv[i], "--delete-excluded") == 0) {
-      config->delete_excluded = true;
-    } else if (strcmp(argv[i], "--delete-after") == 0) {
-      config->delete_after = true;
-    } else if (strcmp(argv[i], "--max-delete") == 0 && i + 1 < argc) {
-      int val;
-      if (!parse_nonneg_int(argv[++i], &val)) {
-        fprintf(stderr, "Error: --max-delete must be a non-negative integer\n");
+    } else if (opt_is(argv[i], "--info", NULL)) {
+      if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--skip-compress=", 16) == 0) {
+      if (parse_skip_compress(config, argv[i] + 16) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--skip-compress", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-      config->max_delete = val;
-    } else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
-      if (!config->filters)
-        config->filters = array_list_create(free);
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+      if (parse_skip_compress(config, argv[++i]) != 0)
         return -1;
-      array_list_add(config->filters, dup);
-    } else if (strcmp(argv[i], "--files-from") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
-        return -1;
-      free(config->files_from);
-      config->files_from = dup;
-    } else if (strcmp(argv[i], "--cvs-exclude") == 0) {
-      config->cvs_exclude = true;
-    } else if (strcmp(argv[i], "--prune-empty-dirs") == 0) {
-      config->prune_empty_dirs = true;
-    } else if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--relative") == 0) {
-      config->relative = true;
-    } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--rsh") == 0) {
-      if (i + 1 < argc) {
-        char* dup = str_dup(argv[++i]);
-        if (!dup)
-          return -1;
-        free(config->rsh_command);
-        config->rsh_command = dup;
-      } else {
-        fprintf(stderr, "Error: -e/--rsh requires a command argument\n");
+    } else if (opt_is(argv[i], "--compress-threads", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
       }
-    } else if (strcmp(argv[i], "--rsync-path") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+      if (set_compression_threads_option(&config->compression_threads, argv[++i]) != 0)
         return -1;
-      free(config->rsync_path);
-      config->rsync_path = dup;
-    } else if (strcmp(argv[i], "--temp-dir") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+    } else if (opt_is(argv[i], "--checksum-choice", "--cc")) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
         return -1;
-      free(config->temp_dir);
-      config->temp_dir = dup;
-    } else if (strcmp(argv[i], "--compare-dest") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+      }
+      if (set_checksum_choice(config, argv[++i]) != 0)
         return -1;
-      free(config->compare_dest);
-      config->compare_dest = dup;
-    } else if (strcmp(argv[i], "--copy-dest") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+    } else if (strncmp(argv[i], "--checksum-choice=", 18) == 0) {
+      if (set_checksum_choice(config, argv[i] + 18) != 0)
         return -1;
-      free(config->copy_dest);
-      config->copy_dest = dup;
-    } else if (strcmp(argv[i], "--link-dest") == 0 && i + 1 < argc) {
-      char* dup = str_dup(argv[++i]);
-      if (!dup)
+    } else if (strncmp(argv[i], "--cc=", 5) == 0) {
+      if (set_checksum_choice(config, argv[i] + 5) != 0)
         return -1;
-      free(config->link_dest);
-      config->link_dest = dup;
+    } else if (strncmp(argv[i], "--checksum-seed=", 16) == 0) {
+      if (set_checksum_seed(config, argv[i] + 16) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--checksum-seed", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --checksum-seed");
+        return -1;
+      }
+      if (set_checksum_seed(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--sockopts=", 11) == 0) {
+      if (set_sockopts_option(config, argv[i] + 11) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--sockopts", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --sockopts");
+        return -1;
+      }
+      if (set_sockopts_option(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--remote-option=", 16) == 0) {
+      if (config_add_remote_option(config, argv[i] + 16, "--remote-option") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "-M=", 3) == 0) {
+      if (config_add_remote_option(config, argv[i] + 3, "-M") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--remote-option", "-M")) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for --remote-option");
+        return -1;
+      }
+      if (config_add_remote_option(config, argv[++i], "--remote-option") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--compare-dest=", 15) == 0) {
+      if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[i] + 15, "--compare-dest") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--compare-dest", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_basis_dest_option(config, BASIS_DEST_COMPARE, argv[++i], "--compare-dest") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--copy-dest=", 12) == 0) {
+      if (set_basis_dest_option(config, BASIS_DEST_COPY, argv[i] + 12, "--copy-dest") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--copy-dest", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_basis_dest_option(config, BASIS_DEST_COPY, argv[++i], "--copy-dest") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--link-dest=", 12) == 0) {
+      if (set_basis_dest_option(config, BASIS_DEST_LINK, argv[i] + 12, "--link-dest") != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--link-dest", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (set_basis_dest_option(config, BASIS_DEST_LINK, argv[++i], "--link-dest") != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--usermap=", 10) == 0) {
+      if (identity_parse_map(config, argv[i] + 10, false) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--usermap", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_map(config, argv[++i], false) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (strncmp(argv[i], "--groupmap=", 11) == 0) {
+      if (identity_parse_map(config, argv[i] + 11, true) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--groupmap", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_map(config, argv[++i], true) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (strncmp(argv[i], "--chown=", 8) == 0) {
+      if (identity_parse_chown(config, argv[i] + 8) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (opt_is(argv[i], "--chown", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_chown(config, argv[++i]) != 0)
+        return -1;
+      config->use_metadata = true;
+    } else if (strncmp(argv[i], "--copy-as=", 10) == 0) {
+      if (identity_parse_copy_as(config, argv[i] + 10) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--copy-as", NULL)) {
+      if (i + 1 >= argc) {
+        log_message(LOG_LEVEL_ERROR, "missing argument for %s", argv[i]);
+        return -1;
+      }
+      if (identity_parse_copy_as(config, argv[++i]) != 0)
+        return -1;
+    } else if (strncmp(argv[i], "--outbuf=", 9) == 0) {
+      if (set_outbuf_option(config, argv[i] + 9) != 0)
+        return -1;
+    } else if (opt_is(argv[i], "--outbuf", NULL)) {
+      if (i + 1 >= argc || set_outbuf_option(config, argv[++i]) != 0)
+        return -1;
     } else if (argv[i][0] == '-') {
-      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      char* escaped = output_escape(argv[i], false);
+      fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
+      free(escaped);
       print_usage();
       return -1;
     } else {
       if (*positional_count < 2)
         positional_args[(*positional_count)++] = i;
       else {
-        fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+        char* escaped = output_escape(argv[i], false);
+        fprintf(stderr, "Unexpected argument: %s\n", escaped ? escaped : "<allocation failed>");
+        free(escaped);
         print_usage();
         return -1;
       }
     }
   }
-  return 0;
-}
+  set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  if (config->compress_choice)
+    config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
 
-/* Validate config after parsing. Returns true if valid. */
-static bool validate_config(const Config* config) {
-  if (!config->send_directory || !config->receive_root_directory) {
-    fprintf(stderr, "Error: source and destination directories are required\n");
-    print_usage();
-    return false;
-  }
-  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
-    fprintf(stderr, "Error: -f/--sendfile cannot be combined with -c (compression) or -s (chunk "
-                    "serialization)\n");
-    return false;
-  }
-  if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
-    fprintf(stderr, "Error: -f/--sendfile is not supported with SSH transport\n");
-    return false;
-  }
-  if (config->use_incremental && config->use_chunk_serialization) {
-    fprintf(stderr, "Error: --incremental is not supported with -s (chunk serialization)\n");
-    return false;
-  }
-  if (config->use_delta && !config->use_incremental) {
-    fprintf(stderr, "Error: --delta requires --incremental\n");
-    return false;
-  }
-  if (config->use_delta && config->use_chunk_serialization) {
-    fprintf(stderr, "Error: --delta cannot be combined with -s (chunk serialization)\n");
-    return false;
-  }
-  if (config->use_delta && config->use_sendfile) {
-    fprintf(stderr, "Error: --delta cannot be combined with -f (sendfile)\n");
-    return false;
-  }
-  if (config->use_tls) {
-    if (!config->tls_cert || !config->tls_key) {
-      fprintf(stderr, "Error: --tls requires --cert and --key\n");
-      return false;
+  /* --files-from is loaded after every argument is seen so that -0/--from0 may
+   * appear anywhere on the command line. A missing or unreadable file, and
+   * invalid (absolute / traversal) entries, are hard CLI errors. */
+  if (config->files_from) {
+    char err[256];
+    FileListSet* set = file_list_load(config->files_from, config->from0, err, sizeof(err));
+    if (!set) {
+      log_message(LOG_LEVEL_ERROR, "--files-from: %s", err);
+      return -1;
     }
+    file_list_destroy((FileListSet*)config->files_from_set);
+    config->files_from_set = set;
   }
-  return true;
-}
 
-static void print_usage(void) {
-  printf("Usage:\n");
-  printf("  fastsync [options] <source> <destination>\n");
-  printf("  fastsync [options] --source-dir <src> --dest-dir <dst>\n");
-  printf("\n");
-  printf("Destination formats:\n");
-  printf("  user@host:/path     SSH transport (rsync-style)\n");
-  printf("  host:/path          SSH transport (current user)\n");
-  printf("  /local/path         TCP transport (requires server on localhost:8080)\n");
-  printf("\n");
-  printf("Options:\n");
-  printf("  -c [level]          Enable compression (level 1-22, default 5)\n");
-  printf("  -z [level]          Alias for -c\n");
-  printf("  -a, --archive       Archive mode (-c -m -M)\n");
-  printf("  -n, --dry-run       Show what would be transferred\n");
-  printf("  -p <port>           SSH port (default: 22)\n");
-  printf("  --progress          Show transfer progress\n");
-  printf("  --delete            Delete files on receiver not in source\n");
-  printf("  --exclude <pattern> Exclude files matching pattern\n");
-  printf("  --include <pattern> Only include files matching pattern\n");
-  printf("  --exclude-from <file> Read exclude patterns from file\n");
-  printf("  --include-from <file> Read include patterns from file\n");
-  printf("  --max-size <n>      Skip files larger than n bytes\n");
-  printf("  --min-size <n>      Skip files smaller than n bytes\n");
-  printf("  --incremental       Skip files unchanged since last transfer\n");
-  printf("  --delta             Delta transfer for changed files (requires --incremental)\n");
-  printf("  --delta-block <n>   Delta block size in bytes (default: %d)\n",
-         DELTA_BLOCK_SIZE_DEFAULT);
-  printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
-         DELTA_MAX_FILE_SIZE);
-  printf("  -m                  Enable multithreading\n");
-  printf("  -s                  Enable chunk serialization\n");
-  printf("  -f                  Enable sendfile (TCP only, not with -c or -s)\n");
-  printf("  -v, --verbose       Enable debug logging\n");
-  printf("  -M, --preserve      Preserve file metadata\n");
-  printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
-  printf("  --source-dir <path> Source directory\n");
-  printf("  --dest-dir <path>   Destination directory\n");
-  printf("  --save-to-disk      Write received files to disk\n");
-  printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
-  printf("  --server-port <n>   Server port (default: 8080)\n");
-  printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
-  printf("  --tls               Enable TLS encryption\n");
-  printf("  --cert <path>       TLS certificate file (PEM)\n");
-  printf("  --key <path>        TLS private key file (PEM)\n");
-  printf("  --ca <path>         TLS CA certificate file (PEM)\n");
-  printf("  --timeout <sec>     I/O timeout in seconds (default: 30)\n");
-  printf("  --contimeout <sec>  Connection timeout in seconds (default: 10)\n");
-  printf("  -q, --quiet         Suppress non-error output\n");
-  printf("  --silent            Alias for --quiet\n");
-  printf("  --backup            Backup existing files before overwriting\n");
-  printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
-  printf("  --stats             Print transfer statistics at end\n");
-  printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
-  printf("  --log-file <path>   Write log messages to file\n");
-  printf("  --queue-size <n>    Queue capacity for multithreaded mode (default: 100)\n");
-  printf("  --partial           Keep partial files on interrupted transfer\n");
-  printf("  --fastsync-server-path <path>\n");
-  printf("                      Path to fastsync-server on remote (default: fastsync-server)\n");
-  printf("  -l, --links         Copy symlinks as symlinks\n");
-  printf("  --copy-links        Transform symlinks into referent files\n");
-  printf("  --safe-links        Skip symlinks that point outside transfer tree\n");
-  printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
-  printf("  -H, --hard-links    Preserve hard links\n");
-  printf("  -A, --acls          Preserve ACLs\n");
-  printf("  -X, --xattrs        Preserve extended attributes\n");
-  printf("  -D, --devices       Preserve device files\n");
-  printf("  -S, --sparse        Handle sparse files efficiently\n");
-  printf("  -i, --itemize-changes  Show per-file change summary\n");
-  printf("  --out-format <fmt>  Custom output format string\n");
-  printf("  --info <flags>      Info verbosity level\n");
-  printf("  --debug <flags>     Debug verbosity level\n");
-  printf("  --list-only         List files without transferring\n");
-  printf("  -h, --human-readable  Human-readable numbers\n");
-  printf("  -u, --update        Skip files newer on destination\n");
-  printf("  --inplace           Update files in-place (no temp+rename)\n");
-  printf("  --append            Append data to shorter files\n");
-  printf("  --append-verify     Append with verify\n");
-  printf("  --delete-excluded   Also delete excluded files\n");
-  printf("  --delete-after      Delete after transfer, not before\n");
-  printf("  --max-delete <n>    Maximum number of files to delete\n");
-  printf("  --filter <rule>     Add file filtering rule\n");
-  printf("  --files-from <file> Read file list from file\n");
-  printf("  --cvs-exclude       Auto-ignore CVS files\n");
-  printf("  --prune-empty-dirs  Omit empty directories from transfer\n");
-  printf("  -R, --relative      Use relative paths\n");
-  printf("  -e, --rsh <cmd>     Specify remote shell\n");
-  printf("  --rsync-path <path> Path to remote binary\n");
-  printf("  --temp-dir <dir>    Temporary directory for files\n");
-  printf("  --compare-dest <dir>  Compare destination\n");
-  printf("  --copy-dest <dir>   Copy destination\n");
-  printf("  --link-dest <dir>   Link destination\n");
-  printf("  --help              Show this help\n");
+  /* Device/special preservation recreates a node from its metadata mode (whose
+     S_IFMT bits carry the node kind), so --devices/--specials/-D imply metadata
+     transmission.  --copy-devices/--write-devices treat the entry as data but a
+     mtime/mode-preserving transfer still benefits from metadata, so all four
+     imply it (FastSync's broad -M bundle; ownership stays opt-in). */
+  if (config->preserve_devices || config->preserve_specials || config->copy_devices ||
+      config->write_devices)
+    config->use_metadata = true;
+
+  /* The "unchanged" decision for --compare-dest/--copy-dest/--link-dest must
+   * be made on the receiver against the basis directories, which requires the
+   * per-file STATUS_CHECK handshake: basis-dir options therefore imply
+   * --incremental (and, via the block below, metadata) on the sender. */
+  if (config_has_basis(config))
+    config->use_incremental = true;
+
+  /* -y/--fuzzy reuses an existing similar-named destination file as the delta
+   * basis, so it is meaningless without the receiver-driven delta path:
+   * imply --incremental and --delta unless --whole-file or an explicit
+   * --no-delta / --no-incremental switched the machinery off.  FastSync has
+   * delta OFF by default (unlike rsync), so a bare --fuzzy must turn it on or
+   * it would be a silent no-op.  -W/--no-delta/--no-incremental therefore
+   * leave fuzzy inert, matching rsync where --whole-file makes fuzzy
+   * irrelevant (note: unlike the basis-dir options, --fuzzy honors an
+   * explicit --no-incremental instead of forcing the handshake back on). */
+  if (config->fuzzy) {
+    if (!no_incremental)
+      config->use_incremental = true;
+    /* Delta needs the incremental per-file handshake, so an explicit
+     * --no-incremental also suppresses the delta implication. */
+    if (!config->whole_file && !no_delta && !no_incremental)
+      config->use_delta = true;
+  }
+
+  /* --append / --append-verify resume a shorter existing destination file.
+   * The receiver must run the per-file STATUS_CHECK handshake to learn the
+   * destination length and reply STATUS_APPEND, so an append mode forces
+   * --incremental on (exactly like the basis-dir options: the handshake is
+   * required, not optional).  The resume itself is a dedicated tail-only
+   * exchange, not the block delta, so no delta implication is made.  When both
+   * spelling are given the safer --append-verify semantics win. */
+  if (config->append || config->append_verify) {
+    config->use_incremental = true;
+  }
+
+  /* Incremental and delta transfers need metadata unless the user disabled it. */
+  if ((config->use_incremental || config->use_delta) && !config->use_metadata &&
+      !config->metadata_explicitly_disabled) {
+    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for incremental/delta transfer");
+    config->use_metadata = true;
+  }
+  /* Recompute the derived xattr flag from the FINAL preserve flags (after any
+   * --no-xattrs/--no-acls negation) so the sender's wire gate always matches
+   * the flags the receiver will recompute from the received config. */
+  config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
+  return 0;
 }
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
   FILE* fp = fopen(filepath, "r");
   if (!fp) {
-    fprintf(stderr, "Error: could not open pattern file '%s': %s\n", filepath, strerror(errno));
+    char* escaped = output_escape(filepath, false);
+    log_message(LOG_LEVEL_ERROR, "could not open pattern file '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(errno));
+    free(escaped);
     return -1;
   }
-  char line[4096];
-  while (fgets(line, sizeof(line), fp)) {
+  char* line = NULL;
+  size_t line_size = 0;
+  ssize_t n;
+  while ((n = getline(&line, &line_size, fp)) != -1) {
     char* p = line;
     while (*p == ' ' || *p == '\t')
       p++;
@@ -573,36 +1561,64 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
       p[--len] = '\0';
     if (len == 0)
       continue;
-    char** tmp = realloc(*patterns, (*count + 1) * sizeof(char*));
-    if (!tmp) {
-      fprintf(stderr, "Error: memory allocation failed for pattern file\n");
+    if (config_add_pattern(patterns, count, p, "pattern file") != 0) {
+      free(line);
       fclose(fp);
       return -1;
     }
-    *patterns = tmp;
-    char* dup = str_dup(p);
-    if (!dup) {
-      fprintf(stderr, "Error: memory allocation failed for pattern file\n");
-      fclose(fp);
-      return -1;
-    }
-    (*patterns)[(*count)++] = dup;
   }
+  free(line);
   fclose(fp);
   return 0;
 }
 
+#ifndef FASTSYNC_TEST_BUILD
+/* Daemon auth (A7, protocol 2.19.0): read --password-file and keep the
+ * username plus the LITERAL password (client-only, never serialized).  Runs
+ * once the destination form is known: the credentials only make sense for a
+ * daemon (host::module/path) destination, so a --password-file without one is a
+ * hard error here rather than a silently-ignored flag.  The password is handed
+ * to the SCRAM challenge/response in config_send and burned by
+ * config_burn_auth/config_delete at teardown.  Returns 0 on success, -1 on
+ * error (the reason is logged; the password is never logged). */
+static int load_daemon_credentials(Config* config) {
+  if (!config->password_file)
+    return 0;
+  if (!config->module || config->module[0] == '\0') {
+    log_message(LOG_LEVEL_ERROR,
+                "--password-file requires a daemon destination (host::module/path)");
+    return -1;
+  }
+  char err[512];
+  char* user = NULL;
+  char* password = NULL;
+  if (credentials_read_secret_file(config->password_file, &user, &password, err, sizeof(err)) !=
+      0) {
+    log_message(LOG_LEVEL_ERROR, "%s", err);
+    return -1;
+  }
+
+  config_burn_auth(config);
+  config->auth_user = user;
+  config->auth_password = password;
+  log_info_message(LOG_INFO_MISC, "Loaded daemon credentials for user '%s'", config->auth_user);
+  return 0;
+}
+
 int main(int argc, char* argv[]) {
+  /* The server may close a connection mid-stream (e.g. when it rejects an
+     oversized delta).  Ignore SIGPIPE so that a broken TCP connection
+     surfaces as a clean write error instead of killing the client. */
+  signal(SIGPIPE, SIG_IGN);
   const char* env_source = NULL;
   const char* env_dest = NULL;
   bool save_to_disk = false;
   parse_environment(&env_source, &env_dest, &save_to_disk);
 
   int exit_code = 0;
-  bool config_owned_by_pipeline = false;
   Config* config = config_create();
   if (!config) {
-    fprintf(stderr, "Error: failed to allocate config\n");
+    log_message(LOG_LEVEL_ERROR, "failed to allocate config");
     return 1;
   }
   config->save_to_disk = save_to_disk;
@@ -623,28 +1639,50 @@ int main(int argc, char* argv[]) {
     free(config->receive_root_directory);
     config->send_directory = str_dup(argv[positional_args[0]]);
     if (!config->send_directory) {
-      fprintf(stderr, "Error: memory allocation failed\n");
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed");
       exit_code = 1;
       goto cleanup;
     }
     config->receive_root_directory = str_dup(argv[positional_args[1]]);
     if (!config->receive_root_directory) {
-      fprintf(stderr, "Error: memory allocation failed\n");
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed");
       exit_code = 1;
       goto cleanup;
     }
     config->save_to_disk = true;
-    config_parse_ssh_dest(config);
   } else if (positional_count == 1) {
-    fprintf(stderr, "Error: missing destination argument\n");
-    print_usage();
-    exit_code = 1;
-    goto cleanup;
+    if (config->read_batch) {
+      /* --read-batch=<file> <dest>: the single positional is the destination
+         (there is no source). */
+      free(config->receive_root_directory);
+      config->receive_root_directory = str_dup(argv[positional_args[0]]);
+      if (!config->receive_root_directory) {
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
+        exit_code = 1;
+        goto cleanup;
+      }
+      config->save_to_disk = true;
+    } else if (config->only_write_batch) {
+      /* --only-write-batch=<file> <source>: the single positional is the
+         source (there is no destination). */
+      free(config->send_directory);
+      config->send_directory = str_dup(argv[positional_args[0]]);
+      if (!config->send_directory) {
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
+        exit_code = 1;
+        goto cleanup;
+      }
+    } else {
+      log_message(LOG_LEVEL_ERROR, "missing destination argument");
+      print_usage();
+      exit_code = 1;
+      goto cleanup;
+    }
   } else {
     if (!config->send_directory && env_source) {
       config->send_directory = str_dup(env_source);
       if (!config->send_directory) {
-        fprintf(stderr, "Error: memory allocation failed\n");
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
         exit_code = 1;
         goto cleanup;
       }
@@ -652,11 +1690,28 @@ int main(int argc, char* argv[]) {
     if (!config->receive_root_directory && env_dest) {
       config->receive_root_directory = str_dup(env_dest);
       if (!config->receive_root_directory) {
-        fprintf(stderr, "Error: memory allocation failed\n");
+        log_message(LOG_LEVEL_ERROR, "memory allocation failed");
         exit_code = 1;
         goto cleanup;
       }
     }
+  }
+
+  /* Resolve the destination's transport form after the source/destination are
+   * final (positional, --dest-dir, or the FASTSYNC_DEST_DIR env fallback):
+   * host::module[/path] selects the daemon TCP transport, host:path the SSH
+   * transport, anything else stays local TCP.  An invalid daemon destination
+   * already logged its reason and is a hard error here. */
+  if (config_parse_transport_dest(config) < 0) {
+    exit_code = 1;
+    goto cleanup;
+  }
+
+  /* Daemon auth: read --password-file (if any) into the wire credentials now
+   * that the destination's module is known. */
+  if (load_daemon_credentials(config) != 0) {
+    exit_code = 1;
+    goto cleanup;
   }
 
   if (!validate_config(config)) {
@@ -664,15 +1719,23 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* Enable implicit flags */
-  if (config->use_incremental && !config->use_metadata) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --incremental");
-    config->use_metadata = true;
+  /* --iconv: install the sender-side local->wire conversion before any path is
+     scanned or serialized (the scanner and the chunk/data path read windows are
+     all driven from this process, so one global initialization covers every
+     send site). */
+  if (!charset_wire_init_sender(config->iconv_spec)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--iconv has an invalid CONVERT_SPEC or an unsupported charset name");
+    exit_code = 1;
+    goto cleanup;
   }
-  if (config->use_delta && !config->use_metadata) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for --delta");
-    config->use_metadata = true;
-  }
+
+  /* Apply the requested --outbuf style now that the mode is parsed. */
+  apply_output_buffering(config);
+
+  /* --open-noatime is a sender-side policy: install it for every source read
+     (scan + data path) without touching the receiver. */
+  file_set_open_noatime(config->open_noatime);
 
   /* Initialize TLS if needed */
   if (config->use_tls)
@@ -680,20 +1743,39 @@ int main(int argc, char* argv[]) {
 
   tcp_set_timeouts(config->timeout, config->contimeout);
 
+  /* Phase 6 residual-batch driver modes.  --read-batch / --only-write-batch are
+     purely local (apply a batch file, or emit one from a scan): neither connects
+     to nor transfers to a server.  --write-batch runs the normal live transfer
+     AND then emits the batch FILE from a separate deterministic scan pass.  It
+     drives the single-threaded transfer so the config outlives the run for that
+     second pass (the -m path takes ownership of the config). */
+  if (config->read_batch) {
+    exit_code = apply_batch_to_dest(config, config->read_batch, config->receive_root_directory);
+    goto cleanup;
+  }
+  if (config->only_write_batch) {
+    exit_code = write_batch_from_source(config, config->only_write_batch);
+    goto cleanup;
+  }
+
   /* Execute transfer */
-  if (config->use_multithreading) {
-    config_owned_by_pipeline = true;
-    exit_code = send_files_multithreaded(config);
+  if (config->write_batch) {
+    exit_code = send_files(config);
+    if (exit_code == 0 && write_batch_from_source(config, config->write_batch) != 0) {
+      log_message(LOG_LEVEL_ERROR, "live transfer succeeded but batch emission failed");
+      exit_code = 1;
+    }
+  } else if (config->use_multithreading) {
+    exit_code = send_files_multithreaded(&config);
   } else {
     exit_code = send_files(config);
   }
 
 cleanup:
+  charset_wire_free();
   if (config) {
-    if (config->log_file)
-      fclose(config->log_file);
-    if (!config_owned_by_pipeline)
-      config_delete(config);
+    config_delete(config);
   }
   return exit_code;
 }
+#endif /* FASTSYNC_TEST_BUILD */

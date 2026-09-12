@@ -1,0 +1,97 @@
+#ifndef FILE_RECEIVE_H
+#define FILE_RECEIVE_H
+
+#include "config.h"
+#include "file_types.h"
+#include <stdbool.h>
+
+/* Server-side file receive/save path. */
+
+File* file_receive(const Config* config, int file_descriptor);
+File* file_receive_directory(int file_descriptor, const Config* config);
+File* file_receive_dir_time(int file_descriptor, const Config* config);
+File* file_receive_hardlink(int file_descriptor);
+File* file_receive_symlink(int file_descriptor, const Config* config);
+File* file_receive_special(int file_descriptor);
+bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode);
+File* receive_incremental_check(int fd, const Config* config, bool* skipped);
+
+/* P7 Wave D directory-time accumulator.  The receiver collects the metadata of
+ * every directory it creates/receives (STATUS_MKDIR with metadata and/or the
+ * trailing STATUS_DIR_TIMES frame(s)) and applies the times only at the END of the
+ * transfer, after all children have been written and after the delete /
+ * --delay-updates phases have committed (writing or removing a child bumps the
+ * parent's mtime).  -O/--omit-dir-times skips the application entirely.  The
+ * list owns deep copies of the paths and metadata; freed on every path. */
+typedef struct {
+  char** paths;          /* owned, destination-relative wire paths */
+  FileMetadata* entries; /* owned, parallel to paths */
+  size_t count;
+  size_t capacity;
+} DirTimeList;
+
+void dir_time_list_init(DirTimeList* list);
+void dir_time_list_free(DirTimeList* list);
+/* Deep-copy one directory's path + metadata into the list.  Returns false on
+ * allocation failure (the caller fails the transfer). */
+bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata);
+/* Apply every accumulated directory's mtime (and atime when captured) beneath
+ * `root_directory`, confined fd-relative.  Best-effort per entry: an absent
+ * directory (an empty/pruned source dir that was deliberately not created) or a
+ * non-directory at the path is skipped QUIETLY, an unreachable one with a
+ * warning, and never fatal. */
+void dir_time_list_apply(const DirTimeList* list, const char* root_directory);
+
+/* A received delete-manifest frame: the keep-set (`keeps`, destination-relative
+   paths the sender transferred/keeps) plus `protected`, destination-relative
+   prefixes the sender asks the receiver never to delete (paths excluded on the
+   source, protected at any depth).  When --delete-excluded is given the sender
+   transmits an empty protected list so excluded destination mirrors are treated
+   as ordinary extras.  With --delete-missing-args a third section (`missing`)
+   carries the destination mirrors of explicitly-listed source entries that do
+   not exist: each is an exact deletion request, independent of the ordinary
+   extras walk (never blocked by the protected prefixes) and processed when the
+   manifest is committed. */
+typedef struct DeleteManifest {
+  ArrayList* keeps;
+  ArrayList* protected;
+  ArrayList* missing;
+} DeleteManifest;
+
+void delete_manifest_free(DeleteManifest* manifest);
+/* Read a delete-manifest frame: keep count + keeps, then protected count +
+   protected prefixes, then missing count + missing paths (self-delimiting; the
+   leading STATUS_MANIFEST code has been consumed).  Returns an owned
+   DeleteManifest, or NULL after signalling STATUS_ERROR on a malformed frame. */
+DeleteManifest* receive_manifest_entries(int fd);
+/* Remove destination entries under config->receive_root_directory that are not
+   in `manifest` (bounded, all-or-nothing walk; staging-dir, basis-dir and
+   protected-prefix skips).  `--max-delete` and `--force` are honored here.  The
+   caller decides WHEN to run it based on the negotiated delete timing.  Returns
+   false (and the transfer fails) when the deletion cannot be committed. */
+bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
+/* --delete-missing-args exact-path deletions: remove each destination mirror
+   in `manifest->missing` (never blocked by the protected prefixes, staging dir
+   and basis dirs excluded).  A regular file/symlink is unlinked; an empty
+   directory is removed; a NON-empty directory is removed recursively only when
+   --delete or --force is in effect, otherwise it is left with a warning (rsync
+   parity).  A missing path is a no-op.  Returns false only on a genuine
+   confinement or I/O error (the run then fails); tolerated per-path cases are
+   reported and skipped. */
+bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest);
+/* Run every deletion family the manifest carries: the --delete-missing-args
+   exact-path deletions first (user requests are not blocked by exclusion
+   protection), then the ordinary extras walk when --delete is active.  Returns
+   true when nothing to do or everything committed. */
+bool manifest_delete_all(const Config* config, DeleteManifest* manifest);
+
+/* Outcome of a single file_save_to_disk operation.  The receiver needs to
+   distinguish "written" from "skipped" so --remove-source-files can be told
+   which sources were actually stored. */
+typedef enum { FILE_SAVE_ERROR = 0, FILE_SAVE_WRITTEN = 1, FILE_SAVE_SKIPPED = 2 } FileSaveResult;
+
+FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
+                                      const Config* config);
+bool file_save_to_disk(const char* root_directory, const File* file, const Config* config);
+
+#endif

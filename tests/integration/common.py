@@ -6,13 +6,19 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 SERVER_CMD = [os.path.join(BUILD_DIR, "server")]
 CLIENT_CMD = [os.path.join(BUILD_DIR, "client")]
-TEST_DATA_DIR = os.path.join(PROJECT_ROOT, "test_data")
+# Under pytest-xdist each worker process gets its own PYTEST_XDIST_WORKER id
+# ('gw0', 'gw1', ...).  Worker-key the transient working dir so concurrent
+# workers on the shared filesystem never collide on fixtures.  Outside xdist
+# (or with -n1) this stays the historical 'test_data' path.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
+TEST_DATA_DIR = os.path.join(PROJECT_ROOT, f"test_data-{_WORKER}" if _WORKER else "test_data")
 
 
 class ServerManager:
@@ -25,7 +31,9 @@ class ServerManager:
     def start(self, extra_args=None):
         self.stop()
         self._port = _find_free_port()
-        cmd = SERVER_CMD + ["-p", str(self._port)]
+        # Plain TCP is intentionally explicit in the server; integration tests
+        # exercise that opt-in mode rather than relying on the secure default.
+        cmd = SERVER_CMD + ["-p", str(self._port), "--allow-unauthenticated"]
         if extra_args:
             cmd += extra_args
         self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -49,6 +57,78 @@ class ServerManager:
 
     def __del__(self):
         self.stop()
+
+
+class CountingProxy:
+    """One-shot TCP forwarder that counts the bytes flowing in each direction
+    between one client and the real server.
+
+    Client output and --stats report SOURCE lengths, so a delta/fuzzy transfer
+    that moves only a few percent of the file is invisible in normal output.
+    Routing the client through this proxy makes the actual wire usage
+    observable: client_to_server counts every byte the client sent (config,
+    paths, and file/delta payloads), server_to_client counts the reply bytes
+    (including the receiver's delta signatures).
+    """
+
+    def __init__(self, target_port):
+        self.target_port = target_port
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self._listener.settimeout(30)
+        self.port = self._listener.getsockname()[1]
+        self.client_to_server = 0
+        self.server_to_client = 0
+
+    @staticmethod
+    def _pump(src, dst, counter):
+        while True:
+            try:
+                data = src.recv(65536)
+            except OSError:
+                return
+            if not data:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                return
+            try:
+                dst.sendall(data)
+            except OSError:
+                return
+            counter[0] += len(data)
+
+    def run(self, cmd):
+        """Forward one client run (the full command list) to the real server and
+        return the CompletedProcess after the counts have settled."""
+
+        def serve():
+            try:
+                client_sock, _ = self._listener.accept()
+                server_sock = socket.create_connection(("127.0.0.1", self.target_port),
+                                                       timeout=10)
+            except OSError:
+                self._listener.close()
+                return
+            c2s, s2c = [0], [0]
+            a = threading.Thread(target=self._pump, args=(client_sock, server_sock, c2s))
+            b = threading.Thread(target=self._pump, args=(server_sock, client_sock, s2c))
+            a.start()
+            b.start()
+            a.join()
+            b.join()
+            self.client_to_server = c2s[0]
+            self.server_to_client = s2c[0]
+            self._listener.close()
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        thread.join(20)
+        return result
 
 
 def run_client(source_dir, dest_dir, flags=None, port=None, extra_args=None):

@@ -1,7 +1,9 @@
 #include "metadata.h"
 #include "file.h"
+#include "identity.h"
 #include "log.h"
 #include "protocol.h"
+#include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -24,6 +26,29 @@ typedef char static_assert_mode_t_fits[(sizeof(mode_t) <= sizeof(int32_t)) ? 1 :
 typedef char static_assert_uid_t_fits[(sizeof(uid_t) <= sizeof(int32_t)) ? 1 : -1];
 typedef char static_assert_gid_t_fits[(sizeof(gid_t) <= sizeof(int32_t)) ? 1 : -1];
 
+bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, long right_nsec,
+                            int modify_window) {
+  int64_t left = (int64_t)left_sec;
+  int64_t right = (int64_t)right_sec;
+  int64_t seconds;
+  int64_t nanoseconds;
+
+  if (left > right || (left == right && left_nsec >= right_nsec)) {
+    seconds = left - right;
+    nanoseconds = (int64_t)left_nsec - (int64_t)right_nsec;
+  } else {
+    seconds = right - left;
+    nanoseconds = (int64_t)right_nsec - (int64_t)left_nsec;
+  }
+  if (nanoseconds < 0) {
+    seconds--;
+    nanoseconds += 1000000000LL;
+  }
+  if (modify_window == 0)
+    return left == right;
+  return seconds < modify_window || (seconds == modify_window && nanoseconds == 0);
+}
+
 void metadata_to_buf(char** buf, const FileMetadata* m) {
   int32_t present = (m != NULL) ? 1 : 0;
   memcpy(*buf, &present, sizeof(present));
@@ -45,15 +70,35 @@ void metadata_to_buf(char** buf, const FileMetadata* m) {
   int64_t mtime_nsec = (int64_t)m->mtime_nsec;
   memcpy(*buf, &mtime_nsec, sizeof(mtime_nsec));
   *buf += sizeof(mtime_nsec);
+  int32_t atime_valid = m->atime_valid ? 1 : 0;
+  memcpy(*buf, &atime_valid, sizeof(atime_valid));
+  *buf += sizeof(atime_valid);
+  int64_t atime_sec = (int64_t)m->atime_sec;
+  memcpy(*buf, &atime_sec, sizeof(atime_sec));
+  *buf += sizeof(atime_sec);
+  int64_t atime_nsec = (int64_t)m->atime_nsec;
+  memcpy(*buf, &atime_nsec, sizeof(atime_nsec));
+  *buf += sizeof(atime_nsec);
+  int32_t crtime_valid = m->crtime_valid ? 1 : 0;
+  memcpy(*buf, &crtime_valid, sizeof(crtime_valid));
+  *buf += sizeof(crtime_valid);
+  int64_t crtime_sec = (int64_t)m->crtime_sec;
+  memcpy(*buf, &crtime_sec, sizeof(crtime_sec));
+  *buf += sizeof(crtime_sec);
+  int64_t crtime_nsec = (int64_t)m->crtime_nsec;
+  memcpy(*buf, &crtime_nsec, sizeof(crtime_nsec));
+  *buf += sizeof(crtime_nsec);
 }
 
 FileMetadata* metadata_from_buf(char** buf) {
   int32_t present;
   memcpy(&present, *buf, sizeof(present));
   *buf += sizeof(present);
+  if (present != 0 && present != 1)
+    return NULL;
   if (!present)
     return NULL;
-  FileMetadata* m = malloc(sizeof(FileMetadata));
+  FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL)
     return NULL;
   int32_t mode;
@@ -76,10 +121,41 @@ FileMetadata* metadata_from_buf(char** buf) {
   memcpy(&mtime_nsec, *buf, sizeof(mtime_nsec));
   *buf += sizeof(mtime_nsec);
   m->mtime_nsec = (long)mtime_nsec;
+  int32_t atime_valid;
+  memcpy(&atime_valid, *buf, sizeof(atime_valid));
+  *buf += sizeof(atime_valid);
+  int64_t atime_sec;
+  memcpy(&atime_sec, *buf, sizeof(atime_sec));
+  *buf += sizeof(atime_sec);
+  int64_t atime_nsec;
+  memcpy(&atime_nsec, *buf, sizeof(atime_nsec));
+  *buf += sizeof(atime_nsec);
+  int32_t crtime_valid;
+  memcpy(&crtime_valid, *buf, sizeof(crtime_valid));
+  *buf += sizeof(crtime_valid);
+  int64_t crtime_sec;
+  memcpy(&crtime_sec, *buf, sizeof(crtime_sec));
+  *buf += sizeof(crtime_sec);
+  int64_t crtime_nsec;
+  memcpy(&crtime_nsec, *buf, sizeof(crtime_nsec));
+  *buf += sizeof(crtime_nsec);
+  m->atime_valid = atime_valid != 0;
+  m->atime_sec = (time_t)atime_sec;
+  m->atime_nsec = (long)atime_nsec;
+  m->crtime_valid = crtime_valid != 0;
+  m->crtime_sec = (time_t)crtime_sec;
+  m->crtime_nsec = (long)crtime_nsec;
+  if (present != 1 || mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 ||
+      gid < 0 || atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
+      (atime_valid && (atime_nsec < 0 || atime_nsec >= 1000000000LL)) ||
+      (crtime_valid && (crtime_nsec < 0 || crtime_nsec >= 1000000000LL))) {
+    free(m);
+    return NULL;
+  }
   return m;
 }
 
-bool metadata_send(int file_descriptor, FileMetadata* m) {
+bool metadata_send(int file_descriptor, const FileMetadata* m) {
   if (m == NULL) {
     int32_t zero = 0;
     return send_n_data(file_descriptor, &zero, sizeof(zero));
@@ -90,12 +166,24 @@ bool metadata_send(int file_descriptor, FileMetadata* m) {
   int32_t gid = (int32_t)m->gid;
   int64_t mtime_sec = (int64_t)m->mtime_sec;
   int64_t mtime_nsec = (int64_t)m->mtime_nsec;
+  int32_t atime_valid = m->atime_valid ? 1 : 0;
+  int64_t atime_sec = (int64_t)m->atime_sec;
+  int64_t atime_nsec = (int64_t)m->atime_nsec;
+  int32_t crtime_valid = m->crtime_valid ? 1 : 0;
+  int64_t crtime_sec = (int64_t)m->crtime_sec;
+  int64_t crtime_nsec = (int64_t)m->crtime_nsec;
   return send_n_data(file_descriptor, &present, sizeof(present)) &&
          send_n_data(file_descriptor, &mode, sizeof(mode)) &&
          send_n_data(file_descriptor, &uid, sizeof(uid)) &&
          send_n_data(file_descriptor, &gid, sizeof(gid)) &&
          send_n_data(file_descriptor, &mtime_sec, sizeof(mtime_sec)) &&
-         send_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec));
+         send_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec)) &&
+         send_n_data(file_descriptor, &atime_valid, sizeof(atime_valid)) &&
+         send_n_data(file_descriptor, &atime_sec, sizeof(atime_sec)) &&
+         send_n_data(file_descriptor, &atime_nsec, sizeof(atime_nsec)) &&
+         send_n_data(file_descriptor, &crtime_valid, sizeof(crtime_valid)) &&
+         send_n_data(file_descriptor, &crtime_sec, sizeof(crtime_sec)) &&
+         send_n_data(file_descriptor, &crtime_nsec, sizeof(crtime_nsec));
 }
 
 FileMetadata* metadata_receive(int file_descriptor, int* ok) {
@@ -105,12 +193,17 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  if (!present) {
+  if (present == 0) {
     if (ok)
       *ok = 1;
     return NULL;
   }
-  FileMetadata* m = malloc(sizeof(FileMetadata));
+  if (present != 1) {
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL) {
     if (ok)
       *ok = 0;
@@ -156,23 +249,195 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
     return NULL;
   }
   m->mtime_nsec = (long)mtime_nsec;
+  int32_t atime_valid;
+  if (!receive_n_data(file_descriptor, &atime_valid, sizeof(atime_valid))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t atime_sec;
+  if (!receive_n_data(file_descriptor, &atime_sec, sizeof(atime_sec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t atime_nsec;
+  if (!receive_n_data(file_descriptor, &atime_nsec, sizeof(atime_nsec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int32_t crtime_valid;
+  if (!receive_n_data(file_descriptor, &crtime_valid, sizeof(crtime_valid))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t crtime_sec;
+  if (!receive_n_data(file_descriptor, &crtime_sec, sizeof(crtime_sec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  int64_t crtime_nsec;
+  if (!receive_n_data(file_descriptor, &crtime_nsec, sizeof(crtime_nsec))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  m->atime_valid = atime_valid != 0;
+  m->atime_sec = (time_t)atime_sec;
+  m->atime_nsec = (long)atime_nsec;
+  m->crtime_valid = crtime_valid != 0;
+  m->crtime_sec = (time_t)crtime_sec;
+  m->crtime_nsec = (long)crtime_nsec;
+  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0 ||
+      atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
+      (atime_valid && (atime_nsec < 0 || atime_nsec >= 1000000000LL)) ||
+      (crtime_valid && (crtime_nsec < 0 || crtime_nsec >= 1000000000LL))) {
+    free(m);
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
   if (ok)
     *ok = 1;
   return m;
 }
 
-void file_restore_metadata(const char* path, FileMetadata* metadata) {
+static mode_t metadata_mode(const FileMetadata* metadata, mode_t current_mode,
+                            bool preserve_executability) {
+  const mode_t execute_bits = S_IXUSR | S_IXGRP | S_IXOTH;
+  if (preserve_executability)
+    return (current_mode & 0777 & ~execute_bits) | (metadata->mode & execute_bits);
+  return metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+}
+
+void file_restore_metadata(const char* path, const FileMetadata* metadata,
+                           bool preserve_executability) {
   if (metadata == NULL)
     return;
-  if (chmod(path, metadata->mode & 07777 & ~(S_ISUID | S_ISGID)) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s", path, strerror(errno));
-  if (chown(path, metadata->uid, metadata->gid) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to chown %s: %s", path, strerror(errno));
+  struct stat current;
+  mode_t current_mode = stat(path, &current) == 0 ? current.st_mode : 0;
+  mode_t safe_mode = metadata_mode(metadata, current_mode, preserve_executability);
+  if (chmod(path, safe_mode) != 0) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s",
+                escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+    free(escaped_path);
+  }
+  /* Never apply client-supplied ownership.  The descriptor API below is the
+     receiver write path; retain this legacy API only for compatibility. */
   struct timespec times[2];
   times[0].tv_sec = 0;
   times[0].tv_nsec = UTIME_OMIT;
   times[1].tv_sec = metadata->mtime_sec;
   times[1].tv_nsec = metadata->mtime_nsec;
-  if (utimensat(AT_FDCWD, path, times, 0) != 0)
-    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s", path, strerror(errno));
+  if (metadata->atime_valid) {
+    times[0].tv_sec = metadata->atime_sec;
+    times[0].tv_nsec = metadata->atime_nsec;
+  }
+  if (metadata->crtime_valid) {
+    log_message(LOG_LEVEL_DEBUG,
+                "crtime (birth time) %lld.%09ld transmitted for %s but not applied: no portable "
+                "setter exists",
+                (long long)metadata->crtime_sec, metadata->crtime_nsec, path);
+  }
+  if (utimensat(AT_FDCWD, path, times, 0) != 0) {
+    char* escaped_path = output_escape(path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s",
+                escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+    free(escaped_path);
+  }
+}
+
+bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
+                                   bool omit_link_times) {
+  if (path == NULL || metadata == NULL)
+    return !identity_copy_as_active();
+  char* leaf = NULL;
+  int parent_fd = file_open_secure_parent(path, &leaf, false);
+  if (parent_fd < 0)
+    return !identity_copy_as_active();
+  /* Ownership (only when the identity policy is active) via lchown semantics:
+     fchownat with AT_SYMLINK_NOFOLLOW never dereferences the link.  A failed
+     REQUIRED --copy-as ownership marks the entry failed; every other policy is
+     best-effort. */
+  bool owned = identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid,
+                                             (int32_t)metadata->gid);
+  /* Symlink mode: not settable on Linux (fchmodat AT_SYMLINK_NOFOLLOW returns
+     EOPNOTSUPP/ENOTSUP); attempt it for platforms that support it and quietly
+     ignore the unsupported case so the transfer never fails over it. */
+  mode_t link_mode = metadata->mode & 0777;
+  if (fchmodat(parent_fd, leaf, link_mode, AT_SYMLINK_NOFOLLOW) != 0 && errno != EOPNOTSUPP &&
+      errno != ENOTSUP && errno != ENOSYS) {
+    log_message(LOG_LEVEL_DEBUG, "Could not set symlink mode on %s: %s", path, strerror(errno));
+  }
+  if (!omit_link_times) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
+    if (metadata->atime_valid) {
+      times[0].tv_sec = metadata->atime_sec;
+      times[0].tv_nsec = metadata->atime_nsec;
+    }
+    if (utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+      char* escaped_path = output_escape(path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to set symlink timestamps on %s: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+      free(escaped_path);
+    }
+  }
+  close(parent_fd);
+  free(leaf);
+  return owned;
+}
+
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability) {
+  if (fd < 0 || metadata == NULL)
+    return metadata == NULL;
+  bool ok = true;
+  struct stat current;
+  if (fstat(fd, &current) != 0)
+    return false;
+  mode_t safe_mode = metadata_mode(metadata, current.st_mode, preserve_executability);
+  if (fchmod(fd, safe_mode) != 0)
+    ok = false;
+  /* Client uid/gid values are deliberately not authoritative UNLESS the client
+     explicitly opted in with an identity flag (--numeric-ids / --usermap /
+     --groupmap / --chown).  identity_apply_ownership is the controlled,
+     privilege-gated path: it consults the negotiated policy, resolves the
+     target ids, and applies them via an fd-relative fchown() that is confined
+     to the just-written file (EPERM/EACCES are logged, never fatal) -- EXCEPT
+     for an active --copy-as, whose forced ownership is REQUIRED: a failure
+     marks this entry as failed instead of reporting a wrong-owner write as
+     success.  With no identity flag set it is a no-op, so a default or plain -M
+     transfer keeps FastSync's existing behavior of never applying client
+     ownership. */
+  if (!identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid))
+    ok = false;
+  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                              {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
+  if (metadata->atime_valid) {
+    times[0].tv_sec = metadata->atime_sec;
+    times[0].tv_nsec = metadata->atime_nsec;
+  }
+  /* --crtimes captures and transmits the source birth time, but there is no
+   * portable way to set a birth time (utimensat can only set atime/mtime), so
+   * the receiver deliberately does NOT apply it.  This is explicit, honest
+   * unsupported-attribute handling: log a debug note and continue — never fail
+   * the transfer and never pretend the crtime was applied. */
+  if (metadata->crtime_valid) {
+    log_message(LOG_LEVEL_DEBUG,
+                "crtime (birth time) %lld.%09ld transmitted but not applied: no portable setter",
+                (long long)metadata->crtime_sec, metadata->crtime_nsec);
+  }
+  if (futimens(fd, times) != 0)
+    ok = false;
+  return ok;
 }

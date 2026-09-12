@@ -2,6 +2,7 @@
 #include "log.h"
 #include "protocol.h"
 #include "transport_tcp.h"
+#include "utils.h"
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -10,7 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 bool tls_global_init(void) {
@@ -33,6 +36,10 @@ static void log_ssl_errors(void) {
 
 static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key,
                                const char* ca_path) {
+  if (!is_server && !ca_path) {
+    log_message(LOG_LEVEL_ERROR, "TLS clients require a CA certificate path");
+    return NULL;
+  }
   const SSL_METHOD* method = is_server ? TLS_server_method() : TLS_client_method();
   SSL_CTX* ctx = SSL_CTX_new(method);
   if (!ctx) {
@@ -41,17 +48,46 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
     return NULL;
   }
 
-  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  /* Harden the context: never negotiate TLS compression (the CRIME attack
+   * vector) and never honour a post-handshake renegotiation request.
+   * SSL_OP_NO_RENEGOTIATION is only available from OpenSSL 1.1.1, so it is
+   * guarded to keep older headers building. */
+  SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+#ifdef SSL_OP_NO_RENEGOTIATION
+  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+#endif
+
+  if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
+  if (SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES") != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
 
   if (cert && key) {
+    struct stat key_stat;
+    if (stat(key, &key_stat) != 0 || !S_ISREG(key_stat.st_mode) || key_stat.st_uid != geteuid() ||
+        (key_stat.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH))) {
+      log_message(LOG_LEVEL_ERROR, "TLS private key must be owned by the current user and private");
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
     if (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) {
-      log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s", cert);
+      char* escaped = output_escape(cert, false);
+      log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0) {
-      log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s", key);
+      char* escaped = output_escape(key, false);
+      log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
@@ -65,12 +101,15 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
 
   if (ca_path) {
     if (!SSL_CTX_load_verify_locations(ctx, ca_path, NULL)) {
-      log_message(LOG_LEVEL_ERROR, "Failed to load CA: %s", ca_path);
+      char* escaped = output_escape(ca_path, false);
+      log_message(LOG_LEVEL_ERROR, "Failed to load CA: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       log_ssl_errors();
       SSL_CTX_free(ctx);
       return NULL;
     }
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
     SSL_CTX_set_verify_depth(ctx, 4);
   } else {
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -85,15 +124,22 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
     log_message(LOG_LEVEL_ERROR, "Failed to create SSL object");
     return NULL;
   }
-  SSL_set_fd(ssl, fd);
+  if (SSL_set_fd(ssl, fd) != 1) {
+    SSL_free(ssl);
+    return NULL;
+  }
 
   // Enable hostname verification for client connections when a hostname is provided.
   // Must be done before SSL_connect to take effect during the handshake.
   if (!is_server && hostname) {
-    SSL_set1_host(ssl, hostname);
+    if (SSL_set1_host(ssl, hostname) != 1) {
+      SSL_free(ssl);
+      return NULL;
+    }
   }
 
   // Retry SSL_accept/SSL_connect on WANT_READ/WANT_WRITE (non-blocking handshake)
+  time_t deadline = time(NULL) + (is_server ? tcp_get_timeout_sec() : tcp_get_contimeout_sec());
   int ret;
   do {
     if (is_server)
@@ -103,7 +149,8 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
 
     if (ret <= 0) {
       int ssl_err = SSL_get_error(ssl, ret);
-      if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+      if ((ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) &&
+          time(NULL) < deadline)
         continue;
       log_message(LOG_LEVEL_ERROR, "SSL %s failed", is_server ? "accept" : "connect");
       log_ssl_errors();
@@ -131,8 +178,10 @@ struct tls_child_ctx {
 static void tls_child_fn(int fd, void* arg) {
   struct tls_child_ctx* ctx = (struct tls_child_ctx*)arg;
   SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true, NULL);
-  if (!ssl)
+  if (!ssl) {
+    io_set_ssl(NULL);
     return;
+  }
   io_set_ssl(ssl);
   ctx->handler(fd);
   SSL_shutdown(ssl);
@@ -146,22 +195,22 @@ bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {
   return true;
 }
 
-bool client_connect_tls(Client* client, char* host, int port, const char* cert_path,
-                        const char* key_path, const char* ca_path) {
-  client->address.sin_port = htons(port);
-  if (inet_pton(AF_INET, host, &client->address.sin_addr) <= 0) {
-    perror("Could not convert host address!");
-    return false;
-  }
-  if (connect(client->file_descriptor, (struct sockaddr*)&client->address, client->address_length) <
-      0) {
-    perror("Could not connect to Server!");
+bool client_connect_tls_ex(Client* client, const char* host, int port, const char* cert_path,
+                           const char* key_path, const char* ca_path,
+                           const TcpConnectOptions* opts) {
+  if (!tcp_connect_socket_ex(client, host, port, opts)) {
+    if (client->file_descriptor >= 0)
+      close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
   }
 
   SSL_CTX* ctx = create_ssl_ctx(false, cert_path, key_path, ca_path);
-  if (!ctx)
+  if (!ctx) {
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
+  }
   client->ssl_ctx = ctx;
 
   // Pass the server hostname for TLS hostname verification (SSL_set1_host
@@ -171,10 +220,17 @@ bool client_connect_tls(Client* client, char* host, int port, const char* cert_p
   if (!ssl) {
     SSL_CTX_free(ctx);
     client->ssl_ctx = NULL;
+    close(client->file_descriptor);
+    client->file_descriptor = -1;
     return false;
   }
 
   client->ssl = ssl;
   io_set_ssl(ssl);
   return true;
+}
+
+bool client_connect_tls(Client* client, const char* host, int port, const char* cert_path,
+                        const char* key_path, const char* ca_path) {
+  return client_connect_tls_ex(client, host, port, cert_path, key_path, ca_path, NULL);
 }

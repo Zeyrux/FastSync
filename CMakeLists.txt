@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(FastFileTransfer)
+project(FastFileTransfer VERSION 2.19.0)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 11)
@@ -58,15 +58,18 @@ endif()
 find_package(OpenSSL REQUIRED)
 
 file(GLOB SHARED_SRCS "src/shared/*.c")
+set(FILE_STORE_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/file_store.c")
+list(REMOVE_ITEM SHARED_SRCS ${FILE_STORE_SRCS})
 file(GLOB SERVER_SRCS "src/server/*.c")
+set(SERVER_RECEIVER_SRCS src/server/receiver.c)
 file(GLOB CLIENT_SRCS "src/client/*.c")
 
 # --- Main executables ---
-add_executable(server ${SERVER_SRCS} ${SHARED_SRCS})
+add_executable(server ${SERVER_SRCS} ${SHARED_SRCS} ${FILE_STORE_SRCS})
 target_include_directories(server PRIVATE src/shared src/server src/client)
 target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
-add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
+add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS} ${FILE_STORE_SRCS} ${SERVER_RECEIVER_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
 target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
@@ -79,8 +82,9 @@ set(TEST_INCLUDES tests src/shared src/server src/client)
 
 # Monolithic test binary (backward compatible)
 file(GLOB TEST_SRCS "tests/test_*.c" "tests/runner.c")
-add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
+add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} ${FILE_STORE_SRCS} ${SERVER_RECEIVER_SRCS} src/client/scanner.c src/client/change_list.c src/client/client_cli.c src/client/client_validation.c src/client/usage.c src/server/server_cli.c)
 target_include_directories(tests PRIVATE ${TEST_INCLUDES})
+target_compile_definitions(tests PRIVATE FASTSYNC_TEST_BUILD)
 target_link_libraries(tests PRIVATE ${TEST_LIBS})
 add_test(NAME unit_all COMMAND tests)
 
@@ -93,7 +97,7 @@ if(ENABLE_FUZZ)
   file(GLOB FUZZ_SRCS "tests/fuzz/*.c")
 	foreach(FUZZ_SRC ${FUZZ_SRCS})
 		get_filename_component(FUZZ_NAME ${FUZZ_SRC} NAME_WE)
-		add_executable(${FUZZ_NAME} ${FUZZ_SRC} ${SHARED_SRCS})
+    add_executable(${FUZZ_NAME} ${FUZZ_SRC} ${SHARED_SRCS} ${FILE_STORE_SRCS} ${SERVER_RECEIVER_SRCS})
 		target_include_directories(${FUZZ_NAME} PRIVATE ${TEST_INCLUDES})
 		target_compile_options(${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
 		target_link_options(${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined)
