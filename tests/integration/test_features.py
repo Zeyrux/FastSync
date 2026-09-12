@@ -16,13 +16,38 @@ from common import (
     run_client, CountingProxy,
     generate_test_files, verify_transfer, clean_dir, make_result,
     get_dest_received_dir, CLIENT_CMD, SERVER_CMD, ServerManager,
-    _find_free_port, _wait_for_port,
+    _find_free_port, _wait_for_port, _wait_proc,
 )
 
 SOURCE_DIR = os.path.join(TEST_DATA_DIR, "feature_source")
 DEST_DIR = os.path.join(TEST_DATA_DIR, "feature_dest")
 DEVICE_SOURCE = os.path.join(TEST_DATA_DIR, "device_source")
 DEVICE_DEST = os.path.join(TEST_DATA_DIR, "device_dest")
+
+
+def _start_captured_server(prefix=None, extra_args=None):
+    """Start a plain-TCP server with captured stdout/stderr for one test.
+
+    Returns (proc, port).  The caller owns `proc` and must terminate it via
+    `_wait_proc` so a server that ignores SIGTERM is killed instead of leaving
+    a zombie or raising TimeoutExpired.  The shared session server discards its
+    output, so tests that lock in a receiver-side warning need their own.  The
+    server's SIGTERM handler exits via `_exit`, which does not flush stdio, so
+    `stdbuf -oL` keeps stdout line-buffered and the warning observable."""
+    port = _find_free_port()
+    cmd = ["stdbuf", "-oL"] + (prefix or []) + SERVER_CMD + ["-p", str(port), "--allow-unauthenticated"]
+    if extra_args:
+        cmd += extra_args
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _wait_for_port(port)
+    return proc, port
+
+
+def _stop_captured_server(proc):
+    """Terminate a captured server and return its (stdout, stderr) text."""
+    proc.terminate()
+    _wait_proc(proc)
+    return proc.communicate()
 
 
 class TestDeviceSpecial:
@@ -66,19 +91,22 @@ class TestDeviceSpecial:
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         assert stat.S_ISFIFO(os.stat(os.path.join(received, "pipe.fifo")).st_mode)
 
-    def test_specials_socket_source_skipped_safely(self, shared_server):
+    @pytest.mark.ci
+    def test_specials_socket_source_skipped_safely(self):
         """A socket cannot be recreated by any standard filesystem call, so
         --specials must skip it with a note and still complete the run (the
         adjacent regular file transfers normally; no socket node appears)."""
         self._setup()
         sock_path = os.path.join(DEVICE_SOURCE, "source.sock")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server, port = _start_captured_server()
         try:
             s.bind(sock_path)
             result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
-                                   flags=["--specials"], port=shared_server.port)
+                                   flags=["--specials"], port=port)
         finally:
             s.close()
+            out, err = _stop_captured_server(server)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         with open(os.path.join(received, "plain.txt")) as f:
@@ -86,15 +114,23 @@ class TestDeviceSpecial:
         assert not os.path.lexists(os.path.join(received, "source.sock")), (
             "socket source must be skipped, not materialized"
         )
+        assert "socket not recreated" in (out + err), (
+            f"receiver did not log the documented socket skip: out={out!r} err={err!r}"
+        )
 
-    def test_copy_devices_fifo_becomes_regular_file(self, shared_server):
+    @pytest.mark.ci
+    @pytest.mark.parametrize("flags", [["--copy-devices"], ["--copy-devices", "--sendfile"]])
+    def test_copy_devices_fifo_becomes_regular_file(self, shared_server, flags):
         """--copy-devices treats a special source as an ordinary regular-file
         copy: a FIFO (st_size 0) becomes a zero-length REGULAR file on the
-        destination (never a FIFO, never a hang), and the run succeeds."""
+        destination (never a FIFO, never a hang), and the run succeeds.  The
+        --sendfile variant previously blocked forever in the sendfile open();
+        the non-regular source now falls back to the buffered read path, so it
+        must complete within the bounded-time assertion below."""
         self._setup()
         os.mkfifo(os.path.join(DEVICE_SOURCE, "device_copy.fifo"))
-        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
-                               flags=["--copy-devices"], port=shared_server.port)
+        result, dur = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                                 flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         copied = os.path.join(received, "device_copy.fifo")
@@ -104,6 +140,7 @@ class TestDeviceSpecial:
             f"copy-devices must produce a regular file, got mode {oct(st.st_mode)}"
         )
         assert st.st_size == 0, f"expected a size-bounded 0-byte copy, got {st.st_size}"
+        assert dur < 60, f"{' '.join(flags)} hung on a FIFO source"
 
     def test_write_devices_non_crash(self, shared_server):
         """--write-devices writes into an existing device only; when the
@@ -117,6 +154,7 @@ class TestDeviceSpecial:
                                flags=["--write-devices"], port=shared_server.port)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
 
+    @pytest.mark.ci
     def test_write_devices_regular_file_target_skipped(self, shared_server):
         """--write-devices only ever writes into an existing char/block node: a
         pre-existing REGULAR file at the destination path is left byte-identical
@@ -148,24 +186,22 @@ class TestDeviceSpecial:
         # The unprivileged receiver must be able to create the destination tree.
         os.makedirs(DEVICE_DEST, exist_ok=True)
         os.chmod(DEVICE_DEST, 0o777)
-        port = _find_free_port()
-        server = subprocess.Popen(
-            ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"] +
-            SERVER_CMD + ["-p", str(port), "--allow-unauthenticated"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server, port = _start_captured_server(
+            prefix=["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"])
         try:
-            _wait_for_port(port)
             result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
                                    flags=["--devices"], port=port)
         finally:
-            server.terminate()
-            server.wait(timeout=5)
+            out, err = _stop_captured_server(server)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:300]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         with open(os.path.join(received, "plain.txt")) as f:
             assert f.read() == "regular content\n"
         assert not os.path.lexists(os.path.join(received, "chardev")), (
             "a receiver without CAP_MKNOD must skip the device node, not create it"
+        )
+        assert "cannot create device node" in (out + err), (
+            f"receiver did not log the documented CAP_MKNOD skip: out={out!r} err={err!r}"
         )
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")

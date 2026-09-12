@@ -1259,6 +1259,19 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
   return 0;
 }
 
+/* Sendfile calls a blocking open() on the source (file_send_sendfile_with_skip
+ * -> file_open_for_read), which never returns for a FIFO/device with no writer.
+ * Only a regular file may take the zero-copy sendfile path; a non-regular source
+ * (FIFO/device copied by --copy-devices) must use the buffered, size-bounded
+ * read path instead.  `stat` follows symlinks, so a dereferenced symlink to a
+ * regular file keeps the sendfile fast path. */
+static bool source_is_regular_file(const File* file) {
+  if (!file || !file->path)
+    return false;
+  struct stat st;
+  return stat(file->path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
                                    ArrayList* remove_sources) {
   if (config->use_chunk_serialization) {
@@ -1337,8 +1350,9 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       continue;
     }
     bool stream = f->data->data == NULL && f->data->size > 0;
-    bool use_sendfile =
-        (config->use_sendfile && !config->use_compression) || (stream && !config->use_compression);
+    bool use_sendfile = ((config->use_sendfile && !config->use_compression) ||
+                         (stream && !config->use_compression)) &&
+                        source_is_regular_file(f);
     SourceFile* source = remove_sources ? source_file_create(f) : NULL;
     int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
     if (rc == 1) {
