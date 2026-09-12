@@ -29,6 +29,10 @@ void log_perror(const char* context);
 void set_log_level(LogLevel level);
 void set_log_debug_flags(uint32_t flags);
 uint32_t get_log_debug_flags(void);
+/* True when a log_debug_message() call with the same flag would actually emit:
+ * the debug log level is enabled AND the flag is selected.  Hot paths use this
+ * to skip expensive message formatting/escaping when the line is filtered. */
+bool log_debug_enabled(LogDebugFlag flag);
 void log_debug_message(LogDebugFlag flag, const char* message, ...);
 void set_log_info_flags(uint32_t flags);
 uint32_t get_log_info_flags(void);

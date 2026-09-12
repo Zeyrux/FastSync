@@ -27,6 +27,10 @@ uint32_t get_log_debug_flags(void) {
   return current_debug_flags;
 }
 
+bool log_debug_enabled(LogDebugFlag flag) {
+  return current_log_level <= LOG_LEVEL_DEBUG && (current_debug_flags & flag) != 0;
+}
+
 void set_log_info_flags(uint32_t flags) {
   info_flags = flags;
   info_flags_explicit = true;

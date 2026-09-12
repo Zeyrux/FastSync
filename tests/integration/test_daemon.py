@@ -5,18 +5,25 @@ started with --daemon reads a FastSync-native module config file, the client
 asks for a module with a host::module/path destination, and the transfer lands
 in the configured module root only.  Read-only modules, unknown modules, and
 auth-required modules without valid credentials are all refused cleanly before
-any data moves.  Wave B (daemon authentication) adds the real credential
-round-trips exercised in TestDaemonAuthentication: modules that declare
-`auth users` accept only a client whose --password-file presents a username on
-the module's list with a matching password (verified as a SHA-256 digest), and
-the daemon refuses to start when such a module has no credential store.
+any data moves.  The A7 auth wave adds the real credential round-trips exercised
+in TestDaemonAuthentication: modules that declare `auth users` accept only a
+client whose --password-file presents a username on the module's list, proven
+through a SCRAM-SHA-256-style challenge/response against a salted PBKDF2
+verifier.  The daemon refuses to start when such a module has no credential
+store, a legacy SHA-256 store line is hard-rejected, and a replayed response
+from another connection is refused.
 """
+import base64
 import glob
 import hashlib
+import hmac
 import os
+import select
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -58,9 +65,39 @@ ALICE_PASS = "alice-s3cret"
 BOB_PASS = "bob-s3cret"
 WRONG_PASS = "wrong-password"
 
+# The store holds a salted PBKDF2 verifier (A7 SCRAM); this is the exact
+# derivation the C implementation performs, recomputed here so the tests are an
+# independent reference.  100000 keeps the module import fast while staying at
+# the validation minimum.
+CRED_ITERS = 100000
 
-def _pw_hash(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+
+def _verifier(password, salt, iters=CRED_ITERS):
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters, 32)
+    client_key = hmac.new(key, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(key, b"Server Key", hashlib.sha256).digest()
+    return stored_key, server_key
+
+
+def _store_line(user, password, iters=CRED_ITERS, salt=None):
+    if salt is None:
+        salt = os.urandom(16)
+    stored_key, server_key = _verifier(password, salt, iters)
+    return "%s:$fastsync$1$pbkdf2-sha256$%d$%s$%s$%s" % (
+        user, iters, base64.b64encode(salt).decode(),
+        base64.b64encode(stored_key).decode(), base64.b64encode(server_key).decode())
+
+
+def _store_secrets(line):
+    """The base64 stored_key/server_key fields of a store line (the values that
+    must never appear in a log)."""
+    parts = line.split("$")
+    return parts[-2], parts[-1]
+
+
+ALICE_LINE = _store_line("alice", ALICE_PASS)
+BOB_LINE = _store_line("bob", BOB_PASS)
 
 
 def _write_client_password_file(path, user, password):
@@ -159,12 +196,12 @@ def daemon_env():
         os.makedirs(d, exist_ok=True)
     generate_test_files(SOURCE_DIR, full=False)
 
-    # Server-side credential store: alice and bob (password digests only; the
-    # plaintext passwords never appear on the daemon host or in any log).
+    # Server-side credential store: alice and bob (salted PBKDF2 verifiers only;
+    # the plaintext passwords never appear on the daemon host or in any log).
     with open(CRED_FILE, "w") as f:
-        f.write("# daemon credential store (Wave B)\n")
-        f.write("alice:%s\n" % _pw_hash(ALICE_PASS))
-        f.write("bob:%s\n" % _pw_hash(BOB_PASS))
+        f.write("# daemon credential store (A7 SCRAM)\n")
+        f.write(ALICE_LINE + "\n")
+        f.write(BOB_LINE + "\n")
     os.chmod(CRED_FILE, 0o600)
 
     # The config's port is a free port chosen per worker; the `daemon` fixture
@@ -518,6 +555,135 @@ class TestDaemonRejection:
             d.stop()
 
 
+# Numeric status values (must match the enum order in src/shared/protocol.h).
+STATUS_AUTH_CHALLENGE = 21
+STATUS_AUTH_RESPONSE = 22
+_AUTH_FRAME_MAX = 1 << 20
+
+
+def _wire_string_frame_len(buf, off):
+    """Return the total byte length of the wire string at buf[off], or None when
+    more bytes are needed."""
+    if len(buf) < off + 8:
+        return None
+    (length,) = struct.unpack_from("<Q", buf, off)
+    if length > _AUTH_FRAME_MAX:
+        raise ValueError("oversized auth frame string")
+    if len(buf) < off + 8 + length:
+        return None
+    return 8 + length
+
+
+def _client_cmd(dest, port, cred_path):
+    return CLIENT_CMD + ["--source-dir", SOURCE_DIR, "--dest-dir", dest,
+                         "--save-to-disk", "--server-port", str(port),
+                         "--password-file", cred_path]
+
+
+class _AuthReplayProxy:
+    """A one-connection-at-a-time TCP relay in front of the daemon.
+
+    The capture connection records the client's STATUS_AUTH_RESPONSE frame (the
+    status, the client nonce string and the proof string); the replay connection
+    substitutes that recorded frame for its own response, so the daemon sees a
+    proof bound to the FIRST connection's challenge nonce."""
+
+    def __init__(self, backend_port):
+        self.backend = ("127.0.0.1", backend_port)
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        self.server.settimeout(20)
+        self.port = self.server.getsockname()[1]
+        self.stolen = None
+
+    def close(self):
+        try:
+            self.server.close()
+        except OSError:
+            pass
+
+    def _run_connection(self, capture):
+        client, _ = self.server.accept()
+        backend = socket.create_connection(self.backend, timeout=20)
+        client.settimeout(20)
+        backend.settimeout(20)
+        buf_c = b""
+        buf_s = b""
+        state = "config"
+        try:
+            while True:
+                ready, _, _ = select.select([client, backend], [], [], 20)
+                if not ready:
+                    break
+                eof = False
+                for sock in ready:
+                    data = sock.recv(65536)
+                    if not data:
+                        eof = True
+                        continue
+                    if sock is client:
+                        buf_c += data
+                    else:
+                        buf_s += data
+                if state == "config":
+                    if buf_c:
+                        backend.sendall(buf_c)
+                        buf_c = b""
+                    if len(buf_s) >= 4:
+                        (status,) = struct.unpack_from("<i", buf_s, 0)
+                        if status == STATUS_AUTH_CHALLENGE:
+                            off = 4 + 4  # status int + iteration int
+                            for _ in range(2):
+                                frame = _wire_string_frame_len(buf_s, off)
+                                if frame is None:
+                                    break
+                                off += frame
+                            else:
+                                client.sendall(buf_s[:off])
+                                buf_s = buf_s[off:]
+                                state = "auth"
+                        else:
+                            if buf_s:
+                                client.sendall(buf_s)
+                                buf_s = b""
+                            state = "relay"
+                elif state == "auth":
+                    if len(buf_c) >= 4:
+                        off = 4
+                        for _ in range(2):
+                            frame = _wire_string_frame_len(buf_c, off)
+                            if frame is None:
+                                break
+                            off += frame
+                        else:
+                            response = buf_c[:off]
+                            buf_c = buf_c[off:]
+                            if capture:
+                                self.stolen = response
+                                backend.sendall(response)
+                            else:
+                                assert self.stolen is not None
+                                backend.sendall(self.stolen)
+                            state = "relay"
+                    if buf_s:
+                        client.sendall(buf_s)
+                        buf_s = b""
+                else:
+                    if buf_c:
+                        backend.sendall(buf_c)
+                        buf_c = b""
+                    if buf_s:
+                        client.sendall(buf_s)
+                        buf_s = b""
+                if eof:
+                    break
+        finally:
+            client.close()
+            backend.close()
+
+
 class TestDaemonAuthentication:
     """Wave B password authentication round-trips on the shared daemon (its
     config declares `locked` with `auth users = alice` and `team` with
@@ -640,8 +806,63 @@ class TestDaemonAuthentication:
         finally:
             d.stop()
 
+    @pytest.mark.ci
+    def test_replayed_auth_response_rejected(self, daemon):
+        """A7 replay defense: an auth response captured from one connection is
+        refused on a second connection (the proof is bound to the challenge
+        nonce), and nothing is written to the module root."""
+        proxy = _AuthReplayProxy(daemon.port)
+        try:
+            cred_a = os.path.join(TEST_DATA_DIR, "replay_a.pw")
+            _write_client_password_file(cred_a, "alice", ALICE_PASS)
+            proc_a = subprocess.Popen(_client_cmd("127.0.0.1::locked", proxy.port, cred_a),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proxy._run_connection(capture=True)
+            out_a, err_a = proc_a.communicate(timeout=30)
+            assert proc_a.returncode == 0, err_a or out_a
+            assert proxy.stolen is not None
+            os.unlink(cred_a)
+
+            before = _tree_file_count(AUTH_MODULE)
+            cred_b = os.path.join(TEST_DATA_DIR, "replay_b.pw")
+            _write_client_password_file(cred_b, "alice", ALICE_PASS)
+            proc_b = subprocess.Popen(_client_cmd("127.0.0.1::locked", proxy.port, cred_b),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proxy._run_connection(capture=False)
+            out_b, err_b = proc_b.communicate(timeout=30)
+            assert proc_b.returncode != 0, "a replayed auth response must be refused"
+            assert _tree_file_count(AUTH_MODULE) == before, \
+                "a replayed auth response wrote data"
+            os.unlink(cred_b)
+        finally:
+            proxy.close()
+
+    def test_legacy_store_refuses_to_start(self):
+        """A legacy `user:SHA256HEX` store is hard-rejected: the daemon must not
+        start and must never accept a replayable bearer digest."""
+        legacy = os.path.join(TEST_DATA_DIR, "fastsyncd_legacy.passwd")
+        with open(legacy, "w") as f:
+            f.write("alice:9b90e524e94995ee4aeae2ee3c428a53405d1e8db147f44facc46797d0caf4c3\n")
+        os.chmod(legacy, 0o600)
+        conf = os.path.join(TEST_DATA_DIR, "fastsyncd_legacy.conf")
+        port = _find_free_port()
+        with open(conf, "w") as f:
+            f.write("port = %d\n\n[locked]\npath = %s\nauth users = alice\n" % (port, AUTH_MODULE))
+        try:
+            proc = subprocess.run(
+                SERVER_CMD + ["--daemon", "--config", conf, "--no-detach",
+                              "--password-file", legacy],
+                capture_output=True, text=True, timeout=15)
+            assert proc.returncode != 0
+            combined = (proc.stderr or "") + (proc.stdout or "")
+            assert "legacy" in combined
+            assert "alice" in combined
+        finally:
+            os.unlink(legacy)
+            os.unlink(conf)
+
     def test_auth_log_does_not_leak_password(self, daemon):
-        """The daemon log must never contain the password or its digest."""
+        """The daemon log must never contain the password or the store verifier."""
         log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
         _push_with_creds("127.0.0.1::locked", daemon.port, "alice", WRONG_PASS)
@@ -652,15 +873,15 @@ class TestDaemonAuthentication:
             tail = f.read().decode("utf-8", "replace")
         assert ALICE_PASS not in tail
         assert WRONG_PASS not in tail
-        assert _pw_hash(ALICE_PASS) not in tail
-        assert _pw_hash(WRONG_PASS) not in tail
+        for secret in _store_secrets(ALICE_LINE):
+            assert secret not in tail
+        assert "$fastsync$" not in tail
 
-    def test_auth_digest_not_logged_at_debug_level(self):
+    def test_auth_secrets_not_logged_at_debug_level(self):
         """Under --verbose the daemon enables LOG_DEBUG_ALL, which normally
-        traces every protocol string -- the auth username/digest must NOT leak
-        into that trace even then.  The redacted marker is logged instead, and
-        the digest/username/password never appear while debug protocol logging
-        is actually proving itself active."""
+        traces every protocol string -- the auth username/proof/signature must
+        NOT leak into that trace even then.  The redacted marker is logged
+        instead, while debug protocol logging is actually proving itself active."""
         d = DaemonManager()
         port = _find_free_port()
         try:
@@ -680,8 +901,9 @@ class TestDaemonAuthentication:
         # The secret-worthy fields must never appear, at any log level.
         assert ALICE_PASS not in log
         assert WRONG_PASS not in log
-        assert _pw_hash(ALICE_PASS) not in log
-        assert _pw_hash(WRONG_PASS) not in log
+        for secret in _store_secrets(ALICE_LINE):
+            assert secret not in log
+        assert "$fastsync$" not in log
 
 
 class TestDaemonMotd:

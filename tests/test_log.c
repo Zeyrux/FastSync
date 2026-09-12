@@ -128,6 +128,25 @@ static void test_log_message_formats() {
   EXPECT_TRUE(true);
 }
 
+/* log_debug_enabled is the lazy-formatting gate for log_debug_message: it must
+ * be true only at DEBUG level with the requested flag selected, exactly
+ * mirroring the filter inside log_debug_message itself. */
+static void test_log_debug_enabled_matches_gate() {
+  set_log_level(LOG_LEVEL_WARNING);
+  set_log_debug_flags(LOG_DEBUG_ALL);
+  EXPECT_FALSE(log_debug_enabled(LOG_DEBUG_PROTO));
+
+  set_log_level(LOG_LEVEL_DEBUG);
+  set_log_debug_flags(LOG_DEBUG_PROTO);
+  EXPECT_TRUE(log_debug_enabled(LOG_DEBUG_PROTO));
+  EXPECT_FALSE(log_debug_enabled(LOG_DEBUG_IO));
+
+  set_log_debug_flags(0);
+  EXPECT_FALSE(log_debug_enabled(LOG_DEBUG_PROTO));
+
+  set_log_debug_flags(LOG_DEBUG_ALL);
+}
+
 void test_log() {
   test_log_message_debug();
   test_log_message_info();
@@ -139,4 +158,5 @@ void test_log() {
   test_log_filtering();
   test_log_stderr_mode_all();
   test_log_message_formats();
+  test_log_debug_enabled_matches_gate();
 }

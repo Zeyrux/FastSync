@@ -113,7 +113,20 @@ enum NET_STATUS {
    * than MAX_MANIFEST_ENTRIES is split across repeated frames.  The receiver
    * defers the actual utimensat until its own delete/publish phase has
    * committed, then skips the whole set when -O/--omit-dir-times is set. */
-  STATUS_DIR_TIMES
+  STATUS_DIR_TIMES,
+  /* Daemon SCRAM-SHA-256 authentication (A7 remediation, protocol 2.19.0).
+   * STATUS_AUTH_CHALLENGE: the server requires auth and is about to send the
+   * iteration count, the base64 salt and the base64 server nonce.
+   * STATUS_AUTH_RESPONSE: the client's reply, followed by the base64 client
+   * nonce and the base64 ClientProof.  STATUS_AUTH_OK: the client proof
+   * verified, followed by the base64 ServerSignature.  STATUS_AUTH_FAILED:
+   * a single generic refusal (unknown user, off-list user, wrong proof,
+   * missing/malformed credentials) after which the server closes without
+   * writing any data. */
+  STATUS_AUTH_CHALLENGE,
+  STATUS_AUTH_RESPONSE,
+  STATUS_AUTH_OK,
+  STATUS_AUTH_FAILED
 };
 
 void io_set_fds(int read_fd, int write_fd);
@@ -138,8 +151,9 @@ bool protocol_send_str(ProtocolSession* session, const char* data);
 char* protocol_receive_str(ProtocolSession* session);
 /* Redacted string variants: identical wire framing to protocol_send_str /
  * protocol_receive_str, but the payload body is replaced by `<redacted>` in the
- * LOG_DEBUG_PROTO debug log.  Used for secrets (daemon auth username/digest) so
- * a --verbose log can never capture a replayable credential. */
+ * LOG_DEBUG_PROTO debug log.  Used for daemon auth material (the username and
+ * the proof/signature fields) so a --verbose log can never capture a credential
+ * that could be replayed. */
 bool protocol_send_str_redacted(ProtocolSession* session, const char* data);
 char* protocol_receive_str_redacted(ProtocolSession* session);
 bool protocol_send_data(ProtocolSession* session, const Data* data);
