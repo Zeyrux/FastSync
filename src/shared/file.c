@@ -930,9 +930,12 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
         int prealloc_rc = 0;
         if (preallocate && !sparse && data_size > 0) {
           prealloc_rc = preallocate_fd(fd, data_size);
-          if (prealloc_rc != 0)
-            log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
-                        strerror(prealloc_rc));
+          if (prealloc_rc != 0) {
+            char* escaped_path = output_escape(path, log_get_8_bit_output());
+            log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted",
+                        escaped_path ? escaped_path : "<allocation failed>", strerror(prealloc_rc));
+            free(escaped_path);
+          }
         }
         if (prealloc_rc == 0) {
           /* posix_fallocate does not guarantee the fd's file offset is left
@@ -1037,9 +1040,12 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       int prealloc_rc = 0;
       if (preallocate && !sparse && data_size > 0) {
         prealloc_rc = preallocate_fd(fd, data_size);
-        if (prealloc_rc != 0)
-          log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted", path,
-                      strerror(prealloc_rc));
+        if (prealloc_rc != 0) {
+          char* escaped_path = output_escape(path, log_get_8_bit_output());
+          log_message(LOG_LEVEL_ERROR, "preallocate failed for '%s' (%s); transfer aborted",
+                      escaped_path ? escaped_path : "<allocation failed>", strerror(prealloc_rc));
+          free(escaped_path);
+        }
       }
       if (prealloc_rc == 0) {
         lseek(fd, 0, SEEK_SET);

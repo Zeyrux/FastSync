@@ -257,10 +257,11 @@ static const char* server_module_gate(const Config* config, void* context) {
      standalone/SSH server has a single operator-authorized root and keeps
      honoring these. */
   if (!module->client_owner) {
-    /* Ownership: refuse the whole transfer up front (a clear failure).  Evaluated
-       against the effective copy (so an operator --no-super has already
-       neutralized an explicit --super), exactly as before. */
-    if (identity_ownership_requested(&effective)) {
+    /* Ownership: refuse the whole transfer up front (a clear failure).
+       Evaluated against the ORIGINAL config so an explicit --super is refused
+       even when an operator --no-super veto already forced the effective copy
+       to OFF (the veto must not silently convert a refusal into an accept). */
+    if (identity_ownership_requested(config)) {
       log_message(LOG_LEVEL_ERROR,
                   "daemon module '%s' refuses client-chosen ownership/super-user activities "
                   "(no `client owner = yes` opt-in); refusing",
