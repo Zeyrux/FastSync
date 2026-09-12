@@ -169,6 +169,7 @@ static void config_set_defaults(Config* config) {
   config->usermap_count = 0;
   config->groupmap = NULL;
   config->groupmap_count = 0;
+  config->super_mode = SUPER_MODE_AUTO;
   config->delay_context = NULL;
   config->preserve_atimes = false;
   config->preserve_crtimes = false;
@@ -256,7 +257,10 @@ static bool validate_received_config(const Config* config) {
             unsupported charset name so the run is refused up front instead of
             every received file name failing mid-transfer.  A NULL spec (iconv
             disabled) is always accepted. */
-         (!config->iconv_spec || charset_spec_valid(config->iconv_spec));
+         (!config->iconv_spec || charset_spec_valid(config->iconv_spec)) &&
+         /* --super / --no-super: the received tri-state must be one of the
+            defined values (AUTO/ON/OFF); anything else is a malformed frame. */
+         config->super_mode >= SUPER_MODE_AUTO && config->super_mode <= SUPER_MODE_OFF;
 }
 
 Config* config_create(void) {
@@ -1185,6 +1189,25 @@ static bool receive_iconv_spec(int fd, Config* c) {
   return true;
 }
 
+/* --super / --no-super privilege policy (P7 Wave E, protocol 2.18.0).  One
+ * trailing int on the config frame, sent after the --iconv spec and before the
+ * STATUS_OK ack, so the receiver knows whether it may attempt super-user
+ * activities (ownership application, char/block device-node creation) that are
+ * already confined below the authorized receive root.  The received value is
+ * validated to the SUPER_MODE_AUTO..SUPER_MODE_OFF range (also re-checked by
+ * validate_received_config). */
+static bool send_privilege_options(int fd, const Config* c) {
+  return send_int(fd, c->super_mode);
+}
+
+static bool receive_privilege_options(int fd, Config* c) {
+  int mode;
+  if (!receive_int(fd, &mode) || mode < SUPER_MODE_AUTO || mode > SUPER_MODE_OFF)
+    return false;
+  c->super_mode = mode;
+  return true;
+}
+
 bool config_send(int file_descriptor, const Config* config) {
   protocol_session_set_max_alloc(NULL, config->max_alloc);
   if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
@@ -1198,7 +1221,7 @@ bool config_send(int file_descriptor, const Config* config) {
       !send_symlink_trust_options(file_descriptor, config) ||
       !send_phase4_xattr_options(file_descriptor, config) ||
       !send_daemon_module(file_descriptor, config) || !send_daemon_auth(file_descriptor, config) ||
-      !send_iconv_spec(file_descriptor, config))
+      !send_iconv_spec(file_descriptor, config) || !send_privilege_options(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -1240,7 +1263,9 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_symlink_trust_options(file_descriptor, config) ||
       !receive_phase4_xattr_options(file_descriptor, config) ||
       !receive_daemon_module(file_descriptor, config) ||
-      !receive_daemon_auth(file_descriptor, config) || !receive_iconv_spec(file_descriptor, config))
+      !receive_daemon_auth(file_descriptor, config) ||
+      !receive_iconv_spec(file_descriptor, config) ||
+      !receive_privilege_options(file_descriptor, config))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

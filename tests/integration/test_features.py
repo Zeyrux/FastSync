@@ -200,8 +200,9 @@ class TestDeviceSpecial:
         assert not os.path.lexists(os.path.join(received, "chardev")), (
             "a receiver without CAP_MKNOD must skip the device node, not create it"
         )
-        assert "cannot create device node" in (out + err), (
-            f"receiver did not log the documented CAP_MKNOD skip: out={out!r} err={err!r}"
+        assert ("cannot create device node" in (out + err)
+                or "device-node creation is not permitted" in (out + err)), (
+            f"receiver did not log the documented device skip: out={out!r} err={err!r}"
         )
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
@@ -4117,6 +4118,68 @@ class TestIdentityMapping:
         st = os.stat(dst_file)
         assert st.st_uid == 12345 and st.st_gid == 54321, \
             f"--chown not applied: uid={st.st_uid} gid={st.st_gid}"
+
+
+class TestSuperPrivilege:
+    """P7 Wave E: --super / --no-super control the receiver's already-confined
+    super-user activities (ownership application, char/block device nodes).
+    FastSync never elevates, so on an unprivileged receiver --super only
+    permits a confined attempt (which then skips); --no-super forbids the
+    activity even for root."""
+
+    def _seed(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"super_{tag}_source")
+        dest = os.path.join(TEST_DATA_DIR, f"super_{tag}_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"super privilege\n")
+        return source, dest
+
+    def test_super_and_no_super_transfer_successfully(self, shared_server):
+        """Both flags parse and the transfer completes normally regardless of
+        the receiver's privilege level."""
+        for flag in ("--super", "--no-super"):
+            source, dest = self._seed(flag.strip("-"))
+            result, _ = run_client(source, dest, flags=[flag], port=shared_server.port)
+            assert result.returncode == 0, \
+                f"{flag} exit {result.returncode}: {(result.stderr or '')[:300]}"
+            received = get_dest_received_dir(dest, source)
+            with open(os.path.join(received, "f.txt"), "rb") as f:
+                assert f.read() == b"super privilege\n"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_no_super_suppresses_ownership_as_root(self, shared_server):
+        """As root the default gate would apply a raw numeric id; --no-super
+        must suppress that ownership application entirely."""
+        source, dest = self._seed("nosuper")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "--numeric-ids", "--no-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.stat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) != (12345, 12346), \
+            f"--no-super must not apply ownership (uid={st.st_uid} gid={st.st_gid})"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_super_applies_ownership_as_root(self, shared_server):
+        """Control/proof the flag is not inert for root: --super with no explicit
+        identity policy treats ownership as raw numeric ids (as --numeric-ids),
+        applying the very ownership --no-super suppressed."""
+        source, dest = self._seed("super")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "--super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.stat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) == (12345, 12346), \
+            f"--super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
 
 
 class TestHardLinks:

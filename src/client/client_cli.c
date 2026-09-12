@@ -848,6 +848,20 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       config->no_motd = true;
       continue;
     }
+    /* "--super" / "--no-super" are real rsync option names controlling the
+     * receiver's super-user activity policy (ownership, device nodes), not a
+     * Boolean pair for the generic --no-* negation branch: both map onto the
+     * Config->super_mode tri-state.  Handle them explicitly (exact match only,
+     * so a malformed "--super=x" still falls through to the unknown-option
+     * error) before the generic negation branch would mis-reject "--no-super". */
+    if (strcmp(argv[i], "--super") == 0) {
+      config->super_mode = SUPER_MODE_ON;
+      continue;
+    }
+    if (strcmp(argv[i], "--no-super") == 0) {
+      config->super_mode = SUPER_MODE_OFF;
+      continue;
+    }
     if (strncmp(argv[i], "--no-", strlen("--no-")) == 0) {
       if (strcmp(argv[i], "--no-delta") == 0)
         no_delta = true;

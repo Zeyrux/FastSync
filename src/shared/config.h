@@ -402,6 +402,22 @@ typedef struct Config {
   IdentityMap* groupmap;
   int groupmap_count;
 
+  /* --super / --no-super (P7 Wave E, protocol 2.18.0): receiver-side privilege
+   * policy for super-user activities confined below the authorized receive
+   * root.  SUPER_MODE_AUTO (default) preserves the pre-existing behavior: a
+   * privileged operation is only attempted when the receiver is ALREADY root
+   * (geteuid() == 0).  SUPER_MODE_ON (--super) PERMITS the receiver to attempt
+   * those activities (ownership application, char/block device-node creation)
+   * even when it is not root -- the attempt is then confined exactly as before
+   * and simply fails/skips if the kernel refuses it.  SUPER_MODE_OFF
+   * (--no-super) FORBIDS them even when running as root.  FastSync NEVER
+   * elevates privileges (no setuid/seteuid/setgid) and never bypasses the
+   * fd-relative confinement (file_open_secure_parent, O_NOFOLLOW, root checks);
+   * --super only permits an attempt that is already confined.  Crosses the wire
+   * as a trailing int so the receiver can enforce the policy.  See
+   * privilege_super_permitted() in identity.h. */
+  int super_mode;
+
   // Receiver-side runtime staging registry for --delay-updates.  Never sent
   // over the wire and never set on the sender side.
   DelayUpdatesContext* delay_context;
@@ -563,8 +579,24 @@ typedef struct Config {
  * would desynchronize on the unknown frame, and the strict same-version
  * handshake (config_receive rejects a mismatched version before parsing
  * anything else) is what keeps a 2.17 client and a 2.16 server from ever
- * reaching that state. */
-#define PROTOCOL_VERSION "2.17.0"
+ * reaching that state.
+ *
+ * Privilege Wave (P7 Wave E): 2.17.0 -> 2.18.0.
+ *
+ * WHY the bump, grounded in the wire: this wave adds the receiver-side
+ * --super / --no-super privilege policy.  The config-frame layout gains a new
+ * trailing int (Config->super_mode) sent immediately AFTER the --iconv
+ * CONVERT_SPEC block (send_privilege_options / receive_privilege_options in
+ * config.c), so the receiver knows whether it may attempt super-user
+ * activities (ownership application, char/block device-node creation) that are
+ * already confined below the authorized receive root.  Any config-frame layout
+ * change must bump the protocol version: a peer that does not parse the new
+ * trailing bytes would desynchronize on the frame boundary, and the strict
+ * same-version handshake (config_receive rejects a mismatched version before
+ * parsing anything else) is what keeps a 2.18 client and a 2.17 server from
+ * ever reaching that state.  --super never elevates privileges; it only
+ * permits a confined attempt, so no new capability is granted. */
+#define PROTOCOL_VERSION "2.18.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
@@ -576,6 +608,15 @@ typedef struct Config {
 #define IDENTITY_MATCH_ANY (-1)
 #define IDENTITY_CURRENT (-1)
 #define MAX_IDENTITY_MAP 128
+
+/* --super / --no-super tri-state (Config->super_mode).  AUTO preserves the
+ * pre-existing behavior (a privileged attempt only when already root); ON
+ * permits confined privileged attempts; OFF forbids them even as root.  See the
+ * Config->super_mode comment above and privilege_super_permitted() in
+ * identity.h. */
+#define SUPER_MODE_AUTO 0
+#define SUPER_MODE_ON 1
+#define SUPER_MODE_OFF 2
 
 Config* config_create(void);
 void config_delete(Config* config);

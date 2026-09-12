@@ -168,6 +168,14 @@ void print_usage(void) {
   printf("                      user.fastsync.stat xattr on each written file and\n");
   printf("                      re-apply it (fd-relative) on a privileged run; the\n");
   printf("                      recording format diverges from rsync's user.rsync.%%stat%%\n");
+  printf("  --super             Permit the receiver to attempt super-user activities\n");
+  printf("                      (ownership application, char/block device-node\n");
+  printf("                      creation) within the confined receive root.  Never\n");
+  printf("                      elevates privileges and never bypasses confinement;\n");
+  printf("                      with no explicit identity policy, ownership follows\n");
+  printf("                      raw numeric ids (as if --numeric-ids)\n");
+  printf("  --no-super          Forbid those super-user activities even when the\n");
+  printf("                      receiver is running as root\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
   printf("  --numeric-ids       Do not map uid/gid by name: use the source numeric\n");
   printf("                      ids directly when applying ownership\n");

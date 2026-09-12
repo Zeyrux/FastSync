@@ -27,6 +27,10 @@ typedef struct {
   int usermap_count;
   IdentityMap* groupmap;
   int groupmap_count;
+  /* --super / --no-super tri-state (SUPER_MODE_AUTO when unset).  Snapshotted
+   * per connection so privilege_super_permitted() can gate super-user
+   * activities without a Config argument. */
+  int super_mode;
   bool set;
 } IdentityActive;
 
@@ -44,6 +48,7 @@ static void identity_active_reset(void) {
   g_identity.chown_uid = 0;
   g_identity.chown_gid_set = false;
   g_identity.chown_gid = 0;
+  g_identity.super_mode = SUPER_MODE_AUTO;
   g_identity.set = false;
 }
 
@@ -76,6 +81,7 @@ void identity_set_active(const Config* config) {
       g_identity.groupmap_count = config->groupmap_count;
     }
   }
+  g_identity.super_mode = config->super_mode;
   g_identity.set = true;
   /* A root receiver would honor any client-supplied ownership request (a
      --usermap/--groupmap/--chown, or raw ids under --numeric-ids).  Surface
@@ -86,6 +92,37 @@ void identity_set_active(const Config* config) {
                 "identity mapping active and running as root: client-supplied "
                 "ownership (usermap/groupmap/chown/numeric-ids) will be honored; "
                 "run the daemon as an unprivileged user unless intended");
+  /* --super explicitly requests super-user activities, but FastSync never
+     elevates privileges: when the receiver is not already root those confined
+     attempts cannot succeed.  Warn exactly once at activation time (never
+     abort) so the operator knows the flag is inert on this host. */
+  if (g_identity.super_mode == SUPER_MODE_ON && geteuid() != 0)
+    log_message(LOG_LEVEL_WARNING,
+                "--super requested but the receiver is not privileged; super-user "
+                "activities (ownership, device nodes) cannot be performed and will "
+                "be skipped");
+}
+
+bool privilege_super_permitted(void) {
+  if (g_identity.super_mode == SUPER_MODE_OFF)
+    return false;
+  if (g_identity.super_mode == SUPER_MODE_ON)
+    return true;
+  /* SUPER_MODE_AUTO (the default): only attempt super-user activities when the
+     receiver is already root. */
+  return geteuid() == 0;
+}
+
+/* --super with NO explicit identity policy implies raw numeric-id preservation,
+ * exactly as if --numeric-ids had been given.  An explicit usermap/groupmap/
+ * --chown/--numeric-ids always wins: identity_resolve_targets() checks those
+ * before the numeric fallback, and this predicate is false whenever any of them
+ * is present.  In AUTO (the default) no implication is made, preserving the
+ * opt-in-only behavior. */
+static bool identity_super_implies_numeric(void) {
+  return g_identity.super_mode == SUPER_MODE_ON && !g_identity.numeric_ids &&
+         !g_identity.chown_uid_set && !g_identity.chown_gid_set && g_identity.usermap_count == 0 &&
+         g_identity.groupmap_count == 0;
 }
 
 bool identity_active_enabled(void) {
@@ -93,10 +130,11 @@ bool identity_active_enabled(void) {
      which runs only when metadata is present (a -M/--preserve transfer).  A
      standalone --numeric-ids (no ownership-affecting flag) carries no
      metadata, never reaches identity_apply_ownership, and therefore correctly
-     stays inert; combined with -M it activates raw-id application. */
-  return g_identity.set &&
-         (g_identity.numeric_ids || g_identity.chown_uid_set || g_identity.chown_gid_set ||
-          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0);
+     stays inert; combined with -M it activates raw-id application.  --super
+     with no explicit identity policy acts like --numeric-ids here. */
+  return g_identity.set && (g_identity.numeric_ids || g_identity.chown_uid_set ||
+                            g_identity.chown_gid_set || g_identity.usermap_count > 0 ||
+                            g_identity.groupmap_count > 0 || identity_super_implies_numeric());
 }
 
 bool identity_wire_valid(const Config* config) {
@@ -388,7 +426,7 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
   } else if (g_identity.chown_uid_set) {
     uid = g_identity.chown_uid == IDENTITY_CURRENT ? geteuid() : (uid_t)g_identity.chown_uid;
     set_uid = true;
-  } else if (g_identity.numeric_ids) {
+  } else if (g_identity.numeric_ids || identity_super_implies_numeric()) {
     uid = (uid_t)source_uid;
     set_uid = true;
   } else {
@@ -412,7 +450,7 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
   } else if (g_identity.chown_gid_set) {
     gid = g_identity.chown_gid == IDENTITY_CURRENT ? getegid() : (gid_t)g_identity.chown_gid;
     set_gid = true;
-  } else if (g_identity.numeric_ids) {
+  } else if (g_identity.numeric_ids || identity_super_implies_numeric()) {
     gid = (gid_t)source_gid;
     set_gid = true;
   } else {
@@ -458,8 +496,9 @@ static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
 void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
   /* Ownership application is OFF unless the client requested an identity flag.
    * This is the controlled gate: a default (or plain -M) transfer never changes
-   * ownership, byte-for-byte preserving FastSync's existing behavior. */
-  if (!identity_active_enabled() || fd < 0)
+   * ownership, byte-for-byte preserving FastSync's existing behavior.  --no-super
+   * additionally forbids it even when the receiver is root. */
+  if (!identity_active_enabled() || !privilege_super_permitted() || fd < 0)
     return;
   struct stat st;
   if (fstat(fd, &st) != 0)
@@ -474,7 +513,7 @@ void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
 
 void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
                                    int32_t source_gid) {
-  if (!identity_active_enabled() || parent_fd < 0 || !leaf)
+  if (!identity_active_enabled() || !privilege_super_permitted() || parent_fd < 0 || !leaf)
     return;
   struct stat st;
   if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)

@@ -1,5 +1,6 @@
 #include "test_config.h"
 #include "config.h"
+#include "identity.h"
 #include "multiprocessing.h"
 #include "protocol.h"
 #include "queue.h"
@@ -1669,6 +1670,89 @@ static void test_config_receive_rejects_invalid_iconv_spec() {
   }
 }
 
+/* P7 Wave E: the --super / --no-super tri-state crosses the config wire
+   unchanged (AUTO/ON/OFF), so the receiver can enforce the privilege policy. */
+static void test_config_super_mode_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  int modes[] = {SUPER_MODE_AUTO, SUPER_MODE_ON, SUPER_MODE_OFF};
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL && recv->super_mode == modes[i];
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->super_mode = modes[i];
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
+/* An out-of-range super_mode value on the wire must be refused on receive
+   (never silently clamped or accepted). */
+static void test_config_receive_rejects_invalid_super_mode() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->super_mode = 99;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* A negative value is equally invalid. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->super_mode = -1;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+/* P7 Wave E: privilege_super_permitted() maps the super_mode tri-state.  OFF
+   forbids super-user activities even for root; ON permits them; AUTO follows
+   the effective uid. */
+static void test_privilege_super_permitted_modes() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->super_mode = SUPER_MODE_OFF;
+  identity_set_active(c);
+  EXPECT_FALSE(privilege_super_permitted());
+  c->super_mode = SUPER_MODE_ON;
+  identity_set_active(c);
+  EXPECT_TRUE(privilege_super_permitted());
+  c->super_mode = SUPER_MODE_AUTO;
+  identity_set_active(c);
+  EXPECT_EQ_INT(privilege_super_permitted() ? 1 : 0, geteuid() == 0 ? 1 : 0);
+  config_delete(c);
+
+  /* After clearing, the neutral default is AUTO (root-following), never a
+     stale snapshot from a previous connection. */
+  identity_clear_active();
+  EXPECT_EQ_INT(privilege_super_permitted() ? 1 : 0, geteuid() == 0 ? 1 : 0);
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1715,8 +1799,11 @@ void test_config() {
     test_config_iconv_spec_wire_roundtrip();
     test_config_iconv_spec_empty_canonicalizes_to_null();
     test_config_receive_rejects_invalid_iconv_spec();
+    test_config_super_mode_wire_roundtrip();
+    test_config_receive_rejects_invalid_super_mode();
     test_config_receive_with_validate_rejects();
   }
+  test_privilege_super_permitted_modes();
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();
 }

@@ -18,6 +18,7 @@
 #include "delay_updates.h"
 #include "delta.h"
 #include "file.h"
+#include "identity.h"
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
@@ -355,6 +356,17 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   if (is_char || is_blk) {
     if (!config || !config->preserve_devices)
       return FILE_SAVE_SKIPPED;
+    /* --super / --no-super (P7 Wave E): char/block device-node creation is a
+       super-user activity.  --no-super forbids it even for a root receiver; the
+       default AUTO only attempts it when already root.  Pure FIFO creation is
+       unprivileged and deliberately NOT gated here. */
+    if (!privilege_super_permitted()) {
+      log_message(LOG_LEVEL_WARNING,
+                  "skipping %s: super-user device-node creation is not permitted "
+                  "(--no-super, or the receiver is not privileged)",
+                  file->path);
+      return FILE_SAVE_SKIPPED;
+    }
   } else if (is_fifo) {
     if (!config || !config->preserve_specials)
       return FILE_SAVE_SKIPPED;

@@ -65,4 +65,14 @@ void identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t sour
 /* Receiver-side wire validation of the resolved identity fields. */
 bool identity_wire_valid(const Config* config);
 
+/* P7 Wave E receiver-side permission gate for super-user activities (ownership
+ * application and char/block device-node creation).  Returns false when the
+ * active config is --no-super (SUPER_MODE_OFF); true when it is --super
+ * (SUPER_MODE_ON); and otherwise (SUPER_MODE_AUTO, the default, or before
+ * identity_set_active() has been called) only when the receiver is ALREADY root
+ * (geteuid() == 0).  This NEVER elevates privileges: it only reports whether an
+ * attempt that is already confined below the authorized receive root may be
+ * made. */
+bool privilege_super_permitted(void);
+
 #endif

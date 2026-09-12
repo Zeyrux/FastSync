@@ -223,7 +223,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.17.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.18.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -233,7 +233,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.17.0"};
+                        "/dst",     "--protocol",   "2.18.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -243,7 +243,8 @@ static void test_parse_args_protocol_accept_current() {
 /* Any --protocol value other than the current PROTOCOL_VERSION must end in
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
-  static const char* const bad_versions[] = {"2.16", "2.15.0", "2.16.0", "216", "31", "abc", ""};
+  static const char* const bad_versions[] = {"2.17", "2.16", "2.15.0", "2.16.0", "2.17.0",
+                                             "216",  "31",   "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -328,6 +329,43 @@ static void test_parse_args_fake_super() {
   char* argv_neg[] = {"fastsync", "--fake-super", "--no-fake-super", "/src", "/dst"};
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_neg, positional_args, &positional_count), 0);
   EXPECT_FALSE(cfg->fake_super);
+  config_delete(cfg);
+}
+
+/* P7 Wave E: --super / --no-super set the receiver-side privilege tri-state
+ * (they take no argument).  The default is AUTO, the last of either flag wins,
+ * and a malformed inline value ("--super=x") is rejected rather than silently
+ * treated as --super. */
+static void test_parse_args_super() {
+  Config* cfg = config_create();
+  EXPECT_EQ_INT(cfg->super_mode, SUPER_MODE_AUTO);
+  char* argv_on[] = {"fastsync", "--super", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_on, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->super_mode, SUPER_MODE_ON);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_off[] = {"fastsync", "--no-super", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_off, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->super_mode, SUPER_MODE_OFF);
+  config_delete(cfg);
+
+  /* Tri-state, not a boolean pair: the last flag wins. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_both[] = {"fastsync", "--super", "--no-super", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_both, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->super_mode, SUPER_MODE_OFF);
+  config_delete(cfg);
+
+  /* A malformed inline value is a hard unknown-option error. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_bad[] = {"fastsync", "--super=x", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_bad, positional_args, &positional_count), -1);
   config_delete(cfg);
 }
 
@@ -3081,6 +3119,7 @@ void test_client_cli() {
   test_parse_args_missing_argument_diagnostic();
   test_parse_args_xattrs_acls();
   test_parse_args_fake_super();
+  test_parse_args_super();
   test_parse_args_partial_progress();
   test_parse_args_itemize_changes();
   test_parse_args_list_only();
