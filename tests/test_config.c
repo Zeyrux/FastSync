@@ -6,6 +6,7 @@
 #include "queue.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <string.h>
@@ -1846,6 +1847,89 @@ static void test_config_receive_rejects_copy_as_without_metadata() {
   config_delete(c);
 }
 
+/* Like roundtrip_config_ok, but the parent is the RECEIVER so the frame can be
+   rejected MID-way, before the sender finishes writing it.  The sender child
+   ignores SIGPIPE so the receiver closing early cannot kill it; the parent
+   waits for the child to exit after observing the rejection. */
+static bool roundtrip_config_rejected(const Config* send_cfg) {
+  int p[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0)
+    return false;
+  pid_t pid = fork();
+  if (pid == 0) {
+    (void)signal(SIGPIPE, SIG_IGN);
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    config_send(p[1], send_cfg);
+    close(p[1]);
+    _exit(0);
+  }
+  close(p[1]);
+  io_set_fds(p[0], p[0]);
+  Config* recv = config_receive(p[0]);
+  bool rejected = recv == NULL;
+  config_delete(recv);
+  close(p[0]);
+  int status;
+  waitpid(pid, &status, 0);
+  return rejected;
+}
+
+/* Build a Config with `count` --skip-compress suffixes, each `suffix_len` bytes
+   long, for the pre-auth config-string budget tests. */
+static Config* make_skip_compress_config(int count, size_t suffix_len) {
+  Config* c = config_create();
+  if (!c)
+    return NULL;
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->skip_compress_set = true;
+  c->skip_compress_count = count;
+  c->skip_compress_suffixes = calloc((size_t)count, sizeof(char*));
+  if (!c->skip_compress_suffixes) {
+    config_delete(c);
+    return NULL;
+  }
+  char* suffix = malloc(suffix_len + 1);
+  if (!suffix) {
+    config_delete(c);
+    return NULL;
+  }
+  memset(suffix, 'x', suffix_len);
+  suffix[suffix_len] = '\0';
+  for (int i = 0; i < count; i++)
+    c->skip_compress_suffixes[i] = str_dup(suffix);
+  free(suffix);
+  return c;
+}
+
+/* Pre-auth memory bound: one connection must not retain unbounded config
+   strings.  An over-limit --skip-compress count is refused, and even an
+   in-range count cannot exceed the aggregate per-connection string budget. */
+static void test_config_receive_rejects_oversized_string_budget() {
+  if (is_running_under_valgrind())
+    return;
+
+  /* Exactly MAX_SKIP_COMPRESS_SUFFIXES tiny suffixes are accepted. */
+  Config* ok = make_skip_compress_config(MAX_SKIP_COMPRESS_SUFFIXES, 1);
+  EXPECT_NOT_NULL(ok);
+  EXPECT_TRUE(roundtrip_config_ok(ok));
+  config_delete(ok);
+
+  /* One suffix over the count cap is rejected before any suffix is read. */
+  Config* over_count = make_skip_compress_config(MAX_SKIP_COMPRESS_SUFFIXES + 1, 1);
+  EXPECT_NOT_NULL(over_count);
+  EXPECT_TRUE(roundtrip_config_rejected(over_count));
+  config_delete(over_count);
+
+  /* In-range count, but the strings together exceed MAX_CONFIG_STRING_BYTES
+     (64 suffixes * ~64 KiB > 1 MiB), so the aggregate budget rejects it. */
+  Config* over_bytes = make_skip_compress_config(64, MAX_STRING_SIZE - 1);
+  EXPECT_NOT_NULL(over_bytes);
+  EXPECT_TRUE(roundtrip_config_rejected(over_bytes));
+  config_delete(over_bytes);
+}
+
 /* identity_copy_as_refused() is the pure, pre-snapshot refusal predicate: a
    --copy-as is refused when the receiver is not root OR the effective super
    mode is OFF (an operator veto), and never when --copy-as is unset. */
@@ -2009,6 +2093,7 @@ void test_config() {
     test_config_copy_as_wire_roundtrip();
     test_config_receive_rejects_negative_copy_as();
     test_config_receive_rejects_copy_as_without_metadata();
+    test_config_receive_rejects_oversized_string_budget();
     test_config_receive_with_validate_rejects();
   }
   test_identity_copy_as_refused();
