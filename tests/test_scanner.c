@@ -1317,6 +1317,58 @@ static void test_scanner_captures_directory_times() {
   rmdir(root);
 }
 
+/* Ownership guard for chunk_data_to_chunk(): a returned Chunk owns its File
+ * objects, so destroying the chunk must free them exactly once and the scanner
+ * must never free them again.  chunk_size = 1 forces the mid-directory
+ * conversion branch (chunk_data_size > chunk_size) for every file, and the
+ * chunk is destroyed immediately, catching a double free / use-after-free under
+ * ASan if ownership transfer regressed.
+ *
+ * The failure path (array_list_to_array() or chunk_create() returning NULL) is
+ * not reachable from a unit test: both allocate through protocol_alloc(), and
+ * each allocation they perform is no larger than the array_list allocations
+ * that already succeeded while building the list (array_list_to_array() copies
+ * exactly `size` pointers, which never exceeds the capacity just grown, and
+ * sizeof(Chunk) is far below the initial 100-entry item array).  Binding a
+ * small --max-alloc session therefore always fails *before* this function, not
+ * inside it, so fault injection cannot isolate these paths. */
+static void test_scanner_chunk_ownership() {
+  const char* dir = "test_scan_ownership";
+  const char* file1 = "test_scan_ownership/a.txt";
+  const char* file2 = "test_scan_ownership/b.txt";
+  const char* file3 = "test_scan_ownership/c.txt";
+
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
+  create_test_file(file1, "aaaa");
+  create_test_file(file2, "bbbb");
+  create_test_file(file3, "cccc");
+
+  ScannerOptions options = {0};
+  options.chunk_size = 1;
+  DirectoryScanner* scanner = directory_scanner_create_with_options(dir, &options);
+  EXPECT_NOT_NULL(scanner);
+
+  int chunks = 0;
+  int files = 0;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    chunks++;
+    files += chunk->element_count;
+    EXPECT_EQ_INT(chunk->element_count, 1);
+    chunk_destroy(chunk);
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+  }
+  EXPECT_EQ_INT(files, 3);
+  EXPECT_EQ_INT(chunks, 3);
+  EXPECT_FALSE(directory_scanner_failed(scanner));
+
+  directory_scanner_destroy(scanner);
+  unlink(file1);
+  unlink(file2);
+  unlink(file3);
+  rmdir(dir);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1353,4 +1405,5 @@ void test_scanner() {
   test_dirs_files_from();
   test_files_from_relative_send_path();
   test_scanner_captures_directory_times();
+  test_scanner_chunk_ownership();
 }
