@@ -128,6 +128,6 @@ bool identity_wire_valid(const Config* config);
  * best-effort behavior where an unprivileged attempt is refused by the kernel
  * and skipped.  Neither EVER elevates privileges. */
 bool privilege_super_permitted(void);
-bool privilege_super_mode_permitted(int mode);
+bool privilege_super_mode_permitted(SuperMode mode);
 
 #endif

@@ -1293,14 +1293,14 @@ static bool receive_iconv_spec(int fd, Config* c) {
  * validated to the SUPER_MODE_AUTO..SUPER_MODE_OFF range (also re-checked by
  * validate_received_config). */
 static bool send_privilege_options(int fd, const Config* c) {
-  return send_int(fd, c->super_mode);
+  return send_int(fd, (int)c->super_mode);
 }
 
 static bool receive_privilege_options(int fd, Config* c) {
   int mode;
   if (!receive_int(fd, &mode) || mode < SUPER_MODE_AUTO || mode > SUPER_MODE_OFF)
     return false;
-  c->super_mode = mode;
+  c->super_mode = (SuperMode)mode;
   return true;
 }
 

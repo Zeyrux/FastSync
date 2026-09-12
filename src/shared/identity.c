@@ -30,7 +30,7 @@ typedef struct {
   /* --super / --no-super tri-state (SUPER_MODE_AUTO when unset).  Snapshotted
    * per connection so privilege_super_permitted() can gate super-user
    * activities without a Config argument. */
-  int super_mode;
+  SuperMode super_mode;
   /* --copy-as=USER[:GROUP]: snapshotted so the ownership resolver can force the
    * target ids without a Config argument. */
   bool copy_as_set;
@@ -128,7 +128,7 @@ bool privilege_super_permitted(void) {
   return privilege_super_mode_permitted(g_identity.super_mode);
 }
 
-bool privilege_super_mode_permitted(int mode) {
+bool privilege_super_mode_permitted(SuperMode mode) {
   /* AUTO and ON both attempt the confined operation; OFF forbids it even for a
    * root receiver.  AUTO is the historical FastSync behavior (always attempt
    * and let the kernel refuse an unprivileged call, which the caller skips), so
