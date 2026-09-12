@@ -142,6 +142,8 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       opts->allow_delete = true;
     } else if (arg_is(argv[i], "--trust-sender")) {
       opts->trust_sender = true;
+    } else if (arg_is(argv[i], "--no-super")) {
+      opts->no_super = true;
     } else if (arg_is(argv[i], "--allow-unauthenticated")) {
       opts->allow_unauthenticated = true;
     } else if (arg_is(argv[i], "--iconv")) {

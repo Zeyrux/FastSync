@@ -168,6 +168,14 @@ void print_usage(void) {
   printf("                      user.fastsync.stat xattr on each written file and\n");
   printf("                      re-apply it (fd-relative) on a privileged run; the\n");
   printf("                      recording format diverges from rsync's user.rsync.%%stat%%\n");
+  printf("  --super             Permit the receiver to attempt super-user activities\n");
+  printf("                      (ownership application, char/block device-node\n");
+  printf("                      creation) within the confined receive root.  Never\n");
+  printf("                      elevates privileges and never bypasses confinement;\n");
+  printf("                      with no explicit identity policy, ownership follows\n");
+  printf("                      raw numeric ids (as if --numeric-ids)\n");
+  printf("  --no-super          Forbid those super-user activities even when the\n");
+  printf("                      receiver is running as root\n");
   printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
   printf("  --numeric-ids       Do not map uid/gid by name: use the source numeric\n");
   printf("                      ids directly when applying ownership\n");
@@ -182,6 +190,13 @@ void print_usage(void) {
   printf("                      Names resolve on the source machine; @N for numerics.\n");
   printf("                      (Metadata is enabled with --preserve; -M now means\n");
   printf("                      rsync's --remote-option.)\n");
+  printf("  --copy-as=USER[:GROUP]  Force every written entry (files, dirs, symlinks\n");
+  printf("                      and special nodes) to USER[:GROUP], resolved on the\n");
+  printf("                      source machine like --chown.  Requires a privileged\n");
+  printf("                      (root) receiver and implies --preserve; an\n");
+  printf("                      unprivileged receiver refuses the transfer.  Never\n");
+  printf("                      switches process credentials (safe-subset; see\n");
+  printf("                      RSYNC_COMPAT.md).  A daemon refuses it.\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");

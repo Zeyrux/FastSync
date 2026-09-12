@@ -200,8 +200,9 @@ class TestDeviceSpecial:
         assert not os.path.lexists(os.path.join(received, "chardev")), (
             "a receiver without CAP_MKNOD must skip the device node, not create it"
         )
-        assert "cannot create device node" in (out + err), (
-            f"receiver did not log the documented CAP_MKNOD skip: out={out!r} err={err!r}"
+        assert ("cannot create device node" in (out + err)
+                or "device-node creation is not permitted" in (out + err)), (
+            f"receiver did not log the documented device skip: out={out!r} err={err!r}"
         )
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
@@ -4119,6 +4120,86 @@ class TestIdentityMapping:
             f"--chown not applied: uid={st.st_uid} gid={st.st_gid}"
 
 
+class TestSuperPrivilege:
+    """P7 Wave E: --super / --no-super control the receiver's already-confined
+    super-user activities (ownership application, char/block device nodes).
+    FastSync never elevates, so on an unprivileged receiver --super only
+    permits a confined attempt (which then skips); --no-super forbids the
+    activity even for root."""
+
+    def _seed(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"super_{tag}_source")
+        dest = os.path.join(TEST_DATA_DIR, f"super_{tag}_dest")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"super privilege\n")
+        return source, dest
+
+    def test_super_and_no_super_transfer_successfully(self, shared_server):
+        """Both flags parse and the transfer completes normally regardless of
+        the receiver's privilege level."""
+        for flag in ("--super", "--no-super"):
+            source, dest = self._seed(flag.strip("-"))
+            result, _ = run_client(source, dest, flags=[flag], port=shared_server.port)
+            assert result.returncode == 0, \
+                f"{flag} exit {result.returncode}: {(result.stderr or '')[:300]}"
+            received = get_dest_received_dir(dest, source)
+            with open(os.path.join(received, "f.txt"), "rb") as f:
+                assert f.read() == b"super privilege\n"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_no_super_suppresses_ownership_as_root(self, shared_server):
+        """As root the default gate would apply a raw numeric id; --no-super
+        must suppress that ownership application entirely."""
+        source, dest = self._seed("nosuper")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "--numeric-ids", "--no-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.stat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) != (12345, 12346), \
+            f"--no-super must not apply ownership (uid={st.st_uid} gid={st.st_gid})"
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_super_applies_ownership_as_root(self, shared_server):
+        """Control/proof the flag is not inert for root: --super with no explicit
+        identity policy treats ownership as raw numeric ids (as --numeric-ids),
+        applying the very ownership --no-super suppressed."""
+        source, dest = self._seed("super")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--preserve", "--super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.stat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) == (12345, 12346), \
+            f"--super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_fake_super_no_super_does_not_change_owner(self, shared_server):
+        """--fake-super records the source owner, but --no-super must suppress the
+        live chown even for root: the destination keeps the receiver's owner
+        instead of the recorded source owner."""
+        source, dest = self._seed("fakesuper_nosuper")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--fake-super", "--preserve", "--no-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.lstat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) != (12345, 12346), \
+            f"--no-super must suppress fake-super's owner replay: uid={st.st_uid} gid={st.st_gid}"
+
+
 class TestHardLinks:
     """-H/--hard-links: source files sharing an inode are re-created as hard
     links to one another on the destination (dedup preserved, first copy
@@ -5098,3 +5179,197 @@ class TestDirectoryAndSymlinkTimes:
         with open(blocker, "rb") as fh:
             assert fh.read() == b"pre-existing blocker\n", "the blocker file was clobbered"
         assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
+
+
+class TestCopyAs:
+    """P7 Wave E: --copy-as=USER[:GROUP] safe subset.
+
+    FastSync never switches the receiver's process credentials; the receiver
+    forces the ownership of every entry it writes to the requested ids through
+    the confined fd-relative identity path, which REQUIRES a privileged (root)
+    receiver.  An unprivileged receiver refuses the whole transfer up front at
+    the config handshake, before any file data moves.
+    """
+
+    @pytest.mark.ci
+    def test_unprivileged_receiver_refuses_copy_as(self, shared_server):
+        """The key assertable behavior: an unprivileged receiver REFUSES a
+        --copy-as transfer cleanly (non-zero exit, no data written) instead of
+        silently writing the wrong ownership."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_refuse_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_refuse_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "secret.txt"), "wb") as fh:
+            fh.write(b"must not be written\n")
+
+        captured = None
+        if os.geteuid() == 0:
+            if shutil.which("setpriv") is None:
+                pytest.skip("root runner without setpriv cannot start an unprivileged receiver")
+            os.chmod(dest, 0o777)
+            proc, port = _start_captured_server(
+                prefix=["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"])
+            captured = proc
+        else:
+            # The session server already runs unprivileged.
+            port = shared_server.port
+
+        try:
+            result, _ = run_client(source, dest,
+                                   flags=["--copy-as=@65534:@65534"], port=port)
+        finally:
+            if captured is not None:
+                out, err = _stop_captured_server(captured)
+            else:
+                out, err = "", ""
+
+        assert result.returncode != 0, (
+            f"an unprivileged receiver must refuse --copy-as: rc={result.returncode} "
+            f"out={result.stdout[:200]!r} err={result.stderr[:200]!r}"
+        )
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(os.path.join(received, "secret.txt")), (
+            "--copy-as refusal leaked file data into the destination"
+        )
+        if captured is not None:
+            assert "copy-as requires a privileged receiver" in (out + err), (
+                f"refusal reason was not logged: out={out!r} err={err!r}"
+            )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_chowns_transferred_file(self, shared_server):
+        """Root-gated: --copy-as=USER:GROUP forces the transferred file's
+        ownership to exactly that uid/gid (numeric form for determinism)."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_root_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_root_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "owned.txt"), "wb") as fh:
+            fh.write(b"owned by nobody\n")
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534"], port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as root transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        target = os.path.join(received, "owned.txt")
+        assert os.path.isfile(target), f"transferred file missing at {target}"
+        st = os.lstat(target)
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--copy-as did not force ownership: uid={st.st_uid} gid={st.st_gid}"
+        )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_owns_directory(self, shared_server):
+        """--copy-as must own an explicitly-created directory entry, not just the
+        files inside it.  A listed directory (--files-from + --dirs -R) is sent
+        as a STATUS_MKDIR entry, exercising the directory ownership path."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_dir_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_dir_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "owned_dir"), exist_ok=True)
+        lst = os.path.join(TEST_DATA_DIR, "copyas_dir_list.txt")
+        with open(lst, "wb") as fh:
+            fh.write(b"owned_dir\n")
+
+        result, _ = run_client(
+            source, dest,
+            flags=["--copy-as=@65534:@65534", "--files-from", lst, "--dirs", "-R"],
+            port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as directory transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        target = os.path.join(dest, "owned_dir")
+        assert os.path.isdir(target), f"explicit directory missing at {target}"
+        st = os.stat(target)
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--copy-as did not own the directory: uid={st.st_uid} gid={st.st_gid}"
+        )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_owns_implicit_parent_dirs(self, shared_server):
+        """--copy-as must also own the intermediate directories that the receiver
+        creates implicitly while writing a nested file (the scanner does not emit
+        STATUS_MKDIR entries for ordinary traversal directories), not just the
+        file itself."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_nested_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_nested_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        nested = os.path.join(source, "top", "mid", "leaf")
+        os.makedirs(nested, exist_ok=True)
+        with open(os.path.join(nested, "deep.txt"), "wb") as fh:
+            fh.write(b"nested copy-as ownership\n")
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as nested transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        for rel in ("top", os.path.join("top", "mid"), os.path.join("top", "mid", "leaf")):
+            target = os.path.join(received, rel)
+            assert os.path.isdir(target), f"implicit directory missing at {target}"
+            st = os.stat(target)
+            assert (st.st_uid, st.st_gid) == (65534, 65534), (
+                f"--copy-as did not own implicit directory {rel}: "
+                f"uid={st.st_uid} gid={st.st_gid}"
+            )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_owns_fifo(self, shared_server):
+        """--copy-as must own a recreated FIFO special node."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_fifo_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_fifo_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.mkfifo(os.path.join(source, "pipe.fifo"))
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534", "--specials"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as FIFO transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        target = os.path.join(received, "pipe.fifo")
+        assert stat.S_ISFIFO(os.lstat(target).st_mode), f"FIFO missing at {target}"
+        st = os.lstat(target)
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--copy-as did not own the FIFO: uid={st.st_uid} gid={st.st_gid}"
+        )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_with_fake_super_keeps_target_owner(self, shared_server):
+        """--fake-super must not let the recorded source owner override the
+        --copy-as forced owner (copy-as is authoritative)."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "mixed.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"copy-as wins over fake-super\n")
+        os.chown(src_file, 12345, 12346)
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534", "--fake-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as --fake-super transfer failed: "
+            f"{(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        st = os.lstat(os.path.join(received, "mixed.txt"))
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--fake-super overrode --copy-as: uid={st.st_uid} gid={st.st_gid}"
+        )

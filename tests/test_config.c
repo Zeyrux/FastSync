@@ -1,5 +1,6 @@
 #include "test_config.h"
 #include "config.h"
+#include "identity.h"
 #include "multiprocessing.h"
 #include "protocol.h"
 #include "queue.h"
@@ -1669,6 +1670,235 @@ static void test_config_receive_rejects_invalid_iconv_spec() {
   }
 }
 
+/* P7 Wave E: the --super / --no-super tri-state crosses the config wire
+   unchanged (AUTO/ON/OFF), so the receiver can enforce the privilege policy. */
+static void test_config_super_mode_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  int modes[] = {SUPER_MODE_AUTO, SUPER_MODE_ON, SUPER_MODE_OFF};
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL && recv->super_mode == modes[i];
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->super_mode = modes[i];
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
+/* --copy-as (P7 Wave E, protocol 2.18.0) travels as a trailing config-frame
+   block: a presence int, then the two int32 ids when set. */
+static void test_config_copy_as_wire_roundtrip() {
+  struct {
+    bool set;
+    int32_t uid;
+    int32_t gid;
+  } cases[] = {{false, 0, 0}, {true, 1000, 1001}};
+  if (is_running_under_valgrind())
+    return;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      close(p[1]);
+      io_set_fds(p[0], p[0]);
+      Config* recv = config_receive(p[0]);
+      bool ok = recv != NULL && recv->copy_as_set == cases[i].set &&
+                (!cases[i].set ||
+                 (recv->copy_as_uid == cases[i].uid && recv->copy_as_gid == cases[i].gid));
+      config_delete(recv);
+      close(p[0]);
+      _exit(ok ? 0 : 1);
+    } else {
+      close(p[0]);
+      io_set_fds(p[1], p[1]);
+      Config* send_cfg = config_create();
+      EXPECT_NOT_NULL(send_cfg);
+      send_cfg->send_directory = str_dup("/src");
+      send_cfg->receive_root_directory = str_dup("/dst");
+      send_cfg->copy_as_set = cases[i].set;
+      send_cfg->copy_as_uid = cases[i].uid;
+      send_cfg->copy_as_gid = cases[i].gid;
+      /* --copy-as requires the metadata path (the receiver chowns from the
+         transmitted source ids); a raw frame with copy_as_set but no metadata
+         is now rejected by validate_received_config. */
+      send_cfg->use_metadata = cases[i].set;
+      bool sent = config_send(p[1], send_cfg);
+      int status;
+      waitpid(pid, &status, 0);
+      close(p[1]);
+      config_delete(send_cfg);
+      EXPECT_TRUE(sent);
+      EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
+/* An out-of-range super_mode value on the wire must be refused on receive
+   (never silently clamped or accepted). */
+static void test_config_receive_rejects_invalid_super_mode() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->super_mode = 99;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* A negative value is equally invalid. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->super_mode = -1;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+/* A hostile peer must not smuggle a negative (sentinel) copy-as id into the
+   ownership path: the receive side rejects it and the run fails the handshake. */
+static void test_config_receive_rejects_negative_copy_as() {
+  if (is_running_under_valgrind())
+    return;
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/src");
+  send_cfg->receive_root_directory = str_dup("/dst");
+  send_cfg->copy_as_set = true;
+  send_cfg->copy_as_uid = -1;
+  send_cfg->copy_as_gid = 0;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    config_delete(recv_cfg);
+    close(p[0]);
+    _exit(recv_cfg ? 1 : 0);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* --copy-as forces ownership through the metadata path.  A frame that sets
+   copy_as_set but not use_metadata would pass the receiver's privilege gate
+   while chowning nothing, so validate_received_config must reject it (and the
+   sender observes the rejection as a failed config_send). */
+static void test_config_receive_rejects_copy_as_without_metadata() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->copy_as_set = true;
+  c->copy_as_uid = 1000;
+  c->copy_as_gid = 1000;
+  c->use_metadata = false;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* With metadata enabled the same block is accepted. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->copy_as_set = true;
+  c->copy_as_uid = 1000;
+  c->copy_as_gid = 1000;
+  c->use_metadata = true;
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+/* identity_copy_as_refused() is the pure, pre-snapshot refusal predicate: a
+   --copy-as is refused when the receiver is not root OR the effective super
+   mode is OFF (an operator veto), and never when --copy-as is unset. */
+static void test_identity_copy_as_refused() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_FALSE(identity_copy_as_refused(c));
+  EXPECT_FALSE(identity_copy_as_refused(NULL));
+
+  c->copy_as_set = true;
+  c->super_mode = SUPER_MODE_AUTO;
+  if (geteuid() == 0) {
+    EXPECT_FALSE(identity_copy_as_refused(c)); /* AUTO permits as root */
+    c->super_mode = SUPER_MODE_ON;
+    EXPECT_FALSE(identity_copy_as_refused(c));
+    c->super_mode = SUPER_MODE_OFF;
+    EXPECT_TRUE(identity_copy_as_refused(c));
+  } else {
+    /* Unprivileged: refused regardless of the mode. */
+    EXPECT_TRUE(identity_copy_as_refused(c));
+    c->super_mode = SUPER_MODE_OFF;
+    EXPECT_TRUE(identity_copy_as_refused(c));
+  }
+  config_delete(c);
+}
+
+/* P7 Wave E: privilege_super_permitted() maps the super_mode tri-state.  OFF
+   forbids super-user activities even for root; ON and AUTO permit the confined
+   attempt (matching FastSync's historical best-effort behavior, where the kernel
+   refuses an unprivileged attempt and the caller skips it). */
+static void test_privilege_super_permitted_modes() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->super_mode = SUPER_MODE_OFF;
+  identity_set_active(c);
+  EXPECT_FALSE(privilege_super_permitted());
+  c->super_mode = SUPER_MODE_ON;
+  identity_set_active(c);
+  EXPECT_TRUE(privilege_super_permitted());
+  c->super_mode = SUPER_MODE_AUTO;
+  identity_set_active(c);
+  EXPECT_TRUE(privilege_super_permitted());
+  config_delete(c);
+
+  /* After clearing, the neutral default is AUTO (attempt), never a stale
+     snapshot from a previous connection. */
+  identity_clear_active();
+  EXPECT_TRUE(privilege_super_permitted());
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -1715,8 +1945,15 @@ void test_config() {
     test_config_iconv_spec_wire_roundtrip();
     test_config_iconv_spec_empty_canonicalizes_to_null();
     test_config_receive_rejects_invalid_iconv_spec();
+    test_config_super_mode_wire_roundtrip();
+    test_config_receive_rejects_invalid_super_mode();
+    test_config_copy_as_wire_roundtrip();
+    test_config_receive_rejects_negative_copy_as();
+    test_config_receive_rejects_copy_as_without_metadata();
     test_config_receive_with_validate_rejects();
   }
+  test_identity_copy_as_refused();
+  test_privilege_super_permitted_modes();
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();
 }

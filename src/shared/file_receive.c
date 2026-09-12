@@ -18,6 +18,7 @@
 #include "delay_updates.h"
 #include "delta.h"
 #include "file.h"
+#include "identity.h"
 #include "log.h"
 #include "metadata.h"
 #include "protocol.h"
@@ -355,6 +356,19 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   if (is_char || is_blk) {
     if (!config || !config->preserve_devices)
       return FILE_SAVE_SKIPPED;
+    /* --super / --no-super (P7 Wave E): char/block device-node creation is a
+       super-user activity.  --no-super forbids it even for a root receiver;
+       AUTO and --super attempt it (an unprivileged attempt is refused by the
+       kernel and skipped).  The helper is evaluated against THIS config's mode
+       so the policy does not depend on a prior identity_set_active().  Pure
+       FIFO creation is unprivileged and deliberately NOT gated here. */
+    if (!privilege_super_mode_permitted(config->super_mode)) {
+      log_message(LOG_LEVEL_WARNING,
+                  "skipping %s: super-user device-node creation is not permitted "
+                  "(super-user activities disabled by --no-super)",
+                  file->path);
+      return FILE_SAVE_SKIPPED;
+    }
   } else if (is_fifo) {
     if (!config || !config->preserve_specials)
       return FILE_SAVE_SKIPPED;
@@ -444,12 +458,19 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     return FILE_SAVE_SKIPPED;
   }
 
-  /* Apply mtime on the fresh node (utimensat, no-follow).  Ownership is not
-     applied -- identity fchown needs an fd and would require opening the node. */
+  /* Apply mtime on the fresh node (utimensat, no-follow). */
   struct timespec times[2] = {
       {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
       {.tv_sec = file->metadata->mtime_sec, .tv_nsec = file->metadata->mtime_nsec}};
   utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
+  /* P7 Wave E: apply the negotiated ownership to the node ITSELF.  A FIFO is
+     created unprivileged, but --copy-as and explicit identity policies own
+     every entry (a char/block node path is already privilege-gated above).  The
+     no-follow helper changes the node's own ownership without dereferencing it;
+     it is a no-op unless an identity policy is active. */
+  if (identity_active_enabled())
+    identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
+                                  (int32_t)file->metadata->gid);
   close(parent_fd);
   free(leaf);
   free(destination);
@@ -567,9 +588,19 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special)
     return file_save_special_to_disk(root_directory, file, config);
-  /* --write-devices: write straight into an existing device node. */
-  if (config && config->write_devices)
+  /* --write-devices: write straight into an existing device node.  Writing
+     into a device is a super-user activity, so --no-super must suppress it just
+     like device-node creation; the default AUTO/--super attempt it (the wide
+     open below keeps its own confinement and best-effort skip semantics). */
+  if (config && config->write_devices) {
+    if (!privilege_super_mode_permitted(config->super_mode)) {
+      log_message(LOG_LEVEL_WARNING,
+                  "write-devices: %s skipped: super-user activities disabled by --no-super",
+                  file->path ? file->path : "(null)");
+      return FILE_SAVE_SKIPPED;
+    }
     return file_save_write_device(root_directory, file);
+  }
 
   /* Explicit directory entries (--dirs) carry an empty payload; the entry is
      created as a directory under the receive root, applying the same secure
@@ -585,6 +616,22 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     if (!dir_path)
       return FILE_SAVE_ERROR;
     bool ok = file_ensure_directory_secure(dir_path);
+    /* P7 Wave E: apply the negotiated ownership to the directory ITSELF (not
+       just the files inside it).  --copy-as and every explicit identity policy
+       own every entry, so a directory must not keep the receiver's owner while
+       its children get the policy owner.  Applied no-follow on the confined
+       parent fd after the mkdir; identity_apply_ownership_link() is itself a
+       no-op unless an identity policy is active. */
+    if (ok && file->metadata && identity_active_enabled()) {
+      char* leaf = NULL;
+      int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
+      if (parent_fd >= 0) {
+        identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
+                                      (int32_t)file->metadata->gid);
+        close(parent_fd);
+      }
+      free(leaf);
+    }
     free(dir_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }

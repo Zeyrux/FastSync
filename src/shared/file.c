@@ -16,6 +16,7 @@
 #include "data.h"
 #include "delta.h"
 #include "file.h"
+#include "identity.h"
 #include "log.h"
 #include "metadata.h"
 #include "utils.h"
@@ -572,8 +573,19 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
     if (strcmp(component, ".") != 0) {
       int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (next < 0 && create_dirs && errno == ENOENT) {
-        if (mkdirat(fd, component, 0755) == 0 || errno == EEXIST)
+        bool created = mkdirat(fd, component, 0755) == 0;
+        if (created || errno == EEXIST) {
+          /* P7 Wave E: --copy-as owns EVERY entry, including the intermediate
+             directories this walk creates implicitly.  Its target ids are a
+             global policy, so they are available here without per-entry source
+             metadata.  Only a directory this walk actually created is chowned
+             (a pre-existing destination directory is left alone, matching
+             rsync's transferred-entry scope); the helper is a no-op unless an
+             identity policy is active. */
+          if (created && identity_copy_as_active())
+            identity_apply_ownership_link(fd, component, 0, 0);
           next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
       }
       /* --keep-dirlinks (-K): a path component that is an existing symlink to
          an in-root directory is used as THAT directory rather than failing the

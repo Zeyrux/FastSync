@@ -1,6 +1,8 @@
 #include "test_xattr.h"
 #include "xattr.h"
+#include "config.h"
 #include "file.h"
+#include "identity.h"
 #include "protocol.h"
 #include "test_utils.h"
 #include <fcntl.h>
@@ -273,6 +275,72 @@ static void test_fake_super_restore() {
   unlink(path);
 }
 
+/* --fake-super owner replay must honor the super gate and copy-as authority:
+   --no-super suppresses the recorded-source-owner chown even for root, and an
+   active --copy-as keeps its forced owner (the recorded source owner must never
+   override it).  Root-gated: only root can observe a chown actually landing. */
+static void test_fake_super_owner_gate() {
+  if (geteuid() != 0)
+    return; /* non-root cannot observe ownership changes; skip silently */
+  const char* path = "test_fake_super_owner_gate.txt";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool has_xattr = setxattr(path, "user.fastsync.xprobe", "p", 1, 0) == 0;
+  if (has_xattr)
+    removexattr(path, "user.fastsync.xprobe");
+  if (!has_xattr) {
+    close(fd);
+    unlink(path);
+    return; /* filesystem without xattr support */
+  }
+  if (fchown(fd, 0, 0) != 0) {
+    close(fd);
+    unlink(path);
+    return;
+  }
+  fake_super_store_fd(fd, 12345, 12346, 0755, 1700000000, 0);
+
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+
+  /* --no-super: the owner leg is skipped even as root. */
+  c->super_mode = SUPER_MODE_OFF;
+  identity_set_active(c);
+  EXPECT_TRUE(fake_super_restore_fd(fd));
+  struct stat st;
+  EXPECT_EQ_INT(fstat(fd, &st), 0);
+  EXPECT_EQ_INT((int)st.st_uid, 0);
+  EXPECT_EQ_INT((int)st.st_gid, 0);
+
+  /* AUTO: the recorded source owner is applied. */
+  c->super_mode = SUPER_MODE_AUTO;
+  identity_set_active(c);
+  EXPECT_TRUE(fake_super_restore_fd(fd));
+  EXPECT_EQ_INT(fstat(fd, &st), 0);
+  EXPECT_EQ_INT((int)st.st_uid, 12345);
+  EXPECT_EQ_INT((int)st.st_gid, 12346);
+
+  /* Active --copy-as is authoritative: the recorded source owner must not
+     override it, even with AUTO/ON. */
+  EXPECT_EQ_INT(fchown(fd, 0, 0), 0);
+  c->super_mode = SUPER_MODE_ON;
+  c->copy_as_set = true;
+  c->copy_as_uid = 777;
+  c->copy_as_gid = 778;
+  identity_set_active(c);
+  EXPECT_TRUE(fake_super_restore_fd(fd));
+  EXPECT_EQ_INT(fstat(fd, &st), 0);
+  EXPECT_EQ_INT((int)st.st_uid, 0);
+  EXPECT_EQ_INT((int)st.st_gid, 0);
+
+  identity_clear_active();
+  config_delete(c);
+  close(fd);
+  unlink(path);
+}
+
 void test_xattr() {
   test_xattr_wire_roundtrip();
   test_xattr_reject_privileged_namespace();
@@ -281,4 +349,5 @@ void test_xattr() {
   test_xattr_capture_and_appliable();
   test_link_copy_fallback_preserves_xattrs();
   test_fake_super_restore();
+  test_fake_super_owner_gate();
 }

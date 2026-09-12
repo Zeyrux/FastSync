@@ -31,6 +31,10 @@ static int authorized_root_fd = -1;
 static bool allow_delete;
 static bool trust_sender;
 static bool allow_unauthenticated;
+/* --no-super operator veto: forces SUPER_MODE_OFF for every connection (even
+ * root), so no super-user activity is attempted and any client --copy-as is
+ * refused.  Set once in main before the accept loop / stdio handler. */
+static bool server_no_super;
 static const char* required_client_cn;
 /* --iconv CONVERT_SPEC the server was itself started with (borrowed argv
  * pointer).  Its LOCAL half may override the local charset the client assumed;
@@ -175,6 +179,48 @@ static const char* server_module_gate(const Config* config, void* context) {
   ModuleGateContext* gate_ctx = (ModuleGateContext*)context;
   if (!config)
     return "missing config frame";
+  /* --copy-as (P7 Wave E, protocol 2.18.0): FastSync's safe subset forces the
+     ownership of every written entry to the requested ids, which needs a
+     privileged (root) receiver.  An unprivileged receiver REFUSES the whole
+     transfer here, at the config handshake and BEFORE the STATUS_OK ack, so no
+     file data is exchanged and there is never a silent wrong-ownership result.
+     Placed first so it applies to the standalone server and daemon alike. */
+  /* Daemon divergence (P7 Wave E): a daemon has no per-module opt-in for
+     client-chosen ownership, so it refuses --copy-as outright even when running
+     as root -- otherwise any anonymous client could pick an arbitrary owner.
+     The standalone listener and the SSH-launched --stdio server keep honoring
+     it (they serve exactly one operator-authorized root). */
+  if (g_daemon_conf != NULL && config->copy_as_set) {
+    log_message(LOG_LEVEL_ERROR, "--copy-as is refused by the daemon (no per-module opt-in for "
+                                 "client-chosen ownership); refusing");
+    return "--copy-as is not permitted by this daemon";
+  }
+  /* --super (SUPER_MODE_ON) with no explicit identity policy implies raw
+     numeric-id ownership, i.e. a client-chosen owner.  A daemon has no
+     per-module opt-in, so refuse the explicit ON request for the same reason it
+     refuses --copy-as; the pre-existing --numeric-ids/--chown/--usermap surfaces
+     are unchanged (documented daemon trust model).  --no-super still works. */
+  if (g_daemon_conf != NULL && config->super_mode == SUPER_MODE_ON) {
+    log_message(LOG_LEVEL_ERROR,
+                "--super is refused by the daemon (no per-module opt-in for client-chosen "
+                "ownership); refusing");
+    return "--super is not permitted by this daemon";
+  }
+  /* Operator veto: --no-super forces SUPER_MODE_OFF for this connection before
+     the copy-as gate is evaluated, and the caller clamps the accepted config
+     again after this returns so the ownership/device gates see it too. */
+  Config* effective = (Config*)config;
+  if (server_no_super)
+    effective->super_mode = SUPER_MODE_OFF;
+  if (identity_copy_as_refused(effective)) {
+    if (geteuid() != 0)
+      log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
+    else
+      log_message(LOG_LEVEL_ERROR,
+                  "--copy-as refused: super-user activities are disabled by the server "
+                  "(--no-super); refusing");
+    return "cannot perform --copy-as on this receiver";
+  }
   /* --iconv (protocol 2.16.0): the receiver's exact conversion direction (the
      client spec's wire charset into this server's local charset, including a
      server-side --iconv override) must be usable BEFORE the STATUS_OK ack, so
@@ -273,6 +319,12 @@ void handler(int file_descriptor) {
     protocol_session_unbind();
     return;
   }
+  /* Operator --no-super veto: clamp the accepted config so every downstream
+   * gate (identity_apply_ownership via privilege_super_permitted, device-node
+   * creation) sees SUPER_MODE_OFF even if the gate callback did not already
+   * mutate a copy of it. */
+  if (server_no_super)
+    config->super_mode = SUPER_MODE_OFF;
   protocol_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
@@ -570,6 +622,9 @@ static void print_server_usage(void) {
   printf("  -6, --ipv6          Bind an IPv6 socket\n");
   printf("  --allow-delete      Permit manifest deletion\n");
   printf("  --trust-sender      Trust the remote sender's file list\n");
+  printf("  --no-super          Operator veto: never attempt super-user activities\n");
+  printf("                      (ownership, device nodes) even as root, and refuse\n");
+  printf("                      any client --copy-as/--super request\n");
   printf("  --iconv=LOCAL[,REMOTE]  Declare this server's LOCAL charset for file-name\n");
   printf("                      conversion: received names are translated to this\n");
   printf("                      charset (the wire charset still comes from the\n");
@@ -661,6 +716,7 @@ int main(int argc, char* argv[]) {
   allow_delete = opts.allow_delete;
   trust_sender = opts.trust_sender;
   allow_unauthenticated = opts.allow_unauthenticated;
+  server_no_super = opts.no_super;
   server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
