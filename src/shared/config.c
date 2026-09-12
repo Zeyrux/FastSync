@@ -246,6 +246,10 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
          valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
+         /* --copy-as forces ownership through the metadata path; without
+            metadata it would pass the privilege gate but silently chown
+            nothing.  Refuse the frame instead. */
+         (!config->copy_as_set || config->use_metadata) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&

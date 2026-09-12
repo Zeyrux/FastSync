@@ -456,12 +456,19 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     return FILE_SAVE_SKIPPED;
   }
 
-  /* Apply mtime on the fresh node (utimensat, no-follow).  Ownership is not
-     applied -- identity fchown needs an fd and would require opening the node. */
+  /* Apply mtime on the fresh node (utimensat, no-follow). */
   struct timespec times[2] = {
       {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
       {.tv_sec = file->metadata->mtime_sec, .tv_nsec = file->metadata->mtime_nsec}};
   utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
+  /* P7 Wave E: apply the negotiated ownership to the node ITSELF.  A FIFO is
+     created unprivileged, but --copy-as and explicit identity policies own
+     every entry (a char/block node path is already privilege-gated above).  The
+     no-follow helper changes the node's own ownership without dereferencing it;
+     it is a no-op unless an identity policy is active. */
+  if (identity_active_enabled())
+    identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
+                                  (int32_t)file->metadata->gid);
   close(parent_fd);
   free(leaf);
   free(destination);
@@ -597,6 +604,22 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     if (!dir_path)
       return FILE_SAVE_ERROR;
     bool ok = file_ensure_directory_secure(dir_path);
+    /* P7 Wave E: apply the negotiated ownership to the directory ITSELF (not
+       just the files inside it).  --copy-as and every explicit identity policy
+       own every entry, so a directory must not keep the receiver's owner while
+       its children get the policy owner.  Applied no-follow on the confined
+       parent fd after the mkdir; identity_apply_ownership_link() is itself a
+       no-op unless an identity policy is active. */
+    if (ok && file->metadata && identity_active_enabled()) {
+      char* leaf = NULL;
+      int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
+      if (parent_fd >= 0) {
+        identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
+                                      (int32_t)file->metadata->gid);
+        close(parent_fd);
+      }
+      free(leaf);
+    }
     free(dir_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }

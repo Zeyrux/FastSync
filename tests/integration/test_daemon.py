@@ -320,6 +320,27 @@ class TestDaemonRejection:
         assert result.returncode != 0
         assert _tree_file_count(AUTH_MODULE) == 0
 
+    def test_copy_as_refused_by_daemon(self, daemon):
+        """P7 Wave E: a daemon refuses client-chosen ownership (--copy-as)
+        outright.  There is no per-module opt-in, so even a root daemon must not
+        honor an arbitrary client-selected owner.  The refusal happens at the
+        config handshake, before any data lands."""
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+        before_files = self._tree_files()
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files", port=daemon.port,
+                               flags=["--copy-as=@65534:@65534"])
+        assert result.returncode != 0, "the daemon must refuse --copy-as"
+        assert self._tree_files() == before_files, \
+            "--copy-as refusal wrote under the module root"
+        time.sleep(0.3)
+        with open(log_path, "rb") as f:
+            f.seek(before)
+            tail = f.read().decode("utf-8", "replace")
+        assert "copy-as is refused by the daemon" in tail, (
+            f"daemon did not log the copy-as refusal: {tail[-400:]!r}"
+        )
+
     @pytest.mark.daemon_detach
     def test_real_detach_path(self):
         """--daemon WITHOUT --no-detach double-forks a real background daemon;

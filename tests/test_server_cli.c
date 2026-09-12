@@ -31,7 +31,26 @@ static void test_server_cli_defaults() {
   EXPECT_EQ_INT(opts.bind_family, AF_UNSPEC);
   EXPECT_FALSE(opts.allow_delete);
   EXPECT_FALSE(opts.allow_unauthenticated);
+  EXPECT_FALSE(opts.no_super);
   server_cli_options_free(&opts);
+}
+
+/* --no-super is a standalone/SSH operator veto (does not require --daemon):
+   it forces SUPER_MODE_OFF for every connection and refuses client --copy-as. */
+static void test_server_cli_no_super() {
+  const char* args[] = {"fastsync-server", "--no-super", "--destination-root", "/srv"};
+  ServerCliOptions opts;
+  EXPECT_EQ_INT(parse_ok(args, 4, &opts), 0);
+  EXPECT_TRUE(opts.no_super);
+  EXPECT_EQ_STR(opts.destination_root, "/srv");
+  server_cli_options_free(&opts);
+
+  const char* args2[] = {"fastsync-server", "--daemon", "--config=/tmp/x.conf", "--no-super"};
+  ServerCliOptions opts2;
+  EXPECT_EQ_INT(parse_ok(args2, 4, &opts2), 0);
+  EXPECT_TRUE(opts2.no_super);
+  EXPECT_TRUE(opts2.daemon_mode);
+  server_cli_options_free(&opts2);
 }
 
 static void test_server_cli_daemon_flags() {
@@ -197,5 +216,6 @@ void test_server_cli() {
   test_server_cli_invalid();
   test_server_cli_password_and_early_input();
   test_server_cli_password_requires_daemon();
+  test_server_cli_no_super();
   test_server_cli_help();
 }

@@ -1741,6 +1741,10 @@ static void test_config_copy_as_wire_roundtrip() {
       send_cfg->copy_as_set = cases[i].set;
       send_cfg->copy_as_uid = cases[i].uid;
       send_cfg->copy_as_gid = cases[i].gid;
+      /* --copy-as requires the metadata path (the receiver chowns from the
+         transmitted source ids); a raw frame with copy_as_set but no metadata
+         is now rejected by validate_received_config. */
+      send_cfg->use_metadata = cases[i].set;
       bool sent = config_send(p[1], send_cfg);
       int status;
       waitpid(pid, &status, 0);
@@ -1812,6 +1816,63 @@ static void test_config_receive_rejects_negative_copy_as() {
     EXPECT_FALSE(sent);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+}
+
+/* --copy-as forces ownership through the metadata path.  A frame that sets
+   copy_as_set but not use_metadata would pass the receiver's privilege gate
+   while chowning nothing, so validate_received_config must reject it (and the
+   sender observes the rejection as a failed config_send). */
+static void test_config_receive_rejects_copy_as_without_metadata() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->copy_as_set = true;
+  c->copy_as_uid = 1000;
+  c->copy_as_gid = 1000;
+  c->use_metadata = false;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+
+  /* With metadata enabled the same block is accepted. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->copy_as_set = true;
+  c->copy_as_uid = 1000;
+  c->copy_as_gid = 1000;
+  c->use_metadata = true;
+  EXPECT_TRUE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+/* identity_copy_as_refused() is the pure, pre-snapshot refusal predicate: a
+   --copy-as is refused when the receiver is not root OR the effective super
+   mode is OFF (an operator veto), and never when --copy-as is unset. */
+static void test_identity_copy_as_refused() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_FALSE(identity_copy_as_refused(c));
+  EXPECT_FALSE(identity_copy_as_refused(NULL));
+
+  c->copy_as_set = true;
+  c->super_mode = SUPER_MODE_AUTO;
+  if (geteuid() == 0) {
+    EXPECT_FALSE(identity_copy_as_refused(c)); /* AUTO permits as root */
+    c->super_mode = SUPER_MODE_ON;
+    EXPECT_FALSE(identity_copy_as_refused(c));
+    c->super_mode = SUPER_MODE_OFF;
+    EXPECT_TRUE(identity_copy_as_refused(c));
+  } else {
+    /* Unprivileged: refused regardless of the mode. */
+    EXPECT_TRUE(identity_copy_as_refused(c));
+    c->super_mode = SUPER_MODE_OFF;
+    EXPECT_TRUE(identity_copy_as_refused(c));
+  }
+  config_delete(c);
 }
 
 /* P7 Wave E: privilege_super_permitted() maps the super_mode tri-state.  OFF
@@ -1888,8 +1949,10 @@ void test_config() {
     test_config_receive_rejects_invalid_super_mode();
     test_config_copy_as_wire_roundtrip();
     test_config_receive_rejects_negative_copy_as();
+    test_config_receive_rejects_copy_as_without_metadata();
     test_config_receive_with_validate_rejects();
   }
+  test_identity_copy_as_refused();
   test_privilege_super_permitted_modes();
   test_config_delete_timing_early_helper();
   test_config_is_remote_dest();

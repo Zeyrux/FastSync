@@ -4181,6 +4181,24 @@ class TestSuperPrivilege:
         assert (st.st_uid, st.st_gid) == (12345, 12346), \
             f"--super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
 
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
+    def test_fake_super_no_super_does_not_change_owner(self, shared_server):
+        """--fake-super records the source owner, but --no-super must suppress the
+        live chown even for root: the destination keeps the receiver's owner
+        instead of the recorded source owner."""
+        source, dest = self._seed("fakesuper_nosuper")
+        os.chown(os.path.join(source, "f.txt"), 12345, 12346)
+        result, _ = run_client(source, dest,
+                               flags=["--fake-super", "--preserve", "--no-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"exit {result.returncode}: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.lstat(os.path.join(received, "f.txt"))
+        assert (st.st_uid, st.st_gid) != (12345, 12346), \
+            f"--no-super must suppress fake-super's owner replay: uid={st.st_uid} gid={st.st_gid}"
+
 
 class TestHardLinks:
     """-H/--hard-links: source files sharing an inode are re-created as hard
@@ -5242,4 +5260,84 @@ class TestCopyAs:
         st = os.lstat(target)
         assert (st.st_uid, st.st_gid) == (65534, 65534), (
             f"--copy-as did not force ownership: uid={st.st_uid} gid={st.st_gid}"
+        )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_owns_directory(self, shared_server):
+        """--copy-as must own an explicitly-created directory entry, not just the
+        files inside it.  A listed directory (--files-from + --dirs -R) is sent
+        as a STATUS_MKDIR entry, exercising the directory ownership path."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_dir_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_dir_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "owned_dir"), exist_ok=True)
+        lst = os.path.join(TEST_DATA_DIR, "copyas_dir_list.txt")
+        with open(lst, "wb") as fh:
+            fh.write(b"owned_dir\n")
+
+        result, _ = run_client(
+            source, dest,
+            flags=["--copy-as=@65534:@65534", "--files-from", lst, "--dirs", "-R"],
+            port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as directory transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        target = os.path.join(dest, "owned_dir")
+        assert os.path.isdir(target), f"explicit directory missing at {target}"
+        st = os.stat(target)
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--copy-as did not own the directory: uid={st.st_uid} gid={st.st_gid}"
+        )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_owns_fifo(self, shared_server):
+        """--copy-as must own a recreated FIFO special node."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_fifo_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_fifo_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.mkfifo(os.path.join(source, "pipe.fifo"))
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534", "--specials"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as FIFO transfer failed: {(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        target = os.path.join(received, "pipe.fifo")
+        assert stat.S_ISFIFO(os.lstat(target).st_mode), f"FIFO missing at {target}"
+        st = os.lstat(target)
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--copy-as did not own the FIFO: uid={st.st_uid} gid={st.st_gid}"
+        )
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
+    def test_root_copy_as_with_fake_super_keeps_target_owner(self, shared_server):
+        """--fake-super must not let the recorded source owner override the
+        --copy-as forced owner (copy-as is authoritative)."""
+        source = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_src")
+        dest = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "mixed.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"copy-as wins over fake-super\n")
+        os.chown(src_file, 12345, 12346)
+
+        result, _ = run_client(source, dest,
+                               flags=["--copy-as=@65534:@65534", "--fake-super"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-as --fake-super transfer failed: "
+            f"{(result.stderr or result.stdout)[:400]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        st = os.lstat(os.path.join(received, "mixed.txt"))
+        assert (st.st_uid, st.st_gid) == (65534, 65534), (
+            f"--fake-super overrode --copy-as: uid={st.st_uid} gid={st.st_gid}"
         )

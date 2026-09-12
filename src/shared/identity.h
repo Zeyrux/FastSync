@@ -56,6 +56,14 @@ int identity_parse_copy_as(Config* config, const char* value);
  * server-side policy veto. */
 bool identity_copy_as_refused(const Config* config);
 
+/* True when the CURRENT per-connection snapshot has a --copy-as active (i.e.
+ * identity_set_active() has run against a config with copy_as_set).  The
+ * --fake-super owner replay consults this so a copy-as run never lets the
+ * recorded source owner overwrite the forced target owner.  Reads the active
+ * snapshot, so call identity_set_active() first (the receiver does, before any
+ * write). */
+bool identity_copy_as_active(void);
+
 /* Receiver-side snapshot of the negotiated identity config.  The server calls
  * identity_set_active() once per connection (before any file write) using the
  * config received over the wire; the snapshot is a deep copy so the caller may

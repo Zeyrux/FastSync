@@ -148,10 +148,25 @@ bool identity_active_enabled(void) {
      metadata, never reaches identity_apply_ownership, and therefore correctly
      stays inert; combined with -M it activates raw-id application.  --super
      with no explicit identity policy acts like --numeric-ids here. */
-  return g_identity.set && (g_identity.numeric_ids || g_identity.chown_uid_set ||
-                            g_identity.chown_gid_set || g_identity.usermap_count > 0 ||
-                            g_identity.groupmap_count > 0 || g_identity.copy_as_set ||
-                            identity_super_implies_numeric());
+  return g_identity.set &&
+         (g_identity.numeric_ids || g_identity.chown_uid_set || g_identity.chown_gid_set ||
+          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0 || g_identity.copy_as_set ||
+          identity_super_implies_numeric());
+}
+
+bool identity_copy_as_active(void) {
+  return g_identity.set && g_identity.copy_as_set;
+}
+
+bool identity_copy_as_refused(const Config* config) {
+  if (!config || !config->copy_as_set)
+    return false;
+  /* The safe-subset --copy-as needs a privileged (root) receiver, and an
+   * operator/--no-super veto forbids the ownership change even for root.  This
+   * is deliberately a pure function of the config and the current effective uid
+   * (never the active snapshot) because the server evaluates it at the
+   * pre-STATUS_OK config gate, before identity_set_active() has run. */
+  return geteuid() != 0 || config->super_mode == SUPER_MODE_OFF;
 }
 
 bool identity_wire_valid(const Config* config) {
@@ -172,6 +187,12 @@ bool identity_wire_valid(const Config* config) {
     if (config->groupmap[i].from < IDENTITY_MATCH_ANY || config->groupmap[i].to < IDENTITY_CURRENT)
       return false;
   }
+  /* Defense-in-depth: a --copy-as block must never carry a negative (sentinel)
+   * id into the ownership path.  receive_copy_as_options already rejects them,
+   * but identity_wire_valid is the shared validation used by both the receiver
+   * and unit tests, so re-assert it here. */
+  if (config->copy_as_set && (config->copy_as_uid < 0 || config->copy_as_gid < 0))
+    return false;
   return true;
 }
 
@@ -413,6 +434,13 @@ done:
   return ret;
 }
 
+/* uid_t/gid_t are unsigned and may hold a value wider than the signed int32 the
+ * wire (and the identity policy) uses.  Reject such an id instead of truncating
+ * it to an out-of-range (possibly negative sentinel) value. */
+static bool identity_id_fits_int32(unsigned long id) {
+  return id <= (unsigned long)INT32_MAX;
+}
+
 int identity_parse_copy_as(Config* config, const char* value) {
   if (!config || !value || *value == '\0') {
     log_message(LOG_LEVEL_ERROR, "--copy-as requires USER[:GROUP]");
@@ -426,7 +454,10 @@ int identity_parse_copy_as(Config* config, const char* value) {
     if (*p == ':')
       colons++;
   if (colons > 1) {
-    log_message(LOG_LEVEL_ERROR, "--copy-as must be USER[:GROUP] (got '%s')", value);
+    char* escaped = output_escape(value, false);
+    log_message(LOG_LEVEL_ERROR, "--copy-as must be USER[:GROUP] (got '%s')",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
     return -1;
   }
 
@@ -443,20 +474,34 @@ int identity_parse_copy_as(Config* config, const char* value) {
     group_token = colon + 1;
   }
 
+  /* The spec is untrusted user input echoed back in error paths: escape it once
+   * (8-bit-safe) so a control byte cannot forge a log line. */
+  char* escaped_spec = output_escape(value, false);
+  const char* shown = escaped_spec ? escaped_spec : "<allocation failed>";
+
   int32_t uid;
   if (*user_token == '\0') {
-    log_message(LOG_LEVEL_ERROR, "--copy-as is missing the user (got '%s')", value);
+    log_message(LOG_LEVEL_ERROR, "--copy-as is missing the user (got '%s')", shown);
+    free(escaped_spec);
     free(spec);
     return -1;
   }
   if (strcmp(user_token, "*") == 0) {
     /* '*' means the current/root user: the client's euid. */
+    if (!identity_id_fits_int32((unsigned long)geteuid())) {
+      log_message(LOG_LEVEL_ERROR, "--copy-as: current user id %lu exceeds INT32_MAX",
+                  (unsigned long)geteuid());
+      free(escaped_spec);
+      free(spec);
+      return -1;
+    }
     uid = (int32_t)geteuid();
   } else if (identity_resolve_token(user_token, false, &uid) != 0) {
     log_message(LOG_LEVEL_ERROR,
-                "--copy-as could not resolve user '%s' (use a name that exists "
-                "on the source, '*', or @N)",
-                value);
+                "--copy-as could not resolve user (use a name that exists on the "
+                "source, '*', or @N): %s",
+                shown);
+    free(escaped_spec);
     free(spec);
     return -1;
   }
@@ -464,15 +509,24 @@ int identity_parse_copy_as(Config* config, const char* value) {
   int32_t gid;
   if (group_token) {
     if (*group_token == '\0') {
-      log_message(LOG_LEVEL_ERROR, "--copy-as group is empty (got '%s')", value);
+      log_message(LOG_LEVEL_ERROR, "--copy-as group is empty (got '%s')", shown);
+      free(escaped_spec);
       free(spec);
       return -1;
     }
     if (strcmp(group_token, "*") == 0) {
+      if (!identity_id_fits_int32((unsigned long)getegid())) {
+        log_message(LOG_LEVEL_ERROR, "--copy-as: current group id %lu exceeds INT32_MAX",
+                    (unsigned long)getegid());
+        free(escaped_spec);
+        free(spec);
+        return -1;
+      }
       gid = (int32_t)getegid();
     } else if (identity_resolve_token(group_token, true, &gid) != 0) {
-      log_message(LOG_LEVEL_ERROR, "--copy-as could not resolve group '%s' (got '%s')", group_token,
-                  value);
+      log_message(LOG_LEVEL_ERROR, "--copy-as could not resolve group (got '%s'): %s", shown,
+                  shown);
+      free(escaped_spec);
       free(spec);
       return -1;
     }
@@ -481,8 +535,30 @@ int identity_parse_copy_as(Config* config, const char* value) {
      * passwd entry has no primary gid to look up, so fall back to gid == uid
      * (the rsync-style numeric convention; documented divergence). */
     struct passwd* pw = getpwuid((uid_t)uid);
-    gid = pw ? (int32_t)pw->pw_gid : uid;
+    if (pw) {
+      if (!identity_id_fits_int32((unsigned long)pw->pw_gid)) {
+        log_message(LOG_LEVEL_ERROR,
+                    "--copy-as: primary group id %lu for the requested user exceeds INT32_MAX",
+                    (unsigned long)pw->pw_gid);
+        free(escaped_spec);
+        free(spec);
+        return -1;
+      }
+      gid = (int32_t)pw->pw_gid;
+    } else {
+      gid = uid;
+    }
   }
+  /* The group-default and gid==uid fallbacks must never store a negative
+   * (sentinel) value; the explicit numeric path is already capped by
+   * identity_resolve_token. */
+  if (uid < 0 || gid < 0) {
+    log_message(LOG_LEVEL_ERROR, "--copy-as resolved id does not fit in int32 (got '%s')", shown);
+    free(escaped_spec);
+    free(spec);
+    return -1;
+  }
+  free(escaped_spec);
   free(spec);
 
   config->copy_as_set = true;
@@ -596,13 +672,28 @@ static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
   /* EPERM/EACCES are expected when the receiver is not privileged (e.g. the CI
    * `nobody` user): warn and continue, never abort the transfer.  Any other
    * error (EIO/EROFS/ENOSPC/...) is a real failure and must not be silently
-   * downgraded to a warning. */
-  if (errno == EPERM || errno == EACCES)
-    log_message(LOG_LEVEL_WARNING, "could not apply ownership (uid=%ld gid=%ld): %s; leaving as-is",
-                (long)uid, (long)gid, strerror(errno));
-  else
+   * downgraded to a warning.
+   *
+   * --copy-as is different: the whole point of the flag is that the target
+   * ownership is REQUIRED (the pre-flight gate already refused an unprivileged
+   * receiver).  If the chown still fails with EPERM/EACCES (a capability-
+   * restricted root, root-squash, or a read-only mount) the run is silently
+   * producing the WRONG ownership, so surface it at ERROR.  It stays
+   * non-fatal: never abort the multithreaded receiver mid-transfer. */
+  if (errno == EPERM || errno == EACCES) {
+    if (identity_copy_as_active())
+      log_message(LOG_LEVEL_ERROR,
+                  "could not apply --copy-as ownership on %s (uid=%ld gid=%ld): %s; "
+                  "entry was written with the wrong owner",
+                  what, (long)uid, (long)gid, strerror(errno));
+    else
+      log_message(LOG_LEVEL_WARNING,
+                  "could not apply ownership (uid=%ld gid=%ld): %s; leaving as-is", (long)uid,
+                  (long)gid, strerror(errno));
+  } else {
     log_message(LOG_LEVEL_ERROR, "failed to apply ownership on %s (uid=%ld gid=%ld): %s", what,
                 (long)uid, (long)gid, strerror(errno));
+  }
 }
 
 void identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {

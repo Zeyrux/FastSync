@@ -243,8 +243,8 @@ static void test_parse_args_protocol_accept_current() {
 /* Any --protocol value other than the current PROTOCOL_VERSION must end in
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
-  static const char* const bad_versions[] = {"2.17", "2.16",   "2.15.0", "2.16.0", "2.17.0",
-                                             "216",  "31",     "abc",    ""};
+  static const char* const bad_versions[] = {"2.17", "2.16", "2.15.0", "2.16.0", "2.17.0",
+                                             "216",  "31",   "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);

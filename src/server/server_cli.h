@@ -33,6 +33,11 @@ typedef struct ServerCliOptions {
   bool allow_delete;          /* --allow-delete */
   bool trust_sender;          /* --trust-sender */
   bool allow_unauthenticated; /* --allow-unauthenticated */
+  /* --no-super: operator veto forcing SUPER_MODE_OFF for every connection, so
+   * the receiver never attempts super-user activities (ownership application,
+   * device-node creation) even when running as root.  Applies to --stdio and
+   * --daemon alike; also makes the server refuse any client --copy-as. */
+  bool no_super; /* --no-super */
   /* --iconv=CONVERT_SPEC: the server's own LOCAL charset declaration.  The
    * client's full spec rides the wire config frame anyway; when the server is
    * started with its own --iconv, its LOCAL half overrides the local charset

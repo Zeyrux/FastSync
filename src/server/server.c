@@ -31,6 +31,10 @@ static int authorized_root_fd = -1;
 static bool allow_delete;
 static bool trust_sender;
 static bool allow_unauthenticated;
+/* --no-super operator veto: forces SUPER_MODE_OFF for every connection (even
+ * root), so no super-user activity is attempted and any client --copy-as is
+ * refused.  Set once in main before the accept loop / stdio handler. */
+static bool server_no_super;
 static const char* required_client_cn;
 /* --iconv CONVERT_SPEC the server was itself started with (borrowed argv
  * pointer).  Its LOCAL half may override the local charset the client assumed;
@@ -181,7 +185,23 @@ static const char* server_module_gate(const Config* config, void* context) {
      transfer here, at the config handshake and BEFORE the STATUS_OK ack, so no
      file data is exchanged and there is never a silent wrong-ownership result.
      Placed first so it applies to the standalone server and daemon alike. */
-  if (config->copy_as_set && geteuid() != 0) {
+  /* Daemon divergence (P7 Wave E): a daemon has no per-module opt-in for
+     client-chosen ownership, so it refuses --copy-as outright even when running
+     as root -- otherwise any anonymous client could pick an arbitrary owner.
+     The standalone listener and the SSH-launched --stdio server keep honoring
+     it (they serve exactly one operator-authorized root). */
+  if (g_daemon_conf != NULL && config->copy_as_set) {
+    log_message(LOG_LEVEL_ERROR, "--copy-as is refused by the daemon (no per-module opt-in for "
+                                 "client-chosen ownership); refusing");
+    return "--copy-as is not permitted by this daemon";
+  }
+  /* Operator veto: --no-super forces SUPER_MODE_OFF for this connection before
+     the copy-as gate is evaluated, and the caller clamps the accepted config
+     again after this returns so the ownership/device gates see it too. */
+  Config* effective = (Config*)config;
+  if (server_no_super)
+    effective->super_mode = SUPER_MODE_OFF;
+  if (identity_copy_as_refused(effective)) {
     log_message(LOG_LEVEL_ERROR, "--copy-as requires a privileged receiver (root); refusing");
     return "--copy-as requires a privileged receiver (root)";
   }
@@ -283,6 +303,12 @@ void handler(int file_descriptor) {
     protocol_session_unbind();
     return;
   }
+  /* Operator --no-super veto: clamp the accepted config so every downstream
+   * gate (identity_apply_ownership via privilege_super_permitted, device-node
+   * creation) sees SUPER_MODE_OFF even if the gate callback did not already
+   * mutate a copy of it. */
+  if (server_no_super)
+    config->super_mode = SUPER_MODE_OFF;
   protocol_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
@@ -671,6 +697,7 @@ int main(int argc, char* argv[]) {
   allow_delete = opts.allow_delete;
   trust_sender = opts.trust_sender;
   allow_unauthenticated = opts.allow_unauthenticated;
+  server_no_super = opts.no_super;
   server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);

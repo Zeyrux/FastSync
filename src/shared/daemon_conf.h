@@ -23,8 +23,13 @@
  * server's --destination-root: the daemon confines every connection that
  * selects this module to this path (file_open_secure_parent /
  * has_path_traversal / path_is_within all keep the existing confinement, just
- * per-module).  There is never any client-chosen root and no --super /
- * --copy-as: a module path always stays confined.
+ * per-module).  There is never any client-chosen root: a module path always
+ * stays confined.  A daemon also REFUSES a client --copy-as outright, because
+ * there is no per-module opt-in for client-chosen ownership (unlike the
+ * standalone/SSH server, which honors it for its single operator-authorized
+ * root); the operator-level --no-super veto additionally forces super-user
+ * activities off for every daemon connection.  See server_module_gate in
+ * server.c and RSYNC_COMPAT.md.
  *
  * `auth_users` is honored by Wave B daemon authentication: a module that
  * declares auth users accepts a connection only when the presented username is

@@ -190,6 +190,13 @@ void print_usage(void) {
   printf("                      Names resolve on the source machine; @N for numerics.\n");
   printf("                      (Metadata is enabled with --preserve; -M now means\n");
   printf("                      rsync's --remote-option.)\n");
+  printf("  --copy-as=USER[:GROUP]  Force every written entry (files, dirs, symlinks\n");
+  printf("                      and special nodes) to USER[:GROUP], resolved on the\n");
+  printf("                      source machine like --chown.  Requires a privileged\n");
+  printf("                      (root) receiver and implies --preserve; an\n");
+  printf("                      unprivileged receiver refuses the transfer.  Never\n");
+  printf("                      switches process credentials (safe-subset; see\n");
+  printf("                      RSYNC_COMPAT.md).  A daemon refuses it.\n");
   printf("  --chunk-size <n>    Chunk size in bytes (default: %d)\n", DEFAULT_CHUNK_SIZE);
   printf("  --source-dir <path> Source directory\n");
   printf("  --dest-dir <path>   Destination directory\n");

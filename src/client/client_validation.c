@@ -170,5 +170,15 @@ bool validate_config(const Config* config) {
                 PROTOCOL_VERSION);
     return false;
   }
+  /* --copy-as pushes the source ids through the metadata path (it implies
+     --preserve).  A later --no-preserve would clear use_metadata, leaving the
+     transfer with nothing to chown while the receiver gate would still pass.
+     Refuse the combination up front rather than silently chowning nothing. */
+  if (config->copy_as_set && !config->use_metadata) {
+    log_message(LOG_LEVEL_ERROR,
+                "--copy-as requires metadata preservation and cannot be combined with "
+                "--no-preserve");
+    return false;
+  }
   return true;
 }
