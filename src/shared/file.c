@@ -284,23 +284,6 @@ size_t file_content_to_buffer(File* file) {
 
 /* ---- Secure filesystem primitives ---- */
 
-static int authorized_root_fd = -1;
-static char* authorized_root_path;
-
-bool file_set_authorized_root(int fd, const char* canonical_path) {
-  char* path_copy = canonical_path ? str_dup(canonical_path) : NULL;
-  if (canonical_path && !path_copy) {
-    authorized_root_fd = -1;
-    free(authorized_root_path);
-    authorized_root_path = NULL;
-    return false;
-  }
-  authorized_root_fd = fd;
-  free(authorized_root_path);
-  authorized_root_path = path_copy;
-  return true;
-}
-
 bool file_path_exists_secure(const char* path) {
   if (!path)
     return false;
@@ -483,7 +466,10 @@ static int open_dir_beneath_root(const char* resolved, const char* root) {
     rel++;
   if (*rel == '\0')
     return -1;
-  int fd = dup(authorized_root_fd);
+  int root_fd = utils_get_authorized_root_fd();
+  if (root_fd < 0)
+    return -1;
+  int fd = dup(root_fd);
   if (fd < 0)
     return -1;
   char* copy = str_dup(rel);
@@ -525,20 +511,21 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
     return -1;
   }
   int fd;
-  if (authorized_root_fd >= 0) {
-    if (!authorized_root_path || path[0] != '/' ||
-        !path_is_within_root(authorized_root_path, path)) {
+  int root_fd = utils_get_authorized_root_fd();
+  const char* root_path = utils_get_authorized_root_path();
+  if (root_fd >= 0) {
+    if (!root_path || path[0] != '/' || !path_is_within_root(root_path, path)) {
       free(copy);
       free(leaf);
       return -1;
     }
-    fd = dup(authorized_root_fd);
+    fd = dup(root_fd);
     if (fd < 0) {
       free(copy);
       free(leaf);
       return -1;
     }
-    size_t root_len = strlen(authorized_root_path);
+    size_t root_len = strlen(root_path);
     char* relative = str_dup(path + root_len);
     if (!relative) {
       free(copy);
@@ -602,15 +589,14 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
          O_NOFOLLOW walk.  Only honoured when the symlink resolves to a
          directory that stays beneath the authorized root, so a malicious link
          can never redirect the write outside it. */
-      if (next < 0 && file_keep_dirlinks && authorized_root_path != NULL &&
+      if (next < 0 && file_keep_dirlinks && root_path != NULL &&
           (errno == ELOOP || errno == ENOTDIR || errno == EACCES)) {
         struct stat lst;
         if (fstatat(fd, component, &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode)) {
           char candidate[PATH_MAX];
           char root[PATH_MAX];
-          if (realpath(authorized_root_path, root) &&
-              snprintf(candidate, sizeof(candidate), "%s%s/%s", root, rel_buf, component) <
-                  (int)sizeof(candidate)) {
+          if (realpath(root_path, root) && snprintf(candidate, sizeof(candidate), "%s%s/%s", root,
+                                                    rel_buf, component) < (int)sizeof(candidate)) {
             char resolved[PATH_MAX];
             if (realpath(candidate, resolved) && strcmp(resolved, root) != 0 &&
                 strncmp(root, resolved, strlen(root)) == 0 &&
@@ -685,8 +671,9 @@ bool file_ensure_directory_secure(const char* path) {
     return false;
   /* The authorized root is already an open directory, and the filesystem root
      is always present: there is no final component left to create for them. */
+  const char* root_path = utils_get_authorized_root_path();
   bool root_is_open =
-      authorized_root_fd >= 0 && authorized_root_path && strcmp(norm, authorized_root_path) == 0;
+      utils_get_authorized_root_fd() >= 0 && root_path && strcmp(norm, root_path) == 0;
   if (root_is_open || strcmp(norm, "/") == 0) {
     free(norm);
     return true;
@@ -733,8 +720,9 @@ bool file_directory_exists_secure(const char* path) {
   char* norm = normalize_directory_path(path);
   if (!norm)
     return false;
+  const char* root_path = utils_get_authorized_root_path();
   bool root_is_open =
-      authorized_root_fd >= 0 && authorized_root_path && strcmp(norm, authorized_root_path) == 0;
+      utils_get_authorized_root_fd() >= 0 && root_path && strcmp(norm, root_path) == 0;
   if (root_is_open || strcmp(norm, "/") == 0) {
     free(norm);
     return true;

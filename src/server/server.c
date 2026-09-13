@@ -30,8 +30,6 @@
 #include <time.h>
 #include <openssl/x509.h>
 
-static char* authorized_root;
-static int authorized_root_fd = -1;
 static bool allow_delete;
 static bool trust_sender;
 static bool allow_unauthenticated;
@@ -201,13 +199,10 @@ static bool tls_client_identity_allowed(SSL* ssl) {
 }
 
 static void release_authorization(void) {
-  file_set_authorized_root(-1, NULL);
-  utils_set_authorized_root_fd(-1);
-  if (authorized_root_fd >= 0)
-    close(authorized_root_fd);
-  authorized_root_fd = -1;
-  free(authorized_root);
-  authorized_root = NULL;
+  int root_fd = utils_get_authorized_root_fd();
+  utils_set_authorized_root(-1, NULL);
+  if (root_fd >= 0)
+    close(root_fd);
 }
 
 static bool path_is_within(const char* root, const char* path) {
@@ -233,13 +228,11 @@ static bool ensure_receive_root(const Config* config) {
 static bool configure_authorization(const char* root) {
   char resolved[PATH_MAX];
   if (!root) {
-    file_set_authorized_root(-1, NULL);
     utils_set_authorized_root(-1, NULL);
     return false;
   }
   int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (root_fd < 0) {
-    file_set_authorized_root(-1, NULL);
     utils_set_authorized_root(-1, NULL);
     return false;
   }
@@ -248,26 +241,12 @@ static bool configure_authorization(const char* root) {
   if (fd_path_length < 0 || (size_t)fd_path_length >= sizeof(fd_path) ||
       !realpath(fd_path, resolved)) {
     close(root_fd);
-    file_set_authorized_root(-1, NULL);
     utils_set_authorized_root(-1, NULL);
     return false;
   }
-  authorized_root = str_dup(resolved);
-  if (!authorized_root) {
+  if (!utils_set_authorized_root(root_fd, resolved)) {
+    /* The setter already cleared the fd/path state on allocation failure. */
     close(root_fd);
-    file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root(-1, NULL);
-    return false;
-  }
-  authorized_root_fd = root_fd;
-  if (!file_set_authorized_root(authorized_root_fd, authorized_root) ||
-      !utils_set_authorized_root(authorized_root_fd, authorized_root)) {
-    file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root(-1, NULL);
-    close(authorized_root_fd);
-    authorized_root_fd = -1;
-    free(authorized_root);
-    authorized_root = NULL;
     return false;
   }
   return true;
@@ -713,6 +692,7 @@ void handler(int file_descriptor) {
    * in effect.  A client's --timeout tightens only that client's own protocol
    * I/O and the server's socket read/write timeout is the transport default. */
   protocol_session_set_io_timeout(&session, config->timeout);
+  const char* authorized_root = utils_get_authorized_root_path();
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
     goto done;

@@ -36,6 +36,17 @@ void utils_set_authorized_root_fd(int fd) {
   (void)utils_set_authorized_root(fd, NULL);
 }
 
+/* Accessors for the process-global authorized root.  The path pointer is
+ * borrowed and valid until the next setter call; the root is a single-threaded,
+ * set-before-worker-threads value (see server.c), so these carry no locking. */
+int utils_get_authorized_root_fd(void) {
+  return authorized_root_fd;
+}
+
+const char* utils_get_authorized_root_path(void) {
+  return authorized_root_path;
+}
+
 bool path_is_within_root(const char* root, const char* path) {
   size_t root_len = strlen(root);
   return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
@@ -50,15 +61,16 @@ bool path_is_within_root(const char* root, const char* path) {
  * in the extra receiver policies they apply, so they are intentionally kept
  * separate.  Both rely on the shared lexical path_is_within_root check. */
 static int open_authorized_destination(const char* dest_root) {
-  if (authorized_root_fd < 0 || !authorized_root_path || !dest_root ||
-      !path_is_within_root(authorized_root_path, dest_root))
+  int root_fd = utils_get_authorized_root_fd();
+  const char* root_path = utils_get_authorized_root_path();
+  if (root_fd < 0 || !root_path || !dest_root || !path_is_within_root(root_path, dest_root))
     return -1;
 
-  int dirfd = dup(authorized_root_fd);
+  int dirfd = dup(root_fd);
   if (dirfd < 0)
     return -1;
 
-  const char* relative_path = dest_root + strlen(authorized_root_path);
+  const char* relative_path = dest_root + strlen(root_path);
   while (*relative_path == '/')
     relative_path++;
   char* relative = str_dup(*relative_path ? relative_path : ".");
@@ -689,11 +701,12 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
   if (!build_keep_index(manifest, &keep))
     return DELETE_WALK_ERROR;
   int rootfd;
-  if (authorized_root_fd >= 0) {
-    if (authorized_root_path)
+  int root_fd = utils_get_authorized_root_fd();
+  if (root_fd >= 0) {
+    if (utils_get_authorized_root_path())
       rootfd = open_authorized_destination(dest_root);
     else if (dest_root == NULL)
-      rootfd = dup(authorized_root_fd);
+      rootfd = dup(root_fd);
     else
       rootfd = -1;
   } else {

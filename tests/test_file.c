@@ -1180,7 +1180,7 @@ static void test_trust_sender_authorized_root_confinement() {
     rmdir(sibling);
     return;
   }
-  EXPECT_TRUE(file_set_authorized_root(root_fd, root_abs));
+  EXPECT_TRUE(utils_set_authorized_root(root_fd, root_abs));
 
   file_set_trust_sender(true);
   struct stat st;
@@ -1204,7 +1204,7 @@ static void test_trust_sender_authorized_root_confinement() {
 
   free(outside_link);
   free(inside_link);
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   close(root_fd);
   unlink("test_trust_sender_outside_link");
   rmdir(sibling);
@@ -1220,7 +1220,7 @@ void test_trust_sender() {
   test_trust_sender_confines_hostile_paths();
   test_trust_sender_authorized_root_confinement();
   file_set_trust_sender(false);
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
 }
 
 /* --sparse/-S hole preservation: a buffer with a long zero run written via
@@ -1341,7 +1341,7 @@ static void test_file_write_to_disk_partial_retention() {
 static void test_dir_time_list() {
   const char* root = "test_dir_time_root";
   const char* sub = "test_dir_time_root/sub";
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   rmdir(sub);
   rmdir(root);
   EXPECT_EQ_INT(mkdir(root, 0755), 0);
@@ -1485,7 +1485,7 @@ static void test_keep_dirlinks_secure_open_impl() {
     rmdir(outside);
     return;
   }
-  EXPECT_TRUE(file_set_authorized_root(root_fd, root_abs));
+  EXPECT_TRUE(utils_set_authorized_root(root_fd, root_abs));
   file_set_keep_dirlinks(true);
 
   struct stat real_st;
@@ -1538,7 +1538,7 @@ static void test_keep_dirlinks_secure_open_impl() {
   free(leaf);
 
   file_set_keep_dirlinks(false);
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   close(root_fd);
   unlink(link);
   unlink(abslink);
@@ -1552,10 +1552,10 @@ static void test_keep_dirlinks_secure_open_impl() {
  * cleared even when an EXPECT inside the body returns early (a failing EXPECT
  * returns from its own function, so the body's trailing resets may be skipped). */
 static void test_keep_dirlinks_secure_open() {
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   file_set_keep_dirlinks(false);
   test_keep_dirlinks_secure_open_impl();
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   file_set_keep_dirlinks(false);
 }
 
