@@ -29,7 +29,13 @@
 
 /* Size of metadata fields on wire, excluding the int32_t `present` field that
  * is always sent first. The total wire size for present metadata is
- * sizeof(int32_t) + FILE_METADATA_WIRE_SIZE (68 bytes on most platforms). */
+ * sizeof(int32_t) + FILE_METADATA_WIRE_SIZE (68 bytes on most platforms).
+ *
+ * metadata_send()/metadata_receive() (protocol 2.20.0) frame the metadata as a
+ * single packed record: one int32 present flag (0 = absent) followed, when
+ * present, by exactly FILE_METADATA_WIRE_SIZE bytes of field data.  This is the
+ * same present+fields byte layout metadata_to_buf()/metadata_from_buf() use, so
+ * the wire metadata is now one frame instead of one frame per field. */
 #define FILE_METADATA_WIRE_SIZE (sizeof(int32_t) * 5 + sizeof(int64_t) * 6)
 
 void metadata_to_buf(char** buf, const FileMetadata* m);
