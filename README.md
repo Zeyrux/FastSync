@@ -506,18 +506,27 @@ defaults to the current directory. |
 implicit global section, then `[module]` sections). Besides `port`, `motd file`,
 and `address`, the global section accepts:
 
-- `max connections = N` — cap on concurrent connections, default 100. The
+- `max connections = N` — global cap on concurrent connections, default 100. The
   listener enforces it; `0`, negative, and non-numeric values are parse errors.
+- `max connections per host = N` — cap on concurrent connections from a single
+  source IP, default 0 (unlimited). Enforced across all forked connection
+  children through a shared registry.
 - `auth failure delay = MS` — milliseconds to sleep after a failed
   authentication, default 500. `0` disables it and the value is capped at 60000,
   so online password guessing is rate-limited per connection. Successful auths
   are never delayed.
+- `auth lockout threshold = N` — number of failed authentications from one source
+  IP before that source is locked out, default 10; `0` disables the lockout. The
+  failure counter is shared across every connection child, so the lockout holds
+  even when the next attempt is handled by a different forked child.
+- `auth lockout duration = SECONDS` — how long a locked-out source is refused
+  (default 300). A locked-out client is refused before any SCRAM challenge is
+  sent; a successful authentication clears the counter.
 - `hosts allow` / `hosts deny` — comma- and/or whitespace-separated host access
   patterns.
 
-A `[module]` may also set `max connections` (parsed and validated but not
-enforced per module — the global cap applies to the whole listener) and its own
-`hosts allow`/`hosts deny`.
+A `[module]` may also set `max connections` (0 = unlimited; enforced per module
+across all connection children) and its own `hosts allow`/`hosts deny`.
 
 Host patterns are `*` (match all), IPv4/IPv6 literals, or IPv4/IPv6 CIDR
 (`10.0.0.0/8`, `2001:db8::/32`). Hostnames are not resolved, so hostname globs

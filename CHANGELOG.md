@@ -4,6 +4,18 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [Unreleased]
+
+### Security
+
+- Enforce the daemon's per-module `max connections` cap and add a global
+  `max connections per host` cap plus a cross-process `auth lockout`
+  (`auth lockout threshold` / `auth lockout duration`). Because the listener
+  forks one child per connection, the counters live in an anonymous shared
+  mapping created before the accept loop and reclaimed by the parent's
+  `SIGCHLD` handler, so the per-module, per-source and auth-failure state is
+  shared across every child (including after `SIGKILL`).
+
 ## [2.20.0] - 2026-09-13
 
 ### Security
