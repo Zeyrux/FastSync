@@ -2347,6 +2347,7 @@ static void golden_config_populate(Config* c) {
   c->compression_level = 7;
   c->chunk_size = 65536;
   c->use_sendfile = false;
+  c->dry_run = true;
   c->use_delete = true;
   c->use_incremental = true;
   c->size_only = false;
@@ -2398,7 +2399,7 @@ static void golden_config_populate(Config* c) {
   c->modify_window = 3;
   c->compress_choice = str_dup("zstd");
   /* "u=rwx,go=rx" is the same 11 bytes as the original "u=rwX,go=rX" (so the
-   * frame stays 633 bytes) but X is not in FastSync's chmod grammar, and the
+   * frame stays 637 bytes) but X is not in FastSync's chmod grammar, and the
    * receive-side golden validates the frame. */
   c->chmod_spec = str_dup("u=rwx,go=rx");
   c->skip_compress_set = true;
@@ -2445,9 +2446,11 @@ static void golden_config_populate(Config* c) {
 
 /* The pinned golden frame (protocol 2.21.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason. */
-#define GOLDEN_WIRE_LEN 633
-#define GOLDEN_WIRE_HASH 7591559741712449854ULL
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The combined
+ * 2.21.0 wave appends the serialized dry_run bool to CONFIG_WIRE_CORE_FIELDS
+ * and keeps the protocol version string at 2.21.0. */
+#define GOLDEN_WIRE_LEN 637
+#define GOLDEN_WIRE_HASH 13228626061067899189ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

@@ -1106,6 +1106,11 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
         }
         config->use_metadata = true;
       }
+      /* Remember that --server-host was explicitly given (the field itself
+         defaults to 127.0.0.1, so a value check cannot distinguish it).  Used
+         by --dry-run to route an explicit remote target to the server. */
+      if (entry->offset == offsetof(Config, server_host))
+        config->server_host_set = true;
     }
   } else if (apply_table_option(config, entry, NULL) != 0) {
     ctx->exit_code = -1;
@@ -1389,6 +1394,7 @@ static int set_server_port_option(Config* config, const char* value, const char*
     return -1;
   }
   config->server_port = port;
+  config->server_port_set = true;
   return 0;
 }
 

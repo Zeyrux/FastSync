@@ -569,6 +569,13 @@ static FileSaveResult file_save_write_device(const char* root_directory, const F
 
 FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
                                       const Config* config) {
+  /* Central no-mutation guard: a server-contacting --dry-run (or a local batch
+     apply that somehow carries dry_run) must never touch the destination, no
+     matter which caller reached this primitive.  The per-caller guards remain,
+     but this is the last line of defense for every save path.  Report SKIPPED
+     so a --remove-source-files sender correctly keeps its source. */
+  if (config && config->dry_run)
+    return FILE_SAVE_SKIPPED;
   /* Backups are incompatible with ignore-existing: moving the entry first
      would make a concurrent no-replace commit overwrite its old name. */
   bool backup_enabled = config && config->backup && !config->ignore_existing;
@@ -1651,12 +1658,15 @@ static File* receive_full_file(int fd, const Config* config, const char* path) {
  * receive_incremental_check() decomposition.
  *
  * The per-file STATUS_CHECK fast path is split into the small helpers below,
- * called in order by a short linear orchestrator.  Each helper owns one
- * decision: request validation, secure destination open, metadata-only skip,
+ * called in order by a short linear orchestrator (receive_incremental_check_ex).
+ * Each helper owns one decision: request validation, secure destination open,
+ * metadata-only skip, server-contacting --dry-run no-mutation short-circuit,
  * alternate-basis match, --append tail resume, block delta, --fuzzy basis, and
  * the final "send the whole file" fallback.  Every protocol send/receive and
- * every resource cleanup is preserved exactly; the wire is byte-for-byte
- * unchanged.
+ * every resource cleanup is preserved exactly; the non-dry-run wire is
+ * byte-for-byte unchanged.  receive_incremental_check_ex additionally exposes a
+ * `would_transfer` out-param for the dry-run caller; the 3-arg
+ * receive_incremental_check wrapper passes NULL.
  * ------------------------------------------------------------------------- */
 
 /* Owned state threaded through the helpers below. */
@@ -1681,6 +1691,7 @@ typedef enum {
   INCREMENTAL_CONTINUE, /* proceed to the next helper */
   INCREMENTAL_ERROR,    /* protocol/validation failure: return NULL */
   INCREMENTAL_SKIP,     /* up to date: *skipped = true, return NULL */
+  INCREMENTAL_DRY_RUN,  /* --dry-run resolved: flags set, return NULL */
   INCREMENTAL_FILE,     /* a File* was produced (out_file) */
 } IncrementalCheckOutcome;
 
@@ -1843,6 +1854,42 @@ static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckStat
     return INCREMENTAL_SKIP;
   }
   return INCREMENTAL_CONTINUE;
+}
+
+/* Server-contacting --dry-run no-mutation short-circuit.  Runs after the
+   quick-skip decision and before any path that could touch the destination.
+   When dry_run is set and the file is not already up to date the receiver must
+   materialize nothing (no basis link/copy, no append/delta/full transfer) and
+   the sender must send no data, so answer STATUS_DRY_RUN_TRANSFER and stop.
+   The one exception is a --compare-dest exact hit with no destination copy: a
+   real run would suppress the data without changing the destination, so it
+   reports as a skip (STATUS_OK) exactly as the full basis path below would.
+   Everything read here (destination file, basis candidates) is read-only. */
+static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalCheckState* state,
+                                                                  bool* skipped,
+                                                                  bool* would_transfer) {
+  const Config* config = state->config;
+  if (!config->dry_run)
+    return INCREMENTAL_CONTINUE;
+
+  bool skip_via_compare = false;
+  if (config_has_basis(config) && !config->ignore_times) {
+    BasisMatch basis;
+    basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
+                     (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
+                     false, &basis);
+    if (basis.hit && basis.type == BASIS_DEST_COMPARE && !state->has_old_file)
+      skip_via_compare = true;
+    basis_match_free(&basis);
+  }
+  Status reply = skip_via_compare ? STATUS_OK : STATUS_DRY_RUN_TRANSFER;
+  if (!send_status(state->fd, reply))
+    return INCREMENTAL_ERROR;
+  if (skip_via_compare)
+    *skipped = true;
+  else if (would_transfer)
+    *would_transfer = true;
+  return INCREMENTAL_DRY_RUN;
 }
 
 /* Alternate basis directories (--compare-dest/--copy-dest/--link-dest): a hit
@@ -2133,7 +2180,14 @@ static File* incremental_check_receive_full(IncrementalCheckState* state) {
   return receive_full_file(state->fd, state->config, state->check_path);
 }
 
-File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
+/* Core implementation.  `would_transfer` (may be NULL) is set true only on the
+ * server-contacting --dry-run path, when the file is not up to date and the
+ * receiver answered STATUS_DRY_RUN_TRANSFER; the caller then knows no File is
+ * returned and nothing was stored. */
+File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
+                                   bool* would_transfer) {
+  if (would_transfer)
+    *would_transfer = false;
   if (!config || !skipped) {
     send_status(fd, STATUS_ERROR);
     return NULL;
@@ -2162,6 +2216,13 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     *skipped = true;
     goto done;
   }
+
+  /* Dry-run resolves here (no mutation) or falls through to the normal path. */
+  outcome = incremental_check_dry_run_shortcut(&state, skipped, would_transfer);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome != INCREMENTAL_CONTINUE)
+    goto done;
 
   outcome = incremental_check_try_basis(&state, &result);
   if (outcome == INCREMENTAL_ERROR)
@@ -2196,6 +2257,10 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
 done:
   incremental_check_state_cleanup(&state);
   return result;
+}
+
+File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
+  return receive_incremental_check_ex(fd, config, skipped, NULL);
 }
 
 File* file_receive(const Config* config, int file_descriptor) {
@@ -2909,6 +2974,11 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
 bool manifest_delete_all(const Config* config, DeleteManifest* manifest) {
   if (!config || !manifest)
     return false;
+  /* Central no-mutation guard: a dry-run never deletes.  No manifest is sent on
+     the dry-run path, but a hostile/buggy peer could; treat it as a no-op so
+     the receiver can never remove anything. */
+  if (config->dry_run)
+    return true;
   if (config->delete_missing_args && !manifest_delete_missing_args(config, manifest))
     return false;
   if (config->use_delete && !manifest_delete_extras(config, manifest))

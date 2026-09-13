@@ -145,8 +145,17 @@ enum NET_STATUS {
    * of a bare STATUS_ERROR.  receive_status() consumes the string and maps the
    * status back to STATUS_ERROR, so every pre-2.21 call site keeps working;
    * callers that want the human-readable reason consult protocol_last_error().
-   * Appended last so the existing wire values never move. */
-  STATUS_ERROR_DETAIL
+   * Appended immediately after STATUS_AUTH_FAILED so the existing wire values
+   * never move. */
+  STATUS_ERROR_DETAIL,
+  /* Server-contacting --dry-run (protocol 2.21.0).  Sent by the receiver in
+   * response to a per-file STATUS_CHECK when the wire config carries
+   * dry_run=true and the file is NOT already up to date: it tells the sender
+   * the file WOULD be transferred, and the sender must NOT transmit any data
+   * (the receiver reads none in dry-run).  STATUS_OK keeps its meaning in this
+   * path ("already up to date / nothing to do").  Appended after
+   * STATUS_ERROR_DETAIL so no existing status is renumbered. */
+  STATUS_DRY_RUN_TRANSFER
 };
 
 void io_set_fds(int read_fd, int write_fd);

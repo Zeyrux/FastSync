@@ -590,6 +590,9 @@ static void test_parse_args_port_alias() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9000);
+  /* The default port is 8080; the explicit bit is what lets --dry-run tell an
+     explicit remote target from the default and route to the server. */
+  EXPECT_TRUE(cfg->server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -597,6 +600,7 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9001);
+  EXPECT_TRUE(cfg->server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -604,6 +608,29 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9002);
+  EXPECT_TRUE(cfg->server_port_set);
+  config_delete(cfg);
+}
+
+/* An explicit --server-host must set its own routing bit (the field itself
+ * defaults to 127.0.0.1, so a value check cannot distinguish an explicit host
+ * from the default); --dry-run uses it to route to the server. */
+static void test_parse_args_server_host_sets_routing_bit() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_FALSE(cfg->server_host_set);
+  char* argv_space[] = {"fastsync", "--server-host", "example.test", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->server_host, "example.test");
+  EXPECT_TRUE(cfg->server_host_set);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_inline[] = {"fastsync", "--server-host=example.test", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->server_host_set);
   config_delete(cfg);
 }
 
@@ -3301,6 +3328,7 @@ void test_client_cli() {
   test_parse_args_non_numeric_port();
   test_parse_args_invalid_server_port();
   test_parse_args_port_alias();
+  test_parse_args_server_host_sets_routing_bit();
   test_parse_args_threads();
   test_client_abort_flag();
   test_parse_args_invalid_compression_level();

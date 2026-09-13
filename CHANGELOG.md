@@ -6,6 +6,21 @@ run the same version because the handshake is strict.
 
 ## [Unreleased]
 
+### Added
+
+- **Server-contacting `--dry-run` (protocol 2.21.0).** `--dry-run` now performs
+  a real handshake with a remote/daemon receiver and reports exactly what WOULD
+  change based on receiver state (existing destination files, mtimes, checksums,
+  basis dirs). The wire config carries the dry-run intent (`Config.dry_run`) and
+  the receiver answers each per-file check with `STATUS_DRY_RUN_TRANSFER` (would
+  transfer) or `STATUS_OK` (already up to date); the sender prints the
+  would-transfer set and its trailer without sending any file data. The receiver
+  performs the normal read-only incremental decision but mutates nothing: no temp
+  files, writes, renames, deletes, metadata/xattr/chown, or directory creation.
+  A plain local destination (no explicit `--server-port`/remote) keeps the
+  original client-side dry-run. Would-delete reporting for `--delete*` is
+  deferred to a follow-up; dry-run never deletes.
+
 ### Security
 
 - Enforce the daemon's per-module `max connections` cap and add a global

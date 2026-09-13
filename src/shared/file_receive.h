@@ -24,6 +24,13 @@ File* file_receive_symlink(int file_descriptor, const Config* config);
 File* file_receive_special(int file_descriptor);
 bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode);
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
+/* Extended variant used by the receiver.  `would_transfer` (may be NULL) is set
+ * true only on the server-contacting --dry-run path when the file is not up to
+ * date: the receiver has already sent STATUS_DRY_RUN_TRANSFER and returns NULL
+ * without storing anything.  On that path `*skipped` is true for an up-to-date
+ * (STATUS_OK) file and both flags are false for a genuine error. */
+File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
+                                   bool* would_transfer);
 
 /* P7 Wave D directory-time accumulator.  The receiver collects the metadata of
  * every directory it creates/receives (STATUS_MKDIR with metadata and/or the
