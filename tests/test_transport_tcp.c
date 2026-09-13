@@ -2,6 +2,7 @@
 #include "protocol.h"
 #include "test_utils.h"
 #include "transport_tcp.h"
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string.h>
@@ -195,6 +196,49 @@ static void test_client_disconnect_delete() {
   client_delete(c);
 }
 
+/* TCP_NODELAY is enabled by default on a connected transfer socket, and an
+ * explicit --sockopts TCP_NODELAY=0 still overrides it. */
+static void test_tcp_nodelay_default_and_override() {
+  Server* s = server_create(0);
+  EXPECT_NOT_NULL(s);
+  EXPECT_EQ_INT(listen(s->file_descriptor, 1), 0);
+  struct sockaddr_in bound;
+  socklen_t bound_len = sizeof(bound);
+  EXPECT_EQ_INT(getsockname(s->file_descriptor, (struct sockaddr*)&bound, &bound_len), 0);
+  int port = (int)ntohs(bound.sin_port);
+  EXPECT_TRUE(port > 0);
+
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_TRUE(client_connect(c, "127.0.0.1", port));
+  int got = 0;
+  socklen_t len = sizeof(got);
+  EXPECT_EQ_INT(getsockopt(c->file_descriptor, IPPROTO_TCP, TCP_NODELAY, &got, &len), 0);
+  EXPECT_EQ_INT(got, 1);
+  client_disconnect(c);
+  client_delete(c);
+
+  SockOptEntry* entries = NULL;
+  int count = 0;
+  EXPECT_EQ_INT(config_sockopts_parse("TCP_NODELAY=0", &entries, &count), 0);
+  TcpConnectOptions opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.sockopts = entries;
+  opts.sockopt_count = count;
+
+  Client* c2 = client_create();
+  EXPECT_NOT_NULL(c2);
+  EXPECT_TRUE(client_connect_ex(c2, "127.0.0.1", port, &opts));
+  got = 0;
+  len = sizeof(got);
+  EXPECT_EQ_INT(getsockopt(c2->file_descriptor, IPPROTO_TCP, TCP_NODELAY, &got, &len), 0);
+  EXPECT_EQ_INT(got, 0);
+  client_disconnect(c2);
+  client_delete(c2);
+  free(entries);
+  server_delete(&s);
+}
+
 void test_transport_tcp() {
   test_server_create_ephemeral();
   test_server_delete_null();
@@ -211,4 +255,5 @@ void test_transport_tcp() {
   test_sockopts_apply_sets_option();
   test_server_create_bind_address();
   test_server_create_bind_ipv6();
+  test_tcp_nodelay_default_and_override();
 }

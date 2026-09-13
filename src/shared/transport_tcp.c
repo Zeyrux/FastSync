@@ -19,6 +19,7 @@
 static volatile sig_atomic_t g_active_connections = 0;
 
 static void tcp_apply_socket_timeout(int fd);
+static void tcp_enable_nodelay_default(int fd, int family);
 
 static void sigchld_handler(int sig) {
   (void)sig;
@@ -148,6 +149,7 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       continue;
     }
     tcp_apply_socket_timeout(fd);
+    tcp_enable_nodelay_default(fd, client_addr.ss_family);
     char peer[128];
     if (!utils_sockaddr_to_string((const struct sockaddr*)&client_addr, peer, sizeof(peer)))
       snprintf(peer, sizeof(peer), "unknown");
@@ -229,6 +231,19 @@ static void tcp_apply_socket_timeout(int fd) {
   tv.tv_usec = 0;
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* Enable TCP_NODELAY by default on a transfer socket: the protocol emits many
+ * small messages and Nagle's algorithm would otherwise coalesce/delay them.
+ * Best-effort only: the family guard keeps this to IP/TCP sockets, and a
+ * setsockopt failure is ignored.  A caller-provided --sockopts TCP_NODELAY=0
+ * is applied afterwards on the connect path, so an explicit user choice still
+ * wins. */
+static void tcp_enable_nodelay_default(int fd, int family) {
+  if (family != AF_INET && family != AF_INET6)
+    return;
+  int value = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
 }
 
 Client* client_create() {
@@ -375,6 +390,9 @@ bool tcp_connect_socket_ex(Client* client, const char* host, int port,
     client->file_descriptor = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (client->file_descriptor < 0)
       continue;
+
+    /* Default first; a user --sockopts TCP_NODELAY=0 applied below overrides. */
+    tcp_enable_nodelay_default(client->file_descriptor, rp->ai_family);
 
     if (opts && opts->sockopt_count > 0 &&
         !tcp_apply_sockopts(client->file_descriptor, opts->sockopts, opts->sockopt_count)) {
