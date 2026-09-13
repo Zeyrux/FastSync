@@ -34,19 +34,34 @@
  * client_send.c, still links the symbol. */
 volatile sig_atomic_t client_abort_requested = 0;
 
-#ifndef FASTSYNC_TEST_BUILD
-/* Signal handler: perform NO work beyond storing the flag.  Logging, protocol
- * I/O and the STATUS_ABORT frame are all done later on the normal send path,
- * which is not async-signal-safe.  Only the production client installs it. */
-static void client_signal_handler(int signo) {
-  (void)signo;
-  client_abort_requested = 1;
+/* Only armed while a network transfer is in flight.  Outside that window the
+ * handler restores the default disposition and re-raises, so purely local modes
+ * (--list-only/--dry-run/--read-batch/--only-write-batch and the batch-emission
+ * pass) keep terminating on Ctrl-C/SIGTERM instead of silently swallowing it. */
+volatile sig_atomic_t client_abort_armed = 0;
+
+void client_set_abort_armed(bool armed) {
+  client_abort_armed = armed ? 1 : 0;
 }
-#endif
 
 bool client_abort_pending(void) {
   return client_abort_requested != 0;
 }
+
+#ifndef FASTSYNC_TEST_BUILD
+/* Signal handler: perform NO work beyond storing the flag.  Logging, protocol
+ * I/O and the STATUS_ABORT frame are all done later on the normal send path,
+ * which is not async-signal-safe.  When no transfer is armed, fall back to the
+ * default action so local-only modes remain interruptible. */
+static void client_signal_handler(int signo) {
+  if (!client_abort_armed) {
+    signal(signo, SIG_DFL);
+    raise(signo);
+    return;
+  }
+  client_abort_requested = 1;
+}
+#endif
 
 #ifndef FASTSYNC_TEST_BUILD
 /* Parse environment variables for source/destination directories and save-to-disk flag. */

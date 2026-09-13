@@ -81,9 +81,12 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     close(w);
   }
 
+  /* Bounded so a crafted 256 MiB length header cannot make each iteration
+     allocate the full MAX_DATA_PAYLOAD_SIZE under ASan; the framing logic is
+     identical to receive_data(), which delegates to the limited variant. */
   rd = make_stream(data, size, &w);
   if (rd >= 0) {
-    Data* d = receive_data(rd);
+    Data* d = receive_data_limited(rd, 1u << 20);
     data_destroy(d);
     close(rd);
     close(w);

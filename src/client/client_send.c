@@ -1949,6 +1949,9 @@ int send_files(Config* config) {
     return 1;
   }
 
+  /* From here on a server session may be live, so Ctrl-C/SIGTERM should set the
+     abort flag (and be forwarded as STATUS_ABORT) instead of terminating. */
+  client_set_abort_armed(true);
   Client* client = connect_transfer_client(config);
   if (!client) {
     if (config->transport == TRANSPORT_TCP)
@@ -2228,6 +2231,7 @@ send_fail:
   prepared_scanner_destroy(&prepared);
   disconnect_transfer_client(client);
   protocol_session_unbind();
+  client_set_abort_armed(false);
   return ret;
 }
 
@@ -2256,6 +2260,9 @@ int send_files_multithreaded(Config** config_ptr) {
       array_list_delete(missing_args);
     return 1;
   }
+
+  /* Armed only once a session may go live (see send_files). */
+  client_set_abort_armed(true);
 
   long pages = sysconf(_SC_AVPHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);
@@ -2411,5 +2418,6 @@ int send_files_multithreaded(Config** config_ptr) {
   /* --ignore-errors: the run completed (and deleted) past an unreadable source
      directory; report it as errored like rsync does. */
   pipeline_context_sender_destroy(context);
+  client_set_abort_armed(false);
   return sender_ok && !scan_io ? 0 : 1;
 }
