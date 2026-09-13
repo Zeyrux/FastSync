@@ -52,11 +52,10 @@ typedef struct DaemonModule {
                         activities.  Without it the daemon refuses all of them. */
   char** auth_users; /* `auth users = a,b`; Wave B credential list */
   int auth_user_count;
-  /* `max connections = N` (optional per-module cap).  0 means "not set"
-   * (inherit the global cap).  Parsed, stored, and validated, but NOT enforced
-   * per-module: connections are counted in the accept-loop parent before the
-   * client's module is known, so only the global cap is enforced (see
-   * transport_tcp.c and the Daemon Mode notes in RSYNC_COMPAT.md). */
+  /* `max connections = N` (optional per-module cap).  0 means unlimited.  The
+   * per-connection child records the selected module in the shared registry
+   * (daemon_limits.c) once the config frame names it, so the cap is enforced
+   * across all forked children; the parent reclaims the slot on SIGCHLD. */
   int max_connections;
   char** hosts_allow; /* `hosts allow = a,b`; host access allow patterns */
   int hosts_allow_count;
@@ -67,14 +66,25 @@ typedef struct DaemonModule {
 /* Global (pre-module) scalar keys.  `motd file` is parsed and stored but has
  * no wire effect yet (MOTD display is Wave C). */
 typedef struct DaemonConfGlobals {
-  int port;                  /* `port`, default DAEMON_CONF_DEFAULT_PORT (873) */
-  char* motd_file;           /* `motd file`, may be NULL */
-  char* address;             /* `address` (optional bind address), may be NULL */
-  int max_connections;       /* `max connections`, default
-                                DAEMON_CONF_DEFAULT_MAX_CONNECTIONS (100) */
-  int auth_failure_delay_ms; /* `auth failure delay`, milliseconds; default
-                                DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS */
-  char** hosts_allow;        /* `hosts allow`; global host access allow patterns */
+  int port;                      /* `port`, default DAEMON_CONF_DEFAULT_PORT (873) */
+  char* motd_file;               /* `motd file`, may be NULL */
+  char* address;                 /* `address` (optional bind address), may be NULL */
+  int max_connections;           /* `max connections`, default
+                                    DAEMON_CONF_DEFAULT_MAX_CONNECTIONS (100) */
+  int auth_failure_delay_ms;     /* `auth failure delay`, milliseconds; default
+                                    DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS */
+  int max_connections_per_host;  /* `max connections per host`, concurrent cap per
+                                    source IP; default
+                                    DAEMON_CONF_DEFAULT_MAX_CONNECTIONS_PER_HOST (0 =
+                                    unlimited) */
+  int auth_lockout_threshold;    /* `auth lockout threshold`, failed attempts from
+                                    one source before lockout; default
+                                    DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_THRESHOLD (0
+                                    disables) */
+  int auth_lockout_duration_sec; /* `auth lockout duration`, seconds; default
+                                    DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_DURATION_SEC
+                                    (0 disables) */
+  char** hosts_allow;            /* `hosts allow`; global host access allow patterns */
   int hosts_allow_count;
   char** hosts_deny; /* `hosts deny`; global host access deny patterns */
   int hosts_deny_count;
@@ -92,11 +102,26 @@ typedef struct DaemonConf {
 #define DAEMON_CONF_DEFAULT_MAX_CONNECTIONS 100
 /* Default `auth failure delay` in milliseconds (0 disables the throttle). */
 #define DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS 500
+/* Default `max connections per host` (0 = unlimited). */
+#define DAEMON_CONF_DEFAULT_MAX_CONNECTIONS_PER_HOST 0
+/* Default cross-process auth lockout: 10 failed attempts from one source lock
+ * it out for 300 s (0 disables either knob). */
+#define DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_THRESHOLD 10
+#define DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_DURATION_SEC 300
+/* Upper bound on a `max connections per host` or `auth lockout threshold`
+ * value, so a typo cannot size the shared registry absurdly. */
+#define DAEMON_CONF_MAX_CONCURRENCY_LIMIT 1000000
+/* Upper bound on `auth lockout duration` (7 days). */
+#define DAEMON_CONF_MAX_AUTH_LOCKOUT_DURATION_SEC 604800
 /* Largest accepted `auth failure delay`, so a typo cannot pin a connection
  * child in nanosleep for an absurd time. */
 /* Bounded well below the socket I/O timeout so a failed-auth child cannot hold
  * a connection slot for long enough to amplify connection-cap exhaustion. */
 #define DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS 5000
+/* Upper bound on the number of [module] sections, so the shared registry's
+ * per-module counter array stays fixed-size.  The parser rejects the next
+ * section past this bound. */
+#define DAEMON_CONF_MAX_MODULES 256
 /* Longest accepted config line (excluding the trailing newline).  Longer lines
  * are rejected rather than buffered unboundedly. */
 #define DAEMON_CONF_MAX_LINE 4096
@@ -129,8 +154,9 @@ bool daemon_module_name_valid(const char* name);
 /* Parse one --dparam=KEY=VALUE (or "--dparam KEY=VALUE") override string and
  * apply it to the global keys only.  Keys are case-insensitive and limited to
  * the global keys defined by the grammar (port, motd file, address,
- * max connections, auth failure delay, hosts allow, hosts deny).  Returns 0 on
- * success, -1 on error (err filled). */
+ * max connections, max connections per host, auth failure delay,
+ * auth lockout threshold, auth lockout duration, hosts allow, hosts deny).
+ * Returns 0 on success, -1 on error (err filled). */
 int daemon_conf_apply_dparam(DaemonConf* conf, const char* assignment, char* err, size_t err_size);
 
 /* Host access-control matching (pure; no I/O).  `daemon_host_pattern_match`
