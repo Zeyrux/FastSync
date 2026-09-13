@@ -609,10 +609,11 @@ void handler(int file_descriptor) {
   if (gate_ctx.super_mode_override != -1)
     config->super_mode = (SuperMode)gate_ctx.super_mode_override;
   protocol_set_8_bit_output(config->eight_bit_output);
-  /* Honor the negotiated --timeout for every protocol frame from here on (the
-   * config handshake itself used the built-in 60 s window).  A positive value
-   * also tightens the socket SO_RCVTIMEO/SO_SNDTIMEO already applied by the
-   * transport; 0 leaves both built-in defaults in place. */
+  /* Server-side per-message protocol deadline for every frame from here on.
+   * `timeout` is not serialized, so this is the server's own config (the server
+   * has no --timeout CLI and defaults it to 0): the built-in 60 s window stays
+   * in effect.  A client's --timeout tightens only that client's own protocol
+   * I/O and the server's socket read/write timeout is the transport default. */
   protocol_session_set_io_timeout(&session, config->timeout);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");

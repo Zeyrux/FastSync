@@ -87,6 +87,12 @@ void protocol_session_set_io_timeout(ProtocolSession* session, int sec) {
   session->io_timeout_sec = sec;
 }
 
+int protocol_get_io_timeout_sec(void) {
+  const ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
+  int sec = session->io_timeout_sec;
+  return sec > 0 ? sec : RECEIVE_TIMEOUT_SEC;
+}
+
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc) {
   if (!session)
     session = bound_session ? bound_session : &legacy_io_session;

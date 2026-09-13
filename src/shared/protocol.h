@@ -152,6 +152,10 @@ void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long
  * An explicit long deadline (e.g. the delete-ack wait) is applied per-call by
  * protocol_receive_status_timed and is unaffected by this setter. */
 void protocol_session_set_io_timeout(ProtocolSession* session, int sec);
+/* Effective per-message I/O deadline (seconds) for the currently-bound session,
+ * falling back to the built-in default.  Used by the plaintext sendfile path
+ * which bypasses the protocol send primitive. */
+int protocol_get_io_timeout_sec(void);
 void* protocol_alloc(size_t size);
 void* protocol_realloc(void* ptr, size_t size);
 void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled);

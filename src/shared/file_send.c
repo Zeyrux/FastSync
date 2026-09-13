@@ -145,7 +145,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
   off_t offset = 0;
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += 60;
+  deadline.tv_sec += protocol_get_io_timeout_sec();
   while ((unsigned long long)offset < file_size) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);

@@ -203,22 +203,41 @@ bool receiver_time_limit_exceeded(const struct timespec* session_start,
   return false;
 }
 
+/* A frame proves forward progress only when it cannot be fabricated for free.
+ * KEEPALIVE/ABORT are pure liveness, and CHECK_BATCH/DIR_TIMES may carry zero
+ * entries, so a peer must not be able to hold a connection slot forever by
+ * merely emitting empty frames. */
+static bool status_counts_as_progress(Status status) {
+  switch (status) {
+  case STATUS_KEEPALIVE:
+  case STATUS_ABORT:
+  case STATUS_CHECK_BATCH:
+  case STATUS_DIR_TIMES:
+    return false;
+  default:
+    return true;
+  }
+}
+
 /* Refresh the progress timestamp for a forward-moving frame and enforce the
- * bounds above.  Returns false (after best-effort STATUS_ERROR) when the
- * connection must be dropped. */
+ * bounds above.  Returns false when the connection must be dropped; the
+ * terminal STATUS_ERROR is sent only when the sink owns error reporting (the
+ * -m sink sets send_error=false so the main thread emits exactly one). */
 static bool receiver_note_status(const struct timespec* session_start,
-                                 struct timespec* last_progress, Status status,
-                                 int file_descriptor) {
+                                 struct timespec* last_progress, Status status, int file_descriptor,
+                                 const ReceiverSink* sink) {
   struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  if (status != STATUS_KEEPALIVE && status != STATUS_ABORT)
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    now = *last_progress;
+  if (status_counts_as_progress(status))
     *last_progress = now;
   if (!receiver_time_limit_exceeded(session_start, last_progress, &now))
     return true;
   log_message(LOG_LEVEL_ERROR,
               "Receive session exceeded its time bound (idle %us / total %us); aborting connection",
               g_max_session_idle_sec, g_max_session_wall_sec);
-  send_status(file_descriptor, STATUS_ERROR);
+  if (!sink || sink->send_error)
+    send_status(file_descriptor, STATUS_ERROR);
   return false;
 }
 
@@ -248,7 +267,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   struct timespec last_progress;
   clock_gettime(CLOCK_MONOTONIC, &session_start);
   last_progress = session_start;
-  if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor))
+  if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor, sink))
     return -1;
   bool early_delete = config_delete_timing_early(config);
   /* Parked keep-set for the late/commit timing.  Every exit path below frees it
@@ -349,7 +368,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   next_status:
     if (!receive_status(file_descriptor, &status))
       goto receive_error;
-    if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor))
+    if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor, sink))
       goto fail;
   }
   if (status != STATUS_FINISHED) {

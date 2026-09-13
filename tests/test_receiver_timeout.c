@@ -62,19 +62,28 @@ static void test_receiver_aborts_idle_keepalive() {
   protocol_session_bind(&session);
 
   Status keepalive = STATUS_KEEPALIVE;
-  EXPECT_EQ_INT((int)write(sv[0], &keepalive, sizeof(keepalive)), (int)sizeof(keepalive));
-  int result = receiver_process_pending(config, sv[1], &sink, NULL);
-  EXPECT_EQ_INT(result, -1);
-
+  ssize_t wrote = write(sv[0], &keepalive, sizeof(keepalive));
+  int result = -2;
+  if (wrote == (ssize_t)sizeof(keepalive))
+    result = receiver_process_pending(config, sv[1], &sink, NULL);
   Status reply = STATUS_OK;
-  EXPECT_EQ_INT((int)read(sv[0], &reply, sizeof(reply)), (int)sizeof(reply));
-  EXPECT_EQ_INT((int)reply, (int)STATUS_ERROR);
+  ssize_t got = -1;
+  if (result == -1)
+    got = read(sv[0], &reply, sizeof(reply));
 
+  /* Tear down the binding/descriptors BEFORE asserting: an EXPECT_* failure
+   * returns immediately, and a dangling bound_session would poison later
+   * fd-level protocol I/O tests. */
   protocol_session_unbind();
   config_delete(config);
   close(sv[0]);
   close(sv[1]);
   receiver_reset_time_limits();
+
+  EXPECT_EQ_INT((int)wrote, (int)sizeof(keepalive));
+  EXPECT_EQ_INT(result, -1);
+  EXPECT_EQ_INT((int)got, (int)sizeof(reply));
+  EXPECT_EQ_INT((int)reply, (int)STATUS_ERROR);
 }
 
 void test_receiver_timeout(void) {
