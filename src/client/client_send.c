@@ -1157,6 +1157,7 @@ static int send_append(const Client* client, File* file, Config* config,
     tail_view.data = (char*)file->data->data + off;
     tail_view.size = tail_len;
     tail_view.protocol_charge = 0;
+    tail_view.owner = NULL;
     ok = send_data(fd, &tail_view);
   }
   return ok ? 0 : -1;
