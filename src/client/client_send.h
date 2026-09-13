@@ -4,6 +4,15 @@
 #include "chunk.h"
 #include "config.h"
 #include "transport_tcp.h"
+#include <signal.h>
+#include <stdbool.h>
+
+/* Set ONLY by the client's SIGINT/SIGTERM handler (async-signal-safe: the
+ * handler stores 1 and does nothing else).  The send loops poll it via
+ * client_abort_pending() and, when set, best-effort send STATUS_ABORT so the
+ * receiver can clean up before the client exits. */
+extern volatile sig_atomic_t client_abort_requested;
+bool client_abort_pending(void);
 
 /* Both sender entry points BORROW `config` for the duration of the call; they
  * never free it, and the caller retains ownership (freeing it with

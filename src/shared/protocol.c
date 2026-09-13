@@ -609,6 +609,136 @@ bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int
   return true;
 }
 
+/* Read exactly one Status frame within `deadline` (CLOCK_MONOTONIC).  Unlike
+ * protocol_receive_status_keepalive this never emits a keepalive: it is used
+ * to consume the first byte(s) of an already-signalled frame and to drain the
+ * peer's outstanding keepalive replies, where injecting a write could split a
+ * reply across a frame boundary.  Returns false on timeout/EOF/error. */
+static bool protocol_read_status_until(ProtocolSession* session, Status* status,
+                                       const struct timespec* deadline) {
+  Status received = STATUS_ERROR;
+  size_t got = 0;
+  while (got < sizeof(Status)) {
+    if (!session->ssl || SSL_pending(session->ssl) == 0) {
+      int remaining_ms = deadline_remaining_ms(deadline);
+      if (remaining_ms <= 0) {
+        log_message(LOG_LEVEL_ERROR, "Receive timeout while reading status");
+        return false;
+      }
+      struct pollfd pfd = {.fd = session->read_fd, .events = POLLIN};
+      int poll_result = poll(&pfd, 1, remaining_ms);
+      if (poll_result == 0) {
+        log_message(LOG_LEVEL_ERROR, "Receive timeout while reading status");
+        return false;
+      }
+      if (poll_result < 0) {
+        if (errno == EINTR)
+          continue;
+        return false;
+      }
+      if (pfd.revents & (POLLERR | POLLNVAL))
+        return false;
+    }
+    ssize_t bytes_received;
+    if (session->ssl)
+      bytes_received = SSL_read(session->ssl, (char*)&received + got, sizeof(Status) - got);
+    else
+      bytes_received = read(session->read_fd, (char*)&received + got, sizeof(Status) - got);
+    if (bytes_received <= 0) {
+      if (session->ssl) {
+        int ssl_err = SSL_get_error(session->ssl, (int)bytes_received);
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+          continue;
+      }
+      if (bytes_received < 0 && errno == EINTR)
+        continue;
+      log_message(LOG_LEVEL_ERROR, "Connection closed while receiving status");
+      return false;
+    }
+    got += (size_t)bytes_received;
+  }
+  *status = received;
+  return true;
+}
+
+bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status, int timeout_sec,
+                                       int keepalive_interval_sec, ProtocolWaitAbort abort_check) {
+  if (!session || !status)
+    return false;
+  if (timeout_sec <= 0)
+    timeout_sec = RECEIVE_TIMEOUT_SEC;
+  if (keepalive_interval_sec <= 0)
+    keepalive_interval_sec = timeout_sec;
+
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += timeout_sec;
+
+  unsigned long keepalives_sent = 0;
+  unsigned long replies_seen = 0;
+  Status final = STATUS_ERROR;
+  while (true) {
+    if (abort_check && abort_check())
+      return false;
+    if (!session->ssl || SSL_pending(session->ssl) == 0) {
+      int remaining_ms = deadline_remaining_ms(&deadline);
+      if (remaining_ms <= 0) {
+        log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", timeout_sec);
+        return false;
+      }
+      /* Only interleave a keepalive while waiting for the FIRST byte of a
+       * frame; once part of a frame is buffered a write could race the peer's
+       * reply into the middle of it. */
+      int interval_ms = keepalive_interval_sec * 1000;
+      int wait_ms = interval_ms < remaining_ms ? interval_ms : remaining_ms;
+      struct pollfd pfd = {.fd = session->read_fd, .events = POLLIN};
+      int poll_result = poll(&pfd, 1, wait_ms);
+      if (poll_result == 0) {
+        if (abort_check && abort_check())
+          return false;
+        if (!protocol_send_status(session, STATUS_KEEPALIVE))
+          return false;
+        keepalives_sent++;
+        continue;
+      }
+      if (poll_result < 0) {
+        if (errno == EINTR)
+          continue;
+        return false;
+      }
+      if (pfd.revents & (POLLERR | POLLNVAL))
+        return false;
+    }
+    Status received;
+    if (!protocol_read_status_until(session, &received, &deadline))
+      return false;
+    if (received == STATUS_KEEPALIVE) {
+      /* The receiver's answer to one of our keepalives. */
+      replies_seen++;
+      continue;
+    }
+    final = received;
+    break;
+  }
+  /* Drain the replies the receiver still owes for keepalives we sent while it
+   * was busy.  It answers them only after the real status, so leaving them
+   * unread would put stale KEEPALIVE frames ahead of the next exchange and
+   * desynchronize the protocol. */
+  while (replies_seen < keepalives_sent) {
+    Status drained;
+    if (!protocol_read_status_until(session, &drained, &deadline))
+      return false;
+    if (drained != STATUS_KEEPALIVE) {
+      log_message(LOG_LEVEL_ERROR, "Unexpected status while draining keepalive replies");
+      return false;
+    }
+    replies_seen++;
+  }
+  *status = final;
+  log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
+  return true;
+}
+
 bool send_str(int fd, const char* data) {
   return protocol_send_str(legacy_session(-1, fd), data);
 }
@@ -647,4 +777,9 @@ bool receive_status(int fd, Status* status) {
 }
 bool receive_status_timed(int fd, Status* status, int timeout_sec) {
   return protocol_receive_status_timed(legacy_session(fd, -1), status, timeout_sec);
+}
+bool receive_status_keepalive(int fd, Status* status, int timeout_sec, int keepalive_interval_sec,
+                              ProtocolWaitAbort abort_check) {
+  return protocol_receive_status_keepalive(legacy_session(fd, -1), status, timeout_sec,
+                                           keepalive_interval_sec, abort_check);
 }

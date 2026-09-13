@@ -1,5 +1,6 @@
 #include "test_client_cli.h"
 #include "checksum.h"
+#include "client_send.h"
 #include "client_validation.h"
 #include "chmod.h"
 #include "config.h"
@@ -577,6 +578,80 @@ static void test_parse_args_invalid_server_port() {
   EXPECT_EQ_INT(ret, -1);
 
   config_delete(cfg);
+}
+
+/* --port is a documented rsync-style alias for --server-port; both the
+ * two-argument and the inline "=" spellings must work. */
+static void test_parse_args_port_alias() {
+  Config* cfg = config_create();
+  char* argv_space[] = {"fastsync", "--port", "9000", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->server_port, 9000);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_inline[] = {"fastsync", "--port=9001", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->server_port, 9001);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_long[] = {"fastsync", "--server-port=9002", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->server_port, 9002);
+  config_delete(cfg);
+}
+
+/* --threads=N sizes the pipeline scanner; bare -j/--threads keeps the default
+ * (scanner_threads == 0), and invalid values are rejected. */
+static void test_parse_args_threads() {
+  Config* cfg = config_create();
+  char* argv_eq[] = {"fastsync", "--threads=8", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_eq, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_multithreading);
+  EXPECT_EQ_INT(cfg->scanner_threads, 8);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_short[] = {"fastsync", "-j", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_short, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_multithreading);
+  EXPECT_EQ_INT(cfg->scanner_threads, 0);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_long[] = {"fastsync", "--threads", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_multithreading);
+  EXPECT_EQ_INT(cfg->scanner_threads, 0);
+  config_delete(cfg);
+
+  const char* bad[] = {"--threads=0", "--threads=-3", "--threads=abc", "--threads=257"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    cfg = config_create();
+    char* argv_bad[] = {"fastsync", (char*)bad[i], "/src", "/dst"};
+    positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv_bad, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
+/* The graceful-abort flag is a plain sig_atomic_t toggled by the handler. */
+static void test_client_abort_flag() {
+  client_abort_requested = 0;
+  EXPECT_FALSE(client_abort_pending());
+  client_abort_requested = 1;
+  EXPECT_TRUE(client_abort_pending());
+  client_abort_requested = 0;
+  EXPECT_FALSE(client_abort_pending());
 }
 
 /* Test parse_args rejects invalid compression level (-z/--compress) */
@@ -3224,6 +3299,9 @@ void test_client_cli() {
   test_parse_args_invalid_port();
   test_parse_args_non_numeric_port();
   test_parse_args_invalid_server_port();
+  test_parse_args_port_alias();
+  test_parse_args_threads();
+  test_client_abort_flag();
   test_parse_args_invalid_compression_level();
   test_parse_args_valid_compression_level();
   test_parse_args_debug_flags();

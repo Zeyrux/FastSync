@@ -885,6 +885,10 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
    unlinks) before replying, so the wait uses a generous explicit deadline
    instead of the default 60 s receive window. */
 #define DELETE_ACK_TIMEOUT_SEC 3600
+/* While waiting for the (potentially slow) receiver-side deletion, send a
+ * STATUS_KEEPALIVE at most this often so the connection is demonstrably alive
+ * and neither side's per-message timeout trips. */
+#define DELETE_ACK_KEEPALIVE_SEC 10
 
 static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
                                        ArrayList* protected_prefixes, ArrayList* missing_args) {
@@ -894,8 +898,21 @@ static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
       0)
     return false;
   Status ack;
-  if (!receive_status_timed(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC))
+  /* The wait is long (up to an hour) and runs inline on this thread: a helper
+   * thread would race the non-thread-safe protocol send path, so keepalives are
+   * emitted from this wait loop itself.  A Ctrl-C/SIGTERM abort flag also ends
+   * the wait; the caller then best-effort sends STATUS_ABORT. */
+  if (!receive_status_keepalive(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC,
+                                DELETE_ACK_KEEPALIVE_SEC, client_abort_pending)) {
+    /* A Ctrl-C/SIGTERM abort ends the wait above; tell the receiver before the
+       caller tears the connection down (best-effort). */
+    if (client_abort_pending()) {
+      log_info_message(LOG_INFO_MISC,
+                       "Abort requested while awaiting delete ack; sending STATUS_ABORT");
+      send_status(client->file_descriptor, STATUS_ABORT);
+    }
     return false;
+  }
   if (ack != STATUS_OK) {
     log_message(LOG_LEVEL_ERROR, "Server failed to delete files before the transfer");
     return false;
@@ -1490,6 +1507,19 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   }
 
   while (true) {
+    /* Graceful abort (Ctrl-C/SIGTERM): tell the receiver to clean up instead of
+       dying abruptly.  Best-effort: a failed send just means the peer is gone.
+       Only reached while the session is active (config_send already succeeded). */
+    if (client_abort_pending()) {
+      log_info_message(LOG_INFO_MISC,
+                       "Abort requested; sending STATUS_ABORT to server and disconnecting");
+      send_status(client->file_descriptor, STATUS_ABORT);
+      pipeline_cancel(context);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
+      return thrd_error;
+    }
     /* Phase 6: stop-elegantly at the next chunk boundary once the --stop-after
        / --stop-at deadline has passed.  Everything already sent is finalized by
        the completion tail below; the run still returns success. */
@@ -1624,7 +1654,9 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
   protocol_session_bind(&context->allocation_session);
   PreparedScanner prepared;
-  if (!prepare_scanner(context->config, 4, &prepared)) {
+  /* -j/--threads=N sizes the parallel scanner's worker pool; 0 (bare -j) lets
+   * the scanner apply its built-in default. */
+  if (!prepare_scanner(context->config, context->config->scanner_threads, &prepared)) {
     pipeline_cancel(context);
     protocol_session_unbind();
     return thrd_error;
@@ -2036,6 +2068,15 @@ int send_files(Config* config) {
      only a prefix of the source. */
   bool scan_stopped_early = false;
   while ((current_chunk = directory_scanner_next(scanner)) != NULL) {
+    /* Graceful abort (Ctrl-C/SIGTERM): notify the receiver and clean up.  The
+       session is active (config_send already succeeded); a send failure here is
+       fine because the client is exiting anyway. */
+    if (client_abort_pending()) {
+      log_info_message(LOG_INFO_MISC, "Abort requested; sending STATUS_ABORT to server");
+      chunk_destroy(current_chunk);
+      send_status(client->file_descriptor, STATUS_ABORT);
+      goto send_fail;
+    }
     /* Phase 6: stop-elegantly at the next chunk boundary once the deadline has
        passed.  The scanner may also have stopped early itself; either way the
        completion tail below keeps everything already sent. */
@@ -2099,6 +2140,13 @@ int send_files(Config* config) {
     goto send_fail;
   if (directory_scanner_had_io_error(scanner))
     had_scan_io = true;
+  /* An abort that arrived after the last chunk must still stop the completion
+     tail (manifest/finalize) rather than let it run to success. */
+  if (client_abort_pending()) {
+    log_info_message(LOG_INFO_MISC, "Abort requested; sending STATUS_ABORT to server");
+    send_status(client->file_descriptor, STATUS_ABORT);
+    goto send_fail;
+  }
   /* Phase 6: the scanner may have stopped early (returning NULL without a
      failure) as soon as the deadline passed, so reflect that here too.  A
      deadline that cut the scan short leaves an incomplete keep-set; transmitting
@@ -2276,7 +2324,7 @@ int send_files_multithreaded(Config** config_ptr) {
          fills the protected excluded prefixes. */
       PreparedScanner prepared;
       memset(&prepared, 0, sizeof(prepared));
-      bool prepared_ok = prepare_scanner(config, 4, &prepared);
+      bool prepared_ok = prepare_scanner(config, config->scanner_threads, &prepared);
       if (prepared_ok && context->excluded_paths)
         prepared.options.excluded_paths = context->excluded_paths;
       bool prebuilt = prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,

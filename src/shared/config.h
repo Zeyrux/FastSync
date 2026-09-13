@@ -81,6 +81,11 @@ typedef struct Config {
   char* receive_root_directory;
   bool save_to_disk;
   bool use_multithreading;
+  /* -j/--threads=N: number of parallel scanner worker threads for the -m
+   * pipeline.  0 (the default, also set by bare -j/--threads) means "use the
+   * scanner's built-in default" (4).  CLIENT-ONLY: it is a local scheduling
+   * concern and is NEVER serialized into the wire config frame. */
+  int scanner_threads;
   bool use_chunk_serialization;
   bool use_compression;
   bool use_sendfile;
@@ -170,7 +175,6 @@ typedef struct Config {
   bool stats;
   int max_depth;
   FILE* log_file;
-  int queue_size;
   bool follow_symlinks;
   bool partial;
 
@@ -348,21 +352,17 @@ typedef struct Config {
 
   // PR #181: IPv6 and bind address
   char* address;
-  char* bind_address;
   bool ipv6;
   bool ipv4;
   /* --sockopts=OPTIONS (Phase 5, Wave B): strict allowlist of TCP/socket
    * options applied via setsockopt after socket() and before connect()/bind().
    * These are LOCAL socket concerns: they never cross the wire config frame.
-   * .address is the outgoing/source bind address (--address); .bind_address is
-   * reserved for daemon-side binding and is not wired yet. */
+   * .address is the outgoing/source bind address (--address). */
   SockOptEntry* sockopts;
   int sockopt_count;
 
   // PR #182: Daemon/server mode
   bool daemon;
-  char* daemon_config;
-  bool server_mode;
   /* --no-motd (Wave C): CLIENT-ONLY, never crosses the wire.  Suppresses
    * DISPLAY of the daemon's MOTD; the daemon still sends the MOTD frame, so
    * the client reads and discards it to keep the stream in sync.  rsync's
