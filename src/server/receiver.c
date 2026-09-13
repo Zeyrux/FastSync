@@ -479,8 +479,12 @@ static bool receiver_save_file(File* file, void* context_pointer) {
     file_destroy(file);
     return false;
   }
-  if (result != FILE_SAVE_ERROR && context->config->remove_source_files && !file->is_dir &&
-      !file->is_special && !file->skip &&
+  /* A dry-run receiver mutates nothing AND records no per-file outcomes: a
+     hostile dry-run client that streamed data frames anyway must not be able to
+     grow `outcomes` without bound (receiver_outcomes_append reallocs uncharged)
+     or force a per-frame ack. */
+  if (!context->config->dry_run && result != FILE_SAVE_ERROR &&
+      context->config->remove_source_files && !file->is_dir && !file->is_special && !file->skip &&
       !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
     file_destroy(file);
     return false;
