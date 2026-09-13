@@ -673,10 +673,14 @@ void handler(int file_descriptor) {
         cnd_broadcast(&context->condition_not_full);
         cnd_broadcast(&context->condition_not_empty);
         mtx_unlock(&context->mutex);
-        /* Unblock a worker parked in socket I/O without closing the fd: the
-         * child owns the single close.  shutdown() makes the pending I/O fail
-         * so thrd_join cannot hang waiting for a thread that never returns. */
-        shutdown(file_descriptor, SHUT_RDWR);
+        /* Unblock a worker parked in socket I/O without closing the fd (the
+         * child owns the single close).  shutdown() only affects sockets; for
+         * the --stdio pipe the receiver's per-message poll timeout still
+         * bounds the join, so do nothing there rather than close a descriptor
+         * another thread may still be using. */
+        struct stat fd_stat;
+        if (fstat(file_descriptor, &fd_stat) == 0 && S_ISSOCK(fd_stat.st_mode))
+          shutdown(file_descriptor, SHUT_RDWR);
         thrd_join(receiver, NULL);
       }
       if (writer_created)
@@ -725,11 +729,8 @@ void handler(int file_descriptor) {
     } else {
       send_status(file_descriptor, STATUS_ERROR);
     }
-    if (!transfer_ok) {
+    if (!transfer_ok)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
-      if (config->delay_updates && config->delay_context)
-        delay_updates_cleanup(config->delay_context);
-    }
   } else {
     if (receiver_receive_files(config, file_descriptor) != 0)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
@@ -744,8 +745,8 @@ done:
    * site must leave stdin/stdout open. */
   if (charset_ready)
     charset_wire_free();
-  if (config && config->delay_context)
-    delay_updates_cleanup(config->delay_context);
+  /* The delay-updates staging tree is released by config_delete (which the
+     branch below always reaches), so it is cleaned exactly once. */
   identity_clear_active();
   protocol_session_unbind();
   if (context != NULL) {

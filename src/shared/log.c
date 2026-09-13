@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <time.h>
@@ -76,13 +77,48 @@ LogStderrMode log_get_stderr_mode(void) {
   return stderr_mode;
 }
 
-static inline void write_message(FILE* dest_io, LogLevel log_level, struct tm t, const char* format,
-                                 va_list args) {
-  fprintf(dest_io, "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t.tm_year + 1900, t.tm_mon + 1,
-          t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, log_level_strings[log_level]);
+/* Format one complete log line (timestamp prefix + body + newline) into a
+ * freshly allocated buffer.  This is pure CPU/malloc work and must happen
+ * OUTSIDE the log mutex: the mutex only guards the log_fp pointer, so a
+ * stalled stderr/stdout pipe cannot block every logging thread.  Returns NULL
+ * on allocation/formatting failure. */
+static char* format_log_line(LogLevel log_level, const struct tm* t, const char* format,
+                             va_list args) {
+  char prefix[64];
+  int prefix_len = snprintf(
+      prefix, sizeof(prefix), "%04d-%02d-%02d %02d:%02d:%02d [%s]: ", t->tm_year + 1900,
+      t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, log_level_strings[log_level]);
+  if (prefix_len < 0 || prefix_len >= (int)sizeof(prefix))
+    return NULL;
+  va_list copy;
+  va_copy(copy, args);
+  int body_len = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  if (body_len < 0)
+    return NULL;
+  size_t total = (size_t)prefix_len + (size_t)body_len;
+  char* line = malloc(total + 2); /* body bytes + '\n' + NUL */
+  if (!line)
+    return NULL;
+  memcpy(line, prefix, (size_t)prefix_len);
+  vsnprintf(line + prefix_len, (size_t)body_len + 1, format, args);
+  line[total] = '\n';
+  line[total + 1] = '\0';
+  return line;
+}
 
-  vfprintf(dest_io, format, args);
-  fprintf(dest_io, "\n");
+/* Write an already-formatted line to the console and, if configured, the log
+ * file.  Only the log_fp pointer is read under the mutex (so log_set_file /
+ * config_delete cannot free it while it is in use); the single console fputs
+ * runs unlocked but is internally atomic per stdio stream. */
+static void emit_log_line(FILE* console, const char* line) {
+  fputs(line, console);
+  call_once(&log_mutex_once, log_mutex_init);
+  mtx_lock(&log_mutex);
+  FILE* file = log_fp;
+  if (file)
+    fputs(line, file);
+  mtx_unlock(&log_mutex);
 }
 
 void log_message(LogLevel log_level, const char* format, ...) {
@@ -95,9 +131,6 @@ void log_message(LogLevel log_level, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
-  call_once(&log_mutex_once, log_mutex_init);
-  mtx_lock(&log_mutex);
-
   FILE* dest_io = stdout;
   if (stderr_mode == LOG_STDERR_ALL || log_level == LOG_LEVEL_ERROR) {
     dest_io = stderr;
@@ -105,16 +138,12 @@ void log_message(LogLevel log_level, const char* format, ...) {
 
   va_list args;
   va_start(args, format);
-  write_message(dest_io, log_level, t, format, args);
+  char* line = format_log_line(log_level, &t, format, args);
   va_end(args);
-
-  if (log_fp) {
-    va_start(args, format);
-    write_message(log_fp, log_level, t, format, args);
-    va_end(args);
-  }
-
-  mtx_unlock(&log_mutex);
+  if (!line)
+    return;
+  emit_log_line(dest_io, line);
+  free(line);
 }
 
 void log_debug_message(LogDebugFlag flag, const char* format, ...) {
@@ -126,21 +155,14 @@ void log_debug_message(LogDebugFlag flag, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
-  call_once(&log_mutex_once, log_mutex_init);
-  mtx_lock(&log_mutex);
-
   va_list args;
   va_start(args, format);
-  write_message(stdout, LOG_LEVEL_DEBUG, t, format, args);
+  char* line = format_log_line(LOG_LEVEL_DEBUG, &t, format, args);
   va_end(args);
-
-  if (log_fp) {
-    va_start(args, format);
-    write_message(log_fp, LOG_LEVEL_DEBUG, t, format, args);
-    va_end(args);
-  }
-
-  mtx_unlock(&log_mutex);
+  if (!line)
+    return;
+  emit_log_line(stdout, line);
+  free(line);
 }
 
 void log_info_message(LogInfoFlag flag, const char* format, ...) {
@@ -153,21 +175,14 @@ void log_info_message(LogInfoFlag flag, const char* format, ...) {
   if (!localtime_r(&now, &t))
     return;
 
-  call_once(&log_mutex_once, log_mutex_init);
-  mtx_lock(&log_mutex);
-
   va_list args;
   va_start(args, format);
-  write_message(stdout, LOG_LEVEL_INFO, t, format, args);
+  char* line = format_log_line(LOG_LEVEL_INFO, &t, format, args);
   va_end(args);
-
-  if (log_fp) {
-    va_start(args, format);
-    write_message(log_fp, LOG_LEVEL_INFO, t, format, args);
-    va_end(args);
-  }
-
-  mtx_unlock(&log_mutex);
+  if (!line)
+    return;
+  emit_log_line(stdout, line);
+  free(line);
 }
 
 void log_perror(const char* context) {
