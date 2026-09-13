@@ -1376,9 +1376,11 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       return true;
     }
     if (config->log_file) {
+      /* Detach the logger before closing: log I/O may be in flight and must
+         never touch a freed FILE*. */
+      log_set_file(NULL);
       fclose(config->log_file);
       config->log_file = NULL;
-      log_set_file(NULL);
     }
     FILE* lf = fopen(ctx->argv[++ctx->i], "a");
     if (!lf) {

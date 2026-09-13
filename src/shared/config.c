@@ -693,6 +693,9 @@ void config_delete(Config* config) {
   if (config == NULL)
     return;
   if (config->log_file) {
+    /* The logging subsystem borrows this FILE*; detach it before closing so a
+     * concurrent log call can never touch the freed handle. */
+    log_set_file(NULL);
     fclose(config->log_file);
     config->log_file = NULL;
   }
@@ -1428,8 +1431,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
     goto error;
   if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
     char* escaped_version = output_escape(config->version, false);
-    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n",
-            escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    log_message(LOG_LEVEL_ERROR, "Protocol version mismatch: client=%s, server=%s",
+                escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
     free(escaped_version);
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
@@ -1455,14 +1458,14 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {
     char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
-    fprintf(stderr, "Unsupported compression choice: %s\n",
-            escaped_choice ? escaped_choice : "<allocation failed>");
+    log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
+                escaped_choice ? escaped_choice : "<allocation failed>");
     free(escaped_choice);
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
   if (!validate_received_config(config)) {
-    fprintf(stderr, "Invalid configuration received from client\n");
+    log_message(LOG_LEVEL_ERROR, "Invalid configuration received from client");
     send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
@@ -1476,7 +1479,7 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
        * the CONFIG_VALIDATE_ALREADY_TERMINATED sentinel, so no second status is
        * written. */
       if (rejection != CONFIG_VALIDATE_ALREADY_TERMINATED) {
-        fprintf(stderr, "%s\n", rejection);
+        log_message(LOG_LEVEL_ERROR, "%s", rejection);
         send_status(file_descriptor, STATUS_ERROR);
       }
       goto error;

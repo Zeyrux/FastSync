@@ -192,13 +192,18 @@ static void tls_child_fn(int fd, void* arg) {
   SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true, NULL);
   if (!ssl) {
     io_set_ssl(NULL);
+    close(fd);
     return;
   }
   io_set_ssl(ssl);
   ctx->handler(fd);
+  /* Shut the TLS layer down before releasing the fd: handler() no longer
+   * closes it, so SSL_shutdown still has a valid socket.  The child owns the
+   * single fd close, performed last. */
   SSL_shutdown(ssl);
   SSL_free(ssl);
   io_set_ssl(NULL);
+  close(fd);
 }
 
 bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {

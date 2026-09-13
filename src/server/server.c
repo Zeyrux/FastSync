@@ -23,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <openssl/x509.h>
 
@@ -502,12 +503,16 @@ void handler(int file_descriptor) {
   gate_ctx.ssl = ssl;
   gate_ctx.fd = file_descriptor;
   gate_ctx.super_mode_override = -1;
-  Config* config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
+  /* All teardown state starts empty so the single `done` epilogue is safe to
+   * reach from any error path (including before the config frame arrives). */
+  Config* config = NULL;
+  PipelineContextReceiver* context = NULL;
+  char* joined_destination = NULL;
+  bool charset_ready = false;
+  config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   /* Apply the super-mode veto the gate decided on (operator --no-super, or a
    * daemon module without the `client owner = yes` opt-in) exactly once, so
@@ -519,23 +524,15 @@ void handler(int file_descriptor) {
   protocol_set_8_bit_output(config->eight_bit_output);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   if (!allow_unauthenticated && ssl == NULL) {
     log_message(LOG_LEVEL_ERROR, "Rejected unauthenticated plaintext connection");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   if (ssl && required_client_cn && !tls_client_identity_allowed(ssl)) {
     log_message(LOG_LEVEL_ERROR, "Rejected TLS client with unauthorized identity");
-    config_delete(config);
-    close(file_descriptor);
-    return;
+    goto done;
   }
   /* Daemon mode: the module's root is the authorized root (installed by
      server_module_gate), and the client's destination is a MODULE-RELATIVE
@@ -545,13 +542,9 @@ void handler(int file_descriptor) {
   if (g_daemon_conf && config->receive_root_directory && config->receive_root_directory[0] == '/') {
     log_message(LOG_LEVEL_ERROR, "Rejected absolute daemon destination (must be relative to the "
                                  "selected module root)");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   char* destination = config->receive_root_directory;
-  char* joined_destination = NULL;
   if (destination && destination[0] != '/')
     joined_destination = path_cat(authorized_root, destination);
   if (joined_destination)
@@ -560,19 +553,16 @@ void handler(int file_descriptor) {
       !path_is_within(authorized_root, destination)) {
     log_message(LOG_LEVEL_ERROR, "Rejected destination outside authorized root");
     free(joined_destination);
-    config_delete(config);
-    close(file_descriptor);
-    return;
+    joined_destination = NULL;
+    goto done;
   }
   if (joined_destination) {
     free(config->receive_root_directory);
     config->receive_root_directory = joined_destination;
+    joined_destination = NULL;
   }
   if (!config->receive_root_directory) {
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   config->use_delete = config->use_delete && allow_delete;
   /* --iconv (protocol 2.16.0): install the receiver-side wire->local conversion
@@ -581,13 +571,13 @@ void handler(int file_descriptor) {
      any) may override the local charset; a spec the client is known to have
      validated cannot fail here unless the server's override names an
      unsupported charset. */
-  if (config->iconv_spec && !charset_wire_init_receiver(config->iconv_spec, server_iconv_spec)) {
-    log_message(LOG_LEVEL_ERROR,
-                "--iconv: unsupported charset conversion requested (LOCAL[,REMOTE])");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+  if (config->iconv_spec) {
+    if (!charset_wire_init_receiver(config->iconv_spec, server_iconv_spec)) {
+      log_message(LOG_LEVEL_ERROR,
+                  "--iconv: unsupported charset conversion requested (LOCAL[,REMOTE])");
+      goto done;
+    }
+    charset_ready = true;
   }
   /* --delete-missing-args deletes destination mirrors receiver-side, so it is
      deletion and stays gated by the same --allow-delete server policy.  When
@@ -602,10 +592,7 @@ void handler(int file_descriptor) {
     log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
                 escaped_root ? escaped_root : "<allocation failed>");
     free(escaped_root);
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   /* A --delay-updates transfer stages under a private 0700 directory inside
      the receive root.  Create it up front (wiping leftovers of any previously
@@ -614,11 +601,7 @@ void handler(int file_descriptor) {
     config->delay_context = delay_updates_context_create(config->receive_root_directory);
     if (!config->delay_context || !delay_updates_prepare(config->delay_context)) {
       log_message(LOG_LEVEL_ERROR, "Failed to initialize --delay-updates staging area");
-      delay_updates_cleanup(config->delay_context);
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      return;
+      goto done;
     }
   }
   /* Preserve the negotiated identity policy for the fd-relative ownership
@@ -628,10 +611,7 @@ void handler(int file_descriptor) {
      rather than silently applying the wrong ownership policy. */
   if (!identity_set_active(config)) {
     log_message(LOG_LEVEL_ERROR, "Failed to activate identity policy");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   /* Persist the negotiated --keep-dirlinks policy once, here at config-accept,
      before any multithreaded receiver/writer threads are spawned, so the
@@ -662,38 +642,25 @@ void handler(int file_descriptor) {
     if (!motd_send(file_descriptor, motd ? motd : "")) {
       free(motd);
       log_message(LOG_LEVEL_ERROR, "Failed to send daemon MOTD");
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
+      goto done;
     }
     free(motd);
   }
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
-    if (q == NULL) {
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
-    }
-    PipelineContextReceiver* context =
-        pipeline_context_receiver_create(config, q, file_descriptor, ssl);
+    if (q == NULL)
+      goto done;
+    context = pipeline_context_receiver_create(config, q, file_descriptor, ssl);
     if (context == NULL) {
       queue_destroy(q);
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
+      goto done;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
     pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);
-    thrd_t receiver, writer;
+    thrd_t receiver = {0};
+    thrd_t writer = {0};
     bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
     bool writer_created = false;
     if (receiver_created)
@@ -706,17 +673,19 @@ void handler(int file_descriptor) {
         cnd_broadcast(&context->condition_not_full);
         cnd_broadcast(&context->condition_not_empty);
         mtx_unlock(&context->mutex);
-        close(file_descriptor);
+        /* Unblock a worker parked in socket I/O without closing the fd (the
+         * child owns the single close).  shutdown() only affects sockets; for
+         * the --stdio pipe the receiver's per-message poll timeout still
+         * bounds the join, so do nothing there rather than close a descriptor
+         * another thread may still be using. */
+        struct stat fd_stat;
+        if (fstat(file_descriptor, &fd_stat) == 0 && S_ISSOCK(fd_stat.st_mode))
+          shutdown(file_descriptor, SHUT_RDWR);
         thrd_join(receiver, NULL);
-      } else {
-        close(file_descriptor);
       }
       if (writer_created)
         thrd_join(writer, NULL);
-      pipeline_context_receiver_destroy(context);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
+      goto done;
     }
     int receiver_result;
     int writer_result;
@@ -760,21 +729,36 @@ void handler(int file_descriptor) {
     } else {
       send_status(file_descriptor, STATUS_ERROR);
     }
-    if (!transfer_ok) {
+    if (!transfer_ok)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
-      if (config->delay_updates && config->delay_context)
-        delay_updates_cleanup(config->delay_context);
-    }
-    pipeline_context_receiver_destroy(context);
   } else {
     if (receiver_receive_files(config, file_descriptor) != 0)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
-    config_delete(config);
   }
-  protocol_session_unbind();
+
+done:
+  /* Single cleanup epilogue: every error path jumps here, so the iconv
+   * receiver conversion is released, the identity snapshot cleared, the
+   * protocol session unbound and the config freed exactly once.  The
+   * connection fd is deliberately NOT closed here -- the child functions own
+   * its single close (plain_child_fn / tls_child_fn), and the --stdio call
+   * site must leave stdin/stdout open. */
+  if (charset_ready)
+    charset_wire_free();
+  /* The delay-updates staging tree is released by config_delete (which the
+     branch below always reaches), so it is cleaned exactly once. */
   identity_clear_active();
-  charset_wire_free();
-  close(file_descriptor);
+  protocol_session_unbind();
+  if (context != NULL) {
+    /* context owns both the config and the queue it was created with. */
+    pipeline_context_receiver_destroy(context);
+    context = NULL;
+    config = NULL;
+  } else {
+    config_delete(config);
+    config = NULL;
+  }
+  free(joined_destination);
 }
 
 #ifndef FASTSYNC_SERVER_AS_LIB
@@ -969,6 +953,9 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
+    /* handler() does not own the stdio fds: it never closes its descriptor
+     * argument, so STDIN/STDOUT stay open for this (single-shot) SSH session
+     * and are released by process exit. */
     handler(STDIN_FILENO);
     release_authorization();
     server_cli_options_free(&opts);

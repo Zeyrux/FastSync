@@ -152,9 +152,18 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     log_message(LOG_LEVEL_INFO, "%s", log_fmt);
     pid_t pid = fork();
     if (pid == 0) {
+      /* Connection children must not run the parent's global cleanup(): it
+       * frees state (credentials / daemon conf) that the child's worker
+       * threads may still be reading and closes fd numbers the child could
+       * already have reused.  Reset the inherited handlers so a signal
+       * terminates the child directly; SIGCHLD is reset too since a child
+       * must never reap the parent's children.  This runs before the child
+       * spawns any thread, so it cannot race one. */
+      signal(SIGINT, SIG_DFL);
+      signal(SIGTERM, SIG_DFL);
+      signal(SIGCHLD, SIG_DFL);
       close(server->file_descriptor);
       child_fn(fd, child_ctx);
-      close(fd);
       _exit(0);
     } else if (pid > 0) {
       g_active_connections++;
@@ -169,6 +178,9 @@ struct plain_ctx {
 
 static void plain_child_fn(int fd, void* ctx) {
   ((struct plain_ctx*)ctx)->handler(fd);
+  /* handler() never closes the connection fd; the child owns its single
+   * close here after the handler has fully torn down. */
+  close(fd);
 }
 
 bool server_listen(Server* server, void (*handler)(int file_descriptor)) {
