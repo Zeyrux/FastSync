@@ -6,6 +6,21 @@ run the same version because the handshake is strict.
 
 ## [Unreleased]
 
+### Added
+
+- **Server-contacting `--dry-run` (protocol 2.21.0).** `--dry-run` now performs
+  a real handshake with a remote/daemon receiver and reports exactly what WOULD
+  change based on receiver state (existing destination files, mtimes, checksums,
+  basis dirs). The wire config carries the dry-run intent (`Config.dry_run`) and
+  the receiver answers each per-file check with `STATUS_DRY_RUN_TRANSFER` (would
+  transfer) or `STATUS_OK` (already up to date); the sender prints the
+  would-transfer set and its trailer without sending any file data. The receiver
+  performs the normal read-only incremental decision but mutates nothing: no temp
+  files, writes, renames, deletes, metadata/xattr/chown, or directory creation.
+  A plain local destination (no explicit `--server-port`/remote) keeps the
+  original client-side dry-run. Would-delete reporting for `--delete*` is
+  deferred to a follow-up; dry-run never deletes.
+
 ### Security
 
 - Enforce the daemon's per-module `max connections` cap and add a global
@@ -22,6 +37,26 @@ run the same version because the handshake is strict.
   per-host cap and the auth lockout (they share one address); clients behind a
   shared NAT/proxy still share a single per-host budget and lockout, which is
   documented.
+
+## [2.21.0] - 2026-09-13
+
+### Added
+
+- Optional server→client rejection detail (protocol 2.21.0). A rejected
+  operation may now carry a bounded human-readable reason via
+  `STATUS_ERROR_DETAIL` instead of a bare `STATUS_ERROR`, so the client can
+  report *why* the server refused (daemon module gate, config validation,
+  receiver-side path/node validation). `receive_status()` transparently maps the
+  new status back to `STATUS_ERROR` for every existing call site and captures
+  the reason into a thread-local buffer exposed by `protocol_last_error()`. The
+  detail body is always consumed, so the stream cannot desynchronize, and
+  messages are sliced to `MAX_ERROR_DETAIL_BYTES` (4096) on send.
+
+### Changed
+
+- `receive_incremental_check()` (the per-file `STATUS_CHECK` fast path) is split
+  into small static helpers with a short linear orchestrator. Pure refactor: the
+  wire byte stream and all cleanup are unchanged.
 
 ## [2.20.0] - 2026-09-13
 

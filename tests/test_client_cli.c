@@ -306,7 +306,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.20.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.21.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -316,7 +316,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.20.0"};
+                        "/dst",     "--protocol",   "2.21.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -326,8 +326,9 @@ static void test_parse_args_protocol_accept_current() {
 /* Any --protocol value other than the current PROTOCOL_VERSION must end in
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
-  static const char* const bad_versions[] = {
-      "2.17", "2.16", "2.15.0", "2.16.0", "2.17.0", "2.18.0", "2.19.0", "216", "31", "abc", ""};
+  static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0",
+                                             "2.17.0", "2.18.0", "2.19.0", "2.20.0",
+                                             "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -589,6 +590,9 @@ static void test_parse_args_port_alias() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9000);
+  /* The default port is 8080; the explicit bit is what lets --dry-run tell an
+     explicit remote target from the default and route to the server. */
+  EXPECT_TRUE(cfg->server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -596,6 +600,7 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9001);
+  EXPECT_TRUE(cfg->server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -603,6 +608,29 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9002);
+  EXPECT_TRUE(cfg->server_port_set);
+  config_delete(cfg);
+}
+
+/* An explicit --server-host must set its own routing bit (the field itself
+ * defaults to 127.0.0.1, so a value check cannot distinguish an explicit host
+ * from the default); --dry-run uses it to route to the server. */
+static void test_parse_args_server_host_sets_routing_bit() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_FALSE(cfg->server_host_set);
+  char* argv_space[] = {"fastsync", "--server-host", "example.test", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->server_host, "example.test");
+  EXPECT_TRUE(cfg->server_host_set);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv_inline[] = {"fastsync", "--server-host=example.test", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->server_host_set);
   config_delete(cfg);
 }
 
@@ -3300,6 +3328,7 @@ void test_client_cli() {
   test_parse_args_non_numeric_port();
   test_parse_args_invalid_server_port();
   test_parse_args_port_alias();
+  test_parse_args_server_host_sets_routing_bit();
   test_parse_args_threads();
   test_client_abort_flag();
   test_parse_args_invalid_compression_level();

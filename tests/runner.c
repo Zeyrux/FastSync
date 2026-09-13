@@ -25,6 +25,7 @@
 #include "test_multiprocessing.h"
 #include "test_property.h"
 #include "test_protocol.h"
+#include "test_protocol_error.h"
 #include "test_queue.h"
 #include "test_receiver_timeout.h"
 #include "test_robustness.h"
@@ -65,6 +66,7 @@ int main() {
   RUN_TEST(test_delta);
   RUN_TEST(test_data);
   RUN_TEST(test_protocol);
+  RUN_TEST(test_protocol_error);
   RUN_TEST(test_receiver_timeout);
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);

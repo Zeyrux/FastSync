@@ -370,6 +370,353 @@ class TestDryRun:
         assert not mismatches, f"Mismatch: {mismatches}"
 
 
+def _snapshot_xattrs(path):
+    """Return a stable, comparable tuple of (name, value) xattr pairs.
+
+    Returns None when the platform/filesystem does not expose xattrs so both
+    snapshots agree on "unavailable" instead of one being treated as changed."""
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except (AttributeError, OSError):
+        return None
+    if not names:
+        return ()
+    pairs = []
+    for name in sorted(names):
+        try:
+            value = os.getxattr(path, name, follow_symlinks=False)
+        except OSError:
+            value = None
+        pairs.append((name, value))
+    return tuple(pairs)
+
+
+def _snapshot_tree(root):
+    """Return a structural snapshot of a directory tree.
+
+    Every entry (including directories) is recorded as
+    (inode, mtime_ns, mode, xattrs, kind-specific payload) so a dry-run that
+    touched a mode, inode, mtime, xattr, or content is observable.  Regular
+    files carry their size+bytes, symlinks their target, and special entries
+    (FIFO/socket/device) their size only -- opening a special file could block.
+    Returns an empty dict for a missing root so "nothing was created" is also
+    observable."""
+    snapshot = {}
+    if not os.path.exists(root):
+        return snapshot
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in list(dirnames) + filenames:
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            st = os.lstat(path)
+            entry = [st.st_ino, st.st_mtime_ns, stat.S_IMODE(st.st_mode), _snapshot_xattrs(path)]
+            if stat.S_ISLNK(st.st_mode):
+                entry.append(("symlink", os.readlink(path)))
+            elif stat.S_ISREG(st.st_mode):
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                entry += [st.st_size, data]
+            else:
+                entry.append(st.st_size)
+            snapshot[rel] = tuple(entry)
+    return snapshot
+
+
+class TestRemoteDryRun:
+    """Server-contacting --dry-run (protocol 2.21.0): contacts the receiver,
+    reports what WOULD transfer/skip based on receiver state, and mutates
+    nothing on either side."""
+
+    def _seed(self, source):
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "nested"), exist_ok=True)
+        with open(os.path.join(source, "keep.txt"), "wb") as f:
+            f.write(b"unchanged content\n")
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"original content\n")
+        with open(os.path.join(source, "nested", "deep.txt"), "wb") as f:
+            f.write(b"deep file\n")
+
+    @pytest.mark.ci
+    def test_remote_dry_run_reports_changes_and_mutates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_dst")
+        self._seed(source)
+        clean_dir(dest)
+
+        # Populate the destination with a real transfer, then make exactly one
+        # file differ (content+size) and add a brand-new file.
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, f"seed transfer failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"a much longer replacement payload\n")
+        with open(os.path.join(source, "added.txt"), "wb") as f:
+            f.write(b"newly added\n")
+
+        before = _snapshot_tree(received)
+        # --checksum makes the up-to-date decision content-based (the seed
+        # transfer did not preserve mtimes), so keep.txt/deep.txt report skip.
+        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"remote dry-run failed: {result.stderr[:300]}"
+        assert "Dry run:" in result.stdout, result.stdout[:200]
+        assert "changed.txt" in result.stdout, result.stdout
+        assert "added.txt" in result.stdout, result.stdout
+        assert "keep.txt" not in result.stdout, (
+            f"up-to-date file must not be reported as would-transfer: {result.stdout}"
+        )
+        assert "deep.txt" not in result.stdout, result.stdout
+        assert _snapshot_tree(received) == before, "remote dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_into_empty_dest_creates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_empty_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_empty_dst")
+        self._seed(source)
+        clean_dir(dest)
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(received)
+
+        result, _ = run_client(source, dest, flags=["--dry-run"], port=shared_server.port)
+        assert result.returncode == 0, f"exit {result.returncode}: {result.stderr[:300]}"
+        assert "keep.txt" in result.stdout
+        assert "changed.txt" in result.stdout
+        assert "deep.txt" in result.stdout
+        # Nowhere may the receiver have created the destination mirror.
+        assert not os.path.exists(received), "dry-run created directories on the receiver"
+        assert _snapshot_tree(received) == {}
+
+    @pytest.mark.ci
+    def test_remote_dry_run_mkpath_does_not_create_root(self, shared_server):
+        """A wire dry_run cannot make --mkpath create anything, and it cannot
+        relax the precondition either: a nonexistent root is rejected (a real
+        run without the created root is impossible in dry-run) while nothing is
+        created."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_mk_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_mk_dst")
+        self._seed(source)
+        shutil.rmtree(dest, ignore_errors=True)
+        assert not os.path.exists(dest)
+
+        result, _ = run_client(source, dest, flags=["--dry-run", "--mkpath"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "dry-run --mkpath accepted a nonexistent receive root"
+        assert not os.path.exists(dest), "dry-run --mkpath created the destination root"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_with_delete_does_not_delete(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_del_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_del_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        extra = os.path.join(received, "extra.txt")
+        with open(extra, "wb") as f:
+            f.write(b"must survive a dry-run delete\n")
+        before = _snapshot_tree(received)
+
+        for flags in (["--dry-run", "--delete"], ["--dry-run", "--delete-after"]):
+            result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+            assert result.returncode == 0, f"{flags}: {result.stderr[:300]}"
+            assert os.path.exists(extra), f"{flags} deleted an extra in dry-run"
+            assert _snapshot_tree(received) == before, f"{flags} mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_quiet_is_silent(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_quiet_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_quiet_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["-q", "--dry-run"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert result.stdout == ""
+        assert result.stderr == ""
+
+    @pytest.mark.ci
+    def test_remote_dry_run_threaded_routes_to_server(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_mt_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_mt_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--dry-run", "--threads"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "changed.txt" in result.stdout
+        assert _snapshot_tree(get_dest_received_dir(dest, source)) == {}
+
+    @pytest.mark.ci
+    def test_normal_transfer_unaffected_by_dry_run(self, shared_server):
+        """A real transfer after dry-run still installs the changes."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_normal_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_normal_dst")
+        self._seed(source)
+        clean_dir(dest)
+        run_client(source, dest, port=shared_server.port)
+        received = get_dest_received_dir(dest, source)
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"updated payload for the real transfer\n")
+        run_client(source, dest, flags=["--dry-run"], port=shared_server.port)
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        with open(os.path.join(received, "changed.txt"), "rb") as f:
+            assert f.read() == b"updated payload for the real transfer\n"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_delay_updates_mutates_nothing(self, shared_server):
+        """--delay-updates stages under the receive root; a dry-run must neither
+        create that staging tree nor publish anything (mode/inode/mtime intact)."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_delay_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_delay_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--delay-updates"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"changed for delay-updates dry-run\n")
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest, flags=["--dry-run", "--delay-updates"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "changed.txt" in result.stdout, result.stdout
+        assert _snapshot_tree(dest) == before, "delay-updates dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_backup_mutates_nothing(self, shared_server):
+        """--backup would rename the old file aside; a dry-run must not."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_backup_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_backup_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"changed for backup dry-run\n")
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest, flags=["--dry-run", "--backup"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "changed.txt" in result.stdout, result.stdout
+        assert _snapshot_tree(dest) == before, "--backup dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_symlink_mutates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_symlink_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_symlink_dst")
+        self._seed(source)
+        os.symlink("changed.txt", os.path.join(source, "link"))
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["-a"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        assert os.path.islink(os.path.join(received, "link"))
+
+        # Re-point the source link so the entry is genuinely stale, then prove a
+        # dry-run leaves the destination link target, inode, and mtime untouched.
+        os.unlink(os.path.join(source, "link"))
+        os.symlink("keep.txt", os.path.join(source, "link"))
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest, flags=["-a", "--dry-run"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert _snapshot_tree(dest) == before, "symlink dry-run mutated the destination"
+        assert os.readlink(os.path.join(received, "link")) == "changed.txt"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_hardlink_mutates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_hardlink_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_hardlink_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "h1.txt"), "wb") as f:
+            f.write(b"hardlinked payload\n")
+        os.link(os.path.join(source, "h1.txt"), os.path.join(source, "h2.txt"))
+        result, _ = run_client(source, dest, flags=["-H"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        assert os.stat(os.path.join(received, "h1.txt")).st_ino == \
+            os.stat(os.path.join(received, "h2.txt")).st_ino
+
+        # Change the shared inode; both names are now stale in the destination.
+        with open(os.path.join(source, "h1.txt"), "wb") as f:
+            f.write(b"changed hardlinked payload\n")
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest, flags=["-H", "--dry-run"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert _snapshot_tree(dest) == before, "hardlink dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_fifo_special_mutates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_fifo_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_fifo_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "plain.txt"), "wb") as f:
+            f.write(b"plain\n")
+        os.mkfifo(os.path.join(source, "existing.fifo"))
+        result, _ = run_client(source, dest, flags=["--specials"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        assert stat.S_ISFIFO(os.lstat(os.path.join(received, "existing.fifo")).st_mode)
+
+        os.mkfifo(os.path.join(source, "new.fifo"))
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest, flags=["--specials", "--dry-run"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert not os.path.exists(os.path.join(received, "new.fifo")), \
+            "dry-run created a FIFO on the receiver"
+        assert _snapshot_tree(dest) == before, "special-node dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_read_batch_with_dry_run_is_refused(self, shared_server):
+        """A dry-run of a local batch apply is meaningless (and must not become a
+        mutation escape hatch): the CLI rejects the combination up front."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_batch_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_batch_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--read-batch=/nonexistent.batch", "--dry-run"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "read-batch + dry-run was accepted"
+        combined = (result.stderr or "") + (result.stdout or "")
+        assert "cannot be combined" in combined or "--dry-run" in combined, combined[:300]
+
+    @pytest.mark.ci
+    def test_remote_dry_run_bad_root_fails_like_real_run(self, shared_server):
+        """A wire dry_run must not relax the destination-root precondition: a
+        missing or non-directory root that fails a real run fails a dry-run too,
+        and the dry-run must not create/replace anything."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_badroot_src")
+        self._seed(source)
+
+        missing = os.path.join(TEST_DATA_DIR, "remote_dry_badroot_missing")
+        shutil.rmtree(missing, ignore_errors=True)
+        real, _ = run_client(source, missing, port=shared_server.port)
+        assert real.returncode != 0, "real run accepted a missing receive root"
+        assert not os.path.exists(missing), "real run created the missing root"
+        dry, _ = run_client(source, missing, flags=["--dry-run"], port=shared_server.port)
+        assert dry.returncode != 0, "dry-run accepted a missing receive root a real run rejects"
+        assert not os.path.exists(missing), "dry-run created the missing receive root"
+
+        fileroot = os.path.join(TEST_DATA_DIR, "remote_dry_badroot_file")
+        shutil.rmtree(fileroot, ignore_errors=True)
+        with open(fileroot, "wb") as f:
+            f.write(b"i am a regular file, not a directory\n")
+        real, _ = run_client(source, fileroot, port=shared_server.port)
+        assert real.returncode != 0, "real run accepted a regular-file receive root"
+        dry, _ = run_client(source, fileroot, flags=["--dry-run"], port=shared_server.port)
+        assert dry.returncode != 0, "dry-run accepted a regular-file receive root a real run rejects"
+        with open(fileroot, "rb") as f:
+            assert f.read() == b"i am a regular file, not a directory\n", \
+                "dry-run clobbered a regular-file receive root"
+
+
 class TestRemoveSourceFiles:
     def test_removes_only_transferred_regular_files(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "remove_source")

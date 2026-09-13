@@ -22,6 +22,17 @@ bool validate_config(const Config* config) {
                 "--write-batch, --only-write-batch, and --read-batch are mutually exclusive");
     return false;
   }
+  /* A dry-run of a local batch apply is not meaningful: --read-batch bypasses
+     the client-side scan/server decision entirely, so dry-run would have no
+     wire state to report (and must not be used as a mutation escape hatch).
+     --only-write-batch likewise never contacts a receiver.  Reject both up
+     front instead of silently ignoring --dry-run. */
+  if (config->dry_run && (read_batch || only_write_batch)) {
+    log_message(LOG_LEVEL_ERROR,
+                "--dry-run cannot be combined with --read-batch or --only-write-batch; "
+                "a dry-run of a local batch apply is not meaningful");
+    return false;
+  }
   if (read_batch) {
     if (!config->receive_root_directory) {
       log_message(LOG_LEVEL_ERROR, "--read-batch requires a destination directory");

@@ -21,7 +21,6 @@ static void config_set_defaults(Config* config) {
   config->scanner_threads = 0;
   config->metadata_explicitly_disabled = false;
   config->show_progress = false;
-  config->dry_run = false;
   config->compression_threads = 0;
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
@@ -42,6 +41,8 @@ static void config_set_defaults(Config* config) {
   config->tls_ca = NULL;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
+  config->server_port_set = false;
+  config->server_host_set = false;
   /* 0 means "--timeout not given": the transport keeps its own built-in 30 s
    * socket timeout (tcp_set_timeouts ignores non-positive values) and the
    * protocol layer keeps its built-in 60 s per-message deadline.  A positive
@@ -190,11 +191,11 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
-         checksum_algo_valid(config->checksum_algo) && identity_wire_valid(config) &&
-         valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
-         valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
-         valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
-         valid_wire_bool(config->fake_super) &&
+         valid_wire_bool(config->dry_run) && checksum_algo_valid(config->checksum_algo) &&
+         identity_wire_valid(config) && valid_wire_bool(config->preserve_atimes) &&
+         valid_wire_bool(config->preserve_crtimes) && valid_wire_bool(config->omit_dir_times) &&
+         valid_wire_bool(config->omit_link_times) && valid_wire_bool(config->munge_links) &&
+         valid_wire_bool(config->keep_dirlinks) && valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
@@ -773,8 +774,8 @@ static bool config_receive_module(int fd, Config* c, ConfigStringBudget* budget)
     return false;
   if (*module != '\0' && !daemon_module_name_valid(module)) {
     log_message(LOG_LEVEL_WARNING, "Daemon client sent an invalid or over-long module name");
+    send_error_detail(fd, "invalid or over-long daemon module name");
     free(module);
-    send_status(fd, STATUS_ERROR);
     return false;
   }
   if (*module != '\0') {
@@ -1238,7 +1239,16 @@ bool config_send(int file_descriptor, const Config* config) {
       return false;
   }
   if (status != STATUS_OK) {
-    log_message(LOG_LEVEL_ERROR, "Error transmitting config");
+    const char* detail = protocol_last_error();
+    if (detail && detail[0] != '\0') {
+      /* The detail is peer-controlled: escape it before logging. */
+      char* escaped = output_escape(detail, log_get_8_bit_output());
+      log_message(LOG_LEVEL_ERROR, "Error transmitting config: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
+    } else {
+      log_message(LOG_LEVEL_ERROR, "Error transmitting config");
+    }
     return false;
   }
   return true;
@@ -1258,8 +1268,11 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
     char* escaped_version = output_escape(config->version, false);
     log_message(LOG_LEVEL_ERROR, "Protocol version mismatch: client=%s, server=%s",
                 escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    char detail[160];
+    snprintf(detail, sizeof(detail), "protocol version mismatch (client=%s, server=%s)",
+             escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    send_error_detail(file_descriptor, detail);
     free(escaped_version);
-    send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
   if (!receive_core_fields(file_descriptor, config, &budget) ||
@@ -1285,13 +1298,16 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
     char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
     log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
                 escaped_choice ? escaped_choice : "<allocation failed>");
+    char detail[128];
+    snprintf(detail, sizeof(detail), "unsupported compression choice: %s",
+             escaped_choice ? escaped_choice : "<allocation failed>");
+    send_error_detail(file_descriptor, detail);
     free(escaped_choice);
-    send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
   if (!validate_received_config(config)) {
     log_message(LOG_LEVEL_ERROR, "Invalid configuration received from client");
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid configuration received from client");
     goto error;
   }
   if (validate) {
@@ -1305,7 +1321,7 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
        * written. */
       if (rejection != CONFIG_VALIDATE_ALREADY_TERMINATED) {
         log_message(LOG_LEVEL_ERROR, "%s", rejection);
-        send_status(file_descriptor, STATUS_ERROR);
+        send_error_detail(file_descriptor, rejection);
       }
       goto error;
     }

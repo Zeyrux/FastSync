@@ -9,6 +9,12 @@
 /* Maximum allowed string size for receive_str (64 KB) */
 #define MAX_STRING_SIZE (64 * 1024)
 
+/* Hard cap on the optional server->client rejection detail carried by
+ * STATUS_ERROR_DETAIL (protocol 2.21.0).  A longer message is sliced to this
+ * many bytes before it is sent, so a peer can never be made to retain more than
+ * this for a rejection and the detail frame stays a small, fixed bound. */
+#define MAX_ERROR_DETAIL_BYTES 4096
+
 /* Maximum uncompressed file payload accepted by the receiver's whole-file
  * paths.  A single whole file is charged against the per-connection memory
  * reservation (MAX_CONNECTION_MEMORY) and against the server allocation
@@ -132,7 +138,24 @@ enum NET_STATUS {
   STATUS_AUTH_CHALLENGE,
   STATUS_AUTH_RESPONSE,
   STATUS_AUTH_OK,
-  STATUS_AUTH_FAILED
+  STATUS_AUTH_FAILED,
+  /* Optional server->client rejection detail (protocol 2.21.0).  When the
+   * server refuses a transfer for a concrete reason it may send
+   * STATUS_ERROR_DETAIL followed by a length-prefixed, bounded string instead
+   * of a bare STATUS_ERROR.  receive_status() consumes the string and maps the
+   * status back to STATUS_ERROR, so every pre-2.21 call site keeps working;
+   * callers that want the human-readable reason consult protocol_last_error().
+   * Appended immediately after STATUS_AUTH_FAILED so the existing wire values
+   * never move. */
+  STATUS_ERROR_DETAIL,
+  /* Server-contacting --dry-run (protocol 2.21.0).  Sent by the receiver in
+   * response to a per-file STATUS_CHECK when the wire config carries
+   * dry_run=true and the file is NOT already up to date: it tells the sender
+   * the file WOULD be transferred, and the sender must NOT transmit any data
+   * (the receiver reads none in dry-run).  STATUS_OK keeps its meaning in this
+   * path ("already up to date / nothing to do").  Appended after
+   * STATUS_ERROR_DETAIL so no existing status is renumbered. */
+  STATUS_DRY_RUN_TRANSFER
 };
 
 void io_set_fds(int read_fd, int write_fd);
@@ -192,6 +215,20 @@ bool send_int(int file_descriptor, int data);
 bool receive_int(int file_descriptor, int* data);
 bool send_status(int file_descriptor, Status status);
 bool receive_status(int file_descriptor, Status* status);
+/* Send STATUS_ERROR_DETAIL followed by a bounded (<= MAX_ERROR_DETAIL_BYTES)
+ * length-prefixed string.  Over-long messages are sliced and NULL is treated
+ * as "".  Returns false if the status or the string could not be sent. */
+bool send_error_detail(int file_descriptor, const char* message);
+/* Human-readable reason captured from the most recent STATUS_ERROR_DETAIL
+ * received on this thread, or "" when the last status was a bare STATUS_ERROR
+ * (or no detail was seen).  Thread-local, and valid until the next non-keepalive
+ * status read on the same thread; a later STATUS_KEEPALIVE does NOT clear it.
+ * The detail body is bounded by MAX_ERROR_DETAIL_BYTES: an over-cap declared
+ * length is drained and yields "" (so the stream never desyncs), while an
+ * absurd length is a fatal framing error that fails the status read. */
+const char* protocol_last_error(void);
+/* Clear the thread-local last-error buffer. */
+void protocol_clear_last_error(void);
 /* receive_status with an explicit per-message deadline in seconds, instead of
    the default RECEIVE_TIMEOUT_SEC.  A reply that may legitimately take longer
    (e.g. the early-delete ACK after a large receiver-side deletion) must use

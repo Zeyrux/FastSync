@@ -196,7 +196,11 @@ int write_thread(void* pipeline_context) {
     }
     size_t file_bytes = file->data ? file->data->size : 0;
     FileSaveResult result = FILE_SAVE_SKIPPED;
-    if (save_to_disk) {
+    /* Server-contacting --dry-run: never write.  The receiver thread does not
+       enqueue anything on the dry-run path, but this keeps the writer thread
+       provably mutation-free if a data frame ever reached it. */
+    bool dry_run = context->config->dry_run;
+    if (save_to_disk && !dry_run) {
       result = file_save_to_disk_full(root_directory, file, context->config);
       if (result == FILE_SAVE_ERROR) {
         file_destroy(file);
@@ -215,7 +219,7 @@ int write_thread(void* pipeline_context) {
     /* P7 Wave D: a directory's times are never applied inline (a later child
        write would clobber them); accumulate the metadata here and let the
        caller apply it once every writer has drained. */
-    if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
+    if (!dry_run && result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
         dir_times_should_capture(context->config) &&
         !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
       file_destroy(file);
@@ -234,8 +238,8 @@ int write_thread(void* pipeline_context) {
        which sources were actually written versus skipped on the receiver.
        Explicit directory entries and recreated device/special nodes have no
        source and are never acknowledged (mirrors receiver.c). */
-    if (context->config->remove_source_files && !file->is_dir && !file->is_special && !file->skip &&
-        !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
+    if (!dry_run && context->config->remove_source_files && !file->is_dir && !file->is_special &&
+        !file->skip && !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
       file_destroy(file);
       pipeline_context_receiver_note_bytes_released(context, file_bytes);
       mtx_lock(&context->mutex);
