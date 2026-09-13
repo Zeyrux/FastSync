@@ -103,26 +103,20 @@ static size_t str_hash_set_hash(const char* key, size_t len) {
   return (size_t)XXH64(key, len, 0);
 }
 
-/* Store an already-allocated key.  Returns 1 when a new slot was filled and 0
- * for a duplicate (the caller keeps ownership of `key` when owned is true). */
-static int str_hash_set_put(StrHashSet* set, const char* key, size_t len, bool owned,
-                            bool is_entry) {
+/* Store a borrowed key.  Returns 1 when a new slot was filled and 0 for a
+ * duplicate. */
+static int str_hash_set_put(StrHashSet* set, const char* key, size_t len) {
   size_t mask = set->capacity - 1;
   size_t index = str_hash_set_hash(key, len) & mask;
   while (true) {
     StrHashSetSlot* slot = &set->slots[index];
     if (!slot->key) {
       slot->key = key;
-      slot->owned = owned;
-      slot->is_entry = is_entry;
       set->size++;
       return 1;
     }
-    if (strlen(slot->key) == len && memcmp(slot->key, key, len) == 0) {
-      if (is_entry)
-        slot->is_entry = true;
+    if (strlen(slot->key) == len && memcmp(slot->key, key, len) == 0)
       return 0;
-    }
     index = (index + 1) & mask;
   }
 }
@@ -138,8 +132,7 @@ static bool str_hash_set_resize(StrHashSet* set, size_t new_capacity) {
   set->size = 0;
   for (size_t i = 0; i < old_capacity; i++) {
     if (old_slots[i].key)
-      (void)str_hash_set_put(set, old_slots[i].key, strlen(old_slots[i].key), old_slots[i].owned,
-                             old_slots[i].is_entry);
+      (void)str_hash_set_put(set, old_slots[i].key, strlen(old_slots[i].key));
   }
   free(old_slots);
   return true;
@@ -159,7 +152,7 @@ bool str_hash_set_init(StrHashSet* set, size_t hint) {
   set->capacity = 0;
   set->size = 0;
   size_t capacity = STR_HASH_SET_MIN_CAPACITY;
-  while (capacity < (hint + 1) * 2)
+  while (capacity < (hint + 1) * 2 && capacity <= SIZE_MAX / 2)
     capacity *= 2;
   set->slots = calloc(capacity, sizeof(StrHashSetSlot));
   if (!set->slots)
@@ -171,46 +164,18 @@ bool str_hash_set_init(StrHashSet* set, size_t hint) {
 void str_hash_set_free(StrHashSet* set) {
   if (!set)
     return;
-  for (size_t i = 0; i < set->capacity; i++) {
-    if (set->slots[i].key && set->slots[i].owned)
-      free((void*)set->slots[i].key);
-  }
   free(set->slots);
   set->slots = NULL;
   set->capacity = 0;
   set->size = 0;
 }
 
-bool str_hash_set_insert_ref(StrHashSet* set, const char* key, bool is_entry) {
+bool str_hash_set_insert_ref(StrHashSet* set, const char* key) {
   if (!set || !key)
     return false;
   if (!str_hash_set_grow(set))
     return false;
-  return str_hash_set_put(set, key, strlen(key), false, is_entry) >= 0;
-}
-
-bool str_hash_set_insert_copy_n(StrHashSet* set, const char* key, size_t len, bool is_entry) {
-  if (!set || !key)
-    return false;
-  bool present = false;
-  if (str_hash_set_lookup_n(set, key, len, &present)) {
-    if (is_entry)
-      (void)str_hash_set_put(set, key, len, false, true); /* upgrade in place */
-    return true;
-  }
-  if (!str_hash_set_grow(set))
-    return false;
-  char* copy = malloc(len + 1);
-  if (!copy)
-    return false;
-  memcpy(copy, key, len);
-  copy[len] = '\0';
-  int result = str_hash_set_put(set, copy, len, true, is_entry);
-  if (result <= 0) {
-    free(copy);
-    return result == 0;
-  }
-  return true;
+  return str_hash_set_put(set, key, strlen(key)) >= 0;
 }
 
 static const StrHashSetSlot* str_hash_set_find_n(const StrHashSet* set, const char* key,
@@ -229,19 +194,140 @@ static const StrHashSetSlot* str_hash_set_find_n(const StrHashSet* set, const ch
   }
 }
 
-bool str_hash_set_lookup_n(const StrHashSet* set, const char* key, size_t len, bool* is_entry) {
-  const StrHashSetSlot* slot = str_hash_set_find_n(set, key, len);
-  if (!slot)
+bool str_hash_set_lookup_n(const StrHashSet* set, const char* key, size_t len) {
+  return str_hash_set_find_n(set, key, len) != NULL;
+}
+
+bool str_hash_set_lookup(const StrHashSet* set, const char* key) {
+  if (!key)
     return false;
-  if (is_entry)
-    *is_entry = slot->is_entry;
+  return str_hash_set_lookup_n(set, key, strlen(key));
+}
+
+static int str_sorted_array_compare(const void* left, const void* right) {
+  const char* const* left_key = left;
+  const char* const* right_key = right;
+  return strcmp(*left_key, *right_key);
+}
+
+bool str_sorted_array_build(StrSortedArray* array, const char* const* items, size_t count) {
+  if (!array)
+    return false;
+  array->items = NULL;
+  array->count = 0;
+  if (count == 0)
+    return true;
+  if (!items || count > SIZE_MAX / sizeof(const char*))
+    return false;
+  const char** sorted = malloc(count * sizeof(*sorted));
+  if (!sorted)
+    return false;
+  for (size_t i = 0; i < count; i++)
+    sorted[i] = items[i];
+  qsort(sorted, count, sizeof(*sorted), str_sorted_array_compare);
+  array->items = sorted;
+  array->count = count;
   return true;
 }
 
-bool str_hash_set_lookup(const StrHashSet* set, const char* key, bool* is_entry) {
-  if (!key)
+void str_sorted_array_free(StrSortedArray* array) {
+  if (!array)
+    return;
+  free(array->items);
+  array->items = NULL;
+  array->count = 0;
+}
+
+bool str_sorted_array_contains(const StrSortedArray* array, const char* key) {
+  if (!array || !key || array->count == 0)
     return false;
-  return str_hash_set_lookup_n(set, key, strlen(key), is_entry);
+  size_t lo = 0;
+  size_t hi = array->count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int cmp = strcmp(array->items[mid], key);
+    if (cmp < 0)
+      lo = mid + 1;
+    else if (cmp > 0)
+      hi = mid;
+    else
+      return true;
+  }
+  return false;
+}
+
+/* Compare `entry` against the virtual key `key` + '/' without allocating the
+ * concatenation.  Returns <0, 0 or >0 as `entry` sorts before, equal to, or
+ * after that virtual key. */
+static int str_sorted_array_compare_prefix(const char* entry, const char* key, size_t key_len) {
+  int cmp = strncmp(entry, key, key_len);
+  if (cmp != 0)
+    return cmp;
+  unsigned char next = (unsigned char)entry[key_len];
+  if (next == '\0')
+    return -1; /* entry == key sorts before key + '/' */
+  return (int)next - (int)'/';
+}
+
+bool str_sorted_array_has_child_prefix(const StrSortedArray* array, const char* key) {
+  if (!array || !key || array->count == 0 || key[0] == '\0')
+    return false;
+  size_t key_len = strlen(key);
+  size_t lo = 0;
+  size_t hi = array->count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (str_sorted_array_compare_prefix(array->items[mid], key, key_len) < 0)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo >= array->count)
+    return false;
+  const char* entry = array->items[lo];
+  return strncmp(entry, key, key_len) == 0 && entry[key_len] == '/';
+}
+
+bool path_index_build(PathIndex* index, const char* const* entries, size_t count) {
+  if (!index)
+    return false;
+  index->exact.slots = NULL;
+  index->exact.capacity = 0;
+  index->exact.size = 0;
+  index->sorted.items = NULL;
+  index->sorted.count = 0;
+  if (!str_hash_set_init(&index->exact, count))
+    return false;
+  if (!str_sorted_array_build(&index->sorted, entries, count)) {
+    str_hash_set_free(&index->exact);
+    return false;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (!str_hash_set_insert_ref(&index->exact, entries[i])) {
+      path_index_free(index);
+      return false;
+    }
+  }
+  return true;
+}
+
+void path_index_free(PathIndex* index) {
+  if (!index)
+    return;
+  str_hash_set_free(&index->exact);
+  str_sorted_array_free(&index->sorted);
+}
+
+bool path_index_contains(const PathIndex* index, const char* path) {
+  return index && str_hash_set_lookup(&index->exact, path);
+}
+
+bool path_index_contains_n(const PathIndex* index, const char* path, size_t len) {
+  return index && str_hash_set_lookup_n(&index->exact, path, len);
+}
+
+bool path_index_has_descendant(const PathIndex* index, const char* path) {
+  return index && str_sorted_array_has_child_prefix(&index->sorted, path);
 }
 
 char* output_escape(const char* string, bool eight_bit_output) {
@@ -344,38 +430,23 @@ bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_si
   return written >= 0 && (size_t)written < buffer_size;
 }
 
-/* Build the keep-set index: every manifest entry is inserted as an exact entry
-   and every ancestor directory prefix of it as a non-entry node.  A lookup of
-   `rel` therefore succeeds iff `rel` is a kept file, a kept directory, or an
-   ancestor directory of kept content (the old is_dir_in_manifest predicate);
-   the entry flag distinguishes an exact kept file from a mere prefix. */
-static bool build_keep_index(ArrayList* manifest, StrHashSet* index) {
-  if (!str_hash_set_init(index, manifest && manifest->size > 0 ? (size_t)manifest->size : 1))
-    return false;
-  if (!manifest)
-    return true;
-  for (int i = 0; i < manifest->size; i++) {
-    const char* entry = (const char*)manifest->items[i];
-    if (!str_hash_set_insert_ref(index, entry, true))
-      goto fail;
-    for (const char* slash = entry; (slash = strchr(slash, '/')) != NULL; slash++) {
-      if (!str_hash_set_insert_copy_n(index, entry, (size_t)(slash - entry), false))
-        goto fail;
-    }
-  }
-  return true;
-fail:
-  str_hash_set_free(index);
-  return false;
+/* Build the keep-set index from the exact manifest entries only.  A lookup of
+   `rel` succeeds iff `rel` is a kept entry, a kept directory, or an ancestor
+   directory of kept content (the old is_dir_in_manifest predicate); the sorted
+   view answers "is an ancestor of kept content" without materializing any
+   per-component prefix copy, so the index is O(manifest size) memory. */
+static bool build_keep_index(const ArrayList* manifest, PathIndex* index) {
+  if (!manifest || manifest->size <= 0)
+    return path_index_build(index, NULL, 0);
+  return path_index_build(index, (const char* const*)manifest->items, (size_t)manifest->size);
 }
 
-static bool keep_is_dir(const StrHashSet* index, const char* rel_path) {
-  return str_hash_set_lookup(index, rel_path, NULL);
+static bool keep_is_dir(const PathIndex* index, const char* rel_path) {
+  return path_index_contains(index, rel_path) || path_index_has_descendant(index, rel_path);
 }
 
-static bool keep_is_file(const StrHashSet* index, const char* rel_path) {
-  bool is_entry = false;
-  return str_hash_set_lookup(index, rel_path, &is_entry) && is_entry;
+static bool keep_is_file(const PathIndex* index, const char* rel_path) {
+  return path_index_contains(index, rel_path);
 }
 
 /* True when child_rel is, or lies below, a protected entry.  A prefix "a"
@@ -405,7 +476,7 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
    prefixes) mark the enclosing directory as surviving, exactly as they would
    make a real rmdir fail with ENOTEMPTY.  Stops early once *count reaches the
    cap (sets *exceeds).  Returns false on a traversal error. */
-static bool count_extras_fd(int dirfd, const char* rel_path, const StrHashSet* keep, size_t cap,
+static bool count_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep, size_t cap,
                             size_t* count, bool* exceeds, const DeleteSkipEntry* skips,
                             int skip_count, bool* survives) {
   /* openat(dirfd, ".") opens an independent file description: a dup() would
@@ -495,7 +566,7 @@ static bool count_extras_fd(int dirfd, const char* rel_path, const StrHashSet* k
   return operation_ok;
 }
 
-static bool delete_extras_fd(int dirfd, const char* rel_path, const StrHashSet* keep,
+static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep,
                              size_t max_delete, size_t* deleted_count, const DeleteSkipEntry* skips,
                              int skip_count) {
   /* Independent file description (see count_extras_fd). */
@@ -595,7 +666,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const StrHashSet* 
   return operation_ok;
 }
 
-DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifest,
+DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        size_t max_delete, const DeleteSkipEntry* skips,
                                        int skip_count, size_t* deleted_out) {
   if (deleted_out)
@@ -604,7 +675,7 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifes
     return DELETE_WALK_ERROR;
   /* Index the keep-set once so both passes answer membership in O(path length)
      instead of scanning every manifest entry for every destination entry. */
-  StrHashSet keep;
+  PathIndex keep;
   if (!build_keep_index(manifest, &keep))
     return DELETE_WALK_ERROR;
   int rootfd;
@@ -619,7 +690,7 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifes
     rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   }
   if (rootfd < 0) {
-    str_hash_set_free(&keep);
+    path_index_free(&keep);
     return DELETE_WALK_ERROR;
   }
   if (max_delete != SIZE_MAX) {
@@ -632,12 +703,12 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifes
                                       skip_count, &survives);
     if (!counted_ok) {
       close(rootfd);
-      str_hash_set_free(&keep);
+      path_index_free(&keep);
       return DELETE_WALK_ERROR;
     }
     if (exceeds) {
       close(rootfd);
-      str_hash_set_free(&keep);
+      path_index_free(&keep);
       return DELETE_WALK_LIMIT_EXCEEDED;
     }
   }
@@ -645,13 +716,13 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifes
   bool ok = delete_extras_fd(rootfd, "", &keep, max_delete, &deleted_count, skips, skip_count);
   if (close(rootfd) != 0)
     ok = false;
-  str_hash_set_free(&keep);
+  path_index_free(&keep);
   if (deleted_out)
     *deleted_out = deleted_count;
   return ok ? DELETE_WALK_OK : DELETE_WALK_ERROR;
 }
 
-bool delete_extras(const char* dest_root, ArrayList* manifest) {
+bool delete_extras(const char* dest_root, const ArrayList* manifest) {
   return delete_extras_limited(dest_root, manifest, SIZE_MAX, NULL, 0, NULL) == DELETE_WALK_OK;
 }
 

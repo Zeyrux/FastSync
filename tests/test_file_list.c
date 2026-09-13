@@ -118,6 +118,79 @@ static void test_membership_matches_reference() {
   EXPECT_TRUE(file_list_affects(NULL, NULL));
 }
 
+/* Explicit ancestor/descendant coverage: a query that is a proper ancestor of
+   a listed entry is affected, and a query below a listed entry is affected,
+   while a component-boundary neighbor is not. */
+static void test_ancestor_and_descendant_queries() {
+  const char* path = "test_file_list_ancestor.txt";
+  char err[160];
+  write_list(path, "top/mid/leaf.txt\nsingle.txt\n");
+  FileListSet* set = file_list_load(path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+
+  /* q is an ancestor of a listed entry. */
+  EXPECT_TRUE(file_list_affects(set, "top"));
+  EXPECT_TRUE(file_list_affects(set, "top/mid"));
+  EXPECT_FALSE(file_list_affects(set, "top/other")); /* neither direction */
+  EXPECT_FALSE(file_list_affects(set, "to"));        /* component boundary */
+
+  /* A listed entry is an ancestor of q. */
+  EXPECT_TRUE(file_list_affects(set, "single.txt"));
+  EXPECT_TRUE(file_list_affects(set, "single.txt/deeper"));
+  EXPECT_FALSE(file_list_affects(set, "single.txtx")); /* boundary */
+
+  check_queries(set,
+                (const char*[]){"top", "top/mid", "top/mid/leaf.txt", "top/other", "single.txt",
+                                "single.txt/deeper", "single.txtx", "to"},
+                8);
+  file_list_destroy(set);
+  remove(path);
+}
+
+/* Regression for the remote OOM: an adversarial --files-from entry made of a
+   very deep chain of repeated components must be indexed with memory
+   proportional to the entry count.  The old implementation stored one copied
+   ancestor prefix per component (O(L^2) bytes for a single entry); the sorted
+   index stores the exact entries only. */
+static void test_deep_paths_are_bounded() {
+  const char* path = "test_file_list_deep.txt";
+  enum { COMPONENTS = 20000 };
+  size_t entry_len = (size_t)COMPONENTS * 2; /* "a/" per component */
+  char* entry = malloc(entry_len + 1);
+  EXPECT_NOT_NULL(entry);
+  for (size_t i = 0; i < entry_len; i += 2) {
+    entry[i] = 'a';
+    entry[i + 1] = '/';
+  }
+  entry[entry_len - 1] = 'z'; /* .../a/z: a deep leaf name */
+  entry[entry_len] = '\0';
+
+  FILE* fp = fopen(path, "wb");
+  EXPECT_NOT_NULL(fp);
+  EXPECT_EQ_INT((int)fwrite(entry, 1, entry_len, fp), (int)entry_len);
+  EXPECT_EQ_INT(fputc('\n', fp), '\n');
+  fclose(fp);
+
+  char err[160];
+  FileListSet* set = file_list_load(path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+  EXPECT_EQ_INT(set->count, 1);
+  /* One exact entry stored, not one node per path component. */
+  EXPECT_EQ_INT((int)set->index.sorted.count, 1);
+  EXPECT_EQ_INT((int)set->index.exact.size, 1);
+  EXPECT_TRUE(file_list_affects(set, entry)); /* exact */
+  EXPECT_TRUE(file_list_affects(set, "a"));   /* ancestor of the entry */
+  EXPECT_TRUE(file_list_affects(set, "a/a")); /* deeper ancestor */
+  EXPECT_FALSE(file_list_affects(set, "b"));  /* unrelated */
+  EXPECT_FALSE(file_list_affects(set, "aa")); /* component boundary */
+
+  file_list_destroy(set);
+  remove(path);
+  free(entry);
+}
+
 void test_file_list() {
   test_membership_matches_reference();
+  test_ancestor_and_descendant_queries();
+  test_deep_paths_are_bounded();
 }

@@ -456,7 +456,72 @@ static void test_fd_peer_ip() {
   EXPECT_EQ_STR(peer_string, "");
 }
 
+/* The keep/files-from indexes must store exactly the input entries (one node
+   each), never a copied ancestor prefix per component.  This builds a PathIndex
+   over paths thousands of components deep and checks the structural bound plus
+   the exact / descendant query semantics. */
+static void test_path_index_bounded() {
+  enum { COUNT = 8, COMPONENTS = 5000 };
+  size_t entry_len = (size_t)COMPONENTS * 2 + 2; /* trailing "xN" */
+  char* storage = malloc((size_t)COUNT * (entry_len + 1));
+  EXPECT_NOT_NULL(storage);
+  const char** entries = calloc(COUNT, sizeof(char*));
+  EXPECT_NOT_NULL(entries);
+  for (int i = 0; i < COUNT; i++) {
+    char* entry = storage + (size_t)i * (entry_len + 1);
+    size_t pos = 0;
+    for (int c = 0; c < COMPONENTS; c++) {
+      entry[pos++] = 'a';
+      entry[pos++] = '/';
+    }
+    entry[pos++] = 'x';
+    entry[pos++] = (char)('0' + i);
+    entry[pos] = '\0';
+    entries[i] = entry;
+  }
+
+  PathIndex index;
+  EXPECT_TRUE(path_index_build(&index, entries, COUNT));
+  EXPECT_EQ_INT((int)index.sorted.count, COUNT);
+  EXPECT_EQ_INT((int)index.exact.size, COUNT);
+  EXPECT_TRUE(path_index_contains(&index, entries[0]));
+  EXPECT_FALSE(path_index_contains(&index, "a"));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a"));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a/a"));
+  EXPECT_FALSE(path_index_has_descendant(&index, "aa"));
+  path_index_free(&index);
+
+  free((void*)entries);
+  free(storage);
+}
+
+static void test_path_index_semantics() {
+  const char* entries[] = {"a/b/c.txt", "a/b/d.txt", "x.txt", "deep/deeper/deepest"};
+  PathIndex index;
+  EXPECT_TRUE(path_index_build(&index, entries, 4));
+  EXPECT_TRUE(path_index_contains(&index, "a/b/c.txt"));
+  EXPECT_FALSE(path_index_contains(&index, "a/b"));
+  EXPECT_TRUE(path_index_contains_n(&index, "a/b/c.txt/ignored", 9));
+  EXPECT_FALSE(path_index_contains_n(&index, "a/b/c.txt/ignored", 10));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a"));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a/b"));
+  EXPECT_FALSE(path_index_has_descendant(&index, "a/b/c.txt"));
+  EXPECT_FALSE(path_index_has_descendant(&index, "ab"));
+  EXPECT_FALSE(path_index_has_descendant(&index, ""));
+  path_index_free(&index);
+
+  /* A zero-entry index answers no queries. */
+  PathIndex empty;
+  EXPECT_TRUE(path_index_build(&empty, NULL, 0));
+  EXPECT_EQ_INT((int)empty.sorted.count, 0);
+  EXPECT_FALSE(path_index_contains(&empty, "a"));
+  EXPECT_FALSE(path_index_has_descendant(&empty, "a"));
+  path_index_free(&empty);
+}
+
 void test_shared_utils() {
+  test_path_index_bounded();
+  test_path_index_semantics();
   test_walker_removes_extras_keeps_manifest_and_protected();
   test_walker_keeps_nested_manifest_dirs();
   test_walker_max_delete_exceeded_deletes_nothing();

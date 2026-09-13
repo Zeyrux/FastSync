@@ -14,14 +14,16 @@
  * rejected at parse time. The set is immutable and shared read-only across
  * scanner worker threads.
  *
- * Membership is answered from `node_index`, built once at load time: it holds
- * every entry plus every ancestor directory prefix of an entry, with the entry
- * flag distinguishing an exact listed path from a mere ancestor.  A lookup is
- * O(path length) instead of O(entry count). */
+ * Membership is answered from `index`, built once at load time over the exact
+ * entries only: `index.exact` matches a listed path, the sorted view detects an
+ * ancestor directory of a listed entry, and `rel`'s own directory prefixes are
+ * matched against the exact set while descending.  No ancestor prefix is stored
+ * as a separate string, so the index is O(entry count) memory however deep the
+ * paths are, and each query is O(path length) comparisons. */
 typedef struct {
   char** entries; /* normalized rel paths; "" means the whole tree */
   int count;
-  StrHashSet node_index;
+  PathIndex index;
   bool whole_tree; /* an entry of "" lists the source root */
 } FileListSet;
 
