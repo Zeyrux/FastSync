@@ -603,12 +603,21 @@ bool utils_fd_peer_ip(int fd, char* buf, size_t len) {
     return false;
   const void* src = NULL;
   int family = peer.ss_family;
-  if (family == AF_INET)
+  if (family == AF_INET) {
     src = &((const struct sockaddr_in*)&peer)->sin_addr;
-  else if (family == AF_INET6)
-    src = &((const struct sockaddr_in6*)&peer)->sin6_addr;
-  else
+  } else if (family == AF_INET6) {
+    const struct sockaddr_in6* peer6 = (const struct sockaddr_in6*)&peer;
+    /* A dual-stack IPv6 listener reports IPv4 peers as ::ffff:a.b.c.d.  Emit
+     * the IPv4 form so IPv4 ACL patterns (and logs) see the real address. */
+    if (IN6_IS_ADDR_V4MAPPED(&peer6->sin6_addr)) {
+      struct in_addr v4;
+      memcpy(&v4, &peer6->sin6_addr.s6_addr[12], sizeof(v4));
+      return inet_ntop(AF_INET, &v4, buf, (socklen_t)len) != NULL;
+    }
+    src = &peer6->sin6_addr;
+  } else {
     return false;
+  }
   return inet_ntop(family, src, buf, (socklen_t)len) != NULL;
 }
 

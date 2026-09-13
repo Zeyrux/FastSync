@@ -506,8 +506,9 @@ A `[module]` may also set `max connections` (parsed and validated but not
 enforced per module — the global cap applies to the whole listener) and its own
 `hosts allow`/`hosts deny`.
 
-Host patterns are `*` (match all), IPv4/IPv6 literals, IPv4/IPv6 CIDR
-(`10.0.0.0/8`, `2001:db8::/32`), or hostname globs (`*.example.com`). A matching
+Host patterns are `*` (match all), IPv4/IPv6 literals, or IPv4/IPv6 CIDR
+(`10.0.0.0/8`, `2001:db8::/32`). Hostnames are not resolved, so hostname globs
+are rejected at parse time rather than silently never matching. A matching
 `hosts deny` rejects; if any `hosts allow` entries exist, a peer matching none of
 them is rejected; deny takes precedence over allow. The global list is checked
 before the module list, before authentication, and the connecting peer address

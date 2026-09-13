@@ -94,7 +94,9 @@ typedef struct DaemonConf {
 #define DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS 500
 /* Largest accepted `auth failure delay`, so a typo cannot pin a connection
  * child in nanosleep for an absurd time. */
-#define DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS 60000
+/* Bounded well below the socket I/O timeout so a failed-auth child cannot hold
+ * a connection slot for long enough to amplify connection-cap exhaustion. */
+#define DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS 5000
 /* Longest accepted config line (excluding the trailing newline).  Longer lines
  * are rejected rather than buffered unboundedly. */
 #define DAEMON_CONF_MAX_LINE 4096

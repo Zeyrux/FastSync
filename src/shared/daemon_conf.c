@@ -91,25 +91,39 @@ static bool parse_cidr(const char* cidr, int* prefix_out, uint8_t* bytes, int* f
   return false;
 }
 
-/* A host pattern is valid when it is non-empty and, when it contains a '/', its
- * address/prefix halves parse as a CIDR.  Literals, `*` and globs are accepted
- * as-is (a glob only ever matches a peer of the same shape). */
+/* A host pattern is valid when it is `*`, a valid IPv4/IPv6 literal, or a valid
+ * CIDR.  Peer addresses reaching the matcher are always numeric, so hostname
+ * globs are rejected at parse time: accepting one would create a deny rule that
+ * silently never matches (fail-open). */
 static bool host_pattern_valid(const char* pattern) {
   if (!pattern || *pattern == '\0')
     return false;
-  if (!strchr(pattern, '/'))
+  if (strcmp(pattern, "*") == 0)
     return true;
-  uint8_t bytes[16];
-  int prefix;
-  int family;
-  return parse_cidr(pattern, &prefix, bytes, &family);
+  if (strchr(pattern, '/')) {
+    uint8_t bytes[16];
+    int prefix;
+    int family;
+    return parse_cidr(pattern, &prefix, bytes, &family);
+  }
+  struct in_addr v4;
+  struct in6_addr v6;
+  return inet_pton(AF_INET, pattern, &v4) == 1 || inet_pton(AF_INET6, pattern, &v6) == 1;
 }
 
 /* Append every comma- and/or whitespace-separated host pattern in `value` to
- * the heap-owned list.  Returns false (err filled) on an invalid pattern or an
- * allocation failure. */
+ * the heap-owned list (or replace the list when `replace` is set, which --dparam
+ * uses so an override can narrow access rather than only widen it).  Returns
+ * false (err filled) on an invalid pattern or an allocation failure. */
 static bool store_host_list(char*** list, int* count, const char* value, const char* key,
-                            const char* module_name, char* err, size_t err_size) {
+                            const char* module_name, bool replace, char* err, size_t err_size) {
+  if (replace) {
+    for (int i = 0; i < *count; i++)
+      free((*list)[i]);
+    free(*list);
+    *list = NULL;
+    *count = 0;
+  }
   char* copy = str_dup(value);
   if (!copy) {
     if (module_name)
@@ -278,8 +292,8 @@ static bool store_port(int* slot, const char* value, char* err, size_t err_size)
 
 /* Apply a global scalar key/value.  Keys are case-insensitive.  Returns false
  * (err filled) on an unknown key or an invalid value. */
-static bool apply_global_key(DaemonConf* conf, char* key, const char* value, char* err,
-                             size_t err_size) {
+static bool apply_global_key(DaemonConf* conf, char* key, const char* value, bool replace_hosts,
+                             char* err, size_t err_size) {
   if (key_equals(key, "port"))
     return store_port(&conf->global.port, value, err, err_size);
   if (key_equals(key, "motd file")) {
@@ -302,10 +316,10 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, cha
     return store_auth_failure_delay(&conf->global.auth_failure_delay_ms, value, err, err_size);
   if (key_equals(key, "hosts allow"))
     return store_host_list(&conf->global.hosts_allow, &conf->global.hosts_allow_count, value,
-                           "hosts allow", NULL, err, err_size);
+                           "hosts allow", NULL, replace_hosts, err, err_size);
   if (key_equals(key, "hosts deny"))
     return store_host_list(&conf->global.hosts_deny, &conf->global.hosts_deny_count, value,
-                           "hosts deny", NULL, err, err_size);
+                           "hosts deny", NULL, replace_hosts, err, err_size);
   set_error(err, err_size, "unknown global key '%s'", key);
   return false;
 }
@@ -389,10 +403,10 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     return store_max_connections(&module->max_connections, value, module->name, err, err_size);
   if (key_equals(key, "hosts allow"))
     return store_host_list(&module->hosts_allow, &module->hosts_allow_count, value, "hosts allow",
-                           module->name, err, err_size);
+                           false, module->name, err, err_size);
   if (key_equals(key, "hosts deny"))
     return store_host_list(&module->hosts_deny, &module->hosts_deny_count, value, "hosts deny",
-                           module->name, err, err_size);
+                           false, module->name, err, err_size);
   set_error(err, err_size, "unknown key '%s' in module '%s'", key, module->name);
   return false;
 }
@@ -573,7 +587,7 @@ DaemonConf* daemon_conf_load(const char* path, char* err, size_t err_size) {
         break;
       }
     } else {
-      if (!apply_global_key(conf, key, value, err, err_size)) {
+      if (!apply_global_key(conf, key, value, false, err, err_size)) {
         ok = false;
         break;
       }
@@ -628,7 +642,7 @@ int daemon_conf_apply_dparam(DaemonConf* conf, const char* assignment, char* err
     set_error(err, err_size, "--dparam '%s' has an empty value", assignment);
     return -1;
   }
-  bool ok = apply_global_key(conf, key, value, err, err_size);
+  bool ok = apply_global_key(conf, key, value, true, err, err_size);
   free(copy);
   return ok ? 0 : -1;
 }

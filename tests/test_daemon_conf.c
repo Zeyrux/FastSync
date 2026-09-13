@@ -321,6 +321,10 @@ static void test_daemon_conf_dparam_override() {
   EXPECT_EQ_INT(
       daemon_conf_apply_dparam(conf, "hosts allow=127.0.0.1,10.0.0.0/8", err, sizeof(err)), 0);
   EXPECT_EQ_INT(conf->global.hosts_allow_count, 2);
+  /* A later --dparam replaces the list (an override must be able to narrow). */
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "hosts allow=127.0.0.1", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.hosts_allow_count, 1);
+  EXPECT_EQ_STR(conf->global.hosts_allow[0], "127.0.0.1");
 
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "port=notaport", err, sizeof(err)), -1);
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "bogus=1", err, sizeof(err)), -1);
@@ -386,7 +390,7 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   char err[256];
   EXPECT_EQ_INT(write_conf("max connections = 25\n"
                            "auth failure delay = 0\n"
-                           "hosts allow = 10.0.0.0/8, *.example.com\n"
+                           "hosts allow = 10.0.0.0/8, 192.168.1.0/24\n"
                            "hosts deny = 192.168.0.1 2001:db8::/32\n"
                            "\n"
                            "[m]\n"
@@ -403,7 +407,7 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, 0);
   EXPECT_EQ_INT(conf->global.hosts_allow_count, 2);
   EXPECT_EQ_STR(conf->global.hosts_allow[0], "10.0.0.0/8");
-  EXPECT_EQ_STR(conf->global.hosts_allow[1], "*.example.com");
+  EXPECT_EQ_STR(conf->global.hosts_allow[1], "192.168.1.0/24");
   EXPECT_EQ_INT(conf->global.hosts_deny_count, 2);
   EXPECT_EQ_STR(conf->global.hosts_deny[0], "192.168.0.1");
   EXPECT_EQ_STR(conf->global.hosts_deny[1], "2001:db8::/32");
@@ -415,9 +419,11 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   daemon_conf_free(conf);
 
   const char* bad_values[] = {
-      "max connections = 0\n",       "max connections = -1\n",        "max connections = abc\n",
-      "auth failure delay = -1\n",   "auth failure delay = 70000\n",  "auth failure delay = soon\n",
-      "hosts allow = 10.0.0.0/99\n", "hosts deny = 2001:db8::/129\n",
+      "max connections = 0\n",         "max connections = -1\n",
+      "max connections = abc\n",       "auth failure delay = -1\n",
+      "auth failure delay = 70000\n",  "auth failure delay = soon\n",
+      "hosts allow = 10.0.0.0/99\n",   "hosts deny = 2001:db8::/129\n",
+      "hosts allow = *.example.com\n", "hosts deny = not-an-ip\n",
   };
   for (size_t i = 0; i < sizeof(bad_values) / sizeof(bad_values[0]); i++) {
     EXPECT_EQ_INT(write_conf(bad_values[i], &path), 0);
