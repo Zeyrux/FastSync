@@ -1,6 +1,7 @@
 #ifndef FILE_LIST_H
 #define FILE_LIST_H
 
+#include "utils.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -12,11 +13,16 @@
  * of "." means the whole tree, absolute entries and ".." traversal are
  * rejected at parse time. The set is immutable and shared read-only across
  * scanner worker threads.
- */
-
+ *
+ * Membership is answered from `node_index`, built once at load time: it holds
+ * every entry plus every ancestor directory prefix of an entry, with the entry
+ * flag distinguishing an exact listed path from a mere ancestor.  A lookup is
+ * O(path length) instead of O(entry count). */
 typedef struct {
   char** entries; /* normalized rel paths; "" means the whole tree */
   int count;
+  StrHashSet node_index;
+  bool whole_tree; /* an entry of "" lists the source root */
 } FileListSet;
 
 /* Load and validate a --files-from file. When `null_separated` (-0/--from0)

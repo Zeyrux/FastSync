@@ -12,6 +12,7 @@
 #include "test_delay_updates.h"
 #include "test_delta.h"
 #include "test_file.h"
+#include "test_file_list.h"
 #include "test_file_sendfile.h"
 #include "test_fuzz_smoke.h"
 #include "test_glob.h"
@@ -67,6 +68,7 @@ int main() {
   RUN_TEST(test_glob);
   RUN_TEST(test_iconv);
   RUN_TEST(test_file);
+  RUN_TEST(test_file_list);
   RUN_TEST(test_trust_sender);
   RUN_TEST(test_delay_updates);
   RUN_TEST(test_file_sendfile);

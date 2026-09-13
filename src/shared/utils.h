@@ -6,6 +6,41 @@
 #include <stdbool.h>
 #include <sys/socket.h>
 
+/* Small open-addressing string hash set used to turn quadratic membership
+ * scans into O(path length) lookups (the --delete keep-set and the
+ * --files-from allow-set).  Keys are hashed with xxHash64 (seed 0); collisions
+ * are resolved by linear probing over a power-of-two table that grows at 75%
+ * load.  Slots may either borrow a caller-owned key (insert_ref) or own an
+ * internal copy (insert_copy_n); owned copies are released by
+ * str_hash_set_free.  The set is not thread-safe for mutation, but a fully
+ * built set supports concurrent read-only lookups. */
+typedef struct {
+  const char* key; /* NULL marks an empty slot */
+  bool owned;      /* key is an internal copy that free() must release */
+  bool is_entry;   /* key was inserted as an exact entry, not just a prefix */
+} StrHashSetSlot;
+
+typedef struct {
+  StrHashSetSlot* slots;
+  size_t capacity; /* power of two, zero before init */
+  size_t size;
+} StrHashSet;
+
+/* Initialize an empty set sized for roughly `hint` entries.  Returns false on
+ * allocation failure. */
+bool str_hash_set_init(StrHashSet* set, size_t hint);
+void str_hash_set_free(StrHashSet* set);
+/* Insert a borrowed key (must outlive the set).  A duplicate only upgrades
+ * is_entry.  Returns false on allocation failure. */
+bool str_hash_set_insert_ref(StrHashSet* set, const char* key, bool is_entry);
+/* Insert a copy of the first `len` bytes of `key` (which need not be
+ * NUL-terminated).  Returns false on allocation failure. */
+bool str_hash_set_insert_copy_n(StrHashSet* set, const char* key, size_t len, bool is_entry);
+/* Look up a NUL-terminated key / a key of `len` bytes.  On a hit, optionally
+ * reports whether the stored key was inserted as an exact entry. */
+bool str_hash_set_lookup(const StrHashSet* set, const char* key, bool* is_entry);
+bool str_hash_set_lookup_n(const StrHashSet* set, const char* key, size_t len, bool* is_entry);
+
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
 char* path_cat(const char* path1, const char* path2);
