@@ -141,7 +141,11 @@ static bool host_bucket_reclaimable(DaemonLimitRegistry* registry, size_t idx, l
   if (until != 0)
     return until <= now;
   long long last_use = atomic_load_explicit(&registry->host_last_use[idx], memory_order_relaxed);
-  return last_use == 0 || now - last_use >= DAEMON_LIMITS_HOST_EVICT_IDLE_SEC;
+  /* A bucket whose key is published but whose last_use has not yet been stamped
+   * (last_use == 0) must be treated as live: reclaiming it here would steal a
+   * bucket a racing child just claimed.  The claim path also stamps last_use
+   * before publishing the key, so this window cannot persist. */
+  return last_use != 0 && now - last_use >= DAEMON_LIMITS_HOST_EVICT_IDLE_SEC;
 }
 
 /* Emit at most one "per-source table full" warning per
@@ -191,14 +195,18 @@ static int host_intern(DaemonLimitRegistry* registry, const char* peer_ip) {
         return (int)idx;
       }
       if (current == 0) {
+        /* Stamp last_use *before* publishing the key so a reclaimer racing the
+         * claim can never observe a claimed bucket with last_use == 0 and
+         * evict it.  A pre-stamp is harmless if the CAS loses: the bucket is
+         * either still empty (never inspected for reclaim) or has just been
+         * taken by another source that wants a fresh timestamp anyway. */
+        atomic_store_explicit(&registry->host_last_use[idx], now, memory_order_relaxed);
         uint64_t expected = 0;
         if (atomic_compare_exchange_strong_explicit(&registry->host_key[idx], &expected, key,
                                                     memory_order_acq_rel, memory_order_acquire)) {
-          atomic_store_explicit(&registry->host_last_use[idx], now, memory_order_relaxed);
           return (int)idx;
         }
         if (atomic_load_explicit(&registry->host_key[idx], memory_order_acquire) == key) {
-          atomic_store_explicit(&registry->host_last_use[idx], now, memory_order_relaxed);
           return (int)idx;
         }
         continue; /* another child won this empty bucket; keep probing */
@@ -209,6 +217,9 @@ static int host_intern(DaemonLimitRegistry* registry, const char* peer_ip) {
       }
     }
     if (evict >= 0) {
+      /* Refresh the timestamp before the key changes hands so the reused bucket
+       * is not seen as immediately idle by a racing reclaimer. */
+      atomic_store_explicit(&registry->host_last_use[evict], now, memory_order_relaxed);
       uint64_t expected = evict_key;
       if (atomic_compare_exchange_strong_explicit(&registry->host_key[evict], &expected, key,
                                                   memory_order_acq_rel, memory_order_acquire)) {
@@ -217,7 +228,27 @@ static int host_intern(DaemonLimitRegistry* registry, const char* peer_ip) {
         atomic_store_explicit(&registry->host_active[evict], 0, memory_order_relaxed);
         atomic_store_explicit(&registry->host_fail[evict], 0, memory_order_relaxed);
         atomic_store_explicit(&registry->host_until[evict], 0, memory_order_relaxed);
-        atomic_store_explicit(&registry->host_last_use[evict], now, memory_order_relaxed);
+        /* Two children can race to intern the same brand-new key into different
+         * eviction targets, leaving the table with duplicate buckets for `key`.
+         * Re-scan for the first (canonical) bucket holding `key`; when it
+         * precedes `evict`, drop our duplicate's occupancy and hand back the
+         * canonical bucket so per-source counts are not orphaned on the
+         * duplicate.  The duplicate keeps its key, so no tombstone hole is
+         * created and probe chains stay intact; it ages out normally. */
+        for (size_t i = 0; i < (size_t)registry->host_slots; i++) {
+          size_t candidate = (start + i) & mask;
+          uint64_t found =
+              atomic_load_explicit(&registry->host_key[candidate], memory_order_acquire);
+          if (found == key) {
+            if (candidate != (size_t)evict) {
+              atomic_store_explicit(&registry->host_active[evict], 0, memory_order_relaxed);
+              return (int)candidate;
+            }
+            break;
+          }
+          if (found == 0)
+            break; /* the key is present at `evict`, so this cannot happen first */
+        }
         return evict;
       }
       continue; /* lost the race; re-probe with fresh observations */

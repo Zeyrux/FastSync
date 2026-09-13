@@ -550,7 +550,7 @@ static void test_daemon_conf_module_count_capped() {
     int n = snprintf(line, sizeof(line), "[m%zu]\npath = /x\n", i);
     if (n < 0 || (size_t)n >= sizeof(line) || used + (size_t)n >= len) {
       free(body);
-      EXPECT_TRUE(0 && "module-count test buffer overflow");
+      EXPECT_FAIL("module-count test buffer overflow");
       return;
     }
     memcpy(body + used, line, (size_t)n);

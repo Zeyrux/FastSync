@@ -189,6 +189,44 @@ static void test_daemon_limits_fork_shared() {
   daemon_limits_destroy(registry);
 }
 
+/* Cross-process auth lockout: failures recorded by forked children against the
+ * shared mmap must lock the source out for the parent.  This is the
+ * cross-process path the integration test can no longer cover because trusted
+ * loopback peers are exempt from the per-host limits. */
+static void test_daemon_limits_fork_auth_lockout() {
+  if (is_running_under_valgrind())
+    return; /* fork + shared mapping is slow/noisy under valgrind */
+  DaemonLimitRegistry* registry = daemon_limits_create(DAEMON_LIMITS_MIN_SLOTS, 1, 0, 2, 300);
+  EXPECT_NOT_NULL(registry);
+
+  int remaining = 0;
+  EXPECT_FALSE(daemon_limits_auth_locked(registry, "10.0.0.1", &remaining));
+
+  /* One failure from each of two children reaches the threshold of 2 in the
+   * shared mapping; atomics only, no mtx/malloc, so fork-safe. */
+  for (int i = 0; i < 2; i++) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      daemon_limits_auth_record_failure(registry, "10.0.0.1");
+      _exit(0);
+    }
+    EXPECT_TRUE(pid > 0);
+    int status = 0;
+    EXPECT_TRUE(waitpid(pid, &status, 0) == pid);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+
+  /* The parent observes the lockout the children established. */
+  EXPECT_TRUE(daemon_limits_auth_locked(registry, "10.0.0.1", &remaining));
+  EXPECT_TRUE(remaining > 0 && remaining <= 300);
+  /* A different source is unaffected across processes. */
+  EXPECT_FALSE(daemon_limits_auth_locked(registry, "10.0.0.2", &remaining));
+  /* The parent clears the shared lockout on a successful authentication. */
+  daemon_limits_auth_record_success(registry, "10.0.0.1");
+  EXPECT_FALSE(daemon_limits_auth_locked(registry, "10.0.0.1", &remaining));
+  daemon_limits_destroy(registry);
+}
+
 /* The occupancy arrays are derived from the slot table: recompute rebuilds them
  * and is the self-heal path the SIGCHLD handler uses after a child dies. */
 static void test_daemon_limits_recompute() {
@@ -269,4 +307,5 @@ void test_daemon_limits() {
   test_daemon_limits_auth_lockout();
   test_daemon_limits_host_table_eviction();
   test_daemon_limits_fork_shared();
+  test_daemon_limits_fork_auth_lockout();
 }
