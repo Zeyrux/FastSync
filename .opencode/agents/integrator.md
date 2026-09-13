@@ -21,7 +21,7 @@ Design integration tests that verify the full transfer pipeline works end-to-end
 - Multiple configurations (TCP, SSH, TLS, compression, multithreading)
 - Network shaping (LAN, WAN profiles)
 - Feature tests (dry run, archive, exclude, delete, incremental, bandwidth limit)
-- Run: `python3 -m pytest tests/ -v --tb=short`
+- Run: `python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"`
 
 ### 3. New: Focused Integration Tests
 When adding new features or fixing bugs, write targeted integration tests.
@@ -77,7 +77,7 @@ openssl req -x509 -newkey rsa:2048 -keyout /tmp/key.pem -out /tmp/cert.pem \
 ### Pattern 4: Incremental Sync
 ```bash
 # First sync
-./build/client --source-dir /tmp/src --dest-dir /tmp/dst --save-to-disk -M
+./build/client --source-dir /tmp/src --dest-dir /tmp/dst --save-to-disk
 
 # Modify source
 echo "updated" >> /tmp/src/file.txt
@@ -90,14 +90,14 @@ echo "updated" >> /tmp/src/file.txt
 ### Pattern 5: Delete Verification
 ```bash
 # Initial sync
-./build/client --source-dir /tmp/src --dest-dir /tmp/dst --save-to-disk -M
+./build/client --source-dir /tmp/src --dest-dir /tmp/dst --save-to-disk
 
 # Add extra file to dest
 echo "extra" > /tmp/dst/.../extra.txt
 
 # Sync with --delete
 ./build/client --source-dir /tmp/src --dest-dir /tmp/dst \
-  --save-to-disk --delete -M
+  --save-to-disk --delete
 
 # Verify extra.txt is gone
 test ! -f /tmp/dst/.../extra.txt
@@ -116,7 +116,7 @@ The project uses Gitea Actions. Key jobs:
 jobs:
   new-job:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v7
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -128,7 +128,7 @@ jobs:
       - name: Unit Tests
         run: ./build-${{ matrix.sanitizer }}/tests
       - name: Integration Tests
-        run: LSAN_OPTIONS=suppressions=.lsan-suppressions.txt python3 -m pytest tests/ -v --tb=short
+        run: LSAN_OPTIONS=suppressions=.lsan-suppressions.txt python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"
 ```
 The symlink step is required because `tests/conftest.py` expects `./build` to exist.
 
@@ -136,7 +136,7 @@ The symlink step is required because `tests/conftest.py` expects `./build` to ex
 
 After any code change:
 - [ ] Unit tests pass: `./build/tests`
-- [ ] Integration tests pass: `python3 -m pytest tests/ -v --tb=short`
+- [ ] Integration tests pass: `python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"`
 - [ ] Build clean: no warnings with `-Wall`
 - [ ] No memory errors: ASan clean
 - [ ] No thread errors: TSan clean (if threading involved)

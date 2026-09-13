@@ -27,16 +27,19 @@ FetchContent_Declare(xxhash GIT_REPOSITORY https://github.com/Cyan4973/xxHash GI
 FetchContent_MakeAvailable(xxhash)
 
 # Sanitizer option
-set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, none)")
-set_property(CACHE SANITIZER PROPERTY STRINGS address thread none)
+set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, undefined, none)")
+set_property(CACHE SANITIZER PROPERTY STRINGS address thread undefined none)
 if(SANITIZER STREQUAL "address")
   add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=address)
 elseif(SANITIZER STREQUAL "thread")
   add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=thread)
+elseif(SANITIZER STREQUAL "undefined")
+  add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=undefined)
 elseif(NOT SANITIZER STREQUAL "none")
-  message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, none")
+  message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, undefined, none")
 endif()
 
 option(STRICT_WARNINGS "Enable strict warnings" OFF)
@@ -94,7 +97,7 @@ tests/integration/ — Python pytest integration tests
 - Use `file(GLOB ...)` for source collection (existing pattern).
 - All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
-- Sanitizer support: pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (live option in CMakeLists.txt).
+- Sanitizer support: pass `-DSANITIZER=address`, `-DSANITIZER=thread`, or `-DSANITIZER=undefined` to cmake (live option in CMakeLists.txt).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.
 - For CI, dependencies are provided by the project's custom Docker image (repo-root `Dockerfile`, same image CI uses). For local development, use `nix-shell`. Never add `apt-get install` / `pip install` to CI workflows. See `AGENTS.md`.
 
@@ -105,7 +108,7 @@ tests/integration/ — Python pytest integration tests
 3. Add new dependencies with `find_package` or `find_library`.
 4. When adding a new executable target, follow the pattern of existing targets.
 5. When adding a new library (static/shared), use `add_library` and follow the project's naming.
-6. For sanitizer builds, pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (matching CI's matrix strategy).
+6. For sanitizer builds, pass `-DSANITIZER=address`, `-DSANITIZER=thread`, or `-DSANITIZER=undefined` to cmake (matching CI's matrix strategy).
 7. Always verify the build compiles after changes.
 
 ## Sanitizer Configurations
@@ -119,11 +122,9 @@ cmake -B build -S . -DSANITIZER=thread    # ThreadSanitizer (race conditions)
 cmake --build build -j$(nproc)
 ```
 
-For UndefinedBehaviorSanitizer (no `-DSANITIZER=undefined` option in CMakeLists.txt yet), use the manual flag approach:
+UndefinedBehaviorSanitizer uses the same built-in option:
 ```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
+cmake -B build -S . -DSANITIZER=undefined
 cmake --build build -j$(nproc)
 ```
 

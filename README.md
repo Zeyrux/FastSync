@@ -314,7 +314,7 @@ ssh user@host 'mkdir -p destination'
 Start the FastSync server:
 
 ```bash
-./build/server --destination-root /path/to -p 8080
+./build/server --destination-root /path/to -p 8080 --allow-unauthenticated
 ```
 
 Then run the client:
@@ -366,7 +366,7 @@ FastSync-native are optional performance or transport extensions.
 ./build/client --incremental --checksum /source/ user@host:destination/
 
 #Preserve supported mode and timestamp metadata
-./build/client -M /source/ user@host:destination/
+./build/client --preserve /source/ user@host:destination/
 
 #Keep backups of overwritten destination files
 ./build/client --backup --backup-dir backups \
@@ -643,7 +643,7 @@ Run the unit test binary:
 Run the Python integration suite:
 
 ```bash
-python3 -m pytest tests/
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"
 ```
 
 For stricter local validation:

@@ -125,7 +125,7 @@ STYLE: <count>
 
 If the user wants to post the review as a PR comment:
 ```bash
-tea pr comment <number> --comment "<review report>"
+tea comment --repo TapTap/FastSync <number> "<review report>"
 ```
 
 ## Rules

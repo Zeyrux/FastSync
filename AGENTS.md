@@ -80,7 +80,7 @@ docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fast
 ### If integration tests fail
 Run locally before pushing:
 ```bash
-python3 -m pytest tests/ -v --tb=short
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"
 ```
 
 ## Branch Strategy
