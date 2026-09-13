@@ -40,7 +40,9 @@ static bool protocol_reserve_memory(ProtocolSession* session, size_t charge) {
   }
 }
 
-static void protocol_release_memory_for_session(ProtocolSession* session, size_t charge) {
+void protocol_release_memory_for_session(ProtocolSession* session, size_t charge) {
+  if (!session)
+    return;
   unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
   while (true) {
     unsigned long long remaining = (unsigned long long)charge >= allocated ? 0 : allocated - charge;
@@ -573,6 +575,7 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
     return NULL;
   }
   result->protocol_charge = allocation_size;
+  result->owner = session;
   return result;
 }
 

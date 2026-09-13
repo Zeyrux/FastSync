@@ -9,6 +9,7 @@
 #include "test_credentials.h"
 #include "test_data.h"
 #include "test_daemon_conf.h"
+#include "test_daemon_limits.h"
 #include "test_delay_updates.h"
 #include "test_delta.h"
 #include "test_file.h"
@@ -85,6 +86,7 @@ int main() {
   RUN_TEST(test_client_cli);
   RUN_TEST(test_server);
   RUN_TEST(test_daemon_conf);
+  RUN_TEST(test_daemon_limits);
   RUN_TEST(test_motd);
   RUN_TEST(test_server_cli);
   RUN_TEST(test_fuzz_smoke);

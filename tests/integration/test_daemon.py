@@ -135,7 +135,7 @@ class DaemonManager:
         self._proc = None
         self._port = None
 
-    def start(self, config_path, port_override=None, extra_args=None):
+    def start(self, config_path, port_override=None, extra_args=None, log_path=None):
         self.stop()
         # When no override is given the daemon binds the config file's `port`
         # (the plain config-port path); with an override the --dparam path.
@@ -146,7 +146,8 @@ class DaemonManager:
             cmd += ["--dparam", f"port={port_override}"]
         if extra_args:
             cmd += extra_args
-        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
+        if log_path is None:
+            log_path = os.path.join(TEST_DATA_DIR, "fastsyncd.log")
         log = open(log_path, "w")
         self._proc = subprocess.Popen(
             cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -1208,3 +1209,80 @@ class TestDaemonTLSAuth:
             d.stop()
             os.unlink(client_creds)
             shutil.rmtree(cert_dir, ignore_errors=True)
+
+
+class TestDaemonConnectionLimits:
+    """Wave 8: cross-process per-module / per-source connection caps and the
+    shared auth lockout.  Each test boots its own daemon with a unique port so
+    the shared (per-daemon) registry state is isolated from the module-scoped
+    `daemon` fixture."""
+
+    LOCKOUT_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_lockout.conf")
+    CAPS_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_caps.conf")
+
+    @pytest.mark.ci
+    def test_auth_lockout_exempts_trusted_loopback(self):
+        """`auth lockout threshold = 1`: a trusted loopback peer is EXEMPT from
+        the shared lockout because every local client shares the 127.0.0.1
+        identity, so a single wrong password must not lock out correct-password
+        attempts (that would be a local denial of service).  The shared
+        per-source lockout machinery itself is covered by the daemon_limits unit
+        tests; this locks in the loopback policy and the absence of a stale
+        "locked out" log line."""
+        port = _find_free_port()
+        with open(self.LOCKOUT_CONF, "w") as f:
+            f.write("port = %d\n"
+                    "auth lockout threshold = 1\n"
+                    "auth lockout duration = 300\n"
+                    "\n"
+                    "[locked]\n"
+                    "path = %s\n"
+                    "auth users = alice\n"
+                    % (port, AUTH_MODULE))
+        d = DaemonManager()
+        log_path = os.path.join(TEST_DATA_DIR, f"fastsyncd_lockout_{os.getpid()}.log")
+        try:
+            d.start(self.LOCKOUT_CONF, port_override=port, extra_args=["--password-file", CRED_FILE],
+                    log_path=log_path)
+            log_before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            # First attempt: wrong password -> a failure is logged, but a loopback
+            # peer is not counted toward the lockout.
+            wrong = _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
+            assert wrong.returncode != 0
+            # Second attempt: the correct password from the same local source must
+            # still be accepted (no lockout), which also runs the SCRAM handshake
+            # to completion in a fresh forked child.
+            right = _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
+            assert right.returncode == 0, (right.stderr or right.stdout)
+            time.sleep(0.3)
+            with open(log_path, "rb") as f:
+                f.seek(log_before)
+                tail = f.read().decode("utf-8", "replace")
+            assert "locked out" not in tail, tail[-400:]
+        finally:
+            d.stop()
+
+    def test_caps_keys_accepted_and_transfer_still_works(self):
+        """A daemon configured with the new keys (per-host cap, lockout threshold
+        and duration, per-module cap) starts and serves a normal transfer."""
+        port = _find_free_port()
+        with open(self.CAPS_CONF, "w") as f:
+            f.write("port = %d\n"
+                    "max connections per host = 5\n"
+                    "auth lockout threshold = 3\n"
+                    "auth lockout duration = 60\n"
+                    "\n"
+                    "[files]\n"
+                    "path = %s\n"
+                    "max connections = 2\n"
+                    % (port, FILES_MODULE))
+        d = DaemonManager()
+        try:
+            d.start(self.CAPS_CONF, port_override=port)
+            result = _push("127.0.0.1::files", port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(FILES_MODULE, SOURCE_DIR)
+            _, missing = verify_transfer(SOURCE_DIR, received)
+            assert not missing, f"missing: {missing[:5]}"
+        finally:
+            d.stop()

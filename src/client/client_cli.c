@@ -608,7 +608,15 @@ typedef struct {
   size_t offset; /* offsetof of the boolean target field in Config */
 } NegatableOption;
 
-/* Options that map directly onto a Config field with no side effects. */
+/* Options that map directly onto a Config field with no side effects.
+ *
+ * NOTE: these CLI tables are intentionally NOT generated from the wire-field
+ * X-macro table in config.h.  The two sets only overlap partially: the CLI
+ * surface also carries client-only fields that never cross the wire (rsh,
+ * outbuf, remote-option, batch paths, trust-sender, ...) and needs flag/alias/
+ * negation semantics that the wire table does not model.  Keeping them
+ * hand-maintained is deliberate; the shared contract is enforced at the wire
+ * boundary by config.[ch] and the golden test. */
 static const OptionEntry OPTION_TABLE[] = {
     {"--dry-run", "-n", OPT_FLAG, offsetof(Config, dry_run)},
     {"--remove-source-files", NULL, OPT_FLAG, offsetof(Config, remove_source_files)},

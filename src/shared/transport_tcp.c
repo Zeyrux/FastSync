@@ -1,4 +1,5 @@
 #include "transport_tcp.h"
+#include "daemon_limits.h"
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
@@ -8,6 +9,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/ssl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,17 +20,43 @@
 
 static volatile sig_atomic_t g_active_connections = 0;
 
+/* Shared registry installed on the active server; the SIGCHLD handler needs a
+ * file-scope pointer so it can reclaim the dead child's slot.  Set once by
+ * accept_loop before the fork loop (single-threaded parent). */
+static DaemonLimitRegistry* g_limit_registry = NULL;
+/* Slot reserved by the parent for the connection child currently being forked.
+ * Written before fork(), read by the child (which inherits the value). */
+static int g_current_slot = DAEMON_LIMITS_NO_SLOT;
+
 static void tcp_apply_socket_timeout(int fd);
 static void tcp_enable_nodelay_default(int fd, int family);
 
 static void sigchld_handler(int sig) {
   (void)sig;
   int saved_errno = errno;
-  while (waitpid(-1, NULL, WNOHANG) > 0) {
+  pid_t pid;
+  while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
     if (g_active_connections > 0)
       g_active_connections--;
+    daemon_limits_reclaim_pid(g_limit_registry, (long)pid);
   }
+  /* Re-derive the occupancy counters once for the whole reap batch.  The slot
+   * table is the source of truth, so this self-heals any count leaked by a child
+   * SIGKILLed mid-registration.  Atomics only: async-signal-safe. */
+  if (g_limit_registry)
+    daemon_limits_recompute(g_limit_registry);
   errno = saved_errno;
+}
+
+/* Reset a signal to its default action with sigaction (preferred over
+ * signal(3), whose semantics are implementation-defined).  Used in the forked
+ * child before it can spawn any thread. */
+static void reset_signal_default(int sig) {
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = SIG_DFL;
+  sigemptyset(&action.sa_mask);
+  sigaction(sig, &action, NULL);
 }
 
 /* Map a listen socket's address to its numeric port for logging, independent
@@ -108,6 +136,7 @@ Server* server_create_ex(int port, const ServerBindOptions* bind_opts) {
   server->ssl_ctx = NULL;
   server->max_connections = 100;
   server->active_connections = 0;
+  server->limit_registry = NULL;
 
   return server;
 }
@@ -119,6 +148,15 @@ Server* server_create(int port) {
 void server_set_max_connections(Server* server, unsigned int max_connections) {
   if (server && max_connections > 0)
     server->max_connections = max_connections;
+}
+
+void server_set_limit_registry(Server* server, struct DaemonLimitRegistry* registry) {
+  if (server)
+    server->limit_registry = registry;
+}
+
+int transport_tcp_current_slot(void) {
+  return g_current_slot;
 }
 
 void server_delete(Server** server) {
@@ -139,7 +177,17 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     log_perror("Could not listen on port!");
     return;
   }
-  signal(SIGCHLD, sigchld_handler);
+  /* SIGCHLD via sigaction (not signal(3)); SA_RESTART keeps accept(2) from
+   * failing with EINTR, and SA_NOCLDSTOP only notifies on child exit.  The
+   * accept loop is single-threaded at this point, so installing here cannot race
+   * a worker thread. */
+  struct sigaction chld_action;
+  memset(&chld_action, 0, sizeof(chld_action));
+  chld_action.sa_handler = sigchld_handler;
+  sigemptyset(&chld_action.sa_mask);
+  chld_action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+  sigaction(SIGCHLD, &chld_action, NULL);
+  g_limit_registry = server->limit_registry;
   while (1) {
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -159,9 +207,37 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       close(fd);
       continue;
     }
+    int slot = DAEMON_LIMITS_NO_SLOT;
+    if (server->limit_registry) {
+      slot = daemon_limits_claim_slot(server->limit_registry);
+      if (slot == DAEMON_LIMITS_NO_SLOT) {
+        /* The global cap bounds live children, so this only happens when the
+         * fixed registry is smaller than the configured cap; fail closed. */
+        log_message(LOG_LEVEL_WARNING, "Connection registry slots exhausted (max %u), rejecting %s",
+                    server->max_connections, peer);
+        close(fd);
+        continue;
+      }
+    }
     log_message(LOG_LEVEL_INFO, "%s from %s", log_fmt, peer);
+    g_current_slot = slot;
+    /* Block SIGCHLD across fork() and the parent's pid publication: a child
+     * that exits immediately must not be reaped before its slot records its
+     * pid, which would leak the slot and its module/source counts.  Use
+     * pthread_sigmask rather than sigprocmask so the behavior is well defined
+     * even if this process ever gains threads: the mask is per-thread, the fork
+     * copies only the calling thread, and the child inherits this thread's
+     * blocked mask until it restores `previous` below.  No thread exists yet at
+     * this point, and none is created before the mask is restored, so the
+     * critical window is race-free. */
+    sigset_t blocked;
+    sigset_t previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &blocked, &previous);
     pid_t pid = fork();
     if (pid == 0) {
+      pthread_sigmask(SIG_SETMASK, &previous, NULL);
       /* Connection children must not run the parent's global cleanup(): it
        * frees state (credentials / daemon conf) that the child's worker
        * threads may still be reading and closes fd numbers the child could
@@ -169,15 +245,21 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
        * terminates the child directly; SIGCHLD is reset too since a child
        * must never reap the parent's children.  This runs before the child
        * spawns any thread, so it cannot race one. */
-      signal(SIGINT, SIG_DFL);
-      signal(SIGTERM, SIG_DFL);
-      signal(SIGCHLD, SIG_DFL);
+      reset_signal_default(SIGINT);
+      reset_signal_default(SIGTERM);
+      reset_signal_default(SIGCHLD);
       close(server->file_descriptor);
       child_fn(fd, child_ctx);
       _exit(0);
     } else if (pid > 0) {
       g_active_connections++;
+      if (server->limit_registry)
+        daemon_limits_set_slot_pid(server->limit_registry, slot, (long)pid);
+    } else if (server->limit_registry) {
+      /* fork() failed: release the reservation so the slot is not leaked. */
+      daemon_limits_reclaim_slot(server->limit_registry, slot);
     }
+    pthread_sigmask(SIG_SETMASK, &previous, NULL);
     close(fd);
   }
 }

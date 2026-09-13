@@ -86,6 +86,7 @@ set(SHARED_SRCS
 	src/shared/config.c
 	src/shared/credentials.c
 	src/shared/daemon_conf.c
+	src/shared/daemon_limits.c
 	src/shared/data.c
 	src/shared/delay_updates.c
 	src/shared/delta.c
@@ -205,6 +206,7 @@ set(TEST_SRCS
 	tests/test_config.c
 	tests/test_credentials.c
 	tests/test_daemon_conf.c
+	tests/test_daemon_limits.c
 	tests/test_data.c
 	tests/test_delay_updates.c
 	tests/test_delta.c
