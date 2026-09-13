@@ -90,63 +90,65 @@ void metadata_to_buf(char** buf, const FileMetadata* m) {
   *buf += sizeof(crtime_nsec);
 }
 
-FileMetadata* metadata_from_buf(char** buf) {
+FileMetadata* metadata_from_buf(const uint8_t* buf, size_t len) {
+  if (buf == NULL || len < sizeof(int32_t))
+    return NULL;
   int32_t present;
-  memcpy(&present, *buf, sizeof(present));
-  *buf += sizeof(present);
-  if (present != 0 && present != 1)
+  memcpy(&present, buf, sizeof(present));
+  if (present != 1)
     return NULL;
-  if (!present)
+  if (len < sizeof(int32_t) + FILE_METADATA_WIRE_SIZE)
     return NULL;
+  const uint8_t* cursor = buf + sizeof(int32_t);
   FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
   if (m == NULL)
     return NULL;
   int32_t mode;
-  memcpy(&mode, *buf, sizeof(mode));
-  *buf += sizeof(mode);
+  memcpy(&mode, cursor, sizeof(mode));
+  cursor += sizeof(mode);
   m->mode = (mode_t)mode;
   int32_t uid;
-  memcpy(&uid, *buf, sizeof(uid));
-  *buf += sizeof(uid);
+  memcpy(&uid, cursor, sizeof(uid));
+  cursor += sizeof(uid);
   m->uid = (uid_t)uid;
   int32_t gid;
-  memcpy(&gid, *buf, sizeof(gid));
-  *buf += sizeof(gid);
+  memcpy(&gid, cursor, sizeof(gid));
+  cursor += sizeof(gid);
   m->gid = (gid_t)gid;
   int64_t mtime_sec;
-  memcpy(&mtime_sec, *buf, sizeof(mtime_sec));
-  *buf += sizeof(mtime_sec);
+  memcpy(&mtime_sec, cursor, sizeof(mtime_sec));
+  cursor += sizeof(mtime_sec);
   m->mtime_sec = (time_t)mtime_sec;
   int64_t mtime_nsec;
-  memcpy(&mtime_nsec, *buf, sizeof(mtime_nsec));
-  *buf += sizeof(mtime_nsec);
+  memcpy(&mtime_nsec, cursor, sizeof(mtime_nsec));
+  cursor += sizeof(mtime_nsec);
   m->mtime_nsec = (long)mtime_nsec;
   int32_t atime_valid;
-  memcpy(&atime_valid, *buf, sizeof(atime_valid));
-  *buf += sizeof(atime_valid);
+  memcpy(&atime_valid, cursor, sizeof(atime_valid));
+  cursor += sizeof(atime_valid);
   int64_t atime_sec;
-  memcpy(&atime_sec, *buf, sizeof(atime_sec));
-  *buf += sizeof(atime_sec);
+  memcpy(&atime_sec, cursor, sizeof(atime_sec));
+  cursor += sizeof(atime_sec);
   int64_t atime_nsec;
-  memcpy(&atime_nsec, *buf, sizeof(atime_nsec));
-  *buf += sizeof(atime_nsec);
+  memcpy(&atime_nsec, cursor, sizeof(atime_nsec));
+  cursor += sizeof(atime_nsec);
   int32_t crtime_valid;
-  memcpy(&crtime_valid, *buf, sizeof(crtime_valid));
-  *buf += sizeof(crtime_valid);
+  memcpy(&crtime_valid, cursor, sizeof(crtime_valid));
+  cursor += sizeof(crtime_valid);
   int64_t crtime_sec;
-  memcpy(&crtime_sec, *buf, sizeof(crtime_sec));
-  *buf += sizeof(crtime_sec);
+  memcpy(&crtime_sec, cursor, sizeof(crtime_sec));
+  cursor += sizeof(crtime_sec);
   int64_t crtime_nsec;
-  memcpy(&crtime_nsec, *buf, sizeof(crtime_nsec));
-  *buf += sizeof(crtime_nsec);
+  memcpy(&crtime_nsec, cursor, sizeof(crtime_nsec));
+  cursor += sizeof(crtime_nsec);
   m->atime_valid = atime_valid != 0;
   m->atime_sec = (time_t)atime_sec;
   m->atime_nsec = (long)atime_nsec;
   m->crtime_valid = crtime_valid != 0;
   m->crtime_sec = (time_t)crtime_sec;
   m->crtime_nsec = (long)crtime_nsec;
-  if (present != 1 || mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 ||
-      gid < 0 || atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
+  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0 ||
+      atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
       (atime_valid && (atime_nsec < 0 || atime_nsec >= 1000000000LL)) ||
       (crtime_valid && (crtime_nsec < 0 || crtime_nsec >= 1000000000LL))) {
     free(m);
@@ -196,8 +198,7 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  char* cursor = packed;
-  FileMetadata* m = metadata_from_buf(&cursor);
+  FileMetadata* m = metadata_from_buf((const uint8_t*)packed, sizeof(packed));
   if (m == NULL) {
     if (ok)
       *ok = 0;

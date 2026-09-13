@@ -128,8 +128,7 @@ static void test_fuzz_metadata_from_buf() {
   EXPECT_EQ_INT((int)(meta_ptr - meta_buf), (int)meta_buf_size);
 
   /* Deserialize from buffer (simulates fuzz_metadata_from_buf) */
-  char* buf_copy = meta_buf;
-  FileMetadata* deserialized = metadata_from_buf(&buf_copy);
+  FileMetadata* deserialized = metadata_from_buf((const uint8_t*)meta_buf, (size_t)meta_buf_size);
   EXPECT_NOT_NULL(deserialized);
   EXPECT_EQ_INT((int)deserialized->mode, (int)meta->mode);
   EXPECT_EQ_INT((int)deserialized->mtime_sec, (int)meta->mtime_sec);
