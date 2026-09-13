@@ -3,6 +3,7 @@
 #include "config.h"
 #include "protocol.h"
 #include "queue.h"
+#include "receiver_pipeline.h"
 #include "utils.h"
 #include "test_utils.h"
 #include <stdio.h>
