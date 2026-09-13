@@ -37,6 +37,7 @@ static void test_sender_create_destroy() {
   EXPECT_NULL(ctx->manifest);
 
   pipeline_context_sender_destroy(ctx);
+  config_delete(cfg); /* the context borrows cfg; the caller owns it */
 }
 
 /* Test pipeline_context_receiver_create/destroy with valid arguments */
@@ -80,6 +81,7 @@ static void test_sender_queue_capacities() {
   EXPECT_EQ_INT(ctx->queue_scanner->capacity, 1);
   EXPECT_EQ_INT(ctx->queue_loader->capacity, 1);
   pipeline_context_sender_destroy(ctx);
+  config_delete(cfg); /* the context borrows cfg; the caller owns it */
 }
 
 /* Invalid queue capacities must not create unusable pipeline queues. */
@@ -445,8 +447,9 @@ static void test_sender_enqueue_byte_budget() {
   EXPECT_EQ_INT((int)ctx->queued_bytes, 2000); /* second payload now in flight */
 
   /* pipeline_context_sender_destroy frees the still-queued second chunk and
-     owns cfg/q_scanner/q_loader from here on. */
+     owns q_scanner/q_loader; cfg stays borrowed and is freed by the caller. */
   pipeline_context_sender_destroy(ctx);
+  config_delete(cfg);
 }
 
 void test_multiprocessing() {

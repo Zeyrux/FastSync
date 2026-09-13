@@ -1239,6 +1239,20 @@ class TestProgress:
         assert "Stats:" in result.stderr
         assert "KB" in result.stderr
 
+    def test_human_readable_stats_multithreaded(self, shared_server):
+        # The multithreaded sender shares the single-threaded --stats format,
+        # including --human-readable and the rate suffix.
+        clean_dir(DEST_DIR)
+        result, dur = run_client(
+            SOURCE_DIR, DEST_DIR,
+            flags=["--threads", "-h", "--stats"],
+            port=shared_server.port,
+        )
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
+        assert "Stats:" in result.stderr
+        assert "KB" in result.stderr
+        assert "/s" in result.stderr
+
     def test_human_readable_progress_multithreaded(self, shared_server):
         clean_dir(DEST_DIR)
         result, dur = run_client(

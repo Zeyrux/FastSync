@@ -383,6 +383,7 @@ static void test_pipeline_sender_lifecycle() {
   EXPECT_EQ_INT((int)pcs->allocation_session.max_alloc, (int)cfg->max_alloc);
 
   pipeline_context_sender_destroy(pcs);
+  config_delete(cfg); /* the context borrows cfg; the caller owns it */
 }
 
 static void test_pipeline_receiver_lifecycle() {
