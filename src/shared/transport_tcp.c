@@ -115,6 +115,11 @@ Server* server_create(int port) {
   return server_create_ex(port, NULL);
 }
 
+void server_set_max_connections(Server* server, unsigned int max_connections) {
+  if (server && max_connections > 0)
+    server->max_connections = max_connections;
+}
+
 void server_delete(Server** server) {
   if (server == NULL || *server == NULL)
     return;
@@ -135,7 +140,7 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
   }
   signal(SIGCHLD, sigchld_handler);
   while (1) {
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
     int fd = accept(server->file_descriptor, (struct sockaddr*)&client_addr, &client_len);
     if (fd < 0) {
@@ -143,13 +148,16 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       continue;
     }
     tcp_apply_socket_timeout(fd);
+    char peer[128];
+    if (!utils_sockaddr_to_string((const struct sockaddr*)&client_addr, peer, sizeof(peer)))
+      snprintf(peer, sizeof(peer), "unknown");
     if ((unsigned int)g_active_connections >= server->max_connections) {
-      log_message(LOG_LEVEL_WARNING, "Max connections (%u) reached, rejecting",
-                  server->max_connections);
+      log_message(LOG_LEVEL_WARNING, "Max connections (%u) reached, rejecting %s",
+                  server->max_connections, peer);
       close(fd);
       continue;
     }
-    log_message(LOG_LEVEL_INFO, "%s", log_fmt);
+    log_message(LOG_LEVEL_INFO, "%s from %s", log_fmt, peer);
     pid_t pid = fork();
     if (pid == 0) {
       /* Connection children must not run the parent's global cleanup(): it

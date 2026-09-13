@@ -51,6 +51,7 @@ READONLY_MODULE = os.path.join(MODULE_ROOT, "readonly")
 AUTH_MODULE = os.path.join(MODULE_ROOT, "auth")
 TEAM_MODULE = os.path.join(MODULE_ROOT, "team")
 OWNER_MODULE = os.path.join(MODULE_ROOT, "owner")
+DENIED_MODULE = os.path.join(MODULE_ROOT, "denied")
 CONF_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.conf")
 CRED_FILE = os.path.join(TEST_DATA_DIR, "fastsyncd.passwd")
 STARTFAIL_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_startfail.conf")
@@ -191,7 +192,7 @@ def _config_port(config_path):
 @pytest.fixture(scope="module", autouse=True)
 def daemon_env():
     for d in (MODULE_ROOT, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE,
-              DETACH_MODULE):
+              DENIED_MODULE, DETACH_MODULE):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     generate_test_files(SOURCE_DIR, full=False)
@@ -231,7 +232,12 @@ def daemon_env():
             "[owner]\n"
             "path = %s\n"
             "client owner = yes\n"
-            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE))
+            "\n"
+            "[denied]\n"
+            "path = %s\n"
+            "hosts deny = 127.0.0.1\n"
+            % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE,
+               DENIED_MODULE))
 
     # A dedicated config for the fail-closed startup check: an auth-required
     # module with no credential store must refuse to start.  Its own free port
@@ -367,6 +373,15 @@ class TestDaemonRejection:
         assert result.returncode != 0
         result = _push("127.0.0.1::/sub", daemon.port)
         assert result.returncode != 0
+
+    @pytest.mark.ci
+    def test_hosts_deny_rejects_loopback(self, daemon):
+        """Host access control: a module with `hosts deny = 127.0.0.1` refuses a
+        loopback client at the config gate, before any data is exchanged."""
+        before = self._tree_files()
+        result = _push("127.0.0.1::denied", daemon.port)
+        assert result.returncode != 0
+        assert self._tree_files() == before, "host-denied connection wrote under the module root"
 
     def test_dotdot_destination_rejected(self, daemon):
         """A '..' path expansion in the module-relative path is refused at parse

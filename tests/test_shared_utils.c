@@ -356,6 +356,69 @@ static void test_loopback_helpers() {
   close(listener);
 }
 
+/* The daemon host ACL reads the numeric peer address through
+ * utils_fd_peer_ip.  A real loopback TCP peer reports "127.0.0.1"; a pipe or an
+ * AF_UNIX socketpair has no INET peer and must return false with an empty
+ * buffer (the fail-closed "cannot tell" result). */
+static void test_fd_peer_ip() {
+  char ip[INET6_ADDRSTRLEN];
+  EXPECT_FALSE(utils_fd_peer_ip(-1, ip, sizeof(ip)));
+  EXPECT_EQ_STR(ip, "");
+  EXPECT_FALSE(utils_fd_peer_ip(-1, NULL, 0));
+
+  int pipe_fds[2];
+  EXPECT_EQ_INT(pipe(pipe_fds), 0);
+  EXPECT_FALSE(utils_fd_peer_ip(pipe_fds[0], ip, sizeof(ip)));
+  EXPECT_EQ_STR(ip, "");
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+
+  int pair_fds[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, pair_fds), 0);
+  EXPECT_FALSE(utils_fd_peer_ip(pair_fds[0], ip, sizeof(ip)));
+  EXPECT_EQ_STR(ip, "");
+  close(pair_fds[0]);
+  close(pair_fds[1]);
+
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(listener >= 0);
+  struct sockaddr_in bind_addr;
+  memset(&bind_addr, 0, sizeof(bind_addr));
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bind_addr.sin_port = 0;
+  EXPECT_EQ_INT(bind(listener, (const struct sockaddr*)&bind_addr, sizeof(bind_addr)), 0);
+  EXPECT_EQ_INT(listen(listener, 1), 0);
+  socklen_t addr_len = sizeof(bind_addr);
+  EXPECT_EQ_INT(getsockname(listener, (struct sockaddr*)&bind_addr, &addr_len), 0);
+  int dialer = socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(dialer >= 0);
+  EXPECT_EQ_INT(connect(dialer, (const struct sockaddr*)&bind_addr, sizeof(bind_addr)), 0);
+  int accepted = accept(listener, NULL, NULL);
+  EXPECT_TRUE(accepted >= 0);
+  EXPECT_TRUE(utils_fd_peer_ip(accepted, ip, sizeof(ip)));
+  EXPECT_EQ_STR(ip, "127.0.0.1");
+
+  /* utils_sockaddr_to_string includes the port for a real peer. */
+  struct sockaddr_storage peer;
+  socklen_t peer_len = sizeof(peer);
+  EXPECT_EQ_INT(getpeername(accepted, (struct sockaddr*)&peer, &peer_len), 0);
+  char peer_string[128];
+  EXPECT_TRUE(
+      utils_sockaddr_to_string((const struct sockaddr*)&peer, peer_string, sizeof(peer_string)));
+  EXPECT_TRUE(strncmp(peer_string, "127.0.0.1:", strlen("127.0.0.1:")) == 0);
+  close(accepted);
+  close(dialer);
+  close(listener);
+
+  /* A non-INET family formats to "unknown" at the call site, not a bogus IP. */
+  struct sockaddr sa_unix;
+  memset(&sa_unix, 0, sizeof(sa_unix));
+  sa_unix.sa_family = AF_UNIX;
+  EXPECT_FALSE(utils_sockaddr_to_string(&sa_unix, peer_string, sizeof(peer_string)));
+  EXPECT_EQ_STR(peer_string, "");
+}
+
 void test_shared_utils() {
   test_walker_removes_extras_keeps_manifest_and_protected();
   test_walker_max_delete_exceeded_deletes_nothing();
@@ -363,6 +426,7 @@ void test_shared_utils() {
   test_walker_unlimited_deletes_all();
   test_walker_hard_bound_all_or_nothing();
   test_loopback_helpers();
+  test_fd_peer_ip();
 
   /* --append / --append-verify tail-resume math: a resume is eligible only for
      a shorter existing destination, and the tail length is then the difference. */

@@ -1,9 +1,13 @@
 #include "daemon_conf.h"
 #include "credentials.h"
 #include "utils.h"
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
+#include <netinet/in.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +53,144 @@ static bool parse_bool_value(const char* value, bool* out) {
   return false;
 }
 
+/* Parse an IPv4/IPv6 CIDR "addr/prefix" into `bytes`/`*family`.  Returns false
+ * for a malformed address, a missing/oversized prefix, or a prefix that does
+ * not fit the address family. */
+static bool parse_cidr(const char* cidr, int* prefix_out, uint8_t* bytes, int* family_out) {
+  const char* slash = strchr(cidr, '/');
+  if (!slash)
+    return false;
+  size_t addr_len = (size_t)(slash - cidr);
+  if (addr_len == 0 || addr_len >= INET6_ADDRSTRLEN)
+    return false;
+  char addr[INET6_ADDRSTRLEN];
+  memcpy(addr, cidr, addr_len);
+  addr[addr_len] = '\0';
+  char* end = NULL;
+  long prefix = strtol(slash + 1, &end, 10);
+  if (end == slash + 1 || *end != '\0')
+    return false;
+  struct in_addr v4;
+  struct in6_addr v6;
+  if (inet_pton(AF_INET, addr, &v4) == 1) {
+    if (prefix < 0 || prefix > 32)
+      return false;
+    memcpy(bytes, &v4, sizeof(v4));
+    *prefix_out = (int)prefix;
+    *family_out = AF_INET;
+    return true;
+  }
+  if (inet_pton(AF_INET6, addr, &v6) == 1) {
+    if (prefix < 0 || prefix > 128)
+      return false;
+    memcpy(bytes, &v6, sizeof(v6));
+    *prefix_out = (int)prefix;
+    *family_out = AF_INET6;
+    return true;
+  }
+  return false;
+}
+
+/* A host pattern is valid when it is non-empty and, when it contains a '/', its
+ * address/prefix halves parse as a CIDR.  Literals, `*` and globs are accepted
+ * as-is (a glob only ever matches a peer of the same shape). */
+static bool host_pattern_valid(const char* pattern) {
+  if (!pattern || *pattern == '\0')
+    return false;
+  if (!strchr(pattern, '/'))
+    return true;
+  uint8_t bytes[16];
+  int prefix;
+  int family;
+  return parse_cidr(pattern, &prefix, bytes, &family);
+}
+
+/* Append every comma- and/or whitespace-separated host pattern in `value` to
+ * the heap-owned list.  Returns false (err filled) on an invalid pattern or an
+ * allocation failure. */
+static bool store_host_list(char*** list, int* count, const char* value, const char* key,
+                            const char* module_name, char* err, size_t err_size) {
+  char* copy = str_dup(value);
+  if (!copy) {
+    if (module_name)
+      set_error(err, err_size, "out of memory parsing '%s' for module '%s'", key, module_name);
+    else
+      set_error(err, err_size, "out of memory parsing '%s'", key);
+    return false;
+  }
+  char* save = NULL;
+  for (char* token = strtok_r(copy, ", \t", &save); token; token = strtok_r(NULL, ", \t", &save)) {
+    if (!host_pattern_valid(token)) {
+      if (module_name)
+        set_error(err, err_size, "module '%s': invalid host pattern '%s' in '%s'", module_name,
+                  token, key);
+      else
+        set_error(err, err_size, "invalid host pattern '%s' in '%s'", token, key);
+      free(copy);
+      return false;
+    }
+    char** grown = realloc(*list, (size_t)(*count + 1) * sizeof(char*));
+    if (!grown) {
+      if (module_name)
+        set_error(err, err_size, "out of memory parsing '%s' for module '%s'", key, module_name);
+      else
+        set_error(err, err_size, "out of memory parsing '%s'", key);
+      free(copy);
+      return false;
+    }
+    *list = grown;
+    char* dup = str_dup(token);
+    if (!dup) {
+      if (module_name)
+        set_error(err, err_size, "out of memory parsing '%s' for module '%s'", key, module_name);
+      else
+        set_error(err, err_size, "out of memory parsing '%s'", key);
+      free(copy);
+      return false;
+    }
+    (*list)[(*count)++] = dup;
+  }
+  free(copy);
+  return true;
+}
+
+/* Parse a `max connections` value: a positive integer (0/negative/garbage are
+ * rejected because they would silently disable the cap or admit nothing). */
+static bool store_max_connections(int* slot, const char* value, const char* module_name, char* err,
+                                  size_t err_size) {
+  char* end = NULL;
+  errno = 0;
+  long n = strtol(value, &end, 10);
+  if (*value == '\0' || errno != 0 || *end != '\0' || n <= 0 || n > INT_MAX) {
+    if (module_name)
+      set_error(err, err_size,
+                "module '%s': invalid 'max connections' '%s' (must be a positive "
+                "integer)",
+                module_name, value);
+    else
+      set_error(err, err_size, "invalid 'max connections' '%s' (must be a positive integer)",
+                value);
+    return false;
+  }
+  *slot = (int)n;
+  return true;
+}
+
+/* Parse an `auth failure delay` value: 0 (disabled) through the configured cap. */
+static bool store_auth_failure_delay(int* slot, const char* value, char* err, size_t err_size) {
+  char* end = NULL;
+  errno = 0;
+  long n = strtol(value, &end, 10);
+  if (*value == '\0' || errno != 0 || *end != '\0' || n < 0 ||
+      n > DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS) {
+    set_error(err, err_size, "invalid 'auth failure delay' '%s' (must be 0-%d milliseconds)", value,
+              DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS);
+    return false;
+  }
+  *slot = (int)n;
+  return true;
+}
+
 bool daemon_module_name_valid(const char* name) {
   if (!name || *name == '\0')
     return false;
@@ -69,7 +211,16 @@ DaemonConf* daemon_conf_create(void) {
   if (!conf)
     return NULL;
   conf->global.port = DAEMON_CONF_DEFAULT_PORT;
+  conf->global.max_connections = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS;
+  conf->global.auth_failure_delay_ms = DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS;
   return conf;
+}
+
+/* Free a heap-owned pattern list of `count` entries. */
+static void free_string_list(char** list, int count) {
+  for (int i = 0; i < count; i++)
+    free(list[i]);
+  free(list);
 }
 
 void daemon_conf_free(DaemonConf* conf) {
@@ -77,6 +228,8 @@ void daemon_conf_free(DaemonConf* conf) {
     return;
   free(conf->global.motd_file);
   free(conf->global.address);
+  free_string_list(conf->global.hosts_allow, conf->global.hosts_allow_count);
+  free_string_list(conf->global.hosts_deny, conf->global.hosts_deny_count);
   for (int i = 0; i < conf->module_count; i++) {
     DaemonModule* m = &conf->modules[i];
     free(m->name);
@@ -84,6 +237,8 @@ void daemon_conf_free(DaemonConf* conf) {
     for (int j = 0; j < m->auth_user_count; j++)
       free(m->auth_users[j]);
     free(m->auth_users);
+    free_string_list(m->hosts_allow, m->hosts_allow_count);
+    free_string_list(m->hosts_deny, m->hosts_deny_count);
   }
   free(conf->modules);
   free(conf);
@@ -141,6 +296,16 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, cha
     }
     return true;
   }
+  if (key_equals(key, "max connections"))
+    return store_max_connections(&conf->global.max_connections, value, NULL, err, err_size);
+  if (key_equals(key, "auth failure delay"))
+    return store_auth_failure_delay(&conf->global.auth_failure_delay_ms, value, err, err_size);
+  if (key_equals(key, "hosts allow"))
+    return store_host_list(&conf->global.hosts_allow, &conf->global.hosts_allow_count, value,
+                           "hosts allow", NULL, err, err_size);
+  if (key_equals(key, "hosts deny"))
+    return store_host_list(&conf->global.hosts_deny, &conf->global.hosts_deny_count, value,
+                           "hosts deny", NULL, err, err_size);
   set_error(err, err_size, "unknown global key '%s'", key);
   return false;
 }
@@ -220,6 +385,14 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     free(list);
     return true;
   }
+  if (key_equals(key, "max connections"))
+    return store_max_connections(&module->max_connections, value, module->name, err, err_size);
+  if (key_equals(key, "hosts allow"))
+    return store_host_list(&module->hosts_allow, &module->hosts_allow_count, value, "hosts allow",
+                           module->name, err, err_size);
+  if (key_equals(key, "hosts deny"))
+    return store_host_list(&module->hosts_deny, &module->hosts_deny_count, value, "hosts deny",
+                           module->name, err, err_size);
   set_error(err, err_size, "unknown key '%s' in module '%s'", key, module->name);
   return false;
 }
@@ -458,4 +631,87 @@ int daemon_conf_apply_dparam(DaemonConf* conf, const char* assignment, char* err
   bool ok = apply_global_key(conf, key, value, err, err_size);
   free(copy);
   return ok ? 0 : -1;
+}
+
+/* Compare the first `prefix` bits of two 16-byte address buffers. */
+static bool bit_prefix_match(const uint8_t* a, const uint8_t* b, int prefix) {
+  int whole = prefix / 8;
+  if (whole > 0 && memcmp(a, b, (size_t)whole) != 0)
+    return false;
+  int remainder = prefix % 8;
+  if (remainder == 0)
+    return true;
+  uint8_t mask = (uint8_t)(0xffu << (8 - remainder));
+  return (a[whole] & mask) == (b[whole] & mask);
+}
+
+/* Case-insensitive glob match used for hostname patterns.  Falls back to the
+ * shared case-sensitive matcher when an operand is too long for the stack
+ * buffers. */
+static bool host_glob_match(const char* pattern, const char* str) {
+  char pbuf[256];
+  char sbuf[256];
+  size_t plen = strlen(pattern);
+  size_t slen = strlen(str);
+  if (plen >= sizeof(pbuf) || slen >= sizeof(sbuf))
+    return glob_match(pattern, str);
+  for (size_t i = 0; i <= plen; i++)
+    pbuf[i] = (char)tolower((unsigned char)pattern[i]);
+  for (size_t i = 0; i <= slen; i++)
+    sbuf[i] = (char)tolower((unsigned char)str[i]);
+  return glob_match(pbuf, sbuf);
+}
+
+bool daemon_host_pattern_match(const char* pattern, const char* peer_ip) {
+  if (!pattern || *pattern == '\0' || !peer_ip || *peer_ip == '\0')
+    return false;
+  if (strcmp(pattern, "*") == 0)
+    return true;
+  if (strchr(pattern, '/')) {
+    uint8_t pattern_bytes[16];
+    uint8_t peer_bytes[16];
+    int prefix = 0;
+    int family = AF_UNSPEC;
+    if (!parse_cidr(pattern, &prefix, pattern_bytes, &family))
+      return false;
+    if (inet_pton(family, peer_ip, peer_bytes) != 1)
+      return false;
+    return bit_prefix_match(pattern_bytes, peer_bytes, prefix);
+  }
+  struct in_addr pattern_v4;
+  struct in_addr peer_v4;
+  if (inet_pton(AF_INET, pattern, &pattern_v4) == 1)
+    return inet_pton(AF_INET, peer_ip, &peer_v4) == 1 && pattern_v4.s_addr == peer_v4.s_addr;
+  struct in6_addr pattern_v6;
+  struct in6_addr peer_v6;
+  if (inet_pton(AF_INET6, pattern, &pattern_v6) == 1)
+    return inet_pton(AF_INET6, peer_ip, &peer_v6) == 1 &&
+           memcmp(&pattern_v6, &peer_v6, sizeof(pattern_v6)) == 0;
+  /* Not a literal: a hostname/glob pattern. */
+  return host_glob_match(pattern, peer_ip);
+}
+
+bool daemon_hosts_allowed(const char* peer_ip, char* const* allow, int allow_count,
+                          char* const* deny, int deny_count) {
+  if (!peer_ip)
+    return false;
+  for (int i = 0; i < deny_count; i++) {
+    if (daemon_host_pattern_match(deny[i], peer_ip))
+      return false;
+  }
+  if (allow_count > 0) {
+    for (int i = 0; i < allow_count; i++) {
+      if (daemon_host_pattern_match(allow[i], peer_ip))
+        return true;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool daemon_hosts_restricted(char* const* allow, int allow_count, char* const* deny,
+                             int deny_count) {
+  (void)allow;
+  (void)deny;
+  return allow_count > 0 || deny_count > 0;
 }

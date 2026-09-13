@@ -487,6 +487,32 @@ defaults to the current directory. |
 | `-v`, `--verbose` | Enable debug logging. |
 | `--help` | Print server usage. |
 
+### Daemon configuration
+
+`fastsync-server --daemon --config FILE` reads a line-based module config (an
+implicit global section, then `[module]` sections). Besides `port`, `motd file`,
+and `address`, the global section accepts:
+
+- `max connections = N` — cap on concurrent connections, default 100. The
+  listener enforces it; `0`, negative, and non-numeric values are parse errors.
+- `auth failure delay = MS` — milliseconds to sleep after a failed
+  authentication, default 500. `0` disables it and the value is capped at 60000,
+  so online password guessing is rate-limited per connection. Successful auths
+  are never delayed.
+- `hosts allow` / `hosts deny` — comma- and/or whitespace-separated host access
+  patterns.
+
+A `[module]` may also set `max connections` (parsed and validated but not
+enforced per module — the global cap applies to the whole listener) and its own
+`hosts allow`/`hosts deny`.
+
+Host patterns are `*` (match all), IPv4/IPv6 literals, IPv4/IPv6 CIDR
+(`10.0.0.0/8`, `2001:db8::/32`), or hostname globs (`*.example.com`). A matching
+`hosts deny` rejects; if any `hosts allow` entries exist, a peer matching none of
+them is rejected; deny takes precedence over allow. The global list is checked
+before the module list, before authentication, and the connecting peer address
+(IPv4 or IPv6) appears in the connection and authentication audit log lines.
+
 ## Architecture
 
 ### Client

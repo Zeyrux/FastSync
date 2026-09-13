@@ -31,6 +31,10 @@ static void test_daemon_conf_create_defaults() {
   EXPECT_EQ_INT(conf->global.port, DAEMON_CONF_DEFAULT_PORT);
   EXPECT_NULL(conf->global.motd_file);
   EXPECT_NULL(conf->global.address);
+  EXPECT_EQ_INT(conf->global.max_connections, DAEMON_CONF_DEFAULT_MAX_CONNECTIONS);
+  EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS);
+  EXPECT_EQ_INT(conf->global.hosts_allow_count, 0);
+  EXPECT_EQ_INT(conf->global.hosts_deny_count, 0);
   EXPECT_EQ_INT(conf->module_count, 0);
   daemon_conf_free(conf);
 }
@@ -310,6 +314,14 @@ static void test_daemon_conf_dparam_override() {
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "port = 9000", err, sizeof(err)), 0);
   EXPECT_EQ_INT(conf->global.port, 9000);
 
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "max connections=7", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.max_connections, 7);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "AUTH FAILURE DELAY=1500", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, 1500);
+  EXPECT_EQ_INT(
+      daemon_conf_apply_dparam(conf, "hosts allow=127.0.0.1,10.0.0.0/8", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.hosts_allow_count, 2);
+
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "port=notaport", err, sizeof(err)), -1);
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "bogus=1", err, sizeof(err)), -1);
   EXPECT_TRUE(strstr(err, "unknown global key") != NULL);
@@ -366,6 +378,114 @@ static void test_daemon_conf_auth_users_validated() {
   daemon_conf_free(ok_conf);
 }
 
+/* Wave 3 daemon hardening: configurable global/per-module connection caps,
+ * auth-failure throttle and host access lists parse strictly (valid values are
+ * stored, malformed values fail the whole load). */
+static void test_daemon_conf_limits_and_hosts_parse() {
+  char* path;
+  char err[256];
+  EXPECT_EQ_INT(write_conf("max connections = 25\n"
+                           "auth failure delay = 0\n"
+                           "hosts allow = 10.0.0.0/8, *.example.com\n"
+                           "hosts deny = 192.168.0.1 2001:db8::/32\n"
+                           "\n"
+                           "[m]\n"
+                           "path = /x\n"
+                           "max connections = 3\n"
+                           "hosts allow = 127.0.0.1\n"
+                           "hosts deny = *\n",
+                           &path),
+                0);
+  DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_EQ_INT(conf->global.max_connections, 25);
+  EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, 0);
+  EXPECT_EQ_INT(conf->global.hosts_allow_count, 2);
+  EXPECT_EQ_STR(conf->global.hosts_allow[0], "10.0.0.0/8");
+  EXPECT_EQ_STR(conf->global.hosts_allow[1], "*.example.com");
+  EXPECT_EQ_INT(conf->global.hosts_deny_count, 2);
+  EXPECT_EQ_STR(conf->global.hosts_deny[0], "192.168.0.1");
+  EXPECT_EQ_STR(conf->global.hosts_deny[1], "2001:db8::/32");
+  EXPECT_EQ_INT(conf->modules[0].max_connections, 3);
+  EXPECT_EQ_INT(conf->modules[0].hosts_allow_count, 1);
+  EXPECT_EQ_STR(conf->modules[0].hosts_allow[0], "127.0.0.1");
+  EXPECT_EQ_INT(conf->modules[0].hosts_deny_count, 1);
+  EXPECT_EQ_STR(conf->modules[0].hosts_deny[0], "*");
+  daemon_conf_free(conf);
+
+  const char* bad_values[] = {
+      "max connections = 0\n",       "max connections = -1\n",        "max connections = abc\n",
+      "auth failure delay = -1\n",   "auth failure delay = 70000\n",  "auth failure delay = soon\n",
+      "hosts allow = 10.0.0.0/99\n", "hosts deny = 2001:db8::/129\n",
+  };
+  for (size_t i = 0; i < sizeof(bad_values) / sizeof(bad_values[0]); i++) {
+    EXPECT_EQ_INT(write_conf(bad_values[i], &path), 0);
+    const DaemonConf* rejected = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NULL(rejected);
+  }
+
+  /* The same strictness applies inside a module section. */
+  const char* bad_module[] = {
+      "[m]\npath = /x\nmax connections = 0\n",
+      "[m]\npath = /x\nhosts allow = 10.0.0.0/40\n",
+      "[m]\npath = /x\nhosts deny = 999.1.1.1/8\n",
+  };
+  for (size_t i = 0; i < sizeof(bad_module) / sizeof(bad_module[0]); i++) {
+    EXPECT_EQ_INT(write_conf(bad_module[i], &path), 0);
+    const DaemonConf* rejected = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NULL(rejected);
+    EXPECT_TRUE(strstr(err, "invalid") != NULL);
+  }
+
+  /* An empty hosts list is not an error (no patterns are added). */
+  EXPECT_EQ_INT(write_conf("hosts allow = \n[m]\npath = /x\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_EQ_INT(conf->global.hosts_allow_count, 0);
+  daemon_conf_free(conf);
+}
+
+static void test_daemon_hosts_allowed() {
+  /* Pattern forms. */
+  EXPECT_TRUE(daemon_host_pattern_match("*", "203.0.113.9"));
+  EXPECT_TRUE(daemon_host_pattern_match("10.0.0.1", "10.0.0.1"));
+  EXPECT_FALSE(daemon_host_pattern_match("10.0.0.1", "10.0.0.2"));
+  EXPECT_TRUE(daemon_host_pattern_match("10.0.0.0/8", "10.255.1.2"));
+  EXPECT_FALSE(daemon_host_pattern_match("10.0.0.0/8", "11.0.0.1"));
+  EXPECT_TRUE(daemon_host_pattern_match("2001:db8::/32", "2001:db8:1234::5"));
+  EXPECT_FALSE(daemon_host_pattern_match("2001:db8::/32", "2001:db9::1"));
+  EXPECT_TRUE(daemon_host_pattern_match("::1", "::1"));
+  EXPECT_FALSE(daemon_host_pattern_match("::1", "::2"));
+  EXPECT_TRUE(daemon_host_pattern_match("*.example.com", "host.example.com"));
+  EXPECT_FALSE(daemon_host_pattern_match("*.example.com", "example.org"));
+  EXPECT_FALSE(daemon_host_pattern_match(NULL, "10.0.0.1"));
+  EXPECT_FALSE(daemon_host_pattern_match("10.0.0.1", NULL));
+  EXPECT_FALSE(daemon_host_pattern_match("", "10.0.0.1"));
+
+  char* allow[] = {"10.0.0.0/8"};
+  char* deny[] = {"10.0.0.1"};
+  /* Deny takes precedence over a matching allow. */
+  EXPECT_FALSE(daemon_hosts_allowed("10.0.0.1", allow, 1, deny, 1));
+  EXPECT_TRUE(daemon_hosts_allowed("10.0.0.2", allow, 1, deny, 1));
+  /* A non-empty allow list rejects a peer that matches none of its entries. */
+  EXPECT_FALSE(daemon_hosts_allowed("192.168.1.1", allow, 1, NULL, 0));
+  /* With only a deny list, everything not denied is accepted. */
+  EXPECT_TRUE(daemon_hosts_allowed("192.168.1.1", NULL, 0, deny, 1));
+  EXPECT_FALSE(daemon_hosts_allowed("10.0.0.1", NULL, 0, deny, 1));
+  /* No lists at all accepts everyone. */
+  EXPECT_TRUE(daemon_hosts_allowed("192.168.1.1", NULL, 0, NULL, 0));
+  /* An unprovable peer (NULL) never matches an allow list. */
+  EXPECT_FALSE(daemon_hosts_allowed(NULL, allow, 1, NULL, 0));
+
+  EXPECT_FALSE(daemon_hosts_restricted(NULL, 0, NULL, 0));
+  EXPECT_TRUE(daemon_hosts_restricted(allow, 1, NULL, 0));
+  EXPECT_TRUE(daemon_hosts_restricted(NULL, 0, deny, 1));
+}
+
 static void test_daemon_module_name_valid() {
   EXPECT_TRUE(daemon_module_name_valid("backup"));
   EXPECT_TRUE(daemon_module_name_valid("Backup_2"));
@@ -398,5 +518,7 @@ void test_daemon_conf() {
   test_daemon_conf_find_module();
   test_daemon_conf_dparam_override();
   test_daemon_conf_auth_users_validated();
+  test_daemon_conf_limits_and_hosts_parse();
+  test_daemon_hosts_allowed();
   test_daemon_module_name_valid();
 }
