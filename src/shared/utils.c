@@ -36,6 +36,9 @@ void utils_set_authorized_root_fd(int fd) {
   (void)utils_set_authorized_root(fd, NULL);
 }
 
+/* Accessors for the process-global authorized root.  The path pointer is
+ * borrowed and valid until the next setter call; the root is a single-threaded,
+ * set-before-worker-threads value (see server.c), so these carry no locking. */
 int utils_get_authorized_root_fd(void) {
   return authorized_root_fd;
 }

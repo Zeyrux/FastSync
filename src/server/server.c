@@ -231,7 +231,7 @@ static bool configure_authorization(const char* root) {
     return false;
   }
   if (!utils_set_authorized_root(root_fd, resolved)) {
-    utils_set_authorized_root(-1, NULL);
+    /* The setter already cleared the fd/path state on allocation failure. */
     close(root_fd);
     return false;
   }
