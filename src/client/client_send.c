@@ -482,10 +482,11 @@ static void disconnect_transfer_client(Client* client) {
 }
 
 /* True when --dry-run should contact a receiver rather than running the
- * client-side local manifest.  A remote (SSH host:path), daemon
- * (host::module/path), or an explicit --server-port/--port selects the
- * server-contacting path; a plain local destination keeps the original
- * client-side behavior (which never dials the default 127.0.0.1:8080). */
+ * client-side local manifest.  Any target a real run would reach over the wire
+ * selects the server-contacting path: a remote (SSH host:path), a daemon
+ * (host::module/path), an explicit --server-host, --server-port/--port, TLS, or
+ * a source-bind --address.  A plain local destination (none of these) keeps the
+ * original client-side behavior, which never dials the default 127.0.0.1:8080. */
 static bool dry_run_targets_server(const Config* config) {
   if (!config)
     return false;
@@ -493,7 +494,13 @@ static bool dry_run_targets_server(const Config* config) {
     return true;
   if (config->module && config->module[0] != '\0')
     return true;
-  return config->server_port_set;
+  if (config->server_host_set || config->server_port_set)
+    return true;
+  if (config->use_tls)
+    return true;
+  if (config->address != NULL)
+    return true;
+  return false;
 }
 
 static bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
@@ -1040,11 +1047,18 @@ static int incremental_check(Client* client, File* file, const Config* config,
     return 3;
   }
   /* Server-contacting --dry-run: the receiver decided the file is not up to
-     date and answered "would transfer" WITHOUT expecting any data.  The caller
-     only uses this in the dry-run path; a non-dry-run sender never receives it
-     because the receiver only emits it when the wire config sets dry_run. */
-  if (s == STATUS_DRY_RUN_TRANSFER)
-    return 4;
+     date and answered "would transfer" WITHOUT expecting any data.  Treat it as
+     the dry-run code ONLY when this session actually requested dry-run.  A
+     hostile/buggy peer that emits it outside dry-run is a protocol error: fail
+     closed (and send STATUS_ERROR) rather than fall through to the normal path,
+     which would transmit file data the receiver is not reading and desync. */
+  if (s == STATUS_DRY_RUN_TRANSFER) {
+    if (config->dry_run)
+      return 4;
+    log_message(LOG_LEVEL_ERROR, "Unexpected DRY_RUN_TRANSFER status outside a --dry-run session");
+    send_status(client->file_descriptor, STATUS_ERROR);
+    return -1;
+  }
   if (s != STATUS_NEXT) {
     log_message(LOG_LEVEL_ERROR, "Unexpected server status");
     send_status(client->file_descriptor, STATUS_ERROR);
@@ -1478,6 +1492,16 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
       }
       return arc == 0 ? 0 : -1;
     }
+    // rc == 4: the receiver answered DRY_RUN_TRANSFER, which is only valid in
+    // incremental_check's dedicated dry-run consumer.  send_single_file never
+    // runs a dry-run session, so this is a protocol error: abort instead of
+    // falling through and sending data the receiver is not reading.
+    if (rc == 4) {
+      log_message(LOG_LEVEL_ERROR, "Receiver answered DRY_RUN_TRANSFER in a non-dry-run transfer");
+      delta_signature_destroy(sig);
+      send_status(client->file_descriptor, STATUS_ERROR);
+      return -1;
+    }
     // rc == 0: unchanged file, skip
     // rc == 2: server sent delta signature but sendfile doesn't support delta
     delta_signature_destroy(sig);
@@ -1518,6 +1542,14 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
       return 0;
     }
     return arc == 0 ? 0 : -1;
+  }
+  if (rc == 4) {
+    /* See the sendfile branch above: DRY_RUN_TRANSFER is only valid in the
+       dedicated dry-run consumer, never in the normal per-file send path. */
+    log_message(LOG_LEVEL_ERROR, "Receiver answered DRY_RUN_TRANSFER in a non-dry-run transfer");
+    delta_signature_destroy(sig);
+    send_status(client->file_descriptor, STATUS_ERROR);
+    return -1;
   }
   if (rc == 2 && config->use_delta && !config->whole_file) {
     int drc = send_delta(client, file, sig, config);

@@ -42,6 +42,7 @@ static void config_set_defaults(Config* config) {
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
   config->server_port_set = false;
+  config->server_host_set = false;
   /* 0 means "--timeout not given": the transport keeps its own built-in 30 s
    * socket timeout (tcp_set_timeouts ignores non-positive values) and the
    * protocol layer keeps its built-in 60 s per-message deadline.  A positive

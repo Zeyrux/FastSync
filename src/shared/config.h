@@ -292,6 +292,12 @@ typedef struct Config {
    * existing client-side dry-run behavior instead of dialing the default
    * 127.0.0.1:8080. */
   bool server_port_set;
+  /* True when --server-host was explicitly given.  CLIENT-ONLY (never
+   * serialized), and distinct from the "127.0.0.1" default: --dry-run uses it
+   * to route an explicit remote target to the server so it reports receiver
+   * state exactly like a real run, instead of silently running the client-side
+   * manifest. */
+  bool server_host_set;
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
