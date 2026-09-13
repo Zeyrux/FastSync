@@ -127,6 +127,12 @@ bool utils_set_authorized_root(int fd, const char* canonical_path);
 /* The fd-only compatibility form is fail-closed for path-based operations;
  * callers should use utils_set_authorized_root with the canonical identity. */
 void utils_set_authorized_root_fd(int fd);
+/* True when `path` is `root` itself or lies directly beneath it: a lexical
+ * prefix test requiring the byte after `root` to be '\0' or '/'.  Both `root`
+ * and `path` must be absolute canonical paths free of "."/".." components (the
+ * callers guarantee this); this is containment by string, not by resolved
+ * symlinks.  Shared by the utils and file secure-walk root confinement. */
+bool path_is_within_root(const char* root, const char* path);
 bool has_path_traversal(const char* path);
 bool utils_valid_batch_path(const char* path);
 bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_size);

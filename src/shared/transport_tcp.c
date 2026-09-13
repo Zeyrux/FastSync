@@ -440,10 +440,6 @@ bool tcp_connect_socket_ex(Client* client, const char* host, int port,
   return true;
 }
 
-bool tcp_connect_socket(Client* client, const char* host, int port) {
-  return tcp_connect_socket_ex(client, host, port, NULL);
-}
-
 bool client_connect_ex(Client* client, const char* host, int port, const TcpConnectOptions* opts) {
   if (!tcp_connect_socket_ex(client, host, port, opts))
     return false;

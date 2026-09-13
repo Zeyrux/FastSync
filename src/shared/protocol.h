@@ -172,7 +172,6 @@ char* protocol_receive_str(ProtocolSession* session);
 bool protocol_send_str_redacted(ProtocolSession* session, const char* data);
 char* protocol_receive_str_redacted(ProtocolSession* session);
 bool protocol_send_data(ProtocolSession* session, const Data* data);
-Data* protocol_receive_data(ProtocolSession* session);
 Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long maximum_size);
 bool protocol_send_int(ProtocolSession* session, int data);
 bool protocol_receive_int(ProtocolSession* session, int* data);

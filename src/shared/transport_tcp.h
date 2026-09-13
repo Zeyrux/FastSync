@@ -57,7 +57,6 @@ bool client_connect_ex(Client* client, const char* host, int port, const TcpConn
 bool client_connect(Client* client, const char* host, int port);
 bool tcp_connect_socket_ex(Client* client, const char* host, int port,
                            const TcpConnectOptions* opts);
-bool tcp_connect_socket(Client* client, const char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec);

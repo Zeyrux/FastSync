@@ -52,7 +52,6 @@ bool file_symlink_at_secure(const char* path, const char* target);
 /* --keep-dirlinks (-K) receiver process-wide policy: allow an in-root existing
  * symlink-to-directory to be followed as a directory. */
 void file_set_keep_dirlinks(bool enable);
-bool file_get_keep_dirlinks(void);
 
 /* --trust-sender receiver process-wide policy (Phase 5).  When set, the
  * receiver trusts that the sender already produced a clean file list and skips

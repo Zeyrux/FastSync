@@ -36,11 +36,19 @@ void utils_set_authorized_root_fd(int fd) {
   (void)utils_set_authorized_root(fd, NULL);
 }
 
-static bool path_is_within_root(const char* root, const char* path) {
+bool path_is_within_root(const char* root, const char* path) {
   size_t root_len = strlen(root);
   return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
 }
 
+/* Open the destination root directory itself, confined to the authorized root.
+ * NOTE (do not merge with file_open_secure_parent): this walk opens dest_root
+ * (a directory that must already exist) and returns its fd, whereas
+ * file_open_secure_parent resolves the PARENT of a file path, optionally
+ * creating missing components and honouring --keep-dirlinks / --copy-as.  The
+ * two differ in create-vs-no-create, in what path component they stop at, and
+ * in the extra receiver policies they apply, so they are intentionally kept
+ * separate.  Both rely on the shared lexical path_is_within_root check. */
 static int open_authorized_destination(const char* dest_root) {
   if (authorized_root_fd < 0 || !authorized_root_path || !dest_root ||
       !path_is_within_root(authorized_root_path, dest_root))

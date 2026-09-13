@@ -570,10 +570,6 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
   return result;
 }
 
-Data* protocol_receive_data(ProtocolSession* session) {
-  return protocol_receive_data_limited(session, MAX_DATA_PAYLOAD_SIZE);
-}
-
 bool protocol_send_int(ProtocolSession* session, int data) {
   if (!protocol_send_n_data(session, &data, sizeof(int)))
     return false;

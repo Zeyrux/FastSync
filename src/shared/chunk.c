@@ -207,17 +207,20 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     return NULL;
   char* data_pointer = data->data;
   size_t remaining_size = data->size;
+  /* The element currently being parsed is owned by `files` only after the
+   * array_list_add() at the end of the iteration; until then the error
+   * epilogue destroys it directly.  Keeping this one pointer nulled after the
+   * hand-off makes the single cleanup path correct for every failure. */
+  File* file = NULL;
 
   while (remaining_size > 0) {
     if ((unsigned int)files->size >= MAX_FILES_PER_CHUNK) {
       log_message(LOG_LEVEL_ERROR, "Chunk contains too many files");
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path length");
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
 
     size_t path_len;
@@ -227,26 +230,19 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 
     if (path_len > SIZE_MAX - 1 || remaining_size < path_len) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for path");
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
 
-    if (path_len == SIZE_MAX) {
-      array_list_delete(files);
-      return NULL;
-    }
     char* path = protocol_alloc(path_len + 1);
     if (path == NULL) {
       log_perror("Could not allocate memory for file path");
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
     memcpy(path, data_pointer, path_len);
     path[path_len] = '\0';
     if (memchr(path, '\0', path_len) != NULL) {
       free(path);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
     data_pointer += path_len;
     remaining_size -= path_len;
@@ -260,8 +256,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       if (local_path == NULL) {
         log_message(LOG_LEVEL_ERROR,
                     "--iconv: received chunk file name cannot be converted to the local charset");
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       path = local_path;
       path_len = strlen(path);
@@ -269,30 +264,23 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 
     if (path_len == 0 || has_path_traversal(path)) {
       free(path);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
 
-    File* file = file_create(path);
+    file = file_create(path);
     free(path);
-    if (file == NULL) {
-      array_list_delete(files);
-      return NULL;
-    }
+    if (file == NULL)
+      goto error;
 
     if (remaining_size < sizeof(int)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for entry type");
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
     int entry_type;
     memcpy(&entry_type, data_pointer, sizeof(int));
     if (entry_type != 0 && entry_type != 1 && entry_type != 2 && entry_type != 3) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: bad entry type");
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
     file->is_dir = entry_type == 1;
     file->is_symlink = entry_type == 2;
@@ -303,9 +291,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     if (file->is_special) {
       if (remaining_size < 2 * (int32_t)sizeof(int32_t)) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for special rdev");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       int32_t special_major, special_minor;
       memcpy(&special_major, data_pointer, sizeof(special_major));
@@ -320,9 +306,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       if (special_major < 0 || special_minor < 0 || special_major > 0xffff ||
           special_minor > 0x00ffffff) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: out-of-range special rdev");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       file->rdev_major = special_major;
       file->rdev_minor = special_minor;
@@ -331,37 +315,32 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     if (use_metadata) {
       if (remaining_size < sizeof(int)) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for metadata");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
-      // Peek at present flag to determine total size needed before reading
+      /* Peek at the present flag to determine the total record size before
+         decoding.  metadata_from_buf() independently bounds-checks every read
+         against remaining_size, so a short body can never over-read. */
       int present_flag;
       memcpy(&present_flag, data_pointer, sizeof(int));
       if ((present_flag != 0 && present_flag != 1) ||
           (present_flag == 1 && remaining_size < sizeof(int) + FILE_METADATA_WIRE_SIZE)) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for metadata body");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
-      file->metadata = metadata_from_buf(&data_pointer);
-      remaining_size -= sizeof(int);
+      file->metadata = metadata_from_buf((const uint8_t*)data_pointer, remaining_size);
+      size_t metadata_consumed = sizeof(int);
       if (present_flag == 1) {
-        if (file->metadata == NULL) {
-          file_destroy(file);
-          array_list_delete(files);
-          return NULL;
-        }
-        remaining_size -= FILE_METADATA_WIRE_SIZE;
+        if (file->metadata == NULL)
+          goto error;
+        metadata_consumed += FILE_METADATA_WIRE_SIZE;
       }
+      data_pointer += metadata_consumed;
+      remaining_size -= metadata_consumed;
     }
 
     if (remaining_size < sizeof(size_t)) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for data size");
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
 
     size_t file_data_size;
@@ -371,35 +350,26 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
 
     if (remaining_size < file_data_size) {
       log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for file content");
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
 
     // Reject individual file data larger than the maximum allowed size.
     if (file_data_size > MAX_FILE_DATA_SIZE) {
       log_message(LOG_LEVEL_ERROR, "File data size %zu exceeds maximum %llu", file_data_size,
                   (unsigned long long)MAX_FILE_DATA_SIZE);
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
 
     size_t allocation_size = file_data_size > 0 ? file_data_size : 1;
     void* file_data = protocol_alloc(allocation_size);
     if (file_data == NULL) {
       log_perror("Could not allocate memory for file data");
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
+      goto error;
     }
     memcpy(file_data, data_pointer, file_data_size);
     Data* replacement = data_create(file_data, file_data_size);
-    if (replacement == NULL) {
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
-    }
+    if (replacement == NULL)
+      goto error;
     data_destroy(file->data);
     file->data = replacement;
     data_pointer += file_data_size;
@@ -408,9 +378,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     if (file->is_symlink) {
       if (remaining_size < sizeof(size_t)) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: not enough data for symlink target");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       size_t target_len;
       memcpy(&target_len, data_pointer, sizeof(size_t));
@@ -418,24 +386,18 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       remaining_size -= sizeof(size_t);
       if (target_len == 0 || remaining_size < target_len) {
         log_message(LOG_LEVEL_ERROR, "Invalid chunk format: bad symlink target");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       char* target = protocol_alloc(target_len + 1);
       if (!target) {
         log_perror("Could not allocate memory for symlink target");
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       memcpy(target, data_pointer, target_len);
       target[target_len] = '\0';
       if (memchr(target, '\0', target_len) != NULL) {
         free(target);
-        file_destroy(file);
-        array_list_delete(files);
-        return NULL;
+        goto error;
       }
       /* The symlink target also rides the wire charset; decode it to the local
          charset like the path (a target is a path). */
@@ -446,9 +408,7 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
           log_message(LOG_LEVEL_ERROR,
                       "--iconv: received chunk symlink target cannot be converted to the local "
                       "charset");
-          file_destroy(file);
-          array_list_delete(files);
-          return NULL;
+          goto error;
         }
         target = local_target;
       }
@@ -457,29 +417,27 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
       remaining_size -= target_len;
     }
 
-    if (!array_list_add(files, file)) {
-      file_destroy(file);
-      array_list_delete(files);
-      return NULL;
-    }
+    if (!array_list_add(files, file))
+      goto error;
+    file = NULL;
   }
 
   File** file_array = (File**)array_list_to_array(files);
-  if (files->size > 0 && file_array == NULL) {
-    array_list_delete(files);
-    return NULL;
-  }
+  if (files->size > 0 && file_array == NULL)
+    goto error;
   Chunk* chunk = chunk_create(file_array, files->size);
-
   free(file_array);
-  if (chunk == NULL) {
-    array_list_delete(files);
-    return NULL;
-  }
+  if (chunk == NULL)
+    goto error;
   files->item_destroyer = NULL;
   array_list_delete(files);
-
   return chunk;
+
+error:
+  if (file)
+    file_destroy(file);
+  array_list_delete(files);
+  return NULL;
 }
 
 Data* chunk_compress(Chunk* chunk, int compression_level, bool use_metadata) {

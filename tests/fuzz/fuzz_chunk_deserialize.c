@@ -17,7 +17,11 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (!d)
     return 0;
 
-  Chunk* chunk = chunk_deserialize(d, false);
+  /* Exercise both the metadata and non-metadata chunk layouts: the
+     metadata branch (present flag + 4-vs-72 advance) is only reachable with
+     use_metadata=true, so base the choice on the input rather than hardcoding
+     false. */
+  Chunk* chunk = chunk_deserialize(d, (data[0] & 1) != 0);
   if (chunk)
     chunk_destroy(chunk);
 

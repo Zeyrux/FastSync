@@ -29,8 +29,8 @@ static void test_metadata_to_from_buf_roundtrip() {
   char* write_ptr = buf;
   metadata_to_buf(&write_ptr, &original);
 
-  char* read_ptr = buf;
-  FileMetadata* result = metadata_from_buf(&read_ptr);
+  FileMetadata* result =
+      metadata_from_buf((const uint8_t*)buf, FILE_METADATA_WIRE_SIZE + sizeof(int));
 
   EXPECT_NOT_NULL(result);
   EXPECT_EQ_INT(result->mode, 0755);
@@ -44,8 +44,6 @@ static void test_metadata_to_from_buf_roundtrip() {
   EXPECT_TRUE(result->crtime_valid);
   EXPECT_EQ_INT(result->crtime_sec, 1200000000);
   EXPECT_EQ_INT(result->crtime_nsec, 750000000);
-
-  EXPECT_EQ_INT((int)(read_ptr - buf), (int)FILE_METADATA_WIRE_SIZE + (int)sizeof(int));
 
   free(result);
   free(buf);
@@ -71,10 +69,42 @@ static void test_metadata_from_buf_null() {
   int present = 0;
   memcpy(buf, &present, sizeof(int));
 
-  char* read_ptr = buf;
-  const FileMetadata* result = metadata_from_buf(&read_ptr);
+  const FileMetadata* result =
+      metadata_from_buf((const uint8_t*)buf, FILE_METADATA_WIRE_SIZE + sizeof(int));
 
   EXPECT_NULL(result);
+
+  free(buf);
+}
+
+/* The decoder must reject (never over-read) a present record that is even one
+ * byte shorter than the full int32 flag + FILE_METADATA_WIRE_SIZE body, and
+ * must reject a buffer too short to even hold the present flag. */
+static void test_metadata_from_buf_bounds() {
+  char* buf = malloc(FILE_METADATA_WIRE_SIZE + sizeof(int));
+  EXPECT_NOT_NULL(buf);
+  FileMetadata original = {.mode = 0644,
+                           .uid = 1,
+                           .gid = 2,
+                           .mtime_sec = 3,
+                           .mtime_nsec = 4,
+                           .atime_valid = true,
+                           .atime_sec = 5,
+                           .atime_nsec = 6,
+                           .crtime_valid = false};
+  char* write_ptr = buf;
+  metadata_to_buf(&write_ptr, &original);
+
+  EXPECT_NULL(metadata_from_buf((const uint8_t*)buf, 0));
+  EXPECT_NULL(metadata_from_buf((const uint8_t*)buf, sizeof(int)));
+  EXPECT_NULL(metadata_from_buf((const uint8_t*)buf, FILE_METADATA_WIRE_SIZE + sizeof(int) - 1));
+  /* A buffer larger than the record decodes using only the record prefix. */
+  FileMetadata* decoded =
+      metadata_from_buf((const uint8_t*)buf, FILE_METADATA_WIRE_SIZE + sizeof(int) + 16);
+  EXPECT_NOT_NULL(decoded);
+  EXPECT_EQ_INT(decoded->mode, 0644);
+  free(decoded);
+  EXPECT_NULL(metadata_from_buf(NULL, FILE_METADATA_WIRE_SIZE + sizeof(int)));
 
   free(buf);
 }
@@ -169,10 +199,8 @@ static void test_metadata_wire_is_one_packed_frame() {
   EXPECT_EQ_INT(avail, 0);
 
   /* The present frame decodes in one shot with the shared codec. */
-  char* cursor = (char*)wire;
-  FileMetadata* decoded = metadata_from_buf(&cursor);
+  FileMetadata* decoded = metadata_from_buf((const uint8_t*)wire, sizeof(wire));
   EXPECT_NOT_NULL(decoded);
-  EXPECT_EQ_INT((int)(cursor - (char*)wire), (int)sizeof(wire));
   EXPECT_EQ_INT(decoded->mode, 0640);
   EXPECT_EQ_INT(decoded->uid, 42);
   EXPECT_EQ_INT(decoded->gid, 43);
@@ -451,6 +479,7 @@ void test_metadata() {
   test_metadata_to_from_buf_roundtrip();
   test_metadata_to_buf_null();
   test_metadata_from_buf_null();
+  test_metadata_from_buf_bounds();
   test_metadata_send_receive_roundtrip();
   test_metadata_send_null();
   test_metadata_wire_is_one_packed_frame();

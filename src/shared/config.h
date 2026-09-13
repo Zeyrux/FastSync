@@ -754,6 +754,17 @@ bool config_delete_timing_early(const Config* config);
  * set (none = the default delete-after commit timing); without deletion no
  * timing flag may be set (each timing flag implies --delete). */
 bool config_has_valid_delete_timing(const Config* config);
+
+/* Single source of truth for the cross-field ("combination") invariants a
+ * Config must satisfy.  Returns NULL when `config` is consistent, or a static,
+ * human-readable error string (no trailing period) describing the FIRST
+ * violation found.  No I/O, no logging and no printing, so it is safe to call
+ * from every trust boundary; the iconv rule does invoke charset_spec_valid
+ * (which parses via str_dup/iconv_open), so it is not allocation-free.  The client calls
+ * it from validate_config() for up-front UX and the server calls it from
+ * validate_received_config() so the receiver enforces exactly the same
+ * invariants it relies on (the server is the trust boundary). */
+const char* config_invariants_error(const Config* config);
 /* True when at least one --compare-dest/--copy-dest/--link-dest was set. */
 bool config_has_basis(const Config* config);
 /* Append one basis-dir entry. Returns 0 on success, -1 on allocation failure. */

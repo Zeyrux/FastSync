@@ -2113,7 +2113,8 @@ int main(int argc, char* argv[]) {
      to nor transfers to a server.  --write-batch runs the normal live transfer
      AND then emits the batch FILE from a separate deterministic scan pass.  It
      drives the single-threaded transfer so the config outlives the run for that
-     second pass (the -m path takes ownership of the config). */
+     second pass (main retains ownership of the config; every send path
+     borrows it). */
   if (config->read_batch) {
     exit_code = apply_batch_to_dest(config, config->read_batch, config->receive_root_directory);
     goto cleanup;

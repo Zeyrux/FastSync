@@ -383,6 +383,7 @@ static void test_pipeline_sender_lifecycle() {
   EXPECT_EQ_INT((int)pcs->allocation_session.max_alloc, (int)cfg->max_alloc);
 
   pipeline_context_sender_destroy(pcs);
+  config_delete(cfg); /* the context borrows cfg; the caller owns it */
 }
 
 static void test_pipeline_receiver_lifecycle() {
@@ -2042,6 +2043,156 @@ static void test_super_does_not_imply_numeric() {
   config_delete(c);
 }
 
+/* The single shared predicate must reject every cross-field combination the
+   client/server enforce and accept a plain valid config.  Because both
+   validate_config() (client) and validate_received_config() (server) call it,
+   this table documents the whole invariant set in one place. */
+static void test_config_invariants_error_all_combinations() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  EXPECT_NULL(config_invariants_error(c));
+  config_delete(c);
+
+  c = config_create();
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_COMPARE, "sub"), 0);
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* basis + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->use_sendfile = true;
+  c->use_compression = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* sendfile + compression */
+  config_delete(c);
+
+  c = config_create();
+  c->use_sendfile = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* sendfile + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->use_incremental = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* incremental + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->skip_compress_set = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* skip-compress + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->use_delta = true;                         /* whole_file false -> active */
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* delta without incremental */
+  config_delete(c);
+
+  c = config_create();
+  c->use_delta = true;
+  c->use_incremental = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* delta + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->use_delta = true;
+  c->use_incremental = true;
+  c->use_sendfile = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* delta + sendfile */
+  config_delete(c);
+
+  c = config_create();
+  c->append = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* append + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->append = true;
+  c->whole_file = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* append + whole-file */
+  config_delete(c);
+
+  c = config_create();
+  c->preserve_hard_links = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* hard-links + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->preserve_xattrs = true;
+  c->use_chunk_serialization = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* xattrs + chunk */
+  config_delete(c);
+
+  c = config_create();
+  c->preserve_hard_links = true;
+  c->append = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* hard-links + append */
+  config_delete(c);
+
+  c = config_create();
+  c->delay_updates = true;
+  c->inplace = true;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* delay-updates + inplace */
+  config_delete(c);
+
+  c = config_create();
+  c->delay_updates = true;
+  c->backup_dir = str_dup(".fastsync-stage");
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* delay-updates staging conflict */
+  config_delete(c);
+
+  c = config_create();
+  c->delete_delay = true;                      /* a timing flag without --delete */
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* invalid delete timing */
+  config_delete(c);
+
+  c = config_create();
+  c->iconv_spec = str_dup("no-such-charset,utf-8");
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* malformed iconv spec */
+  config_delete(c);
+
+  c = config_create();
+  c->copy_as_set = true;
+  c->use_metadata = false;
+  EXPECT_NOT_NULL(config_invariants_error(c)); /* copy-as without metadata */
+  config_delete(c);
+}
+
+/* The receiver previously missed several of these; a forged frame that sets
+   the offending serialized fields must now be refused at the config
+   handshake.  (whole_file is client-only, so its rules cannot appear here.) */
+static void test_config_receive_rejects_unified_invariants() {
+  if (is_running_under_valgrind())
+    return;
+  struct {
+    bool incremental, delta, chunk, sendfile, compression;
+  } cases[] = {
+      {true, false, true, false, false},  /* --incremental + -s */
+      {false, true, true, false, false},  /* --delta + -s */
+      {false, true, false, false, false}, /* --delta without --incremental */
+      {false, false, false, true, true},  /* --sendfile + compression */
+      {false, false, true, true, false},  /* --sendfile + -s */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* c = config_create();
+    EXPECT_NOT_NULL(c);
+    c->send_directory = str_dup("/src");
+    c->receive_root_directory = str_dup("/dst");
+    c->use_incremental = cases[i].incremental;
+    c->use_delta = cases[i].delta;
+    c->use_chunk_serialization = cases[i].chunk;
+    c->use_sendfile = cases[i].sendfile;
+    c->use_compression = cases[i].compression;
+    EXPECT_FALSE(roundtrip_config_ok(c));
+    config_delete(c);
+  }
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -2095,6 +2246,8 @@ void test_config() {
     test_config_receive_rejects_copy_as_without_metadata();
     test_config_receive_rejects_oversized_string_budget();
     test_config_receive_with_validate_rejects();
+    test_config_invariants_error_all_combinations();
+    test_config_receive_rejects_unified_invariants();
   }
   test_identity_copy_as_refused();
   test_identity_ownership_requested();

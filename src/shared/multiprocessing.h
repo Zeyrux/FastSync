@@ -120,6 +120,8 @@ typedef struct PipelineContextReceiver {
   DirTimeList dir_times;
 } PipelineContextReceiver;
 
+/* `config` is borrowed and must outlive the context: destroy does NOT free it,
+   so the caller owns it and frees it with config_delete() afterwards. */
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
                                                       Queue* queue_loader);
 void pipeline_context_sender_destroy(PipelineContextSender* context);

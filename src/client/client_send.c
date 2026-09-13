@@ -44,6 +44,10 @@
    receiver's RECEIVER_QUEUE_MAX_BYTES). */
 #define SENDER_QUEUE_MAX_BYTES (MAX_CONNECTION_MEMORY - 2 * MAX_CHUNK_SIZE)
 
+/* One mebibyte in bytes; the unit used by the --stats/--progress lines.
+   Always cast to double when dividing so the output stays fractional. */
+#define BYTES_PER_MIB (1024ULL * 1024ULL)
+
 /* Forward declaration for progress-reporting thread used in multithreaded send. */
 static int progress_thread_fn(void* arg);
 
@@ -51,8 +55,30 @@ static const char* display_bytes(unsigned long long bytes, bool human_readable, 
                                  size_t buffer_size) {
   if (human_readable && format_human_bytes(bytes, buffer, buffer_size))
     return buffer;
-  snprintf(buffer, buffer_size, "%.1f MB", bytes / 1048576.0);
+  snprintf(buffer, buffer_size, "%.1f MB", (double)bytes / (double)BYTES_PER_MIB);
   return buffer;
+}
+
+/* Print the canonical `--stats` line.  Shared by the single-threaded and
+   multithreaded send paths so both honor --stats, --human-readable and --quiet
+   identically; `start` marks the beginning of the transfer for the rate. */
+static void report_transfer_stats(const Config* config, int total_files,
+                                  unsigned long long total_bytes, time_t start) {
+  if (!config->stats || config->quiet)
+    return;
+  double elapsed = difftime(time(NULL), start);
+  double rate = elapsed > 0.0 ? (double)total_bytes / ((double)BYTES_PER_MIB * elapsed) : 0.0;
+  if (config->human_readable) {
+    char total_buffer[32];
+    char rate_buffer[32];
+    fprintf(stderr, "Stats: %d files, %s, %s/s\n", total_files,
+            display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
+            display_bytes((unsigned long long)(rate * (double)BYTES_PER_MIB), true, rate_buffer,
+                          sizeof(rate_buffer)));
+  } else {
+    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files,
+            (double)total_bytes / (double)BYTES_PER_MIB, rate);
+  }
 }
 
 /* Compiled scanner inputs that are shared read-only across scanner instances
@@ -688,7 +714,7 @@ static int send_dry_run_manifest(const Config* config) {
       printf("Total: %d files, %s\n", file_count,
              display_bytes(total_bytes, true, size_buffer, sizeof(size_buffer)));
     else
-      printf("Total: %d files, %.1f MB\n", file_count, total_bytes / 1048576.0);
+      printf("Total: %d files, %.1f MB\n", file_count, (double)total_bytes / (double)BYTES_PER_MIB);
   }
   return 0;
 }
@@ -1425,12 +1451,9 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
   return 0;
 }
 
-int send_chunk(Client* client, Chunk* chunk, Config* config) {
-  return send_chunk_with_removal(client, chunk, config, NULL);
-}
-
 static int send_chunks_multithreaded(void* pipeline_context) {
   PipelineContextSender* context = (PipelineContextSender*)pipeline_context;
+  time_t start = time(NULL);
   Client* client = connect_transfer_client(context->config);
   if (!client) {
     if (context->config->transport == TRANSPORT_TCP)
@@ -1578,10 +1601,9 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   int total_files = context->total_files;
   unsigned long long total_bytes = context->total_bytes;
   mtx_unlock(&context->mutex_progress);
-  if (context->config->stats)
-    fprintf(stderr, "Stats: %d files, %.1f MB\n", total_files, total_bytes / 1048576.0);
+  report_transfer_stats(context->config, total_files, total_bytes, start);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
-                   total_bytes / 1048576.0);
+                   (double)total_bytes / (double)BYTES_PER_MIB);
   disconnect_transfer_client(client);
   mark_sender_done(context);
   protocol_session_unbind();
@@ -1754,17 +1776,18 @@ static int load_files_multithreaded(void* pipeline_context) {
 static void print_transfer_progress(unsigned long long total_bytes, time_t start,
                                     const char* suffix, bool human_readable) {
   double elapsed = difftime(time(NULL), start);
-  double rate = elapsed > 0.0 ? total_bytes / (1048576.0 * elapsed) : 0.0;
+  double rate = elapsed > 0.0 ? (double)total_bytes / ((double)BYTES_PER_MIB * elapsed) : 0.0;
   if (human_readable) {
     char total_buffer[32];
     char rate_buffer[32];
     fprintf(stderr, "\rSent %s  (%s/s)  %s",
             display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
-            display_bytes((unsigned long long)(rate * 1048576.0), true, rate_buffer,
+            display_bytes((unsigned long long)(rate * (double)BYTES_PER_MIB), true, rate_buffer,
                           sizeof(rate_buffer)),
             suffix);
   } else {
-    fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  %s", total_bytes / 1048576.0, rate, suffix);
+    fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  %s", (double)total_bytes / (double)BYTES_PER_MIB,
+            rate, suffix);
   }
   fflush(stderr);
 }
@@ -2132,23 +2155,9 @@ int send_files(Config* config) {
     remove_transferred_sources(config, remove_sources);
   if (config->show_progress && !config->quiet)
     print_transfer_progress(total_bytes, start, "Done.\n", config->human_readable);
-  if (config->stats && !config->quiet) {
-    double elapsed_total = difftime(time(NULL), start);
-    double rate = elapsed_total > 0 ? total_bytes / (1048576.0 * elapsed_total) : 0;
-    if (config->human_readable) {
-      char total_buffer[32];
-      char rate_buffer[32];
-      fprintf(stderr, "Stats: %d files, %s, %s/s\n", total_files,
-              display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
-              display_bytes((unsigned long long)(rate * 1048576.0), true, rate_buffer,
-                            sizeof(rate_buffer)));
-    } else {
-      fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files, total_bytes / 1048576.0,
-              rate);
-    }
-  }
+  report_transfer_stats(config, total_files, total_bytes, start);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
-                   total_bytes / 1048576.0);
+                   (double)total_bytes / (double)BYTES_PER_MIB);
   /* --ignore-errors: an unreadable source directory was skipped but the run
      still completed (and deleted); report the run as errored like rsync does. */
   ret = (ok && !had_scan_io) ? 0 : 1;
@@ -2237,7 +2246,7 @@ int send_files_multithreaded(Config** config_ptr) {
   context->missing_args = missing_args;
   missing_args = NULL; /* owned by the context from here on */
   pipeline_context_sender_set_queue_byte_limit(context, SENDER_QUEUE_MAX_BYTES);
-  *config_ptr = NULL; /* context now owns config through all remaining paths */
+  /* The context borrows `config`; the caller (main) still owns and frees it. */
   struct timespec now_mono;
   if (clock_gettime(CLOCK_MONOTONIC, &now_mono) != 0) {
     now_mono.tv_sec = 0;
