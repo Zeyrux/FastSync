@@ -2347,6 +2347,7 @@ static void golden_config_populate(Config* c) {
   c->compression_level = 7;
   c->chunk_size = 65536;
   c->use_sendfile = false;
+  c->dry_run = true;
   c->use_delete = true;
   c->use_incremental = true;
   c->size_only = false;
@@ -2443,11 +2444,12 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.20.0).  The values below are the only
+/* The pinned golden frame (protocol 2.21.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason. */
-#define GOLDEN_WIRE_LEN 633
-#define GOLDEN_WIRE_HASH 9160991280011164139ULL
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.21.0
+ * bump appends the serialized dry_run bool to CONFIG_WIRE_CORE_FIELDS. */
+#define GOLDEN_WIRE_LEN 637
+#define GOLDEN_WIRE_HASH 13228626061067899189ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

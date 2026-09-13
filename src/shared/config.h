@@ -76,7 +76,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.20.0).
+ * Config wire-field table (single source of truth for protocol 2.21.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -109,6 +109,11 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  * =========================================================================== */
 #define CONFIG_WIRE_HEADER_FIELDS(X) X(version, char*, str_dup(PROTOCOL_VERSION), STR)
 
+/* dry_run (--dry-run) is CLIENT-INTENT that now CROSSES the wire (protocol
+ * 2.21.0): the receiver needs it to answer what WOULD transfer/skip without
+ * touching disk.  The client-only launch behavior (no server contact for a
+ * local destination) is decided separately in client_send.c before the frame
+ * is ever sent. */
 #define CONFIG_WIRE_CORE_FIELDS(X)                                                                 \
   X(eight_bit_output, bool, false, BOOL_8BIT)                                                      \
   X(max_alloc, unsigned long long, DEFAULT_MAX_ALLOC, RAW_MAXALLOC)                                \
@@ -122,7 +127,8 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   X(use_executability, bool, false, BOOL)                                                          \
   X(compression_level, int, 5, INT)                                                                \
   X(chunk_size, unsigned long long, DEFAULT_CHUNK_SIZE, RAW)                                       \
-  X(use_sendfile, bool, false, BOOL)
+  X(use_sendfile, bool, false, BOOL)                                                               \
+  X(dry_run, bool, false, BOOL)
 
 #define CONFIG_WIRE_DELTA_FIELDS(X)                                                                \
   X(use_delete, bool, false, BOOL)                                                                 \
@@ -261,7 +267,6 @@ typedef struct Config {
   int scanner_threads;
   bool metadata_explicitly_disabled;
   bool show_progress;
-  bool dry_run;
   int compression_threads;
   int ssh_port;
   TransportType transport;
@@ -281,6 +286,12 @@ typedef struct Config {
   bool use_tls;
   char* server_host;
   int server_port;
+  /* True when --server-port/--port was explicitly given.  CLIENT-ONLY (never
+   * serialized): --dry-run uses it to decide whether a real server handshake
+   * was requested, so a plain local destination (no explicit port) keeps the
+   * existing client-side dry-run behavior instead of dialing the default
+   * 127.0.0.1:8080. */
+  bool server_port_set;
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
@@ -756,8 +767,23 @@ typedef struct Config {
  * The bump is therefore a deliberate lockstep-release marker, not a
  * desynchronization fix — the strict same-version handshake still rejects a
  * mixed 2.19/2.20 deployment.  The chunk codec, which already used the packed
- * metadata_to_buf()/metadata_from_buf() form, is unchanged. */
-#define PROTOCOL_VERSION "2.20.0"
+ * metadata_to_buf()/metadata_from_buf() form, is unchanged.
+ *
+ * Server-contacting Dry-run Wave: 2.20.0 -> 2.21.0.
+ *
+ * WHY the bump, grounded in the wire: this wave makes --dry-run contact the
+ * receiver and report exactly what WOULD change.  The binary config frame
+ * gains one serialized bool (Config->dry_run) appended to CONFIG_WIRE_CORE_
+ * FIELDS after use_sendfile, and the frame stream gains one terminal status
+ * (STATUS_DRY_RUN_TRANSFER) sent in reply to a per-file STATUS_CHECK when the
+ * file is not already up to date.  The receiver performs the normal read-only
+ * incremental decision but no mutation; the sender then skips the data.  Any
+ * config-frame layout or frame-sequence change must bump the protocol version:
+ * a 2.20 peer would desynchronize on the extra trailing byte and the unknown
+ * status, and the strict same-version handshake (config_receive rejects a
+ * mismatched version before parsing anything else) is what keeps a 2.21 client
+ * and a 2.20 server from ever reaching that state. */
+#define PROTOCOL_VERSION "2.21.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

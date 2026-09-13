@@ -370,6 +370,171 @@ class TestDryRun:
         assert not mismatches, f"Mismatch: {mismatches}"
 
 
+def _snapshot_tree(root):
+    """Return {relpath: (size, mtime_ns, content_bytes)} for a directory tree.
+
+    Used to prove a dry-run left the destination byte-for-byte and
+    timestamp-for-timestamp unchanged.  Returns an empty dict for a missing
+    root so "nothing was created" is also observable."""
+    snapshot = {}
+    if not os.path.exists(root):
+        return snapshot
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                snapshot[rel] = ("symlink", os.readlink(path), st.st_mtime_ns)
+                continue
+            with open(path, "rb") as fh:
+                data = fh.read()
+            snapshot[rel] = (st.st_size, st.st_mtime_ns, data)
+    return snapshot
+
+
+class TestRemoteDryRun:
+    """Server-contacting --dry-run (protocol 2.21.0): contacts the receiver,
+    reports what WOULD transfer/skip based on receiver state, and mutates
+    nothing on either side."""
+
+    def _seed(self, source):
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "nested"), exist_ok=True)
+        with open(os.path.join(source, "keep.txt"), "wb") as f:
+            f.write(b"unchanged content\n")
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"original content\n")
+        with open(os.path.join(source, "nested", "deep.txt"), "wb") as f:
+            f.write(b"deep file\n")
+
+    @pytest.mark.ci
+    def test_remote_dry_run_reports_changes_and_mutates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_dst")
+        self._seed(source)
+        clean_dir(dest)
+
+        # Populate the destination with a real transfer, then make exactly one
+        # file differ (content+size) and add a brand-new file.
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, f"seed transfer failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"a much longer replacement payload\n")
+        with open(os.path.join(source, "added.txt"), "wb") as f:
+            f.write(b"newly added\n")
+
+        before = _snapshot_tree(received)
+        # --checksum makes the up-to-date decision content-based (the seed
+        # transfer did not preserve mtimes), so keep.txt/deep.txt report skip.
+        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"remote dry-run failed: {result.stderr[:300]}"
+        assert "Dry run:" in result.stdout, result.stdout[:200]
+        assert "changed.txt" in result.stdout, result.stdout
+        assert "added.txt" in result.stdout, result.stdout
+        assert "keep.txt" not in result.stdout, (
+            f"up-to-date file must not be reported as would-transfer: {result.stdout}"
+        )
+        assert "deep.txt" not in result.stdout, result.stdout
+        assert _snapshot_tree(received) == before, "remote dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_into_empty_dest_creates_nothing(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_empty_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_empty_dst")
+        self._seed(source)
+        clean_dir(dest)
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(received)
+
+        result, _ = run_client(source, dest, flags=["--dry-run"], port=shared_server.port)
+        assert result.returncode == 0, f"exit {result.returncode}: {result.stderr[:300]}"
+        assert "keep.txt" in result.stdout
+        assert "changed.txt" in result.stdout
+        assert "deep.txt" in result.stdout
+        # Nowhere may the receiver have created the destination mirror.
+        assert not os.path.exists(received), "dry-run created directories on the receiver"
+        assert _snapshot_tree(received) == {}
+
+    @pytest.mark.ci
+    def test_remote_dry_run_mkpath_does_not_create_root(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_mk_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_mk_dst")
+        self._seed(source)
+        shutil.rmtree(dest, ignore_errors=True)
+        assert not os.path.exists(dest)
+
+        result, _ = run_client(source, dest, flags=["--dry-run", "--mkpath"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"exit {result.returncode}: {result.stderr[:300]}"
+        assert "changed.txt" in result.stdout
+        assert not os.path.exists(dest), "dry-run --mkpath created the destination root"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_with_delete_does_not_delete(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_del_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_del_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        extra = os.path.join(received, "extra.txt")
+        with open(extra, "wb") as f:
+            f.write(b"must survive a dry-run delete\n")
+        before = _snapshot_tree(received)
+
+        for flags in (["--dry-run", "--delete"], ["--dry-run", "--delete-after"]):
+            result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+            assert result.returncode == 0, f"{flags}: {result.stderr[:300]}"
+            assert os.path.exists(extra), f"{flags} deleted an extra in dry-run"
+            assert _snapshot_tree(received) == before, f"{flags} mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_quiet_is_silent(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_quiet_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_quiet_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["-q", "--dry-run"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert result.stdout == ""
+        assert result.stderr == ""
+
+    @pytest.mark.ci
+    def test_remote_dry_run_threaded_routes_to_server(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_mt_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_mt_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--dry-run", "--threads"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "changed.txt" in result.stdout
+        assert _snapshot_tree(get_dest_received_dir(dest, source)) == {}
+
+    @pytest.mark.ci
+    def test_normal_transfer_unaffected_by_dry_run(self, shared_server):
+        """A real transfer after dry-run still installs the changes."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_normal_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_normal_dst")
+        self._seed(source)
+        clean_dir(dest)
+        run_client(source, dest, port=shared_server.port)
+        received = get_dest_received_dir(dest, source)
+        with open(os.path.join(source, "changed.txt"), "wb") as f:
+            f.write(b"updated payload for the real transfer\n")
+        run_client(source, dest, flags=["--dry-run"], port=shared_server.port)
+
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        with open(os.path.join(received, "changed.txt"), "rb") as f:
+            assert f.read() == b"updated payload for the real transfer\n"
+
+
 class TestRemoveSourceFiles:
     def test_removes_only_transferred_regular_files(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "remove_source")

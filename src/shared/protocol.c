@@ -446,6 +446,8 @@ static const char* status_to_string(Status status) {
     return "AUTH_OK";
   case STATUS_AUTH_FAILED:
     return "AUTH_FAILED";
+  case STATUS_DRY_RUN_TRANSFER:
+    return "DRY_RUN_TRANSFER";
   default:
     return "UNKNOWN";
   }

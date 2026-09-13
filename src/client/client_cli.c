@@ -1389,6 +1389,7 @@ static int set_server_port_option(Config* config, const char* value, const char*
     return -1;
   }
   config->server_port = port;
+  config->server_port_set = true;
   return 0;
 }
 

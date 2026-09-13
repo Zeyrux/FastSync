@@ -288,10 +288,19 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       goto fail;
     }
     if (status == STATUS_CHECK) {
-      bool skipped;
-      File* file = receive_incremental_check(file_descriptor, config, &skipped);
-      if (!skipped && (!file || !sink->store_file(file, sink->context)))
+      bool skipped = false;
+      bool would_transfer = false;
+      File* file = receive_incremental_check_ex(file_descriptor, config, &skipped, &would_transfer);
+      if (config->dry_run) {
+        /* Server-contacting --dry-run: the reply has already been sent
+           (STATUS_OK = up to date, STATUS_DRY_RUN_TRANSFER = would transfer) and
+           nothing may be stored.  Both flags false means a genuine protocol
+           error (STATUS_ERROR already sent or sent by receive_error below). */
+        if (!skipped && !would_transfer)
+          goto receive_error;
+      } else if (!skipped && (!file || !sink->store_file(file, sink->context))) {
         goto receive_error;
+      }
     } else if (status == STATUS_CHUNK) {
       Chunk* chunk = receive_chunk_data(file_descriptor, config);
       if (!chunk || !receiver_process_chunk(chunk, sink))
@@ -323,6 +332,15 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       DeleteManifest* manifest = receive_manifest_entries(file_descriptor);
       if (!manifest)
         goto fail; /* receive_manifest_entries already sent STATUS_ERROR */
+      if (config->dry_run) {
+        /* Server-contacting --dry-run mutates nothing, so a keep-set manifest
+           is consumed and discarded.  The early-delete mode still needs its ACK
+           so a sender blocked on the delete handshake is not left hanging. */
+        delete_manifest_free(manifest);
+        if (early_delete && !send_status(file_descriptor, STATUS_OK))
+          goto fail;
+        goto next_status;
+      }
       if (early_delete) {
         /* --delete-before / --delete-during: the manifest is authoritative the
            moment it arrives, before any file data.  Delete now and acknowledge
@@ -441,7 +459,11 @@ typedef struct {
 static bool receiver_save_file(File* file, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
   FileSaveResult result = FILE_SAVE_ERROR;
-  if (!context->config->save_to_disk) {
+  if (context->config->dry_run) {
+    /* Defense in depth: a dry-run receiver mutates nothing even if a data
+       frame reaches the sink (the sender is not supposed to send one). */
+    result = FILE_SAVE_SKIPPED;
+  } else if (!context->config->save_to_disk) {
     /* Nothing is stored; report the file as not-written so a
        --remove-source-files sender keeps its source. */
     result = FILE_SAVE_SKIPPED;
@@ -469,6 +491,10 @@ static bool receiver_save_file(File* file, void* context_pointer) {
 
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
+  /* Server-contacting --dry-run: nothing was staged or written, so there is
+     nothing to publish and no directory times to stamp. */
+  if (context->config->dry_run)
+    return receiver_send_final_success(fd, context->config, &context->outcomes);
   /* --delay-updates: the whole protocol stream (including manifest/delete
      handling, which ran inside receiver_process) has succeeded and every
      staged file was fully written.  Publish them atomically now, before the

@@ -21,7 +21,6 @@ static void config_set_defaults(Config* config) {
   config->scanner_threads = 0;
   config->metadata_explicitly_disabled = false;
   config->show_progress = false;
-  config->dry_run = false;
   config->compression_threads = 0;
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
@@ -42,6 +41,7 @@ static void config_set_defaults(Config* config) {
   config->tls_ca = NULL;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
+  config->server_port_set = false;
   /* 0 means "--timeout not given": the transport keeps its own built-in 30 s
    * socket timeout (tcp_set_timeouts ignores non-positive values) and the
    * protocol layer keeps its built-in 60 s per-message deadline.  A positive
@@ -190,11 +190,11 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
-         checksum_algo_valid(config->checksum_algo) && identity_wire_valid(config) &&
-         valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
-         valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
-         valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
-         valid_wire_bool(config->fake_super) &&
+         valid_wire_bool(config->dry_run) && checksum_algo_valid(config->checksum_algo) &&
+         identity_wire_valid(config) && valid_wire_bool(config->preserve_atimes) &&
+         valid_wire_bool(config->preserve_crtimes) && valid_wire_bool(config->omit_dir_times) &&
+         valid_wire_bool(config->omit_link_times) && valid_wire_bool(config->munge_links) &&
+         valid_wire_bool(config->keep_dirlinks) && valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&

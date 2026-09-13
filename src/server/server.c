@@ -756,9 +756,12 @@ void handler(int file_descriptor) {
      skipped via its implied --ignore-missing-args, but nothing is deleted). */
   config->delete_missing_args = config->delete_missing_args && allow_delete;
   /* --mkpath: create the destination root (and its missing leading components)
-     before anything else; without it the root must pre-exist.  A failure here
-     aborts the connection cleanly before any file data is exchanged. */
-  if (!ensure_receive_root(config)) {
+   * before anything else; without it the root must pre-exist.  A failure here
+   * aborts the connection cleanly before any file data is exchanged.  A
+   * server-contacting --dry-run must NOT create anything: the root is only
+   * read for the would-transfer/skip decision (an absent root simply means
+   * "everything would transfer"). */
+  if (!config->dry_run && !ensure_receive_root(config)) {
     char* escaped_root = output_escape(config->receive_root_directory, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
                 escaped_root ? escaped_root : "<allocation failed>");
@@ -767,8 +770,9 @@ void handler(int file_descriptor) {
   }
   /* A --delay-updates transfer stages under a private 0700 directory inside
      the receive root.  Create it up front (wiping leftovers of any previously
-     interrupted delayed transfer) so a fully-skipped run also starts clean. */
-  if (config->delay_updates) {
+     interrupted delayed transfer) so a fully-skipped run also starts clean.
+     A dry-run stages nothing, so the staging tree is never created. */
+  if (config->delay_updates && !config->dry_run) {
     config->delay_context = delay_updates_context_create(config->receive_root_directory);
     if (!config->delay_context || !delay_updates_prepare(config->delay_context)) {
       log_message(LOG_LEVEL_ERROR, "Failed to initialize --delay-updates staging area");
@@ -864,12 +868,13 @@ void handler(int file_descriptor) {
     thrd_join(receiver, &receiver_result);
     thrd_join(writer, &writer_result);
     bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
-    if (transfer_ok) {
+    if (transfer_ok && !config->dry_run) {
       /* Commit-style (late) deletion: receive_thread handed the keep-set
          manifest here instead of deleting while write_thread might still be
          draining, so by now every file is on disk and the whole transfer is
          known to have succeeded.  Remove the extras before publishing a
-         --delay-updates run; the walker skips the staging directory. */
+         --delay-updates run; the walker skips the staging directory.  A
+         server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
         if (!manifest_delete_all(config, context->deferred_manifest)) {
           transfer_ok = false;
@@ -878,7 +883,7 @@ void handler(int file_descriptor) {
         context->deferred_manifest = NULL;
       }
     }
-    if (transfer_ok) {
+    if (transfer_ok && !config->dry_run) {
       /* --delay-updates: receive_thread has finished the whole protocol stream
          (including manifest/delete handling) and write_thread has drained its
          queue, so every staged file is complete.  Publish atomically before the

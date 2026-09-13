@@ -93,7 +93,7 @@ This document maps rsync's full feature set to FastSync's current implementation
 
 | Flag | Rsync Description | FastSync Status | Notes |
 |------|-------------------|-----------------|-------|
-| `-n`, `--dry-run` | Trial run with no changes | ✅ Implemented | `dry_run` config field |
+| `-n`, `--dry-run` | Trial run with no changes | ✅ Implemented | Server-contacting since protocol 2.21.0: with a remote/daemon destination (or an explicit `--server-port`) the client handshakes with the receiver, which runs the normal read-only per-file check and answers `STATUS_DRY_RUN_TRANSFER`/`STATUS_OK` without mutating anything. A plain local destination keeps the client-side manifest. Would-delete reporting for `--delete*` is deferred (dry-run never deletes). |
 | `-b`, `--backup` | Make backups of overwritten files | ✅ Implemented | Backup before overwrite |
 | `--backup-dir=DIR` | Backup directory hierarchy | ✅ Implemented | `backup_dir` config field |
 | `--suffix=SUFFIX` | Backup suffix (default ~) | ✅ Implemented | `suffix` config field |

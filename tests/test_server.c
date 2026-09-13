@@ -6,6 +6,7 @@
 #include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -369,6 +370,88 @@ static void test_incremental_check_size_mismatch_full_transfer() {
     waitpid(pid, &status, 0);
     close(p[1]);
     config_delete(cfg);
+    unlink(path);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* Server-contacting --dry-run: with the wire config's dry_run set, a file that
+   is NOT up to date makes the receiver answer STATUS_DRY_RUN_TRANSFER and
+   return immediately; no data body is read and the destination file is left
+   byte-for-byte unchanged (no temp file, no write, no rename). */
+static void test_incremental_check_dry_run_reports_transfer_without_writing() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->dry_run = true;
+  char* root = make_check_root("dryw");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+  write_check_file(root, "file.txt", "0123456789abcdef");
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/file.txt", root);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    bool would_transfer = false;
+    File* file = receive_incremental_check_ex(p[0], cfg, &skipped, &would_transfer);
+    bool ok = file == NULL && !skipped && would_transfer;
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = (unsigned long long)st.st_size + 1;
+    long long mtime = (long long)st.st_mtime;
+    long long mtime_nsec = 0;
+#ifdef __linux__
+    mtime_nsec = (long long)st.st_mtim.tv_nsec;
+#endif
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_DRY_RUN_TRANSFER);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    /* The destination file must be untouched and no temp sibling may appear. */
+    char buf[32] = {0};
+    int fd = open(path, O_RDONLY);
+    EXPECT_TRUE(fd >= 0);
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    EXPECT_EQ_INT((int)got, 16);
+    EXPECT_EQ_STR(buf, "0123456789abcdef");
+    close(fd);
+    DIR* d = opendir(root);
+    EXPECT_NOT_NULL(d);
+    int entries = 0;
+    const struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+        entries++;
+    }
+    closedir(d);
+    EXPECT_EQ_INT(entries, 1);
     unlink(path);
     rmdir(root);
     free(root);
@@ -771,6 +854,7 @@ void test_server() {
     test_receive_incremental_check_rejects_invalid_nanoseconds();
     test_incremental_check_quick_skip_by_mtime();
     test_incremental_check_size_mismatch_full_transfer();
+    test_incremental_check_dry_run_reports_transfer_without_writing();
     test_incremental_check_delta_oversize_reports_failure();
     test_late_manifest_abort_frees_keepset();
     test_late_manifest_eof_frees_keepset();

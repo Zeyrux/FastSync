@@ -481,6 +481,21 @@ static void disconnect_transfer_client(Client* client) {
   client_delete(client);
 }
 
+/* True when --dry-run should contact a receiver rather than running the
+ * client-side local manifest.  A remote (SSH host:path), daemon
+ * (host::module/path), or an explicit --server-port/--port selects the
+ * server-contacting path; a plain local destination keeps the original
+ * client-side behavior (which never dials the default 127.0.0.1:8080). */
+static bool dry_run_targets_server(const Config* config) {
+  if (!config)
+    return false;
+  if (config->transport == TRANSPORT_SSH)
+    return true;
+  if (config->module && config->module[0] != '\0')
+    return true;
+  return config->server_port_set;
+}
+
 static bool add_chunk_to_manifest(ArrayList* manifest, const Chunk* chunk) {
   if (!manifest)
     return true;
@@ -1024,6 +1039,12 @@ static int incremental_check(Client* client, File* file, const Config* config,
       *resume_offset = offset;
     return 3;
   }
+  /* Server-contacting --dry-run: the receiver decided the file is not up to
+     date and answered "would transfer" WITHOUT expecting any data.  The caller
+     only uses this in the dry-run path; a non-dry-run sender never receives it
+     because the receiver only emits it when the wire config sets dry_run. */
+  if (s == STATUS_DRY_RUN_TRANSFER)
+    return 4;
   if (s != STATUS_NEXT) {
     log_message(LOG_LEVEL_ERROR, "Unexpected server status");
     send_status(client->file_descriptor, STATUS_ERROR);
@@ -1161,6 +1182,174 @@ static int send_append(const Client* client, File* file, Config* config,
     ok = send_data(fd, &tail_view);
   }
   return ok ? 0 : -1;
+}
+
+/* Server-contacting --dry-run.  Connects to the configured remote/daemon and
+ * runs the normal per-file incremental decision WITHOUT transmitting any file
+ * data: the receiver (which also sees dry_run=true on the wire) answers
+ * STATUS_OK for an up-to-date file and STATUS_DRY_RUN_TRANSFER for a file it
+ * would otherwise write, mutating nothing on either side.  The would-transfer
+ * set and the same trailer as the local dry-run are printed.  A
+ * --compare-dest exact basis hit with no destination copy is reported as a
+ * skip by the receiver.
+ *
+ * Only regular files take the receiver-consulted check; directory / symlink /
+ * special / hard-link-sibling entries have no per-file content check, so they
+ * are reported conservatively as would-transfer and their frames are never
+ * sent (which is what keeps the receiver mutation-free).  --delete* is
+ * deliberately NOT transmitted in dry-run, so no deletion can occur; the
+ * would-delete manifest report is a documented follow-up.
+ *
+ * Returns 0 on success, 1 on error. */
+static int send_dry_run_remote(Config* config) {
+  int from_skipped = 0;
+  ArrayList* missing_args = NULL;
+  if (config->delete_missing_args) {
+    missing_args = array_list_create(free);
+    if (!missing_args)
+      return 1;
+  }
+  if (!files_from_list_check(config, missing_args, &from_skipped)) {
+    if (missing_args)
+      array_list_delete(missing_args);
+    return 1;
+  }
+  if (missing_args)
+    array_list_delete(missing_args);
+  /* Alternate basis dirs force the whole-file per-file check on the real
+     receiver; refuse an oversize source up front exactly as send_files does so
+     dry-run reports the same clear diagnostic instead of aborting mid-stream. */
+  if (config_has_basis(config) && !basis_oversize_preflight(config))
+    return 1;
+  /* Would-delete reporting requires a receiver-side read-only extras walk that
+     is not implemented yet; be explicit that --delete is a no-op in dry-run
+     rather than silently ignoring it. */
+  if ((config->use_delete || config->delete_missing_args) && !config->quiet)
+    log_message(LOG_LEVEL_WARNING,
+                "--dry-run: would-delete reporting is not available in this release; nothing is "
+                "deleted");
+
+  /* A live session may follow, so arm graceful abort handling. */
+  client_set_abort_armed(true);
+  Client* client = connect_transfer_client(config);
+  if (!client) {
+    if (config->transport == TRANSPORT_TCP)
+      log_message(LOG_LEVEL_ERROR, "could not connect to server%s",
+                  config->use_tls ? " via TLS" : "");
+    client_set_abort_armed(false);
+    return 1;
+  }
+  ProtocolSession session;
+  protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
+  protocol_session_set_io_timeout(&session, config->timeout);
+  protocol_session_set_ssl(&session, (SSL*)client->ssl);
+  protocol_session_bind(&session);
+
+  int ret = 1;
+  PreparedScanner prepared;
+  memset(&prepared, 0, sizeof(prepared));
+  DirectoryScanner* scanner = NULL;
+  if (!config_send(client->file_descriptor, config))
+    goto dry_fail;
+  receive_daemon_motd(client, config);
+  if (!prepare_scanner(config, 0, &prepared))
+    goto dry_fail;
+  scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
+  if (!scanner)
+    goto dry_fail;
+
+  int file_count = 0;
+  unsigned long long total_bytes = 0;
+  char size_buffer[32];
+  if (!config->quiet)
+    printf("Dry run: files to be transferred\n");
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    for (int i = 0; i < chunk->element_count; i++) {
+      File* f = chunk->items[i];
+      if (!f)
+        continue;
+      unsigned long long fsize = f->data ? f->data->size : 0;
+      bool would;
+      if (f->is_dir || f->is_symlink || f->is_special ||
+          (f->link_group != 0 && !f->link_first && f->hardlink_target != NULL)) {
+        /* No receiver-side content check exists for these frame types; a real
+           run would (re)create them, so report would-transfer and send no
+           frame (the receiver must stay mutation-free). */
+        would = true;
+      } else if (fsize > MAX_RECEIVE_WHOLE_FILE_SIZE && !config->use_incremental &&
+                 !config_has_basis(config)) {
+        /* A non-incremental run streams a >whole-file-limit source without the
+           STATUS_CHECK handshake, so no read-only receiver decision is possible
+           (and none is needed: a real run would transfer it). */
+        would = true;
+      } else {
+        DeltaSignature* sig = NULL;
+        unsigned long long resume_offset = 0;
+        int rc = incremental_check(client, f, config, &sig, &resume_offset);
+        delta_signature_destroy(sig);
+        if (rc < 0) {
+          chunk_destroy(chunk);
+          goto dry_fail;
+        }
+        if (rc == 1)
+          continue; /* up to date; nothing to report */
+        if (rc != 4) {
+          log_message(LOG_LEVEL_ERROR, "Unexpected receiver reply during dry-run");
+          chunk_destroy(chunk);
+          goto dry_fail;
+        }
+        would = true;
+      }
+      if (would) {
+        if (!config->quiet) {
+          char* escaped_path = output_escape(file_wire_path(f), config->eight_bit_output);
+          if (!escaped_path) {
+            chunk_destroy(chunk);
+            goto dry_fail;
+          }
+          if (config->human_readable)
+            printf("  %s (%s)\n", escaped_path,
+                   display_bytes(fsize, true, size_buffer, sizeof(size_buffer)));
+          else
+            printf("  %s (%llu bytes)\n", escaped_path, fsize);
+          free(escaped_path);
+        }
+        total_bytes += fsize;
+        file_count++;
+      }
+    }
+    chunk_destroy(chunk);
+  }
+  bool io_error = directory_scanner_had_io_error(scanner);
+  if (directory_scanner_failed(scanner))
+    goto dry_fail;
+  if (io_error)
+    log_message(LOG_LEVEL_WARNING, "source scan hit an unreadable directory");
+  /* Terminate the stream so the receiver emits its success frame; no data
+     frame and no delete manifest are ever sent in dry-run. */
+  if (!send_status(client->file_descriptor, STATUS_FINISHED))
+    goto dry_fail;
+  Status status;
+  if (!receive_status(client->file_descriptor, &status) || status != STATUS_OK)
+    goto dry_fail;
+  if (!config->quiet) {
+    if (config->human_readable)
+      printf("Total: %d files, %s\n", file_count,
+             display_bytes(total_bytes, true, size_buffer, sizeof(size_buffer)));
+    else
+      printf("Total: %d files, %.1f MB\n", file_count, (double)total_bytes / (double)BYTES_PER_MIB);
+  }
+  ret = io_error ? 1 : 0;
+
+dry_fail:
+  if (scanner)
+    directory_scanner_destroy(scanner);
+  prepared_scanner_destroy(&prepared);
+  disconnect_transfer_client(client);
+  protocol_session_unbind();
+  client_set_abort_armed(false);
+  return ret;
 }
 
 // Send a single file directly (non-incremental path).
@@ -1931,7 +2120,8 @@ int send_files(Config* config) {
   if (config->list_only)
     return send_list_only(config);
   if (config->dry_run)
-    return send_dry_run_manifest(config);
+    return dry_run_targets_server(config) ? send_dry_run_remote(config)
+                                          : send_dry_run_manifest(config);
   ArrayList* missing_args = NULL;
   int skipped = 0;
   if (config->delete_missing_args) {
@@ -2243,7 +2433,8 @@ int send_files_multithreaded(Config** config_ptr) {
   if (config->list_only)
     return send_list_only(config);
   if (config->dry_run)
-    return send_dry_run_manifest(config);
+    return dry_run_targets_server(config) ? send_dry_run_remote(config)
+                                          : send_dry_run_manifest(config);
   ArrayList* missing_args = NULL;
   int skipped = 0;
   if (config->delete_missing_args) {

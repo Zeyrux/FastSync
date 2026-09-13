@@ -1647,7 +1647,14 @@ static File* receive_full_file(int fd, const Config* config, const char* path) {
   return file;
 }
 
-File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
+/* Core implementation.  `would_transfer` (may be NULL) is set true only on the
+ * server-contacting --dry-run path, when the file is not up to date and the
+ * receiver answered STATUS_DRY_RUN_TRANSFER; the caller then knows no File is
+ * returned and nothing was stored. */
+File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
+                                   bool* would_transfer) {
+  if (would_transfer)
+    *would_transfer = false;
   if (!config || !skipped) {
     send_status(fd, STATUS_ERROR);
     return NULL;
@@ -1796,6 +1803,44 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     free(full_path);
     free(check_path);
     *skipped = true;
+    return NULL;
+  }
+
+  /* ---- Server-contacting --dry-run ----
+   * The destination does not already hold this file.  In dry-run the receiver
+   * must NOT materialize anything (no basis link/copy, no append/delta/full
+   * transfer) and the sender must NOT send any data, so answer
+   * STATUS_DRY_RUN_TRANSFER and return immediately.  The one exception is a
+   * --compare-dest exact hit with no destination copy: a real run would
+   * suppress the data without changing the destination, so it reports as a
+   * skip (STATUS_OK) exactly as the full path below would.  Everything read
+   * here (destination file, basis candidates) is read-only. */
+  if (config->dry_run) {
+    bool skip_via_compare = false;
+    if (config_has_basis(config) && !config->ignore_times) {
+      BasisMatch basis;
+      basis_match_find(config, check_path, check_size, (time_t)check_mtime, (long)check_mtime_nsec,
+                       check_digest, check_digest_len, false, &basis);
+      if (basis.hit && basis.type == BASIS_DEST_COMPARE && !has_old_file)
+        skip_via_compare = true;
+      basis_match_free(&basis);
+    }
+    Status reply = skip_via_compare ? STATUS_OK : STATUS_DRY_RUN_TRANSFER;
+    if (!send_status(fd, reply)) {
+      free(old_data);
+      close(old_fd);
+      free(full_path);
+      free(check_path);
+      return NULL;
+    }
+    if (skip_via_compare)
+      *skipped = true;
+    else if (would_transfer)
+      *would_transfer = true;
+    free(old_data);
+    close(old_fd);
+    free(full_path);
+    free(check_path);
     return NULL;
   }
 
@@ -2179,6 +2224,10 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
   free(check_path);
   free(full_path);
   return file;
+}
+
+File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
+  return receive_incremental_check_ex(fd, config, skipped, NULL);
 }
 
 File* file_receive(const Config* config, int file_descriptor) {
