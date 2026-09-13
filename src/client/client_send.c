@@ -1435,6 +1435,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   }
   ProtocolSession session;
   protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
+  protocol_session_set_io_timeout(&session, context->config->timeout);
   protocol_session_set_ssl(&session, (SSL*)client->ssl);
   protocol_session_bind(&session);
   if (!config_send(client->file_descriptor, context->config)) {
@@ -1896,6 +1897,7 @@ int send_files(Config* config) {
   }
   ProtocolSession session;
   protocol_session_init(&session, client->file_descriptor, client->file_descriptor);
+  protocol_session_set_io_timeout(&session, config->timeout);
   protocol_session_set_ssl(&session, (SSL*)client->ssl);
   protocol_session_bind(&session);
   int ret = 1;

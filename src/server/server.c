@@ -609,6 +609,12 @@ void handler(int file_descriptor) {
   if (gate_ctx.super_mode_override != -1)
     config->super_mode = (SuperMode)gate_ctx.super_mode_override;
   protocol_set_8_bit_output(config->eight_bit_output);
+  /* Server-side per-message protocol deadline for every frame from here on.
+   * `timeout` is not serialized, so this is the server's own config (the server
+   * has no --timeout CLI and defaults it to 0): the built-in 60 s window stays
+   * in effect.  A client's --timeout tightens only that client's own protocol
+   * I/O and the server's socket read/write timeout is the transport default. */
+  protocol_session_set_io_timeout(&session, config->timeout);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
     goto done;
@@ -743,6 +749,7 @@ void handler(int file_descriptor) {
       goto done;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
+    protocol_session_set_io_timeout(&context->session, config->timeout);
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
     pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);

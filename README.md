@@ -132,7 +132,7 @@ partial, alternate, and planned behavior.
 | `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
-| `--timeout <sec>` | I/O timeout in seconds (default: 30) |
+| `--timeout <sec>` | Positive I/O timeout in seconds, applied to both the socket (`SO_RCVTIMEO`/`SO_SNDTIMEO`, built-in default 30 s) and the per-message protocol poll deadline (built-in default 60 s). Omit the option to keep both built-ins; `0` is rejected. The server side keeps the built-in 60 s protocol window (the value is not sent on the wire). |
 | `--contimeout <sec>` | Connection timeout in seconds (default: 10) |
 | `--backup` | Backup existing destination files before overwriting |
 | `--backup-dir <dir>` | Target directory for backups (requires `--backup`) |
@@ -150,6 +150,19 @@ partial, alternate, and planned behavior.
 | `--key <path>` | TLS private key file (PEM) |
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
 | `--client-cn <name>` | TLS client certificate common name; mandatory with `--tls` (a TLS connection always verifies the client CN) |
+
+**Per-message vs. connection timeouts.** `--timeout` bounds each individual protocol
+send/receive (the `poll()` deadline), so a peer that stops mid-frame is dropped. It
+does not, by itself, stop a peer that keeps sending well-formed frames forever. The
+receiver therefore also enforces two wall-clock (`CLOCK_MONOTONIC`) bounds on a
+connection: a **1 hour** idle limit and a **24 hour** overall session cap. Only
+frames that move real work (not `STATUS_KEEPALIVE`/`STATUS_ABORT` and not an
+empty `STATUS_CHECK_BATCH`/`STATUS_DIR_TIMES`) refresh the idle timestamp, so a
+peer cannot hold a connection slot by emitting cheap empty frames; a peer that
+fabricates minimal non-empty frames can still occupy a slot until the 24 hour
+cap, since no bound can require actual payload without risking a legitimate
+long operation. Both are deliberately generous so a legitimate long-running
+transfer is never aborted.
 
 ### Server
 
@@ -384,7 +397,7 @@ features without changing the meaning of ordinary compatibility options.
 | `--bwlimit <KB/s>` | Apply token-bucket bandwidth limiting. |
 | `--progress` | Show transfer progress and throughput. |
 | `--stats` | Print transfer statistics. |
-| `--timeout <seconds>` | Set I/O timeout. |
+| `--timeout <seconds>` | Set the socket **and** per-message protocol I/O timeout (positive seconds). Omit to keep the built-in 30 s socket / 60 s protocol defaults. |
 | `--contimeout <seconds>` | Set connection timeout. |
 
 Short-option conflicts with rsync have been resolved for the CLI namespace

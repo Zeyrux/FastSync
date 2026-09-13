@@ -23,6 +23,7 @@
 #include "test_property.h"
 #include "test_protocol.h"
 #include "test_queue.h"
+#include "test_receiver_timeout.h"
 #include "test_robustness.h"
 #include "test_scanner.h"
 #include "test_server.h"
@@ -61,6 +62,7 @@ int main() {
   RUN_TEST(test_delta);
   RUN_TEST(test_data);
   RUN_TEST(test_protocol);
+  RUN_TEST(test_receiver_timeout);
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
   RUN_TEST(test_iconv);
