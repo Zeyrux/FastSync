@@ -127,6 +127,13 @@ bool utils_set_authorized_root(int fd, const char* canonical_path);
 /* The fd-only compatibility form is fail-closed for path-based operations;
  * callers should use utils_set_authorized_root with the canonical identity. */
 void utils_set_authorized_root_fd(int fd);
+/* Read accessors for the process-wide authorized root, so every secure-walk
+ * site consumes the single shared state instead of keeping its own copy.  The
+ * fd is caller-owned (see the setters): it is returned verbatim, never dup'd,
+ * and the caller that opened it is responsible for closing it.  With no root
+ * configured the fd accessor returns -1 and the path accessor returns NULL. */
+int utils_get_authorized_root_fd(void);
+const char* utils_get_authorized_root_path(void);
 /* True when `path` is `root` itself or lies directly beneath it: a lexical
  * prefix test requiring the byte after `root` to be '\0' or '/'.  Both `root`
  * and `path` must be absolute canonical paths free of "."/".." components (the

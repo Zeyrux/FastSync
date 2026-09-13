@@ -62,9 +62,6 @@ void file_set_keep_dirlinks(bool enable);
 void file_set_trust_sender(bool enable);
 bool file_get_trust_sender(void);
 
-/* A configured fd without a canonical identity deliberately rejects paths. */
-bool file_set_authorized_root(int fd, const char* canonical_path);
-
 /* Secure path/filesystem primitives (symlink-safe, O_NOFOLLOW, root-confined). */
 bool file_path_exists_secure(const char* path);
 bool file_stat_secure(const char* path, struct stat* st);
