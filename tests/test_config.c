@@ -2399,7 +2399,7 @@ static void golden_config_populate(Config* c) {
   c->modify_window = 3;
   c->compress_choice = str_dup("zstd");
   /* "u=rwx,go=rx" is the same 11 bytes as the original "u=rwX,go=rX" (so the
-   * frame stays 633 bytes) but X is not in FastSync's chmod grammar, and the
+   * frame stays 637 bytes) but X is not in FastSync's chmod grammar, and the
    * receive-side golden validates the frame. */
   c->chmod_spec = str_dup("u=rwx,go=rx");
   c->skip_compress_set = true;
@@ -2531,7 +2531,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.20.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.21.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())

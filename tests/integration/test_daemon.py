@@ -43,6 +43,9 @@ from common import (
     _find_free_port,
     _wait_for_port,
 )
+# The dry-run no-mutation contract is asserted with the same structural snapshot
+# (mode/inode/mtime/xattr/content) the feature suite uses.
+from test_features import _snapshot_tree
 
 SOURCE_DIR = os.path.join(TEST_DATA_DIR, "daemon_source")
 MODULE_ROOT = os.path.join(TEST_DATA_DIR, "daemon_modules")
@@ -354,6 +357,33 @@ class TestDaemonRejection:
         result = _push("127.0.0.1::readonly", daemon.port)
         assert result.returncode != 0
         assert self._tree_files() == before, "read-only rejection wrote under the module root"
+
+    @pytest.mark.ci
+    def test_read_only_module_allows_dry_run(self, daemon):
+        """A server-contacting --dry-run IS a read-only wire operation, so a
+        `read only = yes` module is the safest dry-run target and must accept it
+        while writing nothing."""
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::readonly", flags=["--dry-run"],
+                               port=daemon.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert "Dry run:" in result.stdout, result.stdout[:200]
+        assert _tree_file_count(READONLY_MODULE) == 0, "read-only dry-run wrote a file"
+
+    @pytest.mark.ci
+    def test_module_dry_run_mutates_nothing(self, daemon):
+        """A daemon-module dry-run reports would-transfer entries but leaves the
+        module tree structurally identical (mode/inode/mtime/xattr/content)."""
+        result = _push("127.0.0.1::files", daemon.port)
+        assert result.returncode == 0, result.stderr or result.stdout
+        before = _snapshot_tree(FILES_MODULE)
+        # --ignore-times forces every regular file to be reported as
+        # would-transfer, so the dry-run exercises the receiver decision rather
+        # than an all-skip shortcut -- while still mutating nothing.
+        result, _ = run_client(SOURCE_DIR, "127.0.0.1::files",
+                               flags=["--dry-run", "--ignore-times"], port=daemon.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert "Dry run:" in result.stdout, result.stdout[:200]
+        assert _snapshot_tree(FILES_MODULE) == before, "daemon dry-run mutated the module root"
 
     def test_unknown_module_rejected(self, daemon):
         result = _push("127.0.0.1::no-such-module", daemon.port)
