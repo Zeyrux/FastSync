@@ -1,4 +1,5 @@
 #include "transport_tcp.h"
+#include "daemon_limits.h"
 #include "log.h"
 #include "protocol.h"
 #include "utils.h"
@@ -18,15 +19,25 @@
 
 static volatile sig_atomic_t g_active_connections = 0;
 
+/* Shared registry installed on the active server; the SIGCHLD handler needs a
+ * file-scope pointer so it can reclaim the dead child's slot.  Set once by
+ * accept_loop before the fork loop (single-threaded parent). */
+static DaemonLimitRegistry* g_limit_registry = NULL;
+/* Slot reserved by the parent for the connection child currently being forked.
+ * Written before fork(), read by the child (which inherits the value). */
+static int g_current_slot = DAEMON_LIMITS_NO_SLOT;
+
 static void tcp_apply_socket_timeout(int fd);
 static void tcp_enable_nodelay_default(int fd, int family);
 
 static void sigchld_handler(int sig) {
   (void)sig;
   int saved_errno = errno;
-  while (waitpid(-1, NULL, WNOHANG) > 0) {
+  pid_t pid;
+  while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
     if (g_active_connections > 0)
       g_active_connections--;
+    daemon_limits_reclaim_pid(g_limit_registry, (long)pid);
   }
   errno = saved_errno;
 }
@@ -108,6 +119,7 @@ Server* server_create_ex(int port, const ServerBindOptions* bind_opts) {
   server->ssl_ctx = NULL;
   server->max_connections = 100;
   server->active_connections = 0;
+  server->limit_registry = NULL;
 
   return server;
 }
@@ -119,6 +131,15 @@ Server* server_create(int port) {
 void server_set_max_connections(Server* server, unsigned int max_connections) {
   if (server && max_connections > 0)
     server->max_connections = max_connections;
+}
+
+void server_set_limit_registry(Server* server, struct DaemonLimitRegistry* registry) {
+  if (server)
+    server->limit_registry = registry;
+}
+
+int transport_tcp_current_slot(void) {
+  return g_current_slot;
 }
 
 void server_delete(Server** server) {
@@ -140,6 +161,7 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
     return;
   }
   signal(SIGCHLD, sigchld_handler);
+  g_limit_registry = server->limit_registry;
   while (1) {
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -159,9 +181,31 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       close(fd);
       continue;
     }
+    int slot = DAEMON_LIMITS_NO_SLOT;
+    if (server->limit_registry) {
+      slot = daemon_limits_claim_slot(server->limit_registry);
+      if (slot == DAEMON_LIMITS_NO_SLOT) {
+        /* The global cap bounds live children, so this only happens when the
+         * fixed registry is smaller than the configured cap; fail closed. */
+        log_message(LOG_LEVEL_WARNING, "Connection registry slots exhausted (max %u), rejecting %s",
+                    server->max_connections, peer);
+        close(fd);
+        continue;
+      }
+    }
     log_message(LOG_LEVEL_INFO, "%s from %s", log_fmt, peer);
+    g_current_slot = slot;
+    /* Block SIGCHLD across fork() and the parent's pid publication: a child
+     * that exits immediately must not be reaped before its slot records its
+     * pid, which would leak the slot and its module/source counts. */
+    sigset_t blocked;
+    sigset_t previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &blocked, &previous);
     pid_t pid = fork();
     if (pid == 0) {
+      sigprocmask(SIG_SETMASK, &previous, NULL);
       /* Connection children must not run the parent's global cleanup(): it
        * frees state (credentials / daemon conf) that the child's worker
        * threads may still be reading and closes fd numbers the child could
@@ -177,7 +221,13 @@ static void accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
       _exit(0);
     } else if (pid > 0) {
       g_active_connections++;
+      if (server->limit_registry)
+        daemon_limits_set_slot_pid(server->limit_registry, slot, (long)pid);
+    } else if (server->limit_registry) {
+      /* fork() failed: release the reservation so the slot is not leaked. */
+      daemon_limits_reclaim_slot(server->limit_registry, slot);
     }
+    sigprocmask(SIG_SETMASK, &previous, NULL);
     close(fd);
   }
 }
