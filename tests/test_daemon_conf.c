@@ -543,11 +543,19 @@ static void test_daemon_conf_module_count_capped() {
   size_t len = (cap + 8) * 32;
   char* body = malloc(len);
   EXPECT_NOT_NULL(body);
+  size_t used = 0;
   body[0] = '\0';
   for (size_t i = 0; i < cap + 1; i++) {
     char line[48];
-    snprintf(line, sizeof(line), "[m%zu]\npath = /x\n", i);
-    strcat(body, line);
+    int n = snprintf(line, sizeof(line), "[m%zu]\npath = /x\n", i);
+    if (n < 0 || (size_t)n >= sizeof(line) || used + (size_t)n >= len) {
+      free(body);
+      EXPECT_TRUE(0 && "module-count test buffer overflow");
+      return;
+    }
+    memcpy(body + used, line, (size_t)n);
+    used += (size_t)n;
+    body[used] = '\0';
   }
   char* path;
   EXPECT_EQ_INT(write_conf(body, &path), 0);
