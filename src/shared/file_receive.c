@@ -569,6 +569,13 @@ static FileSaveResult file_save_write_device(const char* root_directory, const F
 
 FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
                                       const Config* config) {
+  /* Central no-mutation guard: a server-contacting --dry-run (or a local batch
+     apply that somehow carries dry_run) must never touch the destination, no
+     matter which caller reached this primitive.  The per-caller guards remain,
+     but this is the last line of defense for every save path.  Report SKIPPED
+     so a --remove-source-files sender correctly keeps its source. */
+  if (config && config->dry_run)
+    return FILE_SAVE_SKIPPED;
   /* Backups are incompatible with ignore-existing: moving the entry first
      would make a concurrent no-replace commit overwrite its old name. */
   bool backup_enabled = config && config->backup && !config->ignore_existing;
@@ -2941,6 +2948,11 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
 bool manifest_delete_all(const Config* config, DeleteManifest* manifest) {
   if (!config || !manifest)
     return false;
+  /* Central no-mutation guard: a dry-run never deletes.  No manifest is sent on
+     the dry-run path, but a hostile/buggy peer could; treat it as a no-op so
+     the receiver can never remove anything. */
+  if (config->dry_run)
+    return true;
   if (config->delete_missing_args && !manifest_delete_missing_args(config, manifest))
     return false;
   if (config->use_delete && !manifest_delete_extras(config, manifest))
