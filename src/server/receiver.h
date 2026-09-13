@@ -4,6 +4,8 @@
 #include "config.h"
 #include "file.h"
 #include "file_receive.h"
+#include <stdbool.h>
+#include <time.h>
 
 typedef bool (*ReceiverFileSink)(File* file, void* context);
 
@@ -44,5 +46,23 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
                              DeleteManifest** pending_manifest);
 int receiver_receive_files(Config* config, int file_descriptor);
+
+/* ---- Connection time bounds (anti-slowloris) ----
+ * receiver_process_pending() aborts a connection that makes no forward progress
+ * (only STATUS_KEEPALIVE/STATUS_ABORT frames) beyond a wall-clock idle limit,
+ * and enforces a hard cap on the whole session.  Both are CLOCK_MONOTONIC
+ * deltas, independent of the per-message poll deadline, so a 60 s (or
+ * --timeout) receive window can never reset them.  Defaults are deliberately
+ * generous (see MAX_SESSION_IDLE_SEC / MAX_SESSION_WALL_SEC in receiver.c). */
+
+/* Test seam: override the idle/session wall-clock limits (0 = abort on the
+ * next status).  Always restore with receiver_reset_time_limits(). */
+void receiver_set_time_limits(unsigned int idle_sec, unsigned int wall_sec);
+void receiver_reset_time_limits(void);
+/* Pure predicate over explicit monotonic timestamps, exposed so the bound is
+ * unit-testable without sleeping.  True when either the idle or the overall
+ * session limit has elapsed. */
+bool receiver_time_limit_exceeded(const struct timespec* session_start,
+                                  const struct timespec* last_progress, const struct timespec* now);
 
 #endif

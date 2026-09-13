@@ -609,6 +609,11 @@ void handler(int file_descriptor) {
   if (gate_ctx.super_mode_override != -1)
     config->super_mode = (SuperMode)gate_ctx.super_mode_override;
   protocol_set_8_bit_output(config->eight_bit_output);
+  /* Honor the negotiated --timeout for every protocol frame from here on (the
+   * config handshake itself used the built-in 60 s window).  A positive value
+   * also tightens the socket SO_RCVTIMEO/SO_SNDTIMEO already applied by the
+   * transport; 0 leaves both built-in defaults in place. */
+  protocol_session_set_io_timeout(&session, config->timeout);
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
     goto done;
@@ -743,6 +748,7 @@ void handler(int file_descriptor) {
       goto done;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
+    protocol_session_set_io_timeout(&context->session, config->timeout);
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
     pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);

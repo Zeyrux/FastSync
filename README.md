@@ -132,7 +132,7 @@ partial, alternate, and planned behavior.
 | `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
-| `--timeout <sec>` | I/O timeout in seconds (default: 30) |
+| `--timeout <sec>` | I/O timeout in seconds. Applied to both the socket (`SO_RCVTIMEO`/`SO_SNDTIMEO`, built-in default 30 s) and the per-message protocol poll deadline (built-in default 60 s). `0` (the default/unset sentinel) keeps both built-ins; a positive value overrides both. |
 | `--contimeout <sec>` | Connection timeout in seconds (default: 10) |
 | `--backup` | Backup existing destination files before overwriting |
 | `--backup-dir <dir>` | Target directory for backups (requires `--backup`) |
@@ -150,6 +150,15 @@ partial, alternate, and planned behavior.
 | `--key <path>` | TLS private key file (PEM) |
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
 | `--client-cn <name>` | TLS client certificate common name; mandatory with `--tls` (a TLS connection always verifies the client CN) |
+
+**Per-message vs. connection timeouts.** `--timeout` bounds each individual protocol
+send/receive (the `poll()` deadline), so a peer that stops mid-frame is dropped. It
+does not, by itself, stop a peer that keeps sending well-formed frames forever. The
+receiver therefore also enforces two wall-clock (`CLOCK_MONOTONIC`) bounds on a
+connection: a **1 hour** idle limit (only `STATUS_KEEPALIVE`/`STATUS_ABORT` frames
+seen for that long counts as no forward progress) and a **24 hour** overall session
+cap. Both are deliberately generous so a legitimate long-running transfer is never
+aborted; they exist to defeat keepalive slowloris squatting on a connection slot.
 
 ### Server
 
@@ -384,7 +393,7 @@ features without changing the meaning of ordinary compatibility options.
 | `--bwlimit <KB/s>` | Apply token-bucket bandwidth limiting. |
 | `--progress` | Show transfer progress and throughput. |
 | `--stats` | Print transfer statistics. |
-| `--timeout <seconds>` | Set I/O timeout. |
+| `--timeout <seconds>` | Set the socket **and** per-message protocol I/O timeout. `0` keeps the built-in 30 s socket / 60 s protocol defaults; a positive value overrides both. |
 | `--contimeout <seconds>` | Set connection timeout. |
 
 Short-option conflicts with rsync have been resolved for the CLI namespace

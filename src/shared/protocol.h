@@ -52,6 +52,12 @@ typedef struct ProtocolSession {
   atomic_ullong total_allocated_bytes;
   bool eight_bit_output;
   unsigned long long max_alloc;
+  /* Per-session deadline (seconds) applied to every protocol send/receive by
+   * protocol_send_n_data / protocol_receive_n_data.  Defaults to the built-in
+   * 60 s window; a value <= 0 falls back to that default.  Set from the
+   * negotiated Config->timeout so --timeout is honored by the poll()-driven
+   * protocol I/O, not just the socket SO_RCVTIMEO/SO_SNDTIMEO. */
+  int io_timeout_sec;
 } ProtocolSession;
 
 typedef int Status;
@@ -141,6 +147,11 @@ void protocol_session_unbind(void);
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc);
+/* Override the per-message send/receive deadline for this session.
+ * `sec` <= 0 restores the built-in 60 s default (used for --timeout=0/unset).
+ * An explicit long deadline (e.g. the delete-ack wait) is applied per-call by
+ * protocol_receive_status_timed and is unaffected by this setter. */
+void protocol_session_set_io_timeout(ProtocolSession* session, int sec);
 void* protocol_alloc(size_t size);
 void* protocol_realloc(void* ptr, size_t size);
 void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled);

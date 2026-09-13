@@ -67,7 +67,11 @@ static void config_set_defaults(Config* config) {
   config->tls_ca = NULL;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
-  config->timeout = 30;
+  /* 0 means "--timeout not given": the transport keeps its own built-in 30 s
+   * socket timeout (tcp_set_timeouts ignores non-positive values) and the
+   * protocol layer keeps its built-in 60 s per-message deadline.  A positive
+   * value overrides BOTH (see protocol_session_set_io_timeout). */
+  config->timeout = 0;
   config->contimeout = 10;
   config->quiet = false;
   config->backup = false;

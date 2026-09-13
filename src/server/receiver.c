@@ -12,6 +12,7 @@
 #include "utils.h"
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code) {
   if (!outcomes)
@@ -153,6 +154,74 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
   return true;
 }
 
+/* ---- Anti-slowloris connection bounds ----
+ * A legitimate transfer either streams data frames continuously or, when it
+ * must pause, sends STATUS_KEEPALIVE so the peer sees the connection is alive.
+ * An attacker can therefore squat on a connection slot indefinitely by sending
+ * only keepalives under the per-message timeout.  Two CLOCK_MONOTONIC bounds
+ * defeat that without ever punishing a real transfer:
+ *
+ *   MAX_SESSION_IDLE_SEC (1 h): the longest a stream may make no forward
+ *     progress.  Data/status frames count as progress and refresh the timer;
+ *     keepalives do not.  One hour is far longer than any real pause between
+ *     data frames, yet small enough to reap a slowloris well before the 24 h
+ *     session cap.
+ *
+ *   MAX_SESSION_WALL_SEC (24 h): an absolute ceiling on one connection's
+ *     lifetime as defense-in-depth against a trickle of progress frames that
+ *     resets the idle timer just below its limit.  Larger than any plausible
+ *     single transfer while still bounding resource occupancy.
+ *
+ * Both are wall-clock deltas, so the per-message poll timeout (60 s by default,
+ * or --timeout) can never fool them, and both the single-threaded and the -m
+ * receiver paths (receiver_process_pending) share the same logic. */
+#define MAX_SESSION_IDLE_SEC 3600u
+#define MAX_SESSION_WALL_SEC 86400u
+
+static unsigned int g_max_session_idle_sec = MAX_SESSION_IDLE_SEC;
+static unsigned int g_max_session_wall_sec = MAX_SESSION_WALL_SEC;
+
+void receiver_set_time_limits(unsigned int idle_sec, unsigned int wall_sec) {
+  g_max_session_idle_sec = idle_sec;
+  g_max_session_wall_sec = wall_sec;
+}
+
+void receiver_reset_time_limits(void) {
+  g_max_session_idle_sec = MAX_SESSION_IDLE_SEC;
+  g_max_session_wall_sec = MAX_SESSION_WALL_SEC;
+}
+
+bool receiver_time_limit_exceeded(const struct timespec* session_start,
+                                  const struct timespec* last_progress,
+                                  const struct timespec* now) {
+  if (!session_start || !last_progress || !now)
+    return false;
+  if (now->tv_sec - session_start->tv_sec >= (time_t)g_max_session_wall_sec)
+    return true;
+  if (now->tv_sec - last_progress->tv_sec >= (time_t)g_max_session_idle_sec)
+    return true;
+  return false;
+}
+
+/* Refresh the progress timestamp for a forward-moving frame and enforce the
+ * bounds above.  Returns false (after best-effort STATUS_ERROR) when the
+ * connection must be dropped. */
+static bool receiver_note_status(const struct timespec* session_start,
+                                 struct timespec* last_progress, Status status,
+                                 int file_descriptor) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (status != STATUS_KEEPALIVE && status != STATUS_ABORT)
+    *last_progress = now;
+  if (!receiver_time_limit_exceeded(session_start, last_progress, &now))
+    return true;
+  log_message(LOG_LEVEL_ERROR,
+              "Receive session exceeded its time bound (idle %us / total %us); aborting connection",
+              g_max_session_idle_sec, g_max_session_wall_sec);
+  send_status(file_descriptor, STATUS_ERROR);
+  return false;
+}
+
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink) {
   return receiver_process_pending(config, file_descriptor, sink, NULL);
 }
@@ -171,6 +240,15 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
                              DeleteManifest** pending_manifest) {
   Status status;
   if (!receive_status(file_descriptor, &status))
+    return -1;
+  /* Wall-clock (=CLOCK_MONOTONIC) anti-slowloris bookkeeping.  session_start is
+   * fixed for the whole connection; last_progress is refreshed by every frame
+   * that is not a keepalive/abort. */
+  struct timespec session_start;
+  struct timespec last_progress;
+  clock_gettime(CLOCK_MONOTONIC, &session_start);
+  last_progress = session_start;
+  if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor))
     return -1;
   bool early_delete = config_delete_timing_early(config);
   /* Parked keep-set for the late/commit timing.  Every exit path below frees it
@@ -271,6 +349,8 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   next_status:
     if (!receive_status(file_descriptor, &status))
       goto receive_error;
+    if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor))
+      goto fail;
   }
   if (status != STATUS_FINISHED) {
     log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");

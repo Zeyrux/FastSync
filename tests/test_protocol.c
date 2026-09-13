@@ -412,6 +412,35 @@ static void test_protocol_accounting_release_does_not_underflow() {
   protocol_session_unbind();
 }
 
+static void test_protocol_session_io_timeout() {
+  /* Default is the built-in 60 s window; the setter stores exactly what it is
+   * given (<= 0 means "fall back to the default") so callers can propagate
+   * --timeout without special-casing 0. */
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  EXPECT_EQ_INT(session.io_timeout_sec, 60);
+
+  protocol_session_set_io_timeout(&session, 120);
+  EXPECT_EQ_INT(session.io_timeout_sec, 120);
+  protocol_session_set_io_timeout(&session, 0);
+  EXPECT_EQ_INT(session.io_timeout_sec, 0);
+  /* A NULL session is a no-op, not a crash. */
+  protocol_session_set_io_timeout(NULL, 5);
+
+  /* A short per-session deadline must actually bound a non-responsive read:
+   * with no writer the poll waits for the configured 1 s and then fails,
+   * rather than the built-in 60 s. */
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession timed;
+  protocol_session_init(&timed, p[0], p[1]);
+  protocol_session_set_io_timeout(&timed, 1);
+  char buf[4];
+  EXPECT_FALSE(protocol_receive_n_data(&timed, buf, sizeof(buf)));
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_send_receive_status_timed() {
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -440,6 +469,7 @@ void test_protocol() {
   test_send_receive_data();
   test_send_receive_int();
   test_send_receive_status();
+  test_protocol_session_io_timeout();
   test_send_receive_status_timed();
   test_receive_n_data_truncated();
   test_receive_str_truncated();

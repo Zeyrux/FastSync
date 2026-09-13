@@ -76,8 +76,15 @@ void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) 
   session->read_fd = read_fd;
   session->write_fd = write_fd;
   session->max_alloc = DEFAULT_MAX_ALLOC;
+  session->io_timeout_sec = RECEIVE_TIMEOUT_SEC;
   atomic_init(&session->total_allocated_bytes, 0);
   protocol_session_set_bwlimit(session, global_bwlimit());
+}
+
+void protocol_session_set_io_timeout(ProtocolSession* session, int sec) {
+  if (!session)
+    return;
+  session->io_timeout_sec = sec;
 }
 
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc) {
@@ -257,10 +264,11 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
   log_debug_message(LOG_DEBUG_IO, "    Sending n Data: %zu", data_size);
   if (!session)
     return false;
+  int timeout_sec = session->io_timeout_sec > 0 ? session->io_timeout_sec : SEND_TIMEOUT_SEC;
   int fd = session->write_fd;
   struct timespec deadline;
   clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += SEND_TIMEOUT_SEC;
+  deadline.tv_sec += timeout_sec;
   short wait_events = POLLOUT;
   ssize_t total_bytes_send = 0;
   while ((size_t)total_bytes_send < data_size) {
@@ -306,7 +314,10 @@ bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t 
                                    int timeout_sec);
 
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size) {
-  return protocol_receive_n_data_timed(session, data, data_size, RECEIVE_TIMEOUT_SEC);
+  /* Honor the session's configured deadline; protocol_receive_n_data_timed
+   * re-applies the built-in 60 s default when the value is <= 0. */
+  int timeout_sec = session ? session->io_timeout_sec : 0;
+  return protocol_receive_n_data_timed(session, data, data_size, timeout_sec);
 }
 
 bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t data_size,

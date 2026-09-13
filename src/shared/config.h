@@ -157,7 +157,12 @@ typedef struct Config {
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
+  /* --timeout: per-message I/O deadline in seconds.  0 (the default/unset
+   * sentinel) leaves the transport's built-in 30 s socket timeout and the
+   * protocol's built-in 60 s per-message deadline in place; a positive value
+   * overrides both.  See protocol_session_set_io_timeout. */
   int timeout;
+  /* --contimeout: connect()/accept timeout, transport layer only. */
   int contimeout;
   bool quiet;
   bool backup;
