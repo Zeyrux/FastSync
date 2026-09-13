@@ -646,19 +646,18 @@ typedef struct Config {
  *
  * Packed Metadata Wave: 2.19.0 -> 2.20.0.
  *
- * WHY the bump, grounded in the wire: metadata_send()/metadata_receive() no
- * longer emit/consume the metadata as up to 12 separate per-field framed
- * writes.  A file's metadata now crosses the wire as ONE packed frame: a
- * single int32 present flag (0 = absent, 1 = present) followed, when present,
- * by the fixed FILE_METADATA_WIRE_SIZE-byte (68-byte) field record produced by
- * metadata_to_buf().  A 2.19 peer would desynchronize on the removed frames
- * (it would read the packed record's bytes as a stream of separate field
- * frames), so the strict same-version handshake (config_receive rejects a
- * mismatched version before parsing anything else) is what keeps a 2.20 client
- * and a 2.19 server from ever reaching that state.  The encoded field layout
- * itself is unchanged (only its framing collapses), so the chunk codec, which
- * already used the packed metadata_to_buf()/metadata_from_buf() codec, is
- * byte-identical to before. */
+ * WHY the bump: metadata_send()/metadata_receive() no longer emit/consume the
+ * metadata as up to 12 separate per-field writes.  A file's metadata now
+ * crosses the wire as ONE packed frame: a single int32 present flag (0 =
+ * absent, 1 = present) followed, when present, by the fixed
+ * FILE_METADATA_WIRE_SIZE-byte (68-byte) field record produced by
+ * metadata_to_buf().  Protocol data is an unframed byte stream, so the packed
+ * encoding is byte-for-byte identical to the old field-by-field writes (same
+ * fields, same order, same widths); the change only removes per-field syscalls.
+ * The bump is therefore a deliberate lockstep-release marker, not a
+ * desynchronization fix — the strict same-version handshake still rejects a
+ * mixed 2.19/2.20 deployment.  The chunk codec, which already used the packed
+ * metadata_to_buf()/metadata_from_buf() form, is unchanged. */
 #define PROTOCOL_VERSION "2.20.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */

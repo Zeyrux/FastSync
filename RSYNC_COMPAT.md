@@ -850,10 +850,12 @@ now sends the metadata as ONE packed frame: a single `int32` present flag
 `FILE_METADATA_WIRE_SIZE`-byte (68-byte) field record already emitted by the
 shared `metadata_to_buf()`/`metadata_from_buf()` chunk codec. Absent metadata is
 a lone `int32` zero. The encoded field layout is unchanged (only the framing
-collapses), so chunk-serialized blobs remain byte-identical; `PROTOCOL_VERSION`
-was bumped `2.19.0 → 2.20.0` because a 2.19 peer would desynchronize on the
-removed frames. The strict same-version handshake rejects any mismatch before a
-byte of the frame is parsed.
+collapses), so chunk-serialized blobs remain byte-identical. Protocol data is an
+unframed byte stream, so the packed encoding is byte-for-byte identical to the
+old field-by-field writes; `PROTOCOL_VERSION` was bumped `2.19.0 → 2.20.0` as a
+deliberate lockstep-release marker rather than because of a
+desynchronization. The strict same-version handshake rejects any mismatch before
+a byte of the frame is parsed.
 
 ### Recommended Delivery Order
 

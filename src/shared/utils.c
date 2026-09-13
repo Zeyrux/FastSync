@@ -175,7 +175,9 @@ bool str_hash_set_insert_ref(StrHashSet* set, const char* key) {
     return false;
   if (!str_hash_set_grow(set))
     return false;
-  return str_hash_set_put(set, key, strlen(key)) >= 0;
+  /* put() returns 1 for a new slot and 0 for a duplicate; both are success. */
+  (void)str_hash_set_put(set, key, strlen(key));
+  return true;
 }
 
 static const StrHashSetSlot* str_hash_set_find_n(const StrHashSet* set, const char* key,
