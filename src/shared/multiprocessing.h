@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 
 #include "array_list.h"
+#include "chunk.h"
 #include "config.h"
 #include "file.h"
 #include "protocol.h"
@@ -25,6 +26,15 @@ typedef struct {
   cnd_t condition_not_full_loader;
   cnd_t condition_not_empty_loader;
   bool loader_done;
+  /* Aggregate loaded payload bytes queued on queue_loader but not yet released
+     by the sender.  Guarded by `mutex_loader`.  When `max_queue_bytes` is
+     non-zero the loader blocks before enqueueing a chunk that would push this
+     total over it, so the sender buffers a bounded number of bytes rather than
+     an unbounded count of chunks that may each be up to chunk_size (or a single
+     file) in size.  Files streamed straight from disk by sendfile hold no
+     payload, so only in-memory (`data->data`) payloads are counted. */
+  size_t queued_bytes;
+  size_t max_queue_bytes;
   ArrayList* manifest;
   /* Protected prefixes (paths the source scan excluded by user rules) sent
      with the keep-set manifest so --delete leaves them alone unless
@@ -113,6 +123,22 @@ typedef struct PipelineContextReceiver {
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
                                                       Queue* queue_loader);
 void pipeline_context_sender_destroy(PipelineContextSender* context);
+/* Bound the loaded payload bytes the sender may buffer ahead of the network
+   writer (see max_queue_bytes). */
+void pipeline_context_sender_set_queue_byte_limit(PipelineContextSender* context, size_t max_bytes);
+/* Total payload bytes a chunk currently holds in memory (loaded file data
+   only; zero for entries with no payload or data streamed from disk). */
+size_t pipeline_context_sender_chunk_bytes(const Chunk* chunk);
+/* Blocking enqueue used by the sender's loader stage.  Blocks while
+   queue_loader is full by element count or when adding `chunk` would push the
+   queued payload bytes over the configured byte limit; waits until the sender
+   releases bytes.  Takes ownership of `chunk` on success and destroys it on
+   failure/cancel. */
+bool pipeline_context_sender_enqueue_chunk(PipelineContextSender* context, Chunk* chunk);
+/* Account for `released_bytes` of payload memory that the sender freed after
+   destroying a chunk, unblocking a loader waiting on the byte limit. */
+void pipeline_context_sender_note_bytes_released(PipelineContextSender* context,
+                                                 size_t released_bytes);
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,
                                                           int file_descriptor, SSL* ssl);
 void pipeline_context_receiver_destroy(PipelineContextReceiver* context);
