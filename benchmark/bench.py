@@ -26,7 +26,7 @@ import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
-SERVER_CMD = [os.path.join(BUILD_DIR, "server")]
+SERVER_CMD = [os.path.join(BUILD_DIR, "server"), "--allow-unauthenticated"]
 CLIENT_CMD = [os.path.join(BUILD_DIR, "client")]
 BENCH_DIR = os.path.join(PROJECT_ROOT, "bench_data")
 
@@ -43,11 +43,12 @@ NETWORK_PROFILES = {
 }
 
 FASTSYNC_CONFIGS = [
-    {"name": "fastsync",           "flags": [],                     "tool": "fastsync"},
-    {"name": "fastsync -c",        "flags": ["-c"],                 "tool": "fastsync"},
-    {"name": "fastsync -m",        "flags": ["-m"],                 "tool": "fastsync"},
-    {"name": "fastsync -m -c",     "flags": ["-m", "-c"],           "tool": "fastsync"},
-    {"name": "fastsync -m -c -s",  "flags": ["-m", "-c", "-s"],     "tool": "fastsync"},
+    {"name": "fastsync",                        "flags": [],                                     "tool": "fastsync"},
+    {"name": "fastsync -z",                     "flags": ["-z"],                                 "tool": "fastsync"},
+    {"name": "fastsync -j",                     "flags": ["-j"],                                 "tool": "fastsync"},
+    {"name": "fastsync -j -z",                  "flags": ["-j", "-z"],                           "tool": "fastsync"},
+    {"name": "fastsync -j -z --chunk-serialization", "flags": ["-j", "-z", "--chunk-serialization"], "tool": "fastsync"},
+    {"name": "fastsync --sendfile",             "flags": ["--sendfile"],                         "tool": "fastsync"},
 ]
 
 RSYNC_CONFIGS = [
@@ -252,8 +253,10 @@ def run_fastsync(source_dir, dest_dir, flags, port):
         duration = time.monotonic() - start
         if result.returncode == 0:
             return duration
+        sys.stderr.write(f"    fastsync failed (exit {result.returncode}): "
+                         f"{result.stderr.strip()[:500]}\n")
     except subprocess.TimeoutExpired:
-        pass
+        sys.stderr.write("    fastsync timed out after 120s\n")
     return None
 
 
@@ -269,8 +272,10 @@ def run_rsync(source_dir, dest_dir, flags, rsync_daemon=None):
         duration = time.monotonic() - start
         if result.returncode == 0:
             return duration
+        sys.stderr.write(f"    rsync failed (exit {result.returncode}): "
+                         f"{result.stderr.strip()[:500]}\n")
     except subprocess.TimeoutExpired:
-        pass
+        sys.stderr.write("    rsync timed out after 120s\n")
     return None
 
 
@@ -367,15 +372,15 @@ def print_table(results, total_bytes, random_ratio):
 
         if fs_entries:
             print(f"\n FastSync:")
-            print(f" {'Config':<25} {'p50':>8} {'p95':>8} {'min':>8} {'max':>8} {'stdev':>8} {'runs':>5}")
-            print(f" {'-' * 25} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 5}")
+            print(f" {'Config':<38} {'p50':>8} {'p95':>8} {'min':>8} {'max':>8} {'stdev':>8} {'runs':>5}")
+            print(f" {'-' * 38} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 5}")
             for e in sorted(fs_entries, key=lambda x: x.get("p50", 999)):
                 _print_entry(e)
 
         if rsync_entries:
             print(f"\n rsync:")
-            print(f" {'Config':<25} {'p50':>8} {'p95':>8} {'min':>8} {'max':>8} {'stdev':>8} {'runs':>5}")
-            print(f" {'-' * 25} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 5}")
+            print(f" {'Config':<38} {'p50':>8} {'p95':>8} {'min':>8} {'max':>8} {'stdev':>8} {'runs':>5}")
+            print(f" {'-' * 38} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 5}")
             for e in sorted(rsync_entries, key=lambda x: x.get("p50", 999)):
                 _print_entry(e)
 
@@ -392,10 +397,10 @@ def print_table(results, total_bytes, random_ratio):
 
 def _print_entry(e):
     if "p50" in e:
-        print(f" {e['config']:<25} {e['p50']:>7.4f}s {e['p95']:>7.4f}s "
+        print(f" {e['config']:<38} {e['p50']:>7.4f}s {e['p95']:>7.4f}s "
               f"{e['min']:>7.4f}s {e['max']:>7.4f}s {e['stdev']:>7.4f} {e['runs']:>5}")
     else:
-        print(f" {e['config']:<25} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {e['runs']:>5}")
+        print(f" {e['config']:<38} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {e['runs']:>5}")
 
 
 def main():
@@ -448,12 +453,14 @@ Examples:
                         help="Don't clean up test data")
     args = parser.parse_args()
 
-    # Build
-    print("Building...")
-    if os.system(f"cmake -B {BUILD_DIR} -S {PROJECT_ROOT} > /dev/null 2>&1") != 0:
-        print("CMake configure failed"); sys.exit(1)
+    # Build (Release: benchmarking a debug build is meaningless)
+    print("Building (Release)...", file=sys.stderr)
+    configure = (f"cmake -B {BUILD_DIR} -S {PROJECT_ROOT} "
+                 f"-DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1")
+    if os.system(configure) != 0:
+        print("CMake configure failed", file=sys.stderr); sys.exit(1)
     if os.system(f"cmake --build {BUILD_DIR} -j$(nproc) > /dev/null 2>&1") != 0:
-        print("Build failed"); sys.exit(1)
+        print("Build failed", file=sys.stderr); sys.exit(1)
 
     # Determine active profile for display
     has_custom_net = args.delay or args.jitter or args.throughput or args.loss
@@ -480,7 +487,8 @@ Examples:
     compressible_pct = (1 - args.random_ratio) * 100
     random_pct = args.random_ratio * 100
     print(f"Generated {total_bytes / (1024*1024):.1f} MB  "
-          f"({random_pct:.0f}% random, {compressible_pct:.0f}% compressible)")
+          f"({random_pct:.0f}% random, {compressible_pct:.0f}% compressible)",
+          file=sys.stderr)
 
     # Build config list
     if args.configs:
@@ -496,7 +504,7 @@ Examples:
     total_runs = len(configs) * args.runs * len(profiles_to_run)
     progress = Progress(total_runs, "Benchmarking") if args.progress else None
     if progress:
-        print(f"Running {total_runs} transfers...")
+        print(f"Running {total_runs} transfers...", file=sys.stderr)
 
     all_results = []
     try:
