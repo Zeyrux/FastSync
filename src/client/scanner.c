@@ -388,9 +388,13 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
   goto apply_filters;
 
 regular:
-  if (stat(entry->path, &entry->stats) != 0)
-    goto skip;
-  entry->is_directory = S_ISDIR(entry->stats.st_mode);
+  /* Not a symlink: the lstat() above already described this entry, and lstat
+     and stat are identical for every non-symlink, so reuse that result instead
+     of issuing a redundant stat() on the scanner hot path.  stat() is still
+     used on the dereference paths above/below for actual symlinks (copy-links,
+     safe/copy-unsafe links, and -k symlinks-to-directories). */
+  entry->stats = link_stats;
+  entry->is_directory = S_ISDIR(link_stats.st_mode);
   if (entry->is_directory)
     return 1;
 

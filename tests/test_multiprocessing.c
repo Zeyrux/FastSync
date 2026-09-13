@@ -332,6 +332,123 @@ static void test_receiver_enqueue_byte_budget() {
   config_delete(cfg);
 }
 
+/* Build a one-file chunk that appears to hold `bytes` of loaded payload by
+   handing it a real buffer of that size (the byte accounting counts only
+   in-memory `data->data`, mirroring sendfile's streamed chunks). */
+static Chunk* make_loaded_chunk(const char* name, size_t bytes) {
+  File* file = file_create(name);
+  if (!file)
+    return NULL;
+  void* buffer = malloc(bytes > 0 ? bytes : 1);
+  if (!buffer) {
+    file_destroy(file);
+    return NULL;
+  }
+  file->data->data = buffer;
+  file->data->size = bytes;
+  File* items[1] = {file};
+  Chunk* chunk = chunk_create(items, 1);
+  if (!chunk)
+    file_destroy(file);
+  return chunk;
+}
+
+/* Only loaded (in-memory) payload is charged: a chunk whose files have no
+   buffer (e.g. sendfile streams the bytes from disk) accounts for zero. */
+static void test_sender_chunk_bytes_accounting() {
+  EXPECT_EQ_INT((int)pipeline_context_sender_chunk_bytes(NULL), 0);
+
+  File* streamed = file_create("sender_account_streamed");
+  EXPECT_NOT_NULL(streamed);
+  streamed->data->size = 4096; /* declared size, but no in-memory buffer */
+  File* streamed_items[1] = {streamed};
+  Chunk* streamed_chunk = chunk_create(streamed_items, 1);
+  EXPECT_NOT_NULL(streamed_chunk);
+  EXPECT_EQ_INT((int)pipeline_context_sender_chunk_bytes(streamed_chunk), 0);
+  chunk_destroy(streamed_chunk);
+
+  Chunk* loaded = make_loaded_chunk("sender_account_loaded", 2000);
+  EXPECT_NOT_NULL(loaded);
+  EXPECT_EQ_INT((int)pipeline_context_sender_chunk_bytes(loaded), 2000);
+  chunk_destroy(loaded);
+}
+
+typedef struct {
+  PipelineContextSender* context;
+  Chunk* chunk;
+  atomic_bool* done;
+  atomic_bool* result;
+} SenderByteBudgetArg;
+
+static int sender_byte_budget_worker(void* arg) {
+  SenderByteBudgetArg* worker = arg;
+  bool ok = pipeline_context_sender_enqueue_chunk(worker->context, worker->chunk);
+  atomic_store(worker->result, ok);
+  atomic_store(worker->done, true);
+  return thrd_success;
+}
+
+/* The sender's loader stage must not buffer more loaded payload bytes ahead of
+   the network writer than the configured byte budget: an enqueue that would
+   exceed the budget blocks until the sender releases bytes. */
+static void test_sender_enqueue_byte_budget() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+
+  Queue* q_scanner = queue_create(16, chunk_destroy);
+  Queue* q_loader = queue_create(16, chunk_destroy);
+  EXPECT_NOT_NULL(q_scanner);
+  EXPECT_NOT_NULL(q_loader);
+  PipelineContextSender* ctx = pipeline_context_sender_create(cfg, q_scanner, q_loader);
+  EXPECT_NOT_NULL(ctx);
+  pipeline_context_sender_set_queue_byte_limit(ctx, 3000);
+
+  Chunk* first = make_loaded_chunk("sender_budget_1", 2000);
+  EXPECT_NOT_NULL(first);
+  EXPECT_TRUE(pipeline_context_sender_enqueue_chunk(ctx, first));
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 2000);
+
+  /* A second 2000-byte chunk would push the pipeline to 4000 > 3000 budget, so
+     its enqueue must block until the first chunk's bytes are released. */
+  Chunk* second = make_loaded_chunk("sender_budget_2", 2000);
+  EXPECT_NOT_NULL(second);
+  atomic_bool done;
+  atomic_bool result;
+  atomic_init(&done, false);
+  atomic_init(&result, false);
+  SenderByteBudgetArg arg = {ctx, second, &done, &result};
+  thrd_t enqueuer;
+  EXPECT_EQ_INT(thrd_create(&enqueuer, sender_byte_budget_worker, &arg), thrd_success);
+
+  /* Give a broken (unbounded) implementation every chance to enqueue. */
+  struct timespec wait = {0, 200 * 1000000L};
+  thrd_sleep(&wait, NULL);
+  EXPECT_FALSE(atomic_load(&done));
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 2000); /* budget still honored */
+
+  /* Simulate the sender: dequeue + destroy the first chunk, then release its
+     bytes.  Only the post-join state (below) is deterministic. */
+  Chunk* drained =
+      queue_dequeue_multithreaded(q_loader, &ctx->mutex_loader, &ctx->condition_not_empty_loader,
+                                  &ctx->condition_not_full_loader, &ctx->loader_done);
+  EXPECT_NOT_NULL(drained);
+  chunk_destroy(drained);
+  pipeline_context_sender_note_bytes_released(ctx, 2000);
+
+  EXPECT_EQ_INT(thrd_join(enqueuer, NULL), thrd_success);
+  EXPECT_TRUE(atomic_load(&done));
+  EXPECT_TRUE(atomic_load(&result));
+  EXPECT_EQ_INT((int)ctx->queued_bytes, 2000); /* second payload now in flight */
+
+  /* pipeline_context_sender_destroy frees the still-queued second chunk and
+     owns cfg/q_scanner/q_loader from here on. */
+  pipeline_context_sender_destroy(ctx);
+}
+
 void test_multiprocessing() {
   test_sender_create_destroy();
   test_receiver_create_destroy();
@@ -344,4 +461,6 @@ void test_multiprocessing() {
   }
   test_write_thread_done();
   test_receiver_enqueue_byte_budget();
+  test_sender_chunk_bytes_accounting();
+  test_sender_enqueue_byte_budget();
 }

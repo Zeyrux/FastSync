@@ -1369,6 +1369,139 @@ static void test_scanner_chunk_ownership() {
   rmdir(dir);
 }
 
+/* The scanner derives entry type from a single lstat() for non-symlinks
+ * (regular files and directories) and only calls stat() to dereference real
+ * symlinks.  Guard the regular-file/directory/symlink distinction across the
+ * default (symlinks skipped), --copy-links (dereferenced) and -l (carried)
+ * modes so the lstat/stat reuse cannot misclassify entries. */
+static void test_scanner_entry_classification() {
+  const char* root = "test_scan_classify";
+  const char* sub = "test_scan_classify/sub";
+  const char* file = "test_scan_classify/file.txt";
+  const char* nested = "test_scan_classify/sub/nested.txt";
+  const char* link_file = "test_scan_classify/link_file";
+  const char* link_dir = "test_scan_classify/link_dir";
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  create_test_file(file, "hello");    /* 5 bytes */
+  create_test_file(nested, "nested"); /* 6 bytes */
+  EXPECT_EQ_INT(symlink("file.txt", link_file), 0);
+  EXPECT_EQ_INT(symlink("sub", link_dir), 0);
+
+  /* Default: no link option -> symlinks are skipped entirely; regular files and
+     directories (descended, not emitted) are classified as before. */
+  {
+    ScannerOptions options = {0};
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    size_t root_len = strlen(root);
+    bool file_ok = false, nested_ok = false, link_seen = false;
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        const File* f = chunk->items[i];
+        const char* rel = f->path + root_len;
+        if (*rel == '/')
+          rel++;
+        if (strcmp(rel, "file.txt") == 0) {
+          file_ok = !f->is_dir && !f->is_symlink && f->data->size == 5;
+        } else if (strcmp(rel, "sub/nested.txt") == 0) {
+          nested_ok = !f->is_dir && !f->is_symlink && f->data->size == 6;
+        } else {
+          link_seen = true;
+        }
+      }
+      chunk_destroy(chunk);
+    }
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(file_ok);
+    EXPECT_TRUE(nested_ok);
+    EXPECT_FALSE(link_seen);
+    directory_scanner_destroy(scanner);
+  }
+
+  /* --copy-links: symlinks are dereferenced.  A link to a file becomes a
+     regular file with the referent's size; a link to a directory is traversed. */
+  {
+    ScannerOptions options = {0};
+    options.copy_links = true;
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    size_t root_len = strlen(root);
+    bool file_ok = false, nested_ok = false, link_file_ok = false;
+    bool link_dir_nested_ok = false, symlink_leaked = false;
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        const File* f = chunk->items[i];
+        const char* rel = f->path + root_len;
+        if (*rel == '/')
+          rel++;
+        if (f->is_symlink)
+          symlink_leaked = true;
+        if (strcmp(rel, "file.txt") == 0)
+          file_ok = !f->is_dir && f->data->size == 5;
+        else if (strcmp(rel, "sub/nested.txt") == 0)
+          nested_ok = !f->is_dir && f->data->size == 6;
+        else if (strcmp(rel, "link_file") == 0)
+          link_file_ok = !f->is_dir && f->data->size == 5;
+        else if (strcmp(rel, "link_dir/nested.txt") == 0)
+          link_dir_nested_ok = !f->is_dir && f->data->size == 6;
+      }
+      chunk_destroy(chunk);
+    }
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(file_ok);
+    EXPECT_TRUE(nested_ok);
+    EXPECT_TRUE(link_file_ok);
+    EXPECT_TRUE(link_dir_nested_ok);
+    EXPECT_FALSE(symlink_leaked);
+    directory_scanner_destroy(scanner);
+  }
+
+  /* -l (--links): symlinks are carried through as symlinks, not dereferenced. */
+  {
+    ScannerOptions options = {0};
+    options.follow_symlinks = true;
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    size_t root_len = strlen(root);
+    bool file_ok = false, link_file_ok = false, link_dir_ok = false, leaked_dir = false;
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        const File* f = chunk->items[i];
+        const char* rel = f->path + root_len;
+        if (*rel == '/')
+          rel++;
+        if (strcmp(rel, "file.txt") == 0)
+          file_ok = !f->is_dir && !f->is_symlink && f->data->size == 5;
+        else if (strcmp(rel, "link_file") == 0)
+          link_file_ok = f->is_symlink && !f->is_dir;
+        else if (strcmp(rel, "link_dir") == 0)
+          link_dir_ok = f->is_symlink && !f->is_dir;
+        else if (strcmp(rel, "link_dir/nested.txt") == 0)
+          leaked_dir = true;
+      }
+      chunk_destroy(chunk);
+    }
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(file_ok);
+    EXPECT_TRUE(link_file_ok);
+    EXPECT_TRUE(link_dir_ok);
+    EXPECT_FALSE(leaked_dir);
+    directory_scanner_destroy(scanner);
+  }
+
+  unlink(link_file);
+  unlink(link_dir);
+  unlink(nested);
+  unlink(file);
+  rmdir(sub);
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1406,4 +1539,5 @@ void test_scanner() {
   test_files_from_relative_send_path();
   test_scanner_captures_directory_times();
   test_scanner_chunk_ownership();
+  test_scanner_entry_classification();
 }
