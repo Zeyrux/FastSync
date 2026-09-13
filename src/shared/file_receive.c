@@ -1721,7 +1721,7 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
     return INCREMENTAL_ERROR;
   if (!receive_n_data(fd, &state->check_mtime_nsec, sizeof(state->check_mtime_nsec)) ||
       state->check_mtime_nsec < 0 || state->check_mtime_nsec >= 1000000000LL) {
-    send_status(fd, STATUS_ERROR);
+    send_error_detail(fd, "invalid check mtime nanoseconds");
     return INCREMENTAL_ERROR;
   }
   if ((config->checksum || config_has_basis(config))) {
@@ -1729,7 +1729,7 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
     if (!receive_n_data(fd, &wire_len, sizeof(wire_len)) || wire_len == 0 ||
         wire_len > CHECKSUM_MAX_DIGEST_LEN ||
         wire_len != checksum_digest_len((ChecksumAlgo)config->checksum_algo)) {
-      send_status(fd, STATUS_ERROR);
+      send_error_detail(fd, "invalid check digest length");
       return INCREMENTAL_ERROR;
     }
     state->check_digest_len = wire_len;
@@ -1738,7 +1738,7 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
   }
 
   if (state->check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
-    send_status(fd, STATUS_ERROR);
+    send_error_detail(fd, "check size exceeds receiver limit");
     return INCREMENTAL_ERROR;
   }
 
@@ -1757,7 +1757,7 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
 static IncrementalCheckOutcome incremental_check_open_destination(IncrementalCheckState* state) {
   char* full_path = path_cat(state->config->receive_root_directory, state->check_path);
   if (!full_path) {
-    send_status(state->fd, STATUS_ERROR);
+    send_error_detail(state->fd, "could not build destination path");
     return INCREMENTAL_ERROR;
   }
   state->full_path = full_path;
@@ -1911,7 +1911,7 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
                                                                    File** out_file) {
   int fd = state->fd;
   const Config* config = state->config;
-  char* check_path = state->check_path;
+  const char* check_path = state->check_path;
   unsigned long long old_size = state->old_size;
   unsigned long long check_size = state->check_size;
 
@@ -2464,7 +2464,7 @@ File* file_receive_hardlink(int file_descriptor) {
                 escaped_path ? escaped_path : "<allocation failed>");
     free(escaped_path);
     free(path);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid hard-link path");
     return NULL;
   }
   int gid;
@@ -2484,7 +2484,7 @@ File* file_receive_hardlink(int file_descriptor) {
     free(escaped);
     free(target);
     free(path);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid hard-link target path");
     return NULL;
   }
   File* file = file_create(path);
@@ -2514,7 +2514,7 @@ File* file_receive_symlink(int file_descriptor, const Config* config) {
                 escaped_path ? escaped_path : "<allocation failed>");
     free(escaped_path);
     free(path);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid symlink path");
     return NULL;
   }
   char* target = receive_wire_str(file_descriptor);
@@ -2529,7 +2529,7 @@ File* file_receive_symlink(int file_descriptor, const Config* config) {
     free(escaped);
     free(target);
     free(path);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid symlink target");
     return NULL;
   }
   File* file = file_create(path);
@@ -2569,7 +2569,7 @@ File* file_receive_special(int file_descriptor) {
                 escaped_path ? escaped_path : "<allocation failed>");
     free(escaped_path);
     free(path);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid special path");
     return NULL;
   }
   int meta_ok = 1;
@@ -2593,14 +2593,14 @@ File* file_receive_special(int file_descriptor) {
   if (!metadata) {
     log_message(LOG_LEVEL_ERROR, "Special node sent without metadata (mode)");
     free(path);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "special node sent without metadata");
     return NULL;
   }
   if (!file_special_rdev_valid(major, minor, metadata->mode)) {
     log_message(LOG_LEVEL_ERROR, "Invalid special rdev received (%d:%d)", (int)major, (int)minor);
     free(path);
     file_metadata_destroy(metadata);
-    send_status(file_descriptor, STATUS_ERROR);
+    send_error_detail(file_descriptor, "invalid special device rdev");
     return NULL;
   }
   File* file = file_create(path);

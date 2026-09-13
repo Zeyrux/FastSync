@@ -899,7 +899,7 @@ void handler(int file_descriptor) {
       if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
         transfer_ok = false;
     } else {
-      send_status(file_descriptor, STATUS_ERROR);
+      send_error_detail(file_descriptor, "transfer failed on receiver");
     }
     if (!transfer_ok)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");

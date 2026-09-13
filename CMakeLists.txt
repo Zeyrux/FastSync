@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(FastFileTransfer VERSION 2.20.0)
+project(FastFileTransfer VERSION 2.21.0)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 11)
@@ -223,6 +223,7 @@ set(TEST_SRCS
 	tests/test_multiprocessing.c
 	tests/test_property.c
 	tests/test_protocol.c
+	tests/test_protocol_error.c
 	tests/test_queue.c
 	tests/test_receiver_timeout.c
 	tests/test_robustness.c

@@ -76,7 +76,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.20.0).
+ * Config wire-field table (single source of truth for protocol 2.21.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -756,8 +756,22 @@ typedef struct Config {
  * The bump is therefore a deliberate lockstep-release marker, not a
  * desynchronization fix — the strict same-version handshake still rejects a
  * mixed 2.19/2.20 deployment.  The chunk codec, which already used the packed
- * metadata_to_buf()/metadata_from_buf() form, is unchanged. */
-#define PROTOCOL_VERSION "2.20.0"
+ * metadata_to_buf()/metadata_from_buf() form, is unchanged.
+ *
+ * Error-Detail Wave: 2.20.0 -> 2.21.0.
+ *
+ * WHY the bump, grounded in the wire: a server may now answer a rejected
+ * operation with STATUS_ERROR_DETAIL followed by a bounded (<=
+ * MAX_ERROR_DETAIL_BYTES) length-prefixed string instead of a bare
+ * STATUS_ERROR (see protocol.h).  The config-frame LAYOUT is unchanged, but the
+ * FRAME STREAM gains a new framed body after a status, so a 2.20 peer that does
+ * not consume it would desynchronize on the following exchange.  The strict
+ * same-version handshake (config_receive rejects a mismatched version before
+ * parsing anything else) is what keeps a 2.21 client and a 2.20 server from ever
+ * reaching that state.  receive_status() transparently maps STATUS_ERROR_DETAIL
+ * back to STATUS_ERROR for every existing call site and captures the reason into
+ * a thread-local buffer consulted via protocol_last_error(). */
+#define PROTOCOL_VERSION "2.21.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

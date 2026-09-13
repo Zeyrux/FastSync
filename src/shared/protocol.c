@@ -22,6 +22,10 @@ static __thread ProtocolSession* bound_session;
 static __thread ProtocolSession legacy_io_session = {
     .read_fd = -1, .write_fd = -1, .max_alloc = DEFAULT_MAX_ALLOC};
 
+/* Last STATUS_ERROR_DETAIL reason received on this thread (protocol 2.21.0).
+ * Empty when the last status read carried no detail. */
+static __thread char io_error_detail[MAX_ERROR_DETAIL_BYTES + 1];
+
 static unsigned long long io_bwlimit = 0;
 static mtx_t bw_mutex;
 static once_flag bw_mutex_once = ONCE_FLAG_INIT;
@@ -446,6 +450,8 @@ static const char* status_to_string(Status status) {
     return "AUTH_OK";
   case STATUS_AUTH_FAILED:
     return "AUTH_FAILED";
+  case STATUS_ERROR_DETAIL:
+    return "ERROR_DETAIL";
   default:
     return "UNKNOWN";
   }
@@ -600,9 +606,40 @@ bool protocol_send_status(ProtocolSession* session, Status status) {
   return true;
 }
 
+/* Consume the optional detail body of a STATUS_ERROR_DETAIL frame and map the
+ * status back to STATUS_ERROR for existing callers.  Invoked for EVERY status
+ * read (bare STATUS_OK/STATUS_ERROR too) so a stale detail from an earlier
+ * exchange is never reported for a later one.  The body is always read, even
+ * when the caller ignores protocol_last_error(), so the stream never
+ * desynchronizes. */
+static void protocol_capture_error_detail(ProtocolSession* session, Status* status) {
+  io_error_detail[0] = '\0';
+  if (*status != STATUS_ERROR_DETAIL)
+    return;
+  *status = STATUS_ERROR;
+  /* The body MUST be drained even when the session's allocation ceiling is
+   * smaller than the message (e.g. a tiny --max-alloc), otherwise the string
+   * body would be left on the stream and desynchronize the next exchange.
+   * Lift the ceiling for this one bounded string read and restore it. */
+  unsigned long long saved_max_alloc = session->max_alloc;
+  if (saved_max_alloc < MAX_STRING_SIZE + 1)
+    session->max_alloc = MAX_STRING_SIZE + 1;
+  char* detail = protocol_receive_str(session);
+  session->max_alloc = saved_max_alloc;
+  if (!detail)
+    return;
+  size_t len = strlen(detail);
+  if (len > MAX_ERROR_DETAIL_BYTES)
+    len = MAX_ERROR_DETAIL_BYTES;
+  memcpy(io_error_detail, detail, len);
+  io_error_detail[len] = '\0';
+  free(detail);
+}
+
 bool protocol_receive_status(ProtocolSession* session, Status* status) {
   if (!protocol_receive_n_data(session, status, sizeof(Status)))
     return false;
+  protocol_capture_error_detail(session, status);
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
   return true;
 }
@@ -614,6 +651,7 @@ bool protocol_receive_status(ProtocolSession* session, Status* status) {
 bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int timeout_sec) {
   if (!protocol_receive_n_data_timed(session, status, sizeof(Status), timeout_sec))
     return false;
+  protocol_capture_error_detail(session, status);
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
   return true;
 }
@@ -725,6 +763,7 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
     Status received;
     if (!protocol_read_status_until(session, &received, &deadline))
       return false;
+    protocol_capture_error_detail(session, &received);
     if (received == STATUS_KEEPALIVE) {
       /* The receiver's answer to one of our keepalives. */
       replies_seen++;
@@ -751,6 +790,7 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
                     keepalives_sent - replies_seen);
         break;
       }
+      protocol_capture_error_detail(session, &drained);
       if (drained != STATUS_KEEPALIVE) {
         log_message(LOG_LEVEL_ERROR, "Unexpected status while draining keepalive replies");
         return false;
@@ -806,4 +846,25 @@ bool receive_status_keepalive(int fd, Status* status, int timeout_sec, int keepa
                               ProtocolWaitAbort abort_check) {
   return protocol_receive_status_keepalive(legacy_session(fd, -1), status, timeout_sec,
                                            keepalive_interval_sec, abort_check);
+}
+
+bool send_error_detail(int fd, const char* message) {
+  if (!message)
+    message = "";
+  char bounded[MAX_ERROR_DETAIL_BYTES + 1];
+  size_t len = strlen(message);
+  if (len > MAX_ERROR_DETAIL_BYTES) {
+    memcpy(bounded, message, MAX_ERROR_DETAIL_BYTES);
+    bounded[MAX_ERROR_DETAIL_BYTES] = '\0';
+    message = bounded;
+  }
+  return send_status(fd, STATUS_ERROR_DETAIL) && send_str(fd, message);
+}
+
+const char* protocol_last_error(void) {
+  return io_error_detail;
+}
+
+void protocol_clear_last_error(void) {
+  io_error_detail[0] = '\0';
 }

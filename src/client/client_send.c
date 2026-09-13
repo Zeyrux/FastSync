@@ -48,6 +48,17 @@
    Always cast to double when dividing so the output stays fractional. */
 #define BYTES_PER_MIB (1024ULL * 1024ULL)
 
+/* Surface a server rejection to the user.  When the last status exchange
+   carried a STATUS_ERROR_DETAIL reason (protocol 2.21.0) it is appended to the
+   client-side context; a bare STATUS_ERROR still logs the context alone. */
+static void log_server_rejection(const char* context) {
+  const char* detail = protocol_last_error();
+  if (detail && detail[0] != '\0')
+    log_message(LOG_LEVEL_ERROR, "%s: %s", context, detail);
+  else
+    log_message(LOG_LEVEL_ERROR, "%s", context);
+}
+
 /* Forward declaration for progress-reporting thread used in multithreaded send. */
 static int progress_thread_fn(void* arg);
 
@@ -608,8 +619,10 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
       Status per_file;
       if (!receive_status(client->file_descriptor, &per_file))
         return false;
-      if (per_file == STATUS_ERROR)
+      if (per_file == STATUS_ERROR) {
+        log_server_rejection("Receiver reported a per-file error");
         return false;
+      }
       if (per_file == STATUS_OK) {
         ((SourceFile*)remove_sources->items[i])->skipped = true;
       } else if (per_file != STATUS_NEXT) {
@@ -619,7 +632,13 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
     }
   }
   Status status;
-  return receive_status(client->file_descriptor, &status) && status == STATUS_OK;
+  if (!receive_status(client->file_descriptor, &status))
+    return false;
+  if (status != STATUS_OK) {
+    log_server_rejection("Receiver reported transfer failure");
+    return false;
+  }
+  return true;
 }
 
 static void pipeline_cancel(PipelineContextSender* context) {
@@ -914,7 +933,7 @@ static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
     return false;
   }
   if (ack != STATUS_OK) {
-    log_message(LOG_LEVEL_ERROR, "Server failed to delete files before the transfer");
+    log_server_rejection("Server failed to delete files before the transfer");
     return false;
   }
   return true;
@@ -991,7 +1010,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
   if (!receive_status(client->file_descriptor, &s))
     return -1;
   if (s == STATUS_ERROR) {
-    log_message(LOG_LEVEL_ERROR, "Server reported error for file");
+    log_server_rejection("Server reported error for file");
     return -1;
   }
   if (s == STATUS_OK)
@@ -1025,7 +1044,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
     return 3;
   }
   if (s != STATUS_NEXT) {
-    log_message(LOG_LEVEL_ERROR, "Unexpected server status");
+    log_server_rejection("Unexpected server status");
     send_status(client->file_descriptor, STATUS_ERROR);
     return -1;
   }
@@ -1119,6 +1138,7 @@ static int send_append(const Client* client, File* file, Config* config,
       return rc;
     }
     if (resp != STATUS_APPEND_OK) {
+      log_server_rejection("Unexpected append-verify response");
       send_status(fd, STATUS_ERROR);
       return -1;
     }

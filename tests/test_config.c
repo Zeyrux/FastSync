@@ -2443,11 +2443,11 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.20.0).  The values below are the only
+/* The pinned golden frame (protocol 2.21.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason. */
 #define GOLDEN_WIRE_LEN 633
-#define GOLDEN_WIRE_HASH 9160991280011164139ULL
+#define GOLDEN_WIRE_HASH 7591559741712449854ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2529,7 +2529,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.20.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.21.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())
