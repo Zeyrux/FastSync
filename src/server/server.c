@@ -217,12 +217,24 @@ static bool path_is_within(const char* root, const char* path) {
    root is rejected up front instead of being silently invented by a later
    write.  Both paths are confined to the authorized root by the secure file
    helpers. */
+/* Existence-only half of the precondition: the destination root must already
+   resolve to a directory below the authorized root.  Never creates anything, so
+   a server-contacting --dry-run can apply the exact same fail-closed check a
+   real run would without mutating the tree. */
+static bool receive_root_exists(const Config* config) {
+  if (!config || !config->receive_root_directory)
+    return false;
+  return file_directory_exists_secure(config->receive_root_directory);
+}
+
+/* Full precondition for a real run: --mkpath creates the root (and missing
+   leading components), otherwise it must already exist as a directory. */
 static bool ensure_receive_root(const Config* config) {
   if (!config || !config->receive_root_directory)
     return false;
   if (config->mkpath)
     return file_ensure_directory_secure(config->receive_root_directory);
-  return file_directory_exists_secure(config->receive_root_directory);
+  return receive_root_exists(config);
 }
 
 static bool configure_authorization(const char* root) {
@@ -263,9 +275,11 @@ typedef enum {
 } ModuleAuthResult;
 
 /* Looks up the daemon module selected by the client's config frame and rejects
- * a `read only` one (every FastSync network transfer writes; there is no
- * read-only wire operation yet).  Returns the module, or NULL with *error set
- * to the caller-facing rejection message. */
+ * a `read only` one for a real write transfer.  A server-contacting --dry-run
+ * IS a read-only wire operation (it reports what would transfer/skip and
+ * mutates nothing), so a `read only` module is the safest possible dry-run
+ * target and is accepted.  Returns the module, or NULL with *error set to the
+ * caller-facing rejection message. */
 static const DaemonModule* module_gate_lookup_module(const Config* config, const char** error) {
   const DaemonModule* module = daemon_conf_find_module(g_daemon_conf, config->module);
   if (module == NULL) {
@@ -276,7 +290,7 @@ static const DaemonModule* module_gate_lookup_module(const Config* config, const
     *error = "requested daemon module does not exist";
     return NULL;
   }
-  if (module->read_only) {
+  if (module->read_only && !config->dry_run) {
     log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
                 config->module);
     *error = "requested daemon module is read only";
@@ -556,9 +570,10 @@ static const char* module_gate_install_root(const Config* config, const DaemonMo
  * becomes the authorized root via configure_authorization -- exactly the same
  * root confinement the standalone server applies to its single
  * --destination-root, but per-module and NEVER client-chosen.  The module is
- * refused (with a clear log) when it is unknown, when it is `read only` (every
- * FastSync network transfer writes; there is no read-only wire operation yet),
- * when it requests client-chosen ownership without the module's
+ * refused (with a clear log) when it is unknown, when it is `read only` for a
+ * real write transfer (a server-contacting --dry-run is a read-only wire
+ * operation and may target a `read only` module), when it requests
+ * client-chosen ownership without the module's
  * `client owner = yes` opt-in (P7 Wave E hardening), or when the presented
  * daemon credentials fail for a module that declares `auth users`.  Wave A
  * refused every auth-required module (auth was not yet implemented); Wave B
@@ -756,12 +771,14 @@ void handler(int file_descriptor) {
      skipped via its implied --ignore-missing-args, but nothing is deleted). */
   config->delete_missing_args = config->delete_missing_args && allow_delete;
   /* --mkpath: create the destination root (and its missing leading components)
-   * before anything else; without it the root must pre-exist.  A failure here
-   * aborts the connection cleanly before any file data is exchanged.  A
-   * server-contacting --dry-run must NOT create anything: the root is only
-   * read for the would-transfer/skip decision (an absent root simply means
-   * "everything would transfer"). */
-  if (!config->dry_run && !ensure_receive_root(config)) {
+   * before anything else; without it the root must pre-exist.  The precondition
+   * is UNCONDITIONAL: a server-contacting --dry-run must reject exactly the
+   * root a real session would reject, so a client cannot set the wire dry_run
+   * bit to relax it.  Dry-run only runs the existence/directory check (never
+   * --mkpath) so it creates nothing while still failing closed.  A failure here
+   * aborts the connection cleanly before any file data is exchanged. */
+  bool root_ok = config->dry_run ? receive_root_exists(config) : ensure_receive_root(config);
+  if (!root_ok) {
     char* escaped_root = output_escape(config->receive_root_directory, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
                 escaped_root ? escaped_root : "<allocation failed>");
