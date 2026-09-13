@@ -19,7 +19,7 @@ tea pr checkout <number>
 If already on a PR branch, verify with:
 ```bash
 git branch --show-current
-git log main..HEAD --oneline
+git log dev..HEAD --oneline
 ```
 
 ### Step 2: Clean build
@@ -39,17 +39,13 @@ If the PR touches threading, memory management, or network code, also build with
 ```bash
 # AddressSanitizer
 rm -rf build-asan
-cmake -B build-asan -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+cmake -B build-asan -S . -DSANITIZER=address
 cmake --build build-asan -j$(nproc)
 ./build-asan/tests
 
 # ThreadSanitizer (if threading changes)
 rm -rf build-tsan
-cmake -B build-tsan -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake -B build-tsan -S . -DSANITIZER=thread
 cmake --build build-tsan -j$(nproc)
 ./build-tsan/tests
 ```
@@ -91,10 +87,10 @@ If tests fail:
 ### Step 6: Run integration tests (optional)
 
 ```bash
-python3 test.py
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"
 ```
 
-This runs the integration + benchmark suite. It takes longer — only run if the user asks or if unit tests pass.
+This runs the integration suite (benchmarking is `benchmark/bench.py`). It takes longer — only run if the user asks or if unit tests pass.
 
 ### Step 7: Fix and commit
 

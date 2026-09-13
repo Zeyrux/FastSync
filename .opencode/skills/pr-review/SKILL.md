@@ -19,13 +19,13 @@ tea pr checkout <number>
 If already on a PR branch, verify with:
 ```bash
 git branch --show-current
-git log main..HEAD --oneline
+git log dev..HEAD --oneline
 ```
 
 ### Step 2: Get changed files
 
 ```bash
-git diff main --name-only -- '*.c' '*.h'
+git diff dev --name-only -- '*.c' '*.h'
 ```
 
 This gives the list of C source and header files changed in the PR.

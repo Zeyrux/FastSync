@@ -28,7 +28,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" \
   sh -c 'cmake -B build -S . && cmake --build build -j$(nproc) && ./build/tests && python3 -m pytest tests/integration/ -n 4 --dist=load'
 ```
 
-> **Note:** The first `cmake configure` (`cmake -B build -S .`) fetches xxHash from GitHub via `FetchContent` — network access is required. Subsequent reconfigures reuse the cached source.
+> **Note:** The first `cmake configure` (`cmake -B build -S .`) fetches xxHash via `FetchContent` — network access is required. Subsequent reconfigures reuse the cached source.
 
 If a dependency is missing from the CI image, add it to the `Dockerfile` (and rebuild) rather than adding an install step to the CI workflow.
 
@@ -59,7 +59,7 @@ python3 -m pytest tests/integration/ -n 4 --dist=load -m ci   # PR-gate subset o
 
 ## CI Workflow — Waiting for Results
 
-When running the CI workflow via `tea` (the task execution agent), always set a sufficient timeout (e.g., 600000ms) to allow CI to finish. After CI completes, check the results yourself — do not assume success. Use `gh run watch` or similar to monitor CI status, then inspect logs on failure.
+When running the CI workflow via `tea` (the task execution agent), always set a sufficient timeout (e.g., 600000ms) to allow CI to finish. After CI completes, check the results yourself — do not assume success. Monitor CI status via the Gitea API (see below) or `tea actions`, then inspect logs on failure.
 
 ## CI Troubleshooting
 
@@ -165,7 +165,7 @@ This can be cron'd locally if desired (e.g., `crontab -e` with `opencode run`).
 ## Is opencode a good option?
 
 **Yes, for FastSync's needs.** The hybrid model works well:
-- opencode's 17 specialized agents handle deep code analysis, fixes, tests, and reviews
+- opencode's 16 specialized agents handle deep code analysis, fixes, tests, and reviews
 - The assistant orchestrates subagents, merges branches, and iterates on CI
 - You only review the final output
 

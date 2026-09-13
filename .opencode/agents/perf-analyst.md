@@ -56,9 +56,11 @@ DirectoryScanner → Queue(Scanner→Loader) → ChunkBuilder → Queue(Loader�
 
 ### Benchmark Context
 
-From README benchmarks (25MB mixed files, localhost):
-- Best config: `-m -c` (multithread + compression) → 0.20s, 11.2× faster than rsync
-- `sendfile()` bypasses userspace → ~2× faster on localhost
+Use the maintained benchmark tool — do not cite stale README numbers:
+- `python3 benchmark/bench.py` runs the repeatable throughput benchmark.
+- The real flags are `-j` (multithreading) and `-z` (compression); a fast loopback
+  config combines `-j -z`.
+- `sendfile()` (via `--sendfile`) bypasses userspace → ~2× faster on localhost
 - Compression reduces wire data enough that transfer becomes latency-bound on WAN
 
 ## Output Format
@@ -120,6 +122,7 @@ time ./build/client [args...]
 
 # High precision
 perf stat -e task-clock ./build/client [args...]
+```
 
 ## CI & Task Execution
 
@@ -127,9 +130,8 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 
 **CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. **Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. See `AGENTS.md` for details.
-```
