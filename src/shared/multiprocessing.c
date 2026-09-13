@@ -179,6 +179,9 @@ bool pipeline_context_sender_enqueue_chunk(PipelineContextSender* context, Chunk
 }
 
 void pipeline_context_sender_destroy(PipelineContextSender* context) {
+  /* `config` is borrowed: the caller retains ownership and frees it after the
+     pipeline has been destroyed (the worker threads are already joined, so no
+     config access can outlive this call). */
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
@@ -192,7 +195,6 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
     array_list_delete(context->dir_entries);
   if (context->dir_entries_mutex_init)
     mtx_destroy(&context->dir_entries_mutex);
-  config_delete(context->config);
   queue_destroy(context->queue_scanner);
   queue_destroy(context->queue_loader);
   mtx_destroy(&context->mutex_scanner);

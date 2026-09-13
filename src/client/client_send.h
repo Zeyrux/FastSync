@@ -5,9 +5,10 @@
 #include "config.h"
 #include "transport_tcp.h"
 
-int send_chunk(Client* client, Chunk* chunk, Config* config);
+/* Both sender entry points BORROW `config` for the duration of the call; they
+ * never free it, and the caller retains ownership (freeing it with
+ * config_delete() once the call returns). */
 int send_files(Config* config);
-/* Takes ownership only when *config is set to NULL on return. */
 int send_files_multithreaded(Config** config);
 /* Phase 6 residual-batch (client-only).  See client_send.c. */
 int write_batch_from_source(const Config* config, const char* batch_path);

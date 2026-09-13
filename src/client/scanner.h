@@ -117,37 +117,16 @@ typedef struct {
 typedef struct FilterNode FilterNode;
 
 typedef struct {
+  /* Scan inputs, copied once at create time.  Everything that is also a
+     ScannerOptions field lives here (with the normalized chunk_size); only
+     scanner-owned bookkeeping stays as direct members below. */
+  ScannerOptions options;
   Queue* directories;
   DIR* current_dir;
   char* current_path;
-  bool use_metadata;
-  bool preserve_atimes;
-  bool preserve_crtimes;
-  bool preserve_xattrs;
-  bool preserve_acls;
-  unsigned long long chunk_size;
-  char** exclude_patterns;
-  int exclude_count;
-  char** include_patterns;
-  int include_count;
-  unsigned long long max_size;
-  unsigned long long min_size;
-  int max_depth;
   int current_depth;
-  bool follow_symlinks;
-  bool copy_links;
-  bool safe_links;
-  bool copy_unsafe_links;
-  bool copy_dirlinks;
-  bool munge_links;
-  bool checksum;
-  bool one_file_system;
   dev_t root_dev;
   bool failed;
-  /* Phase 4 special/devices (see ScannerOptions). */
-  bool preserve_devices;
-  bool preserve_specials;
-  bool copy_devices;
   /* Phase 2 (files-from / filter layer). */
   char* root_path;          /* transfer root (fs path) for rel computation */
   char* current_rel;        /* rel path of the open directory ("" == root) */
@@ -155,40 +134,17 @@ typedef struct {
   FilterNode* seed_node;    /* inherited context of the seed dir, or NULL */
   FilterNode* current_node; /* filter context of the open directory */
   ArrayList* filter_nodes;  /* owned FilterNode arena (may be NULL) */
-  const FileListSet* file_list;
-  const FilterRuleList* base_filters;
-  bool per_dir_filters;
-  /* --dirs / -R state for the directory-entry generator (dirs_mode replaces
+  /* --dirs / -R state for the directory-entry generator (options.dirs replaces
      the recursive scan). */
-  bool dirs_mode;
   bool relative_mode; /* file_list && relative: send bare relative wire paths */
-  bool prune_empty_dirs;
   bool dirs_root_emitted;
   int list_index;
   ArrayList* dirs_batch; /* owned when non-NULL */
   unsigned long long dirs_batch_size;
-  /* Excluded-path sink (see ScannerOptions). `excluded_mutex` is shared across
-     parallel worker threads. */
-  ArrayList* excluded_paths;
-  mtx_t* excluded_mutex;
-  /* --ignore-errors: continue past unreadable directories (records io_error). */
-  bool ignore_io_errors;
-  /* --ignore-missing-args: --dirs listed-but-missing entries are skipped, not
-     fatal (see ScannerOptions.ignore_missing_args). */
-  bool ignore_missing_args;
   /* A directory could not be opened (I/O error, e.g. EACCES).  With
      --ignore-errors the scan continues past it and the caller decides what to
      do; `failed` is reserved for fatal errors that always abort the scan. */
   bool io_error;
-  /* --hard-links (-H): shared link-group detection table (see ScannerOptions).
-     NULL when -H is off. */
-  HardLinkTable* hardlinks;
-  /* Phase 6: sender stop deadline (from ScannerOptions). */
-  const StopCondition* stop_condition;
-  /* P7 Wave D directory-time capture (see ScannerOptions). */
-  bool capture_dir_times;
-  ArrayList* dir_entries;
-  mtx_t* dir_entries_mutex;
 } DirectoryScanner;
 
 typedef struct {
