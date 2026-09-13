@@ -252,6 +252,11 @@ static char* config_receive_str_redacted(int fd, ConfigStringBudget* budget) {
 }
 
 static bool validate_received_config(const Config* config) {
+  /* Cross-field invariants live in one place (config_invariants_error) so the
+     receiver enforces every combination the client relies on; a hostile peer
+     can forge a frame that violates any clause of the shared predicate. */
+  if (config_invariants_error(config) != NULL)
+    return false;
   return valid_wire_bool(config->save_to_disk) && valid_wire_bool(config->use_multithreading) &&
          valid_wire_bool(config->use_chunk_serialization) &&
          valid_wire_bool(config->use_compression) && valid_wire_bool(config->use_metadata) &&
@@ -275,30 +280,14 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delete_delay) && valid_wire_bool(config->delete_during) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
-         !(config->delay_updates && config->inplace) &&
-         !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
-         checksum_algo_valid(config->checksum_algo) && config_has_valid_delete_timing(config) &&
-         identity_wire_valid(config) &&
-         !(config->skip_compress_set && config->use_chunk_serialization) &&
-         /* --append / --append-verify tail resume needs the per-file check,
-            which chunk serialization -s disables: reject on the receiver too
-            so a -s sender cannot negotiate an inert append mode. */
-         !((config->append || config->append_verify) && config->use_chunk_serialization) &&
-         !(config->preserve_hard_links && config->use_chunk_serialization) &&
-         !(config->preserve_hard_links && (config->append || config->append_verify)) &&
-         /* The xattr block rides the per-file streaming frame, which -s drops. */
-         !((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization) &&
+         checksum_algo_valid(config->checksum_algo) && identity_wire_valid(config) &&
          valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
          valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
          valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
-         /* --copy-as forces ownership through the metadata path; without
-            metadata it would pass the privilege gate but silently chown
-            nothing.  Refuse the frame instead. */
-         (!config->copy_as_set || config->use_metadata) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
@@ -309,14 +298,6 @@ static bool validate_received_config(const Config* config) {
          config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES && config->max_alloc > 0 &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
-         /* The received --iconv CONVERT_SPEC is untrusted input that drives
-            the receiver's path decoding: reject a malformed spec or an
-            unsupported charset name so the run is refused up front instead of
-            every received file name failing mid-transfer.  A NULL spec (iconv
-            disabled) is always accepted. */
-         (!config->iconv_spec || charset_spec_valid(config->iconv_spec)) &&
-         /* --super / --no-super: the received tri-state must be one of the
-            defined values (AUTO/ON/OFF); anything else is a malformed frame. */
          config->super_mode >= SUPER_MODE_AUTO && config->super_mode <= SUPER_MODE_OFF;
 }
 
@@ -346,6 +327,65 @@ bool config_has_valid_delete_timing(const Config* config) {
   int timing_count = (config->delete_before ? 1 : 0) + (config->delete_during ? 1 : 0) +
                      (config->delete_delay ? 1 : 0) + (config->delete_after ? 1 : 0);
   return timing_count <= 1;
+}
+
+/* The cross-field invariants FastSync relies on, in one place.  Every message
+ * here was previously duplicated (verbatim) in client_validation.c and/or
+ * config.c; the client reports the returned string for UX and the server
+ * enforces the same rules at its trust boundary.  Pure: no I/O, no logging.
+ * The order is deliberate (most specific structural conflicts first). */
+const char* config_invariants_error(const Config* config) {
+  if (!config)
+    return "Invalid configuration";
+  if (config_has_basis(config) && config->use_chunk_serialization)
+    return "--compare-dest/--copy-dest/--link-dest require per-file incremental checks and cannot "
+           "be combined with -s (chunk serialization)";
+  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression))
+    return "-f/--sendfile cannot be combined with -c (compression) or -s (chunk serialization)";
+  if (config->use_incremental && config->use_chunk_serialization)
+    return "--incremental is not supported with -s (chunk serialization)";
+  if (config->skip_compress_set && config->use_chunk_serialization)
+    return "--skip-compress cannot be combined with -s (chunk serialization)";
+  if (config->use_delta && !config->whole_file && !config->use_incremental)
+    return "--delta requires --incremental";
+  if (config->use_delta && !config->whole_file && config->use_chunk_serialization)
+    return "--delta cannot be combined with -s (chunk serialization)";
+  if (config->use_delta && !config->whole_file && config->use_sendfile)
+    return "--delta cannot be combined with -f (sendfile)";
+  /* --append / --append-verify resume a shorter existing destination by
+     transmitting only the tail.  The resume needs the per-file STATUS_CHECK
+     handshake (so the dest length is learned), which chunk serialization -s
+     disables; whole-file is the opposite intent (send everything). */
+  if ((config->append || config->append_verify) && config->use_chunk_serialization)
+    return "--append/--append-verify require the per-file incremental check and cannot be "
+           "combined with -s (chunk serialization)";
+  if ((config->append || config->append_verify) && config->whole_file)
+    return "--append/--append-verify are incompatible with --whole-file (which forces a full "
+           "transfer)";
+  /* -H transmits each later hard-link group member as a dedicated per-file
+     STATUS_HARDLINK frame, which -s does not support; and a hard-links sibling
+     carries no payload, so the tail-resume of --append is meaningless. */
+  if (config->preserve_hard_links && config->use_chunk_serialization)
+    return "--hard-links/-H cannot be combined with -s (chunk serialization)";
+  /* -X/-A ride the per-file metadata frame; the chunk-serialization wire format
+     does not carry the xattr block. */
+  if ((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization)
+    return "--xattrs/-X and --acls/-A cannot be combined with -s (chunk serialization)";
+  if (config->preserve_hard_links && (config->append || config->append_verify))
+    return "--hard-links/-H cannot be combined with --append/--append-verify";
+  if (config->delay_updates && config->inplace)
+    return "--delay-updates does not work with --inplace";
+  if (config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir))
+    return "--backup-dir is reserved when --delay-updates is active (used for the internal "
+           "staging directory)";
+  if (!config_has_valid_delete_timing(config))
+    return "--delete-before/--delete-during/--delete-delay/--delete-after select the delete "
+           "timing; at most one may be given and each implies --delete";
+  if (config->iconv_spec && !charset_spec_valid(config->iconv_spec))
+    return "--iconv requires LOCAL[,REMOTE] charset names supported by iconv";
+  if (config->copy_as_set && !config->use_metadata)
+    return "--copy-as requires metadata preservation and cannot be combined with --no-preserve";
+  return NULL;
 }
 
 bool config_has_basis(const Config* config) {

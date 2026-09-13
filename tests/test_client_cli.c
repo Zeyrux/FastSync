@@ -122,6 +122,52 @@ static void test_validate_config_delta_sendfile_constraints() {
   config_delete(cfg);
 }
 
+/* The client must still reject every combination now enforced by the shared
+   config_invariants_error() predicate (the server trusts the same rules). */
+static void test_validate_config_unified_invariants() {
+  Config* cfg = valid_client_config();
+  cfg->use_incremental = true;
+  cfg->use_delta = true;
+  cfg->use_chunk_serialization = true;
+  EXPECT_FALSE(validate_config(cfg)); /* delta + chunk */
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  cfg->use_delta = true;              /* whole_file false */
+  EXPECT_FALSE(validate_config(cfg)); /* delta without incremental */
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  cfg->use_sendfile = true;
+  cfg->use_chunk_serialization = true;
+  EXPECT_FALSE(validate_config(cfg)); /* sendfile + chunk */
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  cfg->preserve_hard_links = true;
+  cfg->use_chunk_serialization = true;
+  EXPECT_FALSE(validate_config(cfg)); /* hard-links + chunk */
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  cfg->preserve_hard_links = true;
+  cfg->append = true;
+  EXPECT_FALSE(validate_config(cfg)); /* hard-links + append */
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  cfg->append = true;
+  cfg->whole_file = true;
+  EXPECT_FALSE(validate_config(cfg)); /* append + whole-file */
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  cfg->preserve_xattrs = true;
+  cfg->use_chunk_serialization = true;
+  EXPECT_FALSE(validate_config(cfg)); /* xattrs + chunk */
+  config_delete(cfg);
+}
+
 /* Test main() with --help flag (early return path, no server connection needed) */
 static void test_cli_help() {
   /* We can't easily call main() because it calls send_files which needs a server.
@@ -3155,6 +3201,7 @@ void test_client_cli() {
   test_validate_config_tls_requirements();
   test_validate_config_credentials_require_tls_or_loopback();
   test_validate_config_delta_sendfile_constraints();
+  test_validate_config_unified_invariants();
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();

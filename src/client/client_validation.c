@@ -1,6 +1,4 @@
 #include "client_validation.h"
-#include "charset.h"
-#include "delay_updates.h"
 #include "log.h"
 #include "usage.h"
 #include "utils.h"
@@ -41,17 +39,6 @@ bool validate_config(const Config* config) {
     print_usage();
     return false;
   }
-  if (config_has_basis(config) && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR,
-                "--compare-dest/--copy-dest/--link-dest require per-file incremental checks and "
-                "cannot be combined with -s (chunk serialization)");
-    return false;
-  }
-  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression)) {
-    log_message(LOG_LEVEL_ERROR, "-f/--sendfile cannot be combined with -c (compression) or -s "
-                                 "(chunk serialization)");
-    return false;
-  }
   if (config->compression_threads > 0 && !config->use_compression) {
     log_message(LOG_LEVEL_ERROR, "--compress-threads requires compression (-c or -z)");
     return false;
@@ -60,71 +47,9 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "-f/--sendfile is not supported with SSH transport");
     return false;
   }
-  if (config->use_incremental && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR, "--incremental is not supported with -s (chunk serialization)");
-    return false;
-  }
   /* -4 and -6 are mutually exclusive: a socket address family cannot be both. */
   if (config->ipv4 && config->ipv6) {
     log_message(LOG_LEVEL_ERROR, "-4/--ipv4 and -6/--ipv6 are mutually exclusive");
-    return false;
-  }
-  if (config->skip_compress_set && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR,
-                "--skip-compress cannot be combined with -s (chunk serialization)");
-    return false;
-  }
-  if (config->use_delta && !config->whole_file && !config->use_incremental) {
-    log_message(LOG_LEVEL_ERROR, "--delta requires --incremental");
-    return false;
-  }
-  if (config->use_delta && !config->whole_file && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR, "--delta cannot be combined with -s (chunk serialization)");
-    return false;
-  }
-  if (config->use_delta && !config->whole_file && config->use_sendfile) {
-    log_message(LOG_LEVEL_ERROR, "--delta cannot be combined with -f (sendfile)");
-    return false;
-  }
-  /* --append / --append-verify resume a shorter existing destination by
-     transmitting only the tail.  The resume needs the per-file STATUS_CHECK
-     handshake (so the dest length is learned), which chunk serialization -s
-     disables; and whole-file is the opposite intent (send everything), so the
-     two would silently make the resume pointless.  Both are rejected up front
-     rather than silently degrading to a full transfer. */
-  if ((config->append || config->append_verify) && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR,
-                "--append/--append-verify require the per-file incremental check and cannot be "
-                "combined with -s (chunk serialization)");
-    return false;
-  }
-  if ((config->append || config->append_verify) && config->whole_file) {
-    log_message(LOG_LEVEL_ERROR,
-                "--append/--append-verify are incompatible with --whole-file (which forces a "
-                "full transfer)");
-    return false;
-  }
-  /* --hard-links/-H transmits each later group member as a dedicated per-file
-     STATUS_HARDLINK frame, which chunk serialization -s does not support; and a
-     hard-links sibling carries no payload, so the tail-resume of --append is
-     meaningless for it.  Both combinations are rejected up front rather than
-     silently degrading. */
-  if (config->preserve_hard_links && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR,
-                "--hard-links/-H cannot be combined with -s (chunk serialization)");
-    return false;
-  }
-  /* -X/-A ride the per-file metadata frame; the buffer-based chunk-serialization
-     wire format does not carry the xattr block, so the pair is rejected up front
-     (mirroring -H + -s) rather than silently dropping attributes. */
-  if ((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization) {
-    log_message(LOG_LEVEL_ERROR,
-                "--xattrs/-X and --acls/-A cannot be combined with -s (chunk serialization)");
-    return false;
-  }
-  if (config->preserve_hard_links && (config->append || config->append_verify)) {
-    log_message(LOG_LEVEL_ERROR,
-                "--hard-links/-H cannot be combined with --append/--append-verify");
     return false;
   }
   if (config->log_file_format && !config->log_file) {
@@ -146,28 +71,12 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "sending daemon credentials to a non-local server requires --tls");
     return false;
   }
-  if (config->delay_updates && config->inplace) {
-    log_message(LOG_LEVEL_ERROR, "--delay-updates does not work with --inplace");
-    return false;
-  }
-  if (config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) {
-    log_message(LOG_LEVEL_ERROR,
-                "--backup-dir is reserved when --delay-updates is active (used for the internal "
-                "staging directory)");
-    return false;
-  }
-  if (!config_has_valid_delete_timing(config)) {
-    log_message(LOG_LEVEL_ERROR,
-                "--delete-before/--delete-during/--delete-delay/--delete-after select the delete "
-                "timing; at most one may be given and each implies --delete");
-    return false;
-  }
-  /* --iconv: reject a malformed CONVERT_SPEC or an unsupported charset name at
-     startup (a probe iconv_open is attempted), so a typo'd charset never fails
-     the run mid-transfer with per-file errors. */
-  if (!charset_spec_valid(config->iconv_spec)) {
-    log_message(LOG_LEVEL_ERROR,
-                "--iconv requires LOCAL[,REMOTE] charset names supported by iconv");
+  /* Every cross-field invariant the receiver enforces lives in one shared
+     predicate so the client and the server can never disagree.  The client
+     reports the specific reason here, before any network I/O. */
+  const char* invariants_error = config_invariants_error(config);
+  if (invariants_error) {
+    log_message(LOG_LEVEL_ERROR, "%s", invariants_error);
     return false;
   }
   /* --protocol: FastSync has exactly one wire format, so the forced version
@@ -178,16 +87,6 @@ bool validate_config(const Config* config) {
                 "--protocol must be %s (FastSync supports only its current wire "
                 "protocol version and cannot speak an older or virtual one)",
                 PROTOCOL_VERSION);
-    return false;
-  }
-  /* --copy-as pushes the source ids through the metadata path (it implies
-     --preserve).  A later --no-preserve would clear use_metadata, leaving the
-     transfer with nothing to chown while the receiver gate would still pass.
-     Refuse the combination up front rather than silently chowning nothing. */
-  if (config->copy_as_set && !config->use_metadata) {
-    log_message(LOG_LEVEL_ERROR,
-                "--copy-as requires metadata preservation and cannot be combined with "
-                "--no-preserve");
     return false;
   }
   return true;

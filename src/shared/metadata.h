@@ -3,6 +3,7 @@
 
 #include "file.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -39,7 +40,13 @@
 #define FILE_METADATA_WIRE_SIZE (sizeof(int32_t) * 5 + sizeof(int64_t) * 6)
 
 void metadata_to_buf(char** buf, const FileMetadata* m);
-FileMetadata* metadata_from_buf(char** buf);
+/* Decode one packed metadata record (an int32 present flag followed, when
+ * present, by FILE_METADATA_WIRE_SIZE field bytes) from `buf`, which has `len`
+ * readable bytes.  Every read is bounds-checked against `len`, so the function
+ * can never over-read the caller's buffer: a too-short record, an absent
+ * (present == 0) record and a malformed record all return NULL.  A successful
+ * decode returns a heap-allocated FileMetadata owned by the caller. */
+FileMetadata* metadata_from_buf(const uint8_t* buf, size_t len);
 bool metadata_send(int file_descriptor, const FileMetadata* m);
 FileMetadata* metadata_receive(int file_descriptor, int* ok);
 void file_restore_metadata(const char* path, const FileMetadata* metadata,
