@@ -2717,6 +2717,70 @@ static void test_config_wire_receive_bounds() {
   config_delete(c);
 }
 
+/* Regression (pre-auth NULL-deref): the *_count receive helpers used to write
+ * the peer-controlled int through the Config member BEFORE validating it.  An
+ * over-cap basis_count therefore left config->basis_count huge while
+ * config->basis_dirs stayed NULL; the config_receive() error path then called
+ * config_delete(), whose `for (i < basis_count) free(basis_dirs[i].path)` loop
+ * dereferenced NULL.  A malicious client could crash the daemon before auth.
+ *
+ * The helpers now validate a LOCAL and publish only on success, so a rejected
+ * count leaves the member at its safe default (0).  The idmap/skip helpers have
+ * the same "write then validate" shape and are covered here too, as is the
+ * config_delete() NULL-array guard that backstops the whole class. */
+static void test_config_receive_rejects_overcap_counts() {
+  if (is_running_under_valgrind())
+    return;
+
+  /* Over-cap basis count.  The values are injected directly (config_basis_append
+   * enforces the cap) with a matching array so the sender can emit the block;
+   * the receiver must reject at the count and remain crash-free while deleting
+   * the partially populated Config. */
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->basis_count = MAX_BASIS_DIRS + 1;
+  c->basis_dirs = calloc((size_t)c->basis_count, sizeof(BasisDest));
+  EXPECT_NOT_NULL(c->basis_dirs);
+  for (int i = 0; i < c->basis_count; i++) {
+    c->basis_dirs[i].type = BASIS_DEST_LINK;
+    c->basis_dirs[i].path = str_dup("basis");
+  }
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* Over-cap identity-map count (usermap and groupmap share the helper). */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->usermap_count = MAX_IDENTITY_MAP + 1;
+  c->usermap = calloc((size_t)c->usermap_count, sizeof(IdentityMap));
+  EXPECT_NOT_NULL(c->usermap);
+  for (int i = 0; i < c->usermap_count; i++) {
+    c->usermap[i].from = 0;
+    c->usermap[i].to = 0;
+  }
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* Over-cap skip-compress count. */
+  Config* over_skip = make_skip_compress_config(MAX_SKIP_COMPRESS_SUFFIXES + 1, 1);
+  EXPECT_NOT_NULL(over_skip);
+  EXPECT_TRUE(roundtrip_config_rejected(over_skip));
+  config_delete(over_skip);
+
+  /* Defense-in-depth: config_delete() on a Config left with a non-zero count
+   * but a NULL array (the exact partial state an over-cap count used to leave
+   * behind) must be safe. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->basis_count = MAX_BASIS_DIRS + 1;
+  c->basis_dirs = NULL;
+  config_delete(c);
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -2775,6 +2839,7 @@ void test_config() {
     test_config_wire_golden();
     test_config_wire_golden_receive();
     test_config_wire_receive_bounds();
+    test_config_receive_rejects_overcap_counts();
     test_config_wire_roundtrip_all_fields();
   }
   test_identity_copy_as_refused();

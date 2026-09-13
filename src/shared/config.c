@@ -687,11 +687,13 @@ void config_delete(Config* config) {
   }
   config->remote_options = NULL;
   config->remote_option_count = 0;
-  for (int i = 0; i < config->basis_count; i++) {
-    free(config->basis_dirs[i].path);
-    config->basis_dirs[i].path = NULL;
+  if (config->basis_dirs) {
+    for (int i = 0; i < config->basis_count; i++) {
+      free(config->basis_dirs[i].path);
+      config->basis_dirs[i].path = NULL;
+    }
+    free(config->basis_dirs);
   }
-  free(config->basis_dirs);
   config->basis_dirs = NULL;
   config->basis_count = 0;
   free(config->partial_dir);
@@ -839,21 +841,33 @@ static bool config_receive_identity_id(int fd, int32_t* value) {
   return true;
 }
 
+/* Read a peer-controlled count into a LOCAL, validate the range, and only then
+ * publish it through `*value`.  Writing through `*value` before validating
+ * leaves the Config holding an over-cap count (e.g. 999999999) whose backing
+ * array is still NULL; the receive error path then runs config_delete(), which
+ * walks the array and dereferences NULL.  Leaving `*value` untouched on failure
+ * also keeps the failed Config in a coherent, safely-deletable state. */
 static bool config_receive_skip_count(int fd, int* value) {
-  if (!receive_int(fd, value) || *value < 0 || *value > MAX_SKIP_COMPRESS_SUFFIXES)
+  int v;
+  if (!receive_int(fd, &v) || v < 0 || v > MAX_SKIP_COMPRESS_SUFFIXES)
     return false;
+  *value = v;
   return true;
 }
 
 static bool config_receive_basis_count(int fd, int* value) {
-  if (!receive_int(fd, value) || *value < 0 || *value > MAX_BASIS_DIRS)
+  int v;
+  if (!receive_int(fd, &v) || v < 0 || v > MAX_BASIS_DIRS)
     return false;
+  *value = v;
   return true;
 }
 
 static bool config_receive_idmap_count(int fd, int* value) {
-  if (!receive_int(fd, value) || *value < 0 || *value > MAX_IDENTITY_MAP)
+  int v;
+  if (!receive_int(fd, &v) || v < 0 || v > MAX_IDENTITY_MAP)
     return false;
+  *value = v;
   return true;
 }
 
