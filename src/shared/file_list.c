@@ -104,8 +104,37 @@ static int normalize_entry(const char* raw, size_t len, bool strip_line_endings,
   return result;
 }
 
+/* Build the membership index: each non-empty entry plus every ancestor
+   directory prefix of it.  The entry flag lets file_list_affects tell an exact
+   listed path from an ancestor of a listed path.  An empty entry (the source
+   root) short-circuits every query, so it is recorded as whole_tree. */
+static bool file_list_index_build(FileListSet* set, char* err, size_t err_size) {
+  if (!str_hash_set_init(&set->node_index, (size_t)set->count * 2 + 1)) {
+    snprintf(err, err_size, "memory allocation failed");
+    return false;
+  }
+  for (int i = 0; i < set->count; i++) {
+    const char* entry = set->entries[i];
+    if (entry[0] == '\0') {
+      set->whole_tree = true;
+      continue;
+    }
+    if (!str_hash_set_insert_ref(&set->node_index, entry, true)) {
+      snprintf(err, err_size, "memory allocation failed");
+      return false;
+    }
+    for (const char* slash = entry; (slash = strchr(slash, '/')) != NULL; slash++) {
+      if (!str_hash_set_insert_copy_n(&set->node_index, entry, (size_t)(slash - entry), false)) {
+        snprintf(err, err_size, "memory allocation failed");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 static FileListSet* string_list_to_set(StringList* raw, char* err, size_t err_size) {
-  FileListSet* set = malloc(sizeof(FileListSet));
+  FileListSet* set = calloc(1, sizeof(FileListSet));
   if (!set) {
     snprintf(err, err_size, "memory allocation failed");
     return NULL;
@@ -114,6 +143,10 @@ static FileListSet* string_list_to_set(StringList* raw, char* err, size_t err_si
   set->entries = raw->items;
   raw->items = NULL;
   raw->count = 0;
+  if (!file_list_index_build(set, err, err_size)) {
+    file_list_destroy(set);
+    return NULL;
+  }
   return set;
 }
 
@@ -163,14 +196,8 @@ void file_list_destroy(FileListSet* set) {
   for (int i = 0; i < set->count; i++)
     free(set->entries[i]);
   free(set->entries);
+  str_hash_set_free(&set->node_index);
   free(set);
-}
-
-static bool path_has_prefix(const char* path, const char* prefix) {
-  size_t plen = strlen(prefix);
-  if (strncmp(path, prefix, plen) != 0)
-    return false;
-  return path[plen] == '/' || path[plen] == '\0';
 }
 
 bool file_list_affects(const FileListSet* set, const char* rel) {
@@ -178,16 +205,30 @@ bool file_list_affects(const FileListSet* set, const char* rel) {
     return true;
   if (!rel)
     return false;
-  for (int i = 0; i < set->count; i++) {
-    const char* entry = set->entries[i];
-    if (entry[0] == '\0')
-      return true; /* whole tree listed */
-    if (strcmp(rel, entry) == 0)
-      return true; /* the entry itself is listed */
-    if (path_has_prefix(rel, entry))
-      return true; /* rel lives under a listed directory */
-    if (path_has_prefix(entry, rel))
-      return true; /* rel is an ancestor directory of a listed entry */
+  if (set->whole_tree)
+    return true; /* whole tree listed */
+  /* A node hit means `rel` is a listed entry, or an ancestor directory of one
+     (rel lives on the path to some listed entry). */
+  if (str_hash_set_lookup(&set->node_index, rel, NULL))
+    return true;
+  /* Otherwise `rel` is affected only when a listed entry is an ancestor of it;
+     walk rel's directory prefixes (which preserve path-boundary semantics) and
+     test each for an exact entry. */
+  size_t len = strlen(rel);
+  while (len > 0) {
+    const char* slash = NULL;
+    for (size_t i = len; i-- > 0;) {
+      if (rel[i] == '/') {
+        slash = rel + i;
+        break;
+      }
+    }
+    if (!slash)
+      break;
+    len = (size_t)(slash - rel);
+    bool is_entry = false;
+    if (str_hash_set_lookup_n(&set->node_index, rel, len, &is_entry) && is_entry)
+      return true;
   }
   return false;
 }

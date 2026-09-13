@@ -150,6 +150,43 @@ static void test_walker_removes_extras_keeps_manifest_and_protected() {
   free(root);
 }
 
+static void test_walker_keeps_nested_manifest_dirs() {
+  /* The keep-set index must preserve deep content: a directory is protected
+     when its own name is a keep entry OR when kept content lives below it, and
+     an exact kept file survives while its siblings are removed. */
+  char* root = make_walk_root("nestedkeep");
+  EXPECT_NOT_NULL(root);
+  EXPECT_TRUE(write_file_at(root, "extra.txt", "extra"));
+  EXPECT_EQ_INT(make_subdir(root, "keepdir"), 0);
+  EXPECT_EQ_INT(make_subdir(root, "keepdir/deep"), 0);
+  EXPECT_TRUE(write_file_at(root, "keepdir/deep/keep.txt", "kept"));
+  EXPECT_TRUE(write_file_at(root, "keepdir/extra2.txt", "extra"));
+  EXPECT_EQ_INT(make_subdir(root, "dropdir"), 0);
+  EXPECT_EQ_INT(make_subdir(root, "keep2"), 0);
+  EXPECT_TRUE(write_file_at(root, "keep2/inner.txt", "kept"));
+  EXPECT_EQ_INT(make_subdir(root, "keep3"), 0);
+
+  const char* keeps[] = {"keepdir/deep/keep.txt", "keep2/inner.txt", "keep3"};
+  ArrayList* manifest = make_manifest_strings(keeps, 3);
+  EXPECT_NOT_NULL(manifest);
+  size_t deleted = 0;
+  DeleteWalkResult result = delete_extras_limited(root, manifest, 100000, NULL, 0, &deleted);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
+  EXPECT_FALSE(file_exists(root, "extra.txt"));
+  EXPECT_TRUE(file_exists(root, "keepdir/deep/keep.txt"));
+  EXPECT_FALSE(file_exists(root, "keepdir/extra2.txt"));
+  EXPECT_TRUE(dir_exists(root, "keepdir"));
+  EXPECT_TRUE(dir_exists(root, "keepdir/deep"));
+  EXPECT_FALSE(dir_exists(root, "dropdir"));
+  EXPECT_TRUE(dir_exists(root, "keep2"));
+  EXPECT_TRUE(file_exists(root, "keep2/inner.txt"));
+  EXPECT_TRUE(dir_exists(root, "keep3")); /* an exact directory keep entry survives */
+  EXPECT_EQ_INT((int)deleted, 3);
+  array_list_delete(manifest);
+  remove_walk_tree(root);
+  free(root);
+}
+
 static void test_walker_max_delete_exceeded_deletes_nothing() {
   char* root = make_walk_root("maxdel");
   EXPECT_NOT_NULL(root);
@@ -421,6 +458,7 @@ static void test_fd_peer_ip() {
 
 void test_shared_utils() {
   test_walker_removes_extras_keeps_manifest_and_protected();
+  test_walker_keeps_nested_manifest_dirs();
   test_walker_max_delete_exceeded_deletes_nothing();
   test_walker_max_delete_exact_bound_deletes();
   test_walker_unlimited_deletes_all();

@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <xxhash.h>
 
 static int authorized_root_fd = -1;
 static char* authorized_root_path;
@@ -94,6 +95,153 @@ char* str_dup(const char* string) {
     return NULL;
   memcpy(new_string, string, str_len + 1);
   return new_string;
+}
+
+#define STR_HASH_SET_MIN_CAPACITY 16
+
+static size_t str_hash_set_hash(const char* key, size_t len) {
+  return (size_t)XXH64(key, len, 0);
+}
+
+/* Store an already-allocated key.  Returns 1 when a new slot was filled and 0
+ * for a duplicate (the caller keeps ownership of `key` when owned is true). */
+static int str_hash_set_put(StrHashSet* set, const char* key, size_t len, bool owned,
+                            bool is_entry) {
+  size_t mask = set->capacity - 1;
+  size_t index = str_hash_set_hash(key, len) & mask;
+  while (true) {
+    StrHashSetSlot* slot = &set->slots[index];
+    if (!slot->key) {
+      slot->key = key;
+      slot->owned = owned;
+      slot->is_entry = is_entry;
+      set->size++;
+      return 1;
+    }
+    if (strlen(slot->key) == len && memcmp(slot->key, key, len) == 0) {
+      if (is_entry)
+        slot->is_entry = true;
+      return 0;
+    }
+    index = (index + 1) & mask;
+  }
+}
+
+static bool str_hash_set_resize(StrHashSet* set, size_t new_capacity) {
+  StrHashSetSlot* old_slots = set->slots;
+  size_t old_capacity = set->capacity;
+  StrHashSetSlot* slots = calloc(new_capacity, sizeof(StrHashSetSlot));
+  if (!slots)
+    return false;
+  set->slots = slots;
+  set->capacity = new_capacity;
+  set->size = 0;
+  for (size_t i = 0; i < old_capacity; i++) {
+    if (old_slots[i].key)
+      (void)str_hash_set_put(set, old_slots[i].key, strlen(old_slots[i].key), old_slots[i].owned,
+                             old_slots[i].is_entry);
+  }
+  free(old_slots);
+  return true;
+}
+
+static bool str_hash_set_grow(StrHashSet* set) {
+  if (set->capacity != 0 && (set->size + 1) * 4 <= set->capacity * 3)
+    return true;
+  size_t new_capacity = set->capacity ? set->capacity * 2 : STR_HASH_SET_MIN_CAPACITY;
+  return str_hash_set_resize(set, new_capacity);
+}
+
+bool str_hash_set_init(StrHashSet* set, size_t hint) {
+  if (!set)
+    return false;
+  set->slots = NULL;
+  set->capacity = 0;
+  set->size = 0;
+  size_t capacity = STR_HASH_SET_MIN_CAPACITY;
+  while (capacity < (hint + 1) * 2)
+    capacity *= 2;
+  set->slots = calloc(capacity, sizeof(StrHashSetSlot));
+  if (!set->slots)
+    return false;
+  set->capacity = capacity;
+  return true;
+}
+
+void str_hash_set_free(StrHashSet* set) {
+  if (!set)
+    return;
+  for (size_t i = 0; i < set->capacity; i++) {
+    if (set->slots[i].key && set->slots[i].owned)
+      free((void*)set->slots[i].key);
+  }
+  free(set->slots);
+  set->slots = NULL;
+  set->capacity = 0;
+  set->size = 0;
+}
+
+bool str_hash_set_insert_ref(StrHashSet* set, const char* key, bool is_entry) {
+  if (!set || !key)
+    return false;
+  if (!str_hash_set_grow(set))
+    return false;
+  return str_hash_set_put(set, key, strlen(key), false, is_entry) >= 0;
+}
+
+bool str_hash_set_insert_copy_n(StrHashSet* set, const char* key, size_t len, bool is_entry) {
+  if (!set || !key)
+    return false;
+  bool present = false;
+  if (str_hash_set_lookup_n(set, key, len, &present)) {
+    if (is_entry)
+      (void)str_hash_set_put(set, key, len, false, true); /* upgrade in place */
+    return true;
+  }
+  if (!str_hash_set_grow(set))
+    return false;
+  char* copy = malloc(len + 1);
+  if (!copy)
+    return false;
+  memcpy(copy, key, len);
+  copy[len] = '\0';
+  int result = str_hash_set_put(set, copy, len, true, is_entry);
+  if (result <= 0) {
+    free(copy);
+    return result == 0;
+  }
+  return true;
+}
+
+static const StrHashSetSlot* str_hash_set_find_n(const StrHashSet* set, const char* key,
+                                                 size_t len) {
+  if (!set || set->capacity == 0 || !key)
+    return NULL;
+  size_t mask = set->capacity - 1;
+  size_t index = str_hash_set_hash(key, len) & mask;
+  while (true) {
+    const StrHashSetSlot* slot = &set->slots[index];
+    if (!slot->key)
+      return NULL;
+    if (strlen(slot->key) == len && memcmp(slot->key, key, len) == 0)
+      return slot;
+    index = (index + 1) & mask;
+  }
+}
+
+bool str_hash_set_lookup_n(const StrHashSet* set, const char* key, size_t len, bool* is_entry) {
+  const StrHashSetSlot* slot = str_hash_set_find_n(set, key, len);
+  if (!slot)
+    return false;
+  if (is_entry)
+    *is_entry = slot->is_entry;
+  return true;
+}
+
+bool str_hash_set_lookup(const StrHashSet* set, const char* key, bool* is_entry) {
+  if (!key)
+    return false;
+  return str_hash_set_lookup_n(set, key, strlen(key), is_entry);
 }
 
 char* output_escape(const char* string, bool eight_bit_output) {
@@ -196,15 +344,38 @@ bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_si
   return written >= 0 && (size_t)written < buffer_size;
 }
 
-static bool is_dir_in_manifest(const char* rel_path, ArrayList* manifest) {
-  size_t len = strlen(rel_path);
+/* Build the keep-set index: every manifest entry is inserted as an exact entry
+   and every ancestor directory prefix of it as a non-entry node.  A lookup of
+   `rel` therefore succeeds iff `rel` is a kept file, a kept directory, or an
+   ancestor directory of kept content (the old is_dir_in_manifest predicate);
+   the entry flag distinguishes an exact kept file from a mere prefix. */
+static bool build_keep_index(ArrayList* manifest, StrHashSet* index) {
+  if (!str_hash_set_init(index, manifest && manifest->size > 0 ? (size_t)manifest->size : 1))
+    return false;
+  if (!manifest)
+    return true;
   for (int i = 0; i < manifest->size; i++) {
     const char* entry = (const char*)manifest->items[i];
-    // Check if entry starts with rel_path + '/' or matches exactly
-    if (strncmp(entry, rel_path, len) == 0 && (entry[len] == '/' || entry[len] == '\0'))
-      return true;
+    if (!str_hash_set_insert_ref(index, entry, true))
+      goto fail;
+    for (const char* slash = entry; (slash = strchr(slash, '/')) != NULL; slash++) {
+      if (!str_hash_set_insert_copy_n(index, entry, (size_t)(slash - entry), false))
+        goto fail;
+    }
   }
+  return true;
+fail:
+  str_hash_set_free(index);
   return false;
+}
+
+static bool keep_is_dir(const StrHashSet* index, const char* rel_path) {
+  return str_hash_set_lookup(index, rel_path, NULL);
+}
+
+static bool keep_is_file(const StrHashSet* index, const char* rel_path) {
+  bool is_entry = false;
+  return str_hash_set_lookup(index, rel_path, &is_entry) && is_entry;
 }
 
 /* True when child_rel is, or lies below, a protected entry.  A prefix "a"
@@ -234,7 +405,7 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
    prefixes) mark the enclosing directory as surviving, exactly as they would
    make a real rmdir fail with ENOTEMPTY.  Stops early once *count reaches the
    cap (sets *exceeds).  Returns false on a traversal error. */
-static bool count_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest, size_t cap,
+static bool count_extras_fd(int dirfd, const char* rel_path, const StrHashSet* keep, size_t cap,
                             size_t* count, bool* exceeds, const DeleteSkipEntry* skips,
                             int skip_count, bool* survives) {
   /* openat(dirfd, ".") opens an independent file description: a dup() would
@@ -284,15 +455,15 @@ static bool count_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest
       bool child_ok = true;
       bool child_survives = true;
       if (childfd >= 0) {
-        child_ok = count_extras_fd(childfd, child_rel, manifest, cap, count, exceeds, skips,
-                                   skip_count, &child_survives);
+        child_ok = count_extras_fd(childfd, child_rel, keep, cap, count, exceeds, skips, skip_count,
+                                   &child_survives);
         close(childfd);
       } else if (errno != ENOENT) {
         operation_ok = false;
       }
       if (!child_ok)
         operation_ok = false;
-      if (is_dir_in_manifest(child_rel, manifest)) {
+      if (keep_is_dir(keep, child_rel)) {
         /* A directory with kept content below it is never removed. */
         local_survives = true;
       } else if (child_survives) {
@@ -308,13 +479,7 @@ static bool count_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest
         }
       }
     } else {
-      bool found = false;
-      for (int i = 0; i < manifest->size; i++) {
-        if (strcmp((char*)manifest->items[i], child_rel) == 0) {
-          found = true;
-          break;
-        }
-      }
+      bool found = keep_is_file(keep, child_rel);
       if (!found) {
         if (*count >= cap) {
           *exceeds = true;
@@ -330,7 +495,7 @@ static bool count_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest
   return operation_ok;
 }
 
-static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifest,
+static bool delete_extras_fd(int dirfd, const char* rel_path, const StrHashSet* keep,
                              size_t max_delete, size_t* deleted_count, const DeleteSkipEntry* skips,
                              int skip_count) {
   /* Independent file description (see count_extras_fd). */
@@ -379,15 +544,15 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       bool child_removed = false;
       if (childfd >= 0) {
-        child_removed = delete_extras_fd(childfd, child_rel, manifest, max_delete, deleted_count,
-                                         skips, skip_count);
+        child_removed = delete_extras_fd(childfd, child_rel, keep, max_delete, deleted_count, skips,
+                                         skip_count);
         if (!child_removed)
           operation_ok = false;
         close(childfd);
       } else if (errno != ENOENT) {
         operation_ok = false;
       }
-      if (child_removed && !is_dir_in_manifest(child_rel, manifest)) {
+      if (child_removed && !keep_is_dir(keep, child_rel)) {
         if (*deleted_count >= max_delete) {
           operation_ok = false;
         } else {
@@ -406,13 +571,7 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, ArrayList* manifes
       }
     } else {
       // Check if relative path is in manifest
-      bool found = false;
-      for (int i = 0; i < manifest->size; i++) {
-        if (strcmp((char*)manifest->items[i], child_rel) == 0) {
-          found = true;
-          break;
-        }
-      }
+      bool found = keep_is_file(keep, child_rel);
       if (!found) {
         if (*deleted_count >= max_delete) {
           operation_ok = false;
@@ -443,6 +602,11 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifes
     *deleted_out = 0;
   if (!manifest)
     return DELETE_WALK_ERROR;
+  /* Index the keep-set once so both passes answer membership in O(path length)
+     instead of scanning every manifest entry for every destination entry. */
+  StrHashSet keep;
+  if (!build_keep_index(manifest, &keep))
+    return DELETE_WALK_ERROR;
   int rootfd;
   if (authorized_root_fd >= 0) {
     if (authorized_root_path)
@@ -454,29 +618,34 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifes
   } else {
     rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   }
-  if (rootfd < 0)
+  if (rootfd < 0) {
+    str_hash_set_free(&keep);
     return DELETE_WALK_ERROR;
+  }
   if (max_delete != SIZE_MAX) {
     /* Rehearse the deletion first so a run that would exceed the cap removes
        nothing (rsync's all-or-nothing --max-delete contract). */
     size_t count = 0;
     bool exceeds = false;
     bool survives = false;
-    bool counted_ok = count_extras_fd(rootfd, "", manifest, max_delete, &count, &exceeds, skips,
+    bool counted_ok = count_extras_fd(rootfd, "", &keep, max_delete, &count, &exceeds, skips,
                                       skip_count, &survives);
     if (!counted_ok) {
       close(rootfd);
+      str_hash_set_free(&keep);
       return DELETE_WALK_ERROR;
     }
     if (exceeds) {
       close(rootfd);
+      str_hash_set_free(&keep);
       return DELETE_WALK_LIMIT_EXCEEDED;
     }
   }
   size_t deleted_count = 0;
-  bool ok = delete_extras_fd(rootfd, "", manifest, max_delete, &deleted_count, skips, skip_count);
+  bool ok = delete_extras_fd(rootfd, "", &keep, max_delete, &deleted_count, skips, skip_count);
   if (close(rootfd) != 0)
     ok = false;
+  str_hash_set_free(&keep);
   if (deleted_out)
     *deleted_out = deleted_count;
   return ok ? DELETE_WALK_OK : DELETE_WALK_ERROR;
