@@ -1647,53 +1647,99 @@ static File* receive_full_file(int fd, const Config* config, const char* path) {
   return file;
 }
 
-File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
-  if (!config || !skipped) {
-    send_status(fd, STATUS_ERROR);
-    return NULL;
-  }
-  *skipped = false;
-  char* check_path = receive_wire_str(fd);
-  if (check_path == NULL) {
-    return NULL;
-  }
+/* ---------------------------------------------------------------------------
+ * receive_incremental_check() decomposition.
+ *
+ * The per-file STATUS_CHECK fast path is split into the small helpers below,
+ * called in order by a short linear orchestrator.  Each helper owns one
+ * decision: request validation, secure destination open, metadata-only skip,
+ * alternate-basis match, --append tail resume, block delta, --fuzzy basis, and
+ * the final "send the whole file" fallback.  Every protocol send/receive and
+ * every resource cleanup is preserved exactly; the wire is byte-for-byte
+ * unchanged.
+ * ------------------------------------------------------------------------- */
 
+/* Owned state threaded through the helpers below. */
+typedef struct {
+  int fd;
+  const Config* config;
+  char* check_path; /* received destination-relative path */
+  char* full_path;  /* receive-root-prefixed destination path */
   unsigned long long check_size;
   long long check_mtime;
   long long check_mtime_nsec;
   uint8_t check_digest[CHECKSUM_MAX_DIGEST_LEN];
-  size_t check_digest_len = 0;
-  if (!receive_n_data(fd, &check_size, sizeof(check_size)) ||
-      !receive_n_data(fd, &check_mtime, sizeof(check_mtime))) {
-    free(check_path);
-    return NULL;
-  }
-  if (!receive_n_data(fd, &check_mtime_nsec, sizeof(check_mtime_nsec)) || check_mtime_nsec < 0 ||
-      check_mtime_nsec >= 1000000000LL) {
-    free(check_path);
+  size_t check_digest_len;
+  bool has_old_file;
+  int old_fd;
+  struct stat old_st;
+  unsigned long long old_size;
+  void* old_data; /* snapshot of the existing destination, or NULL */
+} IncrementalCheckState;
+
+typedef enum {
+  INCREMENTAL_CONTINUE, /* proceed to the next helper */
+  INCREMENTAL_ERROR,    /* protocol/validation failure: return NULL */
+  INCREMENTAL_SKIP,     /* up to date: *skipped = true, return NULL */
+  INCREMENTAL_FILE,     /* a File* was produced (out_file) */
+} IncrementalCheckOutcome;
+
+static void incremental_check_state_init(IncrementalCheckState* state, int fd,
+                                         const Config* config) {
+  memset(state, 0, sizeof(*state));
+  state->fd = fd;
+  state->config = config;
+  state->old_fd = -1;
+}
+
+/* Release every resource the helpers may have acquired.  Idempotent, so it is
+   safe on every exit path exactly the way the original inline cleanup was. */
+static void incremental_check_state_cleanup(IncrementalCheckState* state) {
+  free(state->old_data);
+  state->old_data = NULL;
+  if (state->old_fd >= 0)
+    close(state->old_fd);
+  state->old_fd = -1;
+  free(state->full_path);
+  state->full_path = NULL;
+  free(state->check_path);
+  state->check_path = NULL;
+}
+
+/* Receive and validate the STATUS_CHECK request frame: path, size, mtime,
+   nanosecond mtime, and (when negotiated) the source digest. */
+static IncrementalCheckOutcome incremental_check_receive_request(IncrementalCheckState* state) {
+  int fd = state->fd;
+  const Config* config = state->config;
+  char* check_path = receive_wire_str(fd);
+  if (check_path == NULL)
+    return INCREMENTAL_ERROR;
+  state->check_path = check_path;
+
+  if (!receive_n_data(fd, &state->check_size, sizeof(state->check_size)) ||
+      !receive_n_data(fd, &state->check_mtime, sizeof(state->check_mtime)))
+    return INCREMENTAL_ERROR;
+  if (!receive_n_data(fd, &state->check_mtime_nsec, sizeof(state->check_mtime_nsec)) ||
+      state->check_mtime_nsec < 0 || state->check_mtime_nsec >= 1000000000LL) {
     send_status(fd, STATUS_ERROR);
-    return NULL;
+    return INCREMENTAL_ERROR;
   }
   if ((config->checksum || config_has_basis(config))) {
     uint8_t wire_len;
     if (!receive_n_data(fd, &wire_len, sizeof(wire_len)) || wire_len == 0 ||
         wire_len > CHECKSUM_MAX_DIGEST_LEN ||
         wire_len != checksum_digest_len((ChecksumAlgo)config->checksum_algo)) {
-      free(check_path);
       send_status(fd, STATUS_ERROR);
-      return NULL;
+      return INCREMENTAL_ERROR;
     }
-    check_digest_len = wire_len;
-    if (!receive_n_data(fd, check_digest, check_digest_len)) {
-      free(check_path);
-      return NULL;
-    }
+    state->check_digest_len = wire_len;
+    if (!receive_n_data(fd, state->check_digest, state->check_digest_len))
+      return INCREMENTAL_ERROR;
   }
 
-  if (check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
-    free(check_path);
+  if (state->check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
     send_status(fd, STATUS_ERROR);
-    return NULL;
+    return INCREMENTAL_ERROR;
   }
 
   if (check_path[0] == '\0' || has_path_traversal(check_path)) {
@@ -1701,66 +1747,76 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     log_message(LOG_LEVEL_ERROR, "Invalid received check path: %s",
                 escaped_path ? escaped_path : "<allocation failed>");
     free(escaped_path);
-    free(check_path);
-    return NULL;
+    return INCREMENTAL_ERROR;
   }
+  return INCREMENTAL_CONTINUE;
+}
 
-  char* full_path = path_cat(config->receive_root_directory, check_path);
+/* Open the existing destination entry once, confined below the receive root,
+   and record its stat. */
+static IncrementalCheckOutcome incremental_check_open_destination(IncrementalCheckState* state) {
+  char* full_path = path_cat(state->config->receive_root_directory, state->check_path);
   if (!full_path) {
-    free(check_path);
-    send_status(fd, STATUS_ERROR);
-    return NULL;
+    send_status(state->fd, STATUS_ERROR);
+    return INCREMENTAL_ERROR;
   }
+  state->full_path = full_path;
 
-  /* Open the existing destination entry (if any) once and keep the descriptor
-     until the quick-check below decides whether the old contents are needed. */
-  struct stat st;
-  bool has_old_file = false;
-  int old_fd = -1;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full_path, &leaf, false);
   if (parent_fd >= 0) {
-    old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    state->old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     free(leaf);
     close(parent_fd);
-    has_old_file = old_fd >= 0 && fstat(old_fd, &st) == 0 && S_ISREG(st.st_mode);
+    state->has_old_file = state->old_fd >= 0 && fstat(state->old_fd, &state->old_st) == 0 &&
+                          S_ISREG(state->old_st.st_mode);
   }
-  if (!has_old_file && old_fd >= 0) {
-    close(old_fd);
-    old_fd = -1;
+  if (!state->has_old_file && state->old_fd >= 0) {
+    close(state->old_fd);
+    state->old_fd = -1;
   }
-  unsigned long long old_size = has_old_file ? (unsigned long long)st.st_size : 0;
+  state->old_size = state->has_old_file ? (unsigned long long)state->old_st.st_size : 0;
+  return INCREMENTAL_CONTINUE;
+}
 
-  /* Decide from metadata alone whether the receiver already holds the file
-     the sender is offering.  The old contents are only read into memory when
-     a checksum comparison or a delta transfer actually requires them. */
-  bool size_equal = has_old_file && old_size == check_size;
+/* Metadata-only (and, when --checksum forces it, content) up-to-date decision.
+   Loads the old contents only when a checksum comparison or delta needs them. */
+static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckState* state,
+                                                            bool* out_try_delta) {
+  int fd = state->fd;
+  const Config* config = state->config;
+  bool has_old_file = state->has_old_file;
+  unsigned long long old_size = state->old_size;
+  struct stat st = state->old_st;
+
+  bool size_equal = has_old_file && old_size == state->check_size;
   bool match_by_metadata = false;
   if (size_equal && !config->ignore_times && !config->size_only) {
     long long old_mtime_nsec = 0;
 #ifdef __linux__
     old_mtime_nsec = st.st_mtim.tv_nsec;
 #endif
-    match_by_metadata = metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)check_mtime,
-                                               (long)check_mtime_nsec, config->modify_window);
+    match_by_metadata =
+        metadata_mtime_matches(st.st_mtime, old_mtime_nsec, (time_t)state->check_mtime,
+                               (long)state->check_mtime_nsec, config->modify_window);
   }
 
   bool try_delta = config->use_delta && !config->whole_file && has_old_file &&
-                   delta_should_attempt(old_size, check_size, config->delta_max_file_size);
+                   delta_should_attempt(old_size, state->check_size, config->delta_max_file_size);
   bool checksum_needs_read = size_equal && !config->ignore_times && config->checksum;
   bool need_old_data = checksum_needs_read || try_delta;
+  *out_try_delta = try_delta;
 
-  void* old_data = NULL;
   if (need_old_data && has_old_file && old_size > 0 && old_size <= MAX_RECEIVE_WHOLE_FILE_SIZE &&
       old_size <= SIZE_MAX) {
-    old_data = protocol_alloc((size_t)old_size);
-    if (old_data) {
+    state->old_data = protocol_alloc((size_t)old_size);
+    if (state->old_data) {
       size_t got = 0;
       while (got < (size_t)old_size) {
-        ssize_t n = read(old_fd, (char*)old_data + got, (size_t)old_size - got);
+        ssize_t n = read(state->old_fd, (char*)state->old_data + got, (size_t)old_size - got);
         if (n <= 0) {
-          free(old_data);
-          old_data = NULL;
+          free(state->old_data);
+          state->old_data = NULL;
           break;
         }
         got += (size_t)n;
@@ -1768,417 +1824,378 @@ File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
     }
   }
 
-  /* Quick-skip decision.  If no content comparison is required this is final
-     and the old file was never read; if the read failed the file is not
-     skipped and the transfer proceeds with the full new contents. */
   bool match = false;
   if (checksum_needs_read) {
     uint8_t old_digest[CHECKSUM_MAX_DIGEST_LEN];
     size_t old_len = 0;
     bool hashed = checksum_digest((ChecksumAlgo)config->checksum_algo, config->checksum_seed,
-                                  old_size == 0 ? "" : old_data, (size_t)old_size, old_digest,
-                                  sizeof(old_digest), &old_len);
-    match = hashed && old_len == check_digest_len && check_digest_len > 0 &&
-            memcmp(old_digest, check_digest, check_digest_len) == 0;
+                                  old_size == 0 ? "" : state->old_data, (size_t)old_size,
+                                  old_digest, sizeof(old_digest), &old_len);
+    match = hashed && old_len == state->check_digest_len && state->check_digest_len > 0 &&
+            memcmp(old_digest, state->check_digest, state->check_digest_len) == 0;
   } else if (size_equal && !config->ignore_times) {
     match = config->size_only || match_by_metadata;
   }
 
   if (match) {
-    free(old_data);
-    if (!send_status(fd, STATUS_OK)) {
-      close(old_fd);
-      free(full_path);
-      free(check_path);
-      return NULL;
-    }
-    close(old_fd);
-    free(full_path);
-    free(check_path);
-    *skipped = true;
-    return NULL;
+    if (!send_status(fd, STATUS_OK))
+      return INCREMENTAL_ERROR;
+    return INCREMENTAL_SKIP;
   }
+  return INCREMENTAL_CONTINUE;
+}
 
-  /* ---- Alternate basis directories ---- */
-  if (config_has_basis(config)) {
-    BasisMatch basis;
-    basis_match_find(config, check_path, check_size, (time_t)check_mtime, (long)check_mtime_nsec,
-                     check_digest, check_digest_len, true, &basis);
-    if (basis.hit) {
-      if (basis.type == BASIS_DEST_COMPARE) {
-        /* compare-dest never copies: an exact match only suppresses the data
-           for a file the destination does not already hold (sparse backup).
-           When the destination holds a DIFFERENT version FastSync falls back to
-           a normal transfer rather than deleting the stale entry the way rsync
-           does (see RSYNC_COMPAT.md). */
-        basis_match_free(&basis);
-        if (!has_old_file) {
-          if (!send_status(fd, STATUS_OK)) {
-            close(old_fd);
-            free(full_path);
-            free(check_path);
-            return NULL;
-          }
-          free(old_data);
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          *skipped = true;
-          return NULL;
+/* Alternate basis directories (--compare-dest/--copy-dest/--link-dest): a hit
+   either suppresses the transfer (compare-dest) or materializes the file from
+   the basis without a data frame. */
+static IncrementalCheckOutcome incremental_check_try_basis(IncrementalCheckState* state,
+                                                           File** out_file) {
+  int fd = state->fd;
+  const Config* config = state->config;
+  if (!config_has_basis(config))
+    return INCREMENTAL_CONTINUE;
+
+  BasisMatch basis;
+  basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
+                   (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
+                   true, &basis);
+  if (basis.hit) {
+    if (basis.type == BASIS_DEST_COMPARE) {
+      basis_match_free(&basis);
+      if (!state->has_old_file) {
+        if (!send_status(fd, STATUS_OK))
+          return INCREMENTAL_ERROR;
+        return INCREMENTAL_SKIP;
+      }
+    } else {
+      File* materialized = file_create(state->check_path);
+      if (materialized && basis.content) {
+        data_destroy(materialized->data);
+        materialized->data = basis.content;
+        basis.content = NULL;
+        materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
+        materialized->skip = true; /* receiver must not ack this as a data file */
+        if (basis.type == BASIS_DEST_LINK) {
+          materialized->basis_link = basis.basis_path;
+          basis.basis_path = NULL;
         }
-      } else {
-        /* copy-dest / link-dest: materialize the unchanged file locally so the
-           sender can skip the data.  The store engine re-applies the normal
-           existing/ignore-existing/update/backup/delay-updates policy. */
-        File* materialized = file_create(check_path);
-        if (materialized && basis.content) {
-          data_destroy(materialized->data);
-          materialized->data = basis.content;
-          basis.content = NULL;
-          materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
-          materialized->skip = true; /* receiver must not ack this as a data file */
-          if (basis.type == BASIS_DEST_LINK) {
-            materialized->basis_link = basis.basis_path;
-            basis.basis_path = NULL;
-          }
-          if (!materialized->metadata) {
-            file_destroy(materialized);
-            materialized = NULL;
-          }
-        } else {
+        if (!materialized->metadata) {
           file_destroy(materialized);
           materialized = NULL;
         }
-        if (materialized) {
-          if (!send_status(fd, STATUS_OK)) {
-            basis_match_free(&basis);
-            file_destroy(materialized);
-            close(old_fd);
-            free(full_path);
-            free(check_path);
-            return NULL;
-          }
+      } else {
+        file_destroy(materialized);
+        materialized = NULL;
+      }
+      if (materialized) {
+        if (!send_status(fd, STATUS_OK)) {
           basis_match_free(&basis);
-          free(old_data);
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          *skipped = false;
-          return materialized;
+          file_destroy(materialized);
+          return INCREMENTAL_ERROR;
         }
-        /* Materialization setup failed: fall through to the normal transfer. */
+        basis_match_free(&basis);
+        *out_file = materialized;
+        return INCREMENTAL_FILE;
       }
+      /* Materialization setup failed: fall through to the normal transfer. */
     }
-    basis_match_free(&basis);
   }
+  basis_match_free(&basis);
+  return INCREMENTAL_CONTINUE;
+}
 
-  /* ---- --append / --append-verify tail resume ----
-   * When the existing destination file is SHORTER than the source, an append
-   * mode resumes it by negotiating a resume offset (the prefix length already
-   * present) from the receiver and transferring ONLY the tail.  The receiver
-   * then reconstructs the full file (prefix + tail) and installs it through the
-   * normal atomic store path, so the result is byte-identical to the source.
-   * This takes precedence over block delta (a growing file is cheapest as a
-   * pure tail), and falls through to delta/full only when no shorter old file
-   * makes a resume possible. */
-  bool append_resume = (config->append || config->append_verify) && has_old_file &&
+/* --append / --append-verify tail resume: when the destination is a SHORTER
+   file in an append mode, negotiate the resume offset and receive only the
+   tail.  Produces the reconstructed file, or falls through to delta/full. */
+static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCheckState* state,
+                                                                   File** out_file) {
+  int fd = state->fd;
+  const Config* config = state->config;
+  char* check_path = state->check_path;
+  unsigned long long old_size = state->old_size;
+  unsigned long long check_size = state->check_size;
+
+  bool append_resume = (config->append || config->append_verify) && state->has_old_file &&
                        append_resume_eligible(old_size, check_size);
-  if (append_resume) {
-    /* Ensure the retained prefix (== the whole, shorter destination file) is
-       in memory; it is needed both to rebuild the full file and, for
-       --append-verify, to checksum it.  A load failure is not fatal: the
-       resume is simply not possible and we fall through to the other paths. */
-    if (old_data == NULL && old_size > 0 && old_size <= MAX_RECEIVE_WHOLE_FILE_SIZE &&
-        old_size <= SIZE_MAX) {
-      old_data = protocol_alloc((size_t)old_size);
-      if (old_data) {
-        size_t got = 0;
-        while (got < (size_t)old_size) {
-          ssize_t n = read(old_fd, (char*)old_data + got, (size_t)old_size - got);
-          if (n <= 0) {
-            free(old_data);
-            old_data = NULL;
-            break;
-          }
-          got += (size_t)n;
+  if (!append_resume)
+    return INCREMENTAL_CONTINUE;
+
+  /* Ensure the retained prefix (== the whole, shorter destination file) is in
+     memory; it is needed both to rebuild the full file and, for
+     --append-verify, to checksum it.  A load failure is not fatal: the resume is
+     simply not possible and we fall through to the other paths. */
+  if (state->old_data == NULL && old_size > 0 && old_size <= MAX_RECEIVE_WHOLE_FILE_SIZE &&
+      old_size <= SIZE_MAX) {
+    state->old_data = protocol_alloc((size_t)old_size);
+    if (state->old_data) {
+      size_t got = 0;
+      while (got < (size_t)old_size) {
+        ssize_t n = read(state->old_fd, (char*)state->old_data + got, (size_t)old_size - got);
+        if (n <= 0) {
+          free(state->old_data);
+          state->old_data = NULL;
+          break;
         }
+        got += (size_t)n;
       }
     }
-    if (old_data != NULL || old_size == 0) {
-      if (!send_status(fd, STATUS_APPEND) || !send_n_data(fd, &old_size, sizeof(old_size))) {
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        free(old_data);
-        return NULL;
-      }
-      bool verify = config->append_verify;
-      bool full_fallback = false;
-      if (verify) {
-        Status sig_status;
-        if (!receive_status(fd, &sig_status)) {
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-        if (sig_status != STATUS_APPEND_SIG) {
-          send_status(fd, STATUS_ERROR);
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-        uint64_t src_prefix_hash;
-        if (!receive_n_data(fd, &src_prefix_hash, sizeof(src_prefix_hash))) {
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-        /* Compare the retained prefix against the source prefix.  A mismatch
-           must never be silently appended to: fall back to a full transfer so
-           the result is a byte-identical source copy. */
-        uint64_t dst_prefix_hash =
-            old_size == 0 ? delta_xxhash64("", 0) : delta_xxhash64(old_data, (size_t)old_size);
-        if (dst_prefix_hash == src_prefix_hash) {
-          if (!send_status(fd, STATUS_APPEND_OK)) {
-            close(old_fd);
-            free(full_path);
-            free(check_path);
-            free(old_data);
-            return NULL;
-          }
-        } else {
-          if (!send_status(fd, STATUS_NEXT)) {
-            close(old_fd);
-            free(full_path);
-            free(check_path);
-            free(old_data);
-            return NULL;
-          }
-          full_fallback = true;
-        }
-      }
+  }
+  if (state->old_data == NULL && old_size != 0)
+    return INCREMENTAL_CONTINUE;
 
-      if (full_fallback) {
-        /* Retained prefix differed: receive the sender's full transfer. */
-        free(old_data);
-        old_data = NULL;
-        close(old_fd);
-        File* file = receive_full_file(fd, config, check_path);
-        free(check_path);
-        free(full_path);
-        return file;
-      }
-
-      /* Receive the tail (STATUS_APPEND_DATA + metadata + tail bytes). */
-      Status tail_status;
-      if (!receive_status(fd, &tail_status)) {
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        free(old_data);
-        return NULL;
-      }
-      if (tail_status != STATUS_APPEND_DATA) {
-        send_status(fd, STATUS_ERROR);
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        free(old_data);
-        return NULL;
-      }
-      FileMetadata* meta = NULL;
-      FileXattrList* append_xattrs = NULL;
-      if (config->use_metadata) {
-        int meta_ok = 1;
-        meta = metadata_receive(fd, &meta_ok);
-        if (!meta_ok) {
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-      }
-      if (config->use_xattrs) {
-        int xok = 0;
-        append_xattrs = xattr_receive(fd, &xok);
-        if (!xok) {
-          xattr_list_free(append_xattrs);
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-      }
-      Data* tail = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
-      if (tail == NULL) {
-        xattr_list_free(append_xattrs);
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        free(old_data);
-        return NULL;
-      }
-      if (config->use_compression &&
-          !compression_should_skip_with_suffixes(
-              check_path, config->skip_compress_suffixes,
-              config->skip_compress_set ? config->skip_compress_count : -1)) {
-        Data* uncompressed = data_decompress_limited(tail, MAX_RECEIVE_WHOLE_FILE_SIZE);
-        data_destroy(tail);
-        if (uncompressed == NULL) {
-          xattr_list_free(append_xattrs);
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-        if (uncompressed->size > MAX_FILE_DATA_SIZE) {
-          data_destroy(uncompressed);
-          xattr_list_free(append_xattrs);
-          close(old_fd);
-          free(full_path);
-          free(check_path);
-          free(old_data);
-          return NULL;
-        }
-        tail = uncompressed;
-      }
-      /* The tail must complete the file exactly; anything else is a protocol
-         violation (never a truncated or overrun file). */
-      unsigned long long expected_tail;
-      if (!append_tail_length(old_size, check_size, &expected_tail) ||
-          tail->size != (size_t)expected_tail) {
-        send_status(fd, STATUS_ERROR);
-        data_destroy(tail);
-        xattr_list_free(append_xattrs);
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        free(old_data);
-        return NULL;
-      }
-      size_t full_size = (size_t)check_size;
-      void* full = protocol_alloc(full_size ? full_size : 1);
-      if (!full) {
-        data_destroy(tail);
-        xattr_list_free(append_xattrs);
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        free(old_data);
-        return NULL;
-      }
-      if (old_size > 0 && old_data)
-        memcpy(full, old_data, (size_t)old_size);
-      if (tail->size > 0)
-        memcpy((char*)full + old_size, tail->data, tail->size);
-      data_destroy(tail);
-      free(old_data);
-      old_data = NULL;
-
-      File* file = file_create(check_path);
-      if (!file) {
-        free(full);
-        xattr_list_free(append_xattrs);
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        return NULL;
-      }
-      file->metadata = meta;
-      file->xattrs = append_xattrs;
-      append_xattrs = NULL;
-      data_destroy(file->data);
-      file->data = data_create(full, full_size);
-      if (!file->data) { /* data_create already freed full on failure */
-        file_destroy(file);
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        return NULL;
-      }
-      close(old_fd);
-      free(full_path);
-      free(check_path);
-      return file;
+  if (!send_status(fd, STATUS_APPEND) || !send_n_data(fd, &old_size, sizeof(old_size)))
+    return INCREMENTAL_ERROR;
+  bool verify = config->append_verify;
+  bool full_fallback = false;
+  if (verify) {
+    Status sig_status;
+    if (!receive_status(fd, &sig_status))
+      return INCREMENTAL_ERROR;
+    if (sig_status != STATUS_APPEND_SIG) {
+      send_status(fd, STATUS_ERROR);
+      return INCREMENTAL_ERROR;
+    }
+    uint64_t src_prefix_hash;
+    if (!receive_n_data(fd, &src_prefix_hash, sizeof(src_prefix_hash)))
+      return INCREMENTAL_ERROR;
+    /* Compare the retained prefix against the source prefix.  A mismatch must
+       never be silently appended to: fall back to a full transfer so the result
+       is a byte-identical source copy. */
+    uint64_t dst_prefix_hash =
+        old_size == 0 ? delta_xxhash64("", 0) : delta_xxhash64(state->old_data, (size_t)old_size);
+    if (dst_prefix_hash == src_prefix_hash) {
+      if (!send_status(fd, STATUS_APPEND_OK))
+        return INCREMENTAL_ERROR;
+    } else {
+      if (!send_status(fd, STATUS_NEXT))
+        return INCREMENTAL_ERROR;
+      full_fallback = true;
     }
   }
 
-  if (try_delta && old_data != NULL) {
+  if (full_fallback) {
+    /* Retained prefix differed: receive the sender's full transfer. */
+    free(state->old_data);
+    state->old_data = NULL;
+    if (state->old_fd >= 0) {
+      close(state->old_fd);
+      state->old_fd = -1;
+    }
+    *out_file = receive_full_file(fd, config, check_path);
+    return INCREMENTAL_FILE;
+  }
+
+  /* Receive the tail (STATUS_APPEND_DATA + metadata + tail bytes). */
+  Status tail_status;
+  if (!receive_status(fd, &tail_status))
+    return INCREMENTAL_ERROR;
+  if (tail_status != STATUS_APPEND_DATA) {
+    send_status(fd, STATUS_ERROR);
+    return INCREMENTAL_ERROR;
+  }
+  FileMetadata* meta = NULL;
+  FileXattrList* append_xattrs = NULL;
+  if (config->use_metadata) {
+    int meta_ok = 1;
+    meta = metadata_receive(fd, &meta_ok);
+    if (!meta_ok)
+      return INCREMENTAL_ERROR;
+  }
+  if (config->use_xattrs) {
+    int xok = 0;
+    append_xattrs = xattr_receive(fd, &xok);
+    if (!xok) {
+      xattr_list_free(append_xattrs);
+      return INCREMENTAL_ERROR;
+    }
+  }
+  Data* tail = receive_data_limited(fd, MAX_RECEIVE_WHOLE_FILE_SIZE);
+  if (tail == NULL) {
+    xattr_list_free(append_xattrs);
+    return INCREMENTAL_ERROR;
+  }
+  if (config->use_compression &&
+      !compression_should_skip_with_suffixes(check_path, config->skip_compress_suffixes,
+                                             config->skip_compress_set ? config->skip_compress_count
+                                                                       : -1)) {
+    Data* uncompressed = data_decompress_limited(tail, MAX_RECEIVE_WHOLE_FILE_SIZE);
+    data_destroy(tail);
+    if (uncompressed == NULL) {
+      xattr_list_free(append_xattrs);
+      return INCREMENTAL_ERROR;
+    }
+    if (uncompressed->size > MAX_FILE_DATA_SIZE) {
+      data_destroy(uncompressed);
+      xattr_list_free(append_xattrs);
+      return INCREMENTAL_ERROR;
+    }
+    tail = uncompressed;
+  }
+  /* The tail must complete the file exactly; anything else is a protocol
+     violation (never a truncated or overrun file). */
+  unsigned long long expected_tail;
+  if (!append_tail_length(old_size, check_size, &expected_tail) ||
+      tail->size != (size_t)expected_tail) {
+    send_status(fd, STATUS_ERROR);
+    data_destroy(tail);
+    xattr_list_free(append_xattrs);
+    return INCREMENTAL_ERROR;
+  }
+  size_t full_size = (size_t)check_size;
+  void* full = protocol_alloc(full_size ? full_size : 1);
+  if (!full) {
+    data_destroy(tail);
+    xattr_list_free(append_xattrs);
+    return INCREMENTAL_ERROR;
+  }
+  if (old_size > 0 && state->old_data)
+    memcpy(full, state->old_data, (size_t)old_size);
+  if (tail->size > 0)
+    memcpy((char*)full + old_size, tail->data, tail->size);
+  data_destroy(tail);
+  free(state->old_data);
+  state->old_data = NULL;
+
+  File* file = file_create(check_path);
+  if (!file) {
+    free(full);
+    xattr_list_free(append_xattrs);
+    return INCREMENTAL_ERROR;
+  }
+  file->metadata = meta;
+  file->xattrs = append_xattrs;
+  append_xattrs = NULL;
+  data_destroy(file->data);
+  file->data = data_create(full, full_size);
+  if (!file->data) { /* data_create already freed full on failure */
+    file_destroy(file);
+    return INCREMENTAL_ERROR;
+  }
+  *out_file = file;
+  return INCREMENTAL_FILE;
+}
+
+/* Block delta transfer against the existing destination content. */
+static IncrementalCheckOutcome incremental_check_try_delta(IncrementalCheckState* state,
+                                                           bool try_delta, File** out_file) {
+  if (try_delta && state->old_data != NULL) {
     bool delta_failed = false;
-    File* delta_file =
-        receive_delta_file(fd, config, check_path, old_data, old_size, &delta_failed);
-    old_data = NULL; /* receive_delta_file consumes the snapshot on every path */
+    File* delta_file = receive_delta_file(state->fd, state->config, state->check_path,
+                                          state->old_data, state->old_size, &delta_failed);
+    state->old_data = NULL; /* receive_delta_file consumes the snapshot on every path */
     if (delta_file) {
-      close(old_fd);
-      free(full_path);
-      free(check_path);
-      return delta_file;
+      *out_file = delta_file;
+      return INCREMENTAL_FILE;
     }
-    if (delta_failed) {
-      close(old_fd);
-      free(full_path);
-      free(check_path);
-      return NULL;
-    }
+    if (delta_failed)
+      return INCREMENTAL_ERROR;
   }
-  free(old_data);
-  old_data = NULL;
+  free(state->old_data);
+  state->old_data = NULL;
+  return INCREMENTAL_CONTINUE;
+}
 
-  /* ---- -y/--fuzzy similar-file delta basis ----
-   * Reaching this point means the file must be transferred and the
-   * destination's own content at the exact path could not serve as a delta
-   * basis (it is absent, outside the delta size bounds, or unreadable).  With
-   * --fuzzy the receiver tries an existing similar-named file in the same
-   * destination directory instead.  receive_delta_file performs the whole
-   * handshake: when the sender judges the delta not worthwhile it replies
-   * STATUS_NEXT and the full content is received there, so a fuzzy attempt
-   * can only improve bandwidth, never fall through into the plain transfer
-   * below (that path is reserved for "no usable candidate was found"). */
-  if (config->fuzzy && config->use_delta) {
-    unsigned long long fuzzy_size = 0;
-    void* fuzzy_basis = fuzzy_basis_find_and_load(config, check_path, check_size, &fuzzy_size);
-    if (fuzzy_basis != NULL) {
-      bool fuzzy_failed = false;
-      File* fuzzy_file =
-          receive_delta_file(fd, config, check_path, fuzzy_basis, fuzzy_size, &fuzzy_failed);
-      fuzzy_basis = NULL; /* receive_delta_file consumes the buffer on every path */
-      if (fuzzy_file) {
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        return fuzzy_file;
-      }
-      if (fuzzy_failed) {
-        close(old_fd);
-        free(full_path);
-        free(check_path);
-        return NULL;
-      }
+/* -y/--fuzzy similar-file delta basis.  Reaching this point means the file
+   must be transferred and the destination's own content could not serve as a
+   delta basis; try an existing similar-named sibling in the same directory. */
+static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState* state,
+                                                           File** out_file) {
+  const Config* config = state->config;
+  if (!config->fuzzy || !config->use_delta)
+    return INCREMENTAL_CONTINUE;
+  unsigned long long fuzzy_size = 0;
+  void* fuzzy_basis =
+      fuzzy_basis_find_and_load(config, state->check_path, state->check_size, &fuzzy_size);
+  if (fuzzy_basis != NULL) {
+    bool fuzzy_failed = false;
+    File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, fuzzy_basis,
+                                          fuzzy_size, &fuzzy_failed);
+    fuzzy_basis = NULL; /* receive_delta_file consumes the buffer on every path */
+    if (fuzzy_file) {
+      *out_file = fuzzy_file;
+      return INCREMENTAL_FILE;
     }
-    free(fuzzy_basis);
+    if (fuzzy_failed)
+      return INCREMENTAL_ERROR;
   }
+  free(fuzzy_basis);
+  return INCREMENTAL_CONTINUE;
+}
 
-  if (!send_status(fd, STATUS_NEXT)) {
-    close(old_fd);
-    free(full_path);
-    free(check_path);
+/* Final fallback: tell the sender to transmit the whole file and receive it. */
+static File* incremental_check_receive_full(IncrementalCheckState* state) {
+  if (!send_status(state->fd, STATUS_NEXT))
+    return NULL;
+  if (state->old_fd >= 0) {
+    close(state->old_fd);
+    state->old_fd = -1;
+  }
+  return receive_full_file(state->fd, state->config, state->check_path);
+}
+
+File* receive_incremental_check(int fd, const Config* config, bool* skipped) {
+  if (!config || !skipped) {
+    send_status(fd, STATUS_ERROR);
     return NULL;
   }
-  close(old_fd);
+  *skipped = false;
 
-  File* file = receive_full_file(fd, config, check_path);
-  free(check_path);
-  free(full_path);
-  return file;
+  IncrementalCheckState state;
+  incremental_check_state_init(&state, fd, config);
+
+  File* result = NULL;
+  bool try_delta = false;
+  IncrementalCheckOutcome outcome;
+
+  outcome = incremental_check_receive_request(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+
+  outcome = incremental_check_open_destination(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+
+  outcome = incremental_check_quick_skip(&state, &try_delta);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_SKIP) {
+    *skipped = true;
+    goto done;
+  }
+
+  outcome = incremental_check_try_basis(&state, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_SKIP) {
+    *skipped = true;
+    goto done;
+  }
+  if (outcome == INCREMENTAL_FILE)
+    goto done;
+
+  outcome = incremental_check_try_append_resume(&state, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_FILE)
+    goto done;
+
+  outcome = incremental_check_try_delta(&state, try_delta, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_FILE)
+    goto done;
+
+  outcome = incremental_check_try_fuzzy(&state, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_FILE)
+    goto done;
+
+  result = incremental_check_receive_full(&state);
+
+done:
+  incremental_check_state_cleanup(&state);
+  return result;
 }
 
 File* file_receive(const Config* config, int file_descriptor) {
