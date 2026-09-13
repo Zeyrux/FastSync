@@ -190,6 +190,26 @@ static bool store_max_connections(int* slot, const char* value, const char* modu
   return true;
 }
 
+/* Parse a non-negative concurrency cap where 0 means unlimited/disabled
+ * (per-module `max connections`, `max connections per host`,
+ * `auth lockout threshold`).  Negative/garbage/oversized values are rejected. */
+static bool store_optional_cap(int* slot, const char* value, int max_value, const char* key,
+                               const char* module_name, char* err, size_t err_size) {
+  char* end = NULL;
+  errno = 0;
+  long n = strtol(value, &end, 10);
+  if (*value == '\0' || errno != 0 || *end != '\0' || n < 0 || n > max_value) {
+    if (module_name)
+      set_error(err, err_size, "module '%s': invalid '%s' '%s' (must be 0-%d)", module_name, key,
+                value, max_value);
+    else
+      set_error(err, err_size, "invalid '%s' '%s' (must be 0-%d)", key, value, max_value);
+    return false;
+  }
+  *slot = (int)n;
+  return true;
+}
+
 /* Parse an `auth failure delay` value: 0 (disabled) through the configured cap. */
 static bool store_auth_failure_delay(int* slot, const char* value, char* err, size_t err_size) {
   char* end = NULL;
@@ -227,6 +247,9 @@ DaemonConf* daemon_conf_create(void) {
   conf->global.port = DAEMON_CONF_DEFAULT_PORT;
   conf->global.max_connections = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS;
   conf->global.auth_failure_delay_ms = DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS;
+  conf->global.max_connections_per_host = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS_PER_HOST;
+  conf->global.auth_lockout_threshold = DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_THRESHOLD;
+  conf->global.auth_lockout_duration_sec = DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_DURATION_SEC;
   return conf;
 }
 
@@ -312,8 +335,20 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, boo
   }
   if (key_equals(key, "max connections"))
     return store_max_connections(&conf->global.max_connections, value, NULL, err, err_size);
+  if (key_equals(key, "max connections per host"))
+    return store_optional_cap(&conf->global.max_connections_per_host, value,
+                              DAEMON_CONF_MAX_CONCURRENCY_LIMIT, "max connections per host", NULL,
+                              err, err_size);
   if (key_equals(key, "auth failure delay"))
     return store_auth_failure_delay(&conf->global.auth_failure_delay_ms, value, err, err_size);
+  if (key_equals(key, "auth lockout threshold"))
+    return store_optional_cap(&conf->global.auth_lockout_threshold, value,
+                              DAEMON_CONF_MAX_CONCURRENCY_LIMIT, "auth lockout threshold", NULL,
+                              err, err_size);
+  if (key_equals(key, "auth lockout duration"))
+    return store_optional_cap(&conf->global.auth_lockout_duration_sec, value,
+                              DAEMON_CONF_MAX_AUTH_LOCKOUT_DURATION_SEC, "auth lockout duration",
+                              NULL, err, err_size);
   if (key_equals(key, "hosts allow"))
     return store_host_list(&conf->global.hosts_allow, &conf->global.hosts_allow_count, value,
                            "hosts allow", NULL, replace_hosts, err, err_size);
@@ -400,7 +435,8 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     return true;
   }
   if (key_equals(key, "max connections"))
-    return store_max_connections(&module->max_connections, value, module->name, err, err_size);
+    return store_optional_cap(&module->max_connections, value, DAEMON_CONF_MAX_CONCURRENCY_LIMIT,
+                              "max connections", module->name, err, err_size);
   if (key_equals(key, "hosts allow"))
     return store_host_list(&module->hosts_allow, &module->hosts_allow_count, value, "hosts allow",
                            false, module->name, err, err_size);
@@ -442,6 +478,11 @@ static int open_module(DaemonConf* conf, int* current_module, const char* name, 
   }
   if (daemon_conf_find_module(conf, name)) {
     set_error(err, err_size, "duplicate module '%s'", name);
+    return -1;
+  }
+  if (conf->module_count >= DAEMON_CONF_MAX_MODULES) {
+    set_error(err, err_size, "too many modules (limit %d); module '%s' rejected",
+              DAEMON_CONF_MAX_MODULES, name);
     return -1;
   }
   DaemonModule* grown =

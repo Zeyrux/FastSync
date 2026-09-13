@@ -2,6 +2,7 @@
 #include "charset.h"
 #include "credentials.h"
 #include "daemon_conf.h"
+#include "daemon_limits.h"
 #include "delay_updates.h"
 #include "file.h"
 #include "identity.h"
@@ -56,6 +57,12 @@ static DaemonConf* g_daemon_conf = NULL;
  * such a module exists. */
 static CredentialStore* g_credentials = NULL;
 
+/* Cross-process connection registry (per-module and per-source caps plus the
+ * shared auth lockout), created once in main BEFORE the accept loop forks and
+ * shared read-only-by-pointer with every connection child.  NULL outside daemon
+ * mode or when the mapping could not be allocated (global cap + ACLs remain). */
+static DaemonLimitRegistry* g_daemon_limits = NULL;
+
 /* Opaque context threaded through to the config-frame gate: the connection's
  * SSL object (NULL over plaintext) so the gate can warn when a credential
  * exchange is not encrypted, plus the super-mode override the gate decides on.
@@ -75,6 +82,13 @@ typedef struct ModuleGateContext {
    * not classify the peer; an ACL-configured module then fails closed. */
   bool has_peer_ip;
   char peer_ip[INET6_ADDRSTRLEN];
+  /* True when the peer is provably loopback (utils_fd_peer_is_local, fail
+   * closed).  A trusted local/SSH peer is exempt from the per-host cap and the
+   * cross-process auth lockout: every loopback client shares the 127.0.0.1
+   * identity, so counting/locking them out would let one local client deny
+   * service to (or leak lockout state about) all the others.  The per-module and
+   * global caps still apply. */
+  bool is_local;
 } ModuleGateContext;
 
 /* Server half of the SCRAM challenge/response (A7 remediation, protocol
@@ -292,6 +306,60 @@ static const DaemonModule* module_gate_lookup_module(const Config* config, const
   return module;
 }
 
+/* Index of `module` within the loaded config's module array (the registry's
+ * per-module counter key).  Returns -1 when it cannot be resolved. */
+static int daemon_module_index(const DaemonModule* module) {
+  if (!g_daemon_conf || !module || module < g_daemon_conf->modules ||
+      module >= g_daemon_conf->modules + g_daemon_conf->module_count)
+    return -1;
+  return (int)(module - g_daemon_conf->modules);
+}
+
+/* Shared-registry admission: reserve this connection's slot for the selected
+ * module and the peer source IP.  Enforces the per-module `max connections` and
+ * the global `max connections per host` across every forked child.  Runs before
+ * auth/ownership so a client that is over a cap is refused before any work.
+ * The per-source cap is skipped when the peer cannot be classified (host ACLs
+ * fail closed separately); the module cap still applies.  A missing registry
+ * (allocation failure / non-fork path) fails open -- the global cap and ACLs
+ * still bound the listener. */
+static const char* module_gate_check_limits(const Config* config, const DaemonModule* module,
+                                            ModuleGateContext* gate_ctx) {
+  if (!g_daemon_limits)
+    return NULL;
+  int slot = transport_tcp_current_slot();
+  if (slot < 0)
+    return NULL; /* not on the forked accept-loop path (e.g. --stdio) */
+  int module_index = daemon_module_index(module);
+  if (module_index < 0)
+    return NULL;
+  /* A trusted loopback peer is exempt from the per-source cap: pass an
+   * unparseable peer so the registry skips per-source tracking, while the
+   * per-module cap below is still enforced.  Remote peers are tracked normally. */
+  const char* peer =
+      (!gate_ctx || gate_ctx->is_local || !gate_ctx->has_peer_ip) ? "" : gate_ctx->peer_ip;
+  DaemonLimitResult result =
+      daemon_limits_register(g_daemon_limits, slot, module_index, peer, module->max_connections);
+  switch (result) {
+  case DAEMON_LIMIT_OK:
+    return NULL;
+  case DAEMON_LIMIT_MODULE_FULL:
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s': 'max connections' cap (%d) reached; refusing %s",
+                config->module, module->max_connections, peer[0] ? peer : "peer");
+    return "requested daemon module is at its connection limit";
+  case DAEMON_LIMIT_HOST_FULL:
+    log_message(LOG_LEVEL_ERROR,
+                "daemon: 'max connections per host' cap (%d) reached for %s; refusing module '%s'",
+                g_daemon_conf->global.max_connections_per_host, peer[0] ? peer : "peer",
+                config->module);
+    return "too many concurrent connections from this host";
+  case DAEMON_LIMIT_UNAVAILABLE:
+  default:
+    return NULL;
+  }
+}
+
 /* Per-module client-chosen ownership / super-user policy (P7 Wave E hardening):
  * a daemon module refuses EVERY ownership-affecting request (--numeric-ids,
  * --chown, --usermap/--groupmap, --fake-super, --copy-as, explicit --super)
@@ -396,6 +464,22 @@ static ModuleAuthResult module_gate_authenticate(const Config* config, const Dae
                                                  ModuleGateContext* gate_ctx, const char** error) {
   if (module->auth_user_count == 0)
     return MODULE_AUTH_ACCEPTED;
+  /* Cross-process lockout: a source that failed too many authentications is
+   * refused before the challenge is sent (the counter lives in the shared
+   * registry, so it spans every forked child and survives a child exit).  A
+   * trusted loopback peer is exempt: all local clients share the 127.0.0.1
+   * identity, so a lockout would let one deny the others. */
+  if (g_daemon_limits && gate_ctx && gate_ctx->has_peer_ip && !gate_ctx->is_local) {
+    int remaining = 0;
+    if (daemon_limits_auth_locked(g_daemon_limits, gate_ctx->peer_ip, &remaining)) {
+      log_message(LOG_LEVEL_ERROR,
+                  "daemon module '%s': source %s is locked out after repeated authentication "
+                  "failures (%d s remaining); refusing",
+                  config->module, gate_ctx->peer_ip, remaining);
+      *error = "too many failed authentication attempts from this host; try again later";
+      return MODULE_AUTH_REFUSED;
+    }
+  }
   /* Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR). */
   if (g_credentials == NULL) {
     log_message(LOG_LEVEL_ERROR,
@@ -450,10 +534,17 @@ static ModuleAuthResult module_gate_authenticate(const Config* config, const Dae
                 "daemon module '%s': authentication failed for user '%s' from %s; refusing",
                 config->module, escaped_user ? escaped_user : "(none)", peer);
     free(escaped_user);
-    /* Rate-limit online guessing per connection (no delay on success). */
+    /* Count the failure in the shared registry (locks the source out once the
+     * configured threshold is reached) and rate-limit online guessing per
+     * connection (no delay on success).  A loopback peer is exempt from the
+     * shared counter. */
+    if (g_daemon_limits && gate_ctx->has_peer_ip && !gate_ctx->is_local)
+      daemon_limits_auth_record_failure(g_daemon_limits, gate_ctx->peer_ip);
     daemon_auth_failure_delay();
     return MODULE_AUTH_TERMINATED;
   }
+  if (g_daemon_limits && gate_ctx->has_peer_ip && !gate_ctx->is_local)
+    daemon_limits_auth_record_success(g_daemon_limits, gate_ctx->peer_ip);
   char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
   log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' from %s authenticated", config->module,
               escaped_user ? escaped_user : "<allocation failed>",
@@ -559,8 +650,14 @@ static const char* server_module_gate(const Config* config, void* context) {
         utils_fd_peer_ip(gate_ctx->fd, gate_ctx->peer_ip, sizeof(gate_ctx->peer_ip));
     if (!gate_ctx->has_peer_ip)
       log_message(LOG_LEVEL_DEBUG, "daemon module '%s': peer address unavailable", config->module);
+    /* utils_fd_peer_is_local is fail-closed (getpeername must succeed and report
+     * a loopback peer), so "cannot tell" is never treated as trusted. */
+    gate_ctx->is_local = utils_fd_peer_is_local(gate_ctx->fd);
   }
   error = module_gate_check_hosts(config, module, gate_ctx);
+  if (error)
+    return error;
+  error = module_gate_check_limits(config, module, gate_ctx);
   if (error)
     return error;
   error = module_gate_check_ownership(config, module, gate_ctx);
@@ -590,6 +687,7 @@ void handler(int file_descriptor) {
   gate_ctx.super_mode_override = -1;
   gate_ctx.has_peer_ip = false;
   gate_ctx.peer_ip[0] = '\0';
+  gate_ctx.is_local = false;
   /* All teardown state starts empty so the single `done` epilogue is safe to
    * reach from any error path (including before the config frame arrives). */
   Config* config = NULL;
@@ -880,7 +978,9 @@ static void print_server_usage(void) {
   printf("                      fastsyncd.conf, else /etc/fastsyncd.conf)\n");
   printf("  --dparam=KEY=VALUE  Override one global config key on the command line\n");
   printf("                      (port, motd file, address, max connections,\n");
-  printf("                      auth failure delay, hosts allow, hosts deny)\n");
+  printf("                      max connections per host, auth failure delay,\n");
+  printf("                      auth lockout threshold, auth lockout duration,\n");
+  printf("                      hosts allow, hosts deny)\n");
   printf("  --no-detach         Stay in the foreground (default detaches to\n");
   printf("                      background when running --daemon)\n");
   printf("  --password-file=FILE  Credential store for modules that declare\n");
@@ -1096,11 +1196,10 @@ int main(int argc, char* argv[]) {
                     "unless the module is intentionally open to the network",
                     g_daemon_conf->modules[i].name);
       if (g_daemon_conf->modules[i].max_connections > 0)
-        log_message(LOG_LEVEL_WARNING,
-                    "daemon module '%s': per-module 'max connections' is stored but not enforced "
-                    "per module; the global 'max connections' cap (%d) applies to the whole "
-                    "listener",
-                    g_daemon_conf->modules[i].name, g_daemon_conf->global.max_connections);
+        log_message(LOG_LEVEL_INFO,
+                    "daemon module '%s': per-module 'max connections' cap = %d (enforced "
+                    "across all connection children)",
+                    g_daemon_conf->modules[i].name, g_daemon_conf->modules[i].max_connections);
     }
     /* Daemon credential store (Wave B).  --password-file and --early-input
      * feed the same store, loaded BEFORE the listener forks so every
@@ -1144,6 +1243,21 @@ int main(int argc, char* argv[]) {
                       module->name, module->auth_users[j]);
       }
     }
+    /* Shared cross-process registry for the per-module / per-source caps and
+     * the auth lockout.  Created HERE in the parent before any accept-loop
+     * fork; every connection child inherits the mapping.  A failure degrades to
+     * "registry disabled" (the global cap and host ACLs still apply) rather
+     * than refusing to start. */
+    g_daemon_limits = daemon_limits_create((int)g_daemon_conf->global.max_connections,
+                                           g_daemon_conf->module_count,
+                                           g_daemon_conf->global.max_connections_per_host,
+                                           g_daemon_conf->global.auth_lockout_threshold,
+                                           g_daemon_conf->global.auth_lockout_duration_sec);
+    if (!g_daemon_limits)
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon: could not allocate the shared connection registry; per-module / "
+                  "per-host caps and the cross-process auth lockout are disabled (the global "
+                  "'max connections' cap and host ACLs still apply)");
   } else {
     if (!configure_authorization(opts.destination_root)) {
       char* escaped = output_escape(opts.destination_root, false);
@@ -1167,6 +1281,8 @@ int main(int argc, char* argv[]) {
   }
   if (g_daemon_conf)
     server_set_max_connections(g_server, (unsigned int)g_daemon_conf->global.max_connections);
+  if (g_daemon_limits)
+    server_set_limit_registry(g_server, g_daemon_limits);
   if (opts.use_tls) {
     if (!opts.tls_cert || !opts.tls_key || !opts.tls_ca || !opts.client_cn) {
       fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
@@ -1206,6 +1322,8 @@ int main(int argc, char* argv[]) {
   release_authorization();
 
 out:
+  daemon_limits_destroy(g_daemon_limits);
+  g_daemon_limits = NULL;
   daemon_conf_free(g_daemon_conf);
   g_daemon_conf = NULL;
   credentials_free(g_credentials);

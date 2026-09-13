@@ -112,4 +112,12 @@ extern bool current_test_failed;
     }                                                                                              \
   } while (0)
 
+/* Unconditional test failure carrying an explanatory message. */
+#define EXPECT_FAIL(message)                                                                       \
+  do {                                                                                             \
+    printf("    \033[1;31m[FAIL]\033[0m %s:%d: %s\n", __FILE__, __LINE__, (message));              \
+    current_test_failed = true;                                                                    \
+    return;                                                                                        \
+  } while (0)
+
 #endif

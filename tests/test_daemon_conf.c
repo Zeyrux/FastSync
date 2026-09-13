@@ -33,6 +33,11 @@ static void test_daemon_conf_create_defaults() {
   EXPECT_NULL(conf->global.address);
   EXPECT_EQ_INT(conf->global.max_connections, DAEMON_CONF_DEFAULT_MAX_CONNECTIONS);
   EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS);
+  EXPECT_EQ_INT(conf->global.max_connections_per_host,
+                DAEMON_CONF_DEFAULT_MAX_CONNECTIONS_PER_HOST);
+  EXPECT_EQ_INT(conf->global.auth_lockout_threshold, DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_THRESHOLD);
+  EXPECT_EQ_INT(conf->global.auth_lockout_duration_sec,
+                DAEMON_CONF_DEFAULT_AUTH_LOCKOUT_DURATION_SEC);
   EXPECT_EQ_INT(conf->global.hosts_allow_count, 0);
   EXPECT_EQ_INT(conf->global.hosts_deny_count, 0);
   EXPECT_EQ_INT(conf->module_count, 0);
@@ -316,6 +321,12 @@ static void test_daemon_conf_dparam_override() {
 
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "max connections=7", err, sizeof(err)), 0);
   EXPECT_EQ_INT(conf->global.max_connections, 7);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "max connections per host=3", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.max_connections_per_host, 3);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "auth lockout threshold=5", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.auth_lockout_threshold, 5);
+  EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "auth lockout duration=120", err, sizeof(err)), 0);
+  EXPECT_EQ_INT(conf->global.auth_lockout_duration_sec, 120);
   EXPECT_EQ_INT(daemon_conf_apply_dparam(conf, "AUTH FAILURE DELAY=1500", err, sizeof(err)), 0);
   EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, 1500);
   EXPECT_EQ_INT(
@@ -390,6 +401,9 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   char err[256];
   EXPECT_EQ_INT(write_conf("max connections = 25\n"
                            "auth failure delay = 0\n"
+                           "max connections per host = 4\n"
+                           "auth lockout threshold = 3\n"
+                           "auth lockout duration = 60\n"
                            "hosts allow = 10.0.0.0/8, 192.168.1.0/24\n"
                            "hosts deny = 192.168.0.1 2001:db8::/32\n"
                            "\n"
@@ -405,6 +419,9 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   EXPECT_NOT_NULL(conf);
   EXPECT_EQ_INT(conf->global.max_connections, 25);
   EXPECT_EQ_INT(conf->global.auth_failure_delay_ms, 0);
+  EXPECT_EQ_INT(conf->global.max_connections_per_host, 4);
+  EXPECT_EQ_INT(conf->global.auth_lockout_threshold, 3);
+  EXPECT_EQ_INT(conf->global.auth_lockout_duration_sec, 60);
   EXPECT_EQ_INT(conf->global.hosts_allow_count, 2);
   EXPECT_EQ_STR(conf->global.hosts_allow[0], "10.0.0.0/8");
   EXPECT_EQ_STR(conf->global.hosts_allow[1], "192.168.1.0/24");
@@ -419,11 +436,14 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   daemon_conf_free(conf);
 
   const char* bad_values[] = {
-      "max connections = 0\n",         "max connections = -1\n",
-      "max connections = abc\n",       "auth failure delay = -1\n",
-      "auth failure delay = 70000\n",  "auth failure delay = soon\n",
-      "hosts allow = 10.0.0.0/99\n",   "hosts deny = 2001:db8::/129\n",
-      "hosts allow = *.example.com\n", "hosts deny = not-an-ip\n",
+      "max connections = 0\n",           "max connections = -1\n",
+      "max connections = abc\n",         "auth failure delay = -1\n",
+      "auth failure delay = 70000\n",    "auth failure delay = soon\n",
+      "max connections per host = -1\n", "max connections per host = lots\n",
+      "auth lockout threshold = -2\n",   "auth lockout threshold = many\n",
+      "auth lockout duration = -1\n",    "auth lockout duration = forever\n",
+      "hosts allow = 10.0.0.0/99\n",     "hosts deny = 2001:db8::/129\n",
+      "hosts allow = *.example.com\n",   "hosts deny = not-an-ip\n",
   };
   for (size_t i = 0; i < sizeof(bad_values) / sizeof(bad_values[0]); i++) {
     EXPECT_EQ_INT(write_conf(bad_values[i], &path), 0);
@@ -434,7 +454,8 @@ static void test_daemon_conf_limits_and_hosts_parse() {
 
   /* The same strictness applies inside a module section. */
   const char* bad_module[] = {
-      "[m]\npath = /x\nmax connections = 0\n",
+      "[m]\npath = /x\nmax connections = -1\n",
+      "[m]\npath = /x\nmax connections = abc\n",
       "[m]\npath = /x\nhosts allow = 10.0.0.0/40\n",
       "[m]\npath = /x\nhosts deny = 999.1.1.1/8\n",
   };
@@ -445,6 +466,14 @@ static void test_daemon_conf_limits_and_hosts_parse() {
     EXPECT_NULL(rejected);
     EXPECT_TRUE(strstr(err, "invalid") != NULL);
   }
+
+  /* Module `max connections = 0` is now valid and means unlimited. */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\nmax connections = 0\n", &path), 0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_EQ_INT(conf->modules[0].max_connections, 0);
+  daemon_conf_free(conf);
 
   /* An empty hosts list is not an error (no patterns are added). */
   EXPECT_EQ_INT(write_conf("hosts allow = \n[m]\npath = /x\n", &path), 0);
@@ -509,6 +538,35 @@ static void test_daemon_module_name_valid() {
   }
 }
 
+static void test_daemon_conf_module_count_capped() {
+  size_t cap = DAEMON_CONF_MAX_MODULES;
+  size_t len = (cap + 8) * 32;
+  char* body = malloc(len);
+  EXPECT_NOT_NULL(body);
+  size_t used = 0;
+  body[0] = '\0';
+  for (size_t i = 0; i < cap + 1; i++) {
+    char line[48];
+    int n = snprintf(line, sizeof(line), "[m%zu]\npath = /x\n", i);
+    if (n < 0 || (size_t)n >= sizeof(line) || used + (size_t)n >= len) {
+      free(body);
+      EXPECT_FAIL("module-count test buffer overflow");
+      return;
+    }
+    memcpy(body + used, line, (size_t)n);
+    used += (size_t)n;
+    body[used] = '\0';
+  }
+  char* path;
+  EXPECT_EQ_INT(write_conf(body, &path), 0);
+  free(body);
+  char err[256];
+  const DaemonConf* conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NULL(conf);
+  EXPECT_TRUE(strstr(err, "too many modules") != NULL);
+}
+
 void test_daemon_conf() {
   test_daemon_conf_create_defaults();
   test_daemon_conf_full_parse();
@@ -525,6 +583,7 @@ void test_daemon_conf() {
   test_daemon_conf_dparam_override();
   test_daemon_conf_auth_users_validated();
   test_daemon_conf_limits_and_hosts_parse();
+  test_daemon_conf_module_count_capped();
   test_daemon_hosts_allowed();
   test_daemon_module_name_valid();
 }
