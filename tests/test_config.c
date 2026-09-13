@@ -4,6 +4,7 @@
 #include "multiprocessing.h"
 #include "protocol.h"
 #include "queue.h"
+#include "receiver_pipeline.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <signal.h>
