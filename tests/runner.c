@@ -16,6 +16,7 @@
 #include "test_file_sendfile.h"
 #include "test_fuzz_smoke.h"
 #include "test_glob.h"
+#include "test_hardlink.h"
 #include "test_iconv.h"
 #include "test_log.h"
 #include "test_metadata.h"
@@ -88,6 +89,7 @@ int main() {
   RUN_TEST(test_server_cli);
   RUN_TEST(test_fuzz_smoke);
   RUN_TEST(test_xattr);
+  RUN_TEST(test_hardlink);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);
