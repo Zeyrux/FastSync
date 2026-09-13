@@ -14,6 +14,10 @@
 #include <sys/types.h>
 #include <threads.h>
 
+/* Upper bound on the configurable parallel scanner worker count (--threads=N):
+ * keeps one transfer from spawning an unbounded pool on a very large machine. */
+#define MAX_SCANNER_THREADS 256
+
 typedef struct {
   bool use_metadata;
   /* Phase 4 metadata capture: -U/--atimes and -N/--crtimes tell the scanner to

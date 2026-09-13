@@ -460,6 +460,96 @@ static void test_send_receive_status_timed() {
   close(p[0]);
 }
 
+static bool keepalive_always_abort(void) {
+  return true;
+}
+
+/* A pre-buffered KEEPALIVE reply from the peer must be consumed transparently,
+   leaving the first real status visible to the caller. */
+static void test_receive_status_keepalive_skips_reply() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+
+  EXPECT_TRUE(protocol_send_status(&session, STATUS_KEEPALIVE));
+  EXPECT_TRUE(protocol_send_status(&session, STATUS_OK));
+
+  Status received = STATUS_ERROR;
+  EXPECT_TRUE(protocol_receive_status_keepalive(&session, &received, 5, 1, NULL));
+  EXPECT_EQ_INT((int)received, (int)STATUS_OK);
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* The abort callback ends the wait immediately, before any keepalive traffic. */
+static void test_receive_status_keepalive_aborts() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+
+  Status received = STATUS_ERROR;
+  EXPECT_FALSE(
+      protocol_receive_status_keepalive(&session, &received, 5, 1, keepalive_always_abort));
+
+  close(p[0]);
+  close(p[1]);
+}
+
+typedef struct {
+  int peer_read_fd;
+  int peer_write_fd;
+  bool replied;
+} KeepalivePeerArg;
+
+static int keepalive_peer(void* arg) {
+  KeepalivePeerArg* peer = arg;
+  ProtocolSession session;
+  protocol_session_init(&session, peer->peer_read_fd, peer->peer_write_fd);
+  Status status = STATUS_ERROR;
+  if (protocol_receive_status(&session, &status) && status == STATUS_KEEPALIVE) {
+    /* Model the busy receiver: it sends the real ack first, then the keepalive
+       reply it owes for the queued keepalive (which the client must drain so it
+       does not desynchronize the stream). */
+    peer->replied = protocol_send_status(&session, STATUS_OK) &&
+                    protocol_send_status(&session, STATUS_KEEPALIVE);
+  }
+  return thrd_success;
+}
+
+/* While the peer is silent the helper must emit STATUS_KEEPALIVE, then consume
+   the peer's ack and drain the keepalive reply that follows it -- proving the
+   inline keepalive loop works without a second writer racing the send path. */
+static void test_receive_status_keepalive_emits() {
+  int to_client[2];
+  int to_peer[2];
+  EXPECT_EQ_INT(pipe(to_client), 0);
+  EXPECT_EQ_INT(pipe(to_peer), 0);
+
+  ProtocolSession session;
+  protocol_session_init(&session, to_client[0], to_peer[1]);
+
+  KeepalivePeerArg peer = {.peer_read_fd = to_peer[0], .peer_write_fd = to_client[1]};
+  thrd_t thread;
+  EXPECT_EQ_INT(thrd_create(&thread, keepalive_peer, &peer), thrd_success);
+
+  Status received = STATUS_ERROR;
+  EXPECT_TRUE(protocol_receive_status_keepalive(&session, &received, 10, 1, NULL));
+  EXPECT_EQ_INT((int)received, (int)STATUS_OK);
+
+  int result = 0;
+  EXPECT_EQ_INT(thrd_join(thread, &result), thrd_success);
+  EXPECT_EQ_INT(result, thrd_success);
+  EXPECT_TRUE(peer.replied);
+
+  close(to_client[0]);
+  close(to_client[1]);
+  close(to_peer[0]);
+  close(to_peer[1]);
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -471,6 +561,9 @@ void test_protocol() {
   test_send_receive_status();
   test_protocol_session_io_timeout();
   test_send_receive_status_timed();
+  test_receive_status_keepalive_skips_reply();
+  test_receive_status_keepalive_aborts();
+  test_receive_status_keepalive_emits();
   test_receive_n_data_truncated();
   test_receive_str_truncated();
   test_max_alloc_rejects_single_buffer();

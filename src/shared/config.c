@@ -23,6 +23,7 @@ static void config_set_defaults(Config* config) {
   config->receive_root_directory = NULL;
   config->save_to_disk = false;
   config->use_multithreading = false;
+  config->scanner_threads = 0;
   config->use_chunk_serialization = false;
   config->use_compression = false;
   config->use_metadata = false;
@@ -79,7 +80,6 @@ static void config_set_defaults(Config* config) {
   config->stats = false;
   config->max_depth = 0;
   config->log_file = NULL;
-  config->queue_size = 100;
   config->follow_symlinks = false;
   config->partial = false;
   config->copy_links = false;
@@ -147,14 +147,11 @@ static void config_set_defaults(Config* config) {
   config->delete_during = false;
   config->delete_delay = false;
   config->address = NULL;
-  config->bind_address = NULL;
   config->ipv6 = false;
   config->ipv4 = false;
   config->sockopts = NULL;
   config->sockopt_count = 0;
   config->daemon = false;
-  config->daemon_config = NULL;
-  config->server_mode = false;
   config->no_motd = false;
   config->checksum = false;
   config->checksum_algo = CHECKSUM_ALGO_XXH64;
@@ -789,9 +786,7 @@ void config_delete(Config* config) {
   free(config->partial_dir);
   free(config->suffix);
   free(config->address);
-  free(config->bind_address);
   free(config->sockopts);
-  free(config->daemon_config);
   free(config->compress_choice);
   free(config->chmod_spec);
   if (config->skip_compress_suffixes) {

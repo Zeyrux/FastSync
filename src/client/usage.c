@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <delta.h>
 #include <chunk.h>
+#include "scanner.h"
 
 void print_usage(void) {
   printf("Usage:\n");
@@ -144,7 +145,10 @@ void print_usage(void) {
   printf("                    Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
          DELTA_MAX_FILE_SIZE);
-  printf("  -j, --threads       Enable multithreading\n");
+  printf("  -j, --threads[=N]   Enable the multithreaded scanner/loader/sender\n");
+  printf("                      pipeline; N (1-%d) sets the parallel scanner worker\n",
+         MAX_SCANNER_THREADS);
+  printf("                      count (bare -j/--threads uses the default)\n");
   printf("  --chunk-serialization  Enable chunk serialization (long form only)\n");
   printf("  -s, --secluded-args    Protect-args compatibility option (no effect; remote\n");
   printf("                      SSH argv is already built injection-safe)\n");
@@ -203,6 +207,7 @@ void print_usage(void) {
   printf("  --save-to-disk      Write received files to disk\n");
   printf("  --server-host <ip>  Server IP address (default: 127.0.0.1)\n");
   printf("  --server-port <n>   Server port (default: 8080)\n");
+  printf("  --port <n>          Alias for --server-port\n");
   printf("  --password-file <f> Authenticate a host::module/path daemon destination.\n");
   printf("                      The file's first user:password line supplies the\n");
   printf("                      username and password (only a SHA-256 digest of the\n");

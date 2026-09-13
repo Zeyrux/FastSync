@@ -104,7 +104,7 @@ partial, alternate, and planned behavior.
 | `-c, --checksum` | Verify content by checksum instead of size+mtime |
 | `-z, --compress [level]` | Enable streaming zstd compression (level 1–22, default 5) |
 | `-a, --archive` | rsync archive mode (`-rlptgoD`): links, metadata, devices and specials (not compression/multithreading) |
-| `-j, --threads` | Multithreading mode |
+| `-j, --threads[=N]` | Multithreading mode; `N` (1–256) sets the parallel scanner worker count, bare `-j`/`--threads` uses the default |
 | `-m` | rsync `--prune-empty-dirs` (short form now rsync-parity) |
 | `--chunk-serialization` | Chunk serialization (batch all files per chunk; long form only) |
 | `-s` | rsync `--secluded-args` compatibility no-op (remote SSH argv is already injection-safe) |
@@ -202,7 +202,7 @@ transfer is never aborted.
 3. **FileMetadata** — `mode`, `uid`, `gid`, `mtime_sec`, `mtime_nsec`;
 uid / gid are advisory wire fields and are never applied by the receiver;
 atime is unsupported
-4. **Config** — runtime parameters (transported over wire, TLS settings excluded). Includes `timeout`, `contimeout`, `quiet`, `backup`, `backup_dir`, `stats`, `max_depth`, `log_file`, `queue_size`.
+4. **Config** — runtime parameters (transported over wire, TLS settings excluded). Includes `timeout`, `contimeout`, `quiet`, `backup`, `backup_dir`, `stats`, `max_depth`, `log_file`.
 5. **Queue** — thread-safe bounded queue with condition variables
 6. **DirectoryScanner** — recursive BFS traversal with exclude and include pattern support, max-depth enforcement
 
@@ -378,7 +378,7 @@ features without changing the meaning of ordinary compatibility options.
 
 | Option | Purpose |
 |---|---|
-| `-j`, `--threads` | Enable the multithreaded scanner/loader/sender pipeline. |
+| `-j`, `--threads[=N]` | Enable the multithreaded scanner/loader/sender pipeline. `N` (1–256) sets the parallel scanner worker count; bare `-j`/`--threads` uses the default. |
 | `-z [level]`, `--compress [level]` | Enable streaming zstd compression, levels 1-22. |
 | `--compress-level <n>` | Set the zstd compression level. |
 | `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` and `none`. |
@@ -392,7 +392,7 @@ features without changing the meaning of ordinary compatibility options.
 | `--delta-block <bytes>` | Set the FastSync delta block size (`--block-size` is an alias). |
 | `--delta-max <bytes>` | Limit files eligible for FastSync delta transfer. |
 | `--server-host <host>` | Select the TCP server host. |
-| `--server-port <port>` | Select the TCP server port. |
+| `--server-port <port>` | Select the TCP server port (`--port <port>` and `--port=<port>` are rsync-friendly aliases). |
 | `--tls` | Enable TLS for TCP transport. |
 | `--bwlimit <KB/s>` | Apply token-bucket bandwidth limiting. |
 | `--progress` | Show transfer progress and throughput. |
@@ -478,7 +478,7 @@ link-target transfer remains incomplete. |
 | `--dest-dir <path>` | Set the destination directory explicitly. |
 | `--save-to-disk` | Enable server-side disk persistence. |
 | `--server-host <host>` | TCP server address. |
-| `--server-port <port>` | TCP server port. |
+| `--server-port <port>` | TCP server port. `--port <port>` / `--port=<port>` is an alias. |
 | `--tls` | Enable TLS. Requires `--cert` and `--key`. |
 | `--cert <path>` | TLS certificate file. |
 | `--key <path>` | TLS private key file. |

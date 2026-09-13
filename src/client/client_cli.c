@@ -12,6 +12,7 @@
 #include "identity.h"
 #include "log.h"
 #include "protocol.h"
+#include "scanner.h"
 #include "stop_condition.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
@@ -26,6 +27,41 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Async-signal-safe abort flag set by the SIGINT/SIGTERM handler.  Exposed via
+ * client_send.h so the send loops can poll it.  Defined here (not in
+ * client_send.c) so the unit-test binary, which compiles this file but not
+ * client_send.c, still links the symbol. */
+volatile sig_atomic_t client_abort_requested = 0;
+
+/* Only armed while a network transfer is in flight.  Outside that window the
+ * handler restores the default disposition and re-raises, so purely local modes
+ * (--list-only/--dry-run/--read-batch/--only-write-batch and the batch-emission
+ * pass) keep terminating on Ctrl-C/SIGTERM instead of silently swallowing it. */
+volatile sig_atomic_t client_abort_armed = 0;
+
+void client_set_abort_armed(bool armed) {
+  client_abort_armed = armed ? 1 : 0;
+}
+
+bool client_abort_pending(void) {
+  return client_abort_requested != 0;
+}
+
+#ifndef FASTSYNC_TEST_BUILD
+/* Signal handler: perform NO work beyond storing the flag.  Logging, protocol
+ * I/O and the STATUS_ABORT frame are all done later on the normal send path,
+ * which is not async-signal-safe.  When no transfer is armed, fall back to the
+ * default action so local-only modes remain interruptible. */
+static void client_signal_handler(int signo) {
+  if (!client_abort_armed) {
+    signal(signo, SIG_DFL);
+    raise(signo);
+    return;
+  }
+  client_abort_requested = 1;
+}
+#endif
 
 #ifndef FASTSYNC_TEST_BUILD
 /* Parse environment variables for source/destination directories and save-to-disk flag. */
@@ -138,6 +174,23 @@ static int set_checksum_seed(Config* config, const char* value) {
   if (parse_ull_arg(value, &seed, "--checksum-seed") != 0)
     return -1;
   config->checksum_seed = seed;
+  return 0;
+}
+
+/* --threads=N: enable the -m pipeline and size its parallel scanner pool.
+ * Rejects a non-positive, non-numeric or oversized value up front. */
+static int set_scanner_threads_option(Config* config, const char* value) {
+  int threads;
+  if (!parse_positive_int(value, &threads)) {
+    log_message(LOG_LEVEL_ERROR, "--threads must be a positive integer");
+    return -1;
+  }
+  if (threads > MAX_SCANNER_THREADS) {
+    log_message(LOG_LEVEL_ERROR, "--threads must be between 1 and %d", MAX_SCANNER_THREADS);
+    return -1;
+  }
+  config->use_multithreading = true;
+  config->scanner_threads = threads;
   return 0;
 }
 
@@ -1288,8 +1341,19 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
     return true;
   }
   if (opt_is(arg, "-j", "--threads")) {
+    /* Bare -j/--threads: enable the pipeline with the scanner's built-in
+       worker default (scanner_threads stays 0). */
     config->use_multithreading = true;
     log_info_message(LOG_INFO_MISC, "Enabled Multithreading");
+    return true;
+  }
+  if (strncmp(arg, "--threads=", 10) == 0) {
+    if (set_scanner_threads_option(config, arg + 10) != 0) {
+      ctx->exit_code = -1;
+    } else {
+      log_info_message(LOG_INFO_MISC, "Enabled Multithreading with %d scanner threads",
+                       config->scanner_threads);
+    }
     return true;
   }
   if (opt_is(arg, "--chunk-serialization", NULL)) {
@@ -1300,29 +1364,48 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
   return false;
 }
 
-/* Network/IO options: --server-port, --bwlimit, --chunk-size, --log-file and
- * --stderr.  Returns true when the argument was consumed. */
+/* Parse and validate a TCP server port (--server-port, or its rsync-friendly
+ * alias --port).  Returns 0 on success, -1 (with a message) on a malformed or
+ * out-of-range value. */
+static int set_server_port_option(Config* config, const char* value, const char* option_name) {
+  int port;
+  if (!parse_positive_int(value, &port)) {
+    char* escaped = output_escape(value, false);
+    log_message(LOG_LEVEL_ERROR, "invalid %s value: %s", option_name,
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    return -1;
+  }
+  if (port > 65535) {
+    log_message(LOG_LEVEL_ERROR, "server port must be 1-65535");
+    return -1;
+  }
+  config->server_port = port;
+  return 0;
+}
+
+/* Network/IO options: --server-port/--port, --bwlimit, --chunk-size, --log-file
+ * and --stderr.  Returns true when the argument was consumed. */
 static bool cli_handle_io_options(CliParseCtx* ctx) {
   Config* config = ctx->config;
   const char* arg = ctx->argv[ctx->i];
-  if (opt_is(arg, "--server-port", NULL)) {
+  if (opt_is(arg, "--server-port", "--port")) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
       return true;
     }
-    if (!parse_positive_int(ctx->argv[++ctx->i], &config->server_port)) {
-      char* escaped = output_escape(ctx->argv[ctx->i], false);
-      log_message(LOG_LEVEL_ERROR, "invalid --server-port value: %s",
-                  escaped ? escaped : "<allocation failed>");
-      free(escaped);
+    if (set_server_port_option(config, ctx->argv[++ctx->i], arg) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (config->server_port > 65535) {
-      log_message(LOG_LEVEL_ERROR, "server port must be 1-65535");
+    return true;
+  }
+  /* rsync users commonly write --port=NNNN; --server-port=NNNN is accepted too
+   * so both spellings behave identically. */
+  if (strncmp(arg, "--server-port=", 14) == 0 || strncmp(arg, "--port=", 7) == 0) {
+    const char* option_name = strncmp(arg, "--server-port=", 14) == 0 ? "--server-port" : "--port";
+    const char* value = arg + (strncmp(arg, "--server-port=", 14) == 0 ? 14 : 7);
+    if (set_server_port_option(config, value, option_name) != 0)
       ctx->exit_code = -1;
-    }
     return true;
   }
   if (opt_is(arg, "--bwlimit", NULL)) {
@@ -1975,6 +2058,17 @@ int main(int argc, char* argv[]) {
      oversized delta).  Ignore SIGPIPE so that a broken TCP connection
      surfaces as a clean write error instead of killing the client. */
   signal(SIGPIPE, SIG_IGN);
+  /* Ctrl-C / SIGTERM: set the abort flag so the send loops can send
+   * STATUS_ABORT and let the receiver clean up, instead of dying abruptly.
+   * No SA_RESTART so an in-flight poll()/read() is interrupted (EINTR), which
+   * lets the keepalive/abort checks observe the flag promptly. */
+  struct sigaction abort_action;
+  memset(&abort_action, 0, sizeof(abort_action));
+  abort_action.sa_handler = client_signal_handler;
+  sigemptyset(&abort_action.sa_mask);
+  abort_action.sa_flags = 0;
+  sigaction(SIGINT, &abort_action, NULL);
+  sigaction(SIGTERM, &abort_action, NULL);
   const char* env_source = NULL;
   const char* env_dest = NULL;
   bool save_to_disk = false;

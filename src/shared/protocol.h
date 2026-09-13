@@ -198,4 +198,23 @@ bool receive_status(int file_descriptor, Status* status);
    this so the sender does not abort after the deletion already committed. */
 bool receive_status_timed(int file_descriptor, Status* status, int timeout_sec);
 
+/* Callback polled by protocol_receive_status_keepalive once per keepalive
+   interval.  Return true to stop waiting (e.g. a SIGINT/SIGTERM abort flag was
+   set).  Kept as a function pointer so the protocol layer does not depend on
+   client signal state. */
+typedef bool (*ProtocolWaitAbort)(void);
+
+/* Like receive_status_timed, but while the peer is silent it emits
+   STATUS_KEEPALIVE every keepalive_interval_sec (the receiver answers each with
+   STATUS_KEEPALIVE, which this function consumes and skips) so a long
+   server-side operation does not look like a dead connection.  The total wait
+   is still bounded by timeout_sec; abort_check (may be NULL) is polled every
+   interval and, when it returns true, ends the wait immediately with false.
+   Runs entirely on the calling thread: the protocol send path is NOT safe for
+   concurrent writers, so this must not be paired with a helper thread. */
+bool receive_status_keepalive(int file_descriptor, Status* status, int timeout_sec,
+                              int keepalive_interval_sec, ProtocolWaitAbort abort_check);
+bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status, int timeout_sec,
+                                       int keepalive_interval_sec, ProtocolWaitAbort abort_check);
+
 #endif
