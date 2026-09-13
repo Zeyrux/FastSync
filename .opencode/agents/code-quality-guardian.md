@@ -316,7 +316,7 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 

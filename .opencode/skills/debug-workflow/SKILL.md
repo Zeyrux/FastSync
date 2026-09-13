@@ -32,23 +32,19 @@ Try to reproduce the issue with the exact command the user provides.
 
 **Memory errors (first priority):**
 ```bash
-rm -rf build
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
-cmake --build build -j$(nproc)
-./build/tests
+rm -rf build-asan
+cmake -B build-asan -S . -DSANITIZER=address
+cmake --build build-asan -j$(nproc)
+./build-asan/tests
 # or run the failing command
 ```
 
 **Thread errors:**
 ```bash
-rm -rf build
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
-cmake --build build -j$(nproc)
-./build/tests
+rm -rf build-tsan
+cmake -B build-tsan -S . -DSANITIZER=thread
+cmake --build build-tsan -j$(nproc)
+./build-tsan/tests
 ```
 
 **Valgrind (if ASan doesn't find it):**
@@ -108,13 +104,12 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 ./build/tests
 
 # If integration test needed
-python3 test.py
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"
 
 # Re-run under sanitizer to confirm fix
-rm -rf build
-cmake -B build -S . -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
-cmake --build build -j$(nproc)
+rm -rf build-asan
+cmake -B build-asan -S . -DSANITIZER=address
+cmake --build build-asan -j$(nproc)
 # reproduce the original failing command
 ```
 

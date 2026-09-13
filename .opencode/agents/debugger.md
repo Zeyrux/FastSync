@@ -14,10 +14,9 @@ Diagnose crashes, memory errors, hangs, and logic bugs. You use structured debug
 ### Memory Errors
 ```bash
 # AddressSanitizer (fast, recommended first)
-cmake -B build -S . -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
-cmake --build build -j$(nproc)
-./build/client  # or ./build/server
+cmake -B build-asan -S . -DSANITIZER=address
+cmake --build build-asan -j$(nproc)
+./build-asan/client  # or ./build-asan/server -p 8080 --allow-unauthenticated
 
 # Valgrind (slower, more thorough)
 valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
@@ -32,10 +31,9 @@ valgrind --tool=drd ./build/client ...
 
 ### Thread Sanitizer
 ```bash
-cmake -B build -S . -DCMAKE_C_FLAGS="-fsanitize=thread" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
-cmake --build build -j$(nproc)
-./build/tests
+cmake -B build-tsan -S . -DSANITIZER=thread
+cmake --build build-tsan -j$(nproc)
+./build-tsan/tests
 ```
 
 ### GDB
@@ -143,7 +141,7 @@ gprof ./build/client gmon.out
 
 ### Step 5: Verify
 - Run `./build/tests` (unit tests)
-- Run `python3 test.py` (integration tests)
+- Run `python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"` (integration tests)
 - Run under valgrind again to confirm clean
 - Test under ASan again
 
@@ -162,7 +160,7 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 
