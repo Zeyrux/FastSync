@@ -100,6 +100,12 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  * (STR_MODULE), repeated count+array blocks (BLOCK_*), --copy-as presence
  * (COPY_AS_*), and the derived --delta / use_xattrs bits (DERIVED_DELTA,
  * BOOL_XATTR_DERIVE).
+ *
+ * SCOPE: this table covers ONLY the serialized wire frame.  The client CLI
+ * option tables in client_cli.c (OPTION_TABLE / NEGATABLE_OPTIONS) are still
+ * hand-maintained and are deliberately NOT generated from this table: the CLI
+ * surface carries client-only fields and flag/alias/negation semantics that
+ * have no wire representation.  Do not assume the two are folded together.
  * =========================================================================== */
 #define CONFIG_WIRE_HEADER_FIELDS(X) X(version, char*, str_dup(PROTOCOL_VERSION), STR)
 

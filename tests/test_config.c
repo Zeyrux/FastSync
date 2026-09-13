@@ -2320,75 +2320,74 @@ static void test_config_wire_roundtrip_all_fields() {
 
   Config* populated = config_create();
   EXPECT_NOT_NULL(populated);
+  /* The golden fixture is already receiver-valid, so the same fully-populated
+   * config that backs the byte-exact golden also round-trips unchanged. */
   golden_config_populate(populated);
-  /* Keep the populated config within the server-side validation bounds. */
-  populated->delta_max_file_size = DELTA_MAX_FILE_SIZE;
-  populated->whole_file = false;
-  /* "X" is not part of FastSync's chmod grammar (see parse_clause), so use a
-   * spec the receiver-side validator accepts. */
-  free(populated->chmod_spec);
-  populated->chmod_spec = str_dup("u=rw,go=r");
   EXPECT_TRUE(roundtrip_and_compare(populated));
   config_delete(populated);
 }
 
 /* Populate every serialized field with a non-default value so the wire frame
- * exercises each table entry.  The values are deterministic. */
+ * exercises each table entry.  Boolean runs deliberately alternate true/false:
+ * a run of identical booleans would make an adjacent swap (same KIND) produce
+ * the same byte stream, hiding a table reorder from the golden hash.  The whole
+ * frame stays receiver-valid so the receive-side golden can feed it straight
+ * through config_receive() (hence the valid chmod grammar and delta bound). */
 static void golden_config_populate(Config* c) {
   c->eight_bit_output = true;
   c->max_alloc = 123456789ULL;
   c->send_directory = str_dup("/golden/src");
   c->receive_root_directory = str_dup("/golden/dst");
   c->save_to_disk = true;
-  c->use_multithreading = true;
+  c->use_multithreading = false;
   c->use_chunk_serialization = false;
-  c->use_compression = false;
+  c->use_compression = true;
   c->use_metadata = true;
-  c->use_executability = true;
+  c->use_executability = false;
   c->compression_level = 7;
   c->chunk_size = 65536;
   c->use_sendfile = false;
   c->use_delete = true;
   c->use_incremental = true;
-  c->size_only = true;
+  c->size_only = false;
   c->ignore_times = true;
   c->use_delta = true;
   c->whole_file = false;
   c->delta_block_size = 4096;
-  c->delta_max_file_size = 987654321ULL;
+  c->delta_max_file_size = 200000000ULL;
   c->backup = true;
   c->backup_dir = str_dup("/golden/backup");
-  c->remove_source_files = true;
+  c->remove_source_files = false;
   c->follow_symlinks = true;
-  c->copy_links = true;
+  c->copy_links = false;
   c->safe_links = true;
-  c->copy_unsafe_links = true;
+  c->copy_unsafe_links = false;
   c->preserve_hard_links = true;
-  c->preserve_acls = true;
+  c->preserve_acls = false;
   c->preserve_xattrs = true;
-  c->preserve_devices = true;
+  c->preserve_devices = false;
   c->preserve_sparse = true;
-  c->preserve_specials = true;
+  c->preserve_specials = false;
   c->copy_devices = true;
-  c->write_devices = true;
+  c->write_devices = false;
   c->ignore_existing = true;
-  c->existing = true;
+  c->existing = false;
   c->update = true;
   c->inplace = false;
-  c->delay_updates = false;
+  c->delay_updates = true;
   c->append = false;
   c->use_fsync = true;
   c->append_verify = false;
   c->delete_excluded = true;
-  c->force_delete = true;
+  c->force_delete = false;
   c->delete_missing_args = true;
-  c->delete_after = true;
+  c->delete_after = false;
   c->preallocate = true;
   c->max_delete = 42;
-  c->relative = true;
+  c->relative = false;
   c->prune_empty_dirs = true;
-  c->mkpath = true;
-  c->delete_during = false;
+  c->mkpath = false;
+  c->delete_during = true;
   c->delete_delay = false;
   c->temp_dir = str_dup("/golden/tmp");
   c->partial = true;
@@ -2398,7 +2397,10 @@ static void golden_config_populate(Config* c) {
   c->checksum = true;
   c->modify_window = 3;
   c->compress_choice = str_dup("zstd");
-  c->chmod_spec = str_dup("u=rwX,go=rX");
+  /* "u=rwx,go=rx" is the same 11 bytes as the original "u=rwX,go=rX" (so the
+   * frame stays 633 bytes) but X is not in FastSync's chmod grammar, and the
+   * receive-side golden validates the frame. */
+  c->chmod_spec = str_dup("u=rwx,go=rx");
   c->skip_compress_set = true;
   c->skip_compress_count = 2;
   c->skip_compress_suffixes = calloc(2, sizeof(char*));
@@ -2410,7 +2412,7 @@ static void golden_config_populate(Config* c) {
   c->checksum_algo = CHECKSUM_ALGO_MD5;
   c->checksum_seed = 0x1122334455667788ULL;
   c->numeric_ids = true;
-  c->chown_uid_set = true;
+  c->chown_uid_set = false;
   c->chown_uid = 1234;
   c->chown_gid_set = true;
   c->chown_gid = 5678;
@@ -2425,11 +2427,11 @@ static void golden_config_populate(Config* c) {
   c->groupmap[0].from = 7;
   c->groupmap[0].to = 8;
   c->preserve_atimes = true;
-  c->preserve_crtimes = true;
+  c->preserve_crtimes = false;
   c->omit_dir_times = true;
-  c->omit_link_times = true;
+  c->omit_link_times = false;
   c->munge_links = true;
-  c->keep_dirlinks = true;
+  c->keep_dirlinks = false;
   c->fake_super = true;
   c->module = str_dup("goldenmod");
   c->auth_user = str_dup("goldenuser");
@@ -2441,13 +2443,27 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* FNV-1a 64 over the exact config-frame bytes emitted by
- * config_send_wire_block().  This pins field order and width: any reorder or
- * resize changes the hash. */
-static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) {
+/* The pinned golden frame (protocol 2.20.0).  The values below are the only
+ * thing that ties the generated table to the historical wire format; update
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason. */
+#define GOLDEN_WIRE_LEN 633
+#define GOLDEN_WIRE_HASH 9160991280011164139ULL
+
+static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
+  unsigned long long h = 1469598103934665603ULL;
+  for (size_t i = 0; i < len; i++) {
+    h ^= (unsigned long long)buf[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/* Capture the exact config-frame body emitted by config_send_wire_block() into
+ * a heap buffer.  Returns NULL on any failure. */
+static unsigned char* capture_wire_bytes(const Config* cfg, size_t* out_len) {
   int p[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0)
-    return 0;
+    return NULL;
   pid_t pid = fork();
   if (pid == 0) {
     close(p[1]);
@@ -2458,29 +2474,63 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
     _exit(ok ? 0 : 1);
   }
   close(p[0]);
-  unsigned long long h = 1469598103934665603ULL;
-  unsigned char buf[4096];
-  ssize_t n;
+  size_t capacity = 1024;
   size_t total = 0;
-  while ((n = read(p[1], buf, sizeof(buf))) > 0) {
-    for (ssize_t i = 0; i < n; i++) {
-      h ^= (unsigned long long)buf[i];
-      h *= 1099511628211ULL;
+  unsigned char* bytes = malloc(capacity);
+  if (!bytes) {
+    close(p[1]);
+    waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  for (;;) {
+    if (total == capacity) {
+      size_t grown_capacity = capacity * 2;
+      unsigned char* grown = realloc(bytes, grown_capacity);
+      if (!grown) {
+        free(bytes);
+        close(p[1]);
+        waitpid(pid, NULL, 0);
+        return NULL;
+      }
+      bytes = grown;
+      capacity = grown_capacity;
     }
+    ssize_t n = read(p[1], bytes + total, capacity - total);
+    if (n < 0) {
+      free(bytes);
+      close(p[1]);
+      waitpid(pid, NULL, 0);
+      return NULL;
+    }
+    if (n == 0)
+      break;
     total += (size_t)n;
   }
   close(p[1]);
   int status = 0;
   waitpid(pid, &status, 0);
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    return 0;
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    free(bytes);
+    return NULL;
+  }
   *out_len = total;
+  return bytes;
+}
+
+/* FNV-1a 64 over the exact config-frame bytes emitted by
+ * config_send_wire_block().  This pins field order and width: any reorder or
+ * resize changes the hash. */
+static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) {
+  unsigned char* bytes = capture_wire_bytes(cfg, out_len);
+  if (!bytes)
+    return 0;
+  unsigned long long h = fnv1a_64(bytes, *out_len);
+  free(bytes);
   return h;
 }
 
 /* Byte-for-byte wire compatibility guard (protocol 2.20.0).  The expected hash
- * was captured from the pre-X-macro implementation; the refactor MUST NOT
- * change it. */
+ * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())
     return;
@@ -2490,9 +2540,180 @@ static void test_config_wire_golden() {
   size_t len = 0;
   unsigned long long h = capture_wire_hash(c, &len);
   printf("    wire golden: len=%zu hash=%llu\n", len, h);
-  /* Captured from the pre-X-macro (protocol 2.20.0) implementation. */
-  EXPECT_TRUE(len == 633);
-  EXPECT_TRUE(h == 6163263374908258816ULL);
+  EXPECT_TRUE(len == GOLDEN_WIRE_LEN);
+  EXPECT_TRUE(h == GOLDEN_WIRE_HASH);
+  config_delete(c);
+}
+
+/* Receive-side oracle.  Hashing the sender alone cannot catch a RECV KIND that
+ * reads a different width/order yet still round-trips symmetrically, so feed
+ * the SAME hash-pinned golden bytes through config_receive() and assert both
+ * the decoded struct fields and the derived bits.  Because the bytes are
+ * anchored to the send golden, a divergence on either side fails here. */
+static void test_config_wire_golden_receive() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  golden_config_populate(c);
+
+  size_t len = 0;
+  unsigned char* bytes = capture_wire_bytes(c, &len);
+  EXPECT_NOT_NULL(bytes);
+  EXPECT_TRUE(len == GOLDEN_WIRE_LEN);
+  EXPECT_TRUE(fnv1a_64(bytes, len) == GOLDEN_WIRE_HASH);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    io_set_bwlimit(0);
+    Config* recv = config_receive(p[0]);
+    bool ok = recv != NULL;
+    if (ok) {
+      /* Full field-by-field comparison (generated from CONFIG_WIRE_FIELDS). */
+      ok = config_wire_equal(c, recv);
+      /* Explicit spot checks of the decoded struct, including derived bits. */
+      ok = ok && recv->eight_bit_output && recv->use_compression && recv->use_metadata &&
+           !recv->use_multithreading;
+      ok = ok && recv->compression_level == 7 && recv->chunk_size == 65536;
+      ok = ok && recv->use_delta && !recv->whole_file && recv->use_xattrs;
+      /* Bounded/validated KINDs decoded from the pinned bytes. */
+      ok = ok && recv->checksum_algo == CHECKSUM_ALGO_MD5;
+      ok = ok && recv->super_mode == SUPER_MODE_ON;
+      ok = ok && recv->chown_uid == 1234 && recv->chown_gid == 5678;
+      ok = ok && recv->usermap_count == 2 && recv->usermap[0].from == IDENTITY_MATCH_ANY &&
+           recv->usermap[0].to == 1000 && recv->usermap[1].from == 5 && recv->usermap[1].to == 6;
+      ok = ok && recv->basis_count == 2 && recv->basis_dirs[0].type == BASIS_DEST_COMPARE &&
+           recv->basis_dirs[1].type == BASIS_DEST_LINK;
+      ok = ok && recv->module != NULL && strcmp(recv->module, "goldenmod") == 0;
+      ok = ok && recv->copy_as_set && recv->copy_as_uid == 111 && recv->copy_as_gid == 222;
+    }
+    config_delete(recv);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  }
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  io_set_bwlimit(0);
+  size_t written = 0;
+  bool wrote = true;
+  while (written < len) {
+    ssize_t n = write(p[1], bytes + written, len - written);
+    if (n <= 0) {
+      wrote = false;
+      break;
+    }
+    written += (size_t)n;
+  }
+  Status status = STATUS_ERROR;
+  bool got_status = wrote && receive_status(p[1], &status);
+  close(p[1]);
+  free(bytes);
+  int child_status = 0;
+  waitpid(pid, &child_status, 0);
+  EXPECT_TRUE(got_status && status == STATUS_OK);
+  EXPECT_TRUE(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+  config_delete(c);
+}
+
+/* Hand-build a frame that is valid up to the first core BOOL, then write an
+ * out-of-range boolean (2): a BOOL receiver must reject anything but 0/1. */
+static void write_frame_with_invalid_bool(int fd) {
+  send_str(fd, PROTOCOL_VERSION);
+  send_int(fd, 1); /* eight_bit_output */
+  unsigned long long max_alloc = DEFAULT_MAX_ALLOC;
+  send_n_data(fd, &max_alloc, sizeof(max_alloc));
+  send_str(fd, "/src");
+  send_str(fd, "/dst");
+  send_int(fd, 2); /* save_to_disk: not 0/1 */
+}
+
+/* Feed a caller-built frame into config_receive() and report whether the
+ * receiver rejected it.  The writer runs in a child (SIGPIPE ignored) so a
+ * mid-frame rejection cannot kill the test process. */
+static bool receive_hand_built_frame_rejected(void (*write_frame)(int fd)) {
+  int p[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0)
+    return false;
+  pid_t pid = fork();
+  if (pid == 0) {
+    (void)signal(SIGPIPE, SIG_IGN);
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    io_set_bwlimit(0);
+    write_frame(p[1]);
+    close(p[1]);
+    _exit(0);
+  }
+  close(p[1]);
+  io_set_fds(p[0], p[0]);
+  io_set_bwlimit(0);
+  Config* recv = config_receive(p[0]);
+  bool rejected = recv == NULL;
+  config_delete(recv);
+  close(p[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return rejected;
+}
+
+/* Receive-side bounds for the bounded/validated KINDs that the round-trip
+ * helper cannot exercise (an illegal value has no symmetric sender). */
+static void test_config_wire_receive_bounds() {
+  if (is_running_under_valgrind())
+    return;
+
+  /* BOOL: only 0/1 is a legal wire value. */
+  EXPECT_TRUE(receive_hand_built_frame_rejected(write_frame_with_invalid_bool));
+
+  /* RAW_MAXALLOC: zero is rejected before it can become the session ceiling. */
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->max_alloc = 0;
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* STR_MODULE: a name outside [A-Za-z0-9._-] is refused. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->module = str_dup("bad module");
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* INT_IDMAPCOUNT: one past the identity-map cap is refused at the count. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->usermap_count = MAX_IDENTITY_MAP + 1;
+  c->usermap = calloc((size_t)c->usermap_count, sizeof(IdentityMap));
+  if (c->usermap) {
+    for (int i = 0; i < c->usermap_count; i++) {
+      c->usermap[i].from = 0;
+      c->usermap[i].to = 0;
+    }
+  }
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* INT_IDENTITY: an out-of-range chown_uid (below IDENTITY_MATCH_ANY) is
+   * refused by the identity validator. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->chown_uid_set = true;
+  c->chown_uid = IDENTITY_MATCH_ANY - 1;
+  EXPECT_TRUE(roundtrip_config_rejected(c));
   config_delete(c);
 }
 
@@ -2552,6 +2773,8 @@ void test_config() {
     test_config_invariants_error_all_combinations();
     test_config_receive_rejects_unified_invariants();
     test_config_wire_golden();
+    test_config_wire_golden_receive();
+    test_config_wire_receive_bounds();
     test_config_wire_roundtrip_all_fields();
   }
   test_identity_copy_as_refused();
