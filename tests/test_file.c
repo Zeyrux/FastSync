@@ -3,7 +3,6 @@
 #endif
 #include "test_file.h"
 #include "file.h"
-#include "file_store.h"
 #include "file_receive.h"
 #include "data.h"
 #include "config.h"
@@ -1225,7 +1224,7 @@ void test_trust_sender() {
 }
 
 /* --sparse/-S hole preservation: a buffer with a long zero run written via
- * file_store_write_secure(sparse=true) must round-trip its content exactly and
+ * file_to_disk_secure(sparse=true) must round-trip its content exactly and
  * have the right logical size, and should additionally be genuinely sparse on
  * filesystems that support holes.  The sparseness assertion is tolerant: if the
  * filesystem reports no holes (SEEK_HOLE/SEEK_DATA -> ENXIO) we skip the strict
@@ -1247,7 +1246,7 @@ static void test_file_write_to_disk_sparse_preserves_holes() {
     buf[size - 1 - i] = (unsigned char)((i * 7) % 253);
   }
 
-  EXPECT_TRUE(file_store_write_secure(path, buf, size, false, true, NULL, false));
+  EXPECT_TRUE(file_to_disk_secure(path, buf, size, false, true, false, NULL, false, NULL));
 
   /* Logical size must equal data_size exactly. */
   struct stat st;

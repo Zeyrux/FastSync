@@ -287,11 +287,6 @@ size_t file_content_to_buffer(File* file) {
 static int authorized_root_fd = -1;
 static char* authorized_root_path;
 
-static bool path_is_within_root(const char* root, const char* path) {
-  size_t root_len = strlen(root);
-  return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
-}
-
 bool file_set_authorized_root(int fd, const char* canonical_path) {
   char* path_copy = canonical_path ? str_dup(canonical_path) : NULL;
   if (canonical_path && !path_copy) {
@@ -360,10 +355,6 @@ static bool file_keep_dirlinks = false;
 
 void file_set_keep_dirlinks(bool enable) {
   file_keep_dirlinks = enable;
-}
-
-bool file_get_keep_dirlinks(void) {
-  return file_keep_dirlinks;
 }
 
 /* --trust-sender (Phase 5) receiver process-wide policy: when set, the receiver

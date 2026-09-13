@@ -17,10 +17,6 @@
 static char* SKIP_COMPRESSION_EXTENSIONS[] = {".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mkv",
                                               ".zip", ".gz",   ".xz",  ".zst", NULL};
 
-bool compression_should_skip(const char* path) {
-  return compression_should_skip_with_suffixes(path, NULL, -1);
-}
-
 bool compression_should_skip_with_suffixes(const char* path, char* const* suffixes, int count) {
   if (!path)
     return false;
