@@ -413,8 +413,10 @@ static void test_protocol_accounting_release_does_not_underflow() {
 }
 
 /* A Data acquired on session A must return its connection-memory charge to A
-   even when a different session B is bound at destroy time: releasing against
-   the thread-local bound session would leak A's budget and drain B's. */
+   regardless of what (if anything) is bound at destroy time.  The original bug
+   had two halves: destroying A's Data while a different session is bound leaks
+   A and drains the bound session, and destroying it with nothing bound leaks A
+   and drains the legacy fallback session. */
 static void test_receive_data_charge_follows_owning_session() {
   int pipe_a[2];
   int pipe_b[2];
@@ -431,23 +433,36 @@ static void test_receive_data_charge_follows_owning_session() {
   unsigned long long size = 8;
   EXPECT_EQ_INT((int)write(pipe_a[1], &size, sizeof(size)), (int)sizeof(size));
   EXPECT_EQ_INT((int)write(pipe_a[1], "12345678", 8), 8);
+  EXPECT_EQ_INT((int)write(pipe_a[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(pipe_a[1], "ABCDEFGH", 8), 8);
   EXPECT_EQ_INT((int)write(pipe_b[1], &size, sizeof(size)), (int)sizeof(size));
   EXPECT_EQ_INT((int)write(pipe_b[1], "abcdefgh", 8), 8);
 
-  Data* data_a = protocol_receive_data_limited(&session_a, 8);
+  Data* data_a1 = protocol_receive_data_limited(&session_a, 8);
+  Data* data_a2 = protocol_receive_data_limited(&session_a, 8);
   Data* data_b = protocol_receive_data_limited(&session_b, 8);
-  EXPECT_NOT_NULL(data_a);
+  EXPECT_NOT_NULL(data_a1);
+  EXPECT_NOT_NULL(data_a2);
   EXPECT_NOT_NULL(data_b);
-  EXPECT_TRUE(data_a->owner == &session_a);
+  EXPECT_TRUE(data_a1->owner == &session_a);
+  EXPECT_TRUE(data_a2->owner == &session_a);
   EXPECT_TRUE(data_b->owner == &session_b);
+  EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 16);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
+
+  /* Half 1: destroy A's Data while the unrelated session B is bound.  The
+     charge must go to A, not to the bound B. */
+  protocol_session_bind(&session_b);
+  data_destroy(data_a1);
+  protocol_session_unbind();
+
   EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 8);
   EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
 
-  /* Destroy A's Data while the unrelated session B is the bound session. */
-  protocol_session_bind(&session_b);
-  data_destroy(data_a);
+  /* Half 2: destroy A's remaining Data with NO session bound.  The charge must
+     still go to A, not to the legacy fallback session. */
   protocol_session_unbind();
-
+  data_destroy(data_a2);
   EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 0);
   EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
 
@@ -458,6 +473,24 @@ static void test_receive_data_charge_follows_owning_session() {
   close(pipe_a[1]);
   close(pipe_b[0]);
   close(pipe_b[1]);
+}
+
+/* Freshest Data holds no connection charge; only a bounded receive binds an
+   owner and a charge, so creation helpers must start uncharged and unowned. */
+static void test_data_create_starts_uncharged_and_unowned() {
+  void* buf = malloc(8);
+  EXPECT_NOT_NULL(buf);
+  Data* created = data_create(buf, 8);
+  EXPECT_NOT_NULL(created);
+  EXPECT_TRUE(created->owner == NULL);
+  EXPECT_EQ_INT((int)created->protocol_charge, 0);
+  data_destroy(created);
+
+  Data* reserved = data_create_reserve(64);
+  EXPECT_NOT_NULL(reserved);
+  EXPECT_TRUE(reserved->owner == NULL);
+  EXPECT_EQ_INT((int)reserved->protocol_charge, 0);
+  data_destroy(reserved);
 }
 
 static void test_protocol_session_io_timeout() {
@@ -623,4 +656,5 @@ void test_protocol() {
   test_protocol_string_accounting_is_transient();
   test_protocol_accounting_release_does_not_underflow();
   test_receive_data_charge_follows_owning_session();
+  test_data_create_starts_uncharged_and_unowned();
 }
