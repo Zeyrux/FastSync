@@ -53,10 +53,15 @@
    client-side context; a bare STATUS_ERROR still logs the context alone. */
 static void log_server_rejection(const char* context) {
   const char* detail = protocol_last_error();
-  if (detail && detail[0] != '\0')
-    log_message(LOG_LEVEL_ERROR, "%s: %s", context, detail);
-  else
+  if (detail && detail[0] != '\0') {
+    /* The detail is peer-controlled: escape it so terminal/log-format
+     * metacharacters cannot be injected into the client's output. */
+    char* escaped = output_escape(detail, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "%s: %s", context, escaped ? escaped : "<allocation failed>");
+    free(escaped);
+  } else {
     log_message(LOG_LEVEL_ERROR, "%s", context);
+  }
 }
 
 /* Forward declaration for progress-reporting thread used in multithreaded send. */

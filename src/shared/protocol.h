@@ -212,8 +212,11 @@ bool receive_status(int file_descriptor, Status* status);
 bool send_error_detail(int file_descriptor, const char* message);
 /* Human-readable reason captured from the most recent STATUS_ERROR_DETAIL
  * received on this thread, or "" when the last status was a bare STATUS_ERROR
- * (or no detail was seen).  Thread-local, and valid until the next status read
- * on the same thread. */
+ * (or no detail was seen).  Thread-local, and valid until the next non-keepalive
+ * status read on the same thread; a later STATUS_KEEPALIVE does NOT clear it.
+ * The detail body is bounded by MAX_ERROR_DETAIL_BYTES: an over-cap declared
+ * length is drained and yields "" (so the stream never desyncs), while an
+ * absurd length is a fatal framing error that fails the status read. */
 const char* protocol_last_error(void);
 /* Clear the thread-local last-error buffer. */
 void protocol_clear_last_error(void);

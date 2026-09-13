@@ -4,6 +4,7 @@
 #include "test_utils.h"
 #include <string.h>
 #include <threads.h>
+#include <time.h>
 #include <unistd.h>
 
 /* A detail frame maps back to STATUS_ERROR for the caller and its body is
@@ -85,6 +86,8 @@ static void test_error_detail_drains_despite_tiny_max_alloc(void) {
   EXPECT_TRUE(protocol_receive_status(&receiver, &status));
   EXPECT_EQ_INT((int)status, (int)STATUS_ERROR);
   EXPECT_EQ_STR(protocol_last_error(), "reason");
+  /* The bounded detail reader must never touch the session allocation ceiling. */
+  EXPECT_EQ_INT((int)receiver.max_alloc, 4);
 
   EXPECT_TRUE(protocol_send_status(&sender, STATUS_NEXT));
   EXPECT_TRUE(protocol_receive_status(&receiver, &status));
@@ -92,6 +95,143 @@ static void test_error_detail_drains_despite_tiny_max_alloc(void) {
 
   close(p[0]);
   close(p[1]);
+}
+
+/* An over-cap (but not absurd) declared length is drained through a fixed
+ * scratch buffer so the stream stays in sync, and yields an empty detail.  The
+ * session's tiny --max-alloc must remain untouched. */
+static void test_error_detail_over_cap_is_drained(void) {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession receiver;
+  protocol_session_init(&receiver, p[0], p[1]);
+  protocol_session_set_max_alloc(&receiver, 8);
+  ProtocolSession sender;
+  protocol_session_init(&sender, -1, p[1]);
+
+  size_t size = MAX_ERROR_DETAIL_BYTES + 128;
+  EXPECT_TRUE(protocol_send_status(&sender, STATUS_ERROR_DETAIL));
+  EXPECT_TRUE(protocol_send_n_data(&sender, &size, sizeof(size)));
+  char chunk[512];
+  memset(chunk, 'z', sizeof(chunk));
+  size_t written = 0;
+  while (written < size) {
+    size_t n = size - written < sizeof(chunk) ? size - written : sizeof(chunk);
+    EXPECT_TRUE(protocol_send_n_data(&sender, chunk, n));
+    written += n;
+  }
+  EXPECT_TRUE(protocol_send_status(&sender, STATUS_NEXT));
+
+  Status status = STATUS_OK;
+  EXPECT_TRUE(protocol_receive_status(&receiver, &status));
+  EXPECT_EQ_INT((int)status, (int)STATUS_ERROR);
+  EXPECT_EQ_STR(protocol_last_error(), "");
+  EXPECT_EQ_INT((int)receiver.max_alloc, 8);
+
+  /* Stream is still framed: the following status is read intact. */
+  EXPECT_TRUE(protocol_receive_status(&receiver, &status));
+  EXPECT_EQ_INT((int)status, (int)STATUS_NEXT);
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* A declared length beyond even the absolute string bound can never be drained
+ * sensibly, so it is a fatal framing error and the status read fails. */
+static void test_error_detail_absurd_length_is_fatal(void) {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession receiver;
+  protocol_session_init(&receiver, p[0], p[1]);
+  ProtocolSession sender;
+  protocol_session_init(&sender, -1, p[1]);
+
+  size_t size = (size_t)MAX_STRING_SIZE + 1;
+  EXPECT_TRUE(protocol_send_status(&sender, STATUS_ERROR_DETAIL));
+  EXPECT_TRUE(protocol_send_n_data(&sender, &size, sizeof(size)));
+
+  Status status = STATUS_OK;
+  EXPECT_FALSE(protocol_receive_status(&receiver, &status));
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* The detail body must share the caller's deadline: with the session window at
+ * the 60 s default, a withheld body under a 1 s receive_status_timed deadline
+ * must fail in about a second, not fall back to the session timeout. */
+static void test_error_detail_body_honors_deadline(void) {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  /* Only the status header, body withheld. */
+  EXPECT_TRUE(send_status(0, STATUS_ERROR_DETAIL));
+
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  Status status = STATUS_OK;
+  EXPECT_FALSE(receive_status_timed(0, &status, 1));
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  long long elapsed_ms =
+      (end.tv_sec - start.tv_sec) * 1000LL + (end.tv_nsec - start.tv_nsec) / 1000000LL;
+  EXPECT_TRUE(elapsed_ms < 10000);
+
+  close(p[0]);
+  close(p[1]);
+}
+
+typedef struct {
+  int peer_read_fd;
+  int peer_write_fd;
+  bool replied;
+} DetailKeepalivePeerArg;
+
+static int detail_keepalive_peer(void* arg) {
+  DetailKeepalivePeerArg* peer = arg;
+  ProtocolSession session;
+  protocol_session_init(&session, peer->peer_read_fd, peer->peer_write_fd);
+  Status status = STATUS_ERROR;
+  if (protocol_receive_status(&session, &status) && status == STATUS_KEEPALIVE) {
+    /* The busy receiver answers the real status (with its detail) first, then the
+       keepalive reply it owes -- which the client then drains. */
+    peer->replied = protocol_send_status(&session, STATUS_ERROR_DETAIL) &&
+                    protocol_send_str(&session, "boom") &&
+                    protocol_send_status(&session, STATUS_KEEPALIVE);
+  }
+  return thrd_success;
+}
+
+/* Draining the keepalive replies the peer still owes must not erase the terminal
+ * detail that arrived just before them. */
+static void test_error_detail_survives_keepalive_drain(void) {
+  int to_client[2];
+  int to_peer[2];
+  EXPECT_EQ_INT(pipe(to_client), 0);
+  EXPECT_EQ_INT(pipe(to_peer), 0);
+
+  ProtocolSession session;
+  protocol_session_init(&session, to_client[0], to_peer[1]);
+
+  DetailKeepalivePeerArg peer = {.peer_read_fd = to_peer[0], .peer_write_fd = to_client[1]};
+  thrd_t thread;
+  EXPECT_EQ_INT(thrd_create(&thread, detail_keepalive_peer, &peer), thrd_success);
+
+  Status received = STATUS_OK;
+  EXPECT_TRUE(protocol_receive_status_keepalive(&session, &received, 10, 1, NULL));
+  EXPECT_EQ_INT((int)received, (int)STATUS_ERROR);
+  EXPECT_EQ_STR(protocol_last_error(), "boom");
+
+  int result = 0;
+  EXPECT_EQ_INT(thrd_join(thread, &result), thrd_success);
+  EXPECT_EQ_INT(result, thrd_success);
+  EXPECT_TRUE(peer.replied);
+
+  close(to_client[0]);
+  close(to_client[1]);
+  close(to_peer[0]);
+  close(to_peer[1]);
 }
 
 typedef struct {
@@ -149,5 +289,9 @@ void test_protocol_error(void) {
   test_error_detail_over_long_is_bounded();
   test_bare_error_clears_last_error();
   test_error_detail_drains_despite_tiny_max_alloc();
+  test_error_detail_over_cap_is_drained();
+  test_error_detail_absurd_length_is_fatal();
+  test_error_detail_body_honors_deadline();
+  test_error_detail_survives_keepalive_drain();
   test_last_error_is_thread_local();
 }

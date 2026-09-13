@@ -1239,10 +1239,15 @@ bool config_send(int file_descriptor, const Config* config) {
   }
   if (status != STATUS_OK) {
     const char* detail = protocol_last_error();
-    if (detail && detail[0] != '\0')
-      log_message(LOG_LEVEL_ERROR, "Error transmitting config: %s", detail);
-    else
+    if (detail && detail[0] != '\0') {
+      /* The detail is peer-controlled: escape it before logging. */
+      char* escaped = output_escape(detail, log_get_8_bit_output());
+      log_message(LOG_LEVEL_ERROR, "Error transmitting config: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
+    } else {
       log_message(LOG_LEVEL_ERROR, "Error transmitting config");
+    }
     return false;
   }
   return true;

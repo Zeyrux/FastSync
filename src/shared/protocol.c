@@ -63,6 +63,10 @@ void io_set_fds(int read_fd, int write_fd) {
   bound_session = NULL;
   io_read_fd = read_fd;
   io_write_fd = write_fd;
+  /* A descriptor switch starts a new connection on this thread: a stale
+     rejection detail captured from the previous transport must not leak into
+     the new one. */
+  io_error_detail[0] = '\0';
   /* A descriptor switch starts a new transport; never reuse a TLS object
      belonging to a previous connection or test pipe. */
   io_ssl = NULL;
@@ -338,27 +342,25 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
   return protocol_receive_n_data_timed(session, data, data_size, timeout_sec);
 }
 
-bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t data_size,
-                                   int timeout_sec) {
+/* Read exactly `data_size` bytes from `session` before `deadline` elapses
+ * (CLOCK_MONOTONIC).  Shared by the ordinary timed primitive and the error-detail
+ * body reader so the latter can clamp itself to whatever deadline its caller
+ * already established instead of always applying the session's 60 s window. */
+static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, size_t data_size,
+                                          const struct timespec* deadline) {
   log_debug_message(LOG_DEBUG_IO, "    Receiving n Data: %zu", data_size);
-  if (!session)
+  if (!session || !deadline)
     return false;
   int fd = session->read_fd;
-  if (timeout_sec <= 0)
-    timeout_sec = RECEIVE_TIMEOUT_SEC;
-
-  struct timespec deadline;
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += timeout_sec;
 
   size_t total_bytes_received = 0;
   short wait_events = POLLIN;
   while (total_bytes_received < data_size) {
     if (!session->ssl || SSL_pending(session->ssl) == 0) {
       struct pollfd pfd = {.fd = fd, .events = wait_events};
-      int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+      int poll_result = poll(&pfd, 1, deadline_remaining_ms(deadline));
       if (poll_result == 0) {
-        log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", timeout_sec);
+        log_message(LOG_LEVEL_ERROR, "Receive timeout");
         return false;
       }
       if (poll_result < 0) {
@@ -398,6 +400,18 @@ bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t 
   }
   log_debug_message(LOG_DEBUG_IO, "    Received n Data: %zu", total_bytes_received);
   return true;
+}
+
+bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t data_size,
+                                   int timeout_sec) {
+  if (!session)
+    return false;
+  if (timeout_sec <= 0)
+    timeout_sec = RECEIVE_TIMEOUT_SEC;
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += timeout_sec;
+  return protocol_receive_n_data_until(session, data, data_size, &deadline);
 }
 
 static const char* status_to_string(Status status) {
@@ -606,40 +620,83 @@ bool protocol_send_status(ProtocolSession* session, Status status) {
   return true;
 }
 
+/* Read the bounded, length-prefixed body of a STATUS_ERROR_DETAIL frame within
+ * `deadline` (CLOCK_MONOTONIC), polling `abort_check` (may be NULL) between
+ * drain chunks.  The declared length is validated BEFORE any allocation:
+ *
+ *   - `size > MAX_STRING_SIZE`: an absurd framing error.  Reading/draining that
+ *     many bytes could never finish, so it is fatal (the caller tears the
+ *     connection down) rather than drained.
+ *   - `MAX_ERROR_DETAIL_BYTES < size <= MAX_STRING_SIZE`: drain exactly `size`
+ *     bytes through a small fixed scratch buffer so the stream stays in sync,
+ *     leaving the captured detail empty.  No allocation happens.
+ *   - `size <= MAX_ERROR_DETAIL_BYTES`: read straight into the thread-local
+ *     `io_error_detail` buffer (size+1 capacity, already reserved), so the
+ *     session's --max-alloc / MAX_CONNECTION_MEMORY budgets are never touched.
+ *
+ * Returns false on a fatal framing problem or any I/O failure; the terminal
+ * detail is then empty.  The body is consumed on every non-fatal path even when
+ * the caller ignores protocol_last_error(), so the stream never desyncs. */
+static bool protocol_receive_error_detail_until(ProtocolSession* session,
+                                                const struct timespec* deadline,
+                                                ProtocolWaitAbort abort_check) {
+  io_error_detail[0] = '\0';
+  size_t size = 0;
+  if (!protocol_receive_n_data_until(session, &size, sizeof(size), deadline))
+    return false;
+  if (size > MAX_STRING_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "Error detail length %zu exceeds maximum %llu", size,
+                (unsigned long long)MAX_STRING_SIZE);
+    return false;
+  }
+  if (size > MAX_ERROR_DETAIL_BYTES) {
+    char scratch[256];
+    size_t remaining = size;
+    while (remaining > 0) {
+      if (abort_check && abort_check())
+        return false;
+      size_t chunk = remaining < sizeof(scratch) ? remaining : sizeof(scratch);
+      if (!protocol_receive_n_data_until(session, scratch, chunk, deadline))
+        return false;
+      remaining -= chunk;
+    }
+    return true;
+  }
+  if (!protocol_receive_n_data_until(session, io_error_detail, size, deadline))
+    return false;
+  io_error_detail[size] = '\0';
+  return true;
+}
+
 /* Consume the optional detail body of a STATUS_ERROR_DETAIL frame and map the
  * status back to STATUS_ERROR for existing callers.  Invoked for EVERY status
- * read (bare STATUS_OK/STATUS_ERROR too) so a stale detail from an earlier
- * exchange is never reported for a later one.  The body is always read, even
- * when the caller ignores protocol_last_error(), so the stream never
- * desynchronizes. */
-static void protocol_capture_error_detail(ProtocolSession* session, Status* status) {
+ * read so a stale detail from an earlier exchange is never reported for a later
+ * one -- except for STATUS_KEEPALIVE, which carries no body and whose drain
+ * (protocol_receive_status_keepalive) must NOT erase the terminal detail that
+ * arrived just before it.  Returns false on a fatal framing error. */
+static bool protocol_capture_error_detail(ProtocolSession* session, Status* status,
+                                          const struct timespec* deadline,
+                                          ProtocolWaitAbort abort_check) {
+  if (*status == STATUS_KEEPALIVE)
+    return true;
   io_error_detail[0] = '\0';
   if (*status != STATUS_ERROR_DETAIL)
-    return;
+    return true;
   *status = STATUS_ERROR;
-  /* The body MUST be drained even when the session's allocation ceiling is
-   * smaller than the message (e.g. a tiny --max-alloc), otherwise the string
-   * body would be left on the stream and desynchronize the next exchange.
-   * Lift the ceiling for this one bounded string read and restore it. */
-  unsigned long long saved_max_alloc = session->max_alloc;
-  if (saved_max_alloc < MAX_STRING_SIZE + 1)
-    session->max_alloc = MAX_STRING_SIZE + 1;
-  char* detail = protocol_receive_str(session);
-  session->max_alloc = saved_max_alloc;
-  if (!detail)
-    return;
-  size_t len = strlen(detail);
-  if (len > MAX_ERROR_DETAIL_BYTES)
-    len = MAX_ERROR_DETAIL_BYTES;
-  memcpy(io_error_detail, detail, len);
-  io_error_detail[len] = '\0';
-  free(detail);
+  return protocol_receive_error_detail_until(session, deadline, abort_check);
 }
 
 bool protocol_receive_status(ProtocolSession* session, Status* status) {
-  if (!protocol_receive_n_data(session, status, sizeof(Status)))
+  if (!session || !status)
     return false;
-  protocol_capture_error_detail(session, status);
+  int timeout_sec = session->io_timeout_sec > 0 ? session->io_timeout_sec : RECEIVE_TIMEOUT_SEC;
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += timeout_sec;
+  if (!protocol_receive_n_data_until(session, status, sizeof(Status), &deadline))
+    return false;
+  if (!protocol_capture_error_detail(session, status, &deadline, NULL))
+    return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
   return true;
 }
@@ -647,11 +704,20 @@ bool protocol_receive_status(ProtocolSession* session, Status* status) {
 /* protocol_receive_status with an explicit per-message deadline (seconds).
    Used where a single reply may legitimately take far longer than the default
    60 s receive window - e.g. the sender waiting for the early-delete ACK after
-   the receiver committed a large (up to MAX_SERVER_DELETE_COUNT) deletion. */
+   the receiver committed a large (up to MAX_SERVER_DELETE_COUNT) deletion.  The
+   error-detail body shares the same deadline as the status header. */
 bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int timeout_sec) {
-  if (!protocol_receive_n_data_timed(session, status, sizeof(Status), timeout_sec))
+  if (!session || !status)
     return false;
-  protocol_capture_error_detail(session, status);
+  if (timeout_sec <= 0)
+    timeout_sec = RECEIVE_TIMEOUT_SEC;
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += timeout_sec;
+  if (!protocol_receive_n_data_until(session, status, sizeof(Status), &deadline))
+    return false;
+  if (!protocol_capture_error_detail(session, status, &deadline, NULL))
+    return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
   return true;
 }
@@ -763,7 +829,8 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
     Status received;
     if (!protocol_read_status_until(session, &received, &deadline))
       return false;
-    protocol_capture_error_detail(session, &received);
+    if (!protocol_capture_error_detail(session, &received, &deadline, abort_check))
+      return false;
     if (received == STATUS_KEEPALIVE) {
       /* The receiver's answer to one of our keepalives. */
       replies_seen++;
@@ -790,7 +857,8 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
                     keepalives_sent - replies_seen);
         break;
       }
-      protocol_capture_error_detail(session, &drained);
+      if (!protocol_capture_error_detail(session, &drained, &drain_deadline, abort_check))
+        return false;
       if (drained != STATUS_KEEPALIVE) {
         log_message(LOG_LEVEL_ERROR, "Unexpected status while draining keepalive replies");
         return false;
