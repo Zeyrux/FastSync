@@ -412,6 +412,54 @@ static void test_protocol_accounting_release_does_not_underflow() {
   protocol_session_unbind();
 }
 
+/* A Data acquired on session A must return its connection-memory charge to A
+   even when a different session B is bound at destroy time: releasing against
+   the thread-local bound session would leak A's budget and drain B's. */
+static void test_receive_data_charge_follows_owning_session() {
+  int pipe_a[2];
+  int pipe_b[2];
+  EXPECT_EQ_INT(pipe(pipe_a), 0);
+  EXPECT_EQ_INT(pipe(pipe_b), 0);
+
+  ProtocolSession session_a;
+  ProtocolSession session_b;
+  protocol_session_init(&session_a, pipe_a[0], pipe_a[1]);
+  protocol_session_init(&session_b, pipe_b[0], pipe_b[1]);
+  protocol_session_set_max_alloc(&session_a, 64);
+  protocol_session_set_max_alloc(&session_b, 64);
+
+  unsigned long long size = 8;
+  EXPECT_EQ_INT((int)write(pipe_a[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(pipe_a[1], "12345678", 8), 8);
+  EXPECT_EQ_INT((int)write(pipe_b[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(pipe_b[1], "abcdefgh", 8), 8);
+
+  Data* data_a = protocol_receive_data_limited(&session_a, 8);
+  Data* data_b = protocol_receive_data_limited(&session_b, 8);
+  EXPECT_NOT_NULL(data_a);
+  EXPECT_NOT_NULL(data_b);
+  EXPECT_TRUE(data_a->owner == &session_a);
+  EXPECT_TRUE(data_b->owner == &session_b);
+  EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 8);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
+
+  /* Destroy A's Data while the unrelated session B is the bound session. */
+  protocol_session_bind(&session_b);
+  data_destroy(data_a);
+  protocol_session_unbind();
+
+  EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 0);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
+
+  data_destroy(data_b);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 0);
+
+  close(pipe_a[0]);
+  close(pipe_a[1]);
+  close(pipe_b[0]);
+  close(pipe_b[1]);
+}
+
 static void test_protocol_session_io_timeout() {
   /* Default is the built-in 60 s window; the setter stores exactly what it is
    * given (<= 0 means "fall back to the default") so callers can propagate
@@ -574,4 +622,5 @@ void test_protocol() {
   test_protocol_accounting_reservation_is_atomic();
   test_protocol_string_accounting_is_transient();
   test_protocol_accounting_release_does_not_underflow();
+  test_receive_data_charge_follows_owning_session();
 }
