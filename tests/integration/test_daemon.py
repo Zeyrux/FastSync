@@ -1221,11 +1221,14 @@ class TestDaemonConnectionLimits:
     CAPS_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_caps.conf")
 
     @pytest.mark.ci
-    def test_auth_lockout_is_shared_across_children(self):
-        """`auth lockout threshold = 1`: the first failed authentication locks the
-        source out for the cooldown in the SHARED registry, so a subsequent
-        correct-password attempt (a different forked child) is refused before a
-        SCRAM challenge is even sent."""
+    def test_auth_lockout_exempts_trusted_loopback(self):
+        """`auth lockout threshold = 1`: a trusted loopback peer is EXEMPT from
+        the shared lockout because every local client shares the 127.0.0.1
+        identity, so a single wrong password must not lock out correct-password
+        attempts (that would be a local denial of service).  The shared
+        per-source lockout machinery itself is covered by the daemon_limits unit
+        tests; this locks in the loopback policy and the absence of a stale
+        "locked out" log line."""
         port = _find_free_port()
         with open(self.LOCKOUT_CONF, "w") as f:
             f.write("port = %d\n"
@@ -1241,21 +1244,21 @@ class TestDaemonConnectionLimits:
         try:
             d.start(self.LOCKOUT_CONF, port_override=port, extra_args=["--password-file", CRED_FILE],
                     log_path=log_path)
-            before = _tree_file_count(AUTH_MODULE)
             log_before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
-            # First attempt: wrong password -> records failure #1 -> locks.
+            # First attempt: wrong password -> a failure is logged, but a loopback
+            # peer is not counted toward the lockout.
             wrong = _push_with_creds("127.0.0.1::locked", port, "alice", WRONG_PASS)
             assert wrong.returncode != 0
-            # Second attempt: CORRECT password from the same source must still be
-            # refused by the shared lockout.
+            # Second attempt: the correct password from the same local source must
+            # still be accepted (no lockout), which also runs the SCRAM handshake
+            # to completion in a fresh forked child.
             right = _push_with_creds("127.0.0.1::locked", port, "alice", ALICE_PASS)
-            assert right.returncode != 0, "the shared auth lockout must refuse after threshold"
-            assert _tree_file_count(AUTH_MODULE) == before, "a locked-out source wrote data"
+            assert right.returncode == 0, (right.stderr or right.stdout)
             time.sleep(0.3)
             with open(log_path, "rb") as f:
                 f.seek(log_before)
                 tail = f.read().decode("utf-8", "replace")
-            assert "locked out" in tail, tail[-400:]
+            assert "locked out" not in tail, tail[-400:]
         finally:
             d.stop()
 

@@ -512,7 +512,7 @@ and `address`, the global section accepts:
   source IP, default 0 (unlimited). Enforced across all forked connection
   children through a shared registry.
 - `auth failure delay = MS` — milliseconds to sleep after a failed
-  authentication, default 500. `0` disables it and the value is capped at 60000,
+  authentication, default 500. `0` disables it and the value is capped at 5000,
   so online password guessing is rate-limited per connection. Successful auths
   are never delayed.
 - `auth lockout threshold = N` — number of failed authentications from one source
@@ -527,6 +527,26 @@ and `address`, the global section accepts:
 
 A `[module]` may also set `max connections` (0 = unlimited; enforced per module
 across all connection children) and its own `hosts allow`/`hosts deny`.
+
+The per-host cap and the shared auth lockout identify a source by its numeric
+peer IP. **Loopback peers (127.0.0.0/8, IPv6 `::1`) are exempt**: every local
+client shares that one address, so counting or locking them out would let one
+local process deny service to all the others. The per-module and global
+`max connections` caps still apply to loopback. Because the key is the peer IP,
+`max connections per host` and `auth lockout` also cannot distinguish clients
+behind the same NAT, proxy, or reverse-proxy address — they share one budget and
+one lockout counter, so an over-aggressive lockout can affect unrelated users
+behind that address. Prefer TLS client certificates (`--client-cn`) plus
+`hosts allow`/`hosts deny` for per-client policy when clients share an address,
+and size `auth lockout threshold` accordingly.
+
+The shared per-source table has a bounded lifetime: an entry with no live
+connection is reclaimed once its lockout has expired, or after it has been idle
+(300 s). If every entry is still live or locked, a new source is admitted without
+per-host accounting (fail open) and a rate-limited warning is logged; the
+per-module cap and host ACLs still apply. The occupancy counters are re-derived
+from the shared slot table after every child exit, so a child killed mid-transfer
+(or mid-registration) cannot leak a slot or an occupancy count.
 
 Host patterns are `*` (match all), IPv4/IPv6 literals, or IPv4/IPv6 CIDR
 (`10.0.0.0/8`, `2001:db8::/32`). Hostnames are not resolved, so hostname globs

@@ -82,6 +82,13 @@ typedef struct ModuleGateContext {
    * not classify the peer; an ACL-configured module then fails closed. */
   bool has_peer_ip;
   char peer_ip[INET6_ADDRSTRLEN];
+  /* True when the peer is provably loopback (utils_fd_peer_is_local, fail
+   * closed).  A trusted local/SSH peer is exempt from the per-host cap and the
+   * cross-process auth lockout: every loopback client shares the 127.0.0.1
+   * identity, so counting/locking them out would let one local client deny
+   * service to (or leak lockout state about) all the others.  The per-module and
+   * global caps still apply. */
+  bool is_local;
 } ModuleGateContext;
 
 /* Server half of the SCRAM challenge/response (A7 remediation, protocol
@@ -326,7 +333,11 @@ static const char* module_gate_check_limits(const Config* config, const DaemonMo
   int module_index = daemon_module_index(module);
   if (module_index < 0)
     return NULL;
-  const char* peer = (gate_ctx && gate_ctx->has_peer_ip) ? gate_ctx->peer_ip : "";
+  /* A trusted loopback peer is exempt from the per-source cap: pass an
+   * unparseable peer so the registry skips per-source tracking, while the
+   * per-module cap below is still enforced.  Remote peers are tracked normally. */
+  const char* peer =
+      (!gate_ctx || gate_ctx->is_local || !gate_ctx->has_peer_ip) ? "" : gate_ctx->peer_ip;
   DaemonLimitResult result =
       daemon_limits_register(g_daemon_limits, slot, module_index, peer, module->max_connections);
   switch (result) {
@@ -455,8 +466,10 @@ static ModuleAuthResult module_gate_authenticate(const Config* config, const Dae
     return MODULE_AUTH_ACCEPTED;
   /* Cross-process lockout: a source that failed too many authentications is
    * refused before the challenge is sent (the counter lives in the shared
-   * registry, so it spans every forked child and survives a child exit). */
-  if (g_daemon_limits && gate_ctx && gate_ctx->has_peer_ip) {
+   * registry, so it spans every forked child and survives a child exit).  A
+   * trusted loopback peer is exempt: all local clients share the 127.0.0.1
+   * identity, so a lockout would let one deny the others. */
+  if (g_daemon_limits && gate_ctx && gate_ctx->has_peer_ip && !gate_ctx->is_local) {
     int remaining = 0;
     if (daemon_limits_auth_locked(g_daemon_limits, gate_ctx->peer_ip, &remaining)) {
       log_message(LOG_LEVEL_ERROR,
@@ -523,13 +536,14 @@ static ModuleAuthResult module_gate_authenticate(const Config* config, const Dae
     free(escaped_user);
     /* Count the failure in the shared registry (locks the source out once the
      * configured threshold is reached) and rate-limit online guessing per
-     * connection (no delay on success). */
-    if (g_daemon_limits && gate_ctx->has_peer_ip)
+     * connection (no delay on success).  A loopback peer is exempt from the
+     * shared counter. */
+    if (g_daemon_limits && gate_ctx->has_peer_ip && !gate_ctx->is_local)
       daemon_limits_auth_record_failure(g_daemon_limits, gate_ctx->peer_ip);
     daemon_auth_failure_delay();
     return MODULE_AUTH_TERMINATED;
   }
-  if (g_daemon_limits && gate_ctx->has_peer_ip)
+  if (g_daemon_limits && gate_ctx->has_peer_ip && !gate_ctx->is_local)
     daemon_limits_auth_record_success(g_daemon_limits, gate_ctx->peer_ip);
   char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
   log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' from %s authenticated", config->module,
@@ -636,6 +650,9 @@ static const char* server_module_gate(const Config* config, void* context) {
         utils_fd_peer_ip(gate_ctx->fd, gate_ctx->peer_ip, sizeof(gate_ctx->peer_ip));
     if (!gate_ctx->has_peer_ip)
       log_message(LOG_LEVEL_DEBUG, "daemon module '%s': peer address unavailable", config->module);
+    /* utils_fd_peer_is_local is fail-closed (getpeername must succeed and report
+     * a loopback peer), so "cannot tell" is never treated as trusted. */
+    gate_ctx->is_local = utils_fd_peer_is_local(gate_ctx->fd);
   }
   error = module_gate_check_hosts(config, module, gate_ctx);
   if (error)
@@ -670,6 +687,7 @@ void handler(int file_descriptor) {
   gate_ctx.super_mode_override = -1;
   gate_ctx.has_peer_ip = false;
   gate_ctx.peer_ip[0] = '\0';
+  gate_ctx.is_local = false;
   /* All teardown state starts empty so the single `done` epilogue is safe to
    * reach from any error path (including before the config frame arrives). */
   Config* config = NULL;

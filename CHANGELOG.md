@@ -14,7 +14,14 @@ run the same version because the handshake is strict.
   forks one child per connection, the counters live in an anonymous shared
   mapping created before the accept loop and reclaimed by the parent's
   `SIGCHLD` handler, so the per-module, per-source and auth-failure state is
-  shared across every child (including after `SIGKILL`).
+  shared across every child (including after `SIGKILL`). The per-source table
+  now has a bounded lifetime (expired-lockout/idle entries are reclaimed, with a
+  rate-limited warning when it is genuinely full), and the occupancy counters are
+  re-derived from the shared slot table on every child exit so a child killed
+  mid-registration cannot leak a count. Trusted loopback peers are exempt from the
+  per-host cap and the auth lockout (they share one address); clients behind a
+  shared NAT/proxy still share a single per-host budget and lockout, which is
+  documented.
 
 ## [2.20.0] - 2026-09-13
 
