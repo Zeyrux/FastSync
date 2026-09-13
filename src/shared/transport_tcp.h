@@ -45,6 +45,9 @@ typedef struct {
 
 Server* server_create_ex(int port, const ServerBindOptions* bind_opts);
 Server* server_create(int port);
+/* Override the listener's connection cap (the global daemon `max connections`
+ * value).  A non-positive value is ignored so the default cap stands. */
+void server_set_max_connections(Server* server, unsigned int max_connections);
 bool server_listen(Server* server, void (*handler)(int file_descriptor));
 void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
                         const char* log_fmt);

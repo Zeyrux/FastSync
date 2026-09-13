@@ -77,5 +77,13 @@ bool append_tail_length(unsigned long long old_size, unsigned long long check_si
 bool utils_sockaddr_is_loopback(const struct sockaddr* addr);
 bool utils_fd_peer_is_local(int fd);
 bool utils_host_is_loopback(const char* host);
+/* Numeric peer address of a connected fd (INET6_ADDRSTRLEN is always enough).
+ * Returns false and leaves buf empty when the fd is not a connected INET socket
+ * or getpeername/inet_ntop fails.  Used by the daemon host-access gate; a false
+ * return is "cannot tell" and must be treated as fail-closed when ACLs apply. */
+bool utils_fd_peer_ip(int fd, char* buf, size_t len);
+/* Format a sockaddr as "ip:port" (IPv4) or "[ip]:port" (IPv6) for logging.
+ * Returns false (buf emptied) for a non-INET family or a formatting failure. */
+bool utils_sockaddr_to_string(const struct sockaddr* addr, char* buf, size_t len);
 
 #endif

@@ -23,8 +23,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <openssl/x509.h>
 
 static char* authorized_root;
@@ -68,6 +70,11 @@ typedef struct ModuleGateContext {
      activity (operator --no-super, or a daemon module without the
      `client owner = yes` opt-in); -1 when the config's own mode stands. */
   int super_mode_override;
+  /* Numeric peer address (INET6_ADDRSTRLEN is always enough), filled once by
+   * server_module_gate.  has_peer_ip is false when getpeername/inet_ntop could
+   * not classify the peer; an ACL-configured module then fails closed. */
+  bool has_peer_ip;
+  char peer_ip[INET6_ADDRSTRLEN];
 } ModuleGateContext;
 
 /* Server half of the SCRAM challenge/response (A7 remediation, protocol
@@ -320,6 +327,66 @@ static const char* module_gate_check_ownership(const Config* config, const Daemo
   return NULL;
 }
 
+/* Online-guessing throttle: sleep the configured `auth failure delay`
+ * milliseconds after a failed authentication.  Runs in the per-connection
+ * forked child, so it never blocks the accept loop or another connection.  0
+ * disables it; the parser already caps it at DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS.
+ * Resumes after EINTR so a signal cannot cut the delay short. */
+static void daemon_auth_failure_delay(void) {
+  if (!g_daemon_conf || g_daemon_conf->global.auth_failure_delay_ms <= 0)
+    return;
+  int ms = g_daemon_conf->global.auth_failure_delay_ms;
+  struct timespec delay;
+  delay.tv_sec = ms / 1000;
+  delay.tv_nsec = (long)(ms % 1000) * 1000000L;
+  while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
+    ;
+}
+
+/* Host access control (global then per-module).  A configured list makes an
+ * unprovable peer fail closed.  Deny always takes precedence over allow, and a
+ * non-empty allow list rejects a peer that matches none of its entries.  The
+ * audit line names the peer, the module and the outcome.  Returns an
+ * error string on refusal, NULL on acceptance. */
+static const char* module_gate_check_hosts(const Config* config, const DaemonModule* module,
+                                           ModuleGateContext* gate_ctx) {
+  bool global_restricted = daemon_hosts_restricted(
+      g_daemon_conf->global.hosts_allow, g_daemon_conf->global.hosts_allow_count,
+      g_daemon_conf->global.hosts_deny, g_daemon_conf->global.hosts_deny_count);
+  bool module_restricted = daemon_hosts_restricted(module->hosts_allow, module->hosts_allow_count,
+                                                   module->hosts_deny, module->hosts_deny_count);
+  if (!global_restricted && !module_restricted)
+    return NULL;
+  if (!gate_ctx || !gate_ctx->has_peer_ip) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': cannot determine peer address with host ACLs configured; "
+                "refusing (fail closed)",
+                config->module);
+    return "cannot verify the client host against host access controls";
+  }
+  const char* peer = gate_ctx->peer_ip;
+  if (global_restricted && !daemon_hosts_allowed(peer, g_daemon_conf->global.hosts_allow,
+                                                 g_daemon_conf->global.hosts_allow_count,
+                                                 g_daemon_conf->global.hosts_deny,
+                                                 g_daemon_conf->global.hosts_deny_count)) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': peer %s denied by global 'hosts allow'/'hosts deny'; "
+                "refusing",
+                config->module, peer);
+    return "client host is not permitted by this daemon";
+  }
+  if (module_restricted &&
+      !daemon_hosts_allowed(peer, module->hosts_allow, module->hosts_allow_count,
+                            module->hosts_deny, module->hosts_deny_count)) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': peer %s denied by module 'hosts allow'/'hosts deny'; "
+                "refusing",
+                config->module, peer);
+    return "client host is not permitted by this daemon module";
+  }
+  return NULL;
+}
+
 /* A7 auth gate: runs the SCRAM challenge/response for an auth-required module
  * BEFORE the module root is installed and before any data moves.  Returns
  * MODULE_AUTH_ACCEPTED when the module needs no auth or the handshake succeeds,
@@ -376,16 +443,21 @@ static ModuleAuthResult module_gate_authenticate(const Config* config, const Dae
    * via MODULE_AUTH_TERMINATED; the username may be logged (never the password
    * or any derived proof). */
   if (!server_auth_handshake(gate_ctx->fd, config, module)) {
+    const char* peer = gate_ctx->has_peer_ip ? gate_ctx->peer_ip : "unknown";
     char* escaped_user =
         config->auth_user ? output_escape(config->auth_user, config->eight_bit_output) : NULL;
-    log_message(LOG_LEVEL_ERROR, "daemon module '%s': authentication failed for user '%s'",
-                config->module, escaped_user ? escaped_user : "(none)");
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': authentication failed for user '%s' from %s; refusing",
+                config->module, escaped_user ? escaped_user : "(none)", peer);
     free(escaped_user);
+    /* Rate-limit online guessing per connection (no delay on success). */
+    daemon_auth_failure_delay();
     return MODULE_AUTH_TERMINATED;
   }
   char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
-  log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' authenticated", config->module,
-              escaped_user ? escaped_user : "<allocation failed>");
+  log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' from %s authenticated", config->module,
+              escaped_user ? escaped_user : "<allocation failed>",
+              gate_ctx->has_peer_ip ? gate_ctx->peer_ip : "unknown");
   free(escaped_user);
   return MODULE_AUTH_ACCEPTED;
 }
@@ -478,6 +550,19 @@ static const char* server_module_gate(const Config* config, void* context) {
   const DaemonModule* module = module_gate_lookup_module(config, &error);
   if (!module)
     return error;
+  /* Resolve the peer once, before any auth or ownership work, so the host ACL
+   * and the audit lines all use the same address.  A module with ACLs fails
+   * closed when the peer cannot be classified; an ACL-free module continues
+   * (the accept loop still logged the address). */
+  if (gate_ctx) {
+    gate_ctx->has_peer_ip =
+        utils_fd_peer_ip(gate_ctx->fd, gate_ctx->peer_ip, sizeof(gate_ctx->peer_ip));
+    if (!gate_ctx->has_peer_ip)
+      log_message(LOG_LEVEL_DEBUG, "daemon module '%s': peer address unavailable", config->module);
+  }
+  error = module_gate_check_hosts(config, module, gate_ctx);
+  if (error)
+    return error;
   error = module_gate_check_ownership(config, module, gate_ctx);
   if (error)
     return error;
@@ -503,6 +588,8 @@ void handler(int file_descriptor) {
   gate_ctx.ssl = ssl;
   gate_ctx.fd = file_descriptor;
   gate_ctx.super_mode_override = -1;
+  gate_ctx.has_peer_ip = false;
+  gate_ctx.peer_ip[0] = '\0';
   /* All teardown state starts empty so the single `done` epilogue is safe to
    * reach from any error path (including before the config frame arrives). */
   Config* config = NULL;
@@ -785,7 +872,8 @@ static void print_server_usage(void) {
   printf("  --config=FILE       Daemon config file (default: ~/.config/fastsync/\n");
   printf("                      fastsyncd.conf, else /etc/fastsyncd.conf)\n");
   printf("  --dparam=KEY=VALUE  Override one global config key on the command line\n");
-  printf("                      (port, motd file, address)\n");
+  printf("                      (port, motd file, address, max connections,\n");
+  printf("                      auth failure delay, hosts allow, hosts deny)\n");
   printf("  --no-detach         Stay in the foreground (default detaches to\n");
   printf("                      background when running --daemon)\n");
   printf("  --password-file=FILE  Credential store for modules that declare\n");
@@ -1000,6 +1088,12 @@ int main(int argc, char* argv[]) {
                     "and device nodes within that module root -- pair it with `auth users` "
                     "unless the module is intentionally open to the network",
                     g_daemon_conf->modules[i].name);
+      if (g_daemon_conf->modules[i].max_connections > 0)
+        log_message(LOG_LEVEL_WARNING,
+                    "daemon module '%s': per-module 'max connections' is stored but not enforced "
+                    "per module; the global 'max connections' cap (%d) applies to the whole "
+                    "listener",
+                    g_daemon_conf->modules[i].name, g_daemon_conf->global.max_connections);
     }
     /* Daemon credential store (Wave B).  --password-file and --early-input
      * feed the same store, loaded BEFORE the listener forks so every
@@ -1064,6 +1158,8 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto out;
   }
+  if (g_daemon_conf)
+    server_set_max_connections(g_server, (unsigned int)g_daemon_conf->global.max_connections);
   if (opts.use_tls) {
     if (!opts.tls_cert || !opts.tls_key || !opts.tls_ca || !opts.client_cn) {
       fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");

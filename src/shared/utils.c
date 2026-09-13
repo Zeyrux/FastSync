@@ -587,6 +587,71 @@ bool utils_fd_peer_is_local(int fd) {
   return utils_sockaddr_is_loopback((const struct sockaddr*)&peer);
 }
 
+/* Numeric peer address of a connected fd.  Only AF_INET/AF_INET6 peers are
+   formatted; every other descriptor/family (pipe, AF_UNIX socketpair, ...) or a
+   getpeername failure returns false with buf emptied.  The caller must treat
+   that as "cannot tell". */
+bool utils_fd_peer_ip(int fd, char* buf, size_t len) {
+  if (!buf || len == 0)
+    return false;
+  buf[0] = '\0';
+  if (fd < 0)
+    return false;
+  struct sockaddr_storage peer;
+  socklen_t peer_len = sizeof(peer);
+  if (getpeername(fd, (struct sockaddr*)&peer, &peer_len) != 0)
+    return false;
+  const void* src = NULL;
+  int family = peer.ss_family;
+  if (family == AF_INET) {
+    src = &((const struct sockaddr_in*)&peer)->sin_addr;
+  } else if (family == AF_INET6) {
+    const struct sockaddr_in6* peer6 = (const struct sockaddr_in6*)&peer;
+    /* A dual-stack IPv6 listener reports IPv4 peers as ::ffff:a.b.c.d.  Emit
+     * the IPv4 form so IPv4 ACL patterns (and logs) see the real address. */
+    if (IN6_IS_ADDR_V4MAPPED(&peer6->sin6_addr)) {
+      struct in_addr v4;
+      memcpy(&v4, &peer6->sin6_addr.s6_addr[12], sizeof(v4));
+      return inet_ntop(AF_INET, &v4, buf, (socklen_t)len) != NULL;
+    }
+    src = &peer6->sin6_addr;
+  } else {
+    return false;
+  }
+  return inet_ntop(family, src, buf, (socklen_t)len) != NULL;
+}
+
+/* "ip:port" / "[ip]:port" for a connected peer, used to log the connecting
+   address in the accept loop.  Returns false for a non-INET family. */
+bool utils_sockaddr_to_string(const struct sockaddr* addr, char* buf, size_t len) {
+  if (!addr || !buf || len == 0)
+    return false;
+  buf[0] = '\0';
+  char ip[INET6_ADDRSTRLEN];
+  unsigned short port;
+  int written;
+  if (addr->sa_family == AF_INET) {
+    const struct sockaddr_in* v4 = (const struct sockaddr_in*)addr;
+    if (!inet_ntop(AF_INET, &v4->sin_addr, ip, sizeof(ip)))
+      return false;
+    port = ntohs(v4->sin_port);
+    written = snprintf(buf, len, "%s:%u", ip, port);
+  } else if (addr->sa_family == AF_INET6) {
+    const struct sockaddr_in6* v6 = (const struct sockaddr_in6*)addr;
+    if (!inet_ntop(AF_INET6, &v6->sin6_addr, ip, sizeof(ip)))
+      return false;
+    port = ntohs(v6->sin6_port);
+    written = snprintf(buf, len, "[%s]:%u", ip, port);
+  } else {
+    return false;
+  }
+  if (written < 0 || (size_t)written >= len) {
+    buf[0] = '\0';
+    return false;
+  }
+  return true;
+}
+
 /* True when a client-supplied host string names a loopback destination:
    "localhost", any 127.0.0.0/8 literal, "::1", or "[::1]". */
 bool utils_host_is_loopback(const char* host) {
