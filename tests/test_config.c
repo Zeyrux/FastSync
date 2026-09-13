@@ -1,5 +1,6 @@
 #include "test_config.h"
 #include "config.h"
+#include "delta.h"
 #include "identity.h"
 #include "multiprocessing.h"
 #include "protocol.h"
@@ -2194,6 +2195,307 @@ static void test_config_receive_rejects_unified_invariants() {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * Wire round-trip equivalence.
+ *
+ * config_wire_equal() is generated from the SAME CONFIG_WIRE_FIELDS table as
+ * the serializer, so it can never miss a serialized field: adding a table
+ * entry automatically extends this comparison.  Each KIND maps to a comparison
+ * macro; STR_OPT/STR_KEEP normalize the NULL-vs-"" canonicalization the
+ * receiver performs, RAW_MAXALLOC models the server-side clamp, and
+ * DERIVED_DELTA compares the effective (whole_file-suppressed) bit.
+ * ------------------------------------------------------------------------- */
+static void golden_config_populate(Config* c);
+
+static bool str_opt_equal(const char* a, const char* b) {
+  if (a == NULL || a[0] == '\0')
+    return b == NULL || b[0] == '\0';
+  return b != NULL && strcmp(a, b) == 0;
+}
+
+static bool idmap_equal(const IdentityMap* a, int ac, const IdentityMap* b, int bc) {
+  if (ac != bc)
+    return false;
+  for (int i = 0; i < ac; i++) {
+    if (a[i].from != b[i].from || a[i].to != b[i].to)
+      return false;
+  }
+  return true;
+}
+
+static bool skip_suffixes_equal(const Config* a, const Config* b) {
+  if (a->skip_compress_count != b->skip_compress_count)
+    return false;
+  for (int i = 0; i < a->skip_compress_count; i++) {
+    if (!str_opt_equal(a->skip_compress_suffixes[i], b->skip_compress_suffixes[i]))
+      return false;
+  }
+  return true;
+}
+
+static bool basis_equal(const Config* a, const Config* b) {
+  if (a->basis_count != b->basis_count)
+    return false;
+  for (int i = 0; i < a->basis_count; i++) {
+    if (a->basis_dirs[i].type != b->basis_dirs[i].type ||
+        !str_opt_equal(a->basis_dirs[i].path, b->basis_dirs[i].path))
+      return false;
+  }
+  return true;
+}
+
+#define CONFIG_CMP_BOOL(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_RAW(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_BOOL_8BIT(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_RAW_MAXALLOC(a, b, name)                                                        \
+  ((b)->name == ((a)->name > MAX_SERVER_ALLOC ? MAX_SERVER_ALLOC : (a)->name))
+#define CONFIG_CMP_DERIVED_DELTA(a, b, name) ((b)->name == ((a)->name && !(a)->whole_file))
+#define CONFIG_CMP_STR(a, b, name)                                                                 \
+  ((a)->name != NULL && (b)->name != NULL && strcmp((a)->name, (b)->name) == 0)
+#define CONFIG_CMP_STR_OPT(a, b, name) str_opt_equal((a)->name, (b)->name)
+#define CONFIG_CMP_STR_KEEP(a, b, name) str_opt_equal((a)->name, (b)->name)
+#define CONFIG_CMP_STR_MODULE(a, b, name) str_opt_equal((a)->name, (b)->name)
+#define CONFIG_CMP_STR_REDACTED_AUTH(a, b, name) str_opt_equal((a)->name, (b)->name)
+#define CONFIG_CMP_INT_CHECKSUM_ALGO(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_SUPERMODE(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT_IDENTITY(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT_SKIPCOUNT(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT_BASISCOUNT(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT_IDMAPCOUNT(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_BOOL_XATTR_DERIVE(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_COPY_AS_PRESENCE(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_COPY_AS_ID(a, b, name) (!(a)->copy_as_set || (a)->name == (b)->name)
+#define CONFIG_CMP_BLOCK_SKIP_SUFFIXES(a, b, name) skip_suffixes_equal((a), (b))
+#define CONFIG_CMP_BLOCK_BASIS(a, b, name) basis_equal((a), (b))
+#define CONFIG_CMP_BLOCK_IDMAP(a, b, name)                                                         \
+  idmap_equal((a)->name, (a)->name##_count, (b)->name, (b)->name##_count)
+
+#define WIRE_CMP(name, ctype, def, kind)                                                           \
+  &&(CONFIG_CMP_##kind(a, b, name)                                                                 \
+         ? true                                                                                    \
+         : (fprintf(stderr, "    mismatched field: %s\n", #name), false))
+
+static bool config_wire_equal(const Config* a, const Config* b) {
+  return true CONFIG_WIRE_FIELDS(WIRE_CMP);
+}
+
+static bool roundtrip_and_compare(const Config* send_cfg) {
+  int p[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0)
+    return false;
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    io_set_bwlimit(0);
+    Config* recv = config_receive(p[0]);
+    bool equal = recv != NULL && config_wire_equal(send_cfg, recv);
+    config_delete(recv);
+    close(p[0]);
+    _exit(equal ? 0 : 1);
+  }
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  io_set_bwlimit(0);
+  bool sent = config_send(p[1], send_cfg);
+  int status;
+  waitpid(pid, &status, 0);
+  close(p[1]);
+  return sent && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* Every serialized field must survive a frame round-trip, for a defaults config
+ * and for a fully-populated config. */
+static void test_config_wire_roundtrip_all_fields() {
+  if (is_running_under_valgrind())
+    return;
+
+  Config* defaults = config_create();
+  EXPECT_NOT_NULL(defaults);
+  defaults->send_directory = str_dup("/src");
+  defaults->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(roundtrip_and_compare(defaults));
+  config_delete(defaults);
+
+  Config* populated = config_create();
+  EXPECT_NOT_NULL(populated);
+  golden_config_populate(populated);
+  /* Keep the populated config within the server-side validation bounds. */
+  populated->delta_max_file_size = DELTA_MAX_FILE_SIZE;
+  populated->whole_file = false;
+  /* "X" is not part of FastSync's chmod grammar (see parse_clause), so use a
+   * spec the receiver-side validator accepts. */
+  free(populated->chmod_spec);
+  populated->chmod_spec = str_dup("u=rw,go=r");
+  EXPECT_TRUE(roundtrip_and_compare(populated));
+  config_delete(populated);
+}
+
+/* Populate every serialized field with a non-default value so the wire frame
+ * exercises each table entry.  The values are deterministic. */
+static void golden_config_populate(Config* c) {
+  c->eight_bit_output = true;
+  c->max_alloc = 123456789ULL;
+  c->send_directory = str_dup("/golden/src");
+  c->receive_root_directory = str_dup("/golden/dst");
+  c->save_to_disk = true;
+  c->use_multithreading = true;
+  c->use_chunk_serialization = false;
+  c->use_compression = false;
+  c->use_metadata = true;
+  c->use_executability = true;
+  c->compression_level = 7;
+  c->chunk_size = 65536;
+  c->use_sendfile = false;
+  c->use_delete = true;
+  c->use_incremental = true;
+  c->size_only = true;
+  c->ignore_times = true;
+  c->use_delta = true;
+  c->whole_file = false;
+  c->delta_block_size = 4096;
+  c->delta_max_file_size = 987654321ULL;
+  c->backup = true;
+  c->backup_dir = str_dup("/golden/backup");
+  c->remove_source_files = true;
+  c->follow_symlinks = true;
+  c->copy_links = true;
+  c->safe_links = true;
+  c->copy_unsafe_links = true;
+  c->preserve_hard_links = true;
+  c->preserve_acls = true;
+  c->preserve_xattrs = true;
+  c->preserve_devices = true;
+  c->preserve_sparse = true;
+  c->preserve_specials = true;
+  c->copy_devices = true;
+  c->write_devices = true;
+  c->ignore_existing = true;
+  c->existing = true;
+  c->update = true;
+  c->inplace = false;
+  c->delay_updates = false;
+  c->append = false;
+  c->use_fsync = true;
+  c->append_verify = false;
+  c->delete_excluded = true;
+  c->force_delete = true;
+  c->delete_missing_args = true;
+  c->delete_after = true;
+  c->preallocate = true;
+  c->max_delete = 42;
+  c->relative = true;
+  c->prune_empty_dirs = true;
+  c->mkpath = true;
+  c->delete_during = false;
+  c->delete_delay = false;
+  c->temp_dir = str_dup("/golden/tmp");
+  c->partial = true;
+  c->partial_dir = str_dup("/golden/partial");
+  c->suffix = str_dup(".golden");
+  c->delete_before = false;
+  c->checksum = true;
+  c->modify_window = 3;
+  c->compress_choice = str_dup("zstd");
+  c->chmod_spec = str_dup("u=rwX,go=rX");
+  c->skip_compress_set = true;
+  c->skip_compress_count = 2;
+  c->skip_compress_suffixes = calloc(2, sizeof(char*));
+  c->skip_compress_suffixes[0] = str_dup(".gz");
+  c->skip_compress_suffixes[1] = str_dup(".xz");
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_COMPARE, "compare"), 0);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "link"), 0);
+  c->fuzzy = true;
+  c->checksum_algo = CHECKSUM_ALGO_MD5;
+  c->checksum_seed = 0x1122334455667788ULL;
+  c->numeric_ids = true;
+  c->chown_uid_set = true;
+  c->chown_uid = 1234;
+  c->chown_gid_set = true;
+  c->chown_gid = 5678;
+  c->usermap_count = 2;
+  c->usermap = calloc(2, sizeof(IdentityMap));
+  c->usermap[0].from = IDENTITY_MATCH_ANY;
+  c->usermap[0].to = 1000;
+  c->usermap[1].from = 5;
+  c->usermap[1].to = 6;
+  c->groupmap_count = 1;
+  c->groupmap = calloc(1, sizeof(IdentityMap));
+  c->groupmap[0].from = 7;
+  c->groupmap[0].to = 8;
+  c->preserve_atimes = true;
+  c->preserve_crtimes = true;
+  c->omit_dir_times = true;
+  c->omit_link_times = true;
+  c->munge_links = true;
+  c->keep_dirlinks = true;
+  c->fake_super = true;
+  c->module = str_dup("goldenmod");
+  c->auth_user = str_dup("goldenuser");
+  c->auth_password = str_dup("golden-pw");
+  c->iconv_spec = str_dup("UTF-8,UTF-8");
+  c->super_mode = SUPER_MODE_ON;
+  c->copy_as_set = true;
+  c->copy_as_uid = 111;
+  c->copy_as_gid = 222;
+}
+
+/* FNV-1a 64 over the exact config-frame bytes emitted by
+ * config_send_wire_block().  This pins field order and width: any reorder or
+ * resize changes the hash. */
+static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) {
+  int p[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0)
+    return 0;
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    io_set_bwlimit(0);
+    bool ok = config_send_wire_block(p[0], cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  }
+  close(p[0]);
+  unsigned long long h = 1469598103934665603ULL;
+  unsigned char buf[4096];
+  ssize_t n;
+  size_t total = 0;
+  while ((n = read(p[1], buf, sizeof(buf))) > 0) {
+    for (ssize_t i = 0; i < n; i++) {
+      h ^= (unsigned long long)buf[i];
+      h *= 1099511628211ULL;
+    }
+    total += (size_t)n;
+  }
+  close(p[1]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    return 0;
+  *out_len = total;
+  return h;
+}
+
+/* Byte-for-byte wire compatibility guard (protocol 2.20.0).  The expected hash
+ * was captured from the pre-X-macro implementation; the refactor MUST NOT
+ * change it. */
+static void test_config_wire_golden() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  golden_config_populate(c);
+  size_t len = 0;
+  unsigned long long h = capture_wire_hash(c, &len);
+  printf("    wire golden: len=%zu hash=%llu\n", len, h);
+  /* Captured from the pre-X-macro (protocol 2.20.0) implementation. */
+  EXPECT_TRUE(len == 633);
+  EXPECT_TRUE(h == 6163263374908258816ULL);
+  config_delete(c);
+}
+
 void test_config() {
   test_config_lifecycle();
   test_config_ssh_dest();
@@ -2249,6 +2551,8 @@ void test_config() {
     test_config_receive_with_validate_rejects();
     test_config_invariants_error_all_combinations();
     test_config_receive_rejects_unified_invariants();
+    test_config_wire_golden();
+    test_config_wire_roundtrip_all_fields();
   }
   test_identity_copy_as_refused();
   test_identity_ownership_requested();
