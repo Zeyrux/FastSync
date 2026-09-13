@@ -37,6 +37,13 @@
 
 #define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
+/* Aggregate loaded payload bytes the sender may buffer across the loader queue
+   and the chunk in flight.  Sending one chunk adds up to ~2 * MAX_CHUNK_SIZE of
+   transient serialize/compress buffers on top of the queued payloads, so this
+   ceiling keeps total pipeline memory within MAX_CONNECTION_MEMORY (mirrors the
+   receiver's RECEIVER_QUEUE_MAX_BYTES). */
+#define SENDER_QUEUE_MAX_BYTES (MAX_CONNECTION_MEMORY - 2 * MAX_CHUNK_SIZE)
+
 /* Forward declaration for progress-reporting thread used in multithreaded send. */
 static int progress_thread_fn(void* arg);
 
@@ -1493,6 +1500,10 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       protocol_session_unbind();
       return thrd_error;
     }
+    /* Payload bytes this chunk was charged for on the loader's byte budget.
+       Computed before destruction and released after the memory is actually
+       freed, so a loader blocked on the budget wakes only once room exists. */
+    size_t queued_payload = pipeline_context_sender_chunk_bytes(current_chunk);
     unsigned long long chunk_bytes = 0;
     int chunk_files = 0;
     for (int i = 0; i < current_chunk->element_count; i++) {
@@ -1507,6 +1518,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     context->progress_bytes = context->total_bytes;
     mtx_unlock(&context->mutex_progress);
     chunk_destroy(current_chunk);
+    pipeline_context_sender_note_bytes_released(context, queued_payload);
   }
 
   /* Completion tail: reached on natural exhaustion or an early stop deadline.
@@ -1728,11 +1740,7 @@ static int load_files_multithreaded(void* pipeline_context) {
         }
       }
     }
-    if (!queue_enqueue_multithreaded_cancel(context->queue_loader, chunk, &context->mutex_loader,
-                                            &context->condition_not_empty_loader,
-                                            &context->condition_not_full_loader,
-                                            &context->cancelled)) {
-      chunk_destroy(chunk);
+    if (!pipeline_context_sender_enqueue_chunk(context, chunk)) {
       pipeline_cancel(context);
       protocol_session_unbind();
       return thrd_error;
@@ -2197,8 +2205,13 @@ int send_files_multithreaded(Config** config_ptr) {
   unsigned long long available_memory =
       pages > 0 && page_size > 0 ? (unsigned long long)pages * (unsigned long long)page_size
                                  : 512ULL * 1024 * 1024;
-  unsigned long long avg_file_size = 1024 * 1024;
-  int qsize = (int)(available_memory / avg_file_size);
+  /* Size the chunk queues from the actual chunk size rather than a fixed 1 MiB
+     average: a chunk holds roughly `chunk_size` bytes of file data, so counting
+     chunks at 1 MiB over-estimated the queue capacity by up to 10x.  The byte
+     budget below is the authoritative bound; this count keeps the unloaded
+     chunks waiting in the scanner queue bounded too. */
+  unsigned long long chunk_size = config->chunk_size > 0 ? config->chunk_size : DEFAULT_CHUNK_SIZE;
+  int qsize = (int)(available_memory / chunk_size);
   if (qsize < 10)
     qsize = 10;
   if (qsize > 1000)
@@ -2223,7 +2236,8 @@ int send_files_multithreaded(Config** config_ptr) {
   }
   context->missing_args = missing_args;
   missing_args = NULL; /* owned by the context from here on */
-  *config_ptr = NULL;  /* context now owns config through all remaining paths */
+  pipeline_context_sender_set_queue_byte_limit(context, SENDER_QUEUE_MAX_BYTES);
+  *config_ptr = NULL; /* context now owns config through all remaining paths */
   struct timespec now_mono;
   if (clock_gettime(CLOCK_MONOTONIC, &now_mono) != 0) {
     now_mono.tv_sec = 0;

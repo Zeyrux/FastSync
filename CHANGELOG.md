@@ -4,6 +4,35 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [2.20.0] - 2026-09-13
+
+### Security
+
+- Cap cumulative `DirTimeList` growth and bound pre-auth config-string memory
+  (remote memory-exhaustion DoS).
+- Daemon host access control (`hosts allow`/`hosts deny`, IPv4/IPv6/CIDR),
+  configurable global `max connections`, connection audit logging, and a
+  bounded `auth failure delay` throttle. IPv4-mapped peers are normalized and
+  invalid patterns are rejected at parse time (no silent fail-open).
+- Honor `--timeout` for protocol I/O and bound idle/session time to defeat
+  keepalive slowloris; child-safe signal handling in the forked daemon.
+- Compiler/linker hardening (`_FORTIFY_SOURCE`, stack protector, PIE, RELRO)
+  and pinned build dependencies.
+
+### Fixed
+
+- Use-after-free in the basis-dir oversize preflight.
+- Placeholder `Data` leaks, `missing_args` leak, scanner chunk leak.
+- Thread-safe logging; single fd owner and cleanup epilogue in the server
+  handler.
+
+### Performance
+
+- Metadata now crosses the wire as one packed frame (protocol 2.20.0).
+- Delete keep-set and `--files-from` lookups indexed (O(n*m) → O(n)).
+- Reused per-thread zstd contexts; `TCP_NODELAY` by default.
+- Byte-bounded sender queues; removed a redundant scanner `stat()`.
+
 ## [2.19.0] - 2026-09-12
 
 ### Security

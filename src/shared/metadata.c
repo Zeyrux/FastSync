@@ -157,33 +157,17 @@ FileMetadata* metadata_from_buf(char** buf) {
 
 bool metadata_send(int file_descriptor, const FileMetadata* m) {
   if (m == NULL) {
-    int32_t zero = 0;
-    return send_n_data(file_descriptor, &zero, sizeof(zero));
+    int32_t absent = 0;
+    return send_n_data(file_descriptor, &absent, sizeof(absent));
   }
-  int32_t present = 1;
-  int32_t mode = (int32_t)m->mode;
-  int32_t uid = (int32_t)m->uid;
-  int32_t gid = (int32_t)m->gid;
-  int64_t mtime_sec = (int64_t)m->mtime_sec;
-  int64_t mtime_nsec = (int64_t)m->mtime_nsec;
-  int32_t atime_valid = m->atime_valid ? 1 : 0;
-  int64_t atime_sec = (int64_t)m->atime_sec;
-  int64_t atime_nsec = (int64_t)m->atime_nsec;
-  int32_t crtime_valid = m->crtime_valid ? 1 : 0;
-  int64_t crtime_sec = (int64_t)m->crtime_sec;
-  int64_t crtime_nsec = (int64_t)m->crtime_nsec;
-  return send_n_data(file_descriptor, &present, sizeof(present)) &&
-         send_n_data(file_descriptor, &mode, sizeof(mode)) &&
-         send_n_data(file_descriptor, &uid, sizeof(uid)) &&
-         send_n_data(file_descriptor, &gid, sizeof(gid)) &&
-         send_n_data(file_descriptor, &mtime_sec, sizeof(mtime_sec)) &&
-         send_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec)) &&
-         send_n_data(file_descriptor, &atime_valid, sizeof(atime_valid)) &&
-         send_n_data(file_descriptor, &atime_sec, sizeof(atime_sec)) &&
-         send_n_data(file_descriptor, &atime_nsec, sizeof(atime_nsec)) &&
-         send_n_data(file_descriptor, &crtime_valid, sizeof(crtime_valid)) &&
-         send_n_data(file_descriptor, &crtime_sec, sizeof(crtime_sec)) &&
-         send_n_data(file_descriptor, &crtime_nsec, sizeof(crtime_nsec));
+  /* One packed frame (protocol 2.20.0): the int32 present flag followed by the
+     fixed FILE_METADATA_WIRE_SIZE-byte field record.  metadata_to_buf() emits
+     exactly that layout (present + fields), so build it once and write the
+     whole record in a single call instead of one frame per field. */
+  char packed[sizeof(int32_t) + FILE_METADATA_WIRE_SIZE];
+  char* cursor = packed;
+  metadata_to_buf(&cursor, m);
+  return send_n_data(file_descriptor, packed, sizeof(packed));
 }
 
 FileMetadata* metadata_receive(int file_descriptor, int* ok) {
@@ -203,105 +187,18 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
       *ok = 0;
     return NULL;
   }
-  FileMetadata* m = protocol_alloc(sizeof(FileMetadata));
+  /* Rebuild the packed record metadata_from_buf() expects: the present flag we
+     just read, followed by exactly FILE_METADATA_WIRE_SIZE field bytes. */
+  char packed[sizeof(int32_t) + FILE_METADATA_WIRE_SIZE];
+  memcpy(packed, &present, sizeof(present));
+  if (!receive_n_data(file_descriptor, packed + sizeof(present), FILE_METADATA_WIRE_SIZE)) {
+    if (ok)
+      *ok = 0;
+    return NULL;
+  }
+  char* cursor = packed;
+  FileMetadata* m = metadata_from_buf(&cursor);
   if (m == NULL) {
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  int32_t mode;
-  if (!receive_n_data(file_descriptor, &mode, sizeof(mode))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->mode = (mode_t)mode;
-  int32_t uid;
-  if (!receive_n_data(file_descriptor, &uid, sizeof(uid))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->uid = (uid_t)uid;
-  int32_t gid;
-  if (!receive_n_data(file_descriptor, &gid, sizeof(gid))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->gid = (gid_t)gid;
-  int64_t mtime_sec;
-  if (!receive_n_data(file_descriptor, &mtime_sec, sizeof(mtime_sec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->mtime_sec = (time_t)mtime_sec;
-  int64_t mtime_nsec;
-  if (!receive_n_data(file_descriptor, &mtime_nsec, sizeof(mtime_nsec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->mtime_nsec = (long)mtime_nsec;
-  int32_t atime_valid;
-  if (!receive_n_data(file_descriptor, &atime_valid, sizeof(atime_valid))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  int64_t atime_sec;
-  if (!receive_n_data(file_descriptor, &atime_sec, sizeof(atime_sec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  int64_t atime_nsec;
-  if (!receive_n_data(file_descriptor, &atime_nsec, sizeof(atime_nsec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  int32_t crtime_valid;
-  if (!receive_n_data(file_descriptor, &crtime_valid, sizeof(crtime_valid))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  int64_t crtime_sec;
-  if (!receive_n_data(file_descriptor, &crtime_sec, sizeof(crtime_sec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  int64_t crtime_nsec;
-  if (!receive_n_data(file_descriptor, &crtime_nsec, sizeof(crtime_nsec))) {
-    free(m);
-    if (ok)
-      *ok = 0;
-    return NULL;
-  }
-  m->atime_valid = atime_valid != 0;
-  m->atime_sec = (time_t)atime_sec;
-  m->atime_nsec = (long)atime_nsec;
-  m->crtime_valid = crtime_valid != 0;
-  m->crtime_sec = (time_t)crtime_sec;
-  m->crtime_nsec = (long)crtime_nsec;
-  if (mtime_nsec < 0 || mtime_nsec >= 1000000000LL || mode < 0 || uid < 0 || gid < 0 ||
-      atime_valid < 0 || atime_valid > 1 || crtime_valid < 0 || crtime_valid > 1 ||
-      (atime_valid && (atime_nsec < 0 || atime_nsec >= 1000000000LL)) ||
-      (crtime_valid && (crtime_nsec < 0 || crtime_nsec >= 1000000000LL))) {
-    free(m);
     if (ok)
       *ok = 0;
     return NULL;

@@ -5,6 +5,8 @@
 #include "test_utils.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -134,6 +136,115 @@ static void test_metadata_send_null() {
   close(p[1]);
 }
 
+/* protocol 2.20.0: metadata is one packed frame.  With metadata present the
+ * wire record is exactly sizeof(int32_t) + FILE_METADATA_WIRE_SIZE bytes (the
+ * present flag followed by the fixed field record); absent metadata is a lone
+ * int32 zero. */
+static void test_metadata_wire_is_one_packed_frame() {
+  io_set_bwlimit(0);
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  io_set_fds(p[0], p[1]);
+
+  FileMetadata original = {.mode = 0640,
+                           .uid = 42,
+                           .gid = 43,
+                           .mtime_sec = 111,
+                           .mtime_nsec = 222,
+                           .atime_valid = true,
+                           .atime_sec = 333,
+                           .atime_nsec = 444,
+                           .crtime_valid = false,
+                           .crtime_sec = 0,
+                           .crtime_nsec = 0};
+  EXPECT_TRUE(metadata_send(p[1], &original));
+
+  unsigned char wire[sizeof(int32_t) + FILE_METADATA_WIRE_SIZE];
+  EXPECT_EQ_INT((int)read(p[0], wire, sizeof(wire)), (int)sizeof(wire));
+  int32_t flag;
+  memcpy(&flag, wire, sizeof(flag));
+  EXPECT_EQ_INT(flag, 1);
+  int avail = -1;
+  EXPECT_EQ_INT(ioctl(p[0], FIONREAD, &avail), 0);
+  EXPECT_EQ_INT(avail, 0);
+
+  /* The present frame decodes in one shot with the shared codec. */
+  char* cursor = (char*)wire;
+  FileMetadata* decoded = metadata_from_buf(&cursor);
+  EXPECT_NOT_NULL(decoded);
+  EXPECT_EQ_INT((int)(cursor - (char*)wire), (int)sizeof(wire));
+  EXPECT_EQ_INT(decoded->mode, 0640);
+  EXPECT_EQ_INT(decoded->uid, 42);
+  EXPECT_EQ_INT(decoded->gid, 43);
+  EXPECT_EQ_INT(decoded->mtime_sec, 111);
+  EXPECT_EQ_INT(decoded->mtime_nsec, 222);
+  EXPECT_TRUE(decoded->atime_valid);
+  EXPECT_EQ_INT(decoded->atime_sec, 333);
+  EXPECT_EQ_INT(decoded->atime_nsec, 444);
+  EXPECT_FALSE(decoded->crtime_valid);
+  free(decoded);
+
+  /* Absent metadata is a lone int32 zero (4 bytes). */
+  EXPECT_TRUE(metadata_send(p[1], NULL));
+  EXPECT_EQ_INT((int)read(p[0], wire, sizeof(int32_t)), (int)sizeof(int32_t));
+  memcpy(&flag, wire, sizeof(flag));
+  EXPECT_EQ_INT(flag, 0);
+  avail = -1;
+  EXPECT_EQ_INT(ioctl(p[0], FIONREAD, &avail), 0);
+  EXPECT_EQ_INT(avail, 0);
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* Round-trip over a socketpair (not just a pipe): present metadata compares
+ * equal field-by-field and absent metadata yields NULL with ok == 1. */
+static void test_metadata_send_receive_socketpair() {
+  io_set_bwlimit(0);
+  int sv[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+  io_set_fds(sv[0], sv[1]);
+
+  FileMetadata original = {.mode = 0600,
+                           .uid = 7,
+                           .gid = 8,
+                           .mtime_sec = 1000,
+                           .mtime_nsec = 1,
+                           .atime_valid = true,
+                           .atime_sec = 2000,
+                           .atime_nsec = 2,
+                           .crtime_valid = true,
+                           .crtime_sec = 3000,
+                           .crtime_nsec = 3};
+  EXPECT_TRUE(metadata_send(sv[1], &original));
+
+  int ok = 0;
+  FileMetadata* received = metadata_receive(sv[0], &ok);
+  EXPECT_NOT_NULL(received);
+  EXPECT_EQ_INT(ok, 1);
+  EXPECT_EQ_INT(received->mode, 0600);
+  EXPECT_EQ_INT(received->uid, 7);
+  EXPECT_EQ_INT(received->gid, 8);
+  EXPECT_EQ_INT(received->mtime_sec, 1000);
+  EXPECT_EQ_INT(received->mtime_nsec, 1);
+  EXPECT_TRUE(received->atime_valid);
+  EXPECT_EQ_INT(received->atime_sec, 2000);
+  EXPECT_EQ_INT(received->atime_nsec, 2);
+  EXPECT_TRUE(received->crtime_valid);
+  EXPECT_EQ_INT(received->crtime_sec, 3000);
+  EXPECT_EQ_INT(received->crtime_nsec, 3);
+  free(received);
+
+  EXPECT_TRUE(metadata_send(sv[1], NULL));
+  ok = 0;
+  received = metadata_receive(sv[0], &ok);
+  EXPECT_NULL(received);
+  EXPECT_EQ_INT(ok, 1);
+
+  close(sv[0]);
+  close(sv[1]);
+}
+
 static void test_metadata_rejects_invalid_values() {
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -148,36 +259,30 @@ static void test_metadata_rejects_invalid_values() {
 }
 
 /* metadata_receive must reject an out-of-range atime/crtime nsec even when the
- * flag would otherwise be valid (defense-in-depth on the -U/-N wire fields). */
+ * flag would otherwise be valid (defense-in-depth on the -U/-N wire fields).
+ * The packed record is built by the shared codec so the out-of-range value
+ * actually reaches the wire. */
 static void test_metadata_receive_rejects_bad_optional_times() {
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
   io_set_fds(p[0], p[1]);
 
-  int32_t present = 1;
-  int32_t mode = 0644;
-  int32_t uid = 1000;
-  int32_t gid = 1000;
-  int64_t mtime_sec = 1;
-  int64_t mtime_nsec = 0;
-  int32_t atime_valid = 1;
-  int64_t atime_sec = 1;
-  int64_t atime_nsec = 2000000000; /* invalid: >= 1e9 */
-  EXPECT_TRUE(send_n_data(p[1], &present, sizeof(present)));
-  EXPECT_TRUE(send_n_data(p[1], &mode, sizeof(mode)));
-  EXPECT_TRUE(send_n_data(p[1], &uid, sizeof(uid)));
-  EXPECT_TRUE(send_n_data(p[1], &gid, sizeof(gid)));
-  EXPECT_TRUE(send_n_data(p[1], &mtime_sec, sizeof(mtime_sec)));
-  EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
-  EXPECT_TRUE(send_n_data(p[1], &atime_valid, sizeof(atime_valid)));
-  EXPECT_TRUE(send_n_data(p[1], &atime_sec, sizeof(atime_sec)));
-  EXPECT_TRUE(send_n_data(p[1], &atime_nsec, sizeof(atime_nsec)));
-  int32_t crtime_valid = 0;
-  int64_t crtime_sec = 0;
-  int64_t crtime_nsec = 0;
-  EXPECT_TRUE(send_n_data(p[1], &crtime_valid, sizeof(crtime_valid)));
-  EXPECT_TRUE(send_n_data(p[1], &crtime_sec, sizeof(crtime_sec)));
-  EXPECT_TRUE(send_n_data(p[1], &crtime_nsec, sizeof(crtime_nsec)));
+  FileMetadata bad = {.mode = 0644,
+                      .uid = 1000,
+                      .gid = 1000,
+                      .mtime_sec = 1,
+                      .mtime_nsec = 0,
+                      .atime_valid = true,
+                      .atime_sec = 1,
+                      .atime_nsec = 2000000000, /* invalid: >= 1e9 */
+                      .crtime_valid = false,
+                      .crtime_sec = 0,
+                      .crtime_nsec = 0};
+  char packed[sizeof(int32_t) + FILE_METADATA_WIRE_SIZE];
+  char* write_ptr = packed;
+  metadata_to_buf(&write_ptr, &bad);
+  EXPECT_TRUE(send_n_data(p[1], packed, sizeof(packed)));
+
   int ok = 1;
   EXPECT_NULL(metadata_receive(p[0], &ok));
   EXPECT_EQ_INT(ok, 0);
@@ -235,12 +340,13 @@ static void test_file_restore_metadata() {
   const char* content = "test content";
   EXPECT_TRUE(file_write_to_disk(path, content, strlen(content), false, false));
 
-  FileMetadata m;
-  m.mode = 0644;
-  m.uid = getuid();
-  m.gid = getgid();
-  m.mtime_sec = 1234567890;
-  m.mtime_nsec = 0;
+  FileMetadata m = {.mode = 0644,
+                    .uid = getuid(),
+                    .gid = getgid(),
+                    .mtime_sec = 1234567890,
+                    .mtime_nsec = 0,
+                    .atime_valid = false,
+                    .crtime_valid = false};
 
   file_restore_metadata(path, &m, false);
 
@@ -347,6 +453,8 @@ void test_metadata() {
   test_metadata_from_buf_null();
   test_metadata_send_receive_roundtrip();
   test_metadata_send_null();
+  test_metadata_wire_is_one_packed_frame();
+  test_metadata_send_receive_socketpair();
   test_metadata_rejects_invalid_values();
   test_metadata_receive_rejects_bad_optional_times();
   test_metadata_mtime_window();

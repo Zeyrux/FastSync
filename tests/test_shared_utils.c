@@ -150,6 +150,43 @@ static void test_walker_removes_extras_keeps_manifest_and_protected() {
   free(root);
 }
 
+static void test_walker_keeps_nested_manifest_dirs() {
+  /* The keep-set index must preserve deep content: a directory is protected
+     when its own name is a keep entry OR when kept content lives below it, and
+     an exact kept file survives while its siblings are removed. */
+  char* root = make_walk_root("nestedkeep");
+  EXPECT_NOT_NULL(root);
+  EXPECT_TRUE(write_file_at(root, "extra.txt", "extra"));
+  EXPECT_EQ_INT(make_subdir(root, "keepdir"), 0);
+  EXPECT_EQ_INT(make_subdir(root, "keepdir/deep"), 0);
+  EXPECT_TRUE(write_file_at(root, "keepdir/deep/keep.txt", "kept"));
+  EXPECT_TRUE(write_file_at(root, "keepdir/extra2.txt", "extra"));
+  EXPECT_EQ_INT(make_subdir(root, "dropdir"), 0);
+  EXPECT_EQ_INT(make_subdir(root, "keep2"), 0);
+  EXPECT_TRUE(write_file_at(root, "keep2/inner.txt", "kept"));
+  EXPECT_EQ_INT(make_subdir(root, "keep3"), 0);
+
+  const char* keeps[] = {"keepdir/deep/keep.txt", "keep2/inner.txt", "keep3"};
+  ArrayList* manifest = make_manifest_strings(keeps, 3);
+  EXPECT_NOT_NULL(manifest);
+  size_t deleted = 0;
+  DeleteWalkResult result = delete_extras_limited(root, manifest, 100000, NULL, 0, &deleted);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
+  EXPECT_FALSE(file_exists(root, "extra.txt"));
+  EXPECT_TRUE(file_exists(root, "keepdir/deep/keep.txt"));
+  EXPECT_FALSE(file_exists(root, "keepdir/extra2.txt"));
+  EXPECT_TRUE(dir_exists(root, "keepdir"));
+  EXPECT_TRUE(dir_exists(root, "keepdir/deep"));
+  EXPECT_FALSE(dir_exists(root, "dropdir"));
+  EXPECT_TRUE(dir_exists(root, "keep2"));
+  EXPECT_TRUE(file_exists(root, "keep2/inner.txt"));
+  EXPECT_TRUE(dir_exists(root, "keep3")); /* an exact directory keep entry survives */
+  EXPECT_EQ_INT((int)deleted, 3);
+  array_list_delete(manifest);
+  remove_walk_tree(root);
+  free(root);
+}
+
 static void test_walker_max_delete_exceeded_deletes_nothing() {
   char* root = make_walk_root("maxdel");
   EXPECT_NOT_NULL(root);
@@ -419,8 +456,74 @@ static void test_fd_peer_ip() {
   EXPECT_EQ_STR(peer_string, "");
 }
 
+/* The keep/files-from indexes must store exactly the input entries (one node
+   each), never a copied ancestor prefix per component.  This builds a PathIndex
+   over paths thousands of components deep and checks the structural bound plus
+   the exact / descendant query semantics. */
+static void test_path_index_bounded() {
+  enum { COUNT = 8, COMPONENTS = 5000 };
+  size_t entry_len = (size_t)COMPONENTS * 2 + 2; /* trailing "xN" */
+  char* storage = malloc((size_t)COUNT * (entry_len + 1));
+  EXPECT_NOT_NULL(storage);
+  const char** entries = calloc(COUNT, sizeof(char*));
+  EXPECT_NOT_NULL(entries);
+  for (int i = 0; i < COUNT; i++) {
+    char* entry = storage + (size_t)i * (entry_len + 1);
+    size_t pos = 0;
+    for (int c = 0; c < COMPONENTS; c++) {
+      entry[pos++] = 'a';
+      entry[pos++] = '/';
+    }
+    entry[pos++] = 'x';
+    entry[pos++] = (char)('0' + i);
+    entry[pos] = '\0';
+    entries[i] = entry;
+  }
+
+  PathIndex index;
+  EXPECT_TRUE(path_index_build(&index, entries, COUNT));
+  EXPECT_EQ_INT((int)index.sorted.count, COUNT);
+  EXPECT_EQ_INT((int)index.exact.size, COUNT);
+  EXPECT_TRUE(path_index_contains(&index, entries[0]));
+  EXPECT_FALSE(path_index_contains(&index, "a"));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a"));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a/a"));
+  EXPECT_FALSE(path_index_has_descendant(&index, "aa"));
+  path_index_free(&index);
+
+  free((void*)entries);
+  free(storage);
+}
+
+static void test_path_index_semantics() {
+  const char* entries[] = {"a/b/c.txt", "a/b/d.txt", "x.txt", "deep/deeper/deepest"};
+  PathIndex index;
+  EXPECT_TRUE(path_index_build(&index, entries, 4));
+  EXPECT_TRUE(path_index_contains(&index, "a/b/c.txt"));
+  EXPECT_FALSE(path_index_contains(&index, "a/b"));
+  EXPECT_TRUE(path_index_contains_n(&index, "a/b/c.txt/ignored", 9));
+  EXPECT_FALSE(path_index_contains_n(&index, "a/b/c.txt/ignored", 10));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a"));
+  EXPECT_TRUE(path_index_has_descendant(&index, "a/b"));
+  EXPECT_FALSE(path_index_has_descendant(&index, "a/b/c.txt"));
+  EXPECT_FALSE(path_index_has_descendant(&index, "ab"));
+  EXPECT_FALSE(path_index_has_descendant(&index, ""));
+  path_index_free(&index);
+
+  /* A zero-entry index answers no queries. */
+  PathIndex empty;
+  EXPECT_TRUE(path_index_build(&empty, NULL, 0));
+  EXPECT_EQ_INT((int)empty.sorted.count, 0);
+  EXPECT_FALSE(path_index_contains(&empty, "a"));
+  EXPECT_FALSE(path_index_has_descendant(&empty, "a"));
+  path_index_free(&empty);
+}
+
 void test_shared_utils() {
+  test_path_index_bounded();
+  test_path_index_semantics();
   test_walker_removes_extras_keeps_manifest_and_protected();
+  test_walker_keeps_nested_manifest_dirs();
   test_walker_max_delete_exceeded_deletes_nothing();
   test_walker_max_delete_exact_bound_deletes();
   test_walker_unlimited_deletes_all();

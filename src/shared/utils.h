@@ -6,6 +6,77 @@
 #include <stdbool.h>
 #include <sys/socket.h>
 
+/* Small open-addressing string hash set used to turn quadratic membership
+ * scans into O(path length) exact-match lookups (the --delete keep-set and the
+ * --files-from allow-set).  Keys are hashed with xxHash64 (seed 0); collisions
+ * are resolved by linear probing over a power-of-two table that grows at 75%
+ * load.  Keys are always borrowed from the caller and must outlive the set; the
+ * set never copies or owns keys, so indexing M entries costs O(M) memory.  The
+ * set is not thread-safe for mutation, but a fully built set supports
+ * concurrent read-only lookups. */
+typedef struct {
+  const char* key; /* NULL marks an empty slot */
+} StrHashSetSlot;
+
+typedef struct {
+  StrHashSetSlot* slots;
+  size_t capacity; /* power of two, zero before init */
+  size_t size;
+} StrHashSet;
+
+/* Initialize an empty set sized for roughly `hint` entries.  Returns false on
+ * allocation failure. */
+bool str_hash_set_init(StrHashSet* set, size_t hint);
+void str_hash_set_free(StrHashSet* set);
+/* Insert a borrowed key (must outlive the set).  A duplicate is ignored.
+ * Returns false on allocation failure. */
+bool str_hash_set_insert_ref(StrHashSet* set, const char* key);
+/* Look up a NUL-terminated key / a key of `len` bytes. */
+bool str_hash_set_lookup(const StrHashSet* set, const char* key);
+bool str_hash_set_lookup_n(const StrHashSet* set, const char* key, size_t len);
+
+/* Sorted, non-owning view of NUL-terminated strings.  Built from borrowed
+ * pointers (qsort), so indexing M entries costs O(M) memory and O(M log M)
+ * time; exact membership and ancestor-prefix existence are binary searches
+ * that never materialize a prefix copy. */
+typedef struct {
+  const char** items; /* sorted with strcmp; borrowed, never freed */
+  size_t count;
+} StrSortedArray;
+
+/* Build `array` over the borrowed `items`.  Only the pointer array is copied,
+ * never the strings.  Returns false on allocation failure. */
+bool str_sorted_array_build(StrSortedArray* array, const char* const* items, size_t count);
+void str_sorted_array_free(StrSortedArray* array);
+/* True when some item equals `key`. */
+bool str_sorted_array_contains(const StrSortedArray* array, const char* key);
+/* True when some item starts with `key` followed by '/' (i.e. `key` is a proper
+ * ancestor directory of an item).  Allocates nothing. */
+bool str_sorted_array_has_child_prefix(const StrSortedArray* array, const char* key);
+
+/* Read-only membership index over exact relative paths.  `exact` answers
+ * O(path length) equality; `sorted` answers whether any indexed path lies
+ * strictly below a query directory.  Both borrow their keys from the caller and
+ * no ancestor prefix is stored as a separate string, so an index over M entries
+ * is O(M) memory regardless of path depth.  Not thread-safe to build, but safe
+ * for concurrent read-only queries once built. */
+typedef struct {
+  StrHashSet exact;
+  StrSortedArray sorted;
+} PathIndex;
+
+/* Build an index borrowing `entries` (which must outlive the index).  Returns
+ * false on allocation failure, freeing any partial state. */
+bool path_index_build(PathIndex* index, const char* const* entries, size_t count);
+void path_index_free(PathIndex* index);
+/* True when `path` is an indexed entry. */
+bool path_index_contains(const PathIndex* index, const char* path);
+/* Length-bounded form of path_index_contains (`path` need not be terminated). */
+bool path_index_contains_n(const PathIndex* index, const char* path, size_t len);
+/* True when some indexed entry lies strictly below `path` (starts with
+ * `path` + '/'). */
+bool path_index_has_descendant(const PathIndex* index, const char* path);
+
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
 char* path_cat(const char* path1, const char* path2);
@@ -48,10 +119,10 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
    and the delete pass are two separate walks, so a concurrent change between
    them (another process adding/removing entries) can make the second pass
    delete a different set than the first one counted. */
-DeleteWalkResult delete_extras_limited(const char* dest_root, ArrayList* manifest,
+DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        size_t max_delete, const DeleteSkipEntry* skips,
                                        int skip_count, size_t* deleted_out);
-bool delete_extras(const char* dest_root, ArrayList* manifest);
+bool delete_extras(const char* dest_root, const ArrayList* manifest);
 bool utils_set_authorized_root(int fd, const char* canonical_path);
 /* The fd-only compatibility form is fail-closed for path-based operations;
  * callers should use utils_set_authorized_root with the canonical identity. */

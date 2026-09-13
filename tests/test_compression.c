@@ -6,6 +6,7 @@
 #include "utils.h"
 #include <string.h>
 #include <sys/stat.h>
+#include <threads.h>
 #include <unistd.h>
 
 static void test_data_compress_decompress_roundtrip() {
@@ -137,10 +138,84 @@ static void test_chunk_compress_decompress_roundtrip() {
   unlink(path2);
 }
 
+typedef struct {
+  int id;
+  int iterations;
+  bool ok;
+} CompressionThreadArg;
+
+/* Each worker exercises the per-thread cached zstd contexts: several
+ * compress/decompress round-trips with varying payload sizes, levels and
+ * worker counts so the context is reused (and its parameters re-applied)
+ * across calls, concurrently with other workers. */
+static int compression_reuse_worker(void* arg) {
+  CompressionThreadArg* a = (CompressionThreadArg*)arg;
+  a->ok = true;
+  for (int it = 0; it < a->iterations; it++) {
+    size_t size = 512 + (size_t)((a->id * 7919 + it * 104729) % (48 * 1024));
+    char* original = malloc(size);
+    if (!original) {
+      a->ok = false;
+      break;
+    }
+    for (size_t i = 0; i < size; i++)
+      original[i] = (char)((i * 31 + (size_t)a->id + (size_t)it * 7) % 251);
+    Data* input = data_create(original, size);
+    if (!input) { /* data_create takes ownership of original, even on failure */
+      a->ok = false;
+      break;
+    }
+    int level = 1 + ((it / 2) % 5);
+    int threads = ((it / 2) % 2 == 0) ? 2 : 0;
+    Data* compressed = data_compress_with_threads(input, level, threads);
+    if (!compressed) {
+      data_destroy(input);
+      a->ok = false;
+      break;
+    }
+    Data* decompressed = data_decompress(compressed);
+    bool roundtrip_ok = decompressed != NULL && decompressed->size == size &&
+                        memcmp(decompressed->data, original, size) == 0;
+    data_destroy(decompressed);
+    data_destroy(compressed);
+    data_destroy(input);
+    if (!roundtrip_ok) {
+      a->ok = false;
+      break;
+    }
+  }
+  /* Deliberately do NOT free the thread context here: the C11 tss destructor
+   * must release it when this thread exits (validated by LeakSanitizer). */
+  return thrd_success;
+}
+
+static void test_data_compress_reused_contexts_multithreaded() {
+  enum { NTHREADS = 8, ITERATIONS = 6 };
+  thrd_t threads[NTHREADS];
+  CompressionThreadArg args[NTHREADS];
+  bool all_created = true;
+  for (int i = 0; i < NTHREADS; i++) {
+    args[i].id = i;
+    args[i].iterations = ITERATIONS;
+    args[i].ok = false;
+    if (thrd_create(&threads[i], compression_reuse_worker, &args[i]) != thrd_success) {
+      all_created = false;
+      break;
+    }
+  }
+  EXPECT_TRUE(all_created);
+  for (int i = 0; i < NTHREADS; i++)
+    EXPECT_EQ_INT(thrd_join(threads[i], NULL), thrd_success);
+  for (int i = 0; i < NTHREADS; i++)
+    EXPECT_TRUE(args[i].ok);
+  compression_free_thread_contexts();
+}
+
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
   test_skip_compress_suffix_matching();
   test_data_compress_with_threads_roundtrip();
+  test_data_compress_reused_contexts_multithreaded();
   test_chunk_compress_decompress_roundtrip();
 }

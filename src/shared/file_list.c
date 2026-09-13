@@ -104,8 +104,27 @@ static int normalize_entry(const char* raw, size_t len, bool strip_line_endings,
   return result;
 }
 
+/* Build the membership index over the exact entries only.  `file_list_affects`
+   combines the exact/descendant lookups with a walk of the query's own ancestor
+   prefixes, so no ancestor prefix is ever materialized as a copy and the index
+   stays O(entry count) memory regardless of path depth.  An empty entry (the
+   source root) sets whole_tree and short-circuits every query. */
+static bool file_list_index_build(FileListSet* set, char* err, size_t err_size) {
+  if (!path_index_build(&set->index, (const char* const*)set->entries, (size_t)set->count)) {
+    snprintf(err, err_size, "memory allocation failed");
+    return false;
+  }
+  for (int i = 0; i < set->count; i++) {
+    if (set->entries[i][0] == '\0') {
+      set->whole_tree = true;
+      break;
+    }
+  }
+  return true;
+}
+
 static FileListSet* string_list_to_set(StringList* raw, char* err, size_t err_size) {
-  FileListSet* set = malloc(sizeof(FileListSet));
+  FileListSet* set = calloc(1, sizeof(FileListSet));
   if (!set) {
     snprintf(err, err_size, "memory allocation failed");
     return NULL;
@@ -114,6 +133,10 @@ static FileListSet* string_list_to_set(StringList* raw, char* err, size_t err_si
   set->entries = raw->items;
   raw->items = NULL;
   raw->count = 0;
+  if (!file_list_index_build(set, err, err_size)) {
+    file_list_destroy(set);
+    return NULL;
+  }
   return set;
 }
 
@@ -160,17 +183,11 @@ FileListSet* file_list_load(const char* path, bool null_separated, char* err, si
 void file_list_destroy(FileListSet* set) {
   if (!set)
     return;
+  path_index_free(&set->index);
   for (int i = 0; i < set->count; i++)
     free(set->entries[i]);
   free(set->entries);
   free(set);
-}
-
-static bool path_has_prefix(const char* path, const char* prefix) {
-  size_t plen = strlen(prefix);
-  if (strncmp(path, prefix, plen) != 0)
-    return false;
-  return path[plen] == '/' || path[plen] == '\0';
 }
 
 bool file_list_affects(const FileListSet* set, const char* rel) {
@@ -178,16 +195,30 @@ bool file_list_affects(const FileListSet* set, const char* rel) {
     return true;
   if (!rel)
     return false;
-  for (int i = 0; i < set->count; i++) {
-    const char* entry = set->entries[i];
-    if (entry[0] == '\0')
-      return true; /* whole tree listed */
-    if (strcmp(rel, entry) == 0)
-      return true; /* the entry itself is listed */
-    if (path_has_prefix(rel, entry))
-      return true; /* rel lives under a listed directory */
-    if (path_has_prefix(entry, rel))
-      return true; /* rel is an ancestor directory of a listed entry */
+  if (set->whole_tree)
+    return true; /* whole tree listed */
+  /* An exact entry match means `rel` itself is listed. */
+  if (path_index_contains(&set->index, rel))
+    return true;
+  /* Otherwise `rel` is affected when a listed entry is an ancestor directory of
+     it; walk rel's own directory prefixes (which preserve path-boundary
+     semantics) and test each for an exact entry.  No prefixes are stored. */
+  size_t len = strlen(rel);
+  while (len > 0) {
+    const char* slash = NULL;
+    for (size_t i = len; i-- > 0;) {
+      if (rel[i] == '/') {
+        slash = rel + i;
+        break;
+      }
+    }
+    if (!slash)
+      break;
+    len = (size_t)(slash - rel);
+    if (path_index_contains_n(&set->index, rel, len))
+      return true;
   }
-  return false;
+  /* Finally `rel` is affected when it is an ancestor directory of a listed
+     entry (binary search for the first entry at or after `rel` + '/'). */
+  return path_index_has_descendant(&set->index, rel);
 }

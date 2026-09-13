@@ -642,8 +642,23 @@ typedef struct Config {
  * anything else) is what keeps a 2.19 client and a 2.18 server from ever
  * reaching that state.  SECURITY: a 2.19 store holds a salted PBKDF2 verifier
  * and cannot verify (and refuses to load) a legacy unsalted-SHA-256 store line,
- * so an old bearer digest can never be replayed against a 2.19 daemon. */
-#define PROTOCOL_VERSION "2.19.0"
+ * so an old bearer digest can never be replayed against a 2.19 daemon.
+ *
+ * Packed Metadata Wave: 2.19.0 -> 2.20.0.
+ *
+ * WHY the bump: metadata_send()/metadata_receive() no longer emit/consume the
+ * metadata as up to 12 separate per-field writes.  A file's metadata now
+ * crosses the wire as ONE packed frame: a single int32 present flag (0 =
+ * absent, 1 = present) followed, when present, by the fixed
+ * FILE_METADATA_WIRE_SIZE-byte (68-byte) field record produced by
+ * metadata_to_buf().  Protocol data is an unframed byte stream, so the packed
+ * encoding is byte-for-byte identical to the old field-by-field writes (same
+ * fields, same order, same widths); the change only removes per-field syscalls.
+ * The bump is therefore a deliberate lockstep-release marker, not a
+ * desynchronization fix — the strict same-version handshake still rejects a
+ * mixed 2.19/2.20 deployment.  The chunk codec, which already used the packed
+ * metadata_to_buf()/metadata_from_buf() form, is unchanged. */
+#define PROTOCOL_VERSION "2.20.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
