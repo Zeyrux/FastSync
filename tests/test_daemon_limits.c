@@ -2,7 +2,9 @@
 #include "daemon_limits.h"
 #include "test_utils.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The per-source hash is a pure helper: numeric addresses hash to a nonzero,
@@ -72,6 +74,7 @@ static void test_daemon_limits_module_cap() {
 
   daemon_limits_reclaim_slot(registry, slot0);
   daemon_limits_reclaim_slot(registry, slot1);
+  daemon_limits_recompute(registry);
   int slot4 = daemon_limits_claim_slot(registry);
   EXPECT_TRUE(slot4 >= 0);
   EXPECT_EQ_INT(daemon_limits_register(registry, slot4, 0, "10.0.0.4", 2), DAEMON_LIMIT_OK);
@@ -94,6 +97,7 @@ static void test_daemon_limits_host_cap() {
   EXPECT_EQ_INT(daemon_limits_register(registry, slot2, 0, "10.0.0.2", 0), DAEMON_LIMIT_OK);
   /* Reclaiming the first source frees its per-host allowance. */
   daemon_limits_reclaim_slot(registry, slot0);
+  daemon_limits_recompute(registry);
   EXPECT_EQ_INT(daemon_limits_register(registry, slot1, 0, "10.0.0.1", 0), DAEMON_LIMIT_OK);
 
   daemon_limits_destroy(registry);
@@ -115,6 +119,7 @@ static void test_daemon_limits_reclaim_pid() {
                 DAEMON_LIMIT_MODULE_FULL);
 
   daemon_limits_reclaim_pid(registry, 4242);
+  daemon_limits_recompute(registry);
   EXPECT_EQ_INT(daemon_limits_register(registry, slot1, 0, "10.0.0.1", 1), DAEMON_LIMIT_OK);
   /* Reclaiming an unknown pid is a no-op. */
   daemon_limits_reclaim_pid(registry, 999999);
@@ -179,7 +184,78 @@ static void test_daemon_limits_fork_shared() {
                 DAEMON_LIMIT_MODULE_FULL);
   /* The parent reclaims the dead child's slot by pid. */
   daemon_limits_reclaim_pid(registry, (long)pid);
+  daemon_limits_recompute(registry);
   EXPECT_EQ_INT(daemon_limits_register(registry, slot1, 0, "10.0.0.2", 1), DAEMON_LIMIT_OK);
+  daemon_limits_destroy(registry);
+}
+
+/* The occupancy arrays are derived from the slot table: recompute rebuilds them
+ * and is the self-heal path the SIGCHLD handler uses after a child dies. */
+static void test_daemon_limits_recompute() {
+  DaemonLimitRegistry* registry = daemon_limits_create(DAEMON_LIMITS_MIN_SLOTS, 2, 1, 0, 0);
+  EXPECT_NOT_NULL(registry);
+  int slot0 = daemon_limits_claim_slot(registry);
+  int slot1 = daemon_limits_claim_slot(registry);
+  int slot2 = daemon_limits_claim_slot(registry);
+  EXPECT_TRUE(slot0 >= 0 && slot1 >= 0 && slot2 >= 0);
+  EXPECT_EQ_INT(daemon_limits_register(registry, slot0, 0, "10.0.0.1", 0), DAEMON_LIMIT_OK);
+  EXPECT_EQ_INT(daemon_limits_register(registry, slot1, 0, "10.0.0.2", 0), DAEMON_LIMIT_OK);
+
+  /* Recompute is idempotent and re-derives the same counts from REGISTERED
+   * slots (a CLAIMED slot is never counted). */
+  daemon_limits_recompute(registry);
+  daemon_limits_recompute(registry);
+  EXPECT_EQ_INT(daemon_limits_register(registry, slot2, 0, "10.0.0.3", 2),
+                DAEMON_LIMIT_MODULE_FULL);
+
+  /* Freeing a slot and recomputing releases its module/per-source count. */
+  daemon_limits_reclaim_slot(registry, slot0);
+  daemon_limits_recompute(registry);
+  EXPECT_EQ_INT(daemon_limits_register(registry, slot2, 0, "10.0.0.3", 2), DAEMON_LIMIT_OK);
+  daemon_limits_destroy(registry);
+}
+
+/* The per-source table has a bounded lifetime.  When every bucket is occupied
+ * but not yet reclaimable, a new source is fail-open: the per-host cap is not
+ * enforced and the probe must terminate.  Once the occupied buckets' lockouts
+ * expire (or they go idle), a new source reclaims a bucket and enforcement comes
+ * back.  This covers the "table never evicts -> cap silently fails open forever"
+ * review finding. */
+static void test_daemon_limits_host_table_eviction() {
+  char ip[32];
+
+  /* Part A: all buckets locked out with a long deadline and no active
+   * connection are not reclaimable yet.  A new source cannot be interned, so the
+   * per-host cap is documented fail-open (both connections admitted) -- and the
+   * bounded probe returns instead of looping forever. */
+  DaemonLimitRegistry* registry = daemon_limits_create(DAEMON_LIMITS_MIN_SLOTS, 1, 1, 1, 300);
+  EXPECT_NOT_NULL(registry);
+  for (int i = 0; i < 64; i++) {
+    snprintf(ip, sizeof(ip), "10.0.0.%d", i + 1);
+    daemon_limits_auth_record_failure(registry, ip);
+  }
+  int a = daemon_limits_claim_slot(registry);
+  int b = daemon_limits_claim_slot(registry);
+  EXPECT_TRUE(a >= 0 && b >= 0);
+  EXPECT_EQ_INT(daemon_limits_register(registry, a, 0, "10.9.9.9", 0), DAEMON_LIMIT_OK);
+  EXPECT_EQ_INT(daemon_limits_register(registry, b, 0, "10.9.9.9", 0), DAEMON_LIMIT_OK);
+  daemon_limits_destroy(registry);
+
+  /* Part B: with an already-expired lockout every bucket is reclaimable, so a
+   * new source reclaims one and the per-host cap is enforced again. */
+  registry = daemon_limits_create(DAEMON_LIMITS_MIN_SLOTS, 1, 1, 1, 1);
+  EXPECT_NOT_NULL(registry);
+  for (int i = 0; i < 64; i++) {
+    snprintf(ip, sizeof(ip), "10.0.0.%d", i + 1);
+    daemon_limits_auth_record_failure(registry, ip);
+  }
+  struct timespec pause = {2, 0};
+  nanosleep(&pause, NULL);
+  int c = daemon_limits_claim_slot(registry);
+  int d = daemon_limits_claim_slot(registry);
+  EXPECT_TRUE(c >= 0 && d >= 0);
+  EXPECT_EQ_INT(daemon_limits_register(registry, c, 0, "10.9.9.9", 0), DAEMON_LIMIT_OK);
+  EXPECT_EQ_INT(daemon_limits_register(registry, d, 0, "10.9.9.9", 0), DAEMON_LIMIT_HOST_FULL);
   daemon_limits_destroy(registry);
 }
 
@@ -189,6 +265,8 @@ void test_daemon_limits() {
   test_daemon_limits_module_cap();
   test_daemon_limits_host_cap();
   test_daemon_limits_reclaim_pid();
+  test_daemon_limits_recompute();
   test_daemon_limits_auth_lockout();
+  test_daemon_limits_host_table_eviction();
   test_daemon_limits_fork_shared();
 }

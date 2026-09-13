@@ -1,4 +1,6 @@
 #include "daemon_limits.h"
+#include "daemon_conf.h"
+#include "log.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdatomic.h>
@@ -7,6 +9,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+
+/* The two module-count bounds must agree: the daemon config parser never
+ * produces more than DAEMON_CONF_MAX_MODULES modules, so the shared registry's
+ * per-module counter array is sized from the same bound. */
+_Static_assert(DAEMON_LIMITS_MAX_MODULES == DAEMON_CONF_MAX_MODULES,
+               "daemon_limits module bound must match daemon_conf");
 
 /* Slot lifecycle states (stored in slot_state). */
 enum {
@@ -27,6 +35,7 @@ struct DaemonLimitRegistry {
   int lockout_threshold;
   int lockout_duration_sec;
   size_t map_size;
+  _Atomic long long host_full_warn; /* last "table full" warning epoch */
   _Atomic int* slot_state;
   _Atomic int* slot_pid;
   _Atomic int* slot_module;
@@ -35,7 +44,8 @@ struct DaemonLimitRegistry {
   _Atomic uint64_t* host_key; /* 0 == empty bucket */
   _Atomic int* host_active;
   _Atomic int* host_fail;
-  _Atomic long long* host_until; /* epoch seconds the lockout expires */
+  _Atomic long long* host_until;    /* epoch seconds the lockout expires */
+  _Atomic long long* host_last_use; /* epoch seconds the bucket was last touched */
 };
 
 static size_t round_up(size_t n, size_t align) {
@@ -88,7 +98,17 @@ uint64_t daemon_limits_host_hash(const char* peer_ip, bool* ok) {
   return hash;
 }
 
-/* Find the bucket holding `peer_ip`, or -1 when it has no entry. */
+/* True when the registry must maintain per-source buckets: either the per-host
+ * cap is configured, or the auth lockout is (threshold AND duration > 0).  A
+ * lockout threshold without a duration is a no-op, so it must not size or intern
+ * the table.  create(), register() and the lockout paths all agree on this. */
+static bool registry_tracks_hosts(const DaemonLimitRegistry* registry) {
+  return registry->per_host_cap > 0 ||
+         (registry->lockout_threshold > 0 && registry->lockout_duration_sec > 0);
+}
+
+/* Find the bucket holding `peer_ip`, or -1 when it has no entry.  Finding a
+ * bucket refreshes its last-use time so the eviction policy sees it as live. */
 static int host_lookup(DaemonLimitRegistry* registry, const char* peer_ip) {
   bool ok = false;
   uint64_t key = daemon_limits_host_hash(peer_ip, &ok);
@@ -99,39 +119,112 @@ static int host_lookup(DaemonLimitRegistry* registry, const char* peer_ip) {
   for (size_t i = 0; i < (size_t)registry->host_slots; i++) {
     size_t idx = (start + i) & mask;
     uint64_t current = atomic_load_explicit(&registry->host_key[idx], memory_order_acquire);
-    if (current == key)
+    if (current == key) {
+      atomic_store_explicit(&registry->host_last_use[idx], (long long)time(NULL),
+                            memory_order_relaxed);
       return (int)idx;
+    }
     if (current == 0)
       return -1; /* no tombstones: an empty bucket ends the probe chain */
   }
   return -1;
 }
 
+/* A bucket with no live connection may be repurposed: immediately when its
+ * lockout deadline has already passed (the review's "expired" case), or after an
+ * idle window when it holds no pending lockout.  A bucket with a future lockout
+ * deadline is retained so the lockout actually lasts its configured duration. */
+static bool host_bucket_reclaimable(DaemonLimitRegistry* registry, size_t idx, long long now) {
+  if (atomic_load_explicit(&registry->host_active[idx], memory_order_relaxed) != 0)
+    return false;
+  long long until = atomic_load_explicit(&registry->host_until[idx], memory_order_relaxed);
+  if (until != 0)
+    return until <= now;
+  long long last_use = atomic_load_explicit(&registry->host_last_use[idx], memory_order_relaxed);
+  return last_use == 0 || now - last_use >= DAEMON_LIMITS_HOST_EVICT_IDLE_SEC;
+}
+
+/* Emit at most one "per-source table full" warning per
+ * DAEMON_LIMITS_HOST_FULL_WARN_SEC across all forked children.  Called from a
+ * normal (non-signal) child path, so logging is safe here. */
+static void host_warn_table_full(DaemonLimitRegistry* registry, long long now) {
+  long long last = atomic_load_explicit(&registry->host_full_warn, memory_order_relaxed);
+  if (last != 0 && now - last < DAEMON_LIMITS_HOST_FULL_WARN_SEC)
+    return;
+  if (atomic_compare_exchange_strong_explicit(&registry->host_full_warn, &last, now,
+                                              memory_order_relaxed, memory_order_relaxed)) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon: per-source registry is full (%d slots) and no bucket can be reclaimed; "
+                "'max connections per host' and the auth lockout are temporarily not enforced for "
+                "new sources (the per-module cap and host ACLs still apply)",
+                registry->host_slots);
+  }
+}
+
 /* Find or insert the bucket for `peer_ip`.  Insertion is a lock-free CAS so two
- * forked children racing on the same source converge on one bucket.  Returns -1
- * when the table is full or the address is unparseable (callers fail open: the
- * global/module caps and ACLs still apply). */
+ * forked children racing on the same source converge on one bucket.
+ *
+ * When the probe finds no empty bucket it reclaims, via a key CAS, the first
+ * bucket that is reclaimable (expired lockout or idle, and no active
+ * connection) and resets its counters.  This bounds the table's lifetime so it
+ * cannot fill permanently and stay fail-open.  Returns -1 only when the address
+ * is unparseable or the table is genuinely full of live/locked buckets
+ * (callers fail open: the global/module caps and ACLs still apply). */
 static int host_intern(DaemonLimitRegistry* registry, const char* peer_ip) {
   bool ok = false;
   uint64_t key = daemon_limits_host_hash(peer_ip, &ok);
   if (!ok)
     return -1;
+  long long now = (long long)time(NULL);
   size_t mask = (size_t)registry->host_slots - 1;
   size_t start = (size_t)(key & mask);
-  for (size_t i = 0; i < (size_t)registry->host_slots; i++) {
-    size_t idx = (start + i) & mask;
-    uint64_t current = atomic_load_explicit(&registry->host_key[idx], memory_order_acquire);
-    if (current == key)
-      return (int)idx;
-    if (current == 0) {
-      uint64_t expected = 0;
-      if (atomic_compare_exchange_strong_explicit(&registry->host_key[idx], &expected, key,
-                                                  memory_order_acq_rel, memory_order_acquire))
+  /* A couple of passes bound the work: the first normally claims/seeds a bucket;
+   * a lost eviction CAS retries once against the freshly observed table. */
+  for (int pass = 0; pass < 2; pass++) {
+    int evict = -1;
+    uint64_t evict_key = 0;
+    for (size_t i = 0; i < (size_t)registry->host_slots; i++) {
+      size_t idx = (start + i) & mask;
+      uint64_t current = atomic_load_explicit(&registry->host_key[idx], memory_order_acquire);
+      if (current == key) {
+        atomic_store_explicit(&registry->host_last_use[idx], now, memory_order_relaxed);
         return (int)idx;
-      if (atomic_load_explicit(&registry->host_key[idx], memory_order_acquire) == key)
-        return (int)idx;
+      }
+      if (current == 0) {
+        uint64_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&registry->host_key[idx], &expected, key,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+          atomic_store_explicit(&registry->host_last_use[idx], now, memory_order_relaxed);
+          return (int)idx;
+        }
+        if (atomic_load_explicit(&registry->host_key[idx], memory_order_acquire) == key) {
+          atomic_store_explicit(&registry->host_last_use[idx], now, memory_order_relaxed);
+          return (int)idx;
+        }
+        continue; /* another child won this empty bucket; keep probing */
+      }
+      if (evict < 0 && host_bucket_reclaimable(registry, idx, now)) {
+        evict = (int)idx;
+        evict_key = current;
+      }
     }
+    if (evict >= 0) {
+      uint64_t expected = evict_key;
+      if (atomic_compare_exchange_strong_explicit(&registry->host_key[evict], &expected, key,
+                                                  memory_order_acq_rel, memory_order_acquire)) {
+        /* The bucket now belongs to the new source; clear the evicted source's
+         * stale lockout/failure state. */
+        atomic_store_explicit(&registry->host_active[evict], 0, memory_order_relaxed);
+        atomic_store_explicit(&registry->host_fail[evict], 0, memory_order_relaxed);
+        atomic_store_explicit(&registry->host_until[evict], 0, memory_order_relaxed);
+        atomic_store_explicit(&registry->host_last_use[evict], now, memory_order_relaxed);
+        return evict;
+      }
+      continue; /* lost the race; re-probe with fresh observations */
+    }
+    break; /* no free and no reclaimable bucket: genuinely full */
   }
+  host_warn_table_full(registry, now);
   return -1;
 }
 
@@ -143,6 +236,8 @@ DaemonLimitRegistry* daemon_limits_create(int max_slots, int module_count, int p
     max_slots = DAEMON_LIMITS_MAX_SLOTS;
   if (module_count < 1)
     module_count = 1;
+  if (module_count > DAEMON_LIMITS_MAX_MODULES)
+    module_count = DAEMON_LIMITS_MAX_MODULES;
   if (per_host_cap < 0)
     per_host_cap = 0;
   if (lockout_threshold < 0)
@@ -167,7 +262,7 @@ DaemonLimitRegistry* daemon_limits_create(int max_slots, int module_count, int p
   size_t module_bytes = round_up((size_t)module_count * sizeof(_Atomic int), 16);
   size_t host_key_bytes = round_up((size_t)host_slots * sizeof(_Atomic uint64_t), 16);
   size_t host_int_bytes = round_up((size_t)host_slots * sizeof(_Atomic int), 16) * 2;
-  size_t host_until_bytes = round_up((size_t)host_slots * sizeof(_Atomic long long), 16);
+  size_t host_until_bytes = round_up((size_t)host_slots * sizeof(_Atomic long long), 16) * 2;
   size_t total =
       header + slot_bytes + module_bytes + host_key_bytes + host_int_bytes + host_until_bytes + 16;
 
@@ -205,6 +300,8 @@ DaemonLimitRegistry* daemon_limits_create(int max_slots, int module_count, int p
   cursor += (size_t)host_slots * sizeof(_Atomic int);
   cursor = (unsigned char*)round_up((size_t)(uintptr_t)cursor, 16);
   registry->host_until = (atomic_llong*)cursor;
+  cursor += (size_t)host_slots * sizeof(_Atomic long long);
+  registry->host_last_use = (atomic_llong*)cursor;
 
   for (int i = 0; i < max_slots; i++) {
     atomic_store(&registry->slot_module[i], -1);
@@ -243,25 +340,12 @@ void daemon_limits_set_slot_pid(DaemonLimitRegistry* registry, int slot, long pi
 void daemon_limits_reclaim_slot(DaemonLimitRegistry* registry, int slot) {
   if (!registry || slot < 0 || slot >= registry->max_slots)
     return;
-  int previous =
-      atomic_exchange_explicit(&registry->slot_state[slot], SLOT_FREE, memory_order_acq_rel);
-  if (previous == SLOT_REGISTERED) {
-    int module = atomic_load(&registry->slot_module[slot]);
-    int host = atomic_load(&registry->slot_host[slot]);
-    if (module >= 0 && module < registry->module_count) {
-      int current = atomic_load(&registry->module_active[module]);
-      while (current > 0 &&
-             !atomic_compare_exchange_weak(&registry->module_active[module], &current, current - 1))
-        ;
-    }
-    if (host >= 0 && host < registry->host_slots) {
-      int current = atomic_load(&registry->host_active[host]);
-      while (current > 0 &&
-             !atomic_compare_exchange_weak(&registry->host_active[host], &current, current - 1))
-        ;
-    }
-  }
-  atomic_store(&registry->slot_pid[slot], 0);
+  atomic_exchange_explicit(&registry->slot_state[slot], SLOT_FREE, memory_order_acq_rel);
+  atomic_store_explicit(&registry->slot_pid[slot], 0, memory_order_relaxed);
+  /* The module/host occupancy arrays are derived from the slot table; do not
+   * decrement here or a SIGKILL between a child's increment and its REGISTERED
+   * publish would leak a count.  Callers that need the derived counts call
+   * daemon_limits_recompute. */
 }
 
 void daemon_limits_reclaim_pid(DaemonLimitRegistry* registry, long pid) {
@@ -277,6 +361,29 @@ void daemon_limits_reclaim_pid(DaemonLimitRegistry* registry, long pid) {
   }
 }
 
+void daemon_limits_recompute(DaemonLimitRegistry* registry) {
+  if (!registry)
+    return;
+  /* Zero the derived arrays, then re-derive solely from the REGISTERED slots.
+   * A child that was SIGKILLed after incrementing a counter but before
+   * publishing REGISTERED is not counted, and its leaked increment is erased by
+   * the zeroing, so the leak cannot persist. */
+  for (int m = 0; m < registry->module_count; m++)
+    atomic_store_explicit(&registry->module_active[m], 0, memory_order_relaxed);
+  for (int h = 0; h < registry->host_slots; h++)
+    atomic_store_explicit(&registry->host_active[h], 0, memory_order_relaxed);
+  for (int i = 0; i < registry->max_slots; i++) {
+    if (atomic_load_explicit(&registry->slot_state[i], memory_order_acquire) != SLOT_REGISTERED)
+      continue;
+    int module = atomic_load_explicit(&registry->slot_module[i], memory_order_relaxed);
+    if (module >= 0 && module < registry->module_count)
+      atomic_fetch_add_explicit(&registry->module_active[module], 1, memory_order_relaxed);
+    int host = atomic_load_explicit(&registry->slot_host[i], memory_order_relaxed);
+    if (host >= 0 && host < registry->host_slots)
+      atomic_fetch_add_explicit(&registry->host_active[host], 1, memory_order_relaxed);
+  }
+}
+
 DaemonLimitResult daemon_limits_register(DaemonLimitRegistry* registry, int slot, int module_index,
                                          const char* peer_ip, int module_cap) {
   if (!registry || slot < 0 || slot >= registry->max_slots)
@@ -287,7 +394,7 @@ DaemonLimitResult daemon_limits_register(DaemonLimitRegistry* registry, int slot
     return DAEMON_LIMIT_UNAVAILABLE;
 
   int host = -1;
-  if (registry->per_host_cap > 0 || registry->lockout_threshold > 0)
+  if (registry_tracks_hosts(registry))
     host = host_intern(registry, peer_ip);
 
   int module_count = atomic_fetch_add(&registry->module_active[module_index], 1) + 1;
