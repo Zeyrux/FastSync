@@ -2,6 +2,7 @@
 #include "log.h"
 #include "utils.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,6 +177,8 @@ bool filter_rule_list_add(FilterRuleList* list, FilterRule* rule) {
   if (!list || !rule)
     return false;
   if (list->count == list->capacity) {
+    if (list->capacity > INT_MAX / 2)
+      return false;
     int new_cap = list->capacity > 0 ? list->capacity * 2 : 8;
     FilterRule** grown = realloc(list->items, (size_t)new_cap * sizeof(FilterRule*));
     if (!grown)
@@ -322,8 +325,10 @@ FilterRuleList* filter_file_read(const char* dir_path, const char* owner_rel, bo
   if (!fp) {
     if (errno == ENOENT || errno == ENOTDIR)
       return filter_rule_list_create();
-    log_message(LOG_LEVEL_WARNING, "Could not read .rsync-filter in %s: %s", dir_path,
-                strerror(errno));
+    char* escaped_dir = output_escape(dir_path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_WARNING, "Could not read .rsync-filter in %s: %s",
+                escaped_dir ? escaped_dir : "<allocation failed>", strerror(errno));
+    free(escaped_dir);
     return filter_rule_list_create();
   }
   if (exists)
@@ -336,9 +341,20 @@ FilterRuleList* filter_file_read(const char* dir_path, const char* owner_rel, bo
   }
   char* line = NULL;
   size_t line_cap = 0;
-  ssize_t n;
   bool ok = true;
-  while ((n = getline(&line, &line_cap, fp)) != -1) {
+  while (true) {
+    ssize_t n = utils_getdelim_bounded(fp, &line, &line_cap, '\n', UTILS_MAX_LINE_LEN);
+    if (n < 0) {
+      if (errno == EFBIG) {
+        snprintf(err, err_size, "line in .rsync-filter exceeds %d bytes", (int)UTILS_MAX_LINE_LEN);
+      } else {
+        snprintf(err, err_size, "error reading .rsync-filter: %s", strerror(errno));
+      }
+      ok = false;
+      break;
+    }
+    if (n == 0)
+      break;
     const char* p = line;
     while (*p == ' ' || *p == '\t')
       p++;
