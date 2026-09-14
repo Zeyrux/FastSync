@@ -87,6 +87,34 @@ static void test_config_ssh_dest_no_user() {
   config_delete(cfg);
 }
 
+/* C1: the user@host token is passed to ssh in option position, so a host or user
+ * beginning with '-' (e.g. "-oProxyCommand=...") must be rejected before any
+ * argv is built, and an empty host must be rejected too. */
+static void test_config_ssh_dest_rejects_option_injection() {
+  Config* cfg = make_config("1.0", "/src", "-oProxyCommand=id:/dst", true, false, false, false,
+                            false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_ssh_dest(cfg), -1);
+  EXPECT_EQ_INT(cfg->transport, TRANSPORT_TCP);
+  EXPECT_NULL(cfg->ssh_destination);
+  config_delete(cfg);
+
+  cfg =
+      make_config("1.0", "/src", "-user@host:/dst", true, false, false, false, false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_ssh_dest(cfg), -1);
+  config_delete(cfg);
+
+  cfg = make_config("1.0", "/src", "user@:/dst", true, false, false, false, false, 1, false, 0);
+  EXPECT_EQ_INT(config_parse_ssh_dest(cfg), -1);
+  config_delete(cfg);
+
+  /* config_parse_transport_dest propagates the rejection (and still returns 1
+   * for daemon syntax first). */
+  cfg = make_config("1.0", "/src", "-oProxyCommand=id:/dst", true, false, false, false, false, 1,
+                    false, 0);
+  EXPECT_EQ_INT(config_parse_transport_dest(cfg), -1);
+  config_delete(cfg);
+}
+
 static void test_config_daemon_dest_parse() {
   Config* cfg = make_config("1.0", "/src", "dahost::files/sub/dir", true, false, false, false,
                             false, 1, false, 0);
@@ -2789,6 +2817,7 @@ void test_config() {
   test_config_ssh_dest();
   test_config_ssh_dest_local_path();
   test_config_ssh_dest_no_user();
+  test_config_ssh_dest_rejects_option_injection();
   test_config_daemon_dest_parse();
   test_config_daemon_dest_no_path();
   test_config_daemon_dest_double_slash_normalized();

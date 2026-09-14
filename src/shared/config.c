@@ -613,19 +613,36 @@ int config_parse_transport_dest(Config* config) {
   int daemon_ret = config_parse_daemon_dest(config);
   if (daemon_ret != 0)
     return daemon_ret;
-  config_parse_ssh_dest(config);
-  return 0;
+  /* 0 for a local destination (nothing parsed) or a valid SSH destination;
+   * -1 (already logged) for an injection-shaped user@host. */
+  return config_parse_ssh_dest(config);
 }
 
-void config_parse_ssh_dest(Config* config) {
+int config_parse_ssh_dest(Config* config) {
+  if (!config || !config->receive_root_directory)
+    return 0;
   if (!config_is_remote_dest(config->receive_root_directory))
-    return;
+    return 0;
+  const char* dest = config->receive_root_directory;
+  const char* colon = strchr(dest, ':');
+  /* The user@host token is passed to ssh in option position, so a user or host
+   * beginning with '-' would be consumed by ssh as an option (argument
+   * injection: e.g. "-oProxyCommand=...").  An empty host is likewise not a
+   * valid destination.  Validate before any wire/argv construction. */
+  const char* at = memchr(dest, '@', (size_t)(colon - dest));
+  const char* host = at ? at + 1 : dest;
+  size_t host_len = (size_t)(colon - host);
+  size_t user_len = at ? (size_t)(at - dest) : 0;
+  if (host_len == 0 || host[0] == '-' || (user_len > 0 && dest[0] == '-'))
+    return daemon_dest_parse_error("invalid remote destination user@host (must not be empty or "
+                                   "start with '-')",
+                                   dest);
   config->transport = TRANSPORT_SSH;
-  config->ssh_destination = str_dup(config->receive_root_directory);
-  const char* colon = strchr(config->receive_root_directory, ':');
+  config->ssh_destination = str_dup(dest);
   char* path = str_dup(colon + 1);
   free(config->receive_root_directory);
   config->receive_root_directory = path;
+  return 0;
 }
 
 void config_burn_auth(Config* config) {
