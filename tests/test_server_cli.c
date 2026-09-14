@@ -32,6 +32,28 @@ static void test_server_cli_defaults() {
   EXPECT_FALSE(opts.allow_delete);
   EXPECT_FALSE(opts.allow_unauthenticated);
   EXPECT_FALSE(opts.no_super);
+  EXPECT_FALSE(opts.allow_super);
+  server_cli_options_free(&opts);
+}
+
+/* C3: --allow-super is the standalone/--stdio opt-in for a privileged receiver;
+ * it never combines with --no-super, and daemon modules use their own per-module
+ * `client owner = yes` opt-in instead. */
+static void test_server_cli_allow_super() {
+  const char* args[] = {"fastsync-server", "--allow-super", "--destination-root", "/srv"};
+  ServerCliOptions opts;
+  EXPECT_EQ_INT(parse_ok(args, 4, &opts), 0);
+  EXPECT_TRUE(opts.allow_super);
+  server_cli_options_free(&opts);
+
+  char err[256];
+  const char* a1[] = {"s", "--allow-super", "--no-super"};
+  EXPECT_EQ_INT(server_cli_parse(3, (char**)a1, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "mutually exclusive") != NULL);
+
+  const char* a2[] = {"s", "--daemon", "--config=/tmp/x.conf", "--allow-super"};
+  EXPECT_EQ_INT(server_cli_parse(4, (char**)a2, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "client owner") != NULL);
   server_cli_options_free(&opts);
 }
 
@@ -224,5 +246,6 @@ void test_server_cli() {
   test_server_cli_password_and_early_input();
   test_server_cli_password_requires_daemon();
   test_server_cli_no_super();
+  test_server_cli_allow_super();
   test_server_cli_help();
 }

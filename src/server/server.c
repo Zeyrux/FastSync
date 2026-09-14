@@ -37,6 +37,12 @@ static bool allow_unauthenticated;
  * root), so no super-user activity is attempted and any client --copy-as is
  * refused.  Set once in main before the accept loop / stdio handler. */
 static bool server_no_super;
+/* --allow-super: standalone/--stdio opt-in that preserves the historical
+ * permissive super mode for a root receiver.  When false, a privileged
+ * standalone receiver forces SUPER_MODE_OFF for every connection (C3), so a
+ * client cannot make it create device nodes / write raw devices / apply
+ * client-chosen ownership. */
+static bool server_allow_super;
 static const char* required_client_cn;
 /* --iconv CONVERT_SPEC the server was itself started with (borrowed argv
  * pointer).  Its LOCAL half may override the local charset the client assumed;
@@ -191,8 +197,12 @@ static bool tls_client_identity_allowed(SSL* ssl) {
   int length = X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName,
                                          common_name, sizeof(common_name));
   size_t required_length = strlen(required_client_cn);
-  bool allowed = length >= 0 && (size_t)length == required_length &&
-                 required_length < sizeof(common_name) &&
+  /* X509_NAME_get_text_by_NID truncates an over-long CN to the buffer size; a
+   * returned length at the buffer bound means the CN was silently shortened, so
+   * a required-name prefix could be matched by a longer CN with extra suffix.
+   * Reject any result that reached the bound. */
+  bool allowed = length >= 0 && (size_t)length < sizeof(common_name) - 1 &&
+                 (size_t)length == required_length && required_length < sizeof(common_name) &&
                  credentials_secure_equal(common_name, required_client_cn, required_length);
   X509_free(certificate);
   return allowed;
@@ -592,6 +602,20 @@ static const char* server_module_gate(const Config* config, void* context) {
     if (gate_ctx)
       gate_ctx->super_mode_override = SUPER_MODE_OFF;
   }
+  /* C3: a privileged (root) STANDALONE/--stdio receiver defaults to
+   * SUPER_MODE_OFF.  Without this a client --devices/--write-devices/--super
+   * would let a root server create arbitrary device nodes and write raw devices,
+   * and client-chosen ownership (--numeric-ids/--chown/--usermap/--groupmap)
+   * would be applied, with no operator opt-in.  The operator must pass
+   * --allow-super to restore the historical permissive behavior; an
+   * unprivileged receiver is unaffected (the kernel refuses the confined
+   * attempts) and the daemon path keeps its per-module `client owner = yes`
+   * gate. */
+  if (g_daemon_conf == NULL && geteuid() == 0 && !server_allow_super) {
+    effective.super_mode = SUPER_MODE_OFF;
+    if (gate_ctx)
+      gate_ctx->super_mode_override = SUPER_MODE_OFF;
+  }
   /* --copy-as (P7 Wave E, protocol 2.18.0): FastSync's safe subset forces the
      ownership of every written entry to the requested ids, which needs a
      privileged (root) receiver.  An unprivileged receiver REFUSES the whole
@@ -751,6 +775,13 @@ void handler(int file_descriptor) {
     goto done;
   }
   config->use_delete = config->use_delete && allow_delete;
+  /* --force (receiver-side) is deletion authority too: it lets an incoming
+   * regular file recursively remove a non-empty destination directory tree, and
+   * lets --delete-missing-args remove a non-empty directory mirror.  Without
+   * the operator's --allow-delete it must be inert, exactly like --delete and
+   * --delete-missing-args, so a client cannot use --force to bypass the delete
+   * policy. */
+  config->force_delete = config->force_delete && allow_delete;
   /* --iconv (protocol 2.16.0): install the receiver-side wire->local conversion
      now that the client's full CONVERT_SPEC has been received and validated,
      before any received file name is decoded.  The server's own --iconv (if
@@ -1010,6 +1041,11 @@ static void print_server_usage(void) {
   printf("  --no-super          Operator veto: never attempt super-user activities\n");
   printf("                      (ownership, device nodes) even as root, and refuse\n");
   printf("                      any client --copy-as/--super request\n");
+  printf("  --allow-super       Standalone/--stdio only: keep super-user activities\n");
+  printf("                      enabled for a root receiver.  Without it a root\n");
+  printf("                      standalone server forces SUPER_MODE_OFF, so client\n");
+  printf("                      --devices/--write-devices/--super and ownership\n");
+  printf("                      requests are refused/skipped.  No effect when not root\n");
   printf("  --iconv=LOCAL[,REMOTE]  Declare this server's LOCAL charset for file-name\n");
   printf("                      conversion: received names are translated to this\n");
   printf("                      charset (the wire charset still comes from the\n");
@@ -1134,6 +1170,7 @@ int main(int argc, char* argv[]) {
   trust_sender = opts.trust_sender;
   allow_unauthenticated = opts.allow_unauthenticated;
   server_no_super = opts.no_super;
+  server_allow_super = opts.allow_super;
   server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
