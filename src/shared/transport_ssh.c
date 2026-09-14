@@ -80,7 +80,7 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
    * crafted destination can never inject an ssh option such as
    * -oProxyCommand=... .  This mirrors config_parse_ssh_dest's validation and
    * is defense-in-depth for callers that bypass it. */
-  if (r->host[0] == '\0' || r->host[0] == '-' || (r->user[0] != '\0' && r->user[0] == '-')) {
+  if (r->host[0] == '\0' || r->host[0] == '-' || r->user[0] == '-') {
     remote_dest_destroy(r);
     return -1;
   }
