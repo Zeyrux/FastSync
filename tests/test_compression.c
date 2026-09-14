@@ -295,9 +295,13 @@ static void test_data_decompress_truncated_frame_fails() {
       bool failed_cleanly = (out == NULL);
       data_destroy(out);
       data_destroy(compressed);
+      /* The child inherited `input` across fork(); free it before _exit so the
+       * valgrind CI job (which instruments forked children too) sees no leak. */
+      data_destroy(input);
       _exit(failed_cleanly ? 0 : 1);
     }
     data_destroy(compressed);
+    data_destroy(input);
     _exit(2);
   }
   int status;
