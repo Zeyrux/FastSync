@@ -1,5 +1,6 @@
 #include "test_file_list.h"
 #include "file_list.h"
+#include "utils.h"
 #include "test_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,8 +190,35 @@ static void test_deep_paths_are_bounded() {
   free(entry);
 }
 
+/* An over-long list entry must be rejected cleanly instead of being read
+   without a bound (the reader never allocates beyond UTILS_MAX_LINE_LEN). */
+static void test_oversized_entry_rejected() {
+  const char* path = "test_file_list_oversized.txt";
+  FILE* fp = fopen(path, "wb");
+  EXPECT_NOT_NULL(fp);
+  char chunk[4096];
+  memset(chunk, 'a', sizeof(chunk));
+  size_t total = 0;
+  while (total <= UTILS_MAX_LINE_LEN) {
+    EXPECT_EQ_INT((int)fwrite(chunk, 1, sizeof(chunk), fp), (int)sizeof(chunk));
+    total += sizeof(chunk);
+  }
+  EXPECT_EQ_INT(fputc('\n', fp), '\n');
+  fclose(fp);
+
+  char err[160];
+  FileListSet* set = file_list_load(path, false, err, sizeof(err));
+  if (set) {
+    file_list_destroy(set);
+    EXPECT_FAIL("over-long entry was accepted");
+  }
+  EXPECT_TRUE(strstr(err, "exceeds") != NULL);
+  remove(path);
+}
+
 void test_file_list() {
   test_membership_matches_reference();
   test_ancestor_and_descendant_queries();
   test_deep_paths_are_bounded();
+  test_oversized_entry_rejected();
 }
