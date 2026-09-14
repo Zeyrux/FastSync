@@ -316,6 +316,11 @@ ssh user@host 'mkdir -p destination'
 ./build/client /path/to/source user@host:destination
 ```
 
+FastSync is **push-only**: the source (first argument) is always a local
+directory and only the destination may be remote. A remote source such as
+`client user@host:src ./local` (a "pull") is intentionally not supported; see
+[RSYNC_COMPAT.md](RSYNC_COMPAT.md#direction).
+
 ### TCP transfer
 
 Start the FastSync server:
