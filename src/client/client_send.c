@@ -310,8 +310,11 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
     return false;
   }
   if (set->count == 0) {
+    char* escaped_list =
+        output_escape(config->files_from ? config->files_from : "", log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "--files-from file '%s' contains no entries; nothing to transfer",
-                config->files_from ? config->files_from : "");
+                escaped_list ? escaped_list : "<allocation failed>");
+    free(escaped_list);
     return false;
   }
   bool ignore = config->ignore_missing_args || config->delete_missing_args;
@@ -329,7 +332,10 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
       free(full);
       if (ignore) {
         (*skipped_out)++;
-        log_info_message(LOG_INFO_MISC, "skipping missing --files-from entry '%s'", entry);
+        char* escaped_entry = output_escape(entry, log_get_8_bit_output());
+        log_info_message(LOG_INFO_MISC, "skipping missing --files-from entry '%s'",
+                         escaped_entry ? escaped_entry : "<allocation failed>");
+        free(escaped_entry);
         if (config->delete_missing_args && missing_dest) {
           char* mirror = files_from_missing_dest_path(config, entry);
           if (!mirror || !array_list_add(missing_dest, mirror)) {
@@ -340,8 +346,13 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
         }
         continue;
       }
-      log_message(LOG_LEVEL_ERROR, "--files-from entry '%s' not found in source '%s'", entry,
-                  config->send_directory);
+      char* escaped_entry = output_escape(entry, log_get_8_bit_output());
+      char* escaped_src = output_escape(config->send_directory, log_get_8_bit_output());
+      log_message(LOG_LEVEL_ERROR, "--files-from entry '%s' not found in source '%s'",
+                  escaped_entry ? escaped_entry : "<allocation failed>",
+                  escaped_src ? escaped_src : "<allocation failed>");
+      free(escaped_entry);
+      free(escaped_src);
       return false;
     }
     free(full);
@@ -588,8 +599,12 @@ static void remove_transferred_sources(const Config* config, ArrayList* paths) {
       close(dirfd);
       continue;
     }
-    if (unlinkat(dirfd, leaf, 0) != 0)
-      log_message(LOG_LEVEL_WARNING, "Could not remove source file %s", source->path);
+    if (unlinkat(dirfd, leaf, 0) != 0) {
+      char* escaped_path = output_escape(source->path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Could not remove source file %s",
+                  escaped_path ? escaped_path : "<allocation failed>");
+      free(escaped_path);
+    }
     close(dirfd);
   }
 }
@@ -2120,7 +2135,7 @@ int write_batch_from_source(const Config* config, const char* batch_path) {
     prepared_scanner_destroy(&prepared);
     return 1;
   }
-  int fd = open(batch_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int fd = open(batch_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) {
     log_perror("could not create batch file");
     directory_scanner_destroy(scanner);
@@ -2135,8 +2150,10 @@ int write_batch_from_source(const Config* config, const char* batch_path) {
       if (f == NULL || f->data == NULL)
         continue;
       if (f->data->size > 0 && f->data->data == NULL && !file_load_data(f)) {
+        char* escaped_path = output_escape(f->path ? f->path : "", log_get_8_bit_output());
         log_message(LOG_LEVEL_ERROR, "batch: failed to load data for %s",
-                    f->path ? f->path : "<no path>");
+                    escaped_path ? escaped_path : "<allocation failed>");
+        free(escaped_path);
         ok = false;
         break;
       }

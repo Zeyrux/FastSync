@@ -19,6 +19,7 @@
 #include "usage.h"
 #include "utils.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <time.h>
 #include <signal.h>
@@ -27,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Async-signal-safe abort flag set by the SIGINT/SIGTERM handler.  Exposed via
  * client_send.h so the send loops can poll it.  Defined here (not in
@@ -429,8 +431,14 @@ static int parse_info_flags(const char* value, Config* config) {
   return 0;
 }
 
-/* Parse a string as an unsigned long long. Returns 0 on success, -1 on error. */
+/* Parse a string as an unsigned long long. Returns 0 on success, -1 on error.
+ * A leading '-'/'+' (or whitespace) is rejected outright: strtoull would
+ * otherwise silently wrap a negative value to a huge unsigned one. */
 static int parse_ull_arg(const char* val, unsigned long long* out, const char* optname) {
+  if (!val || val[0] < '0' || val[0] > '9') {
+    log_message(LOG_LEVEL_ERROR, "%s must be a non-negative integer", optname);
+    return -1;
+  }
   char* end;
   errno = 0;
   unsigned long long v = strtoull(val, &end, 10);
@@ -537,7 +545,10 @@ static int config_add_filter(Config* config, const char* rule) {
   char err[160];
   FilterRule* parsed = filter_rule_parse(rule, err, sizeof(err));
   if (!parsed) {
-    log_message(LOG_LEVEL_ERROR, "invalid --filter rule '%s': %s", rule, err);
+    char* escaped = output_escape(rule, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "invalid --filter rule '%s': %s",
+                escaped ? escaped : "<allocation failed>", err);
+    free(escaped);
     return -1;
   }
   filter_rule_free(parsed);
@@ -1303,10 +1314,15 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    if (val >= DELTA_MIN_FILE_SIZE)
+    if (val >= DELTA_MIN_FILE_SIZE && val <= DELTA_MAX_FILE_SIZE) {
       config->delta_max_file_size = val;
-    else
+    } else if (val < DELTA_MIN_FILE_SIZE) {
       log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
+    } else {
+      log_message(LOG_LEVEL_ERROR, "--delta-max must not exceed %llu bytes",
+                  (unsigned long long)DELTA_MAX_FILE_SIZE);
+      ctx->exit_code = -1;
+    }
     return true;
   }
   return false;
@@ -1463,6 +1479,12 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (val > MAX_CHUNK_SIZE) {
+      log_message(LOG_LEVEL_ERROR, "--chunk-size must be between 1 and %llu",
+                  (unsigned long long)MAX_CHUNK_SIZE);
+      ctx->exit_code = -1;
+      return true;
+    }
     config->chunk_size = val;
     return true;
   }
@@ -1479,11 +1501,20 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       fclose(config->log_file);
       config->log_file = NULL;
     }
-    FILE* lf = fopen(ctx->argv[++ctx->i], "a");
+    const char* log_path = ctx->argv[++ctx->i];
+    /* Refuse a symlinked target and never leak the descriptor across exec: an
+     * attacker who can plant a symlink in the working directory must not be
+     * able to redirect (or truncate) an arbitrary file via --log-file.  The log
+     * is created with owner-only permissions. */
+    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+    FILE* lf = log_fd >= 0 ? fdopen(log_fd, "a") : NULL;
     if (!lf) {
-      char* escaped = output_escape(ctx->argv[ctx->i], false);
+      int open_errno = errno;
+      if (log_fd >= 0)
+        close(log_fd);
+      char* escaped = output_escape(log_path, false);
       log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
-                  escaped ? escaped : "<allocation failed>", strerror(errno));
+                  escaped ? escaped : "<allocation failed>", strerror(open_errno));
       free(escaped);
       ctx->exit_code = -1;
       return true;
@@ -2011,8 +2042,24 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
   }
   char* line = NULL;
   size_t line_size = 0;
-  ssize_t n;
-  while ((n = getline(&line, &line_size, fp)) != -1) {
+  while (true) {
+    ssize_t n = utils_getdelim_bounded(fp, &line, &line_size, '\n', UTILS_MAX_LINE_LEN);
+    if (n < 0) {
+      char* escaped = output_escape(filepath, false);
+      if (errno == EFBIG) {
+        log_message(LOG_LEVEL_ERROR, "pattern file '%s' has a line exceeding %d bytes",
+                    escaped ? escaped : "<allocation failed>", (int)UTILS_MAX_LINE_LEN);
+      } else {
+        log_message(LOG_LEVEL_ERROR, "could not read pattern file '%s': %s",
+                    escaped ? escaped : "<allocation failed>", strerror(errno));
+      }
+      free(escaped);
+      free(line);
+      fclose(fp);
+      return -1;
+    }
+    if (n == 0)
+      break;
     char* p = line;
     while (*p == ' ' || *p == '\t')
       p++;

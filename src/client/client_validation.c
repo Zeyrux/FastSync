@@ -25,12 +25,14 @@ bool validate_config(const Config* config) {
   /* A dry-run of a local batch apply is not meaningful: --read-batch bypasses
      the client-side scan/server decision entirely, so dry-run would have no
      wire state to report (and must not be used as a mutation escape hatch).
-     --only-write-batch likewise never contacts a receiver.  Reject both up
+     --only-write-batch likewise never contacts a receiver.  --write-batch DOES
+     run a live transfer but additionally mutates the filesystem by emitting the
+     batch file, so a dry-run must not write it either.  Reject all three up
      front instead of silently ignoring --dry-run. */
-  if (config->dry_run && (read_batch || only_write_batch)) {
+  if (config->dry_run && (read_batch || only_write_batch || write_batch)) {
     log_message(LOG_LEVEL_ERROR,
-                "--dry-run cannot be combined with --read-batch or --only-write-batch; "
-                "a dry-run of a local batch apply is not meaningful");
+                "--dry-run cannot be combined with --read-batch, --only-write-batch, or "
+                "--write-batch; a dry-run must not mutate anything, including batch files");
     return false;
   }
   if (read_batch) {
