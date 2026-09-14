@@ -519,9 +519,38 @@ static void test_path_index_semantics() {
   path_index_free(&empty);
 }
 
+/* utils_getdelim_bounded must return normal short lines unchanged and refuse an
+ * over-long record with EFBIG rather than allocating without bound. */
+static void test_getdelim_bounded() {
+  FILE* fp = tmpfile();
+  EXPECT_NOT_NULL(fp);
+  const char* short_line = "short\n";
+  EXPECT_EQ_INT((int)fwrite(short_line, 1, strlen(short_line), fp), (int)strlen(short_line));
+  char big[32];
+  memset(big, 'x', 20);
+  big[20] = '\n';
+  EXPECT_EQ_INT((int)fwrite(big, 1, 21, fp), 21);
+  rewind(fp);
+
+  char* line = NULL;
+  size_t cap = 0;
+  ssize_t n = utils_getdelim_bounded(fp, &line, &cap, '\n', 64);
+  EXPECT_EQ_INT((int)n, 6);
+  EXPECT_EQ_STR(line, "short\n");
+
+  errno = 0;
+  n = utils_getdelim_bounded(fp, &line, &cap, '\n', 10);
+  EXPECT_EQ_INT((int)n, -1);
+  EXPECT_EQ_INT(errno, EFBIG);
+
+  free(line);
+  fclose(fp);
+}
+
 void test_shared_utils() {
   test_path_index_bounded();
   test_path_index_semantics();
+  test_getdelim_bounded();
   test_walker_removes_extras_keeps_manifest_and_protected();
   test_walker_keeps_nested_manifest_dirs();
   test_walker_max_delete_exceeded_deletes_nothing();

@@ -4,7 +4,9 @@
 #include "array_list.h"
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 
 /* Small open-addressing string hash set used to turn quadratic membership
  * scans into O(path length) exact-match lookups (the --delete keep-set and the
@@ -79,6 +81,17 @@ bool path_index_has_descendant(const PathIndex* index, const char* path);
 
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
+/* Upper bound on one line/token read from a local list file (--files-from,
+ * --exclude-from/--include-from, .rsync-filter).  Mirrors MAX_STRING_SIZE and
+ * stops a hostile multi-gigabyte line from forcing unbounded allocation. */
+#define UTILS_MAX_LINE_LEN (64 * 1024)
+/* Read one `delim`-terminated record from `stream` into *line (grown as needed
+ * and NUL-terminated), refusing to consume/allocate more than `max_len` bytes
+ * of content.  Returns the number of bytes stored (delimiter included, matching
+ * getdelim), 0 at end of file, or -1 on error (errno is EFBIG when the record
+ * exceeds `max_len`, ENOMEM on allocation failure).  *line and *cap are updated
+ * as the buffer grows and the caller owns *line. */
+ssize_t utils_getdelim_bounded(FILE* stream, char** line, size_t* cap, int delim, size_t max_len);
 char* path_cat(const char* path1, const char* path2);
 bool glob_match(const char* pattern, const char* str);
 /* Result of a bounded extra-file deletion run. */
@@ -148,6 +161,12 @@ const char* utils_get_authorized_root_path(void);
  * callers guarantee this); this is containment by string, not by resolved
  * symlinks.  Shared by the utils and file secure-walk root confinement. */
 bool path_is_within_root(const char* root, const char* path);
+/* True when `path` contains a ".." component.  This is a purely lexical
+ * dot-dot check: an absolute path is NOT rejected here, because default
+ * (non-relative) transfers legitimately put the sender's absolute source path
+ * on the wire and the receiver re-roots it under the destination with
+ * path_cat().  Callers that accept a strictly relative path (e.g. batch paths)
+ * must reject a leading '/' themselves (see utils_valid_batch_path). */
 bool has_path_traversal(const char* path);
 bool utils_valid_batch_path(const char* path);
 bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_size);
