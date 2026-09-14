@@ -6,6 +6,7 @@
 #include "utils.h"
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <threads.h>
 #include <unistd.h>
 
@@ -211,9 +212,47 @@ static void test_data_compress_reused_contexts_multithreaded() {
   compression_free_thread_contexts();
 }
 
+/* A truncated zstd frame used to make the decompressor spin forever: the
+ * stream call keeps returning a positive hint with all input consumed.  Run the
+ * decompression in a child with an alarm so a regression (infinite loop) is
+ * caught as a timeout failure instead of hanging the whole unit suite. */
+static void test_data_decompress_truncated_frame_fails() {
+  const char* original =
+      "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+  size_t len = strlen(original);
+  char* buf = malloc(len);
+  EXPECT_NOT_NULL(buf);
+  memcpy(buf, original, len);
+  Data* input = data_create(buf, len);
+  EXPECT_NOT_NULL(input);
+
+  pid_t pid = fork();
+  EXPECT_TRUE(pid >= 0);
+  if (pid == 0) {
+    alarm(10); /* kills the child if the decompressor hangs */
+    Data* compressed = data_compress(input, 3);
+    if (compressed && compressed->size > 1) {
+      compressed->size -= 1; /* drop the final byte: frame is now incomplete */
+      Data* out = data_decompress(compressed);
+      bool failed_cleanly = (out == NULL);
+      data_destroy(out);
+      data_destroy(compressed);
+      _exit(failed_cleanly ? 0 : 1);
+    }
+    data_destroy(compressed);
+    _exit(2);
+  }
+  int status;
+  waitpid(pid, &status, 0);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  data_destroy(input);
+}
+
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
+  test_data_decompress_truncated_frame_fails();
   test_skip_compress_suffix_matching();
   test_data_compress_with_threads_roundtrip();
   test_data_compress_reused_contexts_multithreaded();

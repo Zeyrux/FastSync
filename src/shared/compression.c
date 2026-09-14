@@ -324,6 +324,20 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
       uncompressed_data->data = new_data;
       output.dst = new_data;
       output.size = buf_size;
+      /* Re-attempt with the larger output buffer; the truncated-frame check
+       * below must not reject a complete frame that merely filled the previous
+       * buffer exactly. */
+      continue;
+    }
+    /* A positive hint with all input consumed means the frame is incomplete: a
+     * truncated stream would otherwise spin here forever (ZSTD_decompressStream
+     * keeps returning the same hint).  Fail instead of burning CPU. */
+    if (ret != 0 && input.pos == input.size) {
+      log_message(LOG_LEVEL_ERROR,
+                  "Truncated zstd frame: input exhausted with %zu bytes still expected", ret);
+      data_destroy(uncompressed_data);
+      uncompressed_data = NULL;
+      goto cleanup;
     }
   } while (ret > 0);
 
