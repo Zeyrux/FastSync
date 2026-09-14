@@ -188,7 +188,7 @@ static void test_cli_help() {
 }
 
 /* Test that the -a short spelling applies --archive's config bundle, matching
- * rsync -rlptgoD semantics: links + metadata + devices + specials, and NOT
+ * rsync -rlptD semantics: links + metadata + devices + specials, and NOT
  * compression/multithreading.  (--archive itself is covered by
  * test_parse_args_archive; this guards the short alias.) */
 static void test_cli_archive_flags() {

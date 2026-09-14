@@ -20,8 +20,9 @@ void print_usage(void) {
   printf("Options:\n");
   printf("  -c, --checksum      Verify content by checksum instead of size+mtime\n");
   printf("  -z, --compress [level]  Enable compression (level 1-22, default 5)\n");
-  printf("  -a, --archive       rsync archive mode (-rlptgoD): links, metadata,\n");
-  printf("                      devices and specials (not compression/multithreading)\n");
+  printf("  -a, --archive       rsync archive mode (-rlptD): links, perms, times,\n");
+  printf("                      devices and specials; owner/group are not implied;\n");
+  printf("                      not compression/multithreading\n");
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  --remove-source-files  Remove regular source files after successful transfer\n");
   printf("  -p, --perms         Preserve permission bits (part of the metadata bundle)\n");
@@ -162,6 +163,9 @@ void print_usage(void) {
   printf("                      none suppresses info even with --verbose\n");
   printf("  --preserve          Preserve file metadata (long form only)\n");
   printf("  -E, --executability Preserve executable permission bits\n");
+  printf("  -U, --atimes        Preserve access times\n");
+  printf("  -N, --crtimes       Capture birth time; cannot be applied (documented\n");
+  printf("                      divergence)\n");
   printf("  -X, --xattrs        Preserve user extended attributes (user.* only;\n");
   printf("                      privileged security.*/trusted.* namespaces are\n");
   printf("                      never captured or applied)\n");
