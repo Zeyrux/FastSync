@@ -444,9 +444,10 @@ class TestRemoteDryRun:
         self._seed(source)
         clean_dir(dest)
 
-        # Populate the destination with a real transfer, then make exactly one
-        # file differ (content+size) and add a brand-new file.
-        result, _ = run_client(source, dest, port=shared_server.port)
+        # Populate the destination with a real transfer that preserves mtimes
+        # (--preserve), then make exactly one file differ (content+size) and add
+        # a brand-new file.
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"seed transfer failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
 
@@ -456,9 +457,11 @@ class TestRemoteDryRun:
             f.write(b"newly added\n")
 
         before = _snapshot_tree(received)
-        # --checksum makes the up-to-date decision content-based (the seed
-        # transfer did not preserve mtimes), so keep.txt/deep.txt report skip.
-        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum"],
+        # --checksum must NOT read destination contents in a dry-run (B3), so
+        # the up-to-date decision is metadata-only.  The --preserve seed made
+        # keep.txt and deep.txt size+mtime-identical; the dry-run must also
+        # transmit metadata (--preserve) for that metadata to be comparable.
+        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum", "--preserve"],
                                port=shared_server.port)
         assert result.returncode == 0, f"remote dry-run failed: {result.stderr[:300]}"
         assert "Dry run:" in result.stdout, result.stdout[:200]
@@ -469,6 +472,34 @@ class TestRemoteDryRun:
         )
         assert "deep.txt" not in result.stdout, result.stdout
         assert _snapshot_tree(received) == before, "remote dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_checksum_does_not_read_destination(self, shared_server):
+        """B3: --dry-run --checksum against a read-only module must not read the
+        destination file's content (a 1-bit hash oracle).  A same-size/same-content
+        file whose mtime differs is therefore reported as would-transfer because
+        the metadata-only decision is inconclusive, instead of being hashed and
+        silently skipped."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_oracle_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_oracle_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+
+        target = os.path.join(received, "keep.txt")
+        # Identical size and content, but a deliberately different mtime.
+        os.utime(target, (1000000000, 1000000000))
+        before = _snapshot_tree(received)
+
+        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum", "--preserve"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "keep.txt" in result.stdout, (
+            f"dry-run --checksum must not read the destination to prove equality: {result.stdout}"
+        )
+        assert _snapshot_tree(received) == before, "dry-run mutated the destination"
 
     @pytest.mark.ci
     def test_remote_dry_run_into_empty_dest_creates_nothing(self, shared_server):

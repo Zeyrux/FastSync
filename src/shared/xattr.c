@@ -73,13 +73,17 @@ bool xattr_list_append(FileXattrList* list, const char* name, const void* value,
 
 /* A Linux xattr name is "namespace.name" with an optional leading "trusted.",
  * "system.", "security.", "user.", or "trusted." prefix.  We only ever touch
- * the unprivileged "user.*" namespace and the two POSIX ACL xattrs carried in
- * the "system." namespace.  Everything else -- especially "security.*" (ACLs,
- * capabilities, SELinux labels) and "trusted.*" -- is refused so a client can
- * never compel the receiver to apply a privileged attribute it would not
- * otherwise be able to set (and which would be a local privilege escalation if
- * it could). */
-bool xattr_name_appliable(const char* name) {
+ * the unprivileged "user.*" namespace and, only when --acls/-A was negotiated,
+ * the two POSIX ACL xattrs carried in the "system." namespace.  Everything else
+ * -- especially "security.*" (ACLs, capabilities, SELinux labels) and
+ * "trusted.*" -- is refused so a client can never compel the receiver to apply a
+ * privileged attribute it would not otherwise be able to set (and which would be
+ * a local privilege escalation if it could).
+ *
+ * The ACL gate is deliberate: --xattrs/-X alone derives use_xattrs but must NOT
+ * authorize the ACL names, otherwise a -X client could plant an ACL the
+ * receiver never opted into (B4). */
+bool xattr_name_appliable(const char* name, bool preserve_acls) {
   if (!name || name[0] == '\0')
     return false;
   size_t len = strlen(name);
@@ -95,10 +99,19 @@ bool xattr_name_appliable(const char* name) {
   if (strncmp(name, "user.", 5) == 0)
     return name[5] != '\0';
   if (strcmp(name, "system.posix_acl_access") == 0)
-    return true;
+    return preserve_acls;
   if (strcmp(name, "system.posix_acl_default") == 0)
-    return true;
+    return preserve_acls;
   return false;
+}
+
+/* The two POSIX ACL xattr names: the only names whose applicablity is
+ * conditional (they require --acls).  Used by the receiver to distinguish "not
+ * negotiated" (drop the entry, keep user.* working for -X) from a genuinely
+ * disallowed namespace (hard reject). */
+static bool xattr_name_is_posix_acl(const char* name) {
+  return name != NULL && (strcmp(name, "system.posix_acl_access") == 0 ||
+                          strcmp(name, "system.posix_acl_default") == 0);
 }
 
 /* ---- SENDER: capture ---- */
@@ -130,7 +143,9 @@ FileXattrList* xattr_capture_path(const char* path) {
     if (name_len == 0)
       break; /* trailing double NUL not expected; stop */
     offset += (ssize_t)name_len + 1;
-    if (!xattr_name_appliable(name))
+    /* Capture is sender-side: the scanner has already gated on -X/-A, so the
+       per-name whitelist here allows the ACL names (true). */
+    if (!xattr_name_appliable(name, true))
       continue;
     ssize_t value_size = getxattr(path, name, NULL, 0);
     if (value_size < 0)
@@ -190,7 +205,7 @@ bool xattr_send(int fd, const FileXattrList* list) {
   return true;
 }
 
-FileXattrList* xattr_receive(int fd, int* ok) {
+FileXattrList* xattr_receive(int fd, int* ok, bool preserve_acls) {
   if (ok)
     *ok = 0;
   int count;
@@ -232,11 +247,19 @@ FileXattrList* xattr_receive(int fd, int* ok) {
       xattr_list_free(list);
       return NULL;
     }
-    if (!xattr_name_appliable(name)) {
-      log_message(LOG_LEVEL_ERROR, "rejected xattr block: disallowed namespace for '%s'", name);
-      free(name);
-      xattr_list_free(list);
-      return NULL;
+    bool skip = false;
+    if (!xattr_name_appliable(name, preserve_acls)) {
+      if (!preserve_acls && xattr_name_is_posix_acl(name)) {
+        /* -X without -A: the sender may still carry ACLs, but the receiver must
+           never apply an ACL it was not asked to preserve.  Consume and drop the
+           entry (keeping -X compatibility) rather than failing the transfer. */
+        skip = true;
+      } else {
+        log_message(LOG_LEVEL_ERROR, "rejected xattr block: disallowed namespace for '%s'", name);
+        free(name);
+        xattr_list_free(list);
+        return NULL;
+      }
     }
     int32_t value_len32;
     if (!receive_n_data(fd, &value_len32, sizeof(value_len32))) {
@@ -272,6 +295,12 @@ FileXattrList* xattr_receive(int fd, int* ok) {
         xattr_list_free(list);
         return NULL;
       }
+    }
+    if (skip) {
+      free(value);
+      free(name);
+      budget += (size_t)name_len32 + (size_t)value_len32;
+      continue;
     }
     if (!xattr_list_append(list, name, value, (size_t)value_len32)) {
       free(value);

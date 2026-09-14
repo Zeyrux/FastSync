@@ -844,6 +844,172 @@ static void test_special_socket_path_log_escaped() {
   EXPECT_NOT_NULL(strstr(output, "socket not recreated: evil\\#012path"));
 }
 
+/* B1: a client-planted FIFO at the destination must not block the receiver's
+ * incremental-check open.  With the O_NONBLOCK open plus the post-open S_ISREG
+ * gate the FIFO is simply "no existing regular file", so the receiver proceeds
+ * to a full transfer; without O_NONBLOCK the child blocks in openat() and the
+ * alarm(30) kills it. */
+static void test_incremental_check_fifo_destination_does_not_hang() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* root = make_check_root("qffo");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/file.txt", root);
+  EXPECT_EQ_INT(mkfifo(path, 0600), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    File* file = receive_incremental_check(p[0], cfg, &skipped);
+    bool ok = file != NULL && !skipped;
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = 4;
+    long long mtime = 42;
+    long long mtime_nsec = 0;
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_NEXT);
+
+    Data* body = data_create_reserve(4);
+    EXPECT_NOT_NULL(body);
+    body->data = malloc(4);
+    EXPECT_NOT_NULL(body->data);
+    memcpy(body->data, "data", 4);
+    body->size = 4;
+    EXPECT_TRUE(send_data(p[1], body));
+    data_destroy(body);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    unlink(path);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* B1: a FIFO planted in a --link-dest basis directory must not block
+ * basis_open_regular() either; the basis match is simply declined. */
+static void test_incremental_check_basis_fifo_does_not_hang() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* root = make_check_root("qbfi");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+  char basis_dir[1024];
+  char basis_path[2048];
+  snprintf(basis_dir, sizeof(basis_dir), "%s/basis", root);
+  EXPECT_EQ_INT(mkdir(basis_dir, 0700), 0);
+  snprintf(basis_path, sizeof(basis_path), "%s/file.txt", basis_dir);
+  EXPECT_EQ_INT(mkfifo(basis_path, 0600), 0);
+  EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_LINK, "basis"), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    File* file = receive_incremental_check(p[0], cfg, &skipped);
+    bool ok = file != NULL && !skipped;
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = 4;
+    long long mtime = 42;
+    long long mtime_nsec = 0;
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+    /* config_has_basis() makes the request carry the source digest. */
+    uint8_t wire_len = 8;
+    uint8_t digest[8] = {0};
+    EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+    EXPECT_TRUE(send_n_data(p[1], digest, sizeof(digest)));
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    EXPECT_EQ_INT(s, STATUS_NEXT);
+
+    Data* body = data_create_reserve(4);
+    EXPECT_NOT_NULL(body);
+    body->data = malloc(4);
+    EXPECT_NOT_NULL(body->data);
+    memcpy(body->data, "data", 4);
+    body->size = 4;
+    EXPECT_TRUE(send_data(p[1], body));
+    data_destroy(body);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    unlink(basis_path);
+    rmdir(basis_dir);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* B5: the aggregate entry count across the three manifest sections is capped at
+ * MAX_MANIFEST_ENTRIES, and a section that would push the total over the cap is
+ * rejected before its entries are read (so a tiny first section followed by a
+ * huge claimed second section fails fast). */
+static void test_receive_manifest_total_entry_cap() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/tmp/dst");
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+
+  EXPECT_TRUE(send_int(p[1], 1));
+  EXPECT_TRUE(send_str(p[1], "keep.txt"));
+  /* The second section alone is within its per-section cap, but 1 + it exceeds
+     the cross-section cap; the receiver must reject at the count. */
+  EXPECT_TRUE(send_int(p[1], MAX_MANIFEST_ENTRIES));
+  EXPECT_NULL(receive_manifest_entries(p[0]));
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_ERROR);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+}
+
 void test_server() {
   test_special_socket_path_log_escaped();
   if (!is_running_under_valgrind()) {
@@ -856,6 +1022,9 @@ void test_server() {
     test_incremental_check_size_mismatch_full_transfer();
     test_incremental_check_dry_run_reports_transfer_without_writing();
     test_incremental_check_delta_oversize_reports_failure();
+    test_incremental_check_fifo_destination_does_not_hang();
+    test_incremental_check_basis_fifo_does_not_hang();
+    test_receive_manifest_total_entry_cap();
     test_late_manifest_abort_frees_keepset();
     test_late_manifest_eof_frees_keepset();
     test_late_second_manifest_frees_both();

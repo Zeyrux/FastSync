@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,33 @@
 /* Maximum individual file data size within a chunk (64 MB) */
 #define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
 #define MAX_FILES_PER_CHUNK 65536U
+
+/* Reserve `charge` against `session`'s connection budget.  This mirrors the
+   static protocol_reserve_memory() in protocol.c: the receive-side call sites
+   only have the Data.owner pointer (a ProtocolSession*), and protocol.c is out
+   of scope for this fix, so the same atomic CAS accounting is reproduced here.
+   The matching release always goes through data_destroy()'s Data.owner path. */
+static bool chunk_session_reserve(ProtocolSession* session, size_t charge) {
+  unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
+  while (true) {
+    if (allocated > MAX_CONNECTION_MEMORY ||
+        (unsigned long long)charge > MAX_CONNECTION_MEMORY - allocated)
+      return false;
+    if (atomic_compare_exchange_weak(&session->total_allocated_bytes, &allocated,
+                                     allocated + (unsigned long long)charge))
+      return true;
+  }
+}
+
+bool data_charge_session(Data* data, ProtocolSession* session, size_t charge) {
+  if (!data || charge == 0 || session == NULL)
+    return true;
+  if (!chunk_session_reserve(session, charge))
+    return false;
+  data->owner = session;
+  data->protocol_charge = charge;
+  return true;
+}
 
 Chunk* chunk_create(File** items, int element_count) {
   if (element_count < 0 || (element_count > 0 && items == NULL))
@@ -370,6 +398,15 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     Data* replacement = data_create(file_data, file_data_size);
     if (replacement == NULL)
       goto error;
+    /* Charge the retained per-file copy to the connection budget (when the
+       inbound chunk carries an owning session) so the queued copies are not
+       held outside MAX_CONNECTION_MEMORY (B6).  A NULL owner (e.g. a local
+       batch apply) leaves the copy uncharged. */
+    if (!data_charge_session(replacement, data->owner, allocation_size)) {
+      log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded for chunk file data");
+      data_destroy(replacement);
+      goto error;
+    }
     data_destroy(file->data);
     file->data = replacement;
     data_pointer += file_data_size;
@@ -466,10 +503,19 @@ Chunk* receive_chunk_data(int fd, const Config* config) {
   }
   Data* data_to_process = chunk_data;
   if (config->use_compression) {
+    /* Preserve the inbound session across decompression so the (larger)
+       decompressed chunk is charged to the same connection budget; the
+       compressed buffer's own charge is released by data_destroy below. */
+    ProtocolSession* owner = chunk_data->owner;
     data_to_process = data_decompress_limited(chunk_data, MAX_CHUNK_SIZE);
     data_destroy(chunk_data);
     if (data_to_process == NULL) {
       log_message(LOG_LEVEL_ERROR, "Failed to decompress chunk");
+      return NULL;
+    }
+    if (!data_charge_session(data_to_process, owner, data_to_process->size)) {
+      log_message(LOG_LEVEL_ERROR, "Per-connection memory limit exceeded for decompressed chunk");
+      data_destroy(data_to_process);
       return NULL;
     }
   }

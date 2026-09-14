@@ -23,4 +23,15 @@ Data* chunk_compress_with_threads(Chunk* chunk, int compression_level, bool use_
                                   int compression_threads);
 Chunk* receive_chunk_data(int fd, const Config* config);
 
+/* Charge `charge` retained bytes of `data` against `session`'s per-connection
+ * budget (MAX_CONNECTION_MEMORY), mirroring the protocol layer's accounting, and
+ * record them on `data` so data_destroy() returns the charge through the
+ * Data.owner path.  Returns false (leaving `data` uncharged) when the ceiling
+ * would be exceeded.  A NULL/zero-size charge or a NULL session is a no-op
+ * success.  The receive-side decompression and chunk-copy paths know the owning
+ * session only through the Data.owner of the buffer they are processing, so
+ * this is the entry point that lets them participate in the connection budget
+ * without a session handle (B6). */
+bool data_charge_session(Data* data, ProtocolSession* session, size_t charge);
+
 #endif
