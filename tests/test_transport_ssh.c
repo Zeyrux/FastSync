@@ -66,16 +66,18 @@ static void test_ssh_remote_command_argument_modes() {
   free(command);
 }
 
-/* The build for a single-word argv is [prog, six -o args, user, command]. */
+/* The build for a single-word argv is [prog, six -o args, "--", user, command]. */
 
 static void test_ssh_build_client_argv_default_is_ssh() {
   char** argv = ssh_build_client_argv(NULL, 0, "u@h", "'srv' --stdio");
   EXPECT_NOT_NULL(argv);
   EXPECT_EQ_STR(argv[0], "ssh");
   EXPECT_EQ_STR(argv[1], "-o");
-  EXPECT_EQ_STR(argv[7], "u@h");
-  EXPECT_EQ_STR(argv[8], "'srv' --stdio");
-  EXPECT_NULL(argv[9]);
+  /* The "--" end-of-options marker precedes the destination token. */
+  EXPECT_EQ_STR(argv[7], "--");
+  EXPECT_EQ_STR(argv[8], "u@h");
+  EXPECT_EQ_STR(argv[9], "'srv' --stdio");
+  EXPECT_NULL(argv[10]);
   ssh_free_client_argv(argv);
 }
 
@@ -84,7 +86,7 @@ static void test_ssh_build_client_argv_uses_custom_rsh() {
   char** argv = ssh_build_client_argv("myrsh", 0, "u@h", "rc");
   EXPECT_NOT_NULL(argv);
   EXPECT_EQ_STR(argv[0], "myrsh");
-  EXPECT_NULL(argv[9]);
+  EXPECT_NULL(argv[10]);
   ssh_free_client_argv(argv);
 }
 
@@ -96,19 +98,35 @@ static void test_ssh_build_client_argv_whitespace_command_and_port() {
   EXPECT_EQ_STR(argv[0], "ssh");
   EXPECT_EQ_STR(argv[1], "-p");
   EXPECT_EQ_STR(argv[2], "2222");
-  EXPECT_NULL(argv[11]);
+  EXPECT_NULL(argv[12]);
   ssh_free_client_argv(argv);
 
   argv = ssh_build_client_argv("ssh", 2222, "u@h", "rc");
   EXPECT_NOT_NULL(argv);
   EXPECT_EQ_STR(argv[0], "ssh");
-  /* Flat [prog, -o x6, -p, port, user, command]. */
+  /* Flat [prog, -o x6, -p, port, "--", user, command]. */
   EXPECT_EQ_STR(argv[7], "-p");
   EXPECT_EQ_STR(argv[8], "2222");
-  EXPECT_EQ_STR(argv[9], "u@h");
-  EXPECT_EQ_STR(argv[10], "rc");
-  EXPECT_NULL(argv[11]);
+  EXPECT_EQ_STR(argv[9], "--");
+  EXPECT_EQ_STR(argv[10], "u@h");
+  EXPECT_EQ_STR(argv[11], "rc");
+  EXPECT_NULL(argv[12]);
   ssh_free_client_argv(argv);
+}
+
+/* C1: a destination host/user beginning with '-' would be parsed by ssh as an
+ * option (argument injection: -oProxyCommand=...), and an empty host is never
+ * valid.  These are refused before any child is forked, so no Client is
+ * returned and no command can run. */
+static void test_ssh_connect_rejects_option_host() {
+  /* cppcheck-suppress constVariablePointer */
+  Client* client = client_connect_ssh("-oProxyCommand=touch /tmp/pwned:/remote", 22, NULL, false,
+                                      NULL, false, NULL, 0);
+  EXPECT_NULL(client);
+  client = client_connect_ssh("-evil:/remote", 22, NULL, false, NULL, false, NULL, 0);
+  EXPECT_NULL(client);
+  client = client_connect_ssh("user@:/remote", 22, NULL, false, NULL, false, NULL, 0);
+  EXPECT_NULL(client);
 }
 
 /* --remote-option=OPT appends OPT to the remote command line after " --stdio",
@@ -162,6 +180,7 @@ void test_transport_ssh() {
   test_ssh_connect_invalid_dest_empty();
   test_ssh_connect_malformed();
   test_ssh_connect_unreachable();
+  test_ssh_connect_rejects_option_host();
   test_ssh_remote_command_argument_modes();
   test_ssh_build_client_argv_default_is_ssh();
   test_ssh_build_client_argv_uses_custom_rsh();

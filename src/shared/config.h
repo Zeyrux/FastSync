@@ -851,7 +851,10 @@ bool config_send(int file_descriptor, const Config* config);
 bool config_send_wire_block(int file_descriptor, const Config* config);
 Config* config_receive(int file_descriptor);
 bool config_is_remote_dest(const char* s);
-void config_parse_ssh_dest(Config* config);
+/* Parse a single-colon host:path SSH destination (0 = not an SSH destination or
+ * parsed successfully, -1 = rejected, e.g. a user@host beginning with '-'; the
+ * reason is logged). */
+int config_parse_ssh_dest(Config* config);
 
 /* A ConfigValidateFunc may return this sentinel to tell
  * config_receive_with_validate that the callback ALREADY sent a terminal status

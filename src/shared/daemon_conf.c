@@ -133,6 +133,7 @@ static bool store_host_list(char*** list, int* count, const char* value, const c
     return false;
   }
   char* save = NULL;
+  int added = 0;
   for (char* token = strtok_r(copy, ", \t", &save); token; token = strtok_r(NULL, ", \t", &save)) {
     if (!host_pattern_valid(token)) {
       if (module_name)
@@ -163,8 +164,20 @@ static bool store_host_list(char*** list, int* count, const char* value, const c
       return false;
     }
     (*list)[(*count)++] = dup;
+    added++;
   }
   free(copy);
+  /* A present key with an empty (or separator-only) value would otherwise
+   * install a zero-length list, i.e. no ACL at all: a strict-parse config must
+   * never silently turn a restrictive directive into "allow everyone". */
+  if (added == 0) {
+    if (module_name)
+      set_error(err, err_size, "module '%s': '%s' must list at least one host pattern", module_name,
+                key);
+    else
+      set_error(err, err_size, "'%s' must list at least one host pattern", key);
+    return false;
+  }
   return true;
 }
 
@@ -403,6 +416,7 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
       return false;
     }
     char* save = NULL;
+    int added = 0;
     for (char* token = strtok_r(list, ",", &save); token; token = strtok_r(NULL, ",", &save)) {
       const char* user = trim_ws(token);
       if (*user == '\0')
@@ -430,8 +444,16 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
         return false;
       }
       module->auth_users[module->auth_user_count++] = dup;
+      added++;
     }
     free(list);
+    /* An empty/separator-only value must not silently disable authentication:
+     * the key's presence is an explicit request for an allow-list. */
+    if (added == 0) {
+      set_error(err, err_size, "module '%s': 'auth users' must list at least one user",
+                module->name);
+      return false;
+    }
     return true;
   }
   if (key_equals(key, "max connections"))
@@ -439,10 +461,10 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
                               "max connections", module->name, err, err_size);
   if (key_equals(key, "hosts allow"))
     return store_host_list(&module->hosts_allow, &module->hosts_allow_count, value, "hosts allow",
-                           false, module->name, err, err_size);
+                           module->name, false, err, err_size);
   if (key_equals(key, "hosts deny"))
     return store_host_list(&module->hosts_deny, &module->hosts_deny_count, value, "hosts deny",
-                           false, module->name, err, err_size);
+                           module->name, false, err, err_size);
   set_error(err, err_size, "unknown key '%s' in module '%s'", key, module->name);
   return false;
 }

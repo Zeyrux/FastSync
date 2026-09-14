@@ -16,7 +16,13 @@ def shared_server():
     Under pytest-xdist this session fixture is instantiated once per worker
     process, so each worker gets its own server on an ephemeral port."""
     server = ServerManager()
-    server.start()
+    # --allow-super keeps the historical permissive super mode for a root
+    # receiver: the integration suite's root-only ownership/device/copy-as tests
+    # exercise that opted-in configuration.  The secure default (a root
+    # standalone server without --allow-super forces SUPER_MODE_OFF) is covered
+    # explicitly by TestStandaloneSuperDefault in test_features.py.  Non-root
+    # runs are unaffected by the flag.
+    server.start(extra_args=["--allow-super"])
     yield server
     server.stop()
 

@@ -1592,8 +1592,33 @@ class TestDelete:
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
 
-
-class TestProgress:
+    @pytest.mark.ci
+    def test_force_cannot_replace_directory_without_allow_delete(self):
+        """C2: --force is deletion authority (an incoming file may recursively
+        remove a non-empty destination directory tree).  A server started without
+        --allow-delete must clear it, so the operator's delete policy cannot be
+        bypassed with --force."""
+        source = os.path.join(TEST_DATA_DIR, "force_src")
+        dest = os.path.join(TEST_DATA_DIR, "force_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "blocker"), "wb") as f:
+            f.write(b"incoming file\n")
+        received = get_dest_received_dir(dest, source)
+        blocker = os.path.join(received, "blocker")
+        os.makedirs(blocker)
+        nested = os.path.join(blocker, "nested.txt")
+        with open(nested, "w") as f:
+            f.write("survivor")
+        # Deliberately NO --allow-delete.
+        server = ServerManager()
+        server.start()
+        try:
+            run_client(source, dest, flags=["--force"], port=server.port)
+        finally:
+            server.stop()
+        assert os.path.isdir(blocker), "unauthorized --force removed a destination directory"
+        assert os.path.exists(nested), "unauthorized --force removed a nested file"
     def test_progress_output(self, shared_server):
         clean_dir(DEST_DIR)
         result, dur = run_client(
@@ -4628,6 +4653,61 @@ class TestSuperPrivilege:
         st = os.lstat(os.path.join(received, "f.txt"))
         assert (st.st_uid, st.st_gid) != (12345, 12346), \
             f"--no-super must suppress fake-super's owner replay: uid={st.st_uid} gid={st.st_gid}"
+
+
+class TestStandaloneSuperDefault:
+    """C3: a privileged (root) STANDALONE server without --allow-super forces
+    SUPER_MODE_OFF, so a client cannot make it create device nodes, write raw
+    devices, apply ownership, or use --copy-as.  The shared_server fixture opts in
+    with --allow-super to keep the historical behavior available to the existing
+    root-only tests; these tests start their own un-opted server."""
+
+    @pytest.mark.ci
+    def test_copy_as_refused_without_allow_super(self):
+        """--copy-as is a client-chosen-ownership request and must be refused by
+        a standalone server that did not opt in with --allow-super (on a non-root
+        receiver it is refused for lack of privilege either way)."""
+        source = os.path.join(TEST_DATA_DIR, "super_default_src")
+        dest = os.path.join(TEST_DATA_DIR, "super_default_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"no copy-as\n")
+        server = ServerManager()
+        server.start()  # deliberately no --allow-super
+        try:
+            result, _ = run_client(source, dest,
+                                   flags=["--preserve", "--copy-as=@65534:@65534"],
+                                   port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode != 0, (
+            "standalone server accepted --copy-as without --allow-super"
+        )
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="root can create the source device node")
+    def test_devices_skipped_without_allow_super(self):
+        """Root standalone server without --allow-super must skip device-node
+        creation even for a client --devices request (the run still succeeds and
+        the regular file transfers)."""
+        source = os.path.join(TEST_DATA_DIR, "super_default_dev_src")
+        dest = os.path.join(TEST_DATA_DIR, "super_default_dev_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "plain.txt"), "wb") as f:
+            f.write(b"regular\n")
+        os.mknod(os.path.join(source, "null"), stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        server = ServerManager()
+        server.start()  # deliberately no --allow-super
+        try:
+            result, _ = run_client(source, dest, flags=["--devices"], port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode == 0, f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.lexists(os.path.join(received, "null")), (
+            "root standalone server created a device node without --allow-super"
+        )
 
 
 class TestHardLinks:

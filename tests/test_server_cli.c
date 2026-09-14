@@ -32,6 +32,35 @@ static void test_server_cli_defaults() {
   EXPECT_FALSE(opts.allow_delete);
   EXPECT_FALSE(opts.allow_unauthenticated);
   EXPECT_FALSE(opts.no_super);
+  EXPECT_FALSE(opts.allow_super);
+  server_cli_options_free(&opts);
+}
+
+/* C3: --allow-super is the locally-launched standalone TCP opt-in for a
+ * privileged receiver; it never combines with --no-super, is refused with
+ * --stdio (whose client-composed remote argv must not defeat the default), and
+ * daemon modules use their own per-module `client owner = yes` opt-in instead. */
+static void test_server_cli_allow_super() {
+  const char* args[] = {"fastsync-server", "--allow-super", "--destination-root", "/srv"};
+  ServerCliOptions opts;
+  EXPECT_EQ_INT(parse_ok(args, 4, &opts), 0);
+  EXPECT_TRUE(opts.allow_super);
+  server_cli_options_free(&opts);
+
+  char err[256];
+  const char* a1[] = {"s", "--allow-super", "--no-super"};
+  EXPECT_EQ_INT(server_cli_parse(3, (char**)a1, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "mutually exclusive") != NULL);
+
+  const char* a2[] = {"s", "--daemon", "--config=/tmp/x.conf", "--allow-super"};
+  EXPECT_EQ_INT(server_cli_parse(4, (char**)a2, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "client owner") != NULL);
+
+  /* The SSH/--stdio receiver argv is composed by the client, so --allow-super
+   * must be rejected there and the C3 secure default stays in force. */
+  const char* a3[] = {"s", "--stdio", "--allow-super", "--destination-root", "/srv"};
+  EXPECT_EQ_INT(server_cli_parse(5, (char**)a3, &opts, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "--stdio") != NULL);
   server_cli_options_free(&opts);
 }
 
@@ -224,5 +253,6 @@ void test_server_cli() {
   test_server_cli_password_and_early_input();
   test_server_cli_password_requires_daemon();
   test_server_cli_no_super();
+  test_server_cli_allow_super();
   test_server_cli_help();
 }
