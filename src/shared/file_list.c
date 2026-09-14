@@ -23,6 +23,8 @@ static void string_list_destroy(StringList* list) {
 
 static bool string_list_add(StringList* list, const char* text) {
   if (list->count == list->capacity) {
+    if (list->capacity > INT_MAX / 2)
+      return false;
     int new_cap = list->capacity > 0 ? list->capacity * 2 : 16;
     char** grown = realloc(list->items, (size_t)new_cap * sizeof(char*));
     if (!grown)

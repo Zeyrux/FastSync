@@ -2045,13 +2045,16 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
   while (true) {
     ssize_t n = utils_getdelim_bounded(fp, &line, &line_size, '\n', UTILS_MAX_LINE_LEN);
     if (n < 0) {
+      /* output_escape() may allocate (and clobber errno): capture the reader's
+       * errno first so an over-long line is still reported as EFBIG. */
+      int saved_errno = errno;
       char* escaped = output_escape(filepath, false);
-      if (errno == EFBIG) {
+      if (saved_errno == EFBIG) {
         log_message(LOG_LEVEL_ERROR, "pattern file '%s' has a line exceeding %d bytes",
                     escaped ? escaped : "<allocation failed>", (int)UTILS_MAX_LINE_LEN);
       } else {
         log_message(LOG_LEVEL_ERROR, "could not read pattern file '%s': %s",
-                    escaped ? escaped : "<allocation failed>", strerror(errno));
+                    escaped ? escaped : "<allocation failed>", strerror(saved_errno));
       }
       free(escaped);
       free(line);

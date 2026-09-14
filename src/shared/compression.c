@@ -243,9 +243,13 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
   log_debug_message(LOG_DEBUG_UTIL, "Start to decompress data");
   unsigned long long dst_size =
       ZSTD_getFrameContentSize(compressed_data->data, compressed_data->size);
-  if (ZSTD_isError(dst_size)) {
-    log_message(LOG_LEVEL_ERROR, "Failed to get decompressed size: %s",
-                ZSTD_getErrorName(dst_size));
+  /* ZSTD_isError() is also true for ZSTD_CONTENTSIZE_ERROR and
+   * ZSTD_CONTENTSIZE_UNKNOWN (both are encoded near (size_t)-1), so test the
+   * sentinels explicitly instead of blanket-rejecting every error-ish value:
+   * only CONTENTSIZE_ERROR means an unreadable header, while CONTENTSIZE_UNKNOWN
+   * must reach the estimate fallback below. */
+  if (dst_size == ZSTD_CONTENTSIZE_ERROR) {
+    log_message(LOG_LEVEL_ERROR, "Failed to get decompressed size: invalid zstd frame");
     return NULL;
   }
 

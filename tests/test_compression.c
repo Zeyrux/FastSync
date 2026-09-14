@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <threads.h>
 #include <unistd.h>
+#include <zstd.h>
 
 static void test_data_compress_decompress_roundtrip() {
   const char original[] = "Hello, World! This is test data for compression round-trip!";
@@ -139,6 +140,63 @@ static void test_chunk_compress_decompress_roundtrip() {
   unlink(path2);
 }
 
+/* Build a zstd frame whose header omits the content size (the content size
+ * flag is cleared), which ZSTD_getFrameContentSize reports as
+ * ZSTD_CONTENTSIZE_UNKNOWN. */
+static Data* make_unknown_size_frame(const void* src, size_t len) {
+  ZSTD_CCtx* cctx = ZSTD_createCCtx();
+  if (!cctx)
+    return NULL;
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_contentSizeFlag, 0);
+  size_t cap = ZSTD_compressBound(len);
+  Data* out = data_create_empty(cap);
+  if (!out) {
+    ZSTD_freeCCtx(cctx);
+    return NULL;
+  }
+  ZSTD_inBuffer in = {src, len, 0};
+  ZSTD_outBuffer ob = {out->data, cap, 0};
+  size_t ret;
+  do {
+    ret = ZSTD_compressStream2(cctx, &ob, &in, ZSTD_e_end);
+    if (ZSTD_isError(ret)) {
+      data_destroy(out);
+      ZSTD_freeCCtx(cctx);
+      return NULL;
+    }
+  } while (ret > 0);
+  out->size = ob.pos;
+  ZSTD_freeCCtx(cctx);
+  return out;
+}
+
+/* ZSTD_CONTENTSIZE_UNKNOWN is flagged by ZSTD_isError(), so a naive
+ * ZSTD_isError() check rejects every unknown-size frame.  Such a frame must
+ * instead reach the 3x estimate fallback and decompress correctly. */
+static void test_data_decompress_unknown_size_frame() {
+  const char original[] = "unknown-content-size frame: the decompressor must use the 3x estimate, "
+                          "not reject the frame as an error.";
+  size_t len = strlen(original);
+  char* buf = malloc(len);
+  EXPECT_NOT_NULL(buf);
+  memcpy(buf, original, len);
+
+  Data* frame = make_unknown_size_frame(buf, len);
+  free(buf);
+  EXPECT_NOT_NULL(frame);
+  /* Guard the premise of the test: the frame really has no stored size. */
+  EXPECT_EQ_INT((int)ZSTD_getFrameContentSize(frame->data, frame->size),
+                (int)ZSTD_CONTENTSIZE_UNKNOWN);
+
+  Data* decompressed = data_decompress(frame);
+  EXPECT_NOT_NULL(decompressed);
+  EXPECT_EQ_INT((int)decompressed->size, (int)len);
+  EXPECT_EQ_INT(memcmp(decompressed->data, original, len), 0);
+
+  data_destroy(decompressed);
+  data_destroy(frame);
+}
+
 typedef struct {
   int id;
   int iterations;
@@ -252,6 +310,7 @@ static void test_data_decompress_truncated_frame_fails() {
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
+  test_data_decompress_unknown_size_frame();
   test_data_decompress_truncated_frame_fails();
   test_skip_compress_suffix_matching();
   test_data_compress_with_threads_roundtrip();
