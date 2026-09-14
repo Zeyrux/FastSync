@@ -1195,17 +1195,20 @@ static bool cli_handle_meta_flags(CliParseCtx* ctx) {
     return true;
   }
   if (opt_is(arg, "-a", "--archive")) {
-    /* Real rsync archive (-rlptgoD).  FastSync is always recursive and always
+    /* FastSync archive mode (-rlptD).  FastSync is always recursive and always
      * preserves hard-link/other transfer semantics per its own flags, so -a
-     * implies links, full metadata (perms/times/group/owner as FastSync's
-     * broad bundle), devices and specials.  Compression and multithreading
-     * are NOT implied (they are no longer part of archive mode). */
+     * implies links, metadata (perms/times), devices and specials.  Owner/group
+     * are NOT implied; they require an explicit identity flag
+     * (--numeric-ids/--usermap/--groupmap/--chown/--copy-as).  Compression and
+     * multithreading are NOT implied either (they are no longer part of
+     * archive mode). */
     config->follow_symlinks = true;
     config->use_metadata = true;
     config->preserve_devices = true;
     config->preserve_specials = true;
     log_info_message(LOG_INFO_MISC,
-                     "Enabled archive mode (-rlptgoD: links, metadata, devices, specials)");
+                     "Enabled archive mode (-rlptD: links, metadata, devices, specials; "
+                     "owner/group opt-in)");
     return true;
   }
   if (opt_is(arg, "-p", "--perms")) {
