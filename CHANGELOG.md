@@ -4,41 +4,7 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
-## [Unreleased]
-
-### Added
-
-- **Server-contacting `--dry-run` (protocol 2.21.0).** `--dry-run` now performs
-  a real handshake with a remote/daemon receiver and reports exactly what WOULD
-  change based on receiver state (existing destination files, mtimes, checksums,
-  basis dirs). The wire config carries the dry-run intent (`Config.dry_run`) and
-  the receiver answers each per-file check with `STATUS_DRY_RUN_TRANSFER` (would
-  transfer) or `STATUS_OK` (already up to date); the sender prints the
-  would-transfer set and its trailer without sending any file data. The receiver
-  performs the normal read-only incremental decision but mutates nothing: no temp
-  files, writes, renames, deletes, metadata/xattr/chown, or directory creation.
-  A plain local destination (no explicit `--server-port`/remote) keeps the
-  original client-side dry-run. Would-delete reporting for `--delete*` is
-  deferred to a follow-up; dry-run never deletes.
-
-### Security
-
-- Enforce the daemon's per-module `max connections` cap and add a global
-  `max connections per host` cap plus a cross-process `auth lockout`
-  (`auth lockout threshold` / `auth lockout duration`). Because the listener
-  forks one child per connection, the counters live in an anonymous shared
-  mapping created before the accept loop and reclaimed by the parent's
-  `SIGCHLD` handler, so the per-module, per-source and auth-failure state is
-  shared across every child (including after `SIGKILL`). The per-source table
-  now has a bounded lifetime (expired-lockout/idle entries are reclaimed, with a
-  rate-limited warning when it is genuinely full), and the occupancy counters are
-  re-derived from the shared slot table on every child exit so a child killed
-  mid-registration cannot leak a count. Trusted loopback peers are exempt from the
-  per-host cap and the auth lockout (they share one address); clients behind a
-  shared NAT/proxy still share a single per-host budget and lockout, which is
-  documented.
-
-## [2.21.0] - 2026-09-13
+## [2.21.0] - 2026-09-14
 
 ### Added
 
@@ -51,12 +17,97 @@ run the same version because the handshake is strict.
   the reason into a thread-local buffer exposed by `protocol_last_error()`. The
   detail body is always consumed, so the stream cannot desynchronize, and
   messages are sliced to `MAX_ERROR_DETAIL_BYTES` (4096) on send.
+- **Server-contacting `--dry-run` (protocol 2.21.0).** `--dry-run` now performs
+  a real handshake with a remote/daemon receiver and reports exactly what WOULD
+  change based on receiver state (existing destination files, mtimes, checksums,
+  basis dirs). The wire config carries the dry-run intent (`Config.dry_run`) and
+  the receiver answers each per-file check with `STATUS_DRY_RUN_TRANSFER` (would
+  transfer) or `STATUS_OK` (already up to date); the sender prints the
+  would-transfer set and its trailer without sending any file data. The receiver
+  performs the normal read-only incremental decision but mutates nothing: no temp
+  files, writes, renames, deletes, metadata/xattr/chown, or directory creation.
+  A plain local destination (no explicit `--server-port`/remote) keeps the
+  original client-side dry-run. Would-delete reporting for `--delete*` is
+  deferred to a follow-up; dry-run never deletes.
+- Daemon `max connections per host` (per-source-IP concurrent cap, default 0 =
+  unlimited), `auth lockout threshold` (default 10; 0 disables) and
+  `auth lockout duration` (default 300 s) config keys.
+- `fastsync-server --allow-super` opt-in for a privileged standalone TCP server;
+  without it a root standalone receiver forces super-user activities off (device
+  nodes, `--write-devices`, ownership). The `--stdio` SSH argv is client-composed,
+  so super activities always stay off there.
 
 ### Changed
 
+- Config wire fields are now declared once in an X-macro table
+  (`CONFIG_WIRE_FIELDS` in `src/shared/config.h`) that generates the struct
+  members, defaults, and the send/receive sequence, removing the manual
+  six-site field sync. Wire bytes and `PROTOCOL_VERSION` are unchanged.
 - `receive_incremental_check()` (the per-file `STATUS_CHECK` fast path) is split
   into small static helpers with a short linear orchestrator. Pure refactor: the
   wire byte stream and all cleanup are unchanged.
+- `authorized_root` state has a single owner (`utils.c`) with read accessors; the
+  duplicated statics in `file.c` and the server were removed.
+- `Data` records its owning `ProtocolSession` so its memory charge is returned to
+  the session that reserved it, regardless of the destroying thread.
+- The receiver pipeline moved out of `shared` into `server/receiver_pipeline.[ch]`;
+  the build now uses explicit `fastsync_shared` / `fastsync_client_core` /
+  `fastsync_server_core` targets instead of a GLOB, and the client no longer links
+  server code.
+- The benchmark tool generates the requested random/compressible data mix
+  accurately, verifies each transfer before recording it, computes correct
+  percentiles, adds a MB/s column, handles `tc`/netem without requiring `sudo`
+  when already root, builds into a dedicated `build-bench/` directory, and adds a
+  `--warm` incremental-transfer mode.
+- The `nix-shell` dev environment provides the full toolchain (clang-format,
+  cppcheck, pytest-xdist, OpenSSH, rsync, iproute2, valgrind, lcov) and no longer
+  builds on entry.
+
+### Security
+
+- Enforce the daemon's per-module `max connections` cap (0 = unlimited) and add
+  the shared per-source `max connections per host` cap plus a cross-process
+  `auth lockout`. Because the listener forks one child per connection, the
+  counters live in an anonymous shared mapping created before the accept loop and
+  reclaimed by the parent's `SIGCHLD` handler, so the per-module, per-source and
+  auth-failure state is shared across every child (including after `SIGKILL`). The
+  per-source table has a bounded lifetime (expired/idle entries are reclaimed,
+  with a rate-limited warning when genuinely full), and the occupancy counters are
+  re-derived from the shared slot table on every child exit. Trusted loopback
+  peers are exempt (they share one address); clients behind a shared NAT/proxy
+  share a single per-host budget and lockout, which is documented.
+- Hardening from a full security audit:
+  - Fail a truncated zstd frame instead of spinning forever (remote DoS).
+  - Open receiver destination/basis/hard-link entries `O_NONBLOCK` so a
+    client-planted FIFO cannot block a worker indefinitely.
+  - Require a regular file before `--inplace` writes, closing a FIFO-hang and a
+    raw-device write that bypassed the `--write-devices` gate.
+  - Reject SSH destinations whose user/host begins with `-` and insert `--` before
+    the host token, closing `-o ProxyCommand=…` argument injection (RCE).
+  - Gate client `--force` recursive removal behind the server `--allow-delete`
+    policy.
+  - Reject empty `hosts allow`/`hosts deny`/`auth users` values instead of
+    silently meaning "unrestricted".
+  - Restrict TLS 1.2 to AEAD suites and set server cipher preference; load the
+    private key TOCTOU-safely from an `O_NOFOLLOW` fd; verify IP literals against
+    IP SANs; guard client-cert CN truncation.
+  - Make `--dry-run` content-blind: it neither reads destination files nor
+    hashes basis files, removing a 1-bit content oracle against `read only`
+    modules.
+  - Bound glob matching (iterative DP, no exponential backtracking) and bound
+    line reads for filter/`--files-from`/pattern files.
+  - Gate `system.posix_acl_*` xattrs on `--acls` and charge decompression/chunk
+    allocations against the per-connection memory budget.
+
+### Fixed
+
+- Pre-auth NULL dereference in `config_delete()` when an over-long
+  `basis_count` (and the analogous count fields) was received and then failed
+  validation; received counts are now validated before being published.
+- Leaked inherited `Data` in the forked compression-truncation unit test
+  (valgrind definite leak).
+- `receive_status()` no longer loses a captured rejection reason when owed
+  keepalives are drained.
 
 ## [2.20.0] - 2026-09-13
 
