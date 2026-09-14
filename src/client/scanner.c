@@ -179,7 +179,7 @@ static bool entry_passes_selection(const FileListSet* file_list, const FilterRul
 static void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file) {
   if (!scanner || !file || !(scanner->options.preserve_xattrs || scanner->options.preserve_acls))
     return;
-  file->xattrs = xattr_capture_path(file->path);
+  file->xattrs = xattr_capture_path(file->path, scanner->options.preserve_acls);
 }
 
 /* Apply --hard-links (-H) detection to one regular File.  On a sibling (a
@@ -284,7 +284,10 @@ static int open_directory_filter_context(DirectoryScanner* scanner, const Filter
       filter_file_read(scanner->current_path, scanner->current_rel ? scanner->current_rel : "",
                        &exists, err, sizeof(err));
   if (!own) {
-    log_message(LOG_LEVEL_ERROR, "invalid .rsync-filter in %s: %s", scanner->current_path, err);
+    char* escaped_path = output_escape(scanner->current_path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR, "invalid .rsync-filter in %s: %s",
+                escaped_path ? escaped_path : "<allocation failed>", err);
+    free(escaped_path);
     scanner->failed = true;
     return -1;
   }
@@ -777,11 +780,19 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
        nothing (missing entries never appear there).  Without the flags it stays
        a hard pre-transfer error. */
     if (scanner->options.ignore_missing_args) {
-      log_info_message(LOG_INFO_MISC, "skipping missing --files-from entry '%s'", entry);
+      char* escaped_entry = output_escape(entry, log_get_8_bit_output());
+      log_info_message(LOG_INFO_MISC, "skipping missing --files-from entry '%s'",
+                       escaped_entry ? escaped_entry : "<allocation failed>");
+      free(escaped_entry);
       free(abs_path);
       return NULL;
     }
-    log_message(LOG_LEVEL_ERROR, "--dirs listed entry is not present under the source: %s", entry);
+    {
+      char* escaped_entry = output_escape(entry, log_get_8_bit_output());
+      log_message(LOG_LEVEL_ERROR, "--dirs listed entry is not present under the source: %s",
+                  escaped_entry ? escaped_entry : "<allocation failed>");
+      free(escaped_entry);
+    }
     free(abs_path);
     scanner->failed = true;
     return NULL;
@@ -1434,7 +1445,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   }
   if ((options->preserve_xattrs || options->preserve_acls) &&
       !(file->link_group != 0 && !file->link_first))
-    file->xattrs = xattr_capture_path(file->path);
+    file->xattrs = xattr_capture_path(file->path, options->preserve_acls);
   if (!array_list_add(root_files, file)) {
     free(rel);
     file_destroy(file);

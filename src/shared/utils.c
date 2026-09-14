@@ -378,59 +378,155 @@ char* output_escape(const char* string, bool eight_bit_output) {
   return escaped;
 }
 
+ssize_t utils_getdelim_bounded(FILE* stream, char** line, size_t* cap, int delim, size_t max_len) {
+  if (!stream || !line || !cap || max_len == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  size_t limit = max_len + 1; /* content bytes plus the terminating NUL */
+  if (*line == NULL || *cap < 2) {
+    size_t initial = limit < 256 ? limit : 256;
+    char* buf = malloc(initial);
+    if (!buf)
+      return -1;
+    free(*line);
+    *line = buf;
+    *cap = initial;
+  }
+  size_t len = 0;
+  int c;
+  while ((c = getc_unlocked(stream)) != EOF) {
+    if (len >= max_len) {
+      errno = EFBIG;
+      return -1;
+    }
+    if (len + 2 > *cap) {
+      size_t new_cap = *cap * 2;
+      if (new_cap < len + 2)
+        new_cap = len + 2;
+      if (new_cap > limit)
+        new_cap = limit;
+      char* grown = realloc(*line, new_cap);
+      if (!grown)
+        return -1;
+      *line = grown;
+      *cap = new_cap;
+    }
+    (*line)[len++] = (char)c;
+    if (c == delim)
+      break;
+  }
+  if (c == EOF && len == 0)
+    return 0;
+  (*line)[len] = '\0';
+  return (ssize_t)len;
+}
+
 /* Match a glob pattern against a string. Supported wildcards:
  *   ?      matches any single character except '/'.
  *   *      matches any sequence of characters within one path component (no '/').
  *   **     matches any sequence of characters, including '/' (cross-directory).
  *   slash-star-star-slash is treated as a cross-directory wildcard when it appears between
  * literals.
- */
+ *
+ * The matcher is an iterative O(pattern * string) dynamic program rather than the
+ * original backtracking recursion: overlapping `*`/`**` wildcards made a pattern
+ * like `*a*a*a*...*b` run in exponential time against a long run of `a`, a CPU
+ * denial-of-service vector reachable from a hostile --exclude/--include pattern
+ * or `.rsync-filter`.  The DP reasons over (pattern position, string position)
+ * so every state is visited once; the transitions below mirror the original
+ * recursion exactly. */
 bool glob_match(const char* pattern, const char* str) {
-  while (*pattern) {
-    if (*pattern == '*') {
-      if (*(pattern + 1) == '*') {
-        /* globstar: match across directories */
-        pattern += 2;
-        if (*pattern == '\0')
-          return true;
-        if (*pattern == '/')
-          pattern++;
-        while (*str) {
-          if (glob_match(pattern, str))
-            return true;
-          str++;
+  if (!pattern || !str)
+    return false;
+  size_t pattern_len = strlen(pattern);
+  size_t str_len = strlen(str);
+  if (pattern_len == 0)
+    return str_len == 0;
+  /* Defensive work cap: the DP is bounded by pattern*string states, but a
+   * 64 KiB pattern against a 64 KiB path would still cost billions of steps.
+   * Treat the pattern as non-matching above the cap instead of burning CPU. */
+  if (str_len > (SIZE_MAX / (pattern_len + 1)) - 1)
+    return false;
+  if ((pattern_len + 1) * (str_len + 1) > 64u * 1024u * 1024u)
+    return false;
+
+  size_t row_bytes = str_len + 1;
+  /* Rows for pattern positions i, i+1, i+2 and i+3 are live at once (the
+   * globstar transition can skip up to three pattern bytes).  Four rotating
+   * rows keep memory at O(string length); a stack buffer avoids an allocation
+   * for the common short-leaf case. */
+  enum { STACK_ROW = 257 };
+  uint8_t stack_rows[4 * STACK_ROW];
+  uint8_t* rows = stack_rows;
+  if (row_bytes > STACK_ROW) {
+    rows = malloc(4 * row_bytes);
+    if (!rows)
+      return false;
+  }
+
+#define GLOB_ROW(i) (rows + ((pattern_len - (i)) & 3) * row_bytes)
+
+  /* Base row: pattern position `pattern_len` matches only the string's end. */
+  for (size_t j = 0; j <= str_len; j++)
+    GLOB_ROW(pattern_len)[j] = (j == str_len) ? 1 : 0;
+
+  for (size_t i = pattern_len; i-- > 0;) {
+    const char pc = pattern[i];
+    uint8_t* cur = GLOB_ROW(i);
+    const uint8_t* next = GLOB_ROW(i + 1);
+    if (pc == '*') {
+      if (i + 1 < pattern_len && pattern[i + 1] == '*') {
+        /* Globstar: skip `**` and an optional following '/', then consume any
+         * (possibly empty) run of characters -- including '/'. */
+        size_t rest = i + 2;
+        if (rest < pattern_len && pattern[rest] == '/')
+          rest++;
+        const uint8_t* rest_row = GLOB_ROW(rest);
+        for (size_t j = str_len + 1; j-- > 0;) {
+          bool v = rest_row[j] != 0;
+          if (!v && j < str_len)
+            v = cur[j + 1] != 0;
+          cur[j] = v ? 1 : 0;
         }
-        return glob_match(pattern, str);
+      } else {
+        /* Single `*`: zero characters, or one non-'/' character. */
+        for (size_t j = str_len + 1; j-- > 0;) {
+          bool v = next[j] != 0;
+          if (!v && j < str_len && str[j] != '/')
+            v = cur[j + 1] != 0;
+          cur[j] = v ? 1 : 0;
+        }
       }
-      /* single *: match within one path component */
-      pattern++;
-      while (*str && *str != '/') {
-        if (glob_match(pattern, str))
-          return true;
-        str++;
+    } else if (pc == '?') {
+      for (size_t j = str_len + 1; j-- > 0;) {
+        bool v = j < str_len && str[j] != '/' && next[j + 1] != 0;
+        cur[j] = v ? 1 : 0;
       }
-      return glob_match(pattern, str);
-    } else if (*pattern == '?') {
-      if (!*str || *str == '/')
-        return false;
-      pattern++;
-      str++;
     } else {
-      if (*pattern != *str) {
-        /* allow literal / ** / rest to match any number of directories */
-        if (*pattern == '/' && *(pattern + 1) == '*' && *(pattern + 2) == '*') {
-          const char* rest = pattern + 3;
-          if (*rest == '/')
+      /* Literal: consume an equal character, or -- for a '/' immediately before
+       * a globstar -- let the '/' match zero directories and continue at `**`. */
+      for (size_t j = str_len + 1; j-- > 0;) {
+        bool v = false;
+        if (j < str_len && str[j] == pc) {
+          v = next[j + 1] != 0;
+        } else if (pc == '/' && i + 2 < pattern_len && pattern[i + 1] == '*' &&
+                   pattern[i + 2] == '*') {
+          size_t rest = i + 3;
+          if (rest < pattern_len && pattern[rest] == '/')
             rest++;
-          return glob_match(rest, str);
+          v = GLOB_ROW(rest)[j] != 0;
         }
-        return false;
+        cur[j] = v ? 1 : 0;
       }
-      pattern++;
-      str++;
     }
   }
-  return *str == '\0';
+
+  bool matched = GLOB_ROW(0)[0] != 0;
+#undef GLOB_ROW
+  if (rows != stack_rows)
+    free(rows);
+  return matched;
 }
 
 bool format_human_bytes(unsigned long long bytes, char* buffer, size_t buffer_size) {

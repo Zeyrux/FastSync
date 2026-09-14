@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -994,6 +995,94 @@ static void test_inplace_overwrite_truncates_shorter_payload() {
   rmdir(root);
 }
 
+/* B2: --inplace must refuse an existing non-regular destination entry.  A FIFO
+   would block open(O_WRONLY) forever and a device node would be written
+   directly, bypassing the --write-devices/super gate.  Forked with an alarm so
+   a regression is a prompt failure instead of a hung suite. */
+static void test_inplace_refuses_fifo_destination() {
+  const char* root = "test_inplace_fifo_tmp";
+  const char* path = "test_inplace_fifo_tmp/fifo";
+  unlink(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  EXPECT_EQ_INT(mkfifo(path, 0600), 0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(10);
+    File* f = file_create("fifo");
+    if (!f)
+      _exit(1);
+    const char* content = "payload";
+    f->data->data = malloc(strlen(content));
+    if (!f->data->data)
+      _exit(1);
+    memcpy(f->data->data, content, strlen(content));
+    f->data->size = strlen(content);
+    Config* cfg = config_create();
+    if (!cfg)
+      _exit(1);
+    cfg->inplace = true;
+    bool written = file_save_to_disk(root, f, cfg);
+    file_destroy(f);
+    config_delete(cfg);
+    _exit(written ? 1 : 0); /* must be refused */
+  }
+  int status;
+  waitpid(pid, &status, 0);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(path, &st), 0);
+  EXPECT_TRUE(S_ISFIFO(st.st_mode)); /* left untouched */
+  unlink(path);
+  rmdir(root);
+}
+
+/* B2: an existing char device must not be written by --inplace.  mknod needs
+   privilege, so a non-root run skips gracefully.  /dev/null's (1:3) rdev makes
+   the negative case harmless if it ever regresses. */
+static void test_inplace_refuses_device_destination() {
+  const char* root = "test_inplace_dev_tmp";
+  const char* path = "test_inplace_dev_tmp/dev";
+  unlink(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  if (mknod(path, S_IFCHR | 0600, makedev(1, 3)) != 0) {
+    rmdir(root);
+    return; /* no privilege to create a device node: skip */
+  }
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(10);
+    File* f = file_create("dev");
+    if (!f)
+      _exit(1);
+    const char* content = "payload";
+    f->data->data = malloc(strlen(content));
+    if (!f->data->data)
+      _exit(1);
+    memcpy(f->data->data, content, strlen(content));
+    f->data->size = strlen(content);
+    Config* cfg = config_create();
+    if (!cfg)
+      _exit(1);
+    cfg->inplace = true;
+    bool written = file_save_to_disk(root, f, cfg);
+    file_destroy(f);
+    config_delete(cfg);
+    _exit(written ? 1 : 0); /* must be refused */
+  }
+  int status;
+  waitpid(pid, &status, 0);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(path, &st), 0);
+  EXPECT_TRUE(S_ISCHR(st.st_mode)); /* still a device, not replaced */
+  unlink(path);
+  rmdir(root);
+}
+
 /* Explicit directory entries (--dirs) create the directory under the receive
    root through the same save funnel, creating parents as needed, and reject
    traversal the same way a file path does. */
@@ -1606,4 +1695,6 @@ void test_file() {
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();
   test_inplace_overwrite_truncates_shorter_payload();
+  test_inplace_refuses_fifo_destination();
+  test_inplace_refuses_device_destination();
 }

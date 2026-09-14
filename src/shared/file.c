@@ -890,13 +890,35 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
   if (inplace) {
     /* --inplace writes directly into the destination; a scratch --temp-dir
        does not apply and must never redirect these writes. */
-    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+    /* Type gate BEFORE opening: an existing destination entry that is not a
+       regular file (FIFO, socket, char/block device, directory) must never be
+       opened for writing.  Opening a FIFO would block the receive thread
+       forever and writing into a device would bypass the --write-devices /
+       super-mode gate (a client-controlled device write).  fstatat with
+       AT_SYMLINK_NOFOLLOW does not follow a symlink and does not block. */
+    struct stat pre_stat;
+    if (fstatat(dirfd, leaf, &pre_stat, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISREG(pre_stat.st_mode)) {
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
+    /* O_NONBLOCK: a no-op for a regular file, but a raced-in FIFO cannot block
+       the open before the post-open S_ISREG re-check rejects it. */
+    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
     if (fd >= 0) {
       struct stat destination_stat;
+      /* Re-check the opened descriptor: a concurrent replacement between the
+         fstatat probe and the open (or a device/FIFO raced in) must never be
+         written through. */
+      if (fstat(fd, &destination_stat) != 0 || !S_ISREG(destination_stat.st_mode)) {
+        close(fd);
+        close(dirfd);
+        free(leaf);
+        return false;
+      }
       bool newer = false;
-      if (update && metadata && fstat(fd, &destination_stat) == 0 &&
-          S_ISREG(destination_stat.st_mode)) {
-        newer = stat_is_newer(&destination_stat, metadata);
+      if (update && metadata && stat_is_newer(&destination_stat, metadata)) {
+        newer = true;
       }
       if (newer) {
         ok = true;
@@ -1226,11 +1248,19 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
       if (linked) {
         int target_dirfd = scratch_dirfd >= 0 ? scratch_dirfd : dirfd;
         if (use_fsync) {
-          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-          if (tfd < 0 || fsync(tfd) != 0) {
+          /* O_NONBLOCK: the freshly linked temp is normally the basis's regular
+             file, but a raced-in FIFO at the name must not block this reopen
+             forever.  With O_NONBLOCK such an open fails with ENXIO instead of
+             blocking, which is treated as a benign fsync-skip (the link itself
+             is still installed); any other open/fsync failure falls back to the
+             byte-copy path as before. */
+          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+          if (tfd < 0) {
+            if (errno != ENXIO)
+              linked = false;
+          } else if (fsync(tfd) != 0) {
             linked = false;
-            if (tfd >= 0)
-              close(tfd);
+            close(tfd);
           } else {
             close(tfd);
           }

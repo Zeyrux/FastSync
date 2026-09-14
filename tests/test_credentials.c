@@ -473,6 +473,34 @@ static void test_credentials_store_rejects_legacy_hex() {
   free(path);
 }
 
+/* C9: the legacy-hex detector must check the length before indexing 64 bytes, so
+ * a short secret is never read out of bounds.  Such a line is rejected for the
+ * ordinary "expected verifier" reason, never as legacy. */
+static void test_credentials_store_rejects_short_secret() {
+  char contents[CREDENTIAL_MAX_LINE];
+  snprintf(contents, sizeof(contents), "alice:%s\n", "abc");
+  char* path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  char err[512];
+  const CredentialStore* store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NULL(store);
+  EXPECT_TRUE(strstr(err, "legacy unsalted") == NULL);
+  rm_temp(path);
+  free(path);
+
+  char short_hex[64];
+  memset(short_hex, 'a', 63);
+  short_hex[63] = '\0';
+  snprintf(contents, sizeof(contents), "alice:%s\n", short_hex);
+  path = make_tmp_file(contents);
+  EXPECT_NOT_NULL(path);
+  store = credentials_load(path, NULL, err, sizeof(err));
+  EXPECT_NULL(store);
+  EXPECT_TRUE(strstr(err, "legacy unsalted") == NULL);
+  rm_temp(path);
+  free(path);
+}
+
 static void test_credentials_store_duplicate_rejected() {
   char line[CREDENTIAL_MAX_LINE];
   EXPECT_TRUE(make_store_line("alice", KAT_PASSWORD, CREDENTIAL_MIN_ITERS, line, sizeof(line)));
@@ -1066,6 +1094,7 @@ void test_credentials(void) {
   test_credentials_store_parse_valid();
   test_credentials_store_parse_rejects_malformed();
   test_credentials_store_rejects_legacy_hex();
+  test_credentials_store_rejects_short_secret();
   test_credentials_store_duplicate_rejected();
   test_credentials_store_rejects_nonuniform_iters();
   test_credentials_store_parse_missing_file();

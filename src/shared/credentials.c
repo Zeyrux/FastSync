@@ -158,13 +158,13 @@ static int hex_value(char c) {
  * digits.  Such a line is refused loudly (and never accepted) so an operator
  * cannot keep a replayable bearer digest in place after the protocol bump. */
 static bool secret_is_legacy_hex(const char* s) {
-  if (!s)
+  if (!s || strlen(s) != 64)
     return false;
   for (int i = 0; i < 64; i++) {
     if (hex_value(s[i]) < 0)
       return false;
   }
-  return s[64] == '\0';
+  return true;
 }
 
 bool credentials_b64_encode(const uint8_t* in, size_t n, char* out, size_t out_sz) {

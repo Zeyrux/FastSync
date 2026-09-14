@@ -3275,6 +3275,58 @@ static void test_parse_args_block_size() {
   config_delete(cfg);
 }
 
+/* An over-long --exclude-from/--include-from line is rejected at parse time
+ * rather than being read without a bound. */
+static void test_parse_args_pattern_file_oversized_rejected() {
+  const char* list_path = "cli_pattern_oversized.txt";
+  size_t len = UTILS_MAX_LINE_LEN + 4096;
+  char* big = malloc(len);
+  EXPECT_NOT_NULL(big);
+  memset(big, 'a', len);
+  write_file_bytes(list_path, big, len);
+  free(big);
+
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--exclude-from", (char*)list_path, "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+  remove(list_path);
+}
+
+/* A leading '-'/'+' must be rejected for every unsigned numeric option so
+ * strtoull can never silently wrap (e.g. -1 -> ULLONG_MAX). */
+static void test_parse_args_unsigned_options_reject_sign() {
+  static const char* const opts[] = {"--chunk-size", "--bwlimit", "--delta-max"};
+  for (size_t i = 0; i < sizeof(opts) / sizeof(opts[0]); i++) {
+    Config* cfg = config_create();
+    int positional_args[2];
+    int positional_count = 0;
+    char* argv[] = {"fastsync", (char*)opts[i], "-1", "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  /* An over-cap --chunk-size is rejected at parse time (max 64 MiB). */
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* big_argv[] = {"fastsync", "--chunk-size", "67108865", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, big_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+}
+
+/* --dry-run must not emit a batch file, so it is rejected alongside
+ * --read-batch/--only-write-batch. */
+static void test_validate_config_dry_run_rejects_write_batch() {
+  Config* cfg = valid_client_config();
+  cfg->dry_run = true;
+  cfg->write_batch = str_dup("batch.dat");
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -3432,4 +3484,7 @@ void test_client_cli() {
   test_parse_args_remote_option_short_M();
   test_parse_args_no_motd();
   test_parse_args_password_file();
+  test_parse_args_pattern_file_oversized_rejected();
+  test_parse_args_unsigned_options_reject_sign();
+  test_validate_config_dry_run_rejects_write_batch();
 }

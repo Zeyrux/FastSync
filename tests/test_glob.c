@@ -1,7 +1,9 @@
 #include "test_glob.h"
 #include "utils.h"
 #include "test_utils.h"
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void test_glob_exact_match() {
   EXPECT_TRUE(glob_match("foo", "foo"));
@@ -76,6 +78,34 @@ static void test_glob_doublestar_mid() {
   EXPECT_FALSE(glob_match("a/**/b", "a/x/bad"));
 }
 
+/* The old backtracking matcher explored an exponential number of paths for a
+ * pattern with many `*` wildcards against a long run that never matches the
+ * trailing literal.  The iterative matcher must stay bounded: 30 `*a` groups
+ * followed by `b` against ten thousand `a`s is a few hundred thousand states,
+ * not 2^30 recursion nodes. */
+static void test_glob_pathological_is_bounded() {
+  char pattern[128];
+  size_t pos = 0;
+  for (int i = 0; i < 30; i++) {
+    pattern[pos++] = '*';
+    pattern[pos++] = 'a';
+  }
+  pattern[pos++] = 'b';
+  pattern[pos] = '\0';
+
+  char* text = malloc(10001);
+  EXPECT_NOT_NULL(text);
+  memset(text, 'a', 10000);
+  text[10000] = '\0';
+
+  clock_t start = clock();
+  EXPECT_FALSE(glob_match(pattern, text));
+  double elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
+  EXPECT_TRUE(elapsed < 5.0);
+
+  free(text);
+}
+
 void test_glob() {
   test_glob_exact_match();
   test_glob_question_mark();
@@ -91,4 +121,5 @@ void test_glob() {
   test_glob_doublestar_prefix();
   test_glob_doublestar_suffix();
   test_glob_doublestar_mid();
+  test_glob_pathological_is_bounded();
 }

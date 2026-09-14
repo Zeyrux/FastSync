@@ -444,9 +444,10 @@ class TestRemoteDryRun:
         self._seed(source)
         clean_dir(dest)
 
-        # Populate the destination with a real transfer, then make exactly one
-        # file differ (content+size) and add a brand-new file.
-        result, _ = run_client(source, dest, port=shared_server.port)
+        # Populate the destination with a real transfer that preserves mtimes
+        # (--preserve), then make exactly one file differ (content+size) and add
+        # a brand-new file.
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
         assert result.returncode == 0, f"seed transfer failed: {result.stderr[:200]}"
         received = get_dest_received_dir(dest, source)
 
@@ -456,9 +457,11 @@ class TestRemoteDryRun:
             f.write(b"newly added\n")
 
         before = _snapshot_tree(received)
-        # --checksum makes the up-to-date decision content-based (the seed
-        # transfer did not preserve mtimes), so keep.txt/deep.txt report skip.
-        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum"],
+        # --checksum must NOT read destination contents in a dry-run (B3), so
+        # the up-to-date decision is metadata-only.  The --preserve seed made
+        # keep.txt and deep.txt size+mtime-identical; the dry-run must also
+        # transmit metadata (--preserve) for that metadata to be comparable.
+        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum", "--preserve"],
                                port=shared_server.port)
         assert result.returncode == 0, f"remote dry-run failed: {result.stderr[:300]}"
         assert "Dry run:" in result.stdout, result.stdout[:200]
@@ -469,6 +472,34 @@ class TestRemoteDryRun:
         )
         assert "deep.txt" not in result.stdout, result.stdout
         assert _snapshot_tree(received) == before, "remote dry-run mutated the destination"
+
+    @pytest.mark.ci
+    def test_remote_dry_run_checksum_does_not_read_destination(self, shared_server):
+        """B3: --dry-run --checksum against a read-only module must not read the
+        destination file's content (a 1-bit hash oracle).  A same-size/same-content
+        file whose mtime differs is therefore reported as would-transfer because
+        the metadata-only decision is inconclusive, instead of being hashed and
+        silently skipped."""
+        source = os.path.join(TEST_DATA_DIR, "remote_dry_oracle_src")
+        dest = os.path.join(TEST_DATA_DIR, "remote_dry_oracle_dst")
+        self._seed(source)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["--preserve"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+
+        target = os.path.join(received, "keep.txt")
+        # Identical size and content, but a deliberately different mtime.
+        os.utime(target, (1000000000, 1000000000))
+        before = _snapshot_tree(received)
+
+        result, _ = run_client(source, dest, flags=["--dry-run", "--checksum", "--preserve"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "keep.txt" in result.stdout, (
+            f"dry-run --checksum must not read the destination to prove equality: {result.stdout}"
+        )
+        assert _snapshot_tree(received) == before, "dry-run mutated the destination"
 
     @pytest.mark.ci
     def test_remote_dry_run_into_empty_dest_creates_nothing(self, shared_server):
@@ -1561,8 +1592,33 @@ class TestDelete:
         assert not missing, f"Missing: {missing}"
         assert not mismatches, f"Mismatch: {mismatches}"
 
-
-class TestProgress:
+    @pytest.mark.ci
+    def test_force_cannot_replace_directory_without_allow_delete(self):
+        """C2: --force is deletion authority (an incoming file may recursively
+        remove a non-empty destination directory tree).  A server started without
+        --allow-delete must clear it, so the operator's delete policy cannot be
+        bypassed with --force."""
+        source = os.path.join(TEST_DATA_DIR, "force_src")
+        dest = os.path.join(TEST_DATA_DIR, "force_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "blocker"), "wb") as f:
+            f.write(b"incoming file\n")
+        received = get_dest_received_dir(dest, source)
+        blocker = os.path.join(received, "blocker")
+        os.makedirs(blocker)
+        nested = os.path.join(blocker, "nested.txt")
+        with open(nested, "w") as f:
+            f.write("survivor")
+        # Deliberately NO --allow-delete.
+        server = ServerManager()
+        server.start()
+        try:
+            run_client(source, dest, flags=["--force"], port=server.port)
+        finally:
+            server.stop()
+        assert os.path.isdir(blocker), "unauthorized --force removed a destination directory"
+        assert os.path.exists(nested), "unauthorized --force removed a nested file"
     def test_progress_output(self, shared_server):
         clean_dir(DEST_DIR)
         result, dur = run_client(
@@ -3782,6 +3838,27 @@ class TestBasisDestDirs:
         assert _read_file(os.path.join(received, self.ADDED)) == \
             self._source_tree("c")[self.ADDED], "added file not transferred"
 
+    @pytest.mark.ci
+    def test_dry_run_compare_dest_does_not_read_basis(self, shared_server):
+        # A dry-run --compare-dest must never read/hash the basis file: doing so
+        # is a 1-bit content oracle against the client-supplied digest.  Even a
+        # byte-identical basis with a matching size+mtime is therefore reported
+        # as would-transfer, and nothing is created.
+        source = self._make_source("basis_dry_src", {self.UNCHANGED: b"stable content v1\n"})
+        dest = os.path.join(TEST_DATA_DIR, "basis_dry_dst")
+        clean_dir(dest)
+        self._seed_basis(dest, source, "drybasis", {self.UNCHANGED: b"stable content v1\n"})
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest,
+                               flags=["--compare-dest=drybasis", "--dry-run"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"dry-run compare-dest failed: {result.stderr[:300]}"
+        assert self.UNCHANGED in result.stdout, (
+            "dry-run compare-dest silently skipped: receiver read the basis content"
+        )
+        assert _snapshot_tree(dest) == before, "dry-run compare-dest mutated the destination"
+
     def test_compare_dest_content_mismatch_forces_transfer(self, shared_server):
         # The basis holds a file with a DIFFERENT body: even though it shares
         # the mtime pin, the xxHash check fails and the data must be sent.
@@ -4576,6 +4653,61 @@ class TestSuperPrivilege:
         st = os.lstat(os.path.join(received, "f.txt"))
         assert (st.st_uid, st.st_gid) != (12345, 12346), \
             f"--no-super must suppress fake-super's owner replay: uid={st.st_uid} gid={st.st_gid}"
+
+
+class TestStandaloneSuperDefault:
+    """C3: a privileged (root) STANDALONE server without --allow-super forces
+    SUPER_MODE_OFF, so a client cannot make it create device nodes, write raw
+    devices, apply ownership, or use --copy-as.  The shared_server fixture opts in
+    with --allow-super to keep the historical behavior available to the existing
+    root-only tests; these tests start their own un-opted server."""
+
+    @pytest.mark.ci
+    def test_copy_as_refused_without_allow_super(self):
+        """--copy-as is a client-chosen-ownership request and must be refused by
+        a standalone server that did not opt in with --allow-super (on a non-root
+        receiver it is refused for lack of privilege either way)."""
+        source = os.path.join(TEST_DATA_DIR, "super_default_src")
+        dest = os.path.join(TEST_DATA_DIR, "super_default_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as f:
+            f.write(b"no copy-as\n")
+        server = ServerManager()
+        server.start()  # deliberately no --allow-super
+        try:
+            result, _ = run_client(source, dest,
+                                   flags=["--preserve", "--copy-as=@65534:@65534"],
+                                   port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode != 0, (
+            "standalone server accepted --copy-as without --allow-super"
+        )
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="root can create the source device node")
+    def test_devices_skipped_without_allow_super(self):
+        """Root standalone server without --allow-super must skip device-node
+        creation even for a client --devices request (the run still succeeds and
+        the regular file transfers)."""
+        source = os.path.join(TEST_DATA_DIR, "super_default_dev_src")
+        dest = os.path.join(TEST_DATA_DIR, "super_default_dev_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "plain.txt"), "wb") as f:
+            f.write(b"regular\n")
+        os.mknod(os.path.join(source, "null"), stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        server = ServerManager()
+        server.start()  # deliberately no --allow-super
+        try:
+            result, _ = run_client(source, dest, flags=["--devices"], port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode == 0, f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.lexists(os.path.join(received, "null")), (
+            "root standalone server created a device node without --allow-super"
+        )
 
 
 class TestHardLinks:

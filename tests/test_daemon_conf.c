@@ -391,6 +391,22 @@ static void test_daemon_conf_auth_users_validated() {
   EXPECT_EQ_STR(ok_conf->modules[0].auth_users[0], "alice");
   EXPECT_EQ_STR(ok_conf->modules[0].auth_users[1], "bob");
   daemon_conf_free(ok_conf);
+
+  /* C4: an empty or separator-only `auth users` value is a parse error.  It
+   * would otherwise leave the module with a zero-length allow-list, silently
+   * disabling the authentication the operator asked for. */
+  const char* empty_auth[] = {
+      "[m]\npath = /x\nauth users = \n",
+      "[m]\npath = /x\nauth users = , ,\n",
+      "[m]\npath = /x\nauth users = \t\n",
+  };
+  for (size_t i = 0; i < sizeof(empty_auth) / sizeof(empty_auth[0]); i++) {
+    EXPECT_EQ_INT(write_conf(empty_auth[i], &path), 0);
+    const DaemonConf* rejected = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NULL(rejected);
+    EXPECT_TRUE(strstr(err, "'auth users' must list at least one user") != NULL);
+  }
 }
 
 /* Wave 3 daemon hardening: configurable global/per-module connection caps,
@@ -475,12 +491,55 @@ static void test_daemon_conf_limits_and_hosts_parse() {
   EXPECT_EQ_INT(conf->modules[0].max_connections, 0);
   daemon_conf_free(conf);
 
-  /* An empty hosts list is not an error (no patterns are added). */
-  EXPECT_EQ_INT(write_conf("hosts allow = \n[m]\npath = /x\n", &path), 0);
+  /* C4: a present hosts key with an empty/separator-only value must not silently
+   * install a zero-length (allow-everyone) list. */
+  const char* empty_hosts[] = {
+      "hosts allow = \n[m]\npath = /x\n",
+      "hosts deny = \n[m]\npath = /x\n",
+      "hosts allow = , ,\n[m]\npath = /x\n",
+      "hosts deny = \t\n[m]\npath = /x\n",
+  };
+  for (size_t i = 0; i < sizeof(empty_hosts) / sizeof(empty_hosts[0]); i++) {
+    EXPECT_EQ_INT(write_conf(empty_hosts[i], &path), 0);
+    const DaemonConf* rejected = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NULL(rejected);
+    EXPECT_TRUE(strstr(err, "must list at least one host pattern") != NULL);
+  }
+
+  const char* empty_module_hosts[] = {
+      "[m]\npath = /x\nhosts allow = \n",
+      "[m]\npath = /x\nhosts deny = ,\n",
+  };
+  for (size_t i = 0; i < sizeof(empty_module_hosts) / sizeof(empty_module_hosts[0]); i++) {
+    EXPECT_EQ_INT(write_conf(empty_module_hosts[i], &path), 0);
+    const DaemonConf* rejected = daemon_conf_load(path, err, sizeof(err));
+    free(path);
+    EXPECT_NULL(rejected);
+    EXPECT_TRUE(strstr(err, "must list at least one host pattern") != NULL);
+    /* The diagnostic must name the offending module. */
+    EXPECT_TRUE(strstr(err, "module 'm'") != NULL);
+  }
+
+  /* Per-module host lists APPEND across lines like the global ones.  (A swapped
+   * store_host_list call passed the module name as `replace`, so each line
+   * silently replaced the previous one and only the last survived.) */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\n"
+                           "hosts allow = 127.0.0.1\n"
+                           "hosts allow = 10.0.0.0/8\n"
+                           "hosts deny = 192.168.0.1\n"
+                           "hosts deny = 2001:db8::/32\n",
+                           &path),
+                0);
   conf = daemon_conf_load(path, err, sizeof(err));
   free(path);
   EXPECT_NOT_NULL(conf);
-  EXPECT_EQ_INT(conf->global.hosts_allow_count, 0);
+  EXPECT_EQ_INT(conf->modules[0].hosts_allow_count, 2);
+  EXPECT_EQ_STR(conf->modules[0].hosts_allow[0], "127.0.0.1");
+  EXPECT_EQ_STR(conf->modules[0].hosts_allow[1], "10.0.0.0/8");
+  EXPECT_EQ_INT(conf->modules[0].hosts_deny_count, 2);
+  EXPECT_EQ_STR(conf->modules[0].hosts_deny[0], "192.168.0.1");
+  EXPECT_EQ_STR(conf->modules[0].hosts_deny[1], "2001:db8::/32");
   daemon_conf_free(conf);
 }
 

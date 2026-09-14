@@ -118,3 +118,15 @@ def test_batch_modes_conflict():
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         assert result.returncode != 0, \
             f"expected conflict failure for {flags}: {result.stderr}"
+
+
+@pytest.mark.ci
+def test_dry_run_rejects_write_batch():
+    """--dry-run must not emit a batch file (it must not mutate anything)."""
+    if os.path.exists(BATCH_FILE):
+        os.unlink(BATCH_FILE)
+    cmd = _run(["--source-dir", SOURCE_DIR, "--dest-dir", DEST1,
+                "--dry-run", "--write-batch", BATCH_FILE])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    assert result.returncode != 0, result.stderr
+    assert not os.path.exists(BATCH_FILE), "dry-run must not create a batch file"

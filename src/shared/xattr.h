@@ -59,20 +59,28 @@ void xattr_list_free(FileXattrList* list);
 bool xattr_list_append(FileXattrList* list, const char* name, const void* value, size_t value_len);
 
 /* True when `name` is a well-formed xattr name AND belongs to a namespace this
- * build is authorized to apply (user.* or the two POSIX ACL xattrs).  Used for
- * both capture and receiver-side validation. */
-bool xattr_name_appliable(const char* name);
+ * build is authorized to apply.  `user.*` is always accepted for -X; the two
+ * POSIX ACL xattrs are accepted only when `preserve_acls` (--acls/-A) is set, so
+ * a plain -X run can never carry or apply an ACL the receiver did not ask for.
+ * Used for both capture and receiver-side validation. */
+bool xattr_name_appliable(const char* name, bool preserve_acls);
 
-/* Sender: read the whitelisted xattrs of `path` into a new list.  Returns NULL
- * when the path has no appliable xattrs (or the filesystem has no xattr
- * support); an empty-but-valid list is never returned distinct from NULL. */
-FileXattrList* xattr_capture_path(const char* path);
+/* Sender: read the whitelisted xattrs of `path` into a new list.  The POSIX ACL
+ * names are captured only when `preserve_acls` (--acls/-A) is set, so a plain
+ * -X run never carries an ACL it was not asked to preserve; `user.*` is
+ * unaffected.  Returns NULL when the path has no appliable xattrs (or the
+ * filesystem has no xattr support); an empty-but-valid list is never returned
+ * distinct from NULL. */
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls);
 
 /* Wire: bounded serialization.  xattr_send returns false on write failure; an
  * empty/NULL list transmits a zero-count block.  xattr_receive returns NULL and
- * sets *ok = 0 on any malformed / oversized / non-whitelisted entry. */
+ * sets *ok = 0 on any malformed / oversized / non-whitelisted entry.  When
+ * `preserve_acls` is false, any POSIX ACL entries are consumed and DROPPED (so
+ * a -X transfer still succeeds and never applies an ACL it did not negotiate);
+ * a genuinely disallowed namespace is still rejected. */
 bool xattr_send(int fd, const FileXattrList* list);
-FileXattrList* xattr_receive(int fd, int* ok);
+FileXattrList* xattr_receive(int fd, int* ok, bool preserve_acls);
 
 /* Receiver: apply every entry fd-relative (fsetxattr) to the just-written file
  * descriptor.  A per-attribute failure (e.g. ACL set refused for non-root on a

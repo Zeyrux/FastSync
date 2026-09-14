@@ -6,8 +6,10 @@
 #include "utils.h"
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <threads.h>
 #include <unistd.h>
+#include <zstd.h>
 
 static void test_data_compress_decompress_roundtrip() {
   const char original[] = "Hello, World! This is test data for compression round-trip!";
@@ -138,6 +140,63 @@ static void test_chunk_compress_decompress_roundtrip() {
   unlink(path2);
 }
 
+/* Build a zstd frame whose header omits the content size (the content size
+ * flag is cleared), which ZSTD_getFrameContentSize reports as
+ * ZSTD_CONTENTSIZE_UNKNOWN. */
+static Data* make_unknown_size_frame(const void* src, size_t len) {
+  ZSTD_CCtx* cctx = ZSTD_createCCtx();
+  if (!cctx)
+    return NULL;
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_contentSizeFlag, 0);
+  size_t cap = ZSTD_compressBound(len);
+  Data* out = data_create_empty(cap);
+  if (!out) {
+    ZSTD_freeCCtx(cctx);
+    return NULL;
+  }
+  ZSTD_inBuffer in = {src, len, 0};
+  ZSTD_outBuffer ob = {out->data, cap, 0};
+  size_t ret;
+  do {
+    ret = ZSTD_compressStream2(cctx, &ob, &in, ZSTD_e_end);
+    if (ZSTD_isError(ret)) {
+      data_destroy(out);
+      ZSTD_freeCCtx(cctx);
+      return NULL;
+    }
+  } while (ret > 0);
+  out->size = ob.pos;
+  ZSTD_freeCCtx(cctx);
+  return out;
+}
+
+/* ZSTD_CONTENTSIZE_UNKNOWN is flagged by ZSTD_isError(), so a naive
+ * ZSTD_isError() check rejects every unknown-size frame.  Such a frame must
+ * instead reach the 3x estimate fallback and decompress correctly. */
+static void test_data_decompress_unknown_size_frame() {
+  const char original[] = "unknown-content-size frame: the decompressor must use the 3x estimate, "
+                          "not reject the frame as an error.";
+  size_t len = strlen(original);
+  char* buf = malloc(len);
+  EXPECT_NOT_NULL(buf);
+  memcpy(buf, original, len);
+
+  Data* frame = make_unknown_size_frame(buf, len);
+  free(buf);
+  EXPECT_NOT_NULL(frame);
+  /* Guard the premise of the test: the frame really has no stored size. */
+  EXPECT_EQ_INT((int)ZSTD_getFrameContentSize(frame->data, frame->size),
+                (int)ZSTD_CONTENTSIZE_UNKNOWN);
+
+  Data* decompressed = data_decompress(frame);
+  EXPECT_NOT_NULL(decompressed);
+  EXPECT_EQ_INT((int)decompressed->size, (int)len);
+  EXPECT_EQ_INT(memcmp(decompressed->data, original, len), 0);
+
+  data_destroy(decompressed);
+  data_destroy(frame);
+}
+
 typedef struct {
   int id;
   int iterations;
@@ -211,9 +270,48 @@ static void test_data_compress_reused_contexts_multithreaded() {
   compression_free_thread_contexts();
 }
 
+/* A truncated zstd frame used to make the decompressor spin forever: the
+ * stream call keeps returning a positive hint with all input consumed.  Run the
+ * decompression in a child with an alarm so a regression (infinite loop) is
+ * caught as a timeout failure instead of hanging the whole unit suite. */
+static void test_data_decompress_truncated_frame_fails() {
+  const char* original =
+      "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+  size_t len = strlen(original);
+  char* buf = malloc(len);
+  EXPECT_NOT_NULL(buf);
+  memcpy(buf, original, len);
+  Data* input = data_create(buf, len);
+  EXPECT_NOT_NULL(input);
+
+  pid_t pid = fork();
+  EXPECT_TRUE(pid >= 0);
+  if (pid == 0) {
+    alarm(10); /* kills the child if the decompressor hangs */
+    Data* compressed = data_compress(input, 3);
+    if (compressed && compressed->size > 1) {
+      compressed->size -= 1; /* drop the final byte: frame is now incomplete */
+      Data* out = data_decompress(compressed);
+      bool failed_cleanly = (out == NULL);
+      data_destroy(out);
+      data_destroy(compressed);
+      _exit(failed_cleanly ? 0 : 1);
+    }
+    data_destroy(compressed);
+    _exit(2);
+  }
+  int status;
+  waitpid(pid, &status, 0);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  data_destroy(input);
+}
+
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
+  test_data_decompress_unknown_size_frame();
+  test_data_decompress_truncated_frame_fails();
   test_skip_compress_suffix_matching();
   test_data_compress_with_threads_roundtrip();
   test_data_compress_reused_contexts_multithreaded();

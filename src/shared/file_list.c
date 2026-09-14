@@ -23,6 +23,8 @@ static void string_list_destroy(StringList* list) {
 
 static bool string_list_add(StringList* list, const char* text) {
   if (list->count == list->capacity) {
+    if (list->capacity > INT_MAX / 2)
+      return false;
     int new_cap = list->capacity > 0 ? list->capacity * 2 : 16;
     char** grown = realloc(list->items, (size_t)new_cap * sizeof(char*));
     if (!grown)
@@ -56,8 +58,14 @@ static int normalize_entry(const char* raw, size_t len, bool strip_line_endings,
     snprintf(err, err_size, "absolute path entries are not allowed: '%.*s'", print_len, raw);
     return -1;
   }
-  /* Reject NUL bytes inside a token defensively (NUL-delimited mode splits on
-   * them, so this only guards against embedded garbage). */
+  /* Reject NUL bytes inside a token defensively.  In NUL-delimited mode the
+   * delimiter itself is the final byte and is expected; in line mode any NUL is
+   * embedded garbage (strlen-based parsing would otherwise silently truncate). */
+  size_t scan_len = strip_line_endings ? len : len - 1;
+  if (memchr(raw, '\0', scan_len)) {
+    snprintf(err, err_size, "entry contains an embedded NUL byte");
+    return -1;
+  }
   char* dup = malloc(len + 1);
   if (!dup) {
     snprintf(err, err_size, "memory allocation failed");
@@ -158,10 +166,20 @@ FileListSet* file_list_load(const char* path, bool null_separated, char* err, si
   StringList raw = {0};
   char* line = NULL;
   size_t line_cap = 0;
-  ssize_t n;
   bool ok = true;
   char delim = null_separated ? '\0' : '\n';
-  while (ok && (n = getdelim(&line, &line_cap, delim, fp)) != -1) {
+  while (ok) {
+    ssize_t n = utils_getdelim_bounded(fp, &line, &line_cap, delim, UTILS_MAX_LINE_LEN);
+    if (n < 0) {
+      if (errno == EFBIG)
+        snprintf(err, err_size, "entry in file list exceeds %d bytes", (int)UTILS_MAX_LINE_LEN);
+      else
+        snprintf(err, err_size, "error reading file list: %s", strerror(errno));
+      ok = false;
+      break;
+    }
+    if (n == 0)
+      break;
     int r = normalize_entry(line, (size_t)n, !null_separated, &raw, err, err_size);
     if (r < 0) {
       ok = false;

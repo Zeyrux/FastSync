@@ -243,9 +243,13 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
   log_debug_message(LOG_DEBUG_UTIL, "Start to decompress data");
   unsigned long long dst_size =
       ZSTD_getFrameContentSize(compressed_data->data, compressed_data->size);
-  if (ZSTD_isError(dst_size)) {
-    log_message(LOG_LEVEL_ERROR, "Failed to get decompressed size: %s",
-                ZSTD_getErrorName(dst_size));
+  /* ZSTD_isError() is also true for ZSTD_CONTENTSIZE_ERROR and
+   * ZSTD_CONTENTSIZE_UNKNOWN (both are encoded near (size_t)-1), so test the
+   * sentinels explicitly instead of blanket-rejecting every error-ish value:
+   * only CONTENTSIZE_ERROR means an unreadable header, while CONTENTSIZE_UNKNOWN
+   * must reach the estimate fallback below. */
+  if (dst_size == ZSTD_CONTENTSIZE_ERROR) {
+    log_message(LOG_LEVEL_ERROR, "Failed to get decompressed size: invalid zstd frame");
     return NULL;
   }
 
@@ -324,6 +328,20 @@ Data* data_decompress_limited(Data* compressed_data, size_t maximum_size) {
       uncompressed_data->data = new_data;
       output.dst = new_data;
       output.size = buf_size;
+      /* Re-attempt with the larger output buffer; the truncated-frame check
+       * below must not reject a complete frame that merely filled the previous
+       * buffer exactly. */
+      continue;
+    }
+    /* A positive hint with all input consumed means the frame is incomplete: a
+     * truncated stream would otherwise spin here forever (ZSTD_decompressStream
+     * keeps returning the same hint).  Fail instead of burning CPU. */
+    if (ret != 0 && input.pos == input.size) {
+      log_message(LOG_LEVEL_ERROR,
+                  "Truncated zstd frame: input exhausted with %zu bytes still expected", ret);
+      data_destroy(uncompressed_data);
+      uncompressed_data = NULL;
+      goto cleanup;
     }
   } while (ret > 0);
 
