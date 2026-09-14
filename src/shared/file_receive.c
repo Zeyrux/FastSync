@@ -12,6 +12,7 @@
 #include "array_list.h"
 #include "charset.h"
 #include "chmod.h"
+#include "chunk.h"
 #include "compression.h"
 #include "config.h"
 #include "data.h"
@@ -27,6 +28,11 @@
 
 #define MAX_SERVER_DELETE_COUNT 100000U
 #define MAX_FILE_DATA_SIZE MAX_RECEIVE_WHOLE_FILE_SIZE
+/* Retained cost of one delete-manifest entry beyond its path bytes: the
+   ArrayList pointer slot plus an approximate malloc header/rounding for the
+   heap copy.  Charged against MAX_MANIFEST_BYTES so a frame full of tiny paths
+   cannot retain far more than the byte budget (B5). */
+#define MANIFEST_ENTRY_OVERHEAD (sizeof(char*) + 16)
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
   return file_save_to_disk_full(root_directory, file, config) != FILE_SAVE_ERROR;
@@ -127,7 +133,10 @@ static bool hardlink_read_source(const char* path, void** out_buf, unsigned long
     *source_absent = errno == ENOENT || errno == ENOTDIR;
     return false;
   }
-  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  /* O_NONBLOCK is a no-op for a regular file but makes openat() fail/succeed
+     immediately for a client-planted FIFO instead of blocking the receive
+     thread forever; the post-open S_ISREG gate below is the actual type check. */
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   int saved_errno = errno;
   free(leaf);
   close(parent_fd);
@@ -254,7 +263,8 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
       free(destination_path);
       return absent_result;
     }
-    FileXattrList* sibling_xattrs = cfg->use_xattrs ? xattr_capture_path(staged_first) : NULL;
+    FileXattrList* sibling_xattrs =
+        cfg->use_xattrs ? xattr_capture_path(staged_first, cfg->preserve_acls) : NULL;
     bool ok = file_to_disk_secure_link_attrs(
         staged_sibling, staged_first, content, content_size, preallocate, file->metadata,
         preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, NULL);
@@ -286,7 +296,8 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     return absent_result;
   }
   const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
-  FileXattrList* sibling_xattrs = cfg->use_xattrs ? xattr_capture_path(first_disk) : NULL;
+  FileXattrList* sibling_xattrs =
+      cfg->use_xattrs ? xattr_capture_path(first_disk, cfg->preserve_acls) : NULL;
   bool ok = file_to_disk_secure_link_attrs(
       destination_path, first_disk, content, content_size, preallocate, file->metadata,
       preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
@@ -944,7 +955,7 @@ static bool receive_file_xattrs(File* file, int fd, const Config* config) {
   if (!config->use_xattrs)
     return true;
   int xok = 0;
-  FileXattrList* list = xattr_receive(fd, &xok);
+  FileXattrList* list = xattr_receive(fd, &xok, config->preserve_acls);
   if (!xok) {
     xattr_list_free(list);
     return false;
@@ -1009,9 +1020,19 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
         !compression_should_skip_with_suffixes(
             check_path, config->skip_compress_suffixes,
             config->skip_compress_set ? config->skip_compress_count : -1)) {
+      ProtocolSession* owner = delta_data->owner;
       raw_delta = data_decompress_limited(delta_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
       data_destroy(delta_data);
       if (!raw_delta) {
+        free(old_data);
+        delta_signature_destroy(sig);
+        *failed = true;
+        return NULL;
+      }
+      /* Charge the decompressed delta to the connection budget (the paired
+         wire buffer's charge was just released). */
+      if (!data_charge_session(raw_delta, owner, raw_delta->size)) {
+        data_destroy(raw_delta);
         free(old_data);
         delta_signature_destroy(sig);
         *failed = true;
@@ -1131,9 +1152,17 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
             file->path, config->skip_compress_suffixes,
             config->skip_compress_set ? config->skip_compress_count : -1)) {
       Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
+      ProtocolSession* owner = file_data->owner;
       data_destroy(file_data);
       if (uncompressed == NULL) {
         file_destroy(file);
+        *failed = true;
+        return NULL;
+      }
+      if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
+        data_destroy(uncompressed);
+        file_destroy(file);
+        send_status(fd, STATUS_ERROR);
         *failed = true;
         return NULL;
       }
@@ -1193,7 +1222,9 @@ static bool basis_open_regular(const char* path, unsigned long long expected_siz
   int parent_fd = file_open_secure_parent(path, &leaf, false);
   if (parent_fd < 0)
     return false;
-  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  /* O_NONBLOCK: a client-planted FIFO must not block the receiver's openat()
+     forever; the fstat()/S_ISREG gate below rejects it immediately. */
+  int fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   free(leaf);
   close(parent_fd);
   if (fd < 0)
@@ -1247,13 +1278,26 @@ static bool basis_quick_matches(const Config* config, const struct stat* st, tim
 
 /* Search the basis-dir list in command-line order and return the first exact
    match.  When load_content is true the matched bytes are kept in out->content
-   so the caller can materialize the file without re-reading it. */
+   so the caller can materialize the file without re-reading it.
+
+   An exact match ALSO requires the basis bytes' digest to equal the source's,
+   so `hash_content` gates the content read/hash itself.  A server-contacting
+   --dry-run passes hash_content=false: no basis file may be read or hashed
+   (that would be a 1-bit content oracle against a client-supplied digest), so a
+   metadata-only pass can never confirm a hit and declines it.  The real path
+   always passes hash_content=true, keeping its behavior byte-for-byte. */
 static bool basis_match_find(const Config* config, const char* check_path,
                              unsigned long long check_size, time_t check_mtime,
                              long check_mtime_nsec, const uint8_t* check_digest,
-                             size_t check_digest_len, bool load_content, BasisMatch* out) {
+                             size_t check_digest_len, bool load_content, bool hash_content,
+                             BasisMatch* out) {
   memset(out, 0, sizeof(*out));
   if (!config || !config_has_basis(config) || config->ignore_times)
+    return false;
+  /* Dry-run: never read/hash basis content.  A hit cannot be decided from
+     metadata alone, so report no match (the caller treats it as would-transfer)
+     without touching the file's contents. */
+  if (!hash_content)
     return false;
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
@@ -1637,8 +1681,14 @@ static File* receive_full_file(int fd, const Config* config, const char* path) {
                                              config->skip_compress_set ? config->skip_compress_count
                                                                        : -1)) {
     Data* uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
+    ProtocolSession* owner = file_data->owner;
     data_destroy(file_data);
     if (uncompressed == NULL) {
+      file_destroy(file);
+      return NULL;
+    }
+    if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
+      data_destroy(uncompressed);
       file_destroy(file);
       return NULL;
     }
@@ -1776,7 +1826,9 @@ static IncrementalCheckOutcome incremental_check_open_destination(IncrementalChe
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full_path, &leaf, false);
   if (parent_fd >= 0) {
-    state->old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    /* O_NONBLOCK: an existing FIFO at the destination must not block this
+       openat(); the S_ISREG gate below rejects the non-regular entry. */
+    state->old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     free(leaf);
     close(parent_fd);
     state->has_old_file = state->old_fd >= 0 && fstat(state->old_fd, &state->old_st) == 0 &&
@@ -1815,7 +1867,15 @@ static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckStat
   bool try_delta = config->use_delta && !config->whole_file && has_old_file &&
                    delta_should_attempt(old_size, state->check_size, config->delta_max_file_size);
   bool checksum_needs_read = size_equal && !config->ignore_times && config->checksum;
-  bool need_old_data = checksum_needs_read || try_delta;
+  /* --dry-run must never read the destination file's CONTENTS: a client could
+     otherwise use `--dry-run --checksum` against a read-only module as a
+     1-bit content oracle (hash match / mismatch) and force arbitrary reads.
+     Decide from metadata alone; when metadata is inconclusive (checksum or
+     delta would have required the body) report would-transfer.  The real
+     (non-dry-run) behavior below is unchanged. */
+  bool need_old_data = !config->dry_run && (checksum_needs_read || try_delta);
+  if (config->dry_run)
+    try_delta = false;
   *out_try_delta = try_delta;
 
   if (need_old_data && has_old_file && old_size > 0 && old_size <= MAX_RECEIVE_WHOLE_FILE_SIZE &&
@@ -1836,7 +1896,12 @@ static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckStat
   }
 
   bool match = false;
-  if (checksum_needs_read) {
+  if (config->dry_run) {
+    /* Metadata-only decision: a size match plus a matching mtime is treated as
+       up to date; --checksum/--delta cannot be verified without reading, so an
+       otherwise inconclusive comparison is a would-transfer. */
+    match = size_equal && !config->ignore_times && (config->size_only || match_by_metadata);
+  } else if (checksum_needs_read) {
     uint8_t old_digest[CHECKSUM_MAX_DIGEST_LEN];
     size_t old_len = 0;
     bool hashed = checksum_digest((ChecksumAlgo)config->checksum_algo, config->checksum_seed,
@@ -1861,10 +1926,13 @@ static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckStat
    When dry_run is set and the file is not already up to date the receiver must
    materialize nothing (no basis link/copy, no append/delta/full transfer) and
    the sender must send no data, so answer STATUS_DRY_RUN_TRANSFER and stop.
-   The one exception is a --compare-dest exact hit with no destination copy: a
-   real run would suppress the data without changing the destination, so it
-   reports as a skip (STATUS_OK) exactly as the full basis path below would.
-   Everything read here (destination file, basis candidates) is read-only. */
+
+   The basis lookup is deliberately content-blind: a real run would only accept
+   a --compare-dest exact hit after hashing the basis file and comparing it with
+   the client-supplied digest, which in a dry-run is a 1-bit content oracle.
+   Under dry_run no basis bytes may be read, so an otherwise-matching entry is
+   treated as would-transfer instead of a skip.  Everything read here (the
+   destination file's metadata, basis candidates' metadata) is read-only. */
 static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalCheckState* state,
                                                                   bool* skipped,
                                                                   bool* would_transfer) {
@@ -1875,9 +1943,12 @@ static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalChe
   bool skip_via_compare = false;
   if (config_has_basis(config) && !config->ignore_times) {
     BasisMatch basis;
+    /* hash_content=false: a dry-run must not read or hash the basis file.  No
+       content comparison is possible, so no compare-dest hit can be confirmed
+       and an otherwise-matching file is reported as would-transfer. */
     basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                      (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                     false, &basis);
+                     false, false, &basis);
     if (basis.hit && basis.type == BASIS_DEST_COMPARE && !state->has_old_file)
       skip_via_compare = true;
     basis_match_free(&basis);
@@ -1905,7 +1976,7 @@ static IncrementalCheckOutcome incremental_check_try_basis(IncrementalCheckState
   BasisMatch basis;
   basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                    (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                   true, &basis);
+                   true, true, &basis);
   if (basis.hit) {
     if (basis.type == BASIS_DEST_COMPARE) {
       basis_match_free(&basis);
@@ -2050,7 +2121,7 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
   }
   if (config->use_xattrs) {
     int xok = 0;
-    append_xattrs = xattr_receive(fd, &xok);
+    append_xattrs = xattr_receive(fd, &xok, config->preserve_acls);
     if (!xok) {
       xattr_list_free(append_xattrs);
       return INCREMENTAL_ERROR;
@@ -2066,8 +2137,14 @@ static IncrementalCheckOutcome incremental_check_try_append_resume(IncrementalCh
                                              config->skip_compress_set ? config->skip_compress_count
                                                                        : -1)) {
     Data* uncompressed = data_decompress_limited(tail, MAX_RECEIVE_WHOLE_FILE_SIZE);
+    ProtocolSession* owner = tail->owner;
     data_destroy(tail);
     if (uncompressed == NULL) {
+      xattr_list_free(append_xattrs);
+      return INCREMENTAL_ERROR;
+    }
+    if (!data_charge_session(uncompressed, owner, uncompressed->size)) {
+      data_destroy(uncompressed);
       xattr_list_free(append_xattrs);
       return INCREMENTAL_ERROR;
     }
@@ -2301,8 +2378,14 @@ File* file_receive(const Config* config, int file_descriptor) {
                                              config->skip_compress_set ? config->skip_compress_count
                                                                        : -1)) {
     Data* file_data_uncompressed = data_decompress_limited(file_data, MAX_RECEIVE_WHOLE_FILE_SIZE);
+    ProtocolSession* owner = file_data->owner;
     data_destroy(file_data);
     if (file_data_uncompressed == NULL) {
+      file_destroy(file);
+      return NULL;
+    }
+    if (!data_charge_session(file_data_uncompressed, owner, file_data_uncompressed->size)) {
+      data_destroy(file_data_uncompressed);
       file_destroy(file);
       return NULL;
     }
@@ -2694,19 +2777,21 @@ File* file_receive_special(int file_descriptor) {
    manifest).  Returns an owned DeleteManifest, or NULL after sending STATUS_ERROR
    when the frame is malformed (bad count, empty/absolute path, path traversal,
    or an aggregate size beyond MAX_MANIFEST_BYTES). */
-static bool receive_manifest_section(int fd, ArrayList* list, size_t* manifest_bytes) {
+static bool receive_manifest_section(int fd, ArrayList* list, size_t* manifest_bytes,
+                                     size_t* manifest_entries) {
   int count;
   if (!receive_int(fd, &count)) {
     send_status(fd, STATUS_ERROR);
     return false;
   }
-  if (count < 0 || count > MAX_MANIFEST_ENTRIES) {
+  if (count < 0 || count > MAX_MANIFEST_ENTRIES ||
+      (size_t)count > MAX_MANIFEST_ENTRIES - *manifest_entries) {
     send_status(fd, STATUS_ERROR);
     return false;
   }
   for (int i = 0; i < count; i++) {
     char* s = receive_wire_str(fd);
-    size_t entry_size = s ? strlen(s) : 0;
+    size_t entry_size = s ? strlen(s) + MANIFEST_ENTRY_OVERHEAD : 0;
     if (!s || s[0] == '\0' || s[0] == '/' || has_path_traversal(s) ||
         entry_size > MAX_MANIFEST_BYTES - *manifest_bytes ||
         (*manifest_bytes += entry_size) > MAX_MANIFEST_BYTES || !array_list_add(list, s)) {
@@ -2715,6 +2800,7 @@ static bool receive_manifest_section(int fd, ArrayList* list, size_t* manifest_b
       return false;
     }
   }
+  *manifest_entries += (size_t)count;
   return true;
 }
 
@@ -2733,9 +2819,10 @@ DeleteManifest* receive_manifest_entries(int fd) {
     return NULL;
   }
   size_t manifest_bytes = 0;
-  if (!receive_manifest_section(fd, manifest->keeps, &manifest_bytes) ||
-      !receive_manifest_section(fd, manifest->protected, &manifest_bytes) ||
-      !receive_manifest_section(fd, manifest->missing, &manifest_bytes)) {
+  size_t manifest_entries = 0;
+  if (!receive_manifest_section(fd, manifest->keeps, &manifest_bytes, &manifest_entries) ||
+      !receive_manifest_section(fd, manifest->protected, &manifest_bytes, &manifest_entries) ||
+      !receive_manifest_section(fd, manifest->missing, &manifest_bytes, &manifest_entries)) {
     delete_manifest_free(manifest);
     return NULL;
   }

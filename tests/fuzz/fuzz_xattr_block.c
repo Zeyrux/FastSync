@@ -75,7 +75,7 @@ static void write_best_effort(int fd, const void* data, size_t size) {
 }
 
 static void receive_stream(const unsigned char* prefix, size_t prefix_len, const uint8_t* data,
-                           size_t size) {
+                           size_t size, bool preserve_acls) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
     return;
@@ -91,7 +91,7 @@ static void receive_stream(const unsigned char* prefix, size_t prefix_len, const
   shutdown(sv[0], SHUT_WR);
 
   int ok = 0;
-  FileXattrList* list = xattr_receive(sv[1], &ok);
+  FileXattrList* list = xattr_receive(sv[1], &ok, preserve_acls);
   xattr_list_free(list);
 
   close(sv[0]);
@@ -102,14 +102,18 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (!g_block_ready)
     build_canonical_block();
 
-  /* Raw bytes as the whole block. */
-  receive_stream(NULL, 0, data, size);
+  /* Raw bytes as the whole block.  Exercise both the -X-only (no ACLs) and the
+   * -A (ACL names accepted) receiver gates. */
+  for (int acls = 0; acls < 2; acls++) {
+    bool preserve_acls = acls != 0;
+    receive_stream(NULL, 0, data, size, preserve_acls);
 
-  /* Valid framing so the fuzzer mutates the entry list, the first value and
-   * the second entry respectively instead of stopping at the count. */
-  receive_stream(g_block, g_off_after_entry0, data, size);
-  receive_stream(g_block, g_off_value0, data, size);
-  receive_stream(g_block, g_off_after_count, data, size);
+    /* Valid framing so the fuzzer mutates the entry list, the first value and
+     * the second entry respectively instead of stopping at the count. */
+    receive_stream(g_block, g_off_after_entry0, data, size, preserve_acls);
+    receive_stream(g_block, g_off_value0, data, size, preserve_acls);
+    receive_stream(g_block, g_off_after_count, data, size, preserve_acls);
+  }
 
   return 0;
 }

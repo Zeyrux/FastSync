@@ -1,8 +1,10 @@
 
 #include "chunk.h"
+#include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -279,6 +281,51 @@ static void test_chunk_special_rdev_out_of_range_rejected() {
   chunk_destroy(chunk);
 }
 
+/* B6: chunk_deserialize() charges each retained per-file copy to the owning
+ * session's connection budget (MAX_CONNECTION_MEMORY) so queued chunk payloads
+ * are not held outside the per-connection ceiling; destroying the chunk returns
+ * the charge through the Data.owner path. */
+static void test_chunk_deserialize_charges_session_budget() {
+  const char* path = "temp_chunk_charge.txt";
+  const char* content = "charge me to the connection budget";
+  unlink(path);
+  file_write_to_disk(path, content, strlen(content), false, false);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+  protocol_session_set_max_alloc(&session, 4ULL * 1024 * 1024);
+
+  File* f = file_create(path);
+  EXPECT_NOT_NULL(f);
+  f->data->size = (unsigned long long)st.st_size;
+  EXPECT_TRUE(file_load_data(f));
+  File* files[1] = {f};
+  Chunk* chunk = chunk_create(files, 1);
+  EXPECT_NOT_NULL(chunk);
+  Data* serialized = chunk_serialize(chunk, false);
+  EXPECT_NOT_NULL(serialized);
+  /* Simulate a received buffer carrying its owning session. */
+  serialized->owner = &session;
+
+  Chunk* deserialized = chunk_deserialize(serialized, false);
+  EXPECT_NOT_NULL(deserialized);
+  unsigned long long charged = atomic_load(&session.total_allocated_bytes);
+  EXPECT_EQ_INT((int)charged, (int)strlen(content));
+  chunk_destroy(deserialized);
+  /* The copy's charge is released with the File/Data on destroy. */
+  EXPECT_EQ_INT((int)atomic_load(&session.total_allocated_bytes), 0);
+
+  data_destroy(serialized);
+  chunk_destroy(chunk);
+  close(p[0]);
+  close(p[1]);
+  unlink(path);
+}
+
 void test_chunk() {
   test_file_operations();
   test_chunk_operations();
@@ -286,4 +333,5 @@ void test_chunk() {
   test_chunk_symlink_roundtrip();
   test_chunk_special_rdev_roundtrip();
   test_chunk_special_rdev_out_of_range_rejected();
+  test_chunk_deserialize_charges_session_budget();
 }
