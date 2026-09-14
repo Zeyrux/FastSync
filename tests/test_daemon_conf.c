@@ -517,7 +517,30 @@ static void test_daemon_conf_limits_and_hosts_parse() {
     free(path);
     EXPECT_NULL(rejected);
     EXPECT_TRUE(strstr(err, "must list at least one host pattern") != NULL);
+    /* The diagnostic must name the offending module. */
+    EXPECT_TRUE(strstr(err, "module 'm'") != NULL);
   }
+
+  /* Per-module host lists APPEND across lines like the global ones.  (A swapped
+   * store_host_list call passed the module name as `replace`, so each line
+   * silently replaced the previous one and only the last survived.) */
+  EXPECT_EQ_INT(write_conf("[m]\npath = /x\n"
+                           "hosts allow = 127.0.0.1\n"
+                           "hosts allow = 10.0.0.0/8\n"
+                           "hosts deny = 192.168.0.1\n"
+                           "hosts deny = 2001:db8::/32\n",
+                           &path),
+                0);
+  conf = daemon_conf_load(path, err, sizeof(err));
+  free(path);
+  EXPECT_NOT_NULL(conf);
+  EXPECT_EQ_INT(conf->modules[0].hosts_allow_count, 2);
+  EXPECT_EQ_STR(conf->modules[0].hosts_allow[0], "127.0.0.1");
+  EXPECT_EQ_STR(conf->modules[0].hosts_allow[1], "10.0.0.0/8");
+  EXPECT_EQ_INT(conf->modules[0].hosts_deny_count, 2);
+  EXPECT_EQ_STR(conf->modules[0].hosts_deny[0], "192.168.0.1");
+  EXPECT_EQ_STR(conf->modules[0].hosts_deny[1], "2001:db8::/32");
+  daemon_conf_free(conf);
 }
 
 static void test_daemon_hosts_allowed() {

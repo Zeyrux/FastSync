@@ -45,13 +45,16 @@ typedef struct ServerCliOptions {
    * device-node creation) even when running as root.  Applies to --stdio and
    * --daemon alike; also makes the server refuse any client --copy-as. */
   bool no_super; /* --no-super */
-  /* --allow-super: standalone/--stdio only opt-in that keeps the historical
-   * permissive behavior for a PRIVILEGED (root) receiver.  Without it a root
-   * standalone server forces SUPER_MODE_OFF, so a client --devices /
-   * --write-devices / --super / ownership request cannot make it create device
-   * nodes, write raw devices, or apply client-chosen ownership.  Non-root
-   * receivers are unaffected (the kernel refuses the confined attempts).  The
-   * daemon path instead uses the per-module `client owner = yes` opt-in. */
+  /* --allow-super: locally-launched standalone TCP listener opt-in that keeps
+   * the historical permissive behavior for a PRIVILEGED (root) receiver.
+   * Without it a root standalone server forces SUPER_MODE_OFF, so a client
+   * --devices / --write-devices / --super / ownership request cannot make it
+   * create device nodes, write raw devices, or apply client-chosen ownership.
+   * It is rejected for --stdio: that path's remote argv is composed by the
+   * client (directly and via --remote-option), so it must never opt a root
+   * receiver back into super mode.  Non-root receivers are unaffected (the
+   * kernel refuses the confined attempts).  The daemon path instead uses the
+   * per-module `client owner = yes` opt-in. */
   bool allow_super; /* --allow-super */
   /* --iconv=CONVERT_SPEC: the server's own LOCAL charset declaration.  The
    * client's full spec rides the wire config frame anyway; when the server is

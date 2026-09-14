@@ -461,10 +461,10 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
                               "max connections", module->name, err, err_size);
   if (key_equals(key, "hosts allow"))
     return store_host_list(&module->hosts_allow, &module->hosts_allow_count, value, "hosts allow",
-                           false, module->name, err, err_size);
+                           module->name, false, err, err_size);
   if (key_equals(key, "hosts deny"))
     return store_host_list(&module->hosts_deny, &module->hosts_deny_count, value, "hosts deny",
-                           false, module->name, err, err_size);
+                           module->name, false, err, err_size);
   set_error(err, err_size, "unknown key '%s' in module '%s'", key, module->name);
   return false;
 }

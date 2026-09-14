@@ -267,8 +267,20 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
   }
   if (opts->allow_super && opts->daemon_mode) {
     set_error(err, err_size,
-              "--allow-super is for a standalone/--stdio server; daemon modules opt in per "
-              "module with 'client owner = yes'");
+              "--allow-super is for a locally-launched standalone TCP server; daemon modules opt "
+              "in per module with 'client owner = yes'");
+    return -1;
+  }
+  /* --stdio is the SSH transport: the remote server argv is composed by the
+   * CLIENT (directly and via --remote-option), so a client could otherwise pass
+   * --allow-super to a root --stdio receiver and defeat the C3 secure default.
+   * Never honor it there; the super mode stays forced OFF.  An operator who
+   * must keep the historical permissive behavior over SSH has to launch the
+   * receiver through a forced command, not via client-composed argv. */
+  if (opts->allow_super && opts->stdio_mode) {
+    set_error(err, err_size,
+              "--allow-super is not accepted with --stdio (the remote argv is client-composed; "
+              "use a forced command if the default must hold)");
     return -1;
   }
   if (opts->hash_iterations_set && opts->hash_credentials_file == NULL) {

@@ -178,7 +178,7 @@ transfer is never aborted.
 | `--ca <path>` | TLS CA certificate file for verification (PEM) |
 | `--destination-root <path>` | Authorized destination root (default: `.`) |
 | `--allow-delete` | Permit manifest deletion |
-| `--allow-super` | Standalone/`--stdio` only: keep super-user activities enabled for a **root** receiver. Without it a root standalone server forces `SUPER_MODE_OFF`, so client `--devices`/`--write-devices`/`--super` and client-chosen ownership requests are skipped/refused. No effect when not root. |
+| `--allow-super` | Standalone TCP listener only: keep super-user activities enabled for a **root** receiver. Without it a root standalone server forces `SUPER_MODE_OFF`, so client `--devices`/`--write-devices`/`--super` and client-chosen ownership requests are skipped/refused. **Rejected with `--stdio`** (the SSH remote argv is client-composed, so a client could otherwise pass it and defeat the secure default; operators exposing `fastsync-server --stdio` over SSH must use a forced command if the default must hold). No effect when not root. |
 | `--allow-unauthenticated` | Permit plaintext TCP clients. For an `auth users` module this opts in **loopback plaintext only**; remote auth still requires verified TLS, so the flag never permits remote plaintext auth. |
 | `-v, --verbose` | Enable debug logging |
 | `--help` | Show help |
@@ -304,6 +304,12 @@ The remote host must have `fastsync-server` available in `PATH`, or use
 `--fastsync-server-path`. SSH starts `fastsync-server --stdio` in its remote
 working directory, so use a destination below that directory unless the
 remote server is otherwise configured with a matching authorized root.
+
+The remote `--stdio` server argv is composed by the client, so it must never
+be trusted to opt a root receiver into super-user activities: `--allow-super`
+is rejected with `--stdio` and super stays off on that path. Operators
+exposing `fastsync-server --stdio` over SSH must use a forced command (e.g. an
+`authorized_keys` `command=` entry) if the default must hold.
 
 ```bash
 ssh user@host 'mkdir -p destination'
@@ -500,7 +506,7 @@ link-target transfer remains incomplete. |
 | `--destination-root <path>` | Confine received files to this server-side root;
 defaults to the current directory. |
 | `--allow-delete` | Permit client delete manifests. Deletion is refused by default. This also gates `--force` (which can recursively replace/remove a destination directory tree). |
-| `--allow-super` | Standalone/`--stdio` only: keep super-user activities enabled for a **root** receiver. Without it a root standalone server forces `SUPER_MODE_OFF`, so client `--devices`/`--write-devices`/`--super` and client-chosen ownership requests are skipped/refused. No effect when not root. Daemon modules opt in per module with `client owner = yes`. |
+| `--allow-super` | Standalone TCP listener only: keep super-user activities enabled for a **root** receiver. Without it a root standalone server forces `SUPER_MODE_OFF`, so client `--devices`/`--write-devices`/`--super` and client-chosen ownership requests are skipped/refused. Rejected with `--stdio` (the SSH remote argv is client-composed; use a forced command if the default must hold). No effect when not root. Daemon modules opt in per module with `client owner = yes`. |
 | `-v`, `--verbose` | Enable debug logging. |
 | `--help` | Print server usage. |
 
