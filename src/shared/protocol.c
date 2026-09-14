@@ -302,10 +302,14 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
     if (pfd.revents & (POLLERR | POLLNVAL))
       return false;
     ssize_t bytes_send;
-    if (session->ssl)
-      bytes_send = SSL_write(session->ssl, (const char*)data + total_bytes_send, chunk);
-    else
+    if (session->ssl) {
+      /* SSL_write takes an int length; clamp a >INT_MAX request into chunks so
+       * the size_t downcast can never truncate into a negative/partial write. */
+      size_t ssl_chunk = chunk > (size_t)INT_MAX ? (size_t)INT_MAX : chunk;
+      bytes_send = SSL_write(session->ssl, (const char*)data + total_bytes_send, (int)ssl_chunk);
+    } else {
       bytes_send = write(fd, (const char*)data + total_bytes_send, chunk);
+    }
     if (bytes_send <= 0) {
       if (session->ssl) {
         int ssl_err = SSL_get_error(session->ssl, (int)bytes_send);
@@ -387,6 +391,13 @@ static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, 
           wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
           continue;
         }
+        /* A signal interrupts the blocking TLS read: retry (mirrors the send
+           path and protocol_read_status_until) so the loop reaches its next
+           abort/deadline checkpoint instead of failing spuriously. */
+        if (ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
+          continue;
+      } else if (errno == EINTR) {
+        continue;
       }
       if (bytes_received == 0)
         log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
