@@ -24,6 +24,17 @@ static void test_server_create_tls_without_certs() {
 #ifdef SSL_OP_NO_RENEGOTIATION
   EXPECT_TRUE((SSL_CTX_get_options(ctx) & SSL_OP_NO_RENEGOTIATION) != 0);
 #endif
+  /* C5: the server's preference order decides the cipher and the TLS 1.2 list is
+   * AEAD-only (no CBC/RC4/3DES legacy suites). */
+  EXPECT_TRUE((SSL_CTX_get_options(ctx) & SSL_OP_CIPHER_SERVER_PREFERENCE) != 0);
+  STACK_OF(SSL_CIPHER)* ciphers = SSL_CTX_get_ciphers(ctx);
+  EXPECT_NOT_NULL(ciphers);
+  for (int i = 0; i < sk_SSL_CIPHER_num(ciphers); i++) {
+    const char* name = SSL_CIPHER_get_name(sk_SSL_CIPHER_value(ciphers, i));
+    EXPECT_TRUE(name != NULL && strstr(name, "CBC") == NULL);
+    EXPECT_TRUE(name != NULL && strstr(name, "RC4") == NULL);
+    EXPECT_TRUE(name != NULL && strstr(name, "3DES") == NULL);
+  }
   server_delete(&s);
   EXPECT_NULL(s);
 }
