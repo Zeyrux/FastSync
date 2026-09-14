@@ -116,7 +116,7 @@ static bool xattr_name_is_posix_acl(const char* name) {
 
 /* ---- SENDER: capture ---- */
 
-FileXattrList* xattr_capture_path(const char* path) {
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
   if (!path)
     return NULL;
   ssize_t list_size = listxattr(path, NULL, 0);
@@ -144,8 +144,9 @@ FileXattrList* xattr_capture_path(const char* path) {
       break; /* trailing double NUL not expected; stop */
     offset += (ssize_t)name_len + 1;
     /* Capture is sender-side: the scanner has already gated on -X/-A, so the
-       per-name whitelist here allows the ACL names (true). */
-    if (!xattr_name_appliable(name, true))
+       per-name whitelist here allows the ACL names only when --acls was
+       negotiated.  Without it a plain -X capture never carries an ACL. */
+    if (!xattr_name_appliable(name, preserve_acls))
       continue;
     ssize_t value_size = getxattr(path, name, NULL, 0);
     if (value_size < 0)

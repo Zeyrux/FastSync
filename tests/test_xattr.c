@@ -273,6 +273,80 @@ static void test_link_copy_fallback_preserves_xattrs() {
   rmdir(basis_dir);
 }
 
+/* Capture must honor --acls: xattr_capture_path(path, false) (plain -X) must
+ * never return the POSIX ACL names, while xattr_capture_path(path, true) (-A)
+ * does; user.* is captured either way.  This is the capture-side counterpart of
+ * the receiver's --acls gate and must not depend on the caller having checked
+ * the flag.  Guarded on filesystem/ACL support. */
+static void test_xattr_capture_filters_acls() {
+  const char* path = "test_xattr_capture_acls.txt";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool has_xattr = setxattr(path, "user.fastsync.xprobe", "p", 1, 0) == 0;
+  if (has_xattr)
+    removexattr(path, "user.fastsync.xprobe");
+  if (!has_xattr) {
+    close(fd);
+    unlink(path);
+    return; /* filesystem without xattr support */
+  }
+  if (setxattr(path, "user.keep", "yes", 3, 0) != 0) {
+    close(fd);
+    unlink(path);
+    return;
+  }
+
+  /* Synthesize a valid non-trivial POSIX access ACL blob (little-endian):
+     version 2 followed by USER_OBJ/USER/GROUP_OBJ/MASK/OTHER entries. */
+  uint32_t acl_uid = geteuid() == 0 ? 65534u : (uint32_t)geteuid();
+  unsigned char blob[4 + 5 * 8];
+  uint32_t version = 2;
+  memcpy(blob, &version, 4);
+  const uint16_t tags[5] = {0x01, 0x02, 0x04, 0x10, 0x20}; /* OBJ/USER/GROUP/MASK/OTHER */
+  const uint16_t perms[5] = {0x04, 0x04, 0x04, 0x04, 0x00};
+  const uint32_t ids[5] = {0xFFFFFFFFu, acl_uid, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  size_t off = 4;
+  for (int i = 0; i < 5; i++) {
+    memcpy(blob + off, &tags[i], sizeof(tags[i]));
+    off += sizeof(tags[i]);
+    memcpy(blob + off, &perms[i], sizeof(perms[i]));
+    off += sizeof(perms[i]);
+    memcpy(blob + off, &ids[i], sizeof(ids[i]));
+    off += sizeof(ids[i]);
+  }
+  if (setxattr(path, "system.posix_acl_access", blob, off, 0) != 0) {
+    close(fd);
+    unlink(path);
+    return; /* no unprivileged ACL support: skip silently */
+  }
+  close(fd);
+
+  FileXattrList* plain = xattr_capture_path(path, false);
+  FileXattrList* with_acls = xattr_capture_path(path, true);
+  bool plain_user = false, plain_acl = false, acl_user = false, acl_acl = false;
+  for (int i = 0; plain && i < plain->count; i++) {
+    if (strcmp(plain->items[i].name, "user.keep") == 0)
+      plain_user = true;
+    if (strcmp(plain->items[i].name, "system.posix_acl_access") == 0)
+      plain_acl = true;
+  }
+  for (int i = 0; with_acls && i < with_acls->count; i++) {
+    if (strcmp(with_acls->items[i].name, "user.keep") == 0)
+      acl_user = true;
+    if (strcmp(with_acls->items[i].name, "system.posix_acl_access") == 0)
+      acl_acl = true;
+  }
+  EXPECT_TRUE(plain_user);
+  EXPECT_FALSE(plain_acl);
+  EXPECT_TRUE(acl_user);
+  EXPECT_TRUE(acl_acl);
+  xattr_list_free(plain);
+  xattr_list_free(with_acls);
+  unlink(path);
+}
+
 /* --fake-super replay: fake_super_store_fd records the source stat into the
  * reserved xattr, and fake_super_restore_fd re-applies mode/mtime (and owner,
  * when the process may) fd-relative.  Restore must also be a safe no-op with no
@@ -409,6 +483,7 @@ void test_xattr() {
   test_xattr_reject_oversized_value();
   test_xattr_count_bound();
   test_xattr_capture_and_appliable();
+  test_xattr_capture_filters_acls();
   test_xattr_receive_drops_acl_without_preserve_acls();
   test_link_copy_fallback_preserves_xattrs();
   test_fake_super_restore();

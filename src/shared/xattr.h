@@ -65,10 +65,13 @@ bool xattr_list_append(FileXattrList* list, const char* name, const void* value,
  * Used for both capture and receiver-side validation. */
 bool xattr_name_appliable(const char* name, bool preserve_acls);
 
-/* Sender: read the whitelisted xattrs of `path` into a new list.  Returns NULL
- * when the path has no appliable xattrs (or the filesystem has no xattr
- * support); an empty-but-valid list is never returned distinct from NULL. */
-FileXattrList* xattr_capture_path(const char* path);
+/* Sender: read the whitelisted xattrs of `path` into a new list.  The POSIX ACL
+ * names are captured only when `preserve_acls` (--acls/-A) is set, so a plain
+ * -X run never carries an ACL it was not asked to preserve; `user.*` is
+ * unaffected.  Returns NULL when the path has no appliable xattrs (or the
+ * filesystem has no xattr support); an empty-but-valid list is never returned
+ * distinct from NULL. */
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls);
 
 /* Wire: bounded serialization.  xattr_send returns false on write failure; an
  * empty/NULL list transmits a zero-count block.  xattr_receive returns NULL and

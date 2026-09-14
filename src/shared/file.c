@@ -1248,11 +1248,19 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
       if (linked) {
         int target_dirfd = scratch_dirfd >= 0 ? scratch_dirfd : dirfd;
         if (use_fsync) {
-          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-          if (tfd < 0 || fsync(tfd) != 0) {
+          /* O_NONBLOCK: the freshly linked temp is normally the basis's regular
+             file, but a raced-in FIFO at the name must not block this reopen
+             forever.  With O_NONBLOCK such an open fails with ENXIO instead of
+             blocking, which is treated as a benign fsync-skip (the link itself
+             is still installed); any other open/fsync failure falls back to the
+             byte-copy path as before. */
+          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+          if (tfd < 0) {
+            if (errno != ENXIO)
+              linked = false;
+          } else if (fsync(tfd) != 0) {
             linked = false;
-            if (tfd >= 0)
-              close(tfd);
+            close(tfd);
           } else {
             close(tfd);
           }

@@ -1,4 +1,5 @@
 #include "test_server.h"
+#include "checksum.h"
 #include "config.h"
 #include "delta.h"
 #include "file.h"
@@ -910,6 +911,92 @@ static void test_incremental_check_fifo_destination_does_not_hang() {
   }
 }
 
+/* A server-contacting --dry-run with an alternate basis dir must never read or
+   hash the basis file.  An exact (size+mtime+content) basis match would
+   otherwise let a client probe the basis bytes against its own supplied digest
+   (a 1-bit content oracle).  The dry-run decision is metadata-only, so even a
+   byte-identical basis is reported as would-transfer, not a compare-dest skip. */
+static void test_incremental_check_dry_run_basis_does_not_read_content() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->dry_run = true;
+  char* root = make_check_root("dryb");
+  EXPECT_NOT_NULL(root);
+  cfg->receive_root_directory = str_dup(root);
+
+  char basis_dir[1024];
+  char basis_path[2048];
+  snprintf(basis_dir, sizeof(basis_dir), "%s/basis", root);
+  EXPECT_EQ_INT(mkdir(basis_dir, 0700), 0);
+  const char* content = "basis content that matches\n";
+  write_check_file(basis_dir, "file.txt", content);
+  snprintf(basis_path, sizeof(basis_path), "%s/file.txt", basis_dir);
+  struct stat bst;
+  EXPECT_EQ_INT(stat(basis_path, &bst), 0);
+  EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_COMPARE, "basis"), 0);
+
+  /* The (correct) source digest for the basis bytes: an unfixed dry-run would
+     read+hash the basis and treat this as an exact compare-dest hit. */
+  uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
+  size_t digest_len = 0;
+  EXPECT_TRUE(checksum_digest((ChecksumAlgo)cfg->checksum_algo, cfg->checksum_seed, content,
+                              strlen(content), digest, sizeof(digest), &digest_len));
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(30);
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    bool skipped = false;
+    bool would_transfer = false;
+    File* file = receive_incremental_check_ex(p[0], cfg, &skipped, &would_transfer);
+    bool ok = file == NULL && !skipped && would_transfer;
+    file_destroy(file);
+    config_delete(cfg);
+    close(p[0]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    EXPECT_TRUE(send_str(p[1], "file.txt"));
+    unsigned long long size = (unsigned long long)bst.st_size;
+    long long mtime = (long long)bst.st_mtime;
+    long long mtime_nsec = 0;
+#ifdef __linux__
+    mtime_nsec = (long long)bst.st_mtim.tv_nsec;
+#endif
+    EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
+    uint8_t wire_len = (uint8_t)digest_len;
+    EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+    EXPECT_TRUE(send_n_data(p[1], digest, digest_len));
+    Status s;
+    EXPECT_TRUE(receive_status(p[1], &s));
+    /* A skip here would mean the receiver read+hashed the basis file. */
+    EXPECT_EQ_INT(s, STATUS_DRY_RUN_TRANSFER);
+
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[1]);
+    config_delete(cfg);
+    /* The dry-run must not have materialized anything in the receive root. */
+    char dest_path[2048];
+    snprintf(dest_path, sizeof(dest_path), "%s/file.txt", root);
+    EXPECT_FALSE(file_path_exists_secure(dest_path));
+    unlink(basis_path);
+    rmdir(basis_dir);
+    rmdir(root);
+    free(root);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 /* B1: a FIFO planted in a --link-dest basis directory must not block
  * basis_open_regular() either; the basis match is simply declined. */
 static void test_incremental_check_basis_fifo_does_not_hang() {
@@ -1024,6 +1111,7 @@ void test_server() {
     test_incremental_check_delta_oversize_reports_failure();
     test_incremental_check_fifo_destination_does_not_hang();
     test_incremental_check_basis_fifo_does_not_hang();
+    test_incremental_check_dry_run_basis_does_not_read_content();
     test_receive_manifest_total_entry_cap();
     test_late_manifest_abort_frees_keepset();
     test_late_manifest_eof_frees_keepset();

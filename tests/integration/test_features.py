@@ -3813,6 +3813,27 @@ class TestBasisDestDirs:
         assert _read_file(os.path.join(received, self.ADDED)) == \
             self._source_tree("c")[self.ADDED], "added file not transferred"
 
+    @pytest.mark.ci
+    def test_dry_run_compare_dest_does_not_read_basis(self, shared_server):
+        # A dry-run --compare-dest must never read/hash the basis file: doing so
+        # is a 1-bit content oracle against the client-supplied digest.  Even a
+        # byte-identical basis with a matching size+mtime is therefore reported
+        # as would-transfer, and nothing is created.
+        source = self._make_source("basis_dry_src", {self.UNCHANGED: b"stable content v1\n"})
+        dest = os.path.join(TEST_DATA_DIR, "basis_dry_dst")
+        clean_dir(dest)
+        self._seed_basis(dest, source, "drybasis", {self.UNCHANGED: b"stable content v1\n"})
+        before = _snapshot_tree(dest)
+        result, _ = run_client(source, dest,
+                               flags=["--compare-dest=drybasis", "--dry-run"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"dry-run compare-dest failed: {result.stderr[:300]}"
+        assert self.UNCHANGED in result.stdout, (
+            "dry-run compare-dest silently skipped: receiver read the basis content"
+        )
+        assert _snapshot_tree(dest) == before, "dry-run compare-dest mutated the destination"
+
     def test_compare_dest_content_mismatch_forces_transfer(self, shared_server):
         # The basis holds a file with a DIFFERENT body: even though it shares
         # the mtime pin, the xxHash check fails and the data must be sent.

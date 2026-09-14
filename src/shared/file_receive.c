@@ -263,7 +263,8 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
       free(destination_path);
       return absent_result;
     }
-    FileXattrList* sibling_xattrs = cfg->use_xattrs ? xattr_capture_path(staged_first) : NULL;
+    FileXattrList* sibling_xattrs =
+        cfg->use_xattrs ? xattr_capture_path(staged_first, cfg->preserve_acls) : NULL;
     bool ok = file_to_disk_secure_link_attrs(
         staged_sibling, staged_first, content, content_size, preallocate, file->metadata,
         preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, NULL);
@@ -295,7 +296,8 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     return absent_result;
   }
   const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
-  FileXattrList* sibling_xattrs = cfg->use_xattrs ? xattr_capture_path(first_disk) : NULL;
+  FileXattrList* sibling_xattrs =
+      cfg->use_xattrs ? xattr_capture_path(first_disk, cfg->preserve_acls) : NULL;
   bool ok = file_to_disk_secure_link_attrs(
       destination_path, first_disk, content, content_size, preallocate, file->metadata,
       preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
@@ -1276,13 +1278,26 @@ static bool basis_quick_matches(const Config* config, const struct stat* st, tim
 
 /* Search the basis-dir list in command-line order and return the first exact
    match.  When load_content is true the matched bytes are kept in out->content
-   so the caller can materialize the file without re-reading it. */
+   so the caller can materialize the file without re-reading it.
+
+   An exact match ALSO requires the basis bytes' digest to equal the source's,
+   so `hash_content` gates the content read/hash itself.  A server-contacting
+   --dry-run passes hash_content=false: no basis file may be read or hashed
+   (that would be a 1-bit content oracle against a client-supplied digest), so a
+   metadata-only pass can never confirm a hit and declines it.  The real path
+   always passes hash_content=true, keeping its behavior byte-for-byte. */
 static bool basis_match_find(const Config* config, const char* check_path,
                              unsigned long long check_size, time_t check_mtime,
                              long check_mtime_nsec, const uint8_t* check_digest,
-                             size_t check_digest_len, bool load_content, BasisMatch* out) {
+                             size_t check_digest_len, bool load_content, bool hash_content,
+                             BasisMatch* out) {
   memset(out, 0, sizeof(*out));
   if (!config || !config_has_basis(config) || config->ignore_times)
+    return false;
+  /* Dry-run: never read/hash basis content.  A hit cannot be decided from
+     metadata alone, so report no match (the caller treats it as would-transfer)
+     without touching the file's contents. */
+  if (!hash_content)
     return false;
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
@@ -1911,10 +1926,13 @@ static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckStat
    When dry_run is set and the file is not already up to date the receiver must
    materialize nothing (no basis link/copy, no append/delta/full transfer) and
    the sender must send no data, so answer STATUS_DRY_RUN_TRANSFER and stop.
-   The one exception is a --compare-dest exact hit with no destination copy: a
-   real run would suppress the data without changing the destination, so it
-   reports as a skip (STATUS_OK) exactly as the full basis path below would.
-   Everything read here (destination file, basis candidates) is read-only. */
+
+   The basis lookup is deliberately content-blind: a real run would only accept
+   a --compare-dest exact hit after hashing the basis file and comparing it with
+   the client-supplied digest, which in a dry-run is a 1-bit content oracle.
+   Under dry_run no basis bytes may be read, so an otherwise-matching entry is
+   treated as would-transfer instead of a skip.  Everything read here (the
+   destination file's metadata, basis candidates' metadata) is read-only. */
 static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalCheckState* state,
                                                                   bool* skipped,
                                                                   bool* would_transfer) {
@@ -1925,9 +1943,12 @@ static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalChe
   bool skip_via_compare = false;
   if (config_has_basis(config) && !config->ignore_times) {
     BasisMatch basis;
+    /* hash_content=false: a dry-run must not read or hash the basis file.  No
+       content comparison is possible, so no compare-dest hit can be confirmed
+       and an otherwise-matching file is reported as would-transfer. */
     basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                      (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                     false, &basis);
+                     false, false, &basis);
     if (basis.hit && basis.type == BASIS_DEST_COMPARE && !state->has_old_file)
       skip_via_compare = true;
     basis_match_free(&basis);
@@ -1955,7 +1976,7 @@ static IncrementalCheckOutcome incremental_check_try_basis(IncrementalCheckState
   BasisMatch basis;
   basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                    (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                   true, &basis);
+                   true, true, &basis);
   if (basis.hit) {
     if (basis.type == BASIS_DEST_COMPARE) {
       basis_match_free(&basis);
