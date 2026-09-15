@@ -340,16 +340,85 @@ class TestOwnershipRoot:
         assert (st.st_uid, st.st_gid) == (33333, 44444), \
             f"--chown must override -o, got uid={st.st_uid} gid={st.st_gid}"
 
-    def test_fake_super_o_does_not_change_group(self, shared_server):
-        # --fake-super replays the recorded source stat; with only -o requested
-        # it must apply the owner but leave the group untouched (MAJOR 1).
+    def test_fake_super_o_does_not_real_chown(self, shared_server):
+        # #294: --fake-super only RECORDS ownership; it must never real-chown the
+        # recorded source owner (that defeats the point of the flag).  With -o the
+        # resolved owner is parked in the reserved xattr and the on-disk owner is
+        # left as the receiver's.
         source, dest = self._seed_owned("fake_o", 12345, 54321)
         result, _ = run_client(source, dest, flags=["--fake-super", "-o"],
                                port=shared_server.port)
         assert result.returncode == 0, f"--fake-super -o failed: {(result.stderr or '')[:300]}"
+        dst = _received(dest, source, "f.txt")
+        st = os.stat(dst)
+        assert st.st_uid != 12345, \
+            f"--fake-super -o must NOT real-chown the source owner, got uid={st.st_uid}"
+        record = os.getxattr(dst, "user.fastsync.stat").decode()
+        fields = record.split(":")
+        assert fields[0] == "12345", \
+            f"--fake-super must record the resolved owner, got {fields[0]}"
+
+    def test_o_applies_directory_owner(self, shared_server):
+        """#286.2: -o must apply the source owner to DIRECTORIES too (the
+        deferred directory-metadata application now runs the identity path)."""
+        source = os.path.join(TEST_DATA_DIR, "root_dir_o_src")
+        dest = os.path.join(TEST_DATA_DIR, "root_dir_o_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "sub", "deep"))
+        with open(os.path.join(source, "sub", "deep", "f.txt"), "wb") as fh:
+            fh.write(b"dir owner\n")
+        os.chown(os.path.join(source, "sub"), 12345, 12346)
+        os.chown(os.path.join(source, "sub", "deep"), 23456, 34567)
+
+        result, _ = run_client(source, dest, flags=["-o", "-t"], port=shared_server.port)
+        assert result.returncode == 0, f"-o dir failed: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        sub = os.stat(os.path.join(received, "sub"))
+        deep = os.stat(os.path.join(received, "sub", "deep"))
+        assert sub.st_uid == 12345, f"dir 'sub' owner not applied: {sub.st_uid}"
+        assert deep.st_uid == 23456, f"dir 'sub/deep' owner not applied: {deep.st_uid}"
+        # -o alone must not change the group.
+        assert sub.st_gid != 12346
+
+    def test_a_applies_directory_owner_and_group(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "root_dir_a_src")
+        dest = os.path.join(TEST_DATA_DIR, "root_dir_a_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        os.makedirs(os.path.join(source, "sub"))
+        with open(os.path.join(source, "sub", "f.txt"), "wb") as fh:
+            fh.write(b"dir owner group\n")
+        os.chown(os.path.join(source, "sub"), 12345, 54321)
+
+        result, _ = run_client(source, dest, flags=["-a"], port=shared_server.port)
+        assert result.returncode == 0, f"-a dir failed: {(result.stderr or '')[:300]}"
+        received = get_dest_received_dir(dest, source)
+        st = os.stat(os.path.join(received, "sub"))
+        assert (st.st_uid, st.st_gid) == (12345, 54321), \
+            f"-a must apply dir owner+group, got uid={st.st_uid} gid={st.st_gid}"
+
+    def test_numeric_ids_alone_does_not_chown(self, shared_server):
+        """#286.1: --numeric-ids is a mapping modifier, not an ownership request.
+        `-t --numeric-ids` must leave the receiver's ownership untouched."""
+        source, dest = self._seed_owned("num_only", 12345, 54321)
+        result, _ = run_client(source, dest, flags=["-t", "--numeric-ids"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-t --numeric-ids failed: {(result.stderr or '')[:300]}"
         st = os.stat(_received(dest, source, "f.txt"))
-        assert st.st_uid == 12345, f"--fake-super -o must apply the owner, got uid={st.st_uid}"
-        assert st.st_gid != 54321, "--fake-super -o must not change the group"
+        assert st.st_uid != 12345, \
+            f"--numeric-ids alone must not chown, got uid={st.st_uid}"
+
+    def test_numeric_ids_with_o_uses_raw_id(self, shared_server):
+        source, dest = self._seed_owned("num_o", 12345, 54321)
+        result, _ = run_client(source, dest, flags=["-o", "-t", "--numeric-ids"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-o --numeric-ids failed: {(result.stderr or '')[:300]}"
+        st = os.stat(_received(dest, source, "f.txt"))
+        assert st.st_uid == 12345, \
+            f"-o --numeric-ids must apply the raw id, got uid={st.st_uid}"
 
 
 class TestPreserveFeatureMatrix:

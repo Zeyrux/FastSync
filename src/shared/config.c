@@ -749,10 +749,18 @@ void config_delete(Config* config) {
       free(config->skip_compress_suffixes[i]);
     free(config->skip_compress_suffixes);
   }
-  free(config->usermap);
+  if (config->usermap) {
+    for (int i = 0; i < config->usermap_count; i++)
+      free(config->usermap[i].to_name);
+    free(config->usermap);
+  }
   config->usermap = NULL;
   config->usermap_count = 0;
-  free(config->groupmap);
+  if (config->groupmap) {
+    for (int i = 0; i < config->groupmap_count; i++)
+      free(config->groupmap[i].to_name);
+    free(config->groupmap);
+  }
   config->groupmap = NULL;
   config->groupmap_count = 0;
   if (config->filters) {
@@ -984,7 +992,8 @@ static bool receive_basis_entries(int fd, Config* c, ConfigStringBudget* budget)
 
 static bool send_identity_entries(int fd, const IdentityMap* map, int count) {
   for (int i = 0; i < count; i++) {
-    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].to))
+    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].from_hi) || !send_int(fd, map[i].to) ||
+        !send_str(fd, map[i].to_name ? map[i].to_name : ""))
       return false;
   }
   return true;
@@ -992,20 +1001,32 @@ static bool send_identity_entries(int fd, const IdentityMap* map, int count) {
 
 static bool receive_identity_entries(int fd, ConfigStringBudget* budget, int count,
                                      IdentityMap** out) {
-  (void)budget;
   if (count <= 0)
     return true;
   IdentityMap* map = calloc((size_t)count, sizeof(IdentityMap));
   if (!map)
     return false;
   for (int i = 0; i < count; i++) {
-    if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].to)) {
-      free(map);
-      return false;
+    if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].from_hi) ||
+        !receive_int(fd, &map[i].to))
+      goto fail;
+    char* name = config_receive_str(fd, budget);
+    if (!name)
+      goto fail;
+    if (name[0] == '\0') {
+      free(name);
+      map[i].to_name = NULL;
+    } else {
+      map[i].to_name = name;
     }
   }
   *out = map;
   return true;
+fail:
+  for (int i = 0; i < count; i++)
+    free(map[i].to_name);
+  free(map);
+  return false;
 }
 
 /* ---------------------------------------------------------------------------

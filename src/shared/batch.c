@@ -172,7 +172,7 @@ int batch_read_apply(int fd, const Config* config, const char* dest_root) {
        * destroyed; applied once the whole stream has been consumed. */
       if (save != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
           dir_metadata_should_capture(config) &&
-          !dir_time_list_add(&dir_times, file->path, file->metadata)) {
+          !dir_time_list_add(&dir_times, file->path, file->metadata, file->xattrs)) {
         file_destroy(file);
         chunk_destroy(chunk);
         goto done;

@@ -40,8 +40,9 @@ File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
  * parent's mtime).  -O/--omit-dir-times skips the application entirely.  The
  * list owns deep copies of the paths and metadata; freed on every path. */
 typedef struct {
-  char** paths;          /* owned, destination-relative wire paths */
-  FileMetadata* entries; /* owned, parallel to paths */
+  char** paths;           /* owned, destination-relative wire paths */
+  FileMetadata* entries;  /* owned, parallel to paths */
+  FileXattrList** xattrs; /* owned, parallel to paths; NULL when none */
   size_t count;
   size_t capacity;
   size_t bytes; /* cumulative strlen of every retained path */
@@ -57,17 +58,19 @@ bool dir_metadata_should_capture(const Config* config);
 
 void dir_time_list_init(DirTimeList* list);
 void dir_time_list_free(DirTimeList* list);
-/* Deep-copy one directory's path + metadata into the list.  Returns false on
- * allocation failure OR when the cumulative entry/byte caps would be exceeded
- * (the caller fails the transfer). */
-bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata);
+/* Deep-copy one directory's path + metadata (and, when non-NULL, its captured
+ * xattr/ACL block) into the list.  Returns false on allocation failure OR when
+ * the cumulative entry/byte caps would be exceeded (the caller fails the
+ * transfer). */
+bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata,
+                       const FileXattrList* xattrs);
 /* Apply every accumulated directory's metadata beneath `root_directory`,
- * confined fd-relative.  Times (mtime, plus atime when -U captured one) are
- * applied only when config->preserve_times && !config->omit_dir_times; the mode
- * (through --chmod when configured) is applied only when config->preserve_perms.
- * Best-effort per entry: an absent directory (an empty/pruned source dir that
- * was deliberately not created) or a non-directory at the path is skipped
- * QUIETLY, an unreachable one with a warning, and never fatal. */
+ * confined fd-relative: ownership through the negotiated identity policy,
+ * times (mtime, plus atime when -U captured one under -t), the mode (through
+ * --chmod when configured, under -p), and the captured xattrs/ACLs (under
+ * -X/-A).  Best-effort per entry: an absent directory (an empty/pruned source
+ * dir that was deliberately not created) or a non-directory at the path is
+ * skipped QUIETLY, an unreachable one with a warning, and never fatal. */
 void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory,
                              const Config* config);
 

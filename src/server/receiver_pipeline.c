@@ -221,7 +221,7 @@ int write_thread(void* pipeline_context) {
        caller apply it once every writer has drained. */
     if (!dry_run && result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
         dir_metadata_should_capture(context->config) &&
-        !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+        !dir_time_list_add(&context->dir_times, file->path, file->metadata, file->xattrs)) {
       file_destroy(file);
       pipeline_context_receiver_note_bytes_released(context, file_bytes);
       mtx_lock(&context->mutex);

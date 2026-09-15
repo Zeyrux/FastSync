@@ -1615,9 +1615,19 @@ static void test_dir_time_list() {
   dir_time_list_init(&list);
   EXPECT_EQ_INT((int)list.count, 0);
   FileMetadata metadata = {.mtime_sec = 1000000000, .mtime_nsec = 0};
-  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
-  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
+  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata, NULL));
+  /* A captured xattr block is deep-copied into the list. */
+  FileXattrList* xl = xattr_list_new();
+  EXPECT_NOT_NULL(xl);
+  EXPECT_TRUE(xattr_list_append(xl, "user.dir", "v", 1));
+  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata, xl));
+  xattr_list_free(xl); /* the list owns its own copy now */
   EXPECT_EQ_INT((int)list.count, 2);
+  EXPECT_NOT_NULL(list.xattrs);
+  EXPECT_NOT_NULL(list.xattrs[1]);
+  EXPECT_EQ_INT(list.xattrs[1]->count, 1);
+  EXPECT_EQ_STR(list.xattrs[1]->items[0].name, "user.dir");
+  EXPECT_NULL(list.xattrs[0]);
 
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
@@ -1633,6 +1643,7 @@ static void test_dir_time_list() {
   EXPECT_EQ_INT((int)list.count, 0);
   EXPECT_NULL(list.paths);
   EXPECT_NULL(list.entries);
+  EXPECT_NULL(list.xattrs);
 
   rmdir(sub);
   rmdir(root);
@@ -1657,14 +1668,14 @@ static void test_dir_time_list_cap() {
   for (size_t i = 0; i < MAX_DIR_TIME_ENTRIES + 1 && !rejected; i++) {
     size_t before_count = list.count;
     size_t before_bytes = list.bytes;
-    if (!dir_time_list_add(&list, path, &metadata)) {
+    if (!dir_time_list_add(&list, path, &metadata, NULL)) {
       rejected = true;
       /* The rejected add must not have partially mutated the list. */
       EXPECT_TRUE(list.count == before_count);
       EXPECT_TRUE(list.bytes == before_bytes);
     } else {
       EXPECT_TRUE(list.count == before_count + 1);
-      EXPECT_TRUE(list.bytes == before_bytes + path_len + sizeof(FileMetadata) + sizeof(char*));
+      EXPECT_TRUE(list.bytes == before_bytes + path_len + sizeof(FileMetadata) + 2 * sizeof(char*));
     }
   }
   EXPECT_TRUE(rejected);
