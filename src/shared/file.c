@@ -415,10 +415,69 @@ bool file_get_trust_sender(void) {
   return file_trust_sender;
 }
 
-/* True when `target` is a lexical symlink target that can never escape the
- * receive root once created beneath it: relative (not absolute) and containing
- * no ".." path component.  Used by --munge-links' sender-side containment: an
- * escaping target is never transmitted (the entry is skipped/contained). */
+/* rsync 3.4.1 unsafe_symlink(): true when `target` (the link's destination
+ * string) points outside the transfer tree rooted at the symlink's own
+ * location.  `link_path` is the symlink's path relative to the top of the
+ * transfer (including its name).  This is a purely lexical test matching
+ * rsync's util1.c: absolute/empty targets are always unsafe; leading "../"
+ * components are counted against the symlink's own directory depth; a ".."
+ * that would climb above the transfer root is unsafe.  rsync 3.4.1 additionally
+ * rejects any INTERNAL "/../" component and a trailing "/..". */
+bool file_symlink_unsafe(const char* target, const char* link_path) {
+  if (!target || target[0] == '\0' || target[0] == '/')
+    return true;
+  const char* rest = target;
+  while (strncmp(rest, "../", 3) == 0) {
+    rest += 3;
+    while (*rest == '/')
+      rest++;
+  }
+  if (strstr(rest, "/../") != NULL)
+    return true;
+  size_t target_len = strlen(target);
+  if (target_len > 3 && strcmp(&target[target_len - 3], "/..") == 0)
+    return true;
+
+  int depth = 0;
+  const char* name;
+  const char* slash;
+  const char* src = link_path ? link_path : "";
+  for (name = src; (slash = strchr(name, '/')) != NULL; name = slash + 1) {
+    if (*name == '.' && (name[1] == '/' || (name[1] == '.' && name[2] == '/'))) {
+      if (name[1] == '.')
+        depth = 0;
+    } else {
+      depth++;
+    }
+    while (slash[1] == '/')
+      slash++;
+  }
+  if (*name == '.' && name[1] == '.' && name[2] == '\0')
+    depth = 0;
+
+  for (name = target; (slash = strchr(name, '/')) != NULL; name = slash + 1) {
+    if (*name == '.' && (name[1] == '/' || (name[1] == '.' && name[2] == '/'))) {
+      if (name[1] == '.') {
+        if (--depth < 0)
+          return true;
+      }
+    } else {
+      depth++;
+    }
+    while (slash[1] == '/')
+      slash++;
+  }
+  if (*name == '.' && name[1] == '.' && name[2] == '\0')
+    depth--;
+  return depth < 0;
+}
+
+/* Strict lexical helper: true when `target` is relative (not absolute) and
+ * contains no ".." component at all, so it can never escape the directory it
+ * is created in.  This is stricter than rsync's unsafe_symlink() (which allows
+ * an in-tree ".."); the scanner/receiver use file_symlink_unsafe()/--safe-links
+ * for rsync parity, and this helper is retained for callers that want the
+ * ".."-free guarantee. */
 bool file_symlink_target_contained(const char* target) {
   if (!target || target[0] == '\0' || target[0] == '/')
     return false;
@@ -449,8 +508,9 @@ bool file_symlink_unmunge(char* target) {
   return true;
 }
 
-/* Owned copy of `target` prefixed with SYMLINK_MUNGE_PREFIX (the sender-side
- * --munge-links rewriting).  Returns NULL on allocation failure. */
+/* Owned copy of `target` prefixed with SYMLINK_MUNGE_PREFIX (the receiver-side
+ * --munge-links rewriting, matching rsync's receiver).  Returns NULL on
+ * allocation failure. */
 char* file_symlink_munge(const char* target) {
   if (!target)
     return NULL;
@@ -471,22 +531,13 @@ char* file_symlink_munge(const char* target) {
  * the target is ever followed.  The final component is never dereferenced: an
  * existing non-directory entry at `path` is unlinked by name before the link is
  * placed; an existing directory there is left untouched (returns false, so a
- * caller can treat it as a collision).  As a receiver-side trust-boundary
- * invariant, `target` must be file_symlink_target_contained() (relative and
- * ".."-free): an absolute or escaping target is rejected outright (returns
- * false) so a malicious sender can never materialize a symlink that points
- * outside the receive root. */
+ * caller can treat it as a collision).  The link VALUE `target` is copied
+ * verbatim, matching rsync -l (which stores absolute and ".."-bearing targets
+ * as-is); target policy is the caller's job -- the scanner applies
+ * --safe-links/--copy-unsafe-links, and the receiver applies --munge-links.
+ * The PLACEMENT path is always confined below the authorized root. */
 bool file_symlink_at_secure(const char* path, const char* target) {
-  /* The link itself (`path`) is always kept below the authorized root.  The
-     TARGET may point anywhere: normally only a contained (relative, ".."-free)
-     target is permitted so a malicious sender can never plant a symlink that
-     later dereferences outside the root.  Under --trust-sender that target
-     containment check is relaxed (the receiver trusts the sender and copies the
-     link verbatim, matching rsync -l), but path/leaf confinement is never
-     disabled, so the link still cannot be placed outside the tree. */
   if (!path || !target || has_path_traversal(path))
-    return false;
-  if (!file_trust_sender && !file_symlink_target_contained(target))
     return false;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(path, &leaf, true);

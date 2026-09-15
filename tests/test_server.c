@@ -818,9 +818,23 @@ static void test_special_socket_path_log_escaped() {
   set_log_level(LOG_LEVEL_WARNING);
   log_set_8_bit_output(false);
 
+  const char* root = "test_special_sock_escape_root";
+  const char* existing = "test_special_sock_escape_root/evil\npath";
+  unlink(existing);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  FILE* planted = fopen(existing, "wb");
+  EXPECT_NOT_NULL(planted);
+  fclose(planted);
+
   FILE* capture = tmpfile();
   EXPECT_NOT_NULL(capture);
   log_set_file(capture);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->preserve_specials = true;
+  cfg->use_metadata = true;
 
   File* file = file_create("evil\npath");
   EXPECT_NOT_NULL(file);
@@ -829,7 +843,9 @@ static void test_special_socket_path_log_escaped() {
   EXPECT_NOT_NULL(file->metadata);
   file->metadata->mode = S_IFSOCK | 0644;
 
-  FileSaveResult result = file_save_to_disk_full("/tmp/dst", file, NULL);
+  /* A non-matching entry already occupies the path: the socket creation is
+     refused and the warning must escape the path's control byte. */
+  FileSaveResult result = file_save_to_disk_full(root, file, cfg);
   EXPECT_EQ_INT(result, FILE_SAVE_SKIPPED);
 
   fflush(capture);
@@ -841,8 +857,11 @@ static void test_special_socket_path_log_escaped() {
   log_set_file(NULL);
   fclose(capture);
   file_destroy(file);
+  config_delete(cfg);
+  unlink(existing);
+  rmdir(root);
 
-  EXPECT_NOT_NULL(strstr(output, "socket not recreated: evil\\#012path"));
+  EXPECT_NOT_NULL(strstr(output, "refusing to replace existing entry with socket: evil\\#012path"));
 }
 
 /* B1: a client-planted FIFO at the destination must not block the receiver's

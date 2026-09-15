@@ -518,6 +518,20 @@ static void test_file_symlink_helpers() {
   EXPECT_FALSE(file_symlink_target_contained("../escape"));
   EXPECT_FALSE(file_symlink_target_contained("a/../b"));
   EXPECT_FALSE(file_symlink_target_contained(""));
+
+  /* rsync 3.4.1 unsafe_symlink(): absolute/empty are unsafe; ".." is measured
+     against the symlink's own transfer-relative directory depth. */
+  EXPECT_TRUE(file_symlink_unsafe("/etc/passwd", "link"));
+  EXPECT_TRUE(file_symlink_unsafe("", "link"));
+  EXPECT_FALSE(file_symlink_unsafe("a.txt", "link"));
+  EXPECT_FALSE(file_symlink_unsafe("./a.txt", "link"));
+  EXPECT_FALSE(file_symlink_unsafe("../real.txt", "a/up1"));
+  EXPECT_FALSE(file_symlink_unsafe("../../real.txt", "a/b/up3"));
+  EXPECT_TRUE(file_symlink_unsafe("../../../outside", "a/b/esc"));
+  EXPECT_TRUE(file_symlink_unsafe("../outside", "esc"));
+  /* Internal /../ and a trailing /.. are rejected by rsync 3.4.1. */
+  EXPECT_TRUE(file_symlink_unsafe("a/b/../real.txt", "norm"));
+  EXPECT_TRUE(file_symlink_unsafe("dir/..", "link"));
 }
 
 static void test_file_symlink_at_secure() {
@@ -1123,6 +1137,47 @@ static void test_special_fifo_mode_never_group_other_writable() {
   umask(saved_umask);
 }
 
+/* --specials recreates a unix-domain socket via mknod(S_IFSOCK), which Linux
+ * permits unprivileged.  Without --specials the entry is skipped. */
+static void test_special_socket_recreated() {
+  const char* root = "test_special_sock_tmp";
+  const char* sock = "test_special_sock_tmp/source.sock";
+  unlink(sock);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFSOCK | 0600;
+  meta.uid = geteuid();
+  meta.gid = getegid();
+
+  File* f = file_create("source.sock");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->metadata = &meta;
+  cfg->preserve_specials = true;
+  cfg->use_metadata = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(sock, &st), 0);
+  EXPECT_TRUE(S_ISSOCK(st.st_mode));
+
+  /* Without --specials the same entry is skipped, never a regular file. */
+  unlink(sock);
+  cfg->preserve_specials = false;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_SKIPPED);
+  EXPECT_EQ_INT(lstat(sock, &st), -1);
+
+  f->metadata = NULL;
+  file_destroy(f);
+  config_delete(cfg);
+  unlink(sock);
+  rmdir(root);
+}
+
 static void test_inplace_overwrite_truncates_shorter_payload() {
   const char* root = "test_inplace_trunc_tmp";
   const char* path = "test_inplace_trunc_tmp/big.txt";
@@ -1297,34 +1352,27 @@ static void test_dir_entry_save_to_disk() {
  * receiver enables it from its own process (the standalone server's --trust-
  * sender CLI switch, which a client forwards as --remote-option=--trust-sender),
  * so these tests force file_set_trust_sender(true) directly.  Trust must RELAX
- * only the redundant list-level re-validation (an escaping symlink TARGET is
- * copied verbatim, rsync -l parity) and must NEVER disable the low-level
- * fd-relative confinement floor: file_open_secure_parent's ".." rejection, the
- * O_NOFOLLOW parent walk, leaf/destination confinement, and the ungated
- * has_path_traversal on the link's own placement path in file_symlink_at_secure
- * stay hard.  A hostile sender therefore still cannot place a file, directory
- * or symlink outside the receive root even with trust on. */
+ * only the redundant list-level re-validation and must NEVER disable the
+ * low-level fd-relative confinement floor: file_open_secure_parent's ".."
+ * rejection, the O_NOFOLLOW parent walk, leaf/destination confinement, and the
+ * ungated has_path_traversal on the link's own placement path in
+ * file_symlink_at_secure stay hard.  A hostile sender therefore still cannot
+ * place a file, directory or symlink outside the receive root. */
 
-static void test_trust_sender_relaxes_symlink_target() {
-  const char* root = "test_trust_sender_root";
-  const char* link = "test_trust_sender_root/escape_link";
+static void test_symlink_target_verbatim() {
+  const char* root = "test_symlink_verbatim_root";
+  const char* link = "test_symlink_verbatim_root/escape_link";
   unlink(link);
   rmdir(root);
   EXPECT_EQ_INT(mkdir(root, 0755), 0);
 
-  /* Control: without trust an absolute (escaping) target is refused and the
-     link is never placed. */
+  /* rsync -l parity: a symlink target is stored verbatim, absolute or not; the
+     scanner's --safe-links/--copy-unsafe-links is what filters links. */
   file_set_trust_sender(false);
-  EXPECT_FALSE(file_symlink_at_secure(link, "/etc/passwd"));
-  struct stat st;
-  EXPECT_EQ_INT(lstat(link, &st), -1);
-
-  /* Trust ON: the escaping target is copied verbatim (rsync -l parity) ... */
-  file_set_trust_sender(true);
   EXPECT_TRUE(file_symlink_at_secure(link, "/etc/passwd"));
+  struct stat st;
   EXPECT_EQ_INT(lstat(link, &st), 0);
   EXPECT_TRUE(S_ISLNK(st.st_mode));
-  /* ...but the link itself still lands beneath the receive root. */
   char target[128];
   ssize_t target_len = readlink(link, target, sizeof(target) - 1);
   EXPECT_TRUE(target_len > 0);
@@ -1335,10 +1383,10 @@ static void test_trust_sender_relaxes_symlink_target() {
   }
   unlink(link);
 
-  /* Same relaxation through the real save funnel (file_save_to_disk_full). */
+  /* The same through the real save funnel: verbatim by default. */
   Config* config = config_create();
   EXPECT_NOT_NULL(config);
-  const char* save_link = "test_trust_sender_root/save_link";
+  const char* save_link = "test_symlink_verbatim_root/save_link";
   unlink(save_link);
 
   File* sym = file_create("save_link");
@@ -1348,10 +1396,6 @@ static void test_trust_sender_relaxes_symlink_target() {
   EXPECT_NOT_NULL(sym->symlink_target);
 
   file_set_trust_sender(false);
-  EXPECT_EQ_INT(file_save_to_disk_full(root, sym, config), FILE_SAVE_SKIPPED);
-  EXPECT_EQ_INT(lstat(save_link, &st), -1);
-
-  file_set_trust_sender(true);
   EXPECT_EQ_INT(file_save_to_disk_full(root, sym, config), FILE_SAVE_WRITTEN);
   EXPECT_EQ_INT(lstat(save_link, &st), 0);
   EXPECT_TRUE(S_ISLNK(st.st_mode));
@@ -1477,7 +1521,7 @@ void test_trust_sender() {
      helper), so a later group never inherits a stray trust/authorized-root
      policy. */
   file_set_trust_sender(false);
-  test_trust_sender_relaxes_symlink_target();
+  test_symlink_target_verbatim();
   test_trust_sender_confines_hostile_paths();
   test_trust_sender_authorized_root_confinement();
   file_set_trust_sender(false);
@@ -1877,6 +1921,7 @@ void test_file() {
   test_atomic_no_perms_preserves_destination_mode();
   test_new_file_mode_never_group_other_writable();
   test_special_fifo_mode_never_group_other_writable();
+  test_special_socket_recreated();
   test_inplace_overwrite_truncates_shorter_payload();
   test_inplace_refuses_fifo_destination();
   test_inplace_refuses_device_destination();

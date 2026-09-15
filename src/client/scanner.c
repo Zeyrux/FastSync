@@ -98,17 +98,51 @@ static DirEntry* dir_entry_create(const char* path, int depth, FilterNode* conte
   return de;
 }
 
-static bool safe_relative_link(const char* source_root, const char* containing_dir,
-                               const char* link_target) {
-  char root[PATH_MAX];
-  if (!realpath(source_root, root))
-    return false;
-  char* joined = path_cat(containing_dir, link_target);
-  char resolved[PATH_MAX];
-  bool safe = joined && realpath(joined, resolved) && strncmp(root, resolved, strlen(root)) == 0 &&
-              (resolved[strlen(root)] == '\0' || resolved[strlen(root)] == '/');
-  free(joined);
-  return safe;
+/* How rsync's readlink_stat()/generator resolves one source symlink. */
+typedef enum {
+  LINK_ACTION_SKIP,           /* not transferred (no link option) */
+  LINK_ACTION_SKIP_PROTECTED, /* ignored as unsafe by --safe-links; rsync keeps
+                                 it in the transfer, so its destination mirror
+                                 must be protected from --delete */
+  LINK_ACTION_DEREF,          /* follow the referent (--copy-links, an unsafe
+                                 target under --copy-unsafe-links, or -k dir) */
+  LINK_ACTION_CARRY,          /* transmit the link itself (-l) */
+} LinkAction;
+
+/* Apply rsync's symlink-resolution precedence to one S_ISLNK entry:
+ *   --copy-links  dereferences every symlink;
+ *   --copy-unsafe-links  dereferences only targets unsafe_symlink() flags;
+ *   -k/--copy-dirlinks  dereferences only a symlink whose referent is a dir;
+ *   --safe-links  (receiver-side in rsync; modelled here) ignores an unsafe
+ *                 target that would otherwise be carried; with --munge-links
+ *                 every stored target becomes absolute, so --safe-links then
+ *                 ignores every symlink, exactly as rsync documents;
+ *   -l/--links  carries the link.
+ * `link_rel` is the symlink's transfer-relative path (incl. name) and is used
+ * only for the lexical unsafe test.  `target` receives the raw link value. */
+static LinkAction scanner_link_action(const ScannerOptions* options, const char* path,
+                                      const char* link_rel, char* target, size_t target_size) {
+  if (!options->follow_symlinks && !options->copy_links && !options->safe_links &&
+      !options->copy_unsafe_links && !options->copy_dirlinks)
+    return LINK_ACTION_SKIP;
+  ssize_t length = readlink(path, target, target_size - 1);
+  if (length < 0)
+    return LINK_ACTION_SKIP;
+  target[length] = '\0';
+
+  bool unsafe = file_symlink_unsafe(target, link_rel);
+  if (options->copy_links || (options->copy_unsafe_links && unsafe))
+    return LINK_ACTION_DEREF;
+  if (options->copy_dirlinks) {
+    struct stat ref;
+    if (stat(path, &ref) == 0 && S_ISDIR(ref.st_mode))
+      return LINK_ACTION_DEREF;
+  }
+  if (options->safe_links && (unsafe || options->munge_links))
+    return LINK_ACTION_SKIP_PROTECTED;
+  if (!options->follow_symlinks || target[0] == '\0')
+    return LINK_ACTION_SKIP;
+  return LINK_ACTION_CARRY;
 }
 
 typedef struct {
@@ -210,24 +244,35 @@ static void scanner_assign_hardlink(DirectoryScanner* scanner, HardLinkTable* ta
   }
 }
 
-/* Phase 4 special/devices: detect a device (char/block), FIFO or socket entry
-   and, when the matching --devices/--specials flag asks it be preserved,
-   convert the File into a node to recreate (is_special, empty payload) with its
-   device rdev captured from the source stat.  When the entry is not preserved
-   (or --copy-devices instead copies its content as an ordinary regular file)
-   the File is left as a normal data file.  Returns true when converted. */
-static bool scanner_prepare_special(bool preserve_devices, bool preserve_specials, File* file,
-                                    const struct stat* stats) {
+/* Phase 4 special/devices decision for one non-regular entry, matching rsync:
+   - a char/block device is RECREATED as a node under -D/--devices, unless
+     --copy-devices asks for its content to be copied into a regular file;
+   - a FIFO/socket is RECREATED under --specials;
+   - when the matching flag is absent the entry is SKIPPED ("skipping
+     non-regular file"), exactly like rsync's default, instead of being
+     silently copied as a zero-length regular file;
+   - anything else (regular/directory) is left to the normal data path. */
+typedef enum {
+  SCANNER_SPECIAL_REGULAR,  /* ordinary file: transfer content */
+  SCANNER_SPECIAL_RECREATE, /* is_special node to recreate on the receiver */
+  SCANNER_SPECIAL_SKIP,     /* non-regular entry not requested: skip */
+} ScannerSpecial;
+
+static ScannerSpecial scanner_prepare_special(bool preserve_devices, bool preserve_specials,
+                                              bool copy_devices, File* file,
+                                              const struct stat* stats) {
   if (!file || !stats)
-    return false;
+    return SCANNER_SPECIAL_REGULAR;
   bool is_device = S_ISCHR(stats->st_mode) || S_ISBLK(stats->st_mode);
   bool is_fifo = S_ISFIFO(stats->st_mode);
   bool is_socket = S_ISSOCK(stats->st_mode);
   if (!is_device && !is_fifo && !is_socket)
-    return false;
+    return SCANNER_SPECIAL_REGULAR;
+  if (is_device && copy_devices)
+    return SCANNER_SPECIAL_REGULAR; /* copy device content as a regular file */
   bool preserve = is_device ? preserve_devices : preserve_specials;
   if (!preserve)
-    return false;
+    return SCANNER_SPECIAL_SKIP;
   file->is_special = true;
   file->data->size = 0;
   file->data->data = NULL;
@@ -235,7 +280,7 @@ static bool scanner_prepare_special(bool preserve_devices, bool preserve_special
     file->rdev_major = (int32_t)major(stats->st_rdev);
     file->rdev_minor = (int32_t)minor(stats->st_rdev);
   }
-  return true;
+  return SCANNER_SPECIAL_RECREATE;
 }
 
 /* Append `rel` to the caller's exclusion sink, taking `mtx` when shared across
@@ -306,10 +351,11 @@ static int open_directory_filter_context(DirectoryScanner* scanner, const Filter
   return 0;
 }
 
-/* Inspect symlinks, resolve the entry type, and apply file filters once for both scanners. */
-static int scanner_inspect_entry(const ScannerOptions* options, const char* source_root,
-                                 const char* containing_dir, const char* name,
-                                 ScannerEntry* entry) {
+/* Inspect symlinks, resolve the entry type, and apply file filters once for both scanners.
+ * `link_rel` is the entry's path relative to the transfer root (including its
+ * name), used for the lexical rsync unsafe-symlink test. */
+static int scanner_inspect_entry(const ScannerOptions* options, const char* containing_dir,
+                                 const char* link_rel, const char* name, ScannerEntry* entry) {
   entry->excluded = false;
   entry->is_symlink = false;
   entry->link_target = NULL;
@@ -322,72 +368,49 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
     free(entry->path);
     return 0;
   }
-  bool is_symlink = S_ISLNK(link_stats.st_mode);
-  if (!is_symlink)
+  if (!S_ISLNK(link_stats.st_mode))
     goto regular;
 
-  /* Symlink: choose between dereferencing (---copy-links / --safe-links /
-     --copy-unsafe-links, plus -k for symlinks-to-directories) and carrying the
-     link through as a symlink (-l, and -k for symlinks-to-files).  No link
-     option means the symlink is skipped entirely (pre-existing behavior). */
-  const bool any_link_option = options->follow_symlinks || options->copy_links ||
-                               options->safe_links || options->copy_unsafe_links ||
-                               options->copy_dirlinks;
-  if (!any_link_option)
-    goto skip;
-
   char link_target[4096];
-  ssize_t length = readlink(entry->path, link_target, sizeof(link_target) - 1);
-  if (length < 0)
+  switch (scanner_link_action(options, entry->path, link_rel, link_target, sizeof(link_target))) {
+  case LINK_ACTION_SKIP:
     goto skip;
-  link_target[length] = '\0';
-
-  if (options->safe_links) {
-    if (link_target[0] == '/' || !safe_relative_link(source_root, containing_dir, link_target))
+  case LINK_ACTION_SKIP_PROTECTED:
+    /* --safe-links ignored the link, but rsync still counts it as present in
+       the transfer, so its destination mirror survives --delete.  Record it as
+       an excluded path (the same delete-protection channel as a filter prune). */
+    entry->excluded = true;
+    goto skip;
+  case LINK_ACTION_DEREF:
+    if (stat(entry->path, &entry->stats) != 0) {
+      /* rsync reports "symlink has no referent" and continues (exit 23); we
+         surface the same condition rather than silently dropping the entry. */
+      char* escaped = output_escape(entry->path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "symlink has no referent: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
       goto skip;
-  }
-  if (options->copy_unsafe_links && !options->copy_links) {
-    if (link_target[0] != '/')
-      goto skip;
-  }
-
-  bool emit_symlink = false;
-  if (options->copy_links) {
-    emit_symlink = false; /* --copy-links dereferences every referent */
-  } else if (options->safe_links || options->copy_unsafe_links) {
-    emit_symlink = false; /* preserve pre-existing dereference behavior */
-  } else if (options->copy_dirlinks) {
-    struct stat ref;
-    if (stat(entry->path, &ref) == 0 && S_ISDIR(ref.st_mode))
-      emit_symlink = false; /* -k: symlink to a directory recurses as a dir */
-    else
-      emit_symlink = true; /* -k: symlink to a file stays a symlink */
-  } else if (options->follow_symlinks) {
-    emit_symlink = true; /* -l: copy symlink as symlink */
-  }
-
-  if (!emit_symlink) {
-    if (stat(entry->path, &entry->stats) != 0)
-      goto skip;
+    }
     entry->is_directory = S_ISDIR(entry->stats.st_mode);
     if (entry->is_directory)
       return 1;
     goto apply_filters;
+  case LINK_ACTION_CARRY:
+    break;
   }
 
-  /* Carry the link as a symlink.  --munge-links containment: a target that
-     could escape the receive root (absolute or containing "..") is never
-     transmitted -- the entry is merely skipped ("contained"). */
-  if (link_target[0] == '\0' ||
-      (options->munge_links && !file_symlink_target_contained(link_target)))
-    goto skip;
+  /* Carry the link as a symlink.  --munge-links is applied by the RECEIVER (it
+     prefixes every stored target with /rsyncd-munged/); when the SOURCE already
+     holds a munged value the sender strips it so the receiver re-munges a clean
+     target, round-tripping a munged tree exactly like rsync. */
   entry->is_symlink = true;
   entry->stats = link_stats;
   entry->is_directory = false;
-  entry->link_target =
-      options->munge_links ? file_symlink_munge(link_target) : str_dup(link_target);
+  entry->link_target = str_dup(link_target);
   if (!entry->link_target)
     goto skip;
+  if (options->munge_links)
+    file_symlink_unmunge(entry->link_target);
   goto apply_filters;
 
 regular:
@@ -798,30 +821,57 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
     return NULL;
   }
   struct stat effective = link_stats;
+  bool emit_symlink = false;
+  char* symlink_target = NULL;
   if (S_ISLNK(link_stats.st_mode)) {
-    /* A symlink is transferred (following its referent) only when a link
-       resolution option is active, mirroring the regular scanner. */
-    bool resolve = scanner->options.follow_symlinks || scanner->options.copy_links ||
-                   scanner->options.safe_links || scanner->options.copy_unsafe_links;
-    if (!resolve || stat(abs_path, &effective) != 0) {
+    /* Resolve the listed symlink with the same precedence as the recursive
+       scanner: dereference or carry the link. */
+    char link_target[4096];
+    LinkAction action =
+        scanner_link_action(&scanner->options, abs_path, entry, link_target, sizeof(link_target));
+    if (action == LINK_ACTION_SKIP || action == LINK_ACTION_SKIP_PROTECTED) {
       free(abs_path);
       return NULL;
+    }
+    if (action == LINK_ACTION_DEREF) {
+      if (stat(abs_path, &effective) != 0) {
+        free(abs_path);
+        return NULL;
+      }
+    } else {
+      emit_symlink = true;
+      symlink_target = str_dup(link_target);
+      if (!symlink_target) {
+        free(abs_path);
+        scanner->failed = true;
+        return NULL;
+      }
+      if (scanner->options.munge_links)
+        file_symlink_unmunge(symlink_target);
     }
   }
   bool is_dir = S_ISDIR(effective.st_mode);
   bool is_file = S_ISREG(effective.st_mode);
-  if (!is_dir && !is_file) {
+  if (!emit_symlink && !is_dir && !is_file) {
+    free(symlink_target);
     free(abs_path);
     return NULL;
   }
   File* file = file_create(abs_path);
   free(abs_path);
   if (!file) {
+    free(symlink_target);
     scanner->failed = true;
     return NULL;
   }
-  file->is_dir = is_dir;
-  file->data->size = is_file ? (unsigned long long)effective.st_size : 0;
+  if (emit_symlink) {
+    file->is_symlink = true;
+    file->symlink_target = symlink_target;
+    symlink_target = NULL;
+  } else {
+    file->is_dir = is_dir;
+    file->data->size = is_file ? (unsigned long long)effective.st_size : 0;
+  }
   if (scanner->relative_mode) {
     file->send_path = str_dup(entry);
     if (!file->send_path) {
@@ -978,8 +1028,14 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       continue;
 
     ScannerEntry inspected;
-    int inspection = scanner_inspect_entry(&scanner->options, scanner->current_path,
-                                           scanner->current_path, entry->d_name, &inspected);
+    char* link_rel = child_rel_path(scanner->current_rel, entry->d_name);
+    if (!link_rel) {
+      scanner->failed = true;
+      break;
+    }
+    int inspection = scanner_inspect_entry(&scanner->options, scanner->current_path, link_rel,
+                                           entry->d_name, &inspected);
+    free(link_rel);
     if (inspection < 0) {
       scanner->failed = true;
       break;
@@ -1084,9 +1140,16 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         rel_copy = NULL;
       }
       /* --devices/--specials: a device/FIFO/socket entry marked for preservation
-         becomes a node to recreate (is_special, no data, rdev captured). */
-      scanner_prepare_special(scanner->options.preserve_devices, scanner->options.preserve_specials,
-                              file, &stats);
+         becomes a node to recreate (is_special, no data, rdev captured); an
+         unrequested non-regular entry is skipped (rsync default). */
+      ScannerSpecial special = scanner_prepare_special(scanner->options.preserve_devices,
+                                                       scanner->options.preserve_specials,
+                                                       scanner->options.copy_devices, file, &stats);
+      if (special == SCANNER_SPECIAL_SKIP) {
+        free(rel_copy);
+        file_destroy(file);
+        continue;
+      }
       if (scanner->options.hardlinks && S_ISREG(stats.st_mode))
         scanner_assign_hardlink(scanner, scanner->options.hardlinks, file, &stats);
       if (scanner->options.use_metadata)
@@ -1335,7 +1398,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
                             ParallelScanner* ps) {
   ScannerEntry inspected;
   int inspection =
-      scanner_inspect_entry(options, root_directory, root_directory, entry->d_name, &inspected);
+      scanner_inspect_entry(options, root_directory, entry->d_name, entry->d_name, &inspected);
   if (inspection < 0) {
     ps->failed = true;
     return;
@@ -1415,7 +1478,13 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     file->send_path = rel;
     rel = NULL;
   }
-  scanner_prepare_special(options->preserve_devices, options->preserve_specials, file, &st);
+  ScannerSpecial special = scanner_prepare_special(
+      options->preserve_devices, options->preserve_specials, options->copy_devices, file, &st);
+  if (special == SCANNER_SPECIAL_SKIP) {
+    free(rel);
+    file_destroy(file);
+    return;
+  }
   if (options->hardlinks && S_ISREG(st.st_mode)) {
     int gid;
     bool is_first;

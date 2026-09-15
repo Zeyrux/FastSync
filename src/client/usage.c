@@ -277,11 +277,11 @@ void print_usage(void) {
   printf("                      Local receiver policy: never sent to the peer, off by default\n");
   printf("  -l, --links         Copy symlinks as symlinks\n");
   printf("  -L, --copy-links    Transform symlinks into referent files\n");
-  printf("  --safe-links        Skip symlinks that point outside transfer tree\n");
-  printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
+  printf("  --safe-links        Skip symlinks whose target points outside the tree\n");
+  printf("  --copy-unsafe-links Copy unsafe symlinks (outside tree) as referent files\n");
   printf("  -k, --copy-dirlinks Transform symlinks to directories into real dirs\n");
   printf("  -K, --keep-dirlinks  Keep an existing symlink-to-dir as that dir\n");
-  printf("  --munge-links       Munge symlink targets on the wire (sender)\n");
+  printf("  --munge-links       Munge stored symlink targets (/rsyncd-munged/) on the receiver\n");
   printf("  -H, --hard-links    Preserve hard-link relationships across the transfer\n");
   printf("  -S, --sparse        Handle sparse files efficiently\n");
   printf(
@@ -289,8 +289,7 @@ void print_usage(void) {
   printf(
       "  --devices           Recreate device nodes on the destination (privileged; skipped when\n");
   printf("                      the receiver lacks CAP_MKNOD)\n");
-  printf("  --specials          Recreate special files (FIFOs) on the destination (sockets "
-         "skipped)\n");
+  printf("  --specials          Recreate special files (FIFOs, sockets) on the destination\n");
   printf("  --copy-devices      Copy a source device's content as a regular file instead\n");
   printf("  --write-devices     Write received data into an existing destination device node\n");
   printf("  --inplace           Update files in-place (no temp+rename)\n");

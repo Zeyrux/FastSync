@@ -358,14 +358,6 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     log_message(LOG_LEVEL_ERROR, "Special node has no device/FIFO/socket mode");
     return FILE_SAVE_ERROR;
   }
-  if (is_sock) {
-    /* No standard filesystem call recreates a socket; best-effort unsupported. */
-    char* escaped_path = output_escape(file->path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_WARNING, "socket not recreated: %s (unsupported; skipped)",
-                escaped_path ? escaped_path : "<allocation failed>");
-    free(escaped_path);
-    return FILE_SAVE_SKIPPED;
-  }
   if (is_char || is_blk) {
     if (!config || !config->preserve_devices)
       return FILE_SAVE_SKIPPED;
@@ -383,7 +375,10 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       free(escaped_path);
       return FILE_SAVE_SKIPPED;
     }
-  } else if (is_fifo) {
+  } else if (is_fifo || is_sock) {
+    /* FIFOs and unix sockets are recreated by --specials.  mknod(S_IFSOCK)
+       works unprivileged on Linux (the node carries no live socket), so unlike
+       a socket bound to a live fd it can be materialized. */
     if (!config || !config->preserve_specials)
       return FILE_SAVE_SKIPPED;
   }
@@ -433,9 +428,12 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   } else if (is_blk) {
     create_mode = S_IFBLK;
     rdev = makedev((unsigned)file->rdev_major, (unsigned)file->rdev_minor);
+  } else if (is_sock) {
+    create_mode = S_IFSOCK;
   } else {
     create_mode = S_IFIFO;
   }
+  const char* node_kind = (is_char || is_blk) ? "device" : (is_fifo ? "FIFO" : "socket");
   /* The creation permission bits come from the source only under -p/--perms;
    * otherwise a safe default (0644, group/other write never granted) keeps an
    * unprivileged no--p run from materializing a world-writable node. */
@@ -450,7 +448,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       struct stat st;
       if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
           ((is_char && S_ISCHR(st.st_mode)) || (is_blk && S_ISBLK(st.st_mode)) ||
-           (is_fifo && S_ISFIFO(st.st_mode)))) {
+           (is_fifo && S_ISFIFO(st.st_mode)) || (is_sock && S_ISSOCK(st.st_mode)))) {
         close(parent_fd);
         free(leaf);
         free(destination);
@@ -458,7 +456,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       }
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING, "refusing to replace existing entry with %s: %s (skipped)",
-                  is_fifo ? "FIFO" : "device", escaped_path ? escaped_path : "<allocation failed>");
+                  node_kind, escaped_path ? escaped_path : "<allocation failed>");
       free(escaped_path);
     } else if (errno == EPERM || errno == EACCES) {
       /* Missing CAP_MKNOD / parent write permission: the environment cannot
@@ -467,14 +465,12 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: cannot create %s node (%s)\n"
                   "  --devices/--specials node creation needs privilege (CAP_MKNOD)",
-                  escaped_path ? escaped_path : "<allocation failed>", is_fifo ? "FIFO" : "device",
-                  strerror(errno));
+                  escaped_path ? escaped_path : "<allocation failed>", node_kind, strerror(errno));
       free(escaped_path);
     } else {
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
-      log_message(LOG_LEVEL_WARNING, "failed to create %s %s: %s (skipped)",
-                  is_fifo ? "FIFO" : "device", escaped_path ? escaped_path : "<allocation failed>",
-                  strerror(errno));
+      log_message(LOG_LEVEL_WARNING, "failed to create %s %s: %s (skipped)", node_kind,
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
       free(escaped_path);
     }
     close(parent_fd);
@@ -710,26 +706,23 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     char* link_path = path_cat(root_directory, file->path);
     if (!link_path)
       return FILE_SAVE_ERROR;
-    /* Restore the real target by stripping the sender's --munge-links marker.
-       Only unmunge when the policy was negotiated: a plain -l run must preserve
-       a source symlink whose target genuinely begins with the marker verbatim. */
+    /* The link value is stored verbatim (rsync -l parity: absolute and
+       ".."-bearing targets are preserved; the scanner's --safe-links /
+       --copy-unsafe-links decide which links are sent at all).  --munge-links
+       is a RECEIVER-side rewrite: the stored target is prefixed with
+       /rsyncd-munged/, making the link unusable while the referenced directory
+       does not exist -- exactly as rsync's receiver munges.  Only the link's
+       own placement path is confined below the receive root. */
+    bool munge = config && config->munge_links;
     char* target = str_dup(file->symlink_target);
     bool ok = target != NULL;
-    if (ok && config && config->munge_links)
-      file_symlink_unmunge(target);
-    /* Receiver-side trust boundary (independent of the sender): a target that
-       could escape the receive root (absolute, or relative-with-"..") is never
-       materialized.  It is contained (the entry is skipped) rather than failing
-       the whole transfer, so a hostile sender can inject a broken symlink but
-       can never redirect it outside the root.  --trust-sender deliberately
-       relaxes this receiver-side re-validation: a trusted sender's escaping
-       symlink target is copied verbatim (rsync -l parity).  The low-level
-       leaf/destination confinement in file_symlink_at_secure still ensures the
-       link itself is placed inside the authorized root. */
-    if (ok && !file_get_trust_sender() && !file_symlink_target_contained(target))
-      ok = false;
+    if (ok && munge) {
+      char* munged = file_symlink_munge(target);
+      free(target);
+      target = munged;
+      ok = target != NULL;
+    }
     if (!ok) {
-      /* Skip the escaping/empty target (contained) rather than abort. */
       free(target);
       free(link_path);
       return FILE_SAVE_SKIPPED;

@@ -92,54 +92,63 @@ class TestDeviceSpecial:
         assert stat.S_ISFIFO(os.stat(os.path.join(received, "pipe.fifo")).st_mode)
 
     @pytest.mark.ci
-    def test_specials_socket_source_skipped_safely(self):
-        """A socket cannot be recreated by any standard filesystem call, so
-        --specials must skip it with a note and still complete the run (the
-        adjacent regular file transfers normally; no socket node appears)."""
+    def test_specials_recreates_socket(self, shared_server):
+        """--specials recreates a unix-domain socket with mknod(S_IFSOCK), which
+        Linux permits unprivileged; the adjacent regular file still transfers."""
         self._setup()
         sock_path = os.path.join(DEVICE_SOURCE, "source.sock")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server, port = _start_captured_server()
         try:
             s.bind(sock_path)
             result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
-                                   flags=["--specials"], port=port)
+                                   flags=["--specials"], port=shared_server.port)
         finally:
             s.close()
-            out, err = _stop_captured_server(server)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         with open(os.path.join(received, "plain.txt")) as f:
             assert f.read() == "regular content\n"
-        assert not os.path.lexists(os.path.join(received, "source.sock")), (
-            "socket source must be skipped, not materialized"
-        )
-        assert "socket not recreated" in (out + err), (
-            f"receiver did not log the documented socket skip: out={out!r} err={err!r}"
+        dest_sock = os.path.join(received, "source.sock")
+        assert os.path.lexists(dest_sock), "socket source was not recreated"
+        assert stat.S_ISSOCK(os.lstat(dest_sock).st_mode), (
+            "socket source must be recreated as a socket node"
         )
 
     @pytest.mark.ci
+    def test_special_default_skips_non_regular(self, shared_server):
+        """Without --specials, rsync skips a FIFO/socket as a non-regular file;
+        FastSync must skip it (never copy it as an empty regular file)."""
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "skip.fifo"))
+        sock_path = os.path.join(DEVICE_SOURCE, "skip.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(sock_path)
+            result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST, flags=[], port=shared_server.port)
+        finally:
+            s.close()
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        assert not os.path.lexists(os.path.join(received, "skip.fifo"))
+        assert not os.path.lexists(os.path.join(received, "skip.sock"))
+        with open(os.path.join(received, "plain.txt")) as f:
+            assert f.read() == "regular content\n"
+
+    @pytest.mark.ci
     @pytest.mark.parametrize("flags", [["--copy-devices"], ["--copy-devices", "--sendfile"]])
-    def test_copy_devices_fifo_becomes_regular_file(self, shared_server, flags):
-        """--copy-devices treats a special source as an ordinary regular-file
-        copy: a FIFO (st_size 0) becomes a zero-length REGULAR file on the
-        destination (never a FIFO, never a hang), and the run succeeds.  The
-        --sendfile variant previously blocked forever in the sendfile open();
-        the non-regular source now falls back to the buffered read path, so it
-        must complete within the bounded-time assertion below."""
+    def test_copy_devices_skips_fifo_without_specials(self, shared_server, flags):
+        """rsync's --copy-devices applies to device nodes only; a FIFO/socket is
+        a non-regular entry and is skipped unless --specials is also given.  In
+        particular it must never hang in the sendfile open()."""
         self._setup()
         os.mkfifo(os.path.join(DEVICE_SOURCE, "device_copy.fifo"))
         result, dur = run_client(DEVICE_SOURCE, DEVICE_DEST,
                                  flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
-        copied = os.path.join(received, "device_copy.fifo")
-        assert os.path.lexists(copied), "copy-devices source was not transferred"
-        st = os.lstat(copied)
-        assert stat.S_ISREG(st.st_mode), (
-            f"copy-devices must produce a regular file, got mode {oct(st.st_mode)}"
+        assert not os.path.lexists(os.path.join(received, "device_copy.fifo")), (
+            "a FIFO under --copy-devices alone must be skipped, not materialized"
         )
-        assert st.st_size == 0, f"expected a size-bounded 0-byte copy, got {st.st_size}"
         assert dur < 60, f"{' '.join(flags)} hung on a FIFO source"
 
     def test_write_devices_non_crash(self, shared_server):
@@ -219,6 +228,24 @@ class TestDeviceSpecial:
         st = os.lstat(os.path.join(received, "realdev"))
         assert stat.S_ISCHR(st.st_mode)
         assert os.major(st.st_rdev) == 1 and os.minor(st.st_rdev) == 3
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
+    def test_copy_devices_copies_device_as_regular(self, shared_server):
+        """Root-only: --copy-devices copies a device's content into an ordinary
+        regular file instead of recreating the node.  /dev/null (1,3) has size 0,
+        so the result is a 0-byte REGULAR file."""
+        self._setup()
+        src_dev = os.path.join(DEVICE_SOURCE, "copieddev")
+        os.mknod(src_dev, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["-a", "--copy-devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        st = os.lstat(os.path.join(received, "copieddev"))
+        assert stat.S_ISREG(st.st_mode), (
+            f"--copy-devices must produce a regular file, got mode {oct(st.st_mode)}"
+        )
+        assert st.st_size == 0
 
     def test_m_remove_source_files_keeps_recreated_fifo(self, shared_server):
         """--threads --remove-source-files --specials: a recreated FIFO must NOT be
@@ -5150,8 +5177,10 @@ class TestSymlinkTrust:
         os.symlink("realfile.txt", os.path.join(source, "link_file"))
         os.symlink("realdir", os.path.join(source, "link_dir"))
 
-        result, _ = run_client(source, dest, flags=["-k"], port=shared_server.port)
-        assert result.returncode == 0, f"-k failed: {(result.stderr or result.stdout)[:300]}"
+        # -k only dereferences directory symlinks; file symlinks need -l to be
+        # carried as symlinks (rsync skips them otherwise).
+        result, _ = run_client(source, dest, flags=["-l", "-k"], port=shared_server.port)
+        assert result.returncode == 0, f"-l -k failed: {(result.stderr or result.stdout)[:300]}"
 
         received = get_dest_received_dir(dest, source)
         # link -> realdir dereferences into a real directory tree...
@@ -5191,9 +5220,13 @@ class TestSymlinkTrust:
         # ... and the file is written beneath it, through to the referent dir.
         assert os.path.isfile(os.path.join(parent, "realdir", "file.txt"))
 
-    def test_munge_links_unmunged_target_and_containment(self, shared_server):
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_munge")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_munge_dst")
+    @pytest.mark.ci
+    def test_munge_links_prefixes_targets(self, shared_server):
+        # rsync's --munge-links is a RECEIVER-side rewrite: every stored target
+        # gets the /rsyncd-munged/ prefix, making the link unusable while that
+        # directory does not exist.
+        source = os.path.join(TEST_DATA_DIR, "symlink_munge")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_munge_dst")
         clean_dir(source)
         clean_dir(dest)
         with open(os.path.join(source, "a.txt"), "wb") as f:
@@ -5207,19 +5240,15 @@ class TestSymlinkTrust:
         assert result.returncode == 0, f"--munge-links failed: {(result.stderr or result.stdout)[:300]}"
 
         received = get_dest_received_dir(dest, source)
-        # The safe symlink is created with its correct (unmunged) target.
-        good = os.path.join(received, "good")
-        assert os.path.islink(good)
-        assert os.readlink(good) == "a.txt"
-        # A target that would escape the receive root is contained (skip: never
-        # transmitted, so nothing is created at the destination).
-        assert not os.path.lexists(os.path.join(received, "abs_escape"))
-        assert not os.path.lexists(os.path.join(received, "dotdot_escape"))
+        assert os.readlink(os.path.join(received, "good")) == "/rsyncd-munged/a.txt"
+        assert os.readlink(os.path.join(received, "abs_escape")) == "/rsyncd-munged//etc/passwd"
+        assert os.readlink(os.path.join(received, "dotdot_escape")) == "/rsyncd-munged/../../escape"
         assert os.path.isfile(os.path.join(received, "a.txt"))
 
+    @pytest.mark.ci
     def test_links_copies_symlinks_as_symlinks(self, shared_server):
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_links")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_links_dst")
+        source = os.path.join(TEST_DATA_DIR, "symlink_links")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_links_dst")
         clean_dir(source)
         clean_dir(dest)
         os.makedirs(os.path.join(source, "realdir"))
@@ -5238,48 +5267,157 @@ class TestSymlinkTrust:
         assert os.path.islink(os.path.join(received, "ld"))
         assert os.readlink(os.path.join(received, "ld")) == "realdir"
 
-    def test_receiver_contains_absolute_target_even_without_munge(self, shared_server):
-        # The trust boundary is symmetric and enforced receiver-side: a plain -l
-        # (no --munge-links) run must refuse to materialize an out-of-root
-        # absolute symlink target, while still copying a legitimate in-root one.
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_abs")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_abs_dst")
+    @pytest.mark.ci
+    def test_links_preserves_absolute_and_dotdot_targets(self, shared_server):
+        # rsync -l parity: -l stores a symlink target verbatim, including an
+        # absolute target and an in-tree ".." target (no silent drop).
+        source = os.path.join(TEST_DATA_DIR, "symlink_links_verbatim")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_links_verbatim_dst")
         clean_dir(source)
         clean_dir(dest)
         with open(os.path.join(source, "a.txt"), "wb") as f:
             f.write(b"a\n")
+        os.makedirs(os.path.join(source, "sub"))
         os.symlink("a.txt", os.path.join(source, "good"))
         os.symlink("/etc/passwd", os.path.join(source, "unsafe_abs"))
+        os.symlink("../a.txt", os.path.join(source, "sub", "up"))
 
         result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
         assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
-
         received = get_dest_received_dir(dest, source)
-        good = os.path.join(received, "good")
-        assert os.path.islink(good)
-        assert os.readlink(good) == "a.txt"
-        # The absolute (non-contained) target was not materialized at the dest.
-        assert not os.path.lexists(os.path.join(received, "unsafe_abs"))
+        assert os.readlink(os.path.join(received, "good")) == "a.txt"
+        assert os.readlink(os.path.join(received, "unsafe_abs")) == "/etc/passwd"
+        assert os.readlink(os.path.join(received, "sub", "up")) == "../a.txt"
 
-    def test_links_does_not_strip_munge_prefix_without_munge(self, shared_server):
-        # A source symlink whose target genuinely begins with the #SYMLINK/ marker
-        # must round-trip verbatim under plain -l: the receiver only unmunges when
-        # the negotiated --munge-links policy is on, never unconditionally.
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_prefix")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_prefix_dst")
+    @pytest.mark.ci
+    def test_safe_links_keeps_safe_skips_unsafe(self, shared_server):
+        # --safe-links keeps symlinks that stay inside the transfer tree (even
+        # with a ".." that does not climb out) and drops absolute / escaping /
+        # internally-".."-bearing targets.
+        source = os.path.join(TEST_DATA_DIR, "symlink_safe")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_safe_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        os.makedirs(os.path.join(source, "sub"))
+        os.symlink("a.txt", os.path.join(source, "safe_rel"))
+        os.symlink("../a.txt", os.path.join(source, "sub", "up"))
+        os.symlink("/etc/passwd", os.path.join(source, "abs"))
+        os.symlink("../outside.txt", os.path.join(source, "esc"))
+        os.symlink("sub/../a.txt", os.path.join(source, "internal"))
+
+        result, _ = run_client(source, dest, flags=["-l", "--safe-links"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"--safe-links failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.readlink(os.path.join(received, "safe_rel")) == "a.txt"
+        assert os.readlink(os.path.join(received, "sub", "up")) == "../a.txt"
+        for unsafe in ("abs", "esc", "internal"):
+            assert not os.path.lexists(os.path.join(received, unsafe)), (
+                f"{unsafe} must be skipped by --safe-links"
+            )
+
+    @pytest.mark.ci
+    def test_safe_links_protects_dest_from_delete(self):
+        # rsync counts an unsafe link ignored by --safe-links as present in the
+        # transfer, so its destination mirror survives --delete.  FastSync must
+        # not delete it (no silent data loss).  Own server: deletion needs
+        # --allow-delete, which the shared session server does not grant.
+        source = os.path.join(TEST_DATA_DIR, "symlink_safe_delete")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_safe_delete_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "keep.txt"), "wb") as f:
+            f.write(b"keep\n")
+        os.symlink("/etc/passwd", os.path.join(source, "unsafe_abs"))
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            received = get_dest_received_dir(dest, source)
+            os.makedirs(received, exist_ok=True)
+            mirror = os.path.join(received, "unsafe_abs")
+            with open(mirror, "wb") as f:
+                f.write(b"existing destination data\n")
+            extra = os.path.join(received, "extra.txt")
+            with open(extra, "wb") as f:
+                f.write(b"extra\n")
+
+            result, _ = run_client(source, dest, flags=["-l", "--safe-links", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, (
+                f"--delete --safe-links failed: {(result.stderr or result.stdout)[:300]}"
+            )
+            assert os.path.exists(mirror), (
+                "a destination mirror of a --safe-links-skipped link must survive --delete"
+            )
+            assert not os.path.exists(extra), "a genuine extra must still be deleted"
+
+    @pytest.mark.ci
+    def test_copy_unsafe_links_derefs_only_unsafe(self, shared_server):
+        # --copy-unsafe-links keeps safe symlinks and dereferences unsafe ones
+        # (absolute or escaping) into regular files.
+        source = os.path.join(TEST_DATA_DIR, "symlink_copy_unsafe")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_copy_unsafe_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        with open(os.path.join(source, "refer.txt"), "wb") as f:
+            f.write(b"refer\n")
+        external = os.path.join(TEST_DATA_DIR, "symlink_copy_unsafe_external.txt")
+        with open(external, "wb") as f:
+            f.write(b"external\n")
+        os.symlink("a.txt", os.path.join(source, "safe_rel"))
+        os.symlink("refer.txt", os.path.join(source, "from_rel"))
+        os.symlink("../symlink_copy_unsafe_external.txt", os.path.join(source, "esc"))
+        os.symlink("/etc/hostname", os.path.join(source, "abs"))
+
+        result, _ = run_client(source, dest, flags=["-l", "--copy-unsafe-links"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-unsafe-links failed: {(result.stderr or result.stdout)[:300]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        assert os.path.islink(os.path.join(received, "safe_rel"))
+        assert os.readlink(os.path.join(received, "safe_rel")) == "a.txt"
+        assert os.path.islink(os.path.join(received, "from_rel")), (
+            "a safe symlink must be preserved, not dereferenced"
+        )
+        assert os.readlink(os.path.join(received, "from_rel")) == "refer.txt"
+        # An escaping (..) symlink and an absolute symlink are both dereferenced
+        # into regular files holding the referent's content.
+        assert not os.path.islink(os.path.join(received, "esc"))
+        with open(os.path.join(received, "esc"), "rb") as f:
+            assert f.read() == b"external\n"
+        assert not os.path.islink(os.path.join(received, "abs"))
+        assert os.path.isfile(os.path.join(received, "abs"))
+
+    def test_munge_prefix_roundtrip(self, shared_server):
+        # A source target that already begins with /rsyncd-munged/ round-trips:
+        # plain -l stores it verbatim, and --munge-links strips on the sender
+        # then re-munges on the receiver, yielding the same stored value.
+        source = os.path.join(TEST_DATA_DIR, "symlink_munge_roundtrip")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_munge_roundtrip_dst")
         clean_dir(source)
         clean_dir(dest)
         with open(os.path.join(source, "realfile.txt"), "wb") as f:
             f.write(b"real\n")
-        os.symlink("#SYMLINK/realfile.txt", os.path.join(source, "prefixed"))
+        os.symlink("/rsyncd-munged/realfile.txt", os.path.join(source, "prefixed"))
+        os.symlink("#SYMLINK/realfile.txt", os.path.join(source, "oldmarker"))
 
-        result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
-        assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
-
-        received = get_dest_received_dir(dest, source)
-        prefixed = os.path.join(received, "prefixed")
-        assert os.path.islink(prefixed)
-        assert os.readlink(prefixed) == "#SYMLINK/realfile.txt"
+        for flags, oldmarker_target in (
+            (["-l"], "#SYMLINK/realfile.txt"),
+            (["-l", "--munge-links"], "/rsyncd-munged/#SYMLINK/realfile.txt"),
+        ):
+            clean_dir(dest)
+            result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+            assert result.returncode == 0, (
+                f"{' '.join(flags)} failed: {(result.stderr or result.stdout)[:300]}"
+            )
+            received = get_dest_received_dir(dest, source)
+            assert os.readlink(os.path.join(received, "prefixed")) == "/rsyncd-munged/realfile.txt"
+            assert os.readlink(os.path.join(received, "oldmarker")) == oldmarker_target
 def _xattr_supported(path):
     """True when the filesystem hosting `path` supports user xattrs."""
     try:

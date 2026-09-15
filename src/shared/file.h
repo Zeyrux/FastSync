@@ -44,12 +44,20 @@ int file_open_for_read(const char* path);
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
                         bool inplace, bool sparse);
 
-/* Symlink trust-boundary helpers (Phase 4, symlink wave).  --munge-links
- * sender-side marker: every transmitted symlink target is prefixed with this
- * while the flag is on; the receiver strips it to restore the real target. */
-#define SYMLINK_MUNGE_PREFIX "#SYMLINK/"
+/* Symlink trust-boundary helpers (Phase 4, symlink wave; rsync parity).
+ * --munge-links is a RECEIVER-side rewrite: rsync prefixes every stored symlink
+ * target with this marker, making the link unusable while the referenced
+ * directory does not exist.  A SENDER receiving a munged source strips it back
+ * off before transmitting (so a munged tree round-trips through the receiver's
+ * re-munging). */
+#define SYMLINK_MUNGE_PREFIX "/rsyncd-munged/"
 
 char* file_symlink_munge(const char* target);
+/* rsync 3.4.1 unsafe_symlink(): true when `target` escapes the transfer tree
+ * rooted at `link_path` (the symlink's transfer-relative path incl. its name).
+ * Absolute/empty targets and targets climbing above the transfer root (via
+ * "..") are unsafe, as are internal "/../" components and trailing "/..". */
+bool file_symlink_unsafe(const char* target, const char* link_path);
 /* True when a lexical target is relative and contains no ".." component, so it
  * can never escape the receive root once created beneath it. */
 bool file_symlink_target_contained(const char* target);
@@ -57,8 +65,9 @@ bool file_symlink_target_contained(const char* target);
  * returns true when a marker was removed. */
 bool file_symlink_unmunge(char* target);
 /* Create a symlink at `path` -> `target`, confined below the authorized root
- * (O_NOFOLLOW parent walk, symlinkat; the target is never followed).  Returns
- * false when a directory already occupies `path`. */
+ * (O_NOFOLLOW parent walk, symlinkat; the target is never followed).  The link
+ * value is copied verbatim (rsync -l); only the placement path is confined.
+ * Returns false when a directory already occupies `path`. */
 bool file_symlink_at_secure(const char* path, const char* target);
 /* --keep-dirlinks (-K) receiver process-wide policy: allow an in-root existing
  * symlink-to-directory to be followed as a directory. */
