@@ -59,6 +59,10 @@ def _seed_source():
     if os.path.exists(SOURCE_DIR):
         shutil.rmtree(SOURCE_DIR)
     os.makedirs(os.path.join(SOURCE_DIR, "nested"))
+    # The receiver rejects a destination root that does not exist, and the
+    # capture fixture can run before any test that creates it, so create it
+    # here (test order/distribution must not matter).
+    os.makedirs(DEST_DIR, exist_ok=True)
     with open(os.path.join(SOURCE_DIR, "hello.txt"), "wb") as fh:
         fh.write(b"fault injection payload\n" * 64)
     with open(os.path.join(SOURCE_DIR, "nested", "deep.bin"), "wb") as fh:
