@@ -3099,10 +3099,35 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
         free(leaf);
         leaf = NULL;
         if (config->use_delete || config->force_delete) {
-          if (!file_remove_tree_secure(full))
+          /* Remove the contents entry-by-entry through the budgeted extras
+             walker so every deleted file/dir counts toward --max-delete (rsync
+             parity); the now-empty directory itself costs one more.  A run that
+             hits the cap leaves the remaining entries in place. */
+          ArrayList* no_keeps = array_list_create(free);
+          size_t remaining = budget->max_delete - budget->deleted;
+          size_t contents_deleted = 0;
+          size_t contents_skipped = 0;
+          DeleteWalkResult walk =
+              no_keeps ? delete_extras_limited(full, no_keeps, NULL, remaining, NULL, 0,
+                                               &contents_deleted, &contents_skipped)
+                       : DELETE_WALK_ERROR;
+          if (no_keeps)
+            array_list_delete(no_keeps);
+          budget->deleted += contents_deleted;
+          budget->skipped += contents_skipped;
+          if (walk == DELETE_WALK_LIMIT_REACHED) {
+            budget->limit_hit = true;
+          } else if (walk != DELETE_WALK_OK) {
             ok = false;
-          else
+          } else if (budget->deleted >= budget->max_delete) {
+            budget->limit_hit = true;
+            budget->skipped++;
+          } else if (file_remove_tree_secure(full)) {
+            budget->deleted++;
             removed = true;
+          } else {
+            ok = false;
+          }
         } else {
           char* escaped = output_escape(rel, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING,

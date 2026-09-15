@@ -2854,6 +2854,36 @@ class TestMissingArgs:
             assert os.path.isfile(os.path.join(received, "a.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_missing_nonempty_dir_counts_each_entry_against_budget(self, mt):
+        """A non-empty missing-arg directory with --force/--delete is removed
+        entry-by-entry, each counting toward --max-delete (rsync parity): with a
+        small cap the run stops after N files and leaves the rest in place."""
+        source = self._make_source("mg_dirbudget_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_dirbudget_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            gone = os.path.join(received, "gone")
+            os.makedirs(gone)
+            for i in range(4):
+                with open(os.path.join(gone, f"f{i}"), "w") as fh:
+                    fh.write("stale")
+            lst = _write_rel_list(b"a.txt\ngone\n")
+            flags = ["--files-from", lst, "--delete-missing-args", "--force",
+                     "--max-delete=2"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, \
+                f"non-empty missing-arg dir should cap at 2 and exit 25: {result.stderr[:300]}"
+            assert os.path.isdir(gone), \
+                "the non-empty missing-arg directory should survive a capped run"
+            remaining = len(os.listdir(gone))
+            assert remaining == 2, f"expected 2 entries left, found {remaining}"
+            assert os.path.isfile(os.path.join(received, "a.txt"))
+
+    @pytest.mark.parametrize("mt", [False, True])
     def test_delete_missing_args_not_blocked_by_exclude_protection(self, mt):
         """A missing-arg mirror that sits under a filter-excluded directory is an
         explicit user request, so --delete-missing-args removes it even though an
