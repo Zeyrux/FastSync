@@ -156,6 +156,9 @@ static void test_tcp_set_timeouts() {
   tcp_set_timeouts(-1, -1);
   EXPECT_EQ_INT(tcp_get_timeout_sec(), 0);
   EXPECT_EQ_INT(tcp_get_contimeout_sec(), 0);
+  /* Restore finite defaults so later tests that rely on a bounded connect/IO
+   * timeout (e.g. connecting to a non-routable address) cannot block forever. */
+  tcp_set_timeouts(30, 10);
 }
 
 /* Test client_connect with an invalid host (should fail gracefully) */

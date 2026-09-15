@@ -2693,7 +2693,7 @@ static void golden_config_populate(Config* c) {
  * one report_dest_info bool, and other wire changes landing in this version);
  * the byte-exact values are recomputed for the merged layout. */
 #define GOLDEN_WIRE_LEN 697
-#define GOLDEN_WIRE_HASH 0ULL
+#define GOLDEN_WIRE_HASH 7835017034643051109ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
