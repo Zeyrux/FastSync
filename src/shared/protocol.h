@@ -155,7 +155,18 @@ enum NET_STATUS {
    * (the receiver reads none in dry-run).  STATUS_OK keeps its meaning in this
    * path ("already up to date / nothing to do").  Appended after
    * STATUS_ERROR_DETAIL so no existing status is renumbered. */
-  STATUS_DRY_RUN_TRANSFER
+  STATUS_DRY_RUN_TRANSFER,
+  /* Destination-state report for output parity (protocol 2.23.0).  When the
+   * wire config carries report_dest_info=true, the receiver answers every
+   * per-file STATUS_CHECK request with STATUS_DEST_INFO FIRST, followed by a
+   * fixed record describing the pre-transfer destination entry
+   * (int32 has_old; uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode;
+   * int32 uid; int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict
+   * follows, so the sender can render rsync-accurate -i/--out-format columns
+   * (new vs modified, and which of size/time/perms/owner/group differ) without
+   * changing the transfer decision itself.  Appended after
+   * STATUS_DRY_RUN_TRANSFER so no existing status is renumbered. */
+  STATUS_DEST_INFO
 };
 
 void io_set_fds(int read_fd, int write_fd);

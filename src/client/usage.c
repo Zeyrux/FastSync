@@ -157,7 +157,8 @@ void print_usage(void) {
   printf("  --chunk-serialization  Enable chunk serialization (long form only)\n");
   printf("  -s, --secluded-args    Protect-args compatibility option (no effect; remote\n");
   printf("                      SSH argv is already built injection-safe)\n");
-  printf("  --sendfile          Enable sendfile zero-copy (TCP only; long form only)\n");
+  printf("  --sendfile          Enable sendfile zero-copy (TCP only; long form only;\n");
+  printf("                      -f is bound to --filter, not --sendfile)\n");
   printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
   printf("  --zc <alg>          Alias for --compress-choice\n");
   printf("  -v, --verbose       Enable debug logging\n");

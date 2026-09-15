@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(FastFileTransfer VERSION 2.22.0)
+project(FastFileTransfer VERSION 2.23.0)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 11)
@@ -96,6 +96,7 @@ set(SHARED_SRCS
 	src/shared/file_send.c
 	src/shared/file_store.c
 	src/shared/filter.c
+	src/shared/format.c
 	src/shared/hardlink.c
 	src/shared/identity.c
 	src/shared/log.c
@@ -213,6 +214,7 @@ set(TEST_SRCS
 	tests/test_file.c
 	tests/test_file_list.c
 	tests/test_file_sendfile.c
+	tests/test_format.c
 	tests/test_fuzz_smoke.c
 	tests/test_glob.c
 	tests/test_hardlink.c

@@ -334,7 +334,8 @@ static void apply_output_buffering(const Config* config) {
 }
 #endif
 
-static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
+static int read_patterns_from_file(const char* filepath, char*** patterns, int* count,
+                                   Config* config, char sign, const char* optname);
 
 static int parse_debug_flags(const char* value, Config* config) {
   if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
@@ -566,6 +567,27 @@ static int config_add_filter(Config* config, const char* rule) {
     return -1;
   }
   return 0;
+}
+
+/* Compile one --exclude/--include pattern into the SAME ordered filter rule
+ * list used by --filter/-f: `--exclude P` becomes the rule "- P" and
+ * `--include P` becomes "+ P", appended in command-line order.  This is what
+ * makes rsync's first-match-wins semantics hold across a mixed sequence such as
+ * `--include='*.txt' --exclude='*'`.  Returns 0 on success, -1 on error. */
+static int config_add_selection_rule(Config* config, char sign, const char* pattern,
+                                     const char* optname) {
+  size_t len = strlen(pattern);
+  char* rule = malloc(len + 3);
+  if (!rule) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
+    return -1;
+  }
+  rule[0] = sign;
+  rule[1] = ' ';
+  memcpy(rule + 2, pattern, len + 1);
+  int rc = config_add_filter(config, rule);
+  free(rule);
+  return rc;
 }
 
 static int parse_skip_compress(Config* config, const char* value) {
@@ -1323,7 +1345,8 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
   }
   if (strncmp(arg, "--exclude=", 10) == 0) {
     if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, arg + 10,
-                           "--exclude") != 0)
+                           "--exclude") != 0 ||
+        config_add_selection_rule(config, '-', arg + 10, "--exclude") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1334,13 +1357,15 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       return true;
     }
     if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, ctx->argv[++ctx->i],
-                           "--exclude") != 0)
+                           "--exclude") != 0 ||
+        config_add_selection_rule(config, '-', ctx->argv[ctx->i], "--exclude") != 0)
       ctx->exit_code = -1;
     return true;
   }
   if (strncmp(arg, "--include=", 10) == 0) {
     if (config_add_pattern(&config->include_patterns, &config->include_count, arg + 10,
-                           "--include") != 0)
+                           "--include") != 0 ||
+        config_add_selection_rule(config, '+', arg + 10, "--include") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1351,7 +1376,8 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       return true;
     }
     if (config_add_pattern(&config->include_patterns, &config->include_count, ctx->argv[++ctx->i],
-                           "--include") != 0)
+                           "--include") != 0 ||
+        config_add_selection_rule(config, '+', ctx->argv[ctx->i], "--include") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1634,7 +1660,8 @@ static bool cli_handle_filter_options(CliParseCtx* ctx) {
   Config* config = ctx->config;
   const char* arg = ctx->argv[ctx->i];
   if (strncmp(arg, "--exclude-from=", 15) == 0) {
-    if (read_patterns_from_file(arg + 15, &config->exclude_patterns, &config->exclude_count) != 0)
+    if (read_patterns_from_file(arg + 15, &config->exclude_patterns, &config->exclude_count, config,
+                                '-', "--exclude-from") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1645,12 +1672,13 @@ static bool cli_handle_filter_options(CliParseCtx* ctx) {
       return true;
     }
     if (read_patterns_from_file(ctx->argv[++ctx->i], &config->exclude_patterns,
-                                &config->exclude_count) != 0)
+                                &config->exclude_count, config, '-', "--exclude-from") != 0)
       ctx->exit_code = -1;
     return true;
   }
   if (strncmp(arg, "--include-from=", 15) == 0) {
-    if (read_patterns_from_file(arg + 15, &config->include_patterns, &config->include_count) != 0)
+    if (read_patterns_from_file(arg + 15, &config->include_patterns, &config->include_count, config,
+                                '+', "--include-from") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1661,7 +1689,7 @@ static bool cli_handle_filter_options(CliParseCtx* ctx) {
       return true;
     }
     if (read_patterns_from_file(ctx->argv[++ctx->i], &config->include_patterns,
-                                &config->include_count) != 0)
+                                &config->include_count, config, '+', "--include-from") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -2088,6 +2116,10 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * --no-xattrs/--no-acls negation) so the sender's wire gate always matches
    * the flags the receiver will recompute from the received config. */
   config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
+  /* Output parity: -i/--itemize-changes and --out-format need the pre-transfer
+   * destination snapshot (new vs modified and which attributes differ), so ask
+   * the receiver to report it on every per-file check.  This is a wire field. */
+  config->report_dest_info = config->itemize_changes || config->out_format != NULL;
   return 0;
 }
 
@@ -2284,7 +2316,8 @@ done:
   return result;
 }
 
-static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
+static int read_patterns_from_file(const char* filepath, char*** patterns, int* count,
+                                   Config* config, char sign, const char* optname) {
   FILE* fp = fopen(filepath, "r");
   if (!fp) {
     char* escaped = output_escape(filepath, false);
@@ -2326,7 +2359,8 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
       p[--len] = '\0';
     if (len == 0)
       continue;
-    if (config_add_pattern(patterns, count, p, "pattern file") != 0) {
+    if (config_add_pattern(patterns, count, p, "pattern file") != 0 ||
+        config_add_selection_rule(config, sign, p, optname) != 0) {
       free(line);
       fclose(fp);
       return -1;

@@ -479,6 +479,8 @@ static const char* status_to_string(Status status) {
     return "ERROR_DETAIL";
   case STATUS_DRY_RUN_TRANSFER:
     return "DRY_RUN_TRANSFER";
+  case STATUS_DEST_INFO:
+    return "DEST_INFO";
   default:
     return "UNKNOWN";
   }

@@ -2665,14 +2665,13 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.22.0).  The values below are the only
+/* The pinned golden frame (protocol 2.23.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.22.0
- * preserve-attribute split appends four serialized bools
- * (preserve_perms/times/owner/group) to CONFIG_WIRE_METADATA_TIMES_FIELDS after
- * omit_link_times. */
-#define GOLDEN_WIRE_LEN 653
-#define GOLDEN_WIRE_HASH 95530566005420798ULL
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.23.0
+ * output-parity wave appends one serialized bool (report_dest_info) to the end
+ * of the frame, after the --copy-as block. */
+#define GOLDEN_WIRE_LEN 657
+#define GOLDEN_WIRE_HASH 4633069702262438591ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2754,7 +2753,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.22.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.23.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())

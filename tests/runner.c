@@ -15,6 +15,7 @@
 #include "test_file.h"
 #include "test_file_list.h"
 #include "test_file_sendfile.h"
+#include "test_format.h"
 #include "test_fuzz_smoke.h"
 #include "test_glob.h"
 #include "test_hardlink.h"
@@ -58,6 +59,7 @@ int main() {
   RUN_TEST(test_chunk);
   RUN_TEST(test_batch);
   RUN_TEST(test_change_list);
+  RUN_TEST(test_format);
   RUN_TEST(test_config);
   RUN_TEST(test_credentials);
   RUN_TEST(test_compression);
