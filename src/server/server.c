@@ -1051,7 +1051,7 @@ static void print_server_usage(void) {
   printf("  --early-input=FILE  Second credential store layered over\n");
   printf("                      --password-file (same format); usually a secrets-\n");
   printf("                      manager/process-substitution file.  Requires --daemon\n");
-  printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
+  printf("  -p, --port <port>   TCP port (default: 8080, range: 1-65535)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");

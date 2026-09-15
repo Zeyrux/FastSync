@@ -647,17 +647,20 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
     {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
     {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},
-    {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
+    {"--backup", "-b", OPT_FLAG, offsetof(Config, backup)},
     {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
     {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
     {"--secluded-args", "-s", OPT_NOOP, 0},
+    /* rsync -r/--recursive: FastSync is always recursive, so this is a
+     * faithful no-op (accepted silently, never consumes an argument). */
+    {"--recursive", "-r", OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
     {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
     {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
     {"--blocking-io", NULL, OPT_FLAG, offsetof(Config, blocking_io)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
-    {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
+    {"--copy-links", "-L", OPT_FLAG, offsetof(Config, copy_links)},
     {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
     {"--copy-unsafe-links", NULL, OPT_FLAG, offsetof(Config, copy_unsafe_links)},
     {"--copy-dirlinks", "-k", OPT_FLAG, offsetof(Config, copy_dirlinks)},
@@ -1108,7 +1111,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
   if (!entry)
     return false;
   const char* value = NULL;
-  if (entry->kind != OPT_FLAG) {
+  if (entry->kind != OPT_FLAG && entry->kind != OPT_NOOP) {
     value = inline_value;
     if (!value && ctx->i + 1 < ctx->argc)
       value = ctx->argv[++ctx->i];
@@ -1266,6 +1269,26 @@ static bool cli_handle_meta_flags(CliParseCtx* ctx) {
   return false;
 }
 
+/* Apply a --delta-max value.  Values below the minimum warn and keep the
+ * default; values above the maximum are a hard error.  Returns 0 on success,
+ * -1 on error. */
+static int set_delta_max_option(Config* config, const char* value) {
+  unsigned long long val;
+  if (parse_ull_arg(value, &val, "--delta-max") != 0)
+    return -1;
+  if (val >= DELTA_MIN_FILE_SIZE && val <= DELTA_MAX_FILE_SIZE) {
+    config->delta_max_file_size = val;
+    return 0;
+  }
+  if (val < DELTA_MIN_FILE_SIZE) {
+    log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
+    return 0;
+  }
+  log_message(LOG_LEVEL_ERROR, "--delta-max must not exceed %llu bytes",
+              (unsigned long long)DELTA_MAX_FILE_SIZE);
+  return -1;
+}
+
 /* SSH port and pattern/block-size options.  Returns true when the argument was
  * consumed. */
 static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
@@ -1298,6 +1321,12 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
     }
     return true;
   }
+  if (strncmp(arg, "--exclude=", 10) == 0) {
+    if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, arg + 10,
+                           "--exclude") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--exclude", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
@@ -1306,6 +1335,12 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
     }
     if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, ctx->argv[++ctx->i],
                            "--exclude") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
+  if (strncmp(arg, "--include=", 10) == 0) {
+    if (config_add_pattern(&config->include_patterns, &config->include_count, arg + 10,
+                           "--include") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1330,7 +1365,8 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
-  if (opt_is(arg, "--delta-block", "--block-size")) {
+  if (strcmp(arg, "--delta-block") == 0 || strcmp(arg, "--block-size") == 0 ||
+      strcmp(arg, "-B") == 0) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
@@ -1340,26 +1376,19 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
+  if (strncmp(arg, "--delta-max=", 12) == 0) {
+    if (set_delta_max_option(config, arg + 12) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--delta-max", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
       return true;
     }
-    unsigned long long val;
-    if (parse_ull_arg(ctx->argv[++ctx->i], &val, "--delta-max") != 0) {
+    if (set_delta_max_option(config, ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (val >= DELTA_MIN_FILE_SIZE && val <= DELTA_MAX_FILE_SIZE) {
-      config->delta_max_file_size = val;
-    } else if (val < DELTA_MIN_FILE_SIZE) {
-      log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
-    } else {
-      log_message(LOG_LEVEL_ERROR, "--delta-max must not exceed %llu bytes",
-                  (unsigned long long)DELTA_MAX_FILE_SIZE);
-      ctx->exit_code = -1;
-    }
     return true;
   }
   return false;
@@ -1451,6 +1480,73 @@ static int set_server_port_option(Config* config, const char* value, const char*
   return 0;
 }
 
+/* Open (create/append) a --log-file target and install it in the logger.
+ * Refuses a symlinked target and never leaks the descriptor across exec: an
+ * attacker who can plant a symlink in the working directory must not be able to
+ * redirect (or truncate) an arbitrary file.  The log is created with owner-only
+ * permissions.  Returns 0 on success, -1 on error (already logged). */
+static int set_log_file_option(Config* config, const char* log_path) {
+  if (config->log_file) {
+    /* Detach the logger before closing: log I/O may be in flight and must
+       never touch a freed FILE*. */
+    log_set_file(NULL);
+    fclose(config->log_file);
+    config->log_file = NULL;
+  }
+  int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+  FILE* lf = log_fd >= 0 ? fdopen(log_fd, "a") : NULL;
+  if (!lf) {
+    int open_errno = errno;
+    if (log_fd >= 0)
+      close(log_fd);
+    char* escaped = output_escape(log_path, false);
+    log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(open_errno));
+    free(escaped);
+    return -1;
+  }
+  config->log_file = lf;
+  log_set_file(lf);
+  return 0;
+}
+
+/* Apply a --bwlimit value (kilobytes per second).  Returns 0 on success, -1 on
+ * error. */
+static int set_bwlimit_option(const char* value) {
+  unsigned long long kbps;
+  if (parse_ull_arg(value, &kbps, "--bwlimit") != 0)
+    return -1;
+  if (kbps == 0) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
+    return -1;
+  }
+  if (kbps > ULLONG_MAX / 1024) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
+    return -1;
+  }
+  io_set_bwlimit(kbps * 1024);
+  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
+  return 0;
+}
+
+/* Apply a --chunk-size value.  Returns 0 on success, -1 on error. */
+static int set_chunk_size_option(Config* config, const char* value) {
+  unsigned long long val;
+  if (parse_ull_arg(value, &val, "--chunk-size") != 0)
+    return -1;
+  if (val == 0) {
+    log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
+    return -1;
+  }
+  if (val > MAX_CHUNK_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "--chunk-size must be between 1 and %llu",
+                (unsigned long long)MAX_CHUNK_SIZE);
+    return -1;
+  }
+  config->chunk_size = val;
+  return 0;
+}
+
 /* Network/IO options: --server-port/--port, --bwlimit, --chunk-size, --log-file
  * and --stderr.  Returns true when the argument was consumed. */
 static bool cli_handle_io_options(CliParseCtx* ctx) {
@@ -1475,29 +1571,24 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
+  if (strncmp(arg, "--bwlimit=", 10) == 0) {
+    if (set_bwlimit_option(arg + 10) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--bwlimit", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
       return true;
     }
-    unsigned long long kbps;
-    if (parse_ull_arg(ctx->argv[++ctx->i], &kbps, "--bwlimit") != 0) {
+    if (set_bwlimit_option(ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (kbps == 0) {
-      log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
+    return true;
+  }
+  if (strncmp(arg, "--chunk-size=", 13) == 0) {
+    if (set_chunk_size_option(config, arg + 13) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (kbps > ULLONG_MAX / 1024) {
-      log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
-      ctx->exit_code = -1;
-      return true;
-    }
-    io_set_bwlimit(kbps * 1024);
-    log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
     return true;
   }
   if (opt_is(arg, "--chunk-size", NULL)) {
@@ -1506,23 +1597,13 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    unsigned long long val;
-    if (parse_ull_arg(ctx->argv[++ctx->i], &val, "--chunk-size") != 0) {
+    if (set_chunk_size_option(config, ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (val == 0) {
-      log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
+    return true;
+  }
+  if (strncmp(arg, "--log-file=", 11) == 0) {
+    if (set_log_file_option(config, arg + 11) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (val > MAX_CHUNK_SIZE) {
-      log_message(LOG_LEVEL_ERROR, "--chunk-size must be between 1 and %llu",
-                  (unsigned long long)MAX_CHUNK_SIZE);
-      ctx->exit_code = -1;
-      return true;
-    }
-    config->chunk_size = val;
     return true;
   }
   if (opt_is(arg, "--log-file", NULL)) {
@@ -1531,33 +1612,8 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    if (config->log_file) {
-      /* Detach the logger before closing: log I/O may be in flight and must
-         never touch a freed FILE*. */
-      log_set_file(NULL);
-      fclose(config->log_file);
-      config->log_file = NULL;
-    }
-    const char* log_path = ctx->argv[++ctx->i];
-    /* Refuse a symlinked target and never leak the descriptor across exec: an
-     * attacker who can plant a symlink in the working directory must not be
-     * able to redirect (or truncate) an arbitrary file via --log-file.  The log
-     * is created with owner-only permissions. */
-    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
-    FILE* lf = log_fd >= 0 ? fdopen(log_fd, "a") : NULL;
-    if (!lf) {
-      int open_errno = errno;
-      if (log_fd >= 0)
-        close(log_fd);
-      char* escaped = output_escape(log_path, false);
-      log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
-                  escaped ? escaped : "<allocation failed>", strerror(open_errno));
-      free(escaped);
+    if (set_log_file_option(config, ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    config->log_file = lf;
-    log_set_file(lf);
     return true;
   }
   if (strncmp(arg, "--stderr=", 9) == 0) {
@@ -1577,6 +1633,11 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
 static bool cli_handle_filter_options(CliParseCtx* ctx) {
   Config* config = ctx->config;
   const char* arg = ctx->argv[ctx->i];
+  if (strncmp(arg, "--exclude-from=", 15) == 0) {
+    if (read_patterns_from_file(arg + 15, &config->exclude_patterns, &config->exclude_count) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--exclude-from", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
@@ -1585,6 +1646,11 @@ static bool cli_handle_filter_options(CliParseCtx* ctx) {
     }
     if (read_patterns_from_file(ctx->argv[++ctx->i], &config->exclude_patterns,
                                 &config->exclude_count) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
+  if (strncmp(arg, "--include-from=", 15) == 0) {
+    if (read_patterns_from_file(arg + 15, &config->include_patterns, &config->include_count) != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -2025,18 +2091,149 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   return 0;
 }
 
+/* True for the rsync short options that take a value: the remainder of the
+ * cluster is the value (attached form), or the next argv entry when the option
+ * is written alone. */
+static bool short_takes_value(char c) {
+  return c == 'e' || c == 'B' || c == 'M' || c == 'f' || c == 'T' || c == '@';
+}
+
+/* True when the long option consumes the following argv entry as its value
+ * (i.e. a value-taking option written without an inline "=").  The cluster
+ * expander consults this so a value that happens to start with '-' (e.g.
+ * --filter "- *.tmp") is copied verbatim instead of being mistaken for a
+ * short-option cluster. */
+static bool cli_long_takes_separate_value(const char* arg) {
+  if (strchr(arg, '='))
+    return false;
+  const OptionEntry* entry = find_table_option(arg);
+  if (entry)
+    return entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
+           entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL;
+  static const char* const extra[] = {
+      "--ssh-port",        "--exclude",      "--include",       "--exclude-from",
+      "--include-from",    "--files-from",   "--filter",        "--delta-block",
+      "--block-size",      "--delta-max",    "--server-port",   "--port",
+      "--bwlimit",         "--chunk-size",   "--log-file",      "--stderr",
+      "--stop-after",      "--stop-at",      "--max-alloc",     "--compress-threads",
+      "--checksum-choice", "--cc",           "--checksum-seed", "--sockopts",
+      "--remote-option",   "--compare-dest", "--copy-dest",     "--link-dest",
+      "--usermap",         "--groupmap",     "--chown",         "--copy-as",
+      "--outbuf",          "--debug",        "--info",
+  };
+  for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++)
+    if (strcmp(arg, extra[i]) == 0)
+      return true;
+  return false;
+}
+
+/* Expand rsync-style short-option clusters into one option per token before
+ * parsing: -av -> -a -v, -rlpt -> -r -l -p -t, -B1048576 -> -B 1048576 and
+ * -essh -> -e ssh.  A value-taking short consumes the remainder of its token
+ * (an optional leading '=' is dropped) as its value; otherwise a value-taking
+ * option written alone takes the next argv entry, which is therefore copied
+ * verbatim.  Every expanded token is a copy; *out_orig maps each expanded
+ * token back to its source argv index so the positional-argument indices
+ * returned to main() stay valid for the caller's original argv.  Returns 0 on
+ * success, -1 on allocation failure. */
+static int expand_short_clusters(int argc, char* argv[], char*** out_argv, int** out_orig,
+                                 int* out_argc) {
+  size_t cap = 1;
+  for (int i = 0; i < argc; i++)
+    cap += strlen(argv[i]) + 2;
+  char** exp = calloc(cap, sizeof(char*));
+  int* orig = calloc(cap, sizeof(int));
+  if (!exp || !orig) {
+    free(exp);
+    free(orig);
+    return -1;
+  }
+  int n = 0;
+  bool expect_value = false;
+  for (int i = 0; i < argc; i++) {
+    const char* tok = argv[i];
+    if (i == 0 || expect_value || tok[0] != '-' || tok[1] == '\0') {
+      exp[n] = str_dup(tok);
+      if (!exp[n])
+        goto oom;
+      orig[n] = i;
+      n++;
+      expect_value = false;
+      continue;
+    }
+    if (tok[1] == '-') {
+      exp[n] = str_dup(tok);
+      if (!exp[n])
+        goto oom;
+      orig[n] = i;
+      n++;
+      expect_value = cli_long_takes_separate_value(tok);
+      continue;
+    }
+    size_t len = strlen(tok);
+    for (size_t j = 1; j < len; j++) {
+      char flag[3] = {'-', tok[j], '\0'};
+      exp[n] = str_dup(flag);
+      if (!exp[n])
+        goto oom;
+      orig[n] = i;
+      n++;
+      if (short_takes_value(tok[j])) {
+        const char* value = tok + j + 1;
+        if (*value == '=')
+          value++;
+        if (*value != '\0') {
+          exp[n] = str_dup(value);
+          if (!exp[n])
+            goto oom;
+          orig[n] = i;
+          n++;
+        } else {
+          expect_value = true;
+        }
+        break;
+      }
+    }
+  }
+  *out_argv = exp;
+  *out_orig = orig;
+  *out_argc = n;
+  return 0;
+oom:
+  for (int k = 0; k < n; k++)
+    free(exp[k]);
+  free(exp);
+  free(orig);
+  return -1;
+}
+
+static void free_expanded_args(char** exp, int exp_argc) {
+  for (int i = 0; i < exp_argc; i++)
+    free(exp[i]);
+  free(exp);
+}
+
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
 int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   protocol_set_8_bit_output(config->eight_bit_output);
 
-  if (cli_apply_output_controls(config, argc, argv) != 0)
+  char** exp_argv = NULL;
+  int* exp_orig = NULL;
+  int exp_argc = 0;
+  if (expand_short_clusters(argc, argv, &exp_argv, &exp_orig, &exp_argc) != 0) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed parsing arguments");
     return -1;
+  }
+
+  int result = -1;
+  if (cli_apply_output_controls(config, exp_argc, exp_argv) != 0)
+    goto done;
 
   CliParseCtx ctx = {
       .config = config,
-      .argc = argc,
-      .argv = argv,
+      .argc = exp_argc,
+      .argv = exp_argv,
       .i = 1,
       .exit_code = 0,
       .verbose = false,
@@ -2044,7 +2241,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       .no_incremental = false,
   };
 
-  for (ctx.i = 1; ctx.i < argc; ctx.i++) {
+  for (ctx.i = 1; ctx.i < exp_argc; ctx.i++) {
     ctx.exit_code = 0;
     bool handled = cli_handle_pre_negation(&ctx) || cli_handle_range_time_options(&ctx) ||
                    cli_handle_table_option(&ctx) || cli_handle_inline_chmod(&ctx) ||
@@ -2054,30 +2251,37 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                    cli_handle_checksum_options(&ctx) || cli_handle_remote_basis_options(&ctx) ||
                    cli_handle_outbuf_option(&ctx);
     if (handled) {
-      if (ctx.exit_code != 0)
-        return ctx.exit_code;
+      if (ctx.exit_code != 0) {
+        result = ctx.exit_code;
+        goto done;
+      }
       continue;
     }
 
-    if (argv[ctx.i][0] == '-') {
-      char* escaped = output_escape(argv[ctx.i], false);
-      fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
+    if (ctx.argv[ctx.i][0] == '-') {
+      char* escaped = output_escape(ctx.argv[ctx.i], false);
+      fprintf(stderr, "Unknown option: %s (FastSync does not support this option)\n",
+              escaped ? escaped : "<allocation failed>");
       free(escaped);
       print_usage();
-      return -1;
+      goto done;
     }
     if (*positional_count < 2)
-      positional_args[(*positional_count)++] = ctx.i;
+      positional_args[(*positional_count)++] = exp_orig[ctx.i];
     else {
-      char* escaped = output_escape(argv[ctx.i], false);
+      char* escaped = output_escape(ctx.argv[ctx.i], false);
       fprintf(stderr, "Unexpected argument: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);
       print_usage();
-      return -1;
+      goto done;
     }
   }
 
-  return cli_finalize_config(config, ctx.verbose, ctx.no_delta, ctx.no_incremental);
+  result = cli_finalize_config(config, ctx.verbose, ctx.no_delta, ctx.no_incremental);
+done:
+  free_expanded_args(exp_argv, exp_argc);
+  free(exp_orig);
+  return result;
 }
 
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {

@@ -23,6 +23,7 @@ void print_usage(void) {
   printf("  -a, --archive       rsync archive mode (-rlptgoD): links, perms, times,\n");
   printf("                      owner, group, devices and specials; not\n");
   printf("                      compression/multithreading\n");
+  printf("  -r, --recursive     Recurse into directories (FastSync is always recursive)\n");
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  --remove-source-files  Remove regular source files after successful transfer\n");
   printf("  -p, --perms         Preserve permission bits\n");
@@ -104,10 +105,10 @@ void print_usage(void) {
   printf("                    parent directory is not itself listed\n");
   printf("  --mkpath          Create the destination root directory on the server when it\n");
   printf("                    does not exist yet\n");
-  printf("  --exclude <pattern> Exclude files matching pattern\n");
-  printf("  --include <pattern> Only include files matching pattern\n");
-  printf("  --exclude-from <file> Read exclude patterns from file\n");
-  printf("  --include-from <file> Read include patterns from file\n");
+  printf("  --exclude <pattern>, --exclude=<pattern>  Exclude files matching pattern\n");
+  printf("  --include <pattern>, --include=<pattern>  Only include files matching pattern\n");
+  printf("  --exclude-from <file>, --exclude-from=<file>  Read exclude patterns from file\n");
+  printf("  --include-from <file>, --include-from=<file>  Read include patterns from file\n");
   printf("  --files-from <file> Read the source file list from FILE (paths relative to the "
          "source root)\n");
   printf("  -0, --from0       Entries in --files-from are NUL-delimited\n");
@@ -145,7 +146,7 @@ void print_usage(void) {
   printf("                    --incremental and --delta; inert with --whole-file,\n");
   printf("                    --no-delta, or --no-incremental)\n");
   printf("  --no-fuzzy          Disable --fuzzy\n");
-  printf("  --delta-block <n>, --block-size <n>\n");
+  printf("  -B <n>, --block-size <n>, --delta-block <n>\n");
   printf("                    Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
          DELTA_MAX_FILE_SIZE);
@@ -246,7 +247,7 @@ void print_usage(void) {
   printf("  -6, --ipv6          Force IPv6 for destination resolution\n");
   printf("  --sockopts=OPTS     Comma-separated OPT=VAL socket options applied before connect:\n");
   printf("                      TCP_NODELAY, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF, SO_REUSEADDR\n");
-  printf("  --backup            Backup existing files before overwriting\n");
+  printf("  -b, --backup        Backup existing files before overwriting\n");
   printf("  --backup-dir <dir>  Directory for backups (requires --backup)\n");
   printf("  --suffix <str>      Backup suffix (default: ~)\n");
   printf("  --stats             Print transfer statistics at end\n");
@@ -257,7 +258,7 @@ void print_usage(void) {
   printf("  -h, --human-readable  Print byte sizes in human-readable form\n");
   printf("  --max-depth <n>     Maximum directory depth (0=unlimited)\n");
   printf("  -x, --one-file-system  Do not cross filesystem boundaries\n");
-  printf("  --log-file <path>   Write log messages to file\n");
+  printf("  --log-file <path>, --log-file=<path>  Write log messages to file\n");
   printf("  --stderr=MODE       Route logging to stderr: errors or all\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --partial-dir <dir> Directory for partial files\n");
@@ -275,7 +276,7 @@ void print_usage(void) {
   printf("                      incoming file list (fewer checks, faster, potentially unsafe).\n");
   printf("                      Local receiver policy: never sent to the peer, off by default\n");
   printf("  -l, --links         Copy symlinks as symlinks\n");
-  printf("  --copy-links        Transform symlinks into referent files\n");
+  printf("  -L, --copy-links    Transform symlinks into referent files\n");
   printf("  --safe-links        Skip symlinks that point outside transfer tree\n");
   printf("  --copy-unsafe-links  Only transform unsafe symlinks into referent files\n");
   printf("  -k, --copy-dirlinks Transform symlinks to directories into real dirs\n");

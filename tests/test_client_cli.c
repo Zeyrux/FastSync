@@ -3632,6 +3632,205 @@ static void test_parse_args_acls_implies_perms_xattrs_does_not() {
   config_delete(cfg);
 }
 
+/* rsync short-option clustering: boolean shorts bundle after one dash
+ * (-av == -a -v, -aAX, -rlpt), including the -r recursive no-op. */
+static void test_parse_args_short_clustering() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "-av", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->preserve_owner);
+  EXPECT_TRUE(cfg->preserve_group);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_ax[] = {"fastsync", "-aAX", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_ax, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_rlpt[] = {"fastsync", "-rlpt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_rlpt, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+/* Attached short-option values: a value-taking short consumes the remainder of
+ * its token as the value (-B32768, -essh, -Mfoo, -B=... also tolerated). */
+static void test_parse_args_attached_short_values() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+
+  char* argv_b[] = {"fastsync", "-B32768", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_b, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 32768);
+  config_delete(cfg);
+
+  /* An oversized block size parses (and warns) but keeps the default, exactly
+   * like the long --block-size form. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_big[] = {"fastsync", "-B1048576", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_big, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, (int)DELTA_BLOCK_SIZE_DEFAULT);
+  config_delete(cfg);
+
+  /* A separate value still works for a short written alone. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_sep[] = {"fastsync", "-B", "8192", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_sep, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 8192);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_e[] = {"fastsync", "-essh", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_e, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->rsh_command, "ssh");
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  positional_count = 0;
+  char* argv_m[] = {"fastsync", "-Mfoo=bar", "--source-dir", "/src", "--dest-dir", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 7, argv_m, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->remote_option_count, 1);
+  EXPECT_EQ_STR(cfg->remote_options[0], "foo=bar");
+  config_delete(cfg);
+}
+
+/* Inline --opt=value forms for options that previously only accepted a
+ * separate argument. */
+static void test_parse_args_inline_equals_forms() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--exclude=*.log", "--include=*.txt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->exclude_count, 1);
+  EXPECT_EQ_STR(cfg->exclude_patterns[0], "*.log");
+  EXPECT_EQ_INT(cfg->include_count, 1);
+  EXPECT_EQ_STR(cfg->include_patterns[0], "*.txt");
+  config_delete(cfg);
+
+  const char* list_path = "cli_inline_patterns.txt";
+  write_file_bytes(list_path, "*.o\nbuild/\n", 11);
+  cfg = config_create();
+  positional_count = 0;
+  char arg_excl[64];
+  snprintf(arg_excl, sizeof(arg_excl), "--exclude-from=%s", list_path);
+  char arg_incl[64];
+  snprintf(arg_incl, sizeof(arg_incl), "--include-from=%s", list_path);
+  char* argv2[] = {"fastsync", arg_excl, arg_incl, "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->exclude_count, 2);
+  EXPECT_EQ_STR(cfg->exclude_patterns[0], "*.o");
+  EXPECT_EQ_STR(cfg->exclude_patterns[1], "build/");
+  EXPECT_EQ_INT(cfg->include_count, 2);
+  remove(list_path);
+  config_delete(cfg);
+
+  const char* log_path = "cli_inline_log.txt";
+  cfg = config_create();
+  positional_count = 0;
+  char arg_log[64];
+  snprintf(arg_log, sizeof(arg_log), "--log-file=%s", log_path);
+  char* argv3[] = {"fastsync", arg_log, "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_NOT_NULL(cfg->log_file);
+  config_delete(cfg);
+  remove(log_path);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--chmod=u=rw,go=r", "--out-format=%f %l", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->chmod_spec, "u=rw,go=r");
+  EXPECT_EQ_STR(cfg->out_format, "%f %l");
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv5[] = {"fastsync", "--chunk-size=4096", "--delta-max=1048576", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv5, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->chunk_size == 4096ULL);
+  EXPECT_TRUE(cfg->delta_max_file_size == 1048576ULL);
+  config_delete(cfg);
+}
+
+/* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive) must never
+ * swallow the next argv: `fastsync -s SRC DST` keeps both positionals. */
+static void test_parse_args_noop_does_not_consume_argv() {
+  static const char* const noops[] = {"-s", "--secluded-args", "-r", "--recursive"};
+  for (size_t i = 0; i < sizeof(noops) / sizeof(noops[0]); i++) {
+    Config* cfg = config_create();
+    int positional_args[2];
+    int positional_count = 0;
+    char* argv[] = {"fastsync", (char*)noops[i], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(positional_count, 2);
+    config_delete(cfg);
+  }
+
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "-sv", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+/* -b/--backup and -L/--copy-links short aliases behave like their long forms. */
+static void test_parse_args_backup_copy_links_shorts() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv_b[] = {"fastsync", "-b", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_b, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->backup);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_l[] = {"fastsync", "-L", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_l, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->copy_links);
+  config_delete(cfg);
+}
+
+/* An unknown short option (alone or inside a cluster) is rejected, never
+ * silently ignored. */
+static void test_parse_args_rejects_unsupported_short() {
+  static const char* const bad[] = {"-Q", "-aQ", "-rZ", "-9"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    int positional_args[2];
+    int positional_count = 0;
+    char* argv[] = {"fastsync", (char*)bad[i], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -3801,4 +4000,10 @@ void test_client_cli() {
   test_parse_args_pattern_file_oversized_rejected();
   test_parse_args_unsigned_options_reject_sign();
   test_validate_config_dry_run_rejects_write_batch();
+  test_parse_args_short_clustering();
+  test_parse_args_attached_short_values();
+  test_parse_args_inline_equals_forms();
+  test_parse_args_noop_does_not_consume_argv();
+  test_parse_args_backup_copy_links_shorts();
+  test_parse_args_rejects_unsupported_short();
 }
