@@ -98,18 +98,47 @@ static void test_checksum_algo_name_mapping() {
   EXPECT_EQ_INT(checksum_algo_from_name("XXHASH"), (int)CHECKSUM_ALGO_XXH64);
   EXPECT_EQ_INT(checksum_algo_from_name("md5"), (int)CHECKSUM_ALGO_MD5);
   EXPECT_EQ_INT(checksum_algo_from_name("MD5"), (int)CHECKSUM_ALGO_MD5);
+  EXPECT_EQ_INT(checksum_algo_from_name("xxh3"), (int)CHECKSUM_ALGO_XXH3);
+  EXPECT_EQ_INT(checksum_algo_from_name("XXH3"), (int)CHECKSUM_ALGO_XXH3);
+  EXPECT_EQ_INT(checksum_algo_from_name("xxh128"), (int)CHECKSUM_ALGO_XXH128);
+  EXPECT_EQ_INT(checksum_algo_from_name("XXH128"), (int)CHECKSUM_ALGO_XXH128);
+  /* rsync choices FastSync does not implement are rejected by name. */
+  EXPECT_TRUE(checksum_algo_from_name("md4") < 0);
+  EXPECT_TRUE(checksum_algo_from_name("sha1") < 0);
   EXPECT_TRUE(checksum_algo_from_name("sha256") < 0);
   EXPECT_TRUE(checksum_algo_from_name("crc32") < 0);
   EXPECT_TRUE(checksum_algo_from_name("none") < 0);
-  EXPECT_TRUE(checksum_algo_from_name("xxh3") < 0);
   EXPECT_TRUE(checksum_algo_from_name("") < 0);
   EXPECT_TRUE(checksum_algo_from_name(NULL) < 0);
 
   EXPECT_TRUE(checksum_algo_valid((int)CHECKSUM_ALGO_XXH64));
   EXPECT_TRUE(checksum_algo_valid((int)CHECKSUM_ALGO_MD5));
+  EXPECT_TRUE(checksum_algo_valid((int)CHECKSUM_ALGO_XXH3));
+  EXPECT_TRUE(checksum_algo_valid((int)CHECKSUM_ALGO_XXH128));
   EXPECT_FALSE(checksum_algo_valid(99));
   EXPECT_EQ_STR(checksum_algo_name(CHECKSUM_ALGO_XXH64), "xxh64");
   EXPECT_EQ_STR(checksum_algo_name(CHECKSUM_ALGO_MD5), "md5");
+  EXPECT_EQ_STR(checksum_algo_name(CHECKSUM_ALGO_XXH3), "xxh3");
+  EXPECT_EQ_STR(checksum_algo_name(CHECKSUM_ALGO_XXH128), "xxh128");
+}
+
+/* xxh3 is 8 bytes and seed-aware; xxh128 is 16 bytes and differs from both
+ * xxh64 and md5 for the same input. */
+static void test_checksum_xxh3_xxh128() {
+  EXPECT_EQ_INT((int)checksum_digest_len(CHECKSUM_ALGO_XXH3), 8);
+  EXPECT_EQ_INT((int)checksum_digest_len(CHECKSUM_ALGO_XXH128), 16);
+
+  uint8_t a[CHECKSUM_MAX_DIGEST_LEN], b[CHECKSUM_MAX_DIGEST_LEN];
+  size_t alen = 0, blen = 0;
+  EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH3, 0, "payload", 7, a, sizeof(a), &alen));
+  EXPECT_TRUE(alen == (size_t)8);
+  EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH3, 5, "payload", 7, b, sizeof(b), &blen));
+  EXPECT_TRUE(memcmp(a, b, alen) != 0);
+
+  EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH128, 0, "payload", 7, a, sizeof(a), &alen));
+  EXPECT_TRUE(alen == (size_t)16);
+  EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH128, 0, "payload", 7, b, sizeof(b), &blen));
+  EXPECT_TRUE(memcmp(a, b, blen) == 0);
 }
 
 static void test_checksum_truncated_buffer_rejected() {
@@ -142,6 +171,7 @@ void test_checksum(void) {
   test_checksum_algo_lengths_distinct();
   test_checksum_md5_seed_ignored();
   test_checksum_algo_name_mapping();
+  test_checksum_xxh3_xxh128();
   test_checksum_truncated_buffer_rejected();
   test_checksum_null_empty_digest();
 }

@@ -14,23 +14,54 @@
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
 #define MAX_DECOMPRESSED_SIZE (100ULL * 1024 * 1024) /* 100 MB hard ceiling */
 
-static char* SKIP_COMPRESSION_EXTENSIONS[] = {".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mkv",
-                                              ".zip", ".gz",   ".xz",  ".zst", NULL};
+/* rsync 3.4.1's built-in skip-compress suffix list (the `--skip-compress`
+ * defaults, in the man page's order).  rsync stores it as space-separated
+ * "*.suffix" globs; FastSync matches the plain suffix after the final dot, so
+ * the leading "*." is omitted here.  A user --skip-compress list replaces this
+ * default entirely (matching rsync). */
+#define DEFAULT_SKIP_COMPRESS_SUFFIXES                                                             \
+  "3g2 3gp 7z aac ace apk avi bz2 deb dmg ear f4v flac flv gpg gz iso jar jpeg jpg lrz lz lz4 "    \
+  "lzma "                                                                                          \
+  "lzo m1a m1v m2a m2ts m2v m4a m4b m4p m4r m4v mka mkv mov mp1 mp2 mp3 mp4 mpa mpeg mpg mpv mts " \
+  "odb odf odg odi odm odp ods odt oga ogg ogm ogv ogx opus otg oth otp ots ott oxt png qt rar "   \
+  "rpm "                                                                                           \
+  "rz rzip spx squashfs sxc sxd sxg sxm sxw sz tbz tbz2 tgz tlz ts txz tzo vob war webm webp xz "  \
+  "z "                                                                                             \
+  "zip zst"
+
+/* Case-insensitive match of a bare suffix (no leading dot) against a
+ * space-separated suffix list. */
+static bool suffix_in_list(const char* name, const char* list) {
+  size_t name_len = strlen(name);
+  while (*list) {
+    while (*list == ' ')
+      list++;
+    const char* start = list;
+    while (*list && *list != ' ')
+      list++;
+    size_t len = (size_t)(list - start);
+    if (len == name_len && strncasecmp(name, start, len) == 0)
+      return true;
+  }
+  return false;
+}
 
 bool compression_should_skip_with_suffixes(const char* path, char* const* suffixes, int count) {
   if (!path)
     return false;
   const char* dot = strrchr(path, '.');
-  if (!dot)
+  if (!dot || dot[1] == '\0')
     return false;
-  if (count < 0) {
-    suffixes = SKIP_COMPRESSION_EXTENSIONS;
-    count = 0;
-    while (SKIP_COMPRESSION_EXTENSIONS[count])
-      count++;
-  }
+  const char* name = dot + 1;
+  /* count < 0 (the user gave no --skip-compress) selects rsync's built-in
+   * default list; a non-negative count is the user's explicit list. */
+  if (count < 0)
+    return suffix_in_list(name, DEFAULT_SKIP_COMPRESS_SUFFIXES);
   for (int i = 0; i < count; i++) {
-    if (strcasecmp(dot, suffixes[i]) == 0)
+    const char* suffix = suffixes[i];
+    if (suffix[0] == '.')
+      suffix++;
+    if (strcasecmp(name, suffix) == 0)
       return true;
   }
   return false;

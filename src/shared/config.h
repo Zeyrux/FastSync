@@ -314,12 +314,13 @@ typedef struct Config {
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
-  /* --timeout: per-message I/O deadline in seconds.  0 (the default/unset
-   * sentinel) leaves the transport's built-in 30 s socket timeout and the
-   * protocol's built-in 60 s per-message deadline in place; a positive value
-   * overrides both.  See protocol_session_set_io_timeout. */
+  /* --timeout: per-message I/O deadline in seconds.  0 (rsync's default)
+   * disables the deadline entirely on both the socket layer and the protocol
+   * layer; a positive value sets it.  See protocol_session_set_io_timeout and
+   * tcp_set_timeouts. */
   int timeout;
-  /* --contimeout: connect()/accept timeout, transport layer only. */
+  /* --contimeout: connect()/accept timeout in seconds (rsync's default 60);
+   * 0 disables it.  Transport layer only. */
   int contimeout;
   bool quiet;
   bool stats;

@@ -45,12 +45,12 @@ static void config_set_defaults(Config* config) {
   config->server_port = 8080;
   config->server_port_set = false;
   config->server_host_set = false;
-  /* 0 means "--timeout not given": the transport keeps its own built-in 30 s
-   * socket timeout (tcp_set_timeouts ignores non-positive values) and the
-   * protocol layer keeps its built-in 60 s per-message deadline.  A positive
-   * value overrides BOTH (see protocol_session_set_io_timeout). */
+  /* rsync defaults: --timeout=0 (I/O timeouts disabled) and --contimeout=60.
+   * A value of 0 disables the deadline on both the socket layer
+   * (tcp_set_timeouts) and the protocol layer
+   * (protocol_session_set_io_timeout); a positive value sets it. */
   config->timeout = 0;
-  config->contimeout = 10;
+  config->contimeout = 60;
   config->quiet = false;
   config->stats = false;
   config->max_depth = 0;
@@ -208,7 +208,7 @@ static bool validate_received_config(const Config* config) {
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
          config->max_delete >= -1 && config->skip_compress_count >= 0 &&
-         config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES && config->max_alloc > 0 &&
+         config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
          config->super_mode >= SUPER_MODE_AUTO && config->super_mode <= SUPER_MODE_OFF;
@@ -780,9 +780,11 @@ void config_delete(Config* config) {
  * ------------------------------------------------------------------------- */
 
 /* --max-alloc: raw 64-bit value, clamped server-side and installed as the
- * session allocation ceiling.  A zero value is rejected. */
+ * session allocation ceiling.  Zero means "no alloc limit" (rsync's
+ * --max-alloc=0) and is passed through; a non-zero value is clamped to the
+ * server's own ceiling. */
 static bool config_receive_max_alloc(int fd, unsigned long long* value) {
-  if (!receive_n_data(fd, value, sizeof(*value)) || *value == 0)
+  if (!receive_n_data(fd, value, sizeof(*value)))
     return false;
   if (*value > MAX_SERVER_ALLOC)
     *value = MAX_SERVER_ALLOC;

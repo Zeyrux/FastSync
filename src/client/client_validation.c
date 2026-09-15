@@ -60,6 +60,16 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "-f/--sendfile is not supported with SSH transport");
     return false;
   }
+  /* -M/--remote-option appends an option to the REMOTE server's argv, which
+   * only exists on the SSH (user@host:path) transport.  A daemon
+   * (host::module/path) or local TCP destination has no remote command line,
+   * so the option would be silently ignored; reject it by name instead. */
+  if (config->remote_option_count > 0 && config->transport != TRANSPORT_SSH) {
+    log_message(LOG_LEVEL_ERROR,
+                "-M/--remote-option is only valid with the SSH transport (user@host:path); it "
+                "cannot be used with a daemon (host::module/path) or local TCP destination");
+    return false;
+  }
   /* -4 and -6 are mutually exclusive: a socket address family cannot be both. */
   if (config->ipv4 && config->ipv6) {
     log_message(LOG_LEVEL_ERROR, "-4/--ipv4 and -6/--ipv6 are mutually exclusive");

@@ -126,26 +126,40 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
   return 0;
 }
 
-/* Set and validate the compression algorithm selected by the client. */
+/* Set and validate the compression algorithm selected by the client.  rsync
+ * 3.4.1 can be built with zstd, none, lz4, zlibx, zlib and auto; FastSync only
+ * implements zstd (and no compression).  "auto" is accepted as the default
+ * zstd choice; any other rsync choice is rejected by name instead of being
+ * silently accepted and ignored. */
 static int set_compression_choice(Config* config, const char* value) {
-  if (strcmp(value, "zstd") != 0 && strcmp(value, "none") != 0) {
-    log_message(LOG_LEVEL_ERROR, "--compress-choice must be zstd or none");
+  if (strcmp(value, "zstd") != 0 && strcmp(value, "none") != 0 && strcmp(value, "auto") != 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--compress-choice '%s' is not implemented; FastSync supports zstd, none or auto "
+                "(rsync's lz4/zlib/zlibx are rejected, never silently ignored)",
+                value);
     return -1;
   }
   if (set_string_option(&config->compress_choice, value, "--compress-choice") != 0)
     return -1;
-  config->use_compression = strcmp(value, "zstd") == 0;
+  config->use_compression = strcmp(value, "none") != 0;
   return 0;
 }
 
 /* Validate and store the --checksum-choice/--cc algorithm.  Only the algorithms
- * the engine genuinely supports are accepted (xxHash64 and md5); anything else
- * is a clear error, never a silent no-op.  "xxhash" is accepted as rsync's
- * spelling of xxHash64. */
+ * the engine genuinely supports are accepted (xxh64/xxhash, xxh3, xxh128, md5);
+ * rsync's compiled-in choices that FastSync does not implement (md4, sha1,
+ * none) and the two-name transfer/pre-transfer syntax are a clear error, never
+ * a silent no-op.  "auto" (rsync's default automatic choice) selects FastSync's
+ * default algorithm. */
 static int set_checksum_choice(Config* config, const char* value) {
+  if (strcasecmp(value, "auto") == 0)
+    return 0;
   int algo = checksum_algo_from_name(value);
   if (algo < 0) {
-    log_message(LOG_LEVEL_ERROR, "--checksum-choice must be xxh64 (or xxhash) or md5 (got '%s')",
+    log_message(LOG_LEVEL_ERROR,
+                "--checksum-choice '%s' is not implemented; FastSync supports xxh64 (or xxhash), "
+                "xxh3, xxh128, md5 or auto (rsync's md4/sha1/none and the two-name "
+                "transfer,pre-transfer form are rejected, never silently ignored)",
                 value);
     return -1;
   }
@@ -518,10 +532,6 @@ static int parse_size_arg_allow_zero(const char* value, unsigned long long* out,
   return 0;
 }
 
-static int parse_size_arg(const char* value, unsigned long long* out) {
-  return parse_size_arg_allow_zero(value, out, false);
-}
-
 /* Append a duplicated pattern to a growable pattern array. Returns 0 on success, -1 on error. */
 static int config_add_pattern(char*** patterns, int* count, const char* value,
                               const char* optname) {
@@ -573,7 +583,10 @@ static int parse_skip_compress(Config* config, const char* value) {
   if (!list)
     return -1;
   config->skip_compress_set = true;
-  for (char* token = strtok(list, ","); token; token = strtok(NULL, ",")) {
+  /* rsync documents the LIST as slash-separated; accept that along with the
+   * historical comma-separated spelling.  A leading dot is optional (rsync's
+   * suffixes have none, FastSync historically used them). */
+  for (char* token = strtok(list, ",/"); token; token = strtok(NULL, ",/")) {
     while (*token == ' ' || *token == '\t')
       token++;
     size_t len = strlen(token);
@@ -741,8 +754,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},
     {"--compress-level", "--zl", OPT_POS_INT, offsetof(Config, compression_level)},
 
-    {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
-    {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
+    {"--timeout", NULL, OPT_NONNEG_INT, offsetof(Config, timeout)},
+    {"--contimeout", NULL, OPT_NONNEG_INT, offsetof(Config, contimeout)},
     {"--max-depth", NULL, OPT_NONNEG_INT, offsetof(Config, max_depth)},
     {"--address", NULL, OPT_STRING, offsetof(Config, address)},
     {"--ipv4", "-4", OPT_FLAG, offsetof(Config, ipv4)},
@@ -781,6 +794,7 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"delete", NULL, offsetof(Config, use_delete)},
     {"incremental", NULL, offsetof(Config, use_incremental)},
     {"delta", NULL, offsetof(Config, use_delta)},
+    {"whole-file", "W", offsetof(Config, whole_file)},
     {"fuzzy", NULL, offsetof(Config, fuzzy)},
     {"save-to-disk", NULL, offsetof(Config, save_to_disk)},
     {"progress", NULL, offsetof(Config, show_progress)},
@@ -995,6 +1009,17 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
     config->super_mode = SUPER_MODE_OFF;
     return true;
   }
+  /* rsync's --no-timeout / --no-contimeout explicit spellings clear the
+   * corresponding (integer) deadline; handled before the generic --no-* branch
+   * because the negation table only models boolean fields. */
+  if (strcmp(arg, "--no-timeout") == 0) {
+    config->timeout = 0;
+    return true;
+  }
+  if (strcmp(arg, "--no-contimeout") == 0) {
+    config->contimeout = 0;
+    return true;
+  }
   if (strncmp(arg, "--no-", strlen("--no-")) == 0) {
     if (strcmp(arg, "--no-delta") == 0)
       ctx->no_delta = true;
@@ -1051,7 +1076,8 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
   }
   if (strncmp(arg, "--stop-at=", 10) == 0) {
     if (!stop_parse_at_time(arg + 10, time(NULL), &config->stop_at)) {
-      log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+      log_message(LOG_LEVEL_ERROR, "--stop-at must be a date/time such as 2000-12-31T23:59, 12-31, "
+                                   "14:00, :59, HH:MM[:SS] or now+N[smhd]");
       ctx->exit_code = -1;
       return true;
     }
@@ -1065,7 +1091,8 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       return true;
     }
     if (!stop_parse_at_time(ctx->argv[++ctx->i], time(NULL), &config->stop_at)) {
-      log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+      log_message(LOG_LEVEL_ERROR, "--stop-at must be a date/time such as 2000-12-31T23:59, 12-31, "
+                                   "14:00, :59, HH:MM[:SS] or now+N[smhd]");
       ctx->exit_code = -1;
       return true;
     }
@@ -1089,8 +1116,11 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       }
       value = ctx->argv[++ctx->i];
     }
-    if (parse_size_arg(value, &config->max_alloc) != 0) {
-      log_message(LOG_LEVEL_ERROR, "--max-alloc must be a positive size (B, K, M, G, T, P, or E)");
+    /* rsync: --max-alloc=0 means "no alloc limit" (it maps to SIZE_MAX).  A
+     * size with an optional binary suffix is also accepted. */
+    if (parse_size_arg_allow_zero(value, &config->max_alloc, true) != 0) {
+      log_message(LOG_LEVEL_ERROR, "--max-alloc must be a size (0 = no limit; B, K, M, G, T, P, E "
+                                   "suffixes allowed)");
       ctx->exit_code = -1;
     }
     return true;
@@ -1401,7 +1431,7 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
   const char* arg = ctx->argv[ctx->i];
   if (opt_is(arg, "-z", "--compress")) {
     config->use_compression =
-        !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
+        !config->compress_choice || strcmp(config->compress_choice, "none") != 0;
     log_info_message(LOG_INFO_MISC, "Enabled Compression");
     if (ctx->i + 1 < ctx->argc) {
       char* end_ptr;
@@ -2011,7 +2041,16 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
   set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   if (config->compress_choice)
-    config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
+    config->use_compression = strcmp(config->compress_choice, "none") != 0;
+
+  /* rsync randomizes the checksum seed for every transfer when the user did not
+   * supply one (a seed of 0, including an explicit --checksum-seed=0), using
+   * time(NULL) ^ (getpid() << 6), and transmits it so both ends agree.  Mirror
+   * that: the wire config carries the value, so the receiver uses the exact
+   * seed this sender hashed with.  A non-zero --checksum-seed is honored
+   * verbatim (deterministic). */
+  if (config->checksum_seed == 0)
+    config->checksum_seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 6);
 
   /* --files-from is loaded after every argument is seen so that -0/--from0 may
    * appear anywhere on the command line. A missing or unreadable file, and
@@ -2063,6 +2102,16 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
     config->use_incremental = true;
   }
 
+  /* -c/--checksum switches the per-file quick-check from size+mtime to a
+   * content digest; FastSync expresses that comparison through the incremental
+   * handshake, so -c implies --incremental.  rsync's -c does NOT imply -t (the
+   * digest alone decides), so the incremental auto-preserve below must not be
+   * triggered by a checksum-only implication: capture the explicitly requested
+   * incremental/delta state first. */
+  bool preserve_implied = config->use_incremental || config->use_delta;
+  if (config->checksum)
+    config->use_incremental = true;
+
   /* --incremental/--delta historically auto-enabled the metadata path, which
    * applied mode+mtime (README: "--incremental Auto-enables --preserve").
    * Restore that behavior by turning on the two attributes unless the user
@@ -2070,7 +2119,7 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * BEFORE the derived use_metadata bit so the transport frame is still sent
    * for the incremental/delta handshake even when both attributes were negated
    * via --no-preserve (metadata_explicitly_disabled handles that opt-out). */
-  if ((config->use_incremental || config->use_delta) && !config->metadata_explicitly_disabled) {
+  if (preserve_implied && !config->metadata_explicitly_disabled) {
     if (!config->preserve_perms_explicit_off)
       config->preserve_perms = true;
     if (!config->preserve_times_explicit_off)

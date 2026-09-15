@@ -12,8 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define RECEIVE_TIMEOUT_SEC 60 /* 60 second per-message timeout */
-#define SEND_TIMEOUT_SEC 60
+#define RECEIVE_TIMEOUT_SEC 60 /* built-in fallback for explicit -timed calls only */
 
 static __thread int io_read_fd = -1;
 static __thread int io_write_fd = -1;
@@ -99,8 +98,10 @@ void protocol_session_set_io_timeout(ProtocolSession* session, int sec) {
 
 int protocol_get_io_timeout_sec(void) {
   const ProtocolSession* session = bound_session ? bound_session : &legacy_io_session;
-  int sec = session->io_timeout_sec;
-  return sec > 0 ? sec : RECEIVE_TIMEOUT_SEC;
+  /* 0 (or negative) means the session timeout is disabled, matching rsync's
+   * --timeout=0 default.  Callers must treat a non-positive result as "wait
+   * without a deadline" instead of substituting a built-in window. */
+  return session->io_timeout_sec > 0 ? session->io_timeout_sec : 0;
 }
 
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc) {
@@ -110,7 +111,8 @@ void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long
 }
 
 static bool allocation_allowed(const ProtocolSession* session, size_t size) {
-  return (unsigned long long)size <= session->max_alloc;
+  /* max_alloc == 0 is rsync's --max-alloc=0 "no limit". */
+  return session->max_alloc == 0 || (unsigned long long)size <= session->max_alloc;
 }
 
 static void* protocol_alloc_for_session(const ProtocolSession* session, size_t size) {
@@ -280,11 +282,15 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
   log_debug_message(LOG_DEBUG_IO, "    Sending n Data: %zu", data_size);
   if (!session)
     return false;
-  int timeout_sec = session->io_timeout_sec > 0 ? session->io_timeout_sec : SEND_TIMEOUT_SEC;
+  /* A non-positive session timeout disables the deadline entirely (rsync's
+   * --timeout=0 default); poll then blocks until the socket becomes writable. */
+  int timeout_sec = session->io_timeout_sec > 0 ? session->io_timeout_sec : 0;
   int fd = session->write_fd;
   struct timespec deadline;
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += timeout_sec;
+  if (timeout_sec > 0) {
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_sec;
+  }
   short wait_events = POLLOUT;
   ssize_t total_bytes_send = 0;
   while ((size_t)total_bytes_send < data_size) {
@@ -292,7 +298,7 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
     if (session->bwlimit > 0 && chunk > 65536)
       chunk = 65536;
     struct pollfd pfd = {.fd = fd, .events = wait_events};
-    int poll_result = poll(&pfd, 1, deadline_remaining_ms(&deadline));
+    int poll_result = poll(&pfd, 1, timeout_sec > 0 ? deadline_remaining_ms(&deadline) : -1);
     if (poll_result == 0 || (poll_result < 0 && errno != EINTR)) {
       log_message(LOG_LEVEL_ERROR, "Send timeout or poll failure");
       return false;
@@ -338,12 +344,21 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
 
 bool protocol_receive_n_data_timed(ProtocolSession* session, void* data, size_t data_size,
                                    int timeout_sec);
+static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, size_t data_size,
+                                          const struct timespec* deadline);
 
 bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_size) {
-  /* Honor the session's configured deadline; protocol_receive_n_data_timed
-   * re-applies the built-in 60 s default when the value is <= 0. */
-  int timeout_sec = session ? session->io_timeout_sec : 0;
-  return protocol_receive_n_data_timed(session, data, data_size, timeout_sec);
+  /* Honor the session's configured deadline.  A non-positive value disables the
+   * deadline (rsync's --timeout=0 default): wait without a poll timeout.  The
+   * explicit _timed variants keep their own 0 -> built-in-default contract. */
+  if (!session)
+    return false;
+  if (session->io_timeout_sec <= 0)
+    return protocol_receive_n_data_until(session, data, data_size, NULL);
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += session->io_timeout_sec;
+  return protocol_receive_n_data_until(session, data, data_size, &deadline);
 }
 
 /* Read exactly `data_size` bytes from `session` before `deadline` elapses
@@ -353,7 +368,7 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
 static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, size_t data_size,
                                           const struct timespec* deadline) {
   log_debug_message(LOG_DEBUG_IO, "    Receiving n Data: %zu", data_size);
-  if (!session || !deadline)
+  if (!session)
     return false;
   int fd = session->read_fd;
 
@@ -362,7 +377,8 @@ static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, 
   while (total_bytes_received < data_size) {
     if (!session->ssl || SSL_pending(session->ssl) == 0) {
       struct pollfd pfd = {.fd = fd, .events = wait_events};
-      int poll_result = poll(&pfd, 1, deadline_remaining_ms(deadline));
+      /* A NULL deadline means "wait indefinitely" (timeout disabled). */
+      int poll_result = poll(&pfd, 1, deadline ? deadline_remaining_ms(deadline) : -1);
       if (poll_result == 0) {
         log_message(LOG_LEVEL_ERROR, "Receive timeout");
         return false;
@@ -702,13 +718,16 @@ static bool protocol_capture_error_detail(ProtocolSession* session, Status* stat
 bool protocol_receive_status(ProtocolSession* session, Status* status) {
   if (!session || !status)
     return false;
-  int timeout_sec = session->io_timeout_sec > 0 ? session->io_timeout_sec : RECEIVE_TIMEOUT_SEC;
   struct timespec deadline;
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += timeout_sec;
-  if (!protocol_receive_n_data_until(session, status, sizeof(Status), &deadline))
+  const struct timespec* deadline_ptr = NULL;
+  if (session->io_timeout_sec > 0) {
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += session->io_timeout_sec;
+    deadline_ptr = &deadline;
+  }
+  if (!protocol_receive_n_data_until(session, status, sizeof(Status), deadline_ptr))
     return false;
-  if (!protocol_capture_error_detail(session, status, &deadline, NULL))
+  if (!protocol_capture_error_detail(session, status, deadline_ptr, NULL))
     return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
   return true;
@@ -747,8 +766,8 @@ static bool protocol_read_status_until(ProtocolSession* session, Status* status,
   short wait_events = POLLIN;
   while (got < sizeof(Status)) {
     if (!session->ssl || SSL_pending(session->ssl) == 0) {
-      int remaining_ms = deadline_remaining_ms(deadline);
-      if (remaining_ms <= 0) {
+      int remaining_ms = deadline ? deadline_remaining_ms(deadline) : -1;
+      if (remaining_ms == 0) {
         log_message(LOG_LEVEL_ERROR, "Receive timeout while reading status");
         return false;
       }

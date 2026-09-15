@@ -294,13 +294,26 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     free(destination_path);
     return absent_result;
   }
-  const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
+  /* Resolve a relative --temp-dir against the destination root, exactly as the
+   * primary save path does; an absolute one is used verbatim. */
+  char* resolved_temp = NULL;
+  if (cfg->temp_dir) {
+    resolved_temp =
+        cfg->temp_dir[0] == '/' ? str_dup(cfg->temp_dir) : path_cat(root_directory, cfg->temp_dir);
+    if (!resolved_temp) {
+      free(content);
+      free(first_disk);
+      free(destination_path);
+      return FILE_SAVE_ERROR;
+    }
+  }
   FileXattrList* sibling_xattrs =
       cfg->use_xattrs ? xattr_capture_path(first_disk, cfg->preserve_acls) : NULL;
-  bool ok = file_to_disk_secure_link_attrs(destination_path, first_disk, content, content_size,
-                                           preallocate, file->metadata, policy, use_fsync,
-                                           sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
+  bool ok = file_to_disk_secure_link_attrs(
+      destination_path, first_disk, content, content_size, preallocate, file->metadata, policy,
+      use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, resolved_temp);
   xattr_list_free(sibling_xattrs);
+  free(resolved_temp);
   free(content);
   free(first_disk);
   free(destination_path);
@@ -765,14 +778,15 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return file_save_hardlink_sibling(root_directory, file, config);
   }
 
-  /* These options arrive from the client.  They are names below the server
-     root, never independent filesystem roots.  --temp-dir is confined exactly
-     like --backup-dir/--partial-dir: an absolute or `..`-escaping scratch
-     directory is rejected outright so nothing is ever created outside the
-     authorized destination root. */
+  /* These options arrive from the client.  --backup-dir and --partial-dir are
+     names below the server root, never independent filesystem roots: an
+     absolute or `..`-escaping value is rejected outright.  --temp-dir is
+     deliberately NOT confined: rsync accepts any temp dir (absolute, or
+     relative to the destination root), including one outside the destination
+     tree or on another filesystem, and falls back to a non-atomic copy when
+     the install rename hits EXDEV. */
   if ((backup_dir && (backup_dir[0] == '/' || has_path_traversal(backup_dir))) ||
-      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))) ||
-      (temp_dir && (temp_dir[0] == '/' || has_path_traversal(temp_dir))))
+      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))))
     return FILE_SAVE_ERROR;
   if (backup_dir && !(confined_backup = path_cat(root_directory, backup_dir)))
     return FILE_SAVE_ERROR;
@@ -897,15 +911,21 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   }
 
   /* A configured --temp-dir sends the temporary working copy to a scratch
-     directory resolved below the receive root; the engine then atomically
-     renames the completed file into the final destination directory.  The
-     partial-dir flow already keeps its working copy in a separate directory
-     and --inplace writes directly, so neither diverts through the scratch
-     dir (matching rsync, where --inplace/--partial-dir supersede --temp-dir). */
+     directory; the engine then atomically renames the completed file into the
+     final destination directory.  rsync resolves a relative temp dir against
+     the destination directory and uses an absolute one verbatim, requiring
+     that it already exist; the engine falls back to a non-atomic copy on
+     EXDEV.  The partial-dir flow already keeps its working copy in a separate
+     directory and --inplace writes directly, so neither diverts through the
+     scratch dir (matching rsync, where --inplace/--partial-dir supersede
+     --temp-dir). */
   char* confined_temp = NULL;
   bool use_temp_dir = temp_dir != NULL && !inplace && !use_partial_root;
   if (use_temp_dir) {
-    confined_temp = path_cat(root_directory, temp_dir);
+    if (temp_dir[0] == '/')
+      confined_temp = str_dup(temp_dir);
+    else
+      confined_temp = path_cat(root_directory, temp_dir);
     if (!confined_temp)
       goto fail;
     /* A user-supplied trailing slash would leave the scratch path ending in

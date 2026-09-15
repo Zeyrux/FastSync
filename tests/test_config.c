@@ -2899,13 +2899,14 @@ static void test_config_wire_receive_bounds() {
   /* BOOL: only 0/1 is a legal wire value. */
   EXPECT_TRUE(receive_hand_built_frame_rejected(write_frame_with_invalid_bool));
 
-  /* RAW_MAXALLOC: zero is rejected before it can become the session ceiling. */
+  /* RAW_MAXALLOC: zero is rsync's --max-alloc=0 "no limit" and round-trips;
+   * only the over-ceiling clamp is applied server-side. */
   Config* c = config_create();
   EXPECT_NOT_NULL(c);
   c->send_directory = str_dup("/src");
   c->receive_root_directory = str_dup("/dst");
   c->max_alloc = 0;
-  EXPECT_TRUE(roundtrip_config_rejected(c));
+  EXPECT_FALSE(roundtrip_config_rejected(c));
   config_delete(c);
 
   /* STR_MODULE: a name outside [A-Za-z0-9._-] is refused. */
