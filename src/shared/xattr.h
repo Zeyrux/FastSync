@@ -1,6 +1,7 @@
 #ifndef XATTR_H
 #define XATTR_H
 
+#include "file_attr.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -99,11 +100,13 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
  * Best-effort: absence of the xattr or a malformed record is a silent no-op
  * that never fails the transfer.  The OWNER leg is applied only when an explicit
  * ownership identity policy is active (numeric-ids/chown/usermap/groupmap/
- * copy-as), when super-user activities are permitted, and when --copy-as is not
- * authoritative; a non-root EPERM/EACCES is skipped silently, matching
- * FastSync's identity philosophy.  The mode is sanitized exactly like the normal
- * metadata path (group/other write bits never granted).  Returns true when the
- * xattr was present and parsed. */
-bool fake_super_restore_fd(int fd);
+ * copy-as/-o/-g), when super-user activities are permitted, and when --copy-as
+ * is not authoritative; a non-root EPERM/EACCES is skipped silently, matching
+ * FastSync's identity philosophy.  The MODE leg is applied only when
+ * policy.perms||policy.executability and the MTIME leg only when policy.times,
+ * so the fake-super replay cannot bypass the per-attribute split; the mode is
+ * sanitized exactly like the normal metadata path (group/other write bits never
+ * granted).  Returns true when the xattr was present and parsed. */
+bool fake_super_restore_fd(int fd, FileAttrPolicy policy);
 
 #endif

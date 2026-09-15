@@ -619,6 +619,11 @@ typedef struct {
   size_t offset; /* offsetof of the boolean target field in Config */
 } NegatableOption;
 
+/* Sentinel offset for --no-preserve, the rsync drop-in negation of the whole
+ * preservation bundle: it clears all four per-attribute flags and records the
+ * explicit metadata opt-out instead of clearing a single Config field. */
+#define NEGATABLE_PRESERVE_BUNDLE ((size_t) - 1)
+
 /* Options that map directly onto a Config field with no side effects.
  *
  * NOTE: these CLI tables are intentionally NOT generated from the wire-field
@@ -796,7 +801,11 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"compress", NULL, offsetof(Config, use_compression)},
     {"compress", "z", offsetof(Config, use_compression)},
     {"multithreading", "j", offsetof(Config, use_multithreading)},
-    {"preserve", NULL, offsetof(Config, use_metadata)},
+    {"preserve", NULL, NEGATABLE_PRESERVE_BUNDLE},
+    {"perms", "p", offsetof(Config, preserve_perms)},
+    {"times", "t", offsetof(Config, preserve_times)},
+    {"owner", "o", offsetof(Config, preserve_owner)},
+    {"group", "g", offsetof(Config, preserve_group)},
     {"sendfile", NULL, offsetof(Config, use_sendfile)},
     {"chunk-serialization", NULL, offsetof(Config, use_chunk_serialization)},
     {"xattrs", "X", offsetof(Config, preserve_xattrs)},
@@ -856,9 +865,27 @@ static int apply_negation(Config* config, const char* arg) {
     fprintf(stderr, "Cannot negate unsupported or unsafe option: %s\n", arg);
     return -1;
   }
-  *(bool*)((char*)config + entry->offset) = false;
-  if (entry->offset == offsetof(Config, use_metadata))
+  if (entry->offset == NEGATABLE_PRESERVE_BUNDLE) {
+    config->preserve_perms = false;
+    config->preserve_times = false;
+    config->preserve_owner = false;
+    config->preserve_group = false;
     config->metadata_explicitly_disabled = true;
+    /* --no-preserve is an explicit opt-out of the whole bundle: record it so
+     * the --incremental/--delta auto-preserve in cli_finalize_config does not
+     * silently re-enable perms/times. */
+    config->preserve_perms_explicit_off = true;
+    config->preserve_times_explicit_off = true;
+    return 0;
+  }
+  *(bool*)((char*)config + entry->offset) = false;
+  /* Track an explicit per-attribute negation so --incremental/--delta can
+   * auto-preserve the OTHER attribute without undoing this one.  A later
+   * -p/-t sets the attribute directly; this flag only gates the implication. */
+  if (entry->offset == offsetof(Config, preserve_perms))
+    config->preserve_perms_explicit_off = true;
+  else if (entry->offset == offsetof(Config, preserve_times))
+    config->preserve_times_explicit_off = true;
   return 0;
 }
 
@@ -869,8 +896,6 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   switch (entry->kind) {
   case OPT_FLAG:
     *(bool*)field = true;
-    if (entry->offset == offsetof(Config, update))
-      config->use_metadata = true;
     return 0;
   case OPT_NOOP:
     return 0;
@@ -1115,7 +1140,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
           ctx->exit_code = -1;
           return true;
         }
-        config->use_metadata = true;
+        config->preserve_perms = true;
       }
       /* Remember that --server-host was explicitly given (the field itself
          defaults to 127.0.0.1, so a value check cannot distinguish it).  Used
@@ -1142,21 +1167,15 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
      config. */
   if (entry->offset == offsetof(Config, delete_missing_args))
     config->ignore_missing_args = true;
-  /* -U/--atimes and -N/--crtimes carry their times inside the metadata
-     payload, which is only transmitted when use_metadata is set, so either
-     one implies metadata transmission.  This is FastSync's broad -M bundle
-     (mode/mtime travel too); it does NOT enable ownership application,
-     which stays opt-in via the identity flags. */
-  if (entry->offset == offsetof(Config, preserve_atimes) ||
-      entry->offset == offsetof(Config, preserve_crtimes))
-    config->use_metadata = true;
+  /* -A/--acls implies permission preservation as well as the xattr channel;
+     -X/--xattrs preserves only the extended attributes.  Either sets the
+     derived xattr transport bit so the sender emits the per-file xattr block. */
   if (entry->offset == offsetof(Config, preserve_xattrs) ||
       entry->offset == offsetof(Config, preserve_acls)) {
-    config->use_metadata = true;
     config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
+    if (entry->offset == offsetof(Config, preserve_acls))
+      config->preserve_perms = true;
   }
-  if (entry->offset == offsetof(Config, fake_super))
-    config->use_metadata = true;
   return true;
 }
 
@@ -1178,7 +1197,7 @@ static bool cli_handle_inline_chmod(CliParseCtx* ctx) {
     ctx->exit_code = -1;
     return true;
   }
-  config->use_metadata = true;
+  config->preserve_perms = true;
   return true;
 }
 
@@ -1206,27 +1225,42 @@ static bool cli_handle_meta_flags(CliParseCtx* ctx) {
     return true;
   }
   if (opt_is(arg, "-a", "--archive")) {
-    /* FastSync archive mode (-rlptD).  FastSync is always recursive and always
-     * preserves hard-link/other transfer semantics per its own flags, so -a
-     * implies links, metadata (perms/times), devices and specials.  Owner/group
-     * are NOT implied; they require an explicit identity flag
-     * (--numeric-ids/--usermap/--groupmap/--chown/--copy-as).  Compression and
-     * multithreading are NOT implied either (they are no longer part of
-     * archive mode). */
+    /* FastSync archive mode (-rlptgoD).  FastSync is always recursive and
+     * always preserves hard-link/other transfer semantics per its own flags, so
+     * -a implies links plus the four per-attribute preservation flags
+     * (perms/times/owner/group), devices and specials.  Compression and
+     * multithreading are NOT implied (they are no longer part of archive
+     * mode). */
     config->follow_symlinks = true;
-    config->use_metadata = true;
+    config->preserve_perms = true;
+    config->preserve_times = true;
+    config->preserve_owner = true;
+    config->preserve_group = true;
     config->preserve_devices = true;
     config->preserve_specials = true;
     log_info_message(LOG_INFO_MISC,
-                     "Enabled archive mode (-rlptD: links, metadata, devices, specials; "
-                     "owner/group opt-in)");
+                     "Enabled archive mode (-rlptgoD: links, perms, times, owner, group, "
+                     "devices, specials)");
     return true;
   }
   if (opt_is(arg, "-p", "--perms")) {
-    /* rsync -p/--perms: preserve permission bits.  Folded into FastSync's
-     * broad metadata bundle (mode/mtime travel together). */
-    config->use_metadata = true;
+    config->preserve_perms = true;
     log_info_message(LOG_INFO_MISC, "Enabled permission preservation");
+    return true;
+  }
+  if (opt_is(arg, "-t", "--times")) {
+    config->preserve_times = true;
+    log_info_message(LOG_INFO_MISC, "Enabled time preservation");
+    return true;
+  }
+  if (opt_is(arg, "-o", "--owner")) {
+    config->preserve_owner = true;
+    log_info_message(LOG_INFO_MISC, "Enabled owner preservation");
+    return true;
+  }
+  if (opt_is(arg, "-g", "--group")) {
+    config->preserve_group = true;
+    log_info_message(LOG_INFO_MISC, "Enabled group preservation");
     return true;
   }
   return false;
@@ -1357,12 +1391,12 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
     return true;
   }
   if (opt_is(arg, "--preserve", NULL)) {
-    config->use_metadata = true;
+    config->preserve_perms = true;
+    config->preserve_times = true;
     log_info_message(LOG_INFO_MISC, "Enabled metadata preservation");
     return true;
   }
   if (opt_is(arg, "-E", "--executability")) {
-    config->use_metadata = true;
     config->use_executability = true;
     log_info_message(LOG_INFO_MISC, "Enabled executable permission preservation");
     return true;
@@ -1806,7 +1840,7 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->use_metadata = true;
+    config->preserve_owner = true;
     return true;
   }
   if (opt_is(arg, "--usermap", NULL)) {
@@ -1819,7 +1853,7 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->use_metadata = true;
+    config->preserve_owner = true;
     return true;
   }
   if (strncmp(arg, "--groupmap=", 11) == 0) {
@@ -1827,7 +1861,7 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->use_metadata = true;
+    config->preserve_group = true;
     return true;
   }
   if (opt_is(arg, "--groupmap", NULL)) {
@@ -1840,7 +1874,7 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->use_metadata = true;
+    config->preserve_group = true;
     return true;
   }
   if (strncmp(arg, "--chown=", 8) == 0) {
@@ -1848,7 +1882,10 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->use_metadata = true;
+    if (config->chown_uid_set)
+      config->preserve_owner = true;
+    if (config->chown_gid_set)
+      config->preserve_group = true;
     return true;
   }
   if (opt_is(arg, "--chown", NULL)) {
@@ -1861,7 +1898,10 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->use_metadata = true;
+    if (config->chown_uid_set)
+      config->preserve_owner = true;
+    if (config->chown_gid_set)
+      config->preserve_group = true;
     return true;
   }
   if (strncmp(arg, "--copy-as=", 10) == 0) {
@@ -1921,19 +1961,10 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
     config->files_from_set = set;
   }
 
-  /* Device/special preservation recreates a node from its metadata mode (whose
-     S_IFMT bits carry the node kind), so --devices/--specials/-D imply metadata
-     transmission.  --copy-devices/--write-devices treat the entry as data but a
-     mtime/mode-preserving transfer still benefits from metadata, so all four
-     imply it (FastSync's broad -M bundle; ownership stays opt-in). */
-  if (config->preserve_devices || config->preserve_specials || config->copy_devices ||
-      config->write_devices)
-    config->use_metadata = true;
-
   /* The "unchanged" decision for --compare-dest/--copy-dest/--link-dest must
    * be made on the receiver against the basis directories, which requires the
    * per-file STATUS_CHECK handshake: basis-dir options therefore imply
-   * --incremental (and, via the block below, metadata) on the sender. */
+   * --incremental (and, via the derived bit below, metadata) on the sender. */
   if (config_has_basis(config))
     config->use_incremental = true;
 
@@ -1966,12 +1997,27 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
     config->use_incremental = true;
   }
 
-  /* Incremental and delta transfers need metadata unless the user disabled it. */
-  if ((config->use_incremental || config->use_delta) && !config->use_metadata &&
-      !config->metadata_explicitly_disabled) {
-    log_message(LOG_LEVEL_INFO, "Enabling metadata preservation for incremental/delta transfer");
-    config->use_metadata = true;
+  /* --incremental/--delta historically auto-enabled the metadata path, which
+   * applied mode+mtime (README: "--incremental Auto-enables --preserve").
+   * Restore that behavior by turning on the two attributes unless the user
+   * explicitly negated them (--no-perms/--no-times/--no-preserve).  This runs
+   * BEFORE the derived use_metadata bit so the transport frame is still sent
+   * for the incremental/delta handshake even when both attributes were negated
+   * via --no-preserve (metadata_explicitly_disabled handles that opt-out). */
+  if ((config->use_incremental || config->use_delta) && !config->metadata_explicitly_disabled) {
+    if (!config->preserve_perms_explicit_off)
+      config->preserve_perms = true;
+    if (!config->preserve_times_explicit_off)
+      config->preserve_times = true;
   }
+
+  /* Derive the transport bit from the FINAL parsed flags.  Every
+   * preservation/ownership option that needs the metadata frame (per-attribute
+   * perms/times/owner/group, atimes/crtimes, executability, xattrs/acls,
+   * fake-super, devices/specials, chmod, identity maps/chown/copy-as, and the
+   * incremental/delta handshake unless --no-preserve explicitly disabled it) is
+   * centralized in config_derived_use_metadata(). */
+  config->use_metadata = config_derived_use_metadata(config);
   /* Recompute the derived xattr flag from the FINAL preserve flags (after any
    * --no-xattrs/--no-acls negation) so the sender's wire gate always matches
    * the flags the receiver will recompute from the received config. */
@@ -2121,6 +2167,10 @@ static int load_daemon_credentials(Config* config) {
 }
 
 int main(int argc, char* argv[]) {
+  /* Capture the process umask now, while still single-threaded: the cached
+   * value is what file_mode_base() uses, and reading it later would race with
+   * receiver threads creating files. */
+  file_umask_capture();
   /* The server may close a connection mid-stream (e.g. when it rejects an
      oversized delta).  Ignore SIGPIPE so that a broken TCP connection
      surfaces as a clean write error instead of killing the client. */

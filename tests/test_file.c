@@ -410,7 +410,7 @@ static void test_file_write_to_disk_with_fsync() {
   const char* path = "test_file_write_to_disk_fsync.txt";
   const char* content = "fsync file content";
   EXPECT_TRUE(file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, false,
-                                             NULL, false, true, NULL));
+                                             NULL, (FileAttrPolicy){0}, true, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -420,8 +420,8 @@ static void test_file_write_to_disk_with_fsync() {
 static void test_file_write_to_disk_preallocate_atomic() {
   const char* path = "test_file_write_prealloc_atomic.txt";
   const char* content = "prealloc atomic content";
-  EXPECT_TRUE(
-      file_to_disk_secure(path, content, strlen(content), false, false, true, NULL, false, NULL));
+  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), false, false, true, NULL,
+                                  (FileAttrPolicy){0}, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -438,8 +438,8 @@ static void test_file_write_to_disk_preallocate_atomic() {
 static void test_file_write_to_disk_preallocate_inplace() {
   const char* path = "test_file_write_prealloc_inplace.txt";
   const char* content = "prealloc inplace content";
-  EXPECT_TRUE(
-      file_to_disk_secure(path, content, strlen(content), true, false, true, NULL, false, NULL));
+  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), true, false, true, NULL,
+                                  (FileAttrPolicy){0}, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -951,6 +951,178 @@ static void test_inplace_overwrite_metadata_strips_special_bits() {
   rmdir(root);
 }
 
+/* The per-attribute split: with no -p/-E the atomic (inode-replacing) write
+ * must restore the PRE-EXISTING destination mode instead of the source mode; a
+ * brand-new file keeps the historical 0644 default; -p applies the source. */
+static void test_atomic_no_perms_preserves_destination_mode() {
+  const char* path = "test_attr_split_mode.txt";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
+  EXPECT_TRUE(fd >= 0);
+  /* cppcheck-suppress knownConditionTrueFalse */
+  if (fd < 0)
+    return;
+  EXPECT_EQ_INT(fchmod(fd, 0640), 0);
+  EXPECT_EQ_INT(close(fd), 0);
+
+  FileMetadata m;
+  memset(&m, 0, sizeof(m));
+  m.mode = 0755;
+  m.uid = geteuid();
+  m.gid = getegid();
+  m.mtime_sec = 1700000000;
+
+  /* No -p/-E: the pre-existing 0640 survives the atomic overwrite. */
+  bool ok = file_to_disk_secure_attrs(path, "data", 4, false, false, false, &m,
+                                      (FileAttrPolicy){false, false, false, false}, false, false,
+                                      false, NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0640);
+
+  /* -p: the source mode wins. */
+  ok = file_to_disk_secure_attrs(path, "data2", 5, false, false, false, &m,
+                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
+
+  /* -E only (rsync rule): an executable source derives exec from the
+     pre-existing destination's read bits.  Dest 0640 (owner+group read) with a
+     source 0755 gives 0750, not 0751 and not the scratch 0711. */
+  EXPECT_EQ_INT(chmod(path, 0640), 0);
+  ok = file_to_disk_secure_attrs(path, "data3", 6, false, false, false, &m,
+                                 (FileAttrPolicy){false, false, false, true}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0750);
+
+  unlink(path);
+
+  /* A brand-new file with no -p uses rsync's source&~umask base when metadata
+     is available (m.mode is 0755 here). */
+  const char* fresh = "test_attr_split_fresh.txt";
+  unlink(fresh);
+  ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, &m,
+                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(fresh, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), (int)(m.mode & 0777 & ~(mode_t)file_process_umask()));
+  unlink(fresh);
+
+  /* Without any metadata the historical fixed 0644 default still applies. */
+  unlink(fresh);
+  ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, NULL,
+                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(fresh, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  unlink(fresh);
+}
+
+/* MAJOR 2: a brand-new destination file must never be created group/other
+ * writable from a client-supplied source mode.  The daemon runs with umask(0),
+ * so without the explicit S_IWGRP|S_IWOTH strip a source 0666 (with no -p)
+ * would materialize as world-writable. */
+static void test_new_file_mode_never_group_other_writable() {
+  const char* path = "test_new_file_no_go_write.bin";
+  unlink(path);
+  FileMetadata m;
+  memset(&m, 0, sizeof(m));
+  m.mode = 0666; /* maximal group/other write in the source mode */
+  m.uid = geteuid();
+  m.gid = getegid();
+
+  bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
+                                      (FileAttrPolicy){false, false, false, false}, false, false,
+                                      false, NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & (S_IWGRP | S_IWOTH)), 0);
+  /* The rest of the source mode is still honored (owner write survives). */
+  EXPECT_EQ_INT((int)(st.st_mode & S_IWUSR), S_IWUSR);
+  unlink(path);
+}
+
+/* Security: a client-supplied special-node mode must never materialize a
+ * group/other-writable FIFO.  file_save_special_to_disk() sanitizes the
+ * creation bits the same way the regular-file policy does: under -p the source
+ * mode loses S_IWGRP|S_IWOTH (0777 -> 0755), and without -p a safe 0644 default
+ * is used.  The daemon runs with umask(0) (server.c), so the explicit strip is
+ * what keeps the node safe -- the test clears the umask to prove it. */
+static void test_special_fifo_mode_never_group_other_writable_impl() {
+  const char* root = "test_special_mode_tmp";
+  const char* with_p = "test_special_mode_tmp/with_p.fifo";
+  const char* no_p = "test_special_mode_tmp/no_p.fifo";
+  unlink(with_p);
+  unlink(no_p);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFIFO | 0777;
+  meta.uid = geteuid();
+  meta.gid = getegid();
+  meta.mtime_sec = 1000000000;
+
+  /* -p: the source mode is honored minus group/other write. */
+  File* f = file_create("with_p.fifo");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->metadata = &meta;
+  cfg->preserve_specials = true;
+  cfg->preserve_perms = true;
+  cfg->use_metadata = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(with_p, &st), 0);
+  EXPECT_TRUE(S_ISFIFO(st.st_mode));
+  EXPECT_EQ_INT((int)(st.st_mode & (S_IWGRP | S_IWOTH)), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
+  f->metadata = NULL;
+  file_destroy(f);
+
+  /* No -p: the fixed safe default, never the source's 0777. */
+  f = file_create("no_p.fifo");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->metadata = &meta;
+  cfg->preserve_perms = false;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(lstat(no_p, &st), 0);
+  EXPECT_TRUE(S_ISFIFO(st.st_mode));
+  EXPECT_EQ_INT((int)(st.st_mode & (S_IWGRP | S_IWOTH)), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  f->metadata = NULL;
+  file_destroy(f);
+
+  config_delete(cfg);
+  unlink(with_p);
+  unlink(no_p);
+  rmdir(root);
+}
+
+/* The receiver daemon runs umask(0), so an unsanitized source mode would reach
+ * mkfifo unmasked.  Run the body with umask(0) to exercise the explicit strip,
+ * and restore the process umask from this wrapper so a failing EXPECT inside the
+ * body (which returns from the body only) cannot leak umask(0) into later
+ * tests. */
+static void test_special_fifo_mode_never_group_other_writable() {
+  mode_t saved_umask = umask(0);
+  test_special_fifo_mode_never_group_other_writable_impl();
+  umask(saved_umask);
+}
+
 static void test_inplace_overwrite_truncates_shorter_payload() {
   const char* root = "test_inplace_trunc_tmp";
   const char* path = "test_inplace_trunc_tmp/big.txt";
@@ -1335,7 +1507,8 @@ static void test_file_write_to_disk_sparse_preserves_holes() {
     buf[size - 1 - i] = (unsigned char)((i * 7) % 253);
   }
 
-  EXPECT_TRUE(file_to_disk_secure(path, buf, size, false, true, false, NULL, false, NULL));
+  EXPECT_TRUE(
+      file_to_disk_secure(path, buf, size, false, true, false, NULL, (FileAttrPolicy){0}, NULL));
 
   /* Logical size must equal data_size exactly. */
   struct stat st;
@@ -1400,8 +1573,9 @@ static void test_file_write_to_disk_partial_retention() {
   m.mtime_nsec = 2000000000; /* invalid: forces futimens EINVAL after the write */
   m.atime_valid = false;
   m.crtime_valid = false;
-  bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m, false,
-                                      false, false, false, NULL, false, true, NULL);
+  bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
+                                      (FileAttrPolicy){true, true, false, false}, false, false,
+                                      false, NULL, false, true, NULL);
   EXPECT_FALSE(ok); /* the write itself succeeded, but metadata restore failed */
   /* Retained: the already-written temp now sits at the destination path. */
   int fd = open(path, O_RDONLY);
@@ -1419,8 +1593,9 @@ static void test_file_write_to_disk_partial_retention() {
   unlink(path);
 
   /* Same failure with keep_partial=false: temp is unlinked, nothing retained. */
-  ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m, false,
-                                 false, false, false, NULL, false, false, NULL);
+  ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
+                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
   EXPECT_FALSE(ok);
   EXPECT_TRUE(access(path, F_OK) == -1);
 }
@@ -1444,10 +1619,15 @@ static void test_dir_time_list() {
   EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
   EXPECT_EQ_INT((int)list.count, 2);
 
-  dir_time_list_apply(&list, root);
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->use_metadata = true;
+  cfg->preserve_times = true;
+  dir_metadata_list_apply(&list, root, cfg);
   struct stat st;
   EXPECT_EQ_INT(stat(sub, &st), 0);
   EXPECT_EQ_INT((int)st.st_mtime, 1000000000);
+  config_delete(cfg);
 
   dir_time_list_free(&list);
   EXPECT_EQ_INT((int)list.count, 0);
@@ -1694,6 +1874,9 @@ void test_file() {
   test_keep_dirlinks_secure_open();
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();
+  test_atomic_no_perms_preserves_destination_mode();
+  test_new_file_mode_never_group_other_writable();
+  test_special_fifo_mode_never_group_other_writable();
   test_inplace_overwrite_truncates_shorter_payload();
   test_inplace_refuses_fifo_destination();
   test_inplace_refuses_device_destination();

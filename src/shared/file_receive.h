@@ -48,10 +48,12 @@ typedef struct {
 } DirTimeList;
 
 /* Capture gate shared by the sender-side and receiver-side sinks: directory
- * metadata is accumulated only when --times/--metadata is in effect and
- * -O/--omit-dir-times does not suppress it.  Kept here, next to the accumulator
- * it guards, so both call sites express the same condition. */
-bool dir_times_should_capture(const Config* config);
+ * metadata is accumulated only when a directory attribute is requested
+ * (-p/--perms for directory modes, or -t/--times for directory mtimes with
+ * -O/--omit-dir-times not suppressing them) and metadata rides the wire.  Kept
+ * here, next to the accumulator it guards, so both call sites express the same
+ * condition. */
+bool dir_metadata_should_capture(const Config* config);
 
 void dir_time_list_init(DirTimeList* list);
 void dir_time_list_free(DirTimeList* list);
@@ -59,12 +61,15 @@ void dir_time_list_free(DirTimeList* list);
  * allocation failure OR when the cumulative entry/byte caps would be exceeded
  * (the caller fails the transfer). */
 bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata);
-/* Apply every accumulated directory's mtime (and atime when captured) beneath
- * `root_directory`, confined fd-relative.  Best-effort per entry: an absent
- * directory (an empty/pruned source dir that was deliberately not created) or a
- * non-directory at the path is skipped QUIETLY, an unreachable one with a
- * warning, and never fatal. */
-void dir_time_list_apply(const DirTimeList* list, const char* root_directory);
+/* Apply every accumulated directory's metadata beneath `root_directory`,
+ * confined fd-relative.  Times (mtime, plus atime when -U captured one) are
+ * applied only when config->preserve_times && !config->omit_dir_times; the mode
+ * (through --chmod when configured) is applied only when config->preserve_perms.
+ * Best-effort per entry: an absent directory (an empty/pruned source dir that
+ * was deliberately not created) or a non-directory at the path is skipped
+ * QUIETLY, an unreachable one with a warning, and never fatal. */
+void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory,
+                             const Config* config);
 
 /* A received delete-manifest frame: the keep-set (`keeps`, destination-relative
    paths the sender transferred/keeps) plus `protected`, destination-relative

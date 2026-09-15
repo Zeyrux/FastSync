@@ -2,6 +2,7 @@
 #include "xattr.h"
 #include "identity.h"
 #include "log.h"
+#include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
 #include "file_types.h"
@@ -371,11 +372,15 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
  * still applies mode/mtime where permitted.
  *
  * The OWNER leg additionally honors three policies:
- *   - an explicit ownership identity policy must be active (numeric-ids /
- *     chown / usermap / groupmap / copy-as).  --fake-super on its own only
- *     RECORDS the source owner; replaying that owner as a live chown without an
- *     explicit ownership opt-in would be an un-gated client-chosen-ownership
- *     primitive.
+ *   - an ownership identity policy must be active: the explicit flags
+ *     (--numeric-ids / --chown / --usermap / --groupmap / --copy-as) OR the
+ *     preserve-source -o/--owner / -g/--group requests.  --fake-super on its own
+ *     only RECORDS the source owner; replaying that owner as a live chown
+ *     without an ownership opt-in would be an un-gated client-chosen-ownership
+ *     primitive.  The owner and group sides are applied INDEPENDENTLY (through
+ *     identity_owner_requested()/identity_group_requested()), so a plain -o or
+ *     -g touches only the requested side and passes (uid_t)-1 / (gid_t)-1 for
+ *     the other.
  *   - --no-super (privilege_super_permitted() false) suppresses it even for a
  *     root receiver, exactly like the normal metadata identity path.
  *   - an active --copy-as is AUTHORITATIVE: the identity path already forced the
@@ -383,7 +388,7 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
  *     override it.  The xattr record is still stored/replayed for a later
  *     privileged restore; only the live chown is skipped.  Mode/mtime remain
  *     applied either way so unprivileged --fake-super still works. */
-bool fake_super_restore_fd(int fd) {
+bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
   if (fd < 0)
     return false;
   char record[128];
@@ -405,21 +410,40 @@ bool fake_super_restore_fd(int fd) {
      not hidden.  --no-super suppresses the owner leg even for root, and an
      active --copy-as is authoritative so its forced owner must not be
      overwritten by the recorded source owner. */
-  if (identity_active_enabled() && privilege_super_permitted() && !identity_copy_as_active() &&
-      fchown(fd, (uid_t)ul_uid, (gid_t)ul_gid) != 0 && errno != EPERM && errno != EACCES)
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore owner on destination file: %s",
-                strerror(errno));
-  /* Mode is applied through the same sanitization the normal metadata path
-     uses (metadata_mode): group/other write bits are never granted, so a
-     recorded source mode of 0666 restores as 0644 — identical to a non-fake-
-     super --preserve run, never a privilege-granting regression. */
-  if (fchmod(fd, (mode_t)(ul_mode & 0777U & ~(S_IWGRP | S_IWOTH))) != 0)
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mode on destination file: %s",
-                strerror(errno));
-  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-                              {.tv_sec = (time_t)mtime_sec, .tv_nsec = mtime_nsec}};
-  if (futimens(fd, times) != 0)
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mtime on destination file: %s",
-                strerror(errno));
+  if (identity_active_enabled() && privilege_super_permitted() && !identity_copy_as_active()) {
+    /* Apply only the requested side(s): an unchosen side is passed as -1 so the
+     * kernel leaves it exactly as-is. */
+    uid_t owner = identity_owner_requested() ? (uid_t)ul_uid : (uid_t)-1;
+    gid_t group = identity_group_requested() ? (gid_t)ul_gid : (gid_t)-1;
+    if (fchown(fd, owner, group) != 0 && errno != EPERM && errno != EACCES)
+      log_message(LOG_LEVEL_WARNING,
+                  "--fake-super: could not restore owner on destination file: %s", strerror(errno));
+  }
+  /* Mode is applied only when the per-attribute policy asks for it, through the
+     SAME shared helper the normal metadata path uses (metadata_mode_for_policy):
+     group/other write bits are never granted, so a recorded source mode of 0666
+     restores as 0644 — identical to a non-fake-super --preserve run, never a
+     privilege-granting regression — and the -E rule derives exec bits from the
+     destination's read bits exactly like file_restore_metadata_fd. */
+  if (policy.perms || policy.executability) {
+    struct stat cur;
+    mode_t want = 0;
+    if (fstat(fd, &cur) != 0) {
+      log_message(LOG_LEVEL_WARNING, "--fake-super: could not read destination mode: %s",
+                  strerror(errno));
+    } else if (metadata_mode_for_policy((mode_t)ul_mode, cur.st_mode, policy, &want)) {
+      if (fchmod(fd, want) != 0)
+        log_message(LOG_LEVEL_WARNING,
+                    "--fake-super: could not restore mode on destination file: %s",
+                    strerror(errno));
+    }
+  }
+  if (policy.times) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = (time_t)mtime_sec, .tv_nsec = mtime_nsec}};
+    if (futimens(fd, times) != 0)
+      log_message(LOG_LEVEL_WARNING,
+                  "--fake-super: could not restore mtime on destination file: %s", strerror(errno));
+  }
   return true;
 }

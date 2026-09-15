@@ -36,6 +36,13 @@ typedef struct {
   bool copy_as_set;
   int32_t copy_as_uid;
   int32_t copy_as_gid;
+  /* -o/--owner and -g/--group: preserve the source owner/group through the
+   * normal name/identity resolution path.  Split out of the former
+   * use_metadata bundle; unlike --numeric-ids/--chown/--usermap/--groupmap/-a
+   * these are a preserve-source request, not an arbitrary client-chosen owner,
+   * so they are tracked separately from the explicit ownership gate. */
+  bool preserve_owner;
+  bool preserve_group;
   bool set;
 } IdentityActive;
 
@@ -57,6 +64,8 @@ static void identity_active_reset(void) {
   g_identity.copy_as_set = false;
   g_identity.copy_as_uid = 0;
   g_identity.copy_as_gid = 0;
+  g_identity.preserve_owner = false;
+  g_identity.preserve_group = false;
   g_identity.set = false;
 }
 
@@ -77,6 +86,8 @@ bool identity_set_active(const Config* config) {
   g_identity.copy_as_set = config->copy_as_set;
   g_identity.copy_as_uid = config->copy_as_uid;
   g_identity.copy_as_gid = config->copy_as_gid;
+  g_identity.preserve_owner = config->preserve_owner;
+  g_identity.preserve_group = config->preserve_group;
   if (config->usermap_count > 0) {
     g_identity.usermap = calloc((size_t)config->usermap_count, sizeof(IdentityMap));
     if (!g_identity.usermap)
@@ -95,14 +106,22 @@ bool identity_set_active(const Config* config) {
   }
   g_identity.set = true;
   /* A root receiver would honor any client-supplied ownership request (a
-     --usermap/--groupmap/--chown/--copy-as, or raw ids under --numeric-ids).
-     Surface that prominently; a privileged daemon applying arbitrary client
-     ownership is a deliberate, opt-in choice the operator should be aware of. */
-  if (geteuid() == 0)
-    log_message(LOG_LEVEL_WARNING,
-                "identity mapping active and running as root: client-supplied "
-                "ownership (usermap/groupmap/chown/numeric-ids) will be honored; "
-                "run the daemon as an unprivileged user unless intended");
+     --usermap/--groupmap/--chown/--copy-as, or raw ids under --numeric-ids)
+     ONLY when super-user activities are permitted.  --no-super (or a daemon
+     veto that forced SUPER_MODE_OFF) forbids the chown even for root, so do
+     not claim the ownership will be honored in that case. */
+  if (geteuid() == 0) {
+    if (privilege_super_mode_permitted(g_identity.super_mode))
+      log_message(LOG_LEVEL_WARNING,
+                  "identity mapping active and running as root: client-supplied "
+                  "ownership (usermap/groupmap/chown/numeric-ids) will be honored; "
+                  "run the daemon as an unprivileged user unless intended");
+    else
+      log_message(LOG_LEVEL_WARNING,
+                  "identity mapping active and running as root, but super-user activities are "
+                  "disabled (--no-super): requested ownership will NOT be applied; run the "
+                  "daemon as an unprivileged user unless intended");
+  }
   /* --super explicitly requests super-user activities, but FastSync never
      elevates privileges: when the receiver is not already root the kernel will
      refuse those confined attempts and each is skipped per entry.  Warn exactly
@@ -148,15 +167,47 @@ bool identity_active_enabled(void) {
      identity flag must never silently apply client-chosen ownership. */
   return g_identity.set &&
          (g_identity.numeric_ids || g_identity.chown_uid_set || g_identity.chown_gid_set ||
-          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0 || g_identity.copy_as_set);
+          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0 || g_identity.copy_as_set ||
+          g_identity.preserve_owner || g_identity.preserve_group);
+}
+
+bool identity_owner_requested(void) {
+  return g_identity.set &&
+         (g_identity.copy_as_set || g_identity.chown_uid_set || g_identity.numeric_ids ||
+          g_identity.preserve_owner || g_identity.usermap_count > 0);
+}
+
+bool identity_group_requested(void) {
+  return g_identity.set &&
+         (g_identity.copy_as_set || g_identity.chown_gid_set || g_identity.numeric_ids ||
+          g_identity.preserve_group || g_identity.groupmap_count > 0);
 }
 
 bool identity_ownership_requested(const Config* config) {
   if (!config)
     return false;
-  /* Every value that makes the receiver act on a client-chosen owner, plus an
-   * explicit --super (super-user device-node activities).  Pure config, so the
-   * daemon gate can evaluate it before identity_set_active(). */
+  /* General-awareness predicate: every value that makes the receiver act on a
+   * client-chosen owner, plus an explicit --super (super-user device-node
+   * activities) and the preserve-source -o/-g requests.  Pure config, so callers
+   * can evaluate it before identity_set_active().  The daemon module gate uses
+   * the narrower identity_explicit_ownership_requested() below, which treats a
+   * plain -o/-g/-a as a preserve-source request rather than arbitrary
+   * client-chosen ownership. */
+  return config->numeric_ids || config->chown_uid_set || config->chown_gid_set ||
+         config->usermap_count > 0 || config->groupmap_count > 0 || config->copy_as_set ||
+         config->preserve_owner || config->preserve_group || config->fake_super ||
+         config->super_mode == SUPER_MODE_ON;
+}
+
+bool identity_explicit_ownership_requested(const Config* config) {
+  if (!config)
+    return false;
+  /* The narrow set the daemon gate refuses for a non-opted module: a request
+   * that lets the CLIENT choose an arbitrary owner/group (rather than preserve
+   * the source's own).  Deliberately EXCLUDES preserve_owner/preserve_group so a
+   * plain -a/-o/-g push is not refused; for those the gate instead forces
+   * super-user ownership activity off (no chown happens) unless the module has
+   * `client owner = yes`. */
   return config->numeric_ids || config->chown_uid_set || config->chown_gid_set ||
          config->usermap_count > 0 || config->groupmap_count > 0 || config->copy_as_set ||
          config->fake_super || config->super_mode == SUPER_MODE_ON;
@@ -567,9 +618,6 @@ int identity_parse_copy_as(Config* config, const char* value) {
   config->copy_as_set = true;
   config->copy_as_uid = uid;
   config->copy_as_gid = gid;
-  /* Ownership application needs the metadata path (the source uid/gid must be
-   * transmitted); imply it exactly like --chown/--usermap/--groupmap. */
-  config->use_metadata = true;
   ret = 0;
 
 done:
@@ -596,18 +644,13 @@ static bool identity_map_lookup(const IdentityMap* map, int count, int32_t sourc
  * paths.  Returns false when no side is to be changed. */
 static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, int32_t source_gid,
                                      uid_t* out_uid, gid_t* out_gid) {
-  bool set_uid = false;
-  bool set_gid = false;
-  uid_t uid = 0;
-  gid_t gid = 0;
-
   /* --copy-as (P7 Wave E) has the highest priority: it forces BOTH the owner
    * and group of every written entry to the requested ids, beating usermap /
    * groupmap / --chown / --numeric-ids and the best-effort name lookup.  Only
    * skip when the entry already carries exactly those ids. */
   if (g_identity.copy_as_set) {
-    uid = (uid_t)g_identity.copy_as_uid;
-    gid = (gid_t)g_identity.copy_as_gid;
+    uid_t uid = (uid_t)g_identity.copy_as_uid;
+    gid_t gid = (gid_t)g_identity.copy_as_gid;
     if (st->st_uid == uid && st->st_gid == gid)
       return false;
     *out_uid = uid;
@@ -615,61 +658,68 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
     return true;
   }
 
-  int32_t target;
-  if (identity_map_lookup(g_identity.usermap, g_identity.usermap_count, source_uid, &target)) {
-    uid = target == IDENTITY_CURRENT ? geteuid() : (uid_t)target;
-    set_uid = true;
-  } else if (g_identity.chown_uid_set) {
-    uid = g_identity.chown_uid == IDENTITY_CURRENT ? geteuid() : (uid_t)g_identity.chown_uid;
-    set_uid = true;
-  } else if (g_identity.numeric_ids) {
-    uid = (uid_t)source_uid;
-    set_uid = true;
-  } else {
-    /* Best-effort name mapping against the receiver's own database: if the
-     * transmitted (numeric) id resolves to a name present on this machine,
-     * re-resolve it.  On a shared-account host this is the identity operation;
-     * when the id has no name here, the user side is left alone. */
-    struct passwd* pw = getpwuid((uid_t)source_uid);
-    if (pw) {
-      const struct passwd* mapped = getpwnam(pw->pw_name);
-      if (mapped) {
-        uid = mapped->pw_uid;
-        set_uid = true;
-      }
-    }
-  }
-
-  if (identity_map_lookup(g_identity.groupmap, g_identity.groupmap_count, source_gid, &target)) {
-    gid = target == IDENTITY_CURRENT ? getegid() : (gid_t)target;
-    set_gid = true;
-  } else if (g_identity.chown_gid_set) {
-    gid = g_identity.chown_gid == IDENTITY_CURRENT ? getegid() : (gid_t)g_identity.chown_gid;
-    set_gid = true;
-  } else if (g_identity.numeric_ids) {
-    gid = (gid_t)source_gid;
-    set_gid = true;
-  } else {
-    struct group* gr = getgrgid((gid_t)source_gid);
-    if (gr) {
-      const struct group* mapped = getgrnam(gr->gr_name);
-      if (mapped) {
-        gid = mapped->gr_gid;
-        set_gid = true;
-      }
-    }
-  }
-
-  if (!set_uid && !set_gid)
+  /* Each side is resolved independently: -o/-g and the explicit identity flags
+   * request the owner/group respectively, and a side that is NOT requested must
+   * be left exactly as it is (`-1` to fchown on that side).  This is what lets
+   * plain -g change only the group, or -o only the owner. */
+  bool owner_requested = g_identity.chown_uid_set || g_identity.numeric_ids ||
+                         g_identity.preserve_owner || g_identity.usermap_count > 0;
+  bool group_requested = g_identity.chown_gid_set || g_identity.numeric_ids ||
+                         g_identity.preserve_group || g_identity.groupmap_count > 0;
+  if (!owner_requested && !group_requested)
     return false;
-  /* An unset side keeps the file's current id so the other side can change. */
-  if (!set_uid)
-    uid = st->st_uid;
-  if (!set_gid)
-    gid = st->st_gid;
-  /* Only change ownership when the target differs (avoid needless syscalls and
-   * any chance of clearing setuid/setgid on an already-correct entry). */
-  if (st->st_uid == uid && st->st_gid == gid)
+
+  int32_t target;
+  uid_t uid = (uid_t)-1;
+  gid_t gid = (gid_t)-1;
+
+  /* Priority (unchanged): usermap/groupmap > --chown > --numeric-ids (raw) >
+   * name mapping on the transmitted numeric id, with a raw-id fallback when the
+   * receiver has no name for that id. */
+  if (owner_requested) {
+    if (identity_map_lookup(g_identity.usermap, g_identity.usermap_count, source_uid, &target)) {
+      uid = target == IDENTITY_CURRENT ? geteuid() : (uid_t)target;
+    } else if (g_identity.chown_uid_set) {
+      uid = g_identity.chown_uid == IDENTITY_CURRENT ? geteuid() : (uid_t)g_identity.chown_uid;
+    } else if (g_identity.numeric_ids) {
+      uid = (uid_t)source_uid;
+    } else {
+      /* Best-effort name mapping against the receiver's own database.  When the
+       * transmitted (numeric) id has no name here, fall back to the raw numeric
+       * id so -o still preserves the source owner. */
+      struct passwd* pw = getpwuid((uid_t)source_uid);
+      if (pw) {
+        const struct passwd* mapped = getpwnam(pw->pw_name);
+        uid = mapped ? mapped->pw_uid : (uid_t)source_uid;
+      } else {
+        uid = (uid_t)source_uid;
+      }
+    }
+  }
+
+  if (group_requested) {
+    if (identity_map_lookup(g_identity.groupmap, g_identity.groupmap_count, source_gid, &target)) {
+      gid = target == IDENTITY_CURRENT ? getegid() : (gid_t)target;
+    } else if (g_identity.chown_gid_set) {
+      gid = g_identity.chown_gid == IDENTITY_CURRENT ? getegid() : (gid_t)g_identity.chown_gid;
+    } else if (g_identity.numeric_ids) {
+      gid = (gid_t)source_gid;
+    } else {
+      struct group* gr = getgrgid((gid_t)source_gid);
+      if (gr) {
+        const struct group* mapped = getgrnam(gr->gr_name);
+        gid = mapped ? mapped->gr_gid : (gid_t)source_gid;
+      } else {
+        gid = (gid_t)source_gid;
+      }
+    }
+  }
+
+  /* Only change ownership when a requested side actually differs (avoid
+   * needless syscalls and any chance of clearing setuid/setgid on an
+   * already-correct entry). */
+  bool changed = (owner_requested && uid != st->st_uid) || (group_requested && gid != st->st_gid);
+  if (!changed)
     return false;
   *out_uid = uid;
   *out_gid = gid;

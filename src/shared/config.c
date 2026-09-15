@@ -20,6 +20,8 @@
 static void config_set_defaults(Config* config) {
   config->scanner_threads = 0;
   config->metadata_explicitly_disabled = false;
+  config->preserve_perms_explicit_off = false;
+  config->preserve_times_explicit_off = false;
   config->show_progress = false;
   config->compression_threads = 0;
   config->ssh_port = 22;
@@ -194,7 +196,9 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->dry_run) && checksum_algo_valid(config->checksum_algo) &&
          identity_wire_valid(config) && valid_wire_bool(config->preserve_atimes) &&
          valid_wire_bool(config->preserve_crtimes) && valid_wire_bool(config->omit_dir_times) &&
-         valid_wire_bool(config->omit_link_times) && valid_wire_bool(config->munge_links) &&
+         valid_wire_bool(config->omit_link_times) && valid_wire_bool(config->preserve_perms) &&
+         valid_wire_bool(config->preserve_times) && valid_wire_bool(config->preserve_owner) &&
+         valid_wire_bool(config->preserve_group) && valid_wire_bool(config->munge_links) &&
          valid_wire_bool(config->keep_dirlinks) && valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
@@ -292,9 +296,29 @@ const char* config_invariants_error(const Config* config) {
            "timing; at most one may be given and each implies --delete";
   if (config->iconv_spec && !charset_spec_valid(config->iconv_spec))
     return "--iconv requires LOCAL[,REMOTE] charset names supported by iconv";
+  if ((config->preserve_perms || config->preserve_times || config->preserve_owner ||
+       config->preserve_group || config->preserve_atimes || config->preserve_crtimes ||
+       config->use_executability) &&
+      !config->use_metadata)
+    return "a preservation attribute requires metadata transmission";
   if (config->copy_as_set && !config->use_metadata)
     return "--copy-as requires metadata preservation and cannot be combined with --no-preserve";
   return NULL;
+}
+
+bool config_derived_use_metadata(const Config* config) {
+  if (!config)
+    return false;
+  if (config->preserve_perms || config->preserve_times || config->preserve_owner ||
+      config->preserve_group || config->preserve_atimes || config->preserve_crtimes ||
+      config->use_executability || config->preserve_xattrs || config->preserve_acls ||
+      config->fake_super || config->preserve_devices || config->preserve_specials ||
+      config->copy_devices || config->write_devices ||
+      (config->chmod_spec && config->chmod_spec[0]) || config->copy_as_set ||
+      config->chown_uid_set || config->chown_gid_set || config->usermap_count > 0 ||
+      config->groupmap_count > 0 || config->update)
+    return true;
+  return (config->use_incremental || config->use_delta) && !config->metadata_explicitly_disabled;
 }
 
 bool config_has_basis(const Config* config) {

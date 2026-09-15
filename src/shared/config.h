@@ -76,7 +76,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.21.0).
+ * Config wire-field table (single source of truth for protocol 2.22.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -216,7 +216,11 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   X(preserve_atimes, bool, false, BOOL)                                                            \
   X(preserve_crtimes, bool, false, BOOL)                                                           \
   X(omit_dir_times, bool, false, BOOL)                                                             \
-  X(omit_link_times, bool, false, BOOL)
+  X(omit_link_times, bool, false, BOOL)                                                            \
+  X(preserve_perms, bool, false, BOOL)                                                             \
+  X(preserve_times, bool, false, BOOL)                                                             \
+  X(preserve_owner, bool, false, BOOL)                                                             \
+  X(preserve_group, bool, false, BOOL)
 
 #define CONFIG_WIRE_SYMLINK_TRUST_FIELDS(X)                                                        \
   X(munge_links, bool, false, BOOL)                                                                \
@@ -266,6 +270,15 @@ typedef struct Config {
    * concern and is NEVER serialized into the wire config frame. */
   int scanner_threads;
   bool metadata_explicitly_disabled;
+  /* CLIENT-ONLY (never serialized; not in CONFIG_WIRE_FIELDS).  Set when the
+   * user explicitly turned an attribute off with --no-perms / --no-times (long
+   * or short form).  --incremental/--delta historically auto-enabled mode and
+   * mtime preservation; these flags let cli_finalize_config restore that
+   * behavior while still honoring the explicit per-attribute negation.  A
+   * later -p/-t re-enables the attribute directly, so the flag only prevents
+   * the incremental/delta implication, never a POSITIVE request. */
+  bool preserve_perms_explicit_off;
+  bool preserve_times_explicit_off;
   bool show_progress;
   int compression_threads;
   int ssh_port;
@@ -579,6 +592,22 @@ typedef struct Config {
   /* -O/--omit-dir-times: do not apply mtimes to directories. */
   /* omit_link_times */
   /* -J/--omit-link-times: do not apply times to symlinks. */
+  /* preserve_perms */
+  /* -p/--perms: preserve the source permission bits (mode).  One of the four
+   * per-attribute preservation flags split out of the former single
+   * use_metadata bundle; --chmod and -A/--acls also imply it. */
+  /* preserve_times */
+  /* -t/--times: preserve source modification times.  Split out of the former
+   * use_metadata bundle; --preserve and -a/--archive imply it. */
+  /* preserve_owner */
+  /* -o/--owner: preserve the source owner (uid).  Split out of the former
+   * use_metadata bundle; --usermap/--chown (and, when a uid is requested,
+   * --copy-as) imply it.  Owner application still requires receiver privilege
+   * and is gated separately by the identity flags. */
+  /* preserve_group */
+  /* -g/--group: preserve the source group (gid).  Split out of the former
+   * use_metadata bundle; --groupmap/--chown (and, when a gid is requested,
+   * --copy-as) imply it. */
   /* fake_super */
   /* --fake-super: receiver-only.  When set, each written file additionally gets
    * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
@@ -623,7 +652,7 @@ typedef struct Config {
    * fd-relative confinement (file_open_secure_parent, O_NOFOLLOW, root checks);
    * --super only permits an attempt that is already confined.  Crosses the wire
    * as a trailing int so the receiver can enforce the policy.  See
-   * privilege_super_permitted() and identity_ownership_requested() in
+   * privilege_super_permitted() and identity_explicit_ownership_requested() in
    * identity.h. */
   /* copy_as_set */
   /* --copy-as=USER[:GROUP] (P7 Wave E, protocol 2.18.0).  Safe-subset
@@ -803,8 +832,25 @@ typedef struct Config {
  * unknown status, or the unconsumed detail body, and the strict same-version
  * handshake (config_receive rejects a mismatched version before parsing
  * anything else) is what keeps a 2.21 client and a 2.20 server from ever
- * reaching that state. */
-#define PROTOCOL_VERSION "2.21.0"
+ * reaching that state.
+ *
+ * Preserve-Attribute Split Wave: 2.21.0 -> 2.22.0.
+ *
+ * WHY the bump, grounded in the wire: this wave splits the former single
+ * use_metadata bundle into four independent rsync-compatible preservation
+ * attributes (preserve_perms / preserve_times / preserve_owner /
+ * preserve_group) so -p/-t/-o/-g (and their --no-* negations) become real
+ * drop-in flags.  The binary config frame gains four serialized bools appended
+ * to CONFIG_WIRE_METADATA_TIMES_FIELDS after omit_link_times, in this fixed
+ * order: preserve_perms, preserve_times, preserve_owner, preserve_group.  Any
+ * config-frame layout change must bump the protocol version: a peer that does
+ * not parse the new trailing bytes would desynchronize on the frame boundary,
+ * and the strict same-version handshake (config_receive rejects a mismatched
+ * version before parsing anything else) is what keeps a 2.22 client and a 2.21
+ * server from ever reaching that state.  The fixed-width FileMetadata layout is
+ * UNCHANGED: the receiver still gates attribute application on use_metadata,
+ * which is now DERIVED from these attributes by config_derived_use_metadata(). */
+#define PROTOCOL_VERSION "2.22.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
@@ -918,6 +964,14 @@ bool config_has_valid_delete_timing(const Config* config);
  * validate_received_config() so the receiver enforces exactly the same
  * invariants it relies on (the server is the trust boundary). */
 const char* config_invariants_error(const Config* config);
+/* Single source of truth for the DERIVED transport bit (use_metadata): true
+ * when any configured preservation/ownership option requires the metadata
+ * frame to travel.  Returns false when no such option is set (a bare run).
+ * This is a pure predicate over the config; the client lowers it into
+ * Config->use_metadata at the end of parsing so every implication (devices,
+ * executability, identity maps, incremental/delta, ...) is centralized here
+ * rather than scattered as direct writes. */
+bool config_derived_use_metadata(const Config* config);
 /* True when at least one --compare-dest/--copy-dest/--link-dest was set. */
 bool config_has_basis(const Config* config);
 /* Append one basis-dir entry. Returns 0 on success, -1 on allocation failure. */

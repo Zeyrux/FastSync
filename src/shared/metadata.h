@@ -2,6 +2,7 @@
 #define METADATA_H
 
 #include "file.h"
+#include "file_attr.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -49,19 +50,31 @@ void metadata_to_buf(char** buf, const FileMetadata* m);
 FileMetadata* metadata_from_buf(const uint8_t* buf, size_t len);
 bool metadata_send(int file_descriptor, const FileMetadata* m);
 FileMetadata* metadata_receive(int file_descriptor, int* ok);
-void file_restore_metadata(const char* path, const FileMetadata* metadata,
-                           bool preserve_executability);
-bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability);
+void file_restore_metadata(const char* path, const FileMetadata* metadata, FileAttrPolicy policy);
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, FileAttrPolicy policy);
+
+/* Shared mode-policy helper: the single source of truth for the receiver's
+ * mode rule.  Given a source mode and the destination's CURRENT mode, returns
+ * true and stores the exact mode to apply in *out_mode when `policy` requests
+ * a change, or false when it requests neither --perms nor --executability (the
+ * caller then leaves the destination mode alone).  --perms wins over -E; the
+ * -E rule derives exec bits from the destination's read bits (rsync 3.4);
+ * group/other write is never granted from a client-supplied mode.  Shared by
+ * file_restore_metadata_fd() and the --fake-super replay so the two cannot
+ * diverge. */
+bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrPolicy policy,
+                              mode_t* out_mode);
 /* P7 Wave D: apply a SYMLINK's own metadata using no-follow primitives only
  * (utimensat/lchown/fchmodat with AT_SYMLINK_NOFOLLOW), confined fd-relative
- * under the authorized root.  `omit_link_times` (-J/--omit-link-times)
- * suppresses the timestamps; the link's mode/ownership are still attempted
- * (ownership stays gated by the identity policy and by default is not applied).
+ * under the authorized root.  The link's mode is applied only when policy.perms;
+ * policy.times (further suppressed by `omit_link_times` for -J) applies the
+ * mtime with policy.atimes controlling the atime slot; ownership stays gated by
+ * the identity policy and by default is not applied.
  * A null metadata or an unfollowable parent is a harmless no-op.  Returns false
  * only when a REQUIRED --copy-as ownership application failed, so the caller can
  * report the entry as failed instead of claiming a wrong-owner success. */
 bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
-                                   bool omit_link_times);
+                                   FileAttrPolicy policy, bool omit_link_times);
 
 /* Compare timestamps using rsync's whole-second modification window. */
 bool metadata_mtime_matches(time_t left_sec, long left_nsec, time_t right_sec, long right_nsec,

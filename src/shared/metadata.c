@@ -209,22 +209,55 @@ FileMetadata* metadata_receive(int file_descriptor, int* ok) {
   return m;
 }
 
-static mode_t metadata_mode(const FileMetadata* metadata, mode_t current_mode,
-                            bool preserve_executability) {
+bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrPolicy policy,
+                              mode_t* out_mode) {
   const mode_t execute_bits = S_IXUSR | S_IXGRP | S_IXOTH;
-  if (preserve_executability)
-    return (current_mode & 0777 & ~execute_bits) | (metadata->mode & execute_bits);
-  return metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+  if (policy.perms) {
+    /* Group/other write is never granted from a client-supplied mode. */
+    *out_mode = source_mode & 0777 & ~(S_IWGRP | S_IWOTH);
+    return true;
+  }
+  if (policy.executability) {
+    /* -E/--executability (rsync 3.4 rule): do NOT copy the source's execute
+     * bits per class.  If the source is executable at all, derive the execute
+     * bits from the DESTINATION's own read bits (so a class that can read may
+     * execute); otherwise clear every execute bit.  This runs on the
+     * destination-derived base (pre-existing dest mode, or source&~umask for a
+     * new file), and leaves special bits untouched.  --perms wins when both are
+     * set (handled above). */
+    mode_t base = current_mode & 0777;
+    if (source_mode & 0111)
+      *out_mode = base | ((base & 0444) >> 2);
+    else
+      *out_mode = base & ~execute_bits;
+    return true;
+  }
+  /* Neither requested: no source mode is applied at all. */
+  return false;
 }
 
-void file_restore_metadata(const char* path, const FileMetadata* metadata,
-                           bool preserve_executability) {
+FileAttrPolicy file_attr_policy_from_config(const Config* config) {
+  FileAttrPolicy policy = {false, false, false, false};
+  if (config) {
+    policy.perms = config->preserve_perms;
+    policy.times = config->preserve_times;
+    policy.atimes = config->preserve_atimes;
+    policy.executability = config->use_executability;
+  }
+  return policy;
+}
+
+void file_restore_metadata(const char* path, const FileMetadata* metadata, FileAttrPolicy policy) {
   if (metadata == NULL)
     return;
-  struct stat current;
-  mode_t current_mode = stat(path, &current) == 0 ? current.st_mode : 0;
-  mode_t safe_mode = metadata_mode(metadata, current_mode, preserve_executability);
-  if (chmod(path, safe_mode) != 0) {
+  bool apply_mode = false;
+  mode_t safe_mode = 0;
+  if (policy.perms || policy.executability) {
+    struct stat current;
+    mode_t current_mode = stat(path, &current) == 0 ? current.st_mode : 0;
+    apply_mode = metadata_mode_for_policy(metadata->mode, current_mode, policy, &safe_mode);
+  }
+  if (apply_mode && chmod(path, safe_mode) != 0) {
     char* escaped_path = output_escape(path, log_get_8_bit_output());
     log_message(LOG_LEVEL_WARNING, "Failed to chmod %s: %s",
                 escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
@@ -232,14 +265,23 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
   }
   /* Never apply client-supplied ownership.  The descriptor API below is the
      receiver write path; retain this legacy API only for compatibility. */
-  struct timespec times[2];
-  times[0].tv_sec = 0;
-  times[0].tv_nsec = UTIME_OMIT;
-  times[1].tv_sec = metadata->mtime_sec;
-  times[1].tv_nsec = metadata->mtime_nsec;
-  if (metadata->atime_valid) {
-    times[0].tv_sec = metadata->atime_sec;
-    times[0].tv_nsec = metadata->atime_nsec;
+  if (policy.times || (policy.atimes && metadata->atime_valid)) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = 0, .tv_nsec = UTIME_OMIT}};
+    if (policy.times) {
+      times[1].tv_sec = metadata->mtime_sec;
+      times[1].tv_nsec = metadata->mtime_nsec;
+    }
+    if (policy.atimes && metadata->atime_valid) {
+      times[0].tv_sec = metadata->atime_sec;
+      times[0].tv_nsec = metadata->atime_nsec;
+    }
+    if (utimensat(AT_FDCWD, path, times, 0) != 0) {
+      char* escaped_path = output_escape(path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+      free(escaped_path);
+    }
   }
   if (metadata->crtime_valid) {
     log_message(LOG_LEVEL_DEBUG,
@@ -247,16 +289,10 @@ void file_restore_metadata(const char* path, const FileMetadata* metadata,
                 "setter exists",
                 (long long)metadata->crtime_sec, metadata->crtime_nsec, path);
   }
-  if (utimensat(AT_FDCWD, path, times, 0) != 0) {
-    char* escaped_path = output_escape(path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_WARNING, "Failed to set timestamps on %s: %s",
-                escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-    free(escaped_path);
-  }
 }
 
 bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadata,
-                                   bool omit_link_times) {
+                                   FileAttrPolicy policy, bool omit_link_times) {
   if (path == NULL || metadata == NULL)
     return !identity_copy_as_active();
   char* leaf = NULL;
@@ -269,18 +305,25 @@ bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadat
      best-effort. */
   bool owned = identity_apply_ownership_link(parent_fd, leaf, (int32_t)metadata->uid,
                                              (int32_t)metadata->gid);
-  /* Symlink mode: not settable on Linux (fchmodat AT_SYMLINK_NOFOLLOW returns
-     EOPNOTSUPP/ENOTSUP); attempt it for platforms that support it and quietly
-     ignore the unsupported case so the transfer never fails over it. */
-  mode_t link_mode = metadata->mode & 0777;
-  if (fchmodat(parent_fd, leaf, link_mode, AT_SYMLINK_NOFOLLOW) != 0 && errno != EOPNOTSUPP &&
-      errno != ENOTSUP && errno != ENOSYS) {
-    log_message(LOG_LEVEL_DEBUG, "Could not set symlink mode on %s: %s", path, strerror(errno));
+  /* Symlink mode: only when -p is in effect.  It is not settable on Linux
+     (fchmodat AT_SYMLINK_NOFOLLOW returns EOPNOTSUPP/ENOTSUP); attempt it for
+     platforms that support it and quietly ignore the unsupported case so the
+     transfer never fails over it. */
+  if (policy.perms) {
+    mode_t link_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+    if (fchmodat(parent_fd, leaf, link_mode, AT_SYMLINK_NOFOLLOW) != 0 && errno != EOPNOTSUPP &&
+        errno != ENOTSUP && errno != ENOSYS) {
+      log_message(LOG_LEVEL_DEBUG, "Could not set symlink mode on %s: %s", path, strerror(errno));
+    }
   }
-  if (!omit_link_times) {
+  if (!omit_link_times && (policy.times || (policy.atimes && metadata->atime_valid))) {
     struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-                                {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
-    if (metadata->atime_valid) {
+                                {.tv_sec = 0, .tv_nsec = UTIME_OMIT}};
+    if (policy.times) {
+      times[1].tv_sec = metadata->mtime_sec;
+      times[1].tv_nsec = metadata->mtime_nsec;
+    }
+    if (policy.atimes && metadata->atime_valid) {
       times[0].tv_sec = metadata->atime_sec;
       times[0].tv_nsec = metadata->atime_nsec;
     }
@@ -296,19 +339,22 @@ bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadat
   return owned;
 }
 
-bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserve_executability) {
+bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, FileAttrPolicy policy) {
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;
-  struct stat current;
-  if (fstat(fd, &current) != 0)
-    return false;
-  mode_t safe_mode = metadata_mode(metadata, current.st_mode, preserve_executability);
-  if (fchmod(fd, safe_mode) != 0)
-    ok = false;
+  if (policy.perms || policy.executability) {
+    struct stat current;
+    if (fstat(fd, &current) != 0)
+      return false;
+    mode_t safe_mode = 0;
+    bool apply_mode = metadata_mode_for_policy(metadata->mode, current.st_mode, policy, &safe_mode);
+    if (apply_mode && fchmod(fd, safe_mode) != 0)
+      ok = false;
+  }
   /* Client uid/gid values are deliberately not authoritative UNLESS the client
      explicitly opted in with an identity flag (--numeric-ids / --usermap /
-     --groupmap / --chown).  identity_apply_ownership is the controlled,
+     --groupmap / --chown / -o/-g).  identity_apply_ownership is the controlled,
      privilege-gated path: it consults the negotiated policy, resolves the
      target ids, and applies them via an fd-relative fchown() that is confined
      to the just-written file (EPERM/EACCES are logged, never fatal) -- EXCEPT
@@ -319,12 +365,6 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
      ownership. */
   if (!identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid))
     ok = false;
-  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-                              {.tv_sec = metadata->mtime_sec, .tv_nsec = metadata->mtime_nsec}};
-  if (metadata->atime_valid) {
-    times[0].tv_sec = metadata->atime_sec;
-    times[0].tv_nsec = metadata->atime_nsec;
-  }
   /* --crtimes captures and transmits the source birth time, but there is no
    * portable way to set a birth time (utimensat can only set atime/mtime), so
    * the receiver deliberately does NOT apply it.  This is explicit, honest
@@ -335,7 +375,19 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, bool preserv
                 "crtime (birth time) %lld.%09ld transmitted but not applied: no portable setter",
                 (long long)metadata->crtime_sec, metadata->crtime_nsec);
   }
-  if (futimens(fd, times) != 0)
-    ok = false;
+  if (policy.times || (policy.atimes && metadata->atime_valid)) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = 0, .tv_nsec = UTIME_OMIT}};
+    if (policy.times) {
+      times[1].tv_sec = metadata->mtime_sec;
+      times[1].tv_nsec = metadata->mtime_nsec;
+    }
+    if (policy.atimes && metadata->atime_valid) {
+      times[0].tv_sec = metadata->atime_sec;
+      times[0].tv_nsec = metadata->atime_nsec;
+    }
+    if (futimens(fd, times) != 0)
+      ok = false;
+  }
   return ok;
 }

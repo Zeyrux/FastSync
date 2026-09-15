@@ -8,8 +8,8 @@
 - **Release PR #284 (`dev` -> `main`)** open, CI green (run 553).
   `main` is protected: it needs review/approval to merge.
   https://gitea.tap-tap.win/TapTap/FastSync/pulls/284
-- **`PROTOCOL_VERSION` = `"2.21.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.21.0)`.
+- **`PROTOCOL_VERSION` = `"2.22.0"`** (`src/shared/config.h`); CMake
+  `project(FastFileTransfer VERSION 2.22.0)`.
 - Working tree clean; no wave worktrees remain.
 
 ## What landed this session
@@ -37,6 +37,7 @@
 4. **Tooling:** benchmark accuracy (data mix, verification, percentiles, `tc`,
    `build-bench/`, `--warm` mode); `shell.nix` full toolchain and no build-on-entry;
    docs state push-only / remote-source unsupported.
+5. **Preserve-attribute split (protocol 2.22.0)** landed on `feat/preserve-attr-split`: per-attribute `-p/-t/-o/-g` + `--no-*` negations, `-a` = `-rlptgoD`, and the 2.21.0 → 2.22.0 wire bump.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).

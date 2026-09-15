@@ -28,6 +28,17 @@ void file_metadata_destroy(void* metadata);
 /* --open-noatime process-wide sender policy; see file.c. */
 void file_set_open_noatime(bool enable);
 bool file_get_open_noatime(void);
+/* Capture the process umask ONCE, before any threads are created.  Call this at
+ * the very top of main() in both entry points so the cached value is read while
+ * the process is still single-threaded: reading the umask needs a get+set round
+ * trip (umask(0); umask(old)), which would race against receiver threads
+ * creating files if it happened during the first write.  Idempotent and safe to
+ * call more than once. */
+void file_umask_capture(void);
+/* Process-wide umask, captured once (thread-safe).  Used to derive the mode of
+ * a brand-new destination like rsync: source_mode & 0777 & ~umask.  Falls back
+ * to file_umask_capture() (behind pthread_once) if capture was never called. */
+unsigned file_process_umask(void);
 /* Open `path` read-only for transfer, honouring --open-noatime when set. */
 int file_open_for_read(const char* path);
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
@@ -90,22 +101,21 @@ int file_open_private_dir(const char* dir_path);
    behavior.  --inplace writes never use temp_dir. */
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
-                         bool preserve_executability, const char* temp_dir);
+                         FileAttrPolicy policy, const char* temp_dir);
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
                                     bool preallocate, const FileMetadata* metadata,
-                                    bool preserve_executability, bool use_fsync,
-                                    const char* temp_dir);
+                                    FileAttrPolicy policy, bool use_fsync, const char* temp_dir);
 /* With update enabled, an existing newer destination is left untouched.  The
    check is descriptor-based for inplace writes; atomic replacement still has
    an unavoidable final rename race without filesystem locking. */
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
                                 bool inplace, bool sparse, bool preallocate,
-                                const FileMetadata* metadata, bool preserve_executability,
+                                const FileMetadata* metadata, FileAttrPolicy policy,
                                 const char* temp_dir);
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse, bool preallocate,
-                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const FileMetadata* metadata, FileAttrPolicy policy,
                                     const char* temp_dir);
 /* Receiver write-path variant that also applies per-file xattrs (-X/-A) and the
  * --fake-super stat xattr fd-relative before the final rename.  `update` /
@@ -113,10 +123,9 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
  * enables --partial best-effort retention of a failed write's temp. */
 bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
                                bool inplace, bool sparse, bool preallocate,
-                               const FileMetadata* metadata, bool preserve_executability,
-                               bool update, bool no_replace, bool use_fsync,
-                               const FileXattrList* xattrs, bool fake_super, bool keep_partial,
-                               const char* temp_dir);
+                               const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+                               bool no_replace, bool use_fsync, const FileXattrList* xattrs,
+                               bool fake_super, bool keep_partial, const char* temp_dir);
 /* Atomic --link-dest install: replace `path` with a hard link to `basis_path`
    (via a temp name + rename); fall back to a byte-identical local copy from
    `data` when the link is impossible (EXDEV/EPERM/unsupported filesystem).
@@ -125,15 +134,15 @@ bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long
    never re-allocated). */
 bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
                               unsigned long long data_size, bool preallocate,
-                              const FileMetadata* metadata, bool preserve_executability,
-                              bool use_fsync, const char* temp_dir);
+                              const FileMetadata* metadata, FileAttrPolicy policy, bool use_fsync,
+                              const char* temp_dir);
 /* Like file_to_disk_secure_link, but the byte-copy fallback also applies the
  * per-file xattrs (-X/-A) and --fake-super stat xattr (fd-relative).  On a
  * successful hard link no attributes are applied (the shared inode already
  * carries the basis's). */
 bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, const void* data,
                                     unsigned long long data_size, bool preallocate,
-                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const FileMetadata* metadata, FileAttrPolicy policy,
                                     bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                     const char* temp_dir);
 

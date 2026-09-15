@@ -4,6 +4,46 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [2.22.0] - 2026-09-15
+
+### Added
+
+- **Per-attribute metadata preservation (protocol 2.22.0).** The former single
+  metadata bundle is split into four independent, rsync-compatible flags:
+  `-p/--perms`, `-t/--times`, `-o/--owner`, and `-g/--group`, each applied
+  independently on the receiver, with negations `--no-perms`/`--no-times`/
+  `--no-owner`/`--no-group` (short `--no-p`/`--no-t`/`--no-o`/`--no-g`) and
+  `--no-preserve` clearing all four. `-a/--archive` is now full rsync
+  `-rlptgoD` (owner and group included; their application stays
+  privilege-gated). `-A/--acls` and `--chmod` imply `-p`, `-X/--xattrs` does
+  not, `-E/--executability` sets only executability, and `-U`/`-N` do not imply
+  `-t`. `--incremental`/`--delta` still auto-preserve perms+times unless the
+  user explicitly negated them.
+- Receiver applies directory modes under `-p` (at the end of the transfer,
+  alongside the deferred directory times) and symlink mode under `-p`; `-O`
+  suppresses directory times only.
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.21.0 → 2.22.0`: the binary config frame gains
+  four appended booleans (`preserve_perms`/`preserve_times`/`preserve_owner`/
+  `preserve_group`) after `omit_link_times`. The fixed-width `FileMetadata`
+  layout is unchanged; the receiver derives the metadata-frame gate
+  (`use_metadata`) from the four attributes.
+
+### Notes
+
+- Documented divergences from rsync: a client-supplied mode never grants
+  group/other write (`S_IWGRP|S_IWOTH` are stripped for files, directories,
+  symlinks, and specials; rsync's `-p` preserves them exactly); a brand-new file
+  without `-p` gets `source_mode & ~umask` (sanitized) when metadata is present,
+  else the historical fixed `0644`; `--chmod` implies `-p` (rsync does not);
+  `-o`/`-g` map by name on the receiver with a raw-numeric fallback (only
+  numeric ids cross the wire); and a daemon module without `client owner = yes`
+  does not refuse a plain `-a`/`-o`/`-g` but forces super-user activities off,
+  applies no ownership, and logs a warning (explicit `--chown`/`--usermap`/
+  `--groupmap`/`--numeric-ids`/`--copy-as`/`--super` are still refused).
+
 ## [2.21.0] - 2026-09-14
 
 ### Added
