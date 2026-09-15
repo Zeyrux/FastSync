@@ -801,8 +801,11 @@ static void test_parse_args_rejects_invalid_modify_window() {
 }
 
 static void test_parse_args_max_alloc_sizes() {
-  const char* values[] = {"1", "4K", "2m", "3G", "1T", "1P", "1E", "512B"};
-  const unsigned long long expected[] = {1,
+  /* "0" is rsync's "no alloc limit" sentinel: it must parse to 0, not be
+   * rejected. */
+  const char* values[] = {"0", "1", "4K", "2m", "3G", "1T", "1P", "1E", "512B"};
+  const unsigned long long expected[] = {0,
+                                         1,
                                          4ULL * 1024,
                                          2ULL * 1024 * 1024,
                                          3ULL * 1024 * 1024 * 1024,
@@ -830,8 +833,8 @@ static void test_parse_args_max_alloc_sizes() {
 }
 
 static void test_parse_args_rejects_invalid_max_alloc() {
-  const char* values[] = {"0",  "-1",  "+1",  " 1",   "1 ",
-                          "1Z", "1K2", "1 K", "1\tK", "18446744073709551615K"};
+  const char* values[] = {
+      "-1", "+1", " 1", "1 ", "1Z", "1K2", "1 K", "1\tK", "18446744073709551615K"};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--max-alloc", (char*)values[i], "/src", "/dst"};
@@ -1413,7 +1416,8 @@ static void test_parse_args_checksum_choice_equals_forms() {
 /* An algorithm FastSync does not support must be rejected, never a silent
    no-op. */
 static void test_parse_args_checksum_choice_rejects_unsupported() {
-  static const char* const bad[] = {"md4", "sha256", "crc32", "none", "bogus"};
+  static const char* const bad[] = {"md4",  "sha1",  "sha256",    "crc32",
+                                    "none", "bogus", "xxh64,md5", "xxhash:md5"};
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--checksum-choice", (char*)bad[i], "/src", "/dst"};
@@ -1422,6 +1426,123 @@ static void test_parse_args_checksum_choice_rejects_unsupported() {
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+}
+
+/* xxh3/xxh128 are accepted; "auto" keeps the default algorithm. */
+static void test_parse_args_checksum_choice_new_algos() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum-choice=xxh3", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH3);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--cc=xxh128", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH128);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--checksum-choice=auto", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH64);
+  config_delete(cfg);
+}
+
+/* -c/--checksum must run the per-file content-check handshake (FastSync's
+ * --incremental), but unlike --incremental it must NOT auto-preserve -t/-p. */
+static void test_parse_args_checksum_implies_incremental_only() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-c", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->checksum);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_FALSE(cfg->preserve_perms);
+  config_delete(cfg);
+}
+
+/* rsync's --no-whole-file spelling clears -W. */
+static void test_parse_args_no_whole_file() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-W", "--no-whole-file", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->whole_file);
+  config_delete(cfg);
+}
+
+/* --timeout/--contimeout accept 0 (rsync default: disabled) and the
+ * --no-timeout/--no-contimeout spellings clear them. */
+static void test_parse_args_timeout_zero_and_no_forms() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--timeout=0", "--contimeout=0", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->timeout, 0);
+  EXPECT_EQ_INT(cfg->contimeout, 0);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--timeout", "45", "--contimeout", "90", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->timeout, 45);
+  EXPECT_EQ_INT(cfg->contimeout, 90);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--timeout=30", "--no-timeout", "--no-contimeout", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->timeout, 0);
+  EXPECT_EQ_INT(cfg->contimeout, 0);
+  config_delete(cfg);
+}
+
+/* rsync's --compress-choice choices FastSync does not implement are rejected by
+ * name; zstd/none/auto are accepted. */
+static void test_parse_args_compress_choice_parity() {
+  static const char* const good[] = {"zstd", "none", "auto"};
+  for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--compress-choice", (char*)good[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    config_delete(cfg);
+  }
+  static const char* const bad[] = {"lz4", "zlib", "zlibx", "bogus"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--compress-choice", (char*)bad[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
+/* -M/--remote-option is SSH-only: a daemon or local TCP destination must reject
+ * it instead of silently ignoring it. */
+static void test_validate_config_remote_option_requires_ssh() {
+  Config* cfg = valid_client_config();
+  cfg->remote_options = malloc(sizeof(char*));
+  cfg->remote_options[0] = str_dup("--allow-delete");
+  cfg->remote_option_count = 1;
+  cfg->transport = TRANSPORT_TCP;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->transport = TRANSPORT_SSH;
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
 }
 
 /* --checksum-seed parses as a 64-bit non-negative integer (space and = forms);
@@ -1442,12 +1563,13 @@ static void test_parse_args_checksum_seed() {
   EXPECT_TRUE(cfg->checksum_seed == 12345ULL);
   config_delete(cfg);
 
-  /* 0 is a valid (and default) seed. */
+  /* An explicit seed of 0 is randomized per transfer (rsync behavior), so the
+   * parsed config must come back non-zero. */
   cfg = config_create();
   char* argv3[] = {"fastsync", "--checksum-seed=0", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->checksum_seed == 0ULL);
+  EXPECT_TRUE(cfg->checksum_seed != 0ULL);
   config_delete(cfg);
 
   /* Non-numeric and negative seeds are rejected. */
@@ -1469,7 +1591,7 @@ static void test_parse_args_checksum_seed() {
 }
 
 static void test_parse_args_rejects_unsafe_negation() {
-  static const char* const options[] = {"--no-archive", "--no-timeout", "--no-unknown"};
+  static const char* const options[] = {"--no-archive", "--no-unknown"};
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
@@ -3973,6 +4095,12 @@ void test_client_cli() {
   test_parse_args_checksum_choice_requires_value();
   test_parse_args_checksum_choice_equals_forms();
   test_parse_args_checksum_choice_rejects_unsupported();
+  test_parse_args_checksum_choice_new_algos();
+  test_parse_args_checksum_implies_incremental_only();
+  test_parse_args_no_whole_file();
+  test_parse_args_timeout_zero_and_no_forms();
+  test_parse_args_compress_choice_parity();
+  test_validate_config_remote_option_requires_ssh();
   test_parse_args_checksum_seed();
   test_parse_args_temp_dir();
   test_parse_args_delay_updates();

@@ -74,8 +74,6 @@ static void test_stop_at_parse_now_plus() {
 static void test_stop_at_parse_invalid() {
   time_t now = 1700000000;
   time_t deadline = 0;
-  EXPECT_FALSE(stop_parse_at_time("12", now, &deadline));
-  EXPECT_FALSE(stop_parse_at_time("12:3", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("1234", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("12:30:5", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("12:30:5x", now, &deadline));
@@ -98,6 +96,54 @@ static void test_stop_at_parse_invalid() {
   EXPECT_FALSE(stop_parse_at_time("abc", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time("", now, &deadline));
   EXPECT_FALSE(stop_parse_at_time(NULL, now, &deadline));
+}
+
+/* rsync's flexible date form for --stop-at (y-m-dTh:m, with / separators and
+ * abbreviable fields). */
+static void test_stop_at_parse_date_forms() {
+  time_t now = 1700000000;
+  time_t deadline = 0;
+  struct tm t;
+
+  EXPECT_TRUE(stop_parse_at_time("2030-12-31T23:59", now, &deadline));
+  EXPECT_NOT_NULL(localtime_r(&deadline, &t));
+  EXPECT_EQ_INT(t.tm_year + 1900, 2030);
+  EXPECT_EQ_INT(t.tm_mon + 1, 12);
+  EXPECT_EQ_INT(t.tm_mday, 31);
+  EXPECT_EQ_INT(t.tm_hour, 23);
+  EXPECT_EQ_INT(t.tm_min, 59);
+
+  EXPECT_TRUE(stop_parse_at_time("2030/12/31T23:59", now, &deadline));
+  EXPECT_NOT_NULL(localtime_r(&deadline, &t));
+  EXPECT_EQ_INT(t.tm_year + 1900, 2030);
+  EXPECT_EQ_INT(t.tm_mon + 1, 12);
+  EXPECT_EQ_INT(t.tm_mday, 31);
+
+  EXPECT_TRUE(stop_parse_at_time("2030-12-31", now, &deadline));
+  EXPECT_NOT_NULL(localtime_r(&deadline, &t));
+  EXPECT_EQ_INT(t.tm_year + 1900, 2030);
+  EXPECT_EQ_INT(t.tm_hour, 0);
+  EXPECT_EQ_INT(t.tm_min, 0);
+
+  /* Partial forms resolve to the next matching point in the future. */
+  EXPECT_TRUE(stop_parse_at_time(":59", now, &deadline));
+  EXPECT_TRUE(deadline > now);
+  EXPECT_NOT_NULL(localtime_r(&deadline, &t));
+  EXPECT_EQ_INT(t.tm_min, 59);
+
+  EXPECT_TRUE(stop_parse_at_time("1-30", now, &deadline));
+  EXPECT_TRUE(deadline > now);
+  EXPECT_NOT_NULL(localtime_r(&deadline, &t));
+  EXPECT_EQ_INT(t.tm_mon + 1, 1);
+  EXPECT_EQ_INT(t.tm_mday, 30);
+
+  EXPECT_TRUE(stop_parse_at_time("1", now, &deadline));
+  EXPECT_TRUE(deadline > now);
+  EXPECT_NOT_NULL(localtime_r(&deadline, &t));
+  EXPECT_EQ_INT(t.tm_mday, 1);
+
+  /* Seconds are not part of rsync's date form. */
+  EXPECT_FALSE(stop_parse_at_time("2030-12-31T23:59:59", now, &deadline));
 }
 
 static void test_stop_deadline_latency() {
@@ -145,6 +191,7 @@ void test_stop(void) {
   test_stop_after_parse_invalid();
   test_stop_at_parse_hhmm();
   test_stop_at_parse_now_plus();
+  test_stop_at_parse_date_forms();
   test_stop_at_parse_invalid();
   test_stop_deadline_latency();
 }

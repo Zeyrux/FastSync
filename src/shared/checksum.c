@@ -21,6 +21,20 @@ bool checksum_digest(ChecksumAlgo algo, uint64_t seed, const void* data, size_t 
     return true;
   }
 
+  if (algo == CHECKSUM_ALGO_XXH3) {
+    uint64_t digest = XXH3_64bits_withSeed(data, size, seed);
+    memcpy(out, &digest, sizeof(digest));
+    *out_len = sizeof(digest);
+    return true;
+  }
+
+  if (algo == CHECKSUM_ALGO_XXH128) {
+    XXH128_hash_t digest = XXH3_128bits_withSeed(data, size, seed);
+    memcpy(out, &digest, sizeof(digest));
+    *out_len = sizeof(digest);
+    return true;
+  }
+
   if (algo == CHECKSUM_ALGO_MD5) {
     /* md5 takes no seed; the caller's seed is deliberately ignored (documented
      * in RSYNC_COMPAT.md).  OpenSSL's one-shot EVP_Digest needs a non-NULL
@@ -45,6 +59,10 @@ int checksum_algo_from_name(const char* name) {
     return -1;
   if (strcasecmp(name, "xxh64") == 0 || strcasecmp(name, "xxhash") == 0)
     return (int)CHECKSUM_ALGO_XXH64;
+  if (strcasecmp(name, "xxh3") == 0)
+    return (int)CHECKSUM_ALGO_XXH3;
+  if (strcasecmp(name, "xxh128") == 0)
+    return (int)CHECKSUM_ALGO_XXH128;
   if (strcasecmp(name, "md5") == 0)
     return (int)CHECKSUM_ALGO_MD5;
   return -1;
@@ -54,6 +72,10 @@ const char* checksum_algo_name(ChecksumAlgo algo) {
   switch (algo) {
   case CHECKSUM_ALGO_XXH64:
     return "xxh64";
+  case CHECKSUM_ALGO_XXH3:
+    return "xxh3";
+  case CHECKSUM_ALGO_XXH128:
+    return "xxh128";
   case CHECKSUM_ALGO_MD5:
     return "md5";
   }
@@ -61,13 +83,16 @@ const char* checksum_algo_name(ChecksumAlgo algo) {
 }
 
 bool checksum_algo_valid(int algo) {
-  return algo == (int)CHECKSUM_ALGO_XXH64 || algo == (int)CHECKSUM_ALGO_MD5;
+  return algo == (int)CHECKSUM_ALGO_XXH64 || algo == (int)CHECKSUM_ALGO_MD5 ||
+         algo == (int)CHECKSUM_ALGO_XXH3 || algo == (int)CHECKSUM_ALGO_XXH128;
 }
 
 uint8_t checksum_digest_len(ChecksumAlgo algo) {
   switch (algo) {
   case CHECKSUM_ALGO_XXH64:
+  case CHECKSUM_ALGO_XXH3:
     return 8;
+  case CHECKSUM_ALGO_XXH128:
   case CHECKSUM_ALGO_MD5:
     return 16;
   }

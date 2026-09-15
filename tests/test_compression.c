@@ -64,6 +64,21 @@ static void test_skip_compress_suffix_matching() {
   EXPECT_TRUE(compression_should_skip_with_suffixes("backup.TAR.GZ", suffixes, 2));
   EXPECT_FALSE(compression_should_skip_with_suffixes("notes.txt", suffixes, 2));
   EXPECT_FALSE(compression_should_skip_with_suffixes("archive.zip", suffixes, 0));
+
+  /* A user suffix may omit the leading dot (rsync's spelling). */
+  char* bare[] = {"zip", "gz"};
+  EXPECT_TRUE(compression_should_skip_with_suffixes("archive.zip", bare, 2));
+  EXPECT_TRUE(compression_should_skip_with_suffixes("x.GZ", bare, 2));
+
+  /* No user list (count < 0) selects rsync 3.4.1's built-in default list. */
+  EXPECT_TRUE(compression_should_skip_with_suffixes("movie.mp4", NULL, -1));
+  EXPECT_TRUE(compression_should_skip_with_suffixes("archive.TAR.GZ", NULL, -1));
+  EXPECT_TRUE(compression_should_skip_with_suffixes("photo.jpeg", NULL, -1));
+  EXPECT_TRUE(compression_should_skip_with_suffixes("disk.squashfs", NULL, -1));
+  EXPECT_TRUE(compression_should_skip_with_suffixes("data.7z", NULL, -1));
+  EXPECT_FALSE(compression_should_skip_with_suffixes("notes.txt", NULL, -1));
+  EXPECT_FALSE(compression_should_skip_with_suffixes("program", NULL, -1));
+  EXPECT_FALSE(compression_should_skip_with_suffixes("trailing.", NULL, -1));
 }
 
 static void test_data_compress_with_threads_roundtrip() {

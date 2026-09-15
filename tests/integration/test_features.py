@@ -1327,7 +1327,56 @@ class TestChecksumChoice:
         )
         assert result.returncode != 0, "sha256 must be rejected, not silently ignored"
 
-    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    @pytest.mark.ci
+    def test_checksum_alone_skips_unchanged(self, shared_server):
+        """-c alone (no explicit --incremental) must switch the quick-check to a
+        content digest: an unchanged file whose mtime differs is skipped."""
+        source = os.path.join(TEST_DATA_DIR, "checksum_alone_src")
+        dest = os.path.join(TEST_DATA_DIR, "checksum_alone_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"same content\n")
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = os.path.join(get_dest_received_dir(dest, source), "f.txt")
+        assert os.path.exists(received)
+        # Make the destination mtime differ without changing the bytes.
+        bumped = os.stat(received).st_mtime + 100
+        os.utime(received, (bumped, bumped))
+
+        result, _ = run_client(source, dest, flags=["-c"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        # A skip leaves our bumped mtime in place; a transfer would rewrite it.
+        assert os.stat(received).st_mtime == pytest.approx(bumped), \
+            "-c did not skip an unchanged file"
+
+        # A same-size, same-mtime content change is still detected.
+        with open(received, "wb") as fh:
+            fh.write(b"DIFF content\n")
+        os.utime(received, (bumped, bumped))
+        result, _ = run_client(source, dest, flags=["-c"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        with open(received, "rb") as fh:
+            assert fh.read() == b"same content\n"
+
+    @pytest.mark.ci
+    def test_checksum_choice_md4_single_name_rejected(self, shared_server):
+        for bad in ("md4", "sha1", "none", "xxh64,md5"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=[f"--checksum-choice={bad}"],
+                                   port=shared_server.port)
+            assert result.returncode != 0, f"{bad} must be rejected"
+
+    @pytest.mark.ci
+    def test_compress_choice_unsupported_rejected(self, shared_server):
+        for bad in ("lz4", "zlib", "zlibx"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=[f"--compress-choice={bad}"],
+                                   port=shared_server.port)
+            assert result.returncode != 0, f"{bad} must be rejected"
+
+    @pytest.mark.parametrize("algo", ["xxh64", "xxh3", "xxh128", "md5"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_unchanged_skipped_and_bytes_preserved(self, shared_server, algo, mt):
         clean_dir(DEST_DIR)
@@ -1348,7 +1397,7 @@ class TestChecksumChoice:
     # detected (and re-transferred byte-exactly) because the whole-file digest
     # differs -- the explicit reason --checksum exists.  This exercises the
     # sender/receiver digest agreement for a non-default algorithm.
-    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    @pytest.mark.parametrize("algo", ["xxh64", "xxh3", "xxh128", "md5"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_changed_same_size_mtime_redetected(self, shared_server, algo, mt):
         clean_dir(DEST_DIR)
@@ -2093,6 +2142,8 @@ class TestTempDir:
         source = self._make_source("tempdir_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_dst")
         clean_dir(dest)
+        # rsync requires the temp dir to already exist (it is not created).
+        os.makedirs(os.path.join(dest, "scratch"), exist_ok=True)
         flags = ["--temp-dir=scratch"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"temp-dir sync failed: {result.stderr[:200]}"
@@ -2152,26 +2203,167 @@ class TestTempDir:
         assert not os.path.exists(os.path.join(dest, "scratch")), \
             "--partial-dir wrote through the scratch dir"
 
-    def test_temp_dir_escape_rejected(self, shared_server):
-        source = self._make_source("tempdir_escape_src")
-        dest = os.path.join(TEST_DATA_DIR, "tempdir_escape_dst")
+    def test_temp_dir_must_exist(self, shared_server):
+        """rsync does not create the temp dir; a missing one is a clear error."""
+        source = self._make_source("tempdir_missing_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_missing_dst")
         clean_dir(dest)
-        # "../escape" would resolve one level above the destination root.
-        outside = os.path.join(TEST_DATA_DIR, "escape")
-        assert not os.path.lexists(outside)
-
-        result, _ = run_client(source, dest, flags=["--temp-dir=../escape"],
+        missing_rel = os.path.join(dest, "no_such_scratch")
+        assert not os.path.lexists(missing_rel)
+        result, _ = run_client(source, dest, flags=["--temp-dir=no_such_scratch"],
                                port=shared_server.port)
-        assert result.returncode != 0, "relative escaping --temp-dir was not rejected"
-        assert not os.path.lexists(outside), "file created outside the destination root"
+        assert result.returncode != 0, "a missing relative --temp-dir must fail"
 
+        missing_abs = os.path.join(TEST_DATA_DIR, "no_such_abs_scratch")
+        assert not os.path.lexists(missing_abs)
         clean_dir(dest)
-        abs_escape = os.path.join(TEST_DATA_DIR, "abs_escape_probe")
-        assert not os.path.lexists(abs_escape)
-        result, _ = run_client(source, dest, flags=["--temp-dir", abs_escape],
+        result, _ = run_client(source, dest, flags=["--temp-dir", missing_abs],
                                port=shared_server.port)
-        assert result.returncode != 0, "absolute --temp-dir was not rejected"
-        assert not os.path.lexists(abs_escape), "file created outside the destination root"
+        assert result.returncode != 0, "a missing absolute --temp-dir must fail"
+
+    def test_temp_dir_absolute_outside_root_is_used(self, shared_server):
+        """rsync accepts any temp dir, including one outside the destination
+        tree; the completed files are still installed below the root and no
+        temp files remain in the scratch dir."""
+        source = self._make_source("tempdir_abs_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_abs_dst")
+        clean_dir(dest)
+        scratch = os.path.join(TEST_DATA_DIR, "tempdir_abs_scratch")
+        shutil.rmtree(scratch, ignore_errors=True)
+        os.makedirs(scratch)
+
+        result, _ = run_client(source, dest, flags=["--temp-dir", scratch],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"absolute temp-dir sync failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+        self._assert_clean_scratch(scratch)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+class TestTimeoutAndAllocLimits:
+    """#295: rsync defaults --timeout=0 (disabled), --contimeout=60, and
+    --max-alloc=0 (no limit); 0 must be accepted for all three."""
+
+    def _seed(self, name):
+        source = os.path.join(TEST_DATA_DIR, name)
+        dest = os.path.join(TEST_DATA_DIR, name + "_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"payload\n" * 100)
+        return source, dest
+
+    @pytest.mark.ci
+    def test_timeout_zero_disables_and_transfers(self, shared_server):
+        source, dest = self._seed("timeout_zero_src")
+        result, _ = run_client(source, dest, flags=["--timeout=0", "--contimeout=0"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing and not mismatches
+
+    @pytest.mark.ci
+    def test_no_timeout_forms(self, shared_server):
+        source, dest = self._seed("timeout_no_src")
+        result, _ = run_client(source, dest, flags=["--timeout=30", "--no-timeout",
+                                                    "--no-contimeout"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+
+    @pytest.mark.ci
+    def test_max_alloc_zero_means_no_limit(self, shared_server):
+        source, dest = self._seed("max_alloc_zero_src")
+        result, _ = run_client(source, dest, flags=["--max-alloc=0"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing and not mismatches
+
+    def test_temp_dir_cross_filesystem_fallback(self, shared_server):
+        """A --temp-dir on another filesystem must fall back to a non-atomic
+        copy instead of aborting (rsync parity).  Skipped when no second
+        filesystem is available."""
+        shm = "/dev/shm"
+        if not os.path.isdir(shm):
+            pytest.skip("/dev/shm not available")
+        if os.stat(shm).st_dev == os.stat(TEST_DATA_DIR).st_dev:
+            pytest.skip("/dev/shm is on the same filesystem as the test data")
+        scratch = os.path.join(shm, f"fastsync_tmp_{os.getpid()}")
+        shutil.rmtree(scratch, ignore_errors=True)
+        os.makedirs(scratch)
+        try:
+            source, dest = self._seed("tempdir_xdev_src")
+            result, _ = run_client(source, dest, flags=["--temp-dir", scratch],
+                                   port=shared_server.port)
+            assert result.returncode == 0, f"cross-fs temp-dir failed: {result.stderr[:300]}"
+            received = get_dest_received_dir(dest, source)
+            mismatches, missing = verify_transfer(source, received)
+            assert not missing, f"Missing: {missing}"
+            assert not mismatches, f"Mismatch: {mismatches}"
+            assert os.listdir(scratch) == [], "temp files left behind"
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+class TestRemoteOptionTransport:
+    """#296: -M/--remote-option is SSH-only; a daemon/TCP destination rejects it
+    instead of silently ignoring it."""
+
+    @pytest.mark.ci
+    def test_remote_option_rejected_for_tcp(self, shared_server):
+        for flag in ("--remote-option=--allow-delete", "-M--allow-delete", "-M=--allow-delete"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=[flag],
+                                   port=shared_server.port)
+            assert result.returncode != 0, f"{flag} must be rejected for a TCP destination"
+            assert "remote-option" in (result.stderr + result.stdout), \
+                f"{flag}: error must name --remote-option"
+
+
+class TestTrustSenderServerPath:
+    """--trust-sender is a receiver-local policy: only the receiving SERVER's
+    own flag matters.  For a push, a client --trust-sender is never sent to the
+    peer, so it must not relax a server that did not opt in; a server started
+    with --trust-sender must copy an escaping symlink target verbatim (its
+    normal mode skips it while still confining the link itself)."""
+
+    def _make_source(self, name):
+        source = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(source)
+        with open(os.path.join(source, "file.txt"), "wb") as fh:
+            fh.write(b"content\n")
+        os.symlink("/etc/passwd", os.path.join(source, "escape_link"))
+        return source
+
+    def _run_with_server(self, extra_args, flags, tag):
+        server = ServerManager()
+        server.start(extra_args=extra_args)
+        try:
+            source = self._make_source(f"trust_sender_src_{tag}")
+            dest = os.path.join(TEST_DATA_DIR, f"trust_sender_dst_{tag}")
+            clean_dir(dest)
+            result, _ = run_client(source, dest, flags=["-l"] + flags, port=server.port)
+            link = os.path.join(get_dest_received_dir(dest, source), "escape_link")
+            return result, link
+        finally:
+            server.stop()
+
+    @pytest.mark.ci
+    def test_client_flag_does_not_relax_server(self):
+        result, link = self._run_with_server([], ["--trust-sender"], "client")
+        assert result.returncode == 0, result.stderr[:200]
+        assert not os.path.lexists(link), \
+            "a client --trust-sender must not relax a server that did not opt in"
+
+    @pytest.mark.ci
+    def test_server_flag_materializes_escaping_symlink(self):
+        result, link = self._run_with_server(["--trust-sender"], [], "server")
+        assert result.returncode == 0, result.stderr[:200]
+        assert os.path.islink(link), "server --trust-sender should materialize the symlink"
+        assert os.readlink(link) == "/etc/passwd"
 
 
 def _source_files():

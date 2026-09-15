@@ -95,19 +95,23 @@ bool file_rename_secure(const char* old_path, const char* new_path);
    regular file.  See the .c for the exact success semantics. */
 bool file_remove_tree_secure(const char* path);
 /* Open a private 0700 directory (creating it on demand) that must live below
-   the authorized root.  Used for the --temp-dir scratch directory and the
-   --delay-updates staging directory. */
+   the authorized root.  Used for the --delay-updates staging directory. */
 int file_open_private_dir(const char* dir_path);
 
+/* Open an existing --temp-dir scratch directory as-is (absolute or relative;
+   no creation, no root confinement), matching rsync's --temp-dir handling. */
+int file_open_temp_dir(const char* dir_path);
+
 /* The file_to_disk_secure* variants write a temporary copy in the destination
-   directory and atomically rename it over `path`.  temp_dir is an absolute,
-   root-confined scratch directory (already validated by the caller): when it
-   is non-NULL the temporary copy is instead created there (with a name unique
-   across the whole scratch directory) and atomically renamed into the
-   destination directory once fully written and fsynced.  A rename across
-   filesystems (EXDEV) fails the write with an error; the file is never
-   silently copied into place.  Pass NULL for the historical same-directory
-   behavior.  --inplace writes never use temp_dir. */
+   directory and atomically rename it over `path`.  temp_dir is a scratch
+   directory (an absolute path, or one the caller already resolved against the
+   destination root): when it is non-NULL the temporary copy is instead created
+   there (with a name unique across the whole scratch directory) and atomically
+   renamed into the destination directory once fully written and fsynced.  When
+   that rename/link fails with EXDEV (the scratch dir is on another filesystem)
+   the write falls back to a non-atomic copy directly in the destination
+   directory, matching rsync.  Pass NULL for the same-directory behavior.
+   --inplace writes never use temp_dir. */
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
                          FileAttrPolicy policy, const char* temp_dir);

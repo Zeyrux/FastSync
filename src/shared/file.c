@@ -964,6 +964,19 @@ int file_open_private_dir(const char* dir_path) {
   return fd;
 }
 
+/* Open a --temp-dir scratch directory exactly as rsync does: the directory must
+ * already exist and is used as given (an absolute path is used verbatim, a
+ * relative one was already resolved against the destination root by the
+ * caller).  Unlike file_open_private_dir this neither creates it nor confines
+ * it below the receive root, because rsync accepts any temp dir -- including
+ * one outside the destination tree or on another filesystem.  Returns an
+ * O_DIRECTORY|O_CLOEXEC fd, or -1 on error. */
+int file_open_temp_dir(const char* dir_path) {
+  if (!dir_path)
+    return -1;
+  return open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
 /* After the content and mode/times are restored on the just-written file, apply
  * the per-file xattrs (-X/-A) and, for --fake-super, park the source's
  * uid/gid/mode/mtime in the reserved xattr.  All fd-relative (confined to the
@@ -997,6 +1010,10 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
     return false;
   int fd = -1;
   bool ok = false;
+  /* Set when a --temp-dir install fails with EXDEV: rsync then falls back to a
+   * non-atomic write directly in the destination directory (see the tail of
+   * this function). */
+  bool cross_device_fallback = false;
   /* The base mode applied when --perms is off (neither the source mode nor an
    * exec-only change is taken wholesale): a pre-existing destination keeps its
    * own mode (special bits dropped), while a brand-new file uses
@@ -1127,10 +1144,11 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
        file is created in the destination directory, exactly as historically. */
     int scratch_dirfd = -1;
     if (temp_dir) {
-      scratch_dirfd = file_open_private_dir(temp_dir);
+      scratch_dirfd = file_open_temp_dir(temp_dir);
       if (scratch_dirfd < 0) {
         int saved_errno = errno;
-        log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s",
+        log_message(LOG_LEVEL_ERROR,
+                    "--temp-dir '%s' could not be opened (rsync requires it to already exist): %s",
                     temp_dir, strerror(saved_errno));
         close(dirfd);
         free(leaf);
@@ -1228,17 +1246,16 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                 errno != ENOENT)
               ok = false;
           } else {
+            /* Cross-device (or otherwise impossible) link: rsync falls back to
+               writing the file directly in the destination directory.  Record
+               it and retry below with no scratch dir. */
             if (scratch_dirfd >= 0 && errno == EXDEV)
-              log_message(LOG_LEVEL_ERROR,
-                          "temp dir is on a different filesystem than the destination; cannot "
-                          "link file into place (EXDEV); no fallback copy is attempted");
+              cross_device_fallback = true;
             ok = false;
           }
         } else if (renameat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, dirfd, leaf) != 0) {
           if (scratch_dirfd >= 0 && errno == EXDEV)
-            log_message(LOG_LEVEL_ERROR,
-                        "temp dir is on a different filesystem than the destination; cannot "
-                        "atomically install file (EXDEV); no fallback copy is attempted");
+            cross_device_fallback = true;
           ok = false;
         }
       }
@@ -1271,6 +1288,17 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
     close(fd);
   close(dirfd);
   free(leaf);
+  if (cross_device_fallback) {
+    /* rsync semantics: a --temp-dir on another filesystem must not abort the
+       write.  Retry once with no scratch dir so the file is written and
+       installed non-atomically in the destination directory. */
+    log_message(LOG_LEVEL_WARNING,
+                "temp dir is on a different filesystem than the destination; falling back to a "
+                "non-atomic copy into the destination directory");
+    return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
+                                    policy, update, no_replace, use_fsync, NULL, xattrs, fake_super,
+                                    keep_partial);
+  }
   return ok;
 }
 
@@ -1350,11 +1378,12 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
 
   int scratch_dirfd = -1;
   if (temp_dir) {
-    scratch_dirfd = file_open_private_dir(temp_dir);
+    scratch_dirfd = file_open_temp_dir(temp_dir);
     if (scratch_dirfd < 0) {
       int saved_errno = errno;
-      log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s", temp_dir,
-                  strerror(saved_errno));
+      log_message(LOG_LEVEL_ERROR,
+                  "--temp-dir '%s' could not be opened (rsync requires it to already exist): %s",
+                  temp_dir, strerror(saved_errno));
       close(dirfd);
       free(leaf);
       return false;
