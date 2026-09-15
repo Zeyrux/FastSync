@@ -95,12 +95,14 @@ class TestPreservePerms:
         source = os.path.join(TEST_DATA_DIR, "perms_nop_new_src")
         dest = os.path.join(TEST_DATA_DIR, "perms_nop_new_dst")
         # 0664 has group/other bits that the umask strips, so the result is not
-        # just the source mode.
+        # just the source mode.  FastSync additionally never grants group/other
+        # write from a client-supplied mode (S_IWGRP|S_IWOTH are always
+        # cleared), so the expected mode masks those too.
         _seed_file(source, dest, "f.txt", b"new\n", 0o664)
 
         result, _ = run_client(source, dest, flags=["-t"], port=shared_server.port)
         assert result.returncode == 0, f"-t failed: {(result.stderr or '')[:300]}"
-        want = 0o664 & ~_process_umask()
+        want = 0o664 & ~_process_umask() & ~0o022
         got = os.stat(_received(dest, source, "f.txt")).st_mode & 0o777
         assert got == want, \
             f"new no--p destination mode: want {oct(want)}, got {oct(got)}"
