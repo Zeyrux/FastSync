@@ -61,20 +61,29 @@ replacement for every rsync feature or protocol mode.
 - Temporary-file writes with atomic rename by default.
 - Path traversal checks and destination-root confinement.
 
-### Not yet equivalent to rsync
+### Boundaries and documented divergences
+
+The items below summarize FastSync's rsync compatibility status — recently
+closed gaps and the remaining known divergences. Each row of the detailed
+matrix is classified as parity, caveat, or divergent in
+[`RSYNC_COMPAT.md`](RSYNC_COMPAT.md).
 
 - The FastSync wire protocol is not the rsync wire protocol.
 - SSH mode requires `fastsync-server` on the remote host.
 - Archive mode covers rsync's `-rlptgoD` behavior — links, permissions, times,
   owner, group, devices, and special files — and does not imply compression or
   multithreading (see [Client](#client)). Ownership application is still
-  privilege-gated: a receiver that cannot `chown` logs a warning and skips it,
-  and a client-supplied mode can never grant group/other write (see
+  privilege-gated: a receiver that cannot `chown` logs a warning and skips it.
+  Under `-p` the source mode is copied exactly, including setuid/setgid/sticky
+  and group/other-write bits (strict rsync parity; see
   [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)).
-- Symlink transfer recreates only relative, `..`-free link targets
-  (`-l`/`--links`); an absolute target or any target containing a `..` component
-  is dropped rather than created, even if it would resolve within the receive
-  root. This containment check is skipped under `--trust-sender`.
+- Symlink transfer stores targets **verbatim** (`-l`/`--links`), including
+  absolute and `..`-bearing targets, matching rsync. The receiver does not
+  enforce a containment predicate by default; `--safe-links` drops unsafe
+  targets on the sender, and `--munge-links` rewrites them with rsync's
+  `/rsyncd-munged/` marker. `--trust-sender` does not affect symlink targets.
+  A destination later consumed by a link-following tool can therefore follow a
+  link outside the receive root — use `--safe-links` for untrusted sources.
 - Hard links (`-H`/`--hard-links`), extended attributes (`-X`/`--xattrs`), and
   POSIX ACLs (`-A`/`--acls`) are preserved; owner/group is applied through
   `-o`/`-g` (or an `-a`/`--archive` transfer), through the opt-in identity flags
@@ -84,8 +93,8 @@ replacement for every rsync feature or protocol mode.
   divergences.
 - Device and special-file preservation is implemented with documented
   divergences: recreated device nodes require `CAP_MKNOD` on the receiver (a
-  non-root receiver skips the entry), and sockets cannot be recreated (FIFOs
-  are).
+  non-root receiver skips the entry), while FIFOs **and unix sockets** are
+  recreated (`--specials`).
 - Sparse-file hole preservation (`-S`, `--sparse`) is implemented receiver-side:
   long all-zero runs are written as holes (no wire change; the full file image
   is already in memory).
@@ -98,11 +107,18 @@ replacement for every rsync feature or protocol mode.
 - Short-option names are now rsync-parity (Phase 7 Wave A): FastSync's former
   collisions were renamed (`-j`/`--threads`, `--preserve`, `--sendfile`,
   `--chunk-serialization`, `--timeout`, `--ssh-port`), so `-m`, `-M`, `-f`,
-  `-s`, `-T`, `-p`, `-c`, `-a`, and `-z` follow rsync. See `RSYNC_COMPAT.md`.
+  `-s`, `-T`, `-p`, `-c`, `-a`, and `-z` follow rsync.
+- Short-option clustering (`-av`, `-aAX`, `-rlpt`) and attached values
+  (`-B1000`, `-essh`, `-MOPT`, `--opt=value`) are accepted, matching rsync.
+- `-r`, `-b`, `-L`, and `-B` are parsed with the rsync short names.
+- `--stats` prints the counters FastSync can observe locally; receiver-only
+  counters (matched data, file-list bytes, deleted count) are reported as 0, and
+  `--progress` is an aggregate line rather than a per-file block.
 
 The detailed flag matrix is maintained in
-[`RSYNC_COMPAT.md`](RSYNC_COMPAT.md). It distinguishes implemented,
-partial, alternate, and planned behavior.
+[`RSYNC_COMPAT.md`](RSYNC_COMPAT.md). It reports each row as **parity**,
+**caveat** (works with a documented divergence), or **divergent** (not
+supported), rather than treating "parsed" as parity.
 
 ## Quick Start
 
@@ -120,11 +136,15 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | Argument | Description |
 |----------|-------------|
 | Positional | `<source> <dest>` — automatic SSH detection if dest contains `:` |
-| `-c, --checksum` | Verify content by checksum instead of size+mtime |
+| `-c, --checksum` | Verify content by checksum instead of size+mtime (implies the incremental checksum quick-check) |
+| `--checksum-choice <alg>` | Whole-file checksum algorithm: `xxh64`/`xxhash` (default), `xxh3`, `xxh128`, `md5`, or `auto`; `md4`/`sha1`/`none` are rejected by name |
 | `-z, --compress [level]` | Enable streaming zstd compression (level 1–22, default 5) |
+| `--compress-choice <alg>` | Compression algorithm: `zstd` (default), `none`, or `auto`; `lz4`/`zlib`/`zlibx` are rejected by name |
+| `--skip-compress <list>` | Skip compression for suffixes (`/`- or `,`-separated); defaults to rsync 3.4.1's built-in suffix list |
 | `-a, --archive` | rsync archive mode (`-rlptgoD`): links, perms, times, owner, group, devices and specials; ownership application stays privilege-gated (not compression/multithreading) |
 | `-j, --threads[=N]` | Multithreading mode; `N` (1–256) sets the parallel scanner worker count, bare `-j`/`--threads` uses the default |
 | `-m` | rsync `--prune-empty-dirs` (short form now rsync-parity) |
+| `-r, --recursive` | Recurse into directories (FastSync is always recursive; accepted for rsync compatibility) |
 | `-d, --dirs` | Transfer the named directory entries without recursing into their contents; aliases `--old-dirs`/`--old-d` |
 | `-R, --relative` | With `--files-from`, preserve each listed entry's relative path below the destination root |
 | `--chunk-serialization` | Chunk serialization (batch all files per chunk; long form only) |
@@ -133,13 +153,15 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--preallocate` | Allocate destination file space up front (fail-fast on a full disk) |
 | `--append` | Resume a shorter destination by appending only its tail (prefix not verified; requires `--incremental`) |
 | `--append-verify` | Like `--append`, but verifies the retained prefix checksum first (falls back to a full transfer on mismatch) |
-| `-W, --whole-file` | Transfer changed files without delta processing |
+| `-W, --whole-file` | Transfer changed files without delta processing; `--no-whole-file` clears it |
+| `-B <n>, --block-size <n>` | Delta block size in bytes (alias `--delta-block`) |
+| `--checksum-seed <n>` | Seed for the whole-file xxHash digest; an unset/`0` seed is randomized per transfer, matching rsync |
 | `-I, --ignore-times` | Transfer files even when size and mtime match |
 | `--size-only` | Skip incremental files matching in size, ignoring mtime |
 | `--preserve` | Preserve mode and mtime (`-p` + `-t`; add `-o`/`-g` for owner/group or `-U`/`--atimes` for atime; `-N`/`--crtimes` captures birth time but cannot apply it) |
 | `-U, --atimes` | Preserve access times. Captured with the metadata payload; does not enable ownership. |
 | `-N, --crtimes` | Capture birth time; cannot be applied (documented divergence) |
-| `-p, --perms` | Preserve permission bits (a client mode never grants group/other write) |
+| `-p, --perms` | Preserve permission bits. Strict rsync parity: the source mode is copied exactly, including setuid/setgid/sticky and group/other-write bits |
 | `-t, --times` | Preserve modification times |
 | `-o, --owner` | Preserve the source owner (privilege-gated; mapped by name on the receiver with a numeric fallback) |
 | `-g, --group` | Preserve the source group (privilege-gated; mapped by name on the receiver with a numeric fallback) |
@@ -153,11 +175,11 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--groupmap=MAP` | Map group names when applying ownership |
 | `--numeric-ids` | Apply source numeric uid/gid directly instead of mapping by name |
 | `--copy-as=USER[:GROUP]` | Force every written entry to USER[:GROUP] (requires a privileged receiver) |
-| `--fake-super` | Record/replay effective metadata via a reserved `user.fastsync.stat` xattr |
+| `--fake-super` | Record the resolved owner plus mode/time in a reserved `user.fastsync.stat` xattr and replay mode/time; never performs a real chown |
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes) |
 | `-D` | Preserve device and special files (implies `--devices --specials`) |
 | `--devices` | Recreate device nodes on the destination (privileged; skipped without `CAP_MKNOD`) |
-| `--specials` | Recreate special files (FIFOs); sockets cannot be recreated |
+| `--specials` | Recreate special files: FIFOs and unix sockets |
 | `--remove-source-files` | Remove regular source files after a successful transfer |
 | `--exclude <pattern>` | Exclude files matching glob pattern (repeatable) |
 | `--exclude-from <file>` | Read exclude patterns from a file (one per line) |
@@ -166,30 +188,34 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--files-from <file>` | Read the source file list from FILE (paths relative to the source root) |
 | `--max-size <n>` | Skip files larger than n bytes |
 | `--min-size <n>` | Skip files smaller than n bytes |
-| `--max-alloc <SIZE>` | Maximum single allocation (binary units: B, K, M, G, T, P, E; default 1G) |
+| `-x, --one-file-system` | Do not cross filesystem boundaries; the mount-point directory entry is emitted (empty at the destination) without descending |
+| `--max-alloc <SIZE>` | Maximum single allocation (binary units: B, K, M, G, T, P, E; default 1G; `0` = no local limit, matching rsync) |
 | `-u, --update` | Skip files newer than the source on the receiver |
 | `--incremental` | Skip files unchanged since last transfer (size + mtime). Auto-enables `--preserve`. Incompatible with `--chunk-serialization`. |
 | `--existing` | Skip files not already present at the destination; update existing files normally. |
 | `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`) |
 | `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination |
 | `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win) |
-| `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded) |
+| `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded). Scoped to the synchronized directories, so `--files-from` subsets are safe |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
 | `--delete-during`, `--del` | Delete extras once the keep-set is known, before data is applied (implies `--delete`) |
 | `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`) |
 | `--delete-after` | Explicit delete-after timing (implies `--delete`) |
-| `--delay-updates` | Put updated files into place only at the end of the transfer |
+| `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected) |
+| `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync |
+| `--delay-updates` | Put updated files into place only at the end of the transfer (`--force` is honored at publication) |
+| `-T, --temp-dir <dir>` | Scratch directory for temp files before the atomic install; confined to the receive root (relative only), with an `EXDEV` non-atomic copy fallback |
 | `-n, --dry-run` | Report what would be transferred without mutating the destination. Since protocol 2.21.0 a server-routed target contacts the receiver and reports would-transfer based on receiver state; a plain local destination keeps the client-side scan. Never mutates or deletes. |
 | `-v, --verbose` | Enable debug logging |
 | `-q, --quiet` | Suppress non-error output |
-| `--progress` | Show real-time transfer speed |
+| `--progress` | Show a periodic aggregate transfer line (bytes sent, current rate); not rsync's per-file progress block |
 | `-P` | Enables partial-transfer mode + progress output; interrupted writes retain the already-written temp for resumption |
-| `--stats` | Print transfer statistics at end (bytes, files, timing) |
+| `--stats` | Print transfer statistics at end (bytes, files, timing). Receiver-only counters (matched data, file-list bytes, deleted count) are reported as 0 |
 | `-i, --itemize-changes` | Print an rsync-style per-file change line |
 | `--out-format=FORMAT` | Output format for changed files (`%f %n %l %b %M %%`) |
 | `--list-only` | List source files instead of transferring |
 | `--fsync` | Fsync every written file before publication |
-| `-h, --human-readable` | Format transfer byte sizes with binary units |
+| `-h, --human-readable` | Format transfer byte/rate counts with rsync's decimal (base-1000) units |
 | `--max-depth <n>` | Maximum directory depth to recurse (0 = unlimited, default: 0) |
 | `--log-file <path>` | Write log messages to file instead of stderr |
 | `--write-batch=FILE` | Run the normal live transfer and also emit a self-contained batch file of the source tree |
@@ -209,11 +235,11 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--sockopts=OPTS` | Comma-separated OPT=VAL socket options applied before connect (`TCP_NODELAY`, `SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`, `SO_REUSEADDR`) |
 | `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
-| `--timeout <sec>` | Positive I/O timeout in seconds, applied to both the socket (`SO_RCVTIMEO`/`SO_SNDTIMEO`, built-in default 30 s) and the per-message protocol poll deadline (built-in default 60 s). Omit the option to keep both built-ins; `0` is rejected. The server side keeps the built-in 60 s protocol window (the value is not sent on the wire). |
-| `--contimeout <sec>` | Connection timeout in seconds (default: 10) |
+| `--timeout <sec>` | I/O timeout in seconds, applied to both the socket (`SO_RCVTIMEO`/`SO_SNDTIMEO`) and the per-message protocol poll deadline. Default `0` = disabled (matching rsync); `0` disables it. `--no-timeout` is the negation. The value is not sent on the wire; the server side keeps its own safe floor. |
+| `--contimeout <sec>` | Connection timeout in seconds (default: 60, matching rsync); `0` disables it (`--no-contimeout` is the negation) |
 | `--stop-after=MINS` | Stop the transfer after MINS minutes (a positive integer); whatever was already transferred is kept |
 | `--stop-at=TIME` | Stop at an absolute time (`HH:MM`, `HH:MM:SS`, or `now+N[smhd]`); an early stop skips the late `--delete` keep-set |
-| `--backup` | Backup existing destination files before overwriting |
+| `-b, --backup` | Backup existing destination files before overwriting |
 | `--backup-dir <dir>` | Target directory for backups (requires `--backup`) |
 | `--tls` | Enable TLS encryption |
 | `--cert <path>` | TLS certificate file (PEM) |
@@ -474,9 +500,9 @@ features without changing the meaning of ordinary compatibility options.
 | `-j`, `--threads[=N]` | Enable the multithreaded scanner/loader/sender pipeline. `N` (1–256) sets the parallel scanner worker count; bare `-j`/`--threads` uses the default. |
 | `-z [level]`, `--compress [level]` | Enable streaming zstd compression, levels 1-22. |
 | `--compress-level <n>` | Set the zstd compression level. |
-| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` and `none`. |
+| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd`, `none`, and `auto`; `lz4`/`zlib`/`zlibx` are rejected by name. |
 | `--zl <n>` | Alias for `--compress-level`. |
-| `--skip-compress <list>` | Skip compression for comma-separated suffixes; incompatible with `--chunk-serialization`. |
+| `--skip-compress <list>` | Skip compression for `/`- or `,`-separated suffixes; defaults to rsync 3.4.1's built-in list. Incompatible with `--chunk-serialization`. |
 | `--compress-threads <n>` | Use `n` zstd compression workers. Requires compression and a zstd build with threaded support; the setting affects sender CPU work only. |
 | `--chunk-size <bytes>` | Set the transfer chunk size. |
 | `--chunk-serialization` | Enable FastSync chunk serialization (long form only; `-s` is rsync's `--secluded-args`). |
@@ -488,10 +514,10 @@ features without changing the meaning of ordinary compatibility options.
 | `--server-port <port>` | Select the TCP server port (`--port <port>` and `--port=<port>` are rsync-friendly aliases). |
 | `--tls` | Enable TLS for TCP transport. |
 | `--bwlimit <KB/s>` | Apply token-bucket bandwidth limiting. |
-| `--progress` | Show transfer progress and throughput. |
-| `--stats` | Print transfer statistics. |
-| `--timeout <seconds>` | Set the socket **and** per-message protocol I/O timeout (positive seconds). Omit to keep the built-in 30 s socket / 60 s protocol defaults. |
-| `--contimeout <seconds>` | Set connection timeout. |
+| `--progress` | Show a periodic aggregate transfer line (throughput; not a per-file block). |
+| `--stats` | Print transfer statistics (receiver-only counters are 0). |
+| `--timeout <seconds>` | Set the socket **and** per-message protocol I/O timeout. Default `0` = disabled (matching rsync); `0` disables it. |
+| `--contimeout <seconds>` | Connection timeout (default 60, matching rsync); `0` disables it. |
 
 Short-option conflicts with rsync have been resolved for the CLI namespace
 (Phase 7): `-c` is now rsync's `--checksum`, `-m` is `--prune-empty-dirs`, `-M`
@@ -517,11 +543,14 @@ remote SSH argv is already built injection-safe.
 | `-n`, `--dry-run` | Report what would be transferred without mutating the destination. Since protocol 2.21.0 a server-routed target contacts the receiver and reports would-transfer based on receiver state; a plain local destination keeps the client-side scan. Never mutates or deletes. |
 | `--remove-source-files` | Remove regular source files after a successful transfer. |
 | `--incremental` | Skip files matching destination size and mtime. Auto-enables `--preserve`. Incompatible with `--chunk-serialization`. |
-| `--checksum` | Include xxHash64 content checks in incremental comparisons. |
+| `-c, --checksum` | Verify content by checksum (implies the incremental quick-check). Algorithm selectable with `--checksum-choice`. |
+| `--checksum-choice <alg>` | Whole-file checksum algorithm: `xxh64`/`xxhash` (default), `xxh3`, `xxh128`, `md5`, or `auto`. |
+| `--checksum-seed <n>` | Seed for the whole-file xxHash digest; an unset/`0` seed is randomized per transfer, matching rsync. |
 | `--size-only` | Skip incremental files matching in size, ignoring mtime. |
 | `-I, --ignore-times` | Transfer files even when size and mtime match. |
 | `-u, --update` | Skip files newer than the source on the receiver. |
-| `-W, --whole-file` | Transfer changed files without delta processing. |
+| `-W, --whole-file` | Transfer changed files without delta processing (`--no-whole-file` clears it). |
+| `-B <n>, --block-size <n>` | Delta block size in bytes (alias `--delta-block`). |
 | `-d, --dirs` | Transfer the named directory entries without recursing into their contents (aliases `--old-dirs`/`--old-d`). |
 | `-R, --relative` | With `--files-from`, preserve each listed entry's relative path below the destination root. |
 | `--files-from <file>` | Read the source file list from FILE (paths relative to the source root). |
@@ -532,20 +561,24 @@ remote SSH argv is already built injection-safe.
 | `--preallocate` | Allocate destination file space up front (fail-fast on a full disk). |
 | `--append` | Resume a shorter destination by appending only its tail (prefix not verified; requires `--incremental`). |
 | `--append-verify` | Like `--append`, but verifies the retained prefix checksum first (falls back to a full transfer on mismatch). |
-| `--delete` | Request removal of destination entries absent from the source. The server must allow deletion. Default timing is delete-after: extras are removed only after the whole transfer succeeded. |
+| `--delete` | Request removal of destination entries absent from the source. The server must allow deletion. Default timing is delete-after: extras are removed only after the whole transfer succeeded. Scoped to the synchronized directories, so `--files-from` subsets are safe. |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`). |
 | `--delete-during`, `--del` | Delete extras once the keep-set manifest is known, before data is applied (implies `--delete`; early mode, same engine behaviour as `--delete-before`). |
 | `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`; commit mode, same behaviour as `--delete-after`). |
 | `--delete-after` | Explicit delete-after timing: delete only after the transfer succeeded (implies `--delete`). |
+| `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected). |
+| `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync. |
+| `--force` | Allow an incoming file/symlink to replace a destination directory (also during `--delay-updates` publication). |
 | `--exclude <pattern>` | Exclude matching paths. Repeatable. |
 | `--include <pattern>` | Include matching paths. Repeatable. |
 | `--exclude-from <file>` | Read exclude patterns from a file. |
 | `--include-from <file>` | Read include patterns from a file. |
 | `--max-size <bytes>` | Skip files larger than the limit. |
 | `--min-size <bytes>` | Skip files smaller than the limit. |
-| `--max-alloc <SIZE>` | Maximum single allocation (binary units; default 1G). |
+| `--max-alloc <SIZE>` | Maximum single allocation (binary units; default 1G; `0` = no local limit). |
 | `--max-depth <n>` | Limit recursive scanning depth; zero means unlimited. |
-| `--backup` | Back up overwritten files. |
+| `-b, --backup` | Back up overwritten files. |
+| `-T, --temp-dir <dir>` | Scratch directory for temp files before the atomic install (confined to the receive root; `EXDEV` falls back to a non-atomic copy). |
 | `--backup-dir <dir>` | Store backups under a separate directory (requires `--backup`). |
 | `--suffix <suffix>` | Set the backup filename suffix (default: `~`). |
 | `--partial` | Select partial-transfer handling. On failed/interrupted writes the already-written temp file is retained (best-effort) for resumption. With `--partial --partial-dir <dir>`, completed files are written under the partial directory and installed atomically. |
@@ -565,7 +598,7 @@ remote SSH argv is already built injection-safe.
 | `--preserve` | Preserve mode and mtime (long form only; equivalent to `-p` + `-t`). Add `-o`/`-g` for owner/group, `-U`/`--atimes` for atime, or an identity flag (`--chown`/`--usermap`/`--groupmap`/`--numeric-ids`/`--copy-as`) for mapped ownership. |
 | `-U`, `--atimes` | Preserve access times. Captured with the metadata payload; does not enable ownership. |
 | `-N`, `--crtimes` | Capture birth time and transmit it; it cannot be applied because no portable filesystem call can set a birth time (documented divergence). |
-| `-p`, `--perms` | Preserve permission bits. One of the four per-attribute preserve flags (with `-t`/`-o`/`-g`); a client-supplied mode never grants group/other write. |
+| `-p`, `--perms` | Preserve permission bits. One of the four per-attribute preserve flags (with `-t`/`-o`/`-g`); under `-p` the source mode is copied exactly (setuid/setgid/sticky and group/other-write included), matching rsync. |
 | `-t`, `--times` | Preserve modification times. Independent of the other attributes; `-O`/`--omit-dir-times` suppresses directories only. |
 | `-o`, `--owner` | Preserve the source owner (uid). Mapped by name on the receiver with a raw-numeric fallback (only numeric ids cross the wire); application is privilege-gated. |
 | `-g`, `--group` | Preserve the source group (gid). Same name-mapping/numeric-fallback and privilege gating as `-o`. |
@@ -573,23 +606,26 @@ remote SSH argv is already built injection-safe.
 | `-E`, `--executability` | Preserve executable permission bits. |
 | `-X`, `--xattrs` | Preserve user `user.*` extended attributes. |
 | `-A`, `--acls` | Preserve POSIX ACLs. |
-| `--chmod <changes>` | Modify transferred permissions (rsync syntax). |
-| `--chown=USER:GROUP` | Override the ownership of transferred files (`USER:GROUP`, `USER`, or `:GROUP`). |
-| `--usermap=MAP` | Map usernames when applying ownership (comma-separated `FROM:TO` rules). |
+| `--chmod <changes>` | Modify transferred permissions (rsync syntax, including `D`/`F`/`X` selectors and `s`/`t`); does not imply `-p`. |
+| `--chown=USER:GROUP` | Override the ownership of transferred files (`USER:GROUP`, `USER`, or `:GROUP`); conflicts with `--usermap`/`--groupmap` on the same side. |
+| `--usermap=MAP` | Map usernames when applying ownership (`FROM:TO` rules; names, ids, `LOW-HIGH` ranges, `*`, empty-`FROM`). |
 | `--groupmap=MAP` | Map group names when applying ownership (same syntax as `--usermap`). |
-| `--numeric-ids` | Apply the source numeric uid/gid directly instead of mapping by name. |
+| `--numeric-ids` | Mapping modifier: apply the source numeric uid/gid directly instead of mapping by name (combine with `-o`/`-g`, `-a`, or a map). |
 | `--copy-as=USER[:GROUP]` | Force every written entry to USER[:GROUP]; requires a privileged receiver. |
-| `--fake-super` | Record/replay effective metadata via a reserved `user.fastsync.stat` xattr. |
+| `--fake-super` | Record the resolved owner plus mode/time in a reserved `user.fastsync.stat` xattr and replay mode/time; never performs a real chown. |
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes). |
 | `--no-super` | Forbid those super-user activities even when the receiver is root. |
-| `-l`, `--links` | Copy symlinks as symlinks; the target is transmitted and recreated under the receive root. |
-| `--copy-links` | Copy symlink referents. |
-| `--safe-links` | Skip symlinks that point outside the transfer tree. |
+| `-l`, `--links` | Copy symlinks as symlinks; the target is stored verbatim (absolute and `..`-bearing targets included), matching rsync. |
+| `-L`, `--copy-links` | Copy symlink referents (a broken referent exits 0). |
+| `--safe-links` | Skip symlinks whose target points outside the transfer tree (applied on the sender). |
 | `--copy-unsafe-links` | Copy unsafe symlink referents. |
+| `--munge-links` | Rewrite stored symlink targets with rsync's `/rsyncd-munged/` marker. |
+| `-k`, `--copy-dirlinks` | Treat a symlink to a directory as a real directory on the sender. |
+| `-K`, `--keep-dirlinks` | Follow an existing destination symlink-to-directory (confined to the receive root). |
 | `-H`, `--hard-links` | Preserve hard-link relationships across the transfer. |
 | `-D` | Preserve device and special files (implies `--devices --specials`). |
 | `--devices` | Recreate device nodes on the destination (privileged; skipped without `CAP_MKNOD`). |
-| `--specials` | Recreate special files (FIFOs); sockets cannot be recreated. |
+| `--specials` | Recreate special files: FIFOs and unix sockets. |
 | `-S`, `--sparse` | Sparse-file handling: receiver preserves holes (zero runs are written as holes; no wire change). |
 
 ### Output and logging
@@ -598,8 +634,8 @@ remote SSH argv is already built injection-safe.
 |---|---|
 | `-v`, `--verbose` | Enable debug logging. |
 | `-q`, `--quiet` | Suppress non-error output. |
-| `--progress` | Show live transfer progress. |
-| `--stats` | Print transfer statistics. |
+| `--progress` | Show a periodic aggregate transfer line (not a per-file block). |
+| `--stats` | Print transfer statistics (receiver-only counters are reported as 0). |
 | `-i`, `--itemize-changes` | Print an rsync-style per-file change line. |
 | `--out-format=FORMAT` | Output format for changed files (`%f %n %l %b %M %%`). |
 | `--list-only` | List source files instead of transferring. |
@@ -613,8 +649,12 @@ remote SSH argv is already built injection-safe.
 |---|---|
 | `--ssh-port <port>` | SSH port for the SSH transport (default: 22). Note the short `-p` is now rsync's `--perms`. |
 | `-e`, `--rsh <command>` | Remote shell to launch for the SSH transport (default: `ssh`; may include arguments). |
-| `--fastsync-server-path <path>` | Remote FastSync server path for SSH mode. |
-| `-M`, `--remote-option=OPT` | Append OPT to the remote server invocation over SSH (repeatable). |
+| `--fastsync-server-path <path>` | Remote FastSync server path for SSH mode (client-only; never crosses the wire). |
+| `--rsync-path <path>` | Alias for `--fastsync-server-path`. |
+| `-M`, `--remote-option=OPT` | Append OPT to the remote server invocation over SSH (repeatable; rejected for daemon/TCP destinations). |
+| `--trust-sender` | Receiver-local: trust the remote sender's file list and skip path re-validation (does not affect symlink targets). |
+| `--timeout <sec>` | Socket + per-message I/O timeout; default `0` = disabled. |
+| `--contimeout <sec>` | Connection timeout; default 60; `0` disables. |
 | `--source-dir <path>` | Set the source directory explicitly. |
 | `--dest-dir <path>` | Set the destination directory explicitly. |
 | `--save-to-disk` | Enable server-side disk persistence. |
@@ -638,7 +678,7 @@ remote SSH argv is already built injection-safe.
 | `--config=FILE` | Daemon config file (default: `~/.config/fastsync/fastsyncd.conf`, else `/etc/fastsyncd.conf`). Requires `--daemon`. |
 | `--dparam=KEY=VALUE` | Override one global config key on the command line. Requires `--daemon`. |
 | `--no-detach` | Stay in the foreground (default detaches to the background when running `--daemon`). |
-| `-p <port>` | TCP listen port (default: 8080, range: 1–65535). |
+| `-p, --port <port>` | TCP listen port (default: 8080, range: 1–65535). |
 | `--tls` | Enable TLS. |
 | `--cert <path>` | TLS certificate file (PEM). |
 | `--key <path>` | TLS private key file (PEM). |
@@ -650,7 +690,7 @@ remote SSH argv is already built injection-safe.
 | `-6`, `--ipv6` | Bind an IPv6 socket. |
 | `--allow-delete` | Permit client delete manifests. Deletion is refused by default. This also gates `--force` (which can recursively replace/remove a destination directory tree). |
 | `--allow-super` | Standalone TCP listener only: keep super-user activities enabled for a **root** receiver. Without it a root standalone server forces `SUPER_MODE_OFF`, so client `--devices`/`--write-devices`/`--super` and client-chosen ownership requests are skipped/refused. Rejected with `--stdio` (the SSH remote argv is client-composed; use a forced command if the default must hold). No effect when not root. Daemon modules opt in per module with `client owner = yes`. |
-| `--trust-sender` | Trust the remote sender's file list: skip the receiver's up-front path-traversal and escaping-symlink-target containment re-validation (fewer checks, faster, potentially unsafe; off by default). |
+| `--trust-sender` | Trust the remote sender's file list: skip the receiver's up-front path-traversal re-validation (fewer checks, faster, potentially unsafe; off by default). It does not affect symlink targets, which are stored verbatim either way. |
 | `--no-super` | Operator veto: never attempt super-user activities (ownership, device nodes) even as root, and refuse any client `--copy-as`/`--super` request. |
 | `--allow-unauthenticated` | Permit plaintext/anonymous network clients; an auth-required module still accepts only opted-in loopback plaintext. |
 | `--iconv=LOCAL[,REMOTE]` | Declare this server's LOCAL charset for file-name conversion. |
@@ -742,7 +782,7 @@ before the module list, before authentication, and the connecting peer address
 
 ## Protocol and Security
 
-FastSync protocol version `2.22.0` is shared by the client and server. The
+FastSync protocol version `2.23.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
 manifests, keep-alives, abort handling, per-file remove-source results, and
@@ -807,20 +847,24 @@ operations require the server's explicit `--allow-delete` policy.
 The project will reach the drop-in replacement goal in stages:
 
 1. Correct rsync option meanings, including short options, combined options,
-   and `--option=value` syntax.
+   and `--option=value` syntax — **done** in the rsync-parity wave: `-r`/`-b`/
+   `-L`/`-B`, short-option clustering (`-av`, `-aAX`, `-rlpt`), and attached
+   values (`-B1000`, `-essh`, `-MOPT`) all parse.
 2. Add differential tests that compare FastSync and rsync contents, metadata,
    links, deletes, filters, dry runs, and exit codes.
-3. `-a` now implements the expected recursive, links, permissions, times,
-   owner/group (`-o`/`-g`), and supported device/special-file behavior (full
-   rsync `-rlptgoD`); ownership application stays privilege-gated and remaining
-   work is the documented device/special-file divergences.
-4. Symlink, sparse-file, metadata, delete-policy, and resumable-write semantics
-   are implemented; remaining work is the documented edge cases.
+3. `-a` implements full rsync `-rlptgoD`; under `-p` the source mode is copied
+   exactly (no masking). Ownership application stays privilege-gated, as in
+   rsync.
+4. Symlink (verbatim storage), sparse-file, metadata, delete-policy (including
+   `--max-delete` partial + exit 25), and resumable-write semantics are
+   implemented; remaining work is the documented edge cases, which the
+   **Rsync-Parity Wave** section of `RSYNC_COMPAT.md` enumerates honestly.
 5. Add rsync remote-shell and daemon protocol interoperability.
 6. Keep FastSync performance options as negotiated, optional extensions.
 
 The exhaustive implementation matrix and compatibility notes are in
-[`RSYNC_COMPAT.md`](RSYNC_COMPAT.md).
+[`RSYNC_COMPAT.md`](RSYNC_COMPAT.md); each row is classified as parity, caveat,
+or divergent.
 
 ## Testing
 

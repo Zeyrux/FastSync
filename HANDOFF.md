@@ -8,8 +8,8 @@
 - **Release PR #284 (`dev` -> `main`)** open, CI green (run 553).
   `main` is protected: it needs review/approval to merge.
   https://gitea.tap-tap.win/TapTap/FastSync/pulls/284
-- **`PROTOCOL_VERSION` = `"2.22.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.22.0)`.
+- **`PROTOCOL_VERSION` = `"2.23.0"`** (`src/shared/config.h`); CMake
+  `project(FastFileTransfer VERSION 2.23.0)`.
 - Working tree clean; no wave worktrees remain.
 
 ## What landed this session
@@ -38,6 +38,7 @@
    `build-bench/`, `--warm` mode); `shell.nix` full toolchain and no build-on-entry;
    docs state push-only / remote-source unsupported.
 5. **Preserve-attribute split (protocol 2.22.0)** landed on `feat/preserve-attr-split`: per-attribute `-p/-t/-o/-g` + `--no-*` negations, `-a` = `-rlptgoD`, and the 2.21.0 → 2.22.0 wire bump.
+6. **Rsync-parity wave (protocol 2.23.0)** on `feat/rsync-parity`: rsync short options/clustering/attached values (`-r`/`-b`/`-L`/`-B`, `-av`, `-aAX`, `-B1000`, `-essh`, `-MOPT`), `-c` checksum quick-check, `--checksum-choice`/`--compress-choice` validation and seed randomization, rsync timeout/max-alloc defaults, temp-dir confinement + `EXDEV` fallback, ownership/mapping parity (numeric-ids modifier, map ranges/`*`/empty-FROM, `--chown`+map conflicts, fake-super resolved-owner record), verbatim symlink storage with rsync `--safe-links`/`--munge-links`, socket recreation under `--specials`, `--chmod` 3.4.1 semantics, and delete scoping + `--max-delete` partial/exit-25. Wire: appended delete-manifest synchronized-directory section and `STATUS_DELETE_LIMIT`.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
