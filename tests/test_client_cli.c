@@ -530,7 +530,9 @@ static void test_parse_args_chmod() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->chmod_spec, "u=rw,go=r");
-  EXPECT_TRUE(cfg->preserve_perms);
+  /* rsync's --chmod does NOT imply --perms: it only tweaks the mode used for a
+   * new destination unless -p is also given. */
+  EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
   mode_t result;
   EXPECT_TRUE(chmod_apply(0777, cfg->chmod_spec, &result));
@@ -545,14 +547,39 @@ static void test_parse_args_numeric_chmod() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->chmod_spec, "7777");
-  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+static void test_parse_args_accepts_selector_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod=Dg+s,Fo-w,+X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->chmod_spec, "Dg+s,Fo-w,+X");
+  EXPECT_FALSE(cfg->preserve_perms);
+  config_delete(cfg);
+}
+
+static void test_parse_args_appends_repeated_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod=a+r", "--chmod=a-w", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  /* Repeated --chmod options accumulate (rsync >= 3.2.4) instead of replacing. */
+  EXPECT_EQ_STR(cfg->chmod_spec, "a+r,a-w");
+  mode_t result;
+  EXPECT_TRUE(chmod_apply(0644, cfg->chmod_spec, &result));
+  EXPECT_EQ_INT(result, 0444);
   config_delete(cfg);
 }
 
 static void test_parse_args_rejects_invalid_chmod() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--chmod=a+X", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--chmod=a+r,", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
@@ -4135,6 +4162,8 @@ void test_client_cli() {
   test_parse_args_executability();
   test_parse_args_chmod();
   test_parse_args_numeric_chmod();
+  test_parse_args_accepts_selector_chmod();
+  test_parse_args_appends_repeated_chmod();
   test_parse_args_rejects_invalid_chmod();
   test_parse_args_invalid_port();
   test_parse_args_non_numeric_port();

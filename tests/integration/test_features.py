@@ -936,6 +936,133 @@ class TestChmod:
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert (os.stat(os.path.join(received, "small.txt")).st_mode & 0o777) == 0o644
 
+    @pytest.mark.ci
+    def test_chmod_does_not_imply_perms(self, shared_server):
+        """rsync's --chmod only tweaks the mode used for a NEW destination; it
+        does not imply -p, so a pre-existing destination keeps its own mode."""
+        source = os.path.join(TEST_DATA_DIR, "chmod_nop_src")
+        dest = os.path.join(TEST_DATA_DIR, "chmod_nop_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"one\n")
+        os.chmod(src_file, 0o644)
+
+        result, _ = run_client(source, dest, flags=["-p"], port=shared_server.port)
+        assert result.returncode == 0, f"seed failed: {(result.stderr or '')[:200]}"
+        dst_file = os.path.join(get_dest_received_dir(dest, source), "f.txt")
+        os.chmod(dst_file, 0o600)
+        with open(src_file, "wb") as fh:
+            fh.write(b"two, changed content\n")
+
+        result, _ = run_client(source, dest, flags=["--chmod=go+w"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--chmod failed: {(result.stderr or result.stdout)[:300]}"
+        got = stat.S_IMODE(os.stat(dst_file).st_mode)
+        assert got == 0o600, \
+            f"--chmod must not imply -p; existing dest mode changed to {oct(got)}"
+
+    @pytest.mark.ci
+    def test_chmod_go_w_with_perms(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "chmod_gow_src")
+        dest = os.path.join(TEST_DATA_DIR, "chmod_gow_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"x\n")
+        os.chmod(src_file, 0o644)
+
+        result, _ = run_client(source, dest, flags=["-p", "--chmod=go+w"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-p --chmod=go+w failed: {(result.stderr or result.stdout)[:300]}"
+        got = stat.S_IMODE(os.stat(
+            os.path.join(get_dest_received_dir(dest, source), "f.txt")).st_mode)
+        assert got == 0o666, f"--chmod=go+w must grant group/other write, got {oct(got)}"
+
+    @pytest.mark.ci
+    def test_chmod_repeated_options_accumulate(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "chmod_append_src")
+        dest = os.path.join(TEST_DATA_DIR, "chmod_append_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"x\n")
+        os.chmod(src_file, 0o644)
+
+        result, _ = run_client(source, dest,
+                               flags=["-p", "--chmod=a+r", "--chmod=a-w"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"append --chmod failed: {(result.stderr or result.stdout)[:300]}"
+        got = stat.S_IMODE(os.stat(
+            os.path.join(get_dest_received_dir(dest, source), "f.txt")).st_mode)
+        assert got == 0o444, f"repeated --chmod must accumulate, got {oct(got)}"
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_chmod_matches_rsync(self, shared_server):
+        """Differential --chmod verification against rsync 3.4.1 for D/F/X
+        selectors, no-/with--p new files, special bits, and append semantics."""
+        cases = [
+            ("go_w_no_p", ["--chmod=go+w"], {}, {"f.txt": (b"x", 0o644)}, ["f.txt"]),
+            ("go_w_p", ["-p", "--chmod=go+w"], {}, {"f.txt": (b"x", 0o644)}, ["f.txt"]),
+            ("world_writable_p", ["-p"], {}, {"f.txt": (b"x", 0o666)}, ["f.txt"]),
+            ("setgid_sticky_dirs_p", ["-p"], {"sg": 0o2755, "st": 0o1777},
+             {"sg/a.txt": (b"x", 0o644), "st/b.txt": (b"x", 0o644)},
+             ["sg", "st"]),
+            ("special_file_p", ["-p"], {}, {"s": (b"x", 0o6755)}, ["s"]),
+            ("archive_special_file", ["-a"], {}, {"s": (b"x", 0o6755)}, ["s"]),
+            ("archive_setgid_dir", ["-a"], {"d": 0o2755},
+             {"d/a.txt": (b"x", 0o644)}, ["d"]),
+            ("dfx_p", ["-p", "--chmod=Dg+s,Fo-w,+X"], {"d": 0o700},
+             {"d/inner.txt": (b"x", 0o644), "f.txt": (b"x", 0o644)}, ["d", "f.txt"]),
+            ("x_selector_p", ["-p", "--chmod=a+X"], {"d": 0o600},
+             {"d/inner.txt": (b"x", 0o644), "exe": (b"x", 0o755), "noexe": (b"x", 0o644)},
+             ["d", "exe", "noexe"]),
+            ("append_p", ["-p", "--chmod=a+r", "--chmod=a-w"], {},
+             {"f.txt": (b"x", 0o644)}, ["f.txt"]),
+        ]
+        for name, flags, dirs, files, check in cases:
+            source = os.path.join(TEST_DATA_DIR, f"chmod_diff_{name}_src")
+            fdest = os.path.join(TEST_DATA_DIR, f"chmod_diff_{name}_fs")
+            rdest = os.path.join(TEST_DATA_DIR, f"chmod_diff_{name}_rsync")
+            clean_dir(source)
+            clean_dir(fdest)
+            clean_dir(rdest)
+            for rel, mode in dirs.items():
+                path = os.path.join(source, rel)
+                os.makedirs(path, exist_ok=True)
+                os.chmod(path, mode)
+            for rel, (content, mode) in files.items():
+                path = os.path.join(source, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(content)
+                os.chmod(path, mode)
+
+            rsync_result = subprocess.run(
+                ["rsync", "-r"] + flags + [source + "/", rdest + "/"],
+                text=True, capture_output=True)
+            assert rsync_result.returncode == 0, \
+                f"rsync {name} failed: {rsync_result.stderr[:300]}"
+
+            result, _ = run_client(source, fdest, flags=flags, port=shared_server.port)
+            assert result.returncode == 0, \
+                f"FastSync {name} failed: {(result.stderr or result.stdout)[:300]}"
+
+            fs_root = get_dest_received_dir(fdest, source)
+            for rel in check:
+                rsync_mode = stat.S_IMODE(os.lstat(os.path.join(rdest, rel)).st_mode)
+                fs_mode = stat.S_IMODE(os.lstat(os.path.join(fs_root, rel)).st_mode)
+                assert fs_mode == rsync_mode, (
+                    f"{name}: mode mismatch for {rel}: "
+                    f"FastSync {oct(fs_mode)} != rsync {oct(rsync_mode)}")
+
 
 class TestPreallocate:
     """--preallocate allocates the destination file space up front; the final

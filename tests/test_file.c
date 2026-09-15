@@ -957,7 +957,8 @@ static void test_inplace_overwrite_metadata_strips_special_bits() {
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
-  /* Metadata-derived mode is applied and never includes setuid/setgid/sticky. */
+  /* No -p: the pre-existing destination mode (without its special bits) is
+   * restored; the source mode is not applied. */
   EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
 
@@ -1039,12 +1040,11 @@ static void test_atomic_no_perms_preserves_destination_mode() {
   unlink(fresh);
 }
 
-/* MAJOR 2: a brand-new destination file must never be created group/other
- * writable from a client-supplied source mode.  The daemon runs with umask(0),
- * so without the explicit S_IWGRP|S_IWOTH strip a source 0666 (with no -p)
- * would materialize as world-writable. */
-static void test_new_file_mode_never_group_other_writable() {
-  const char* path = "test_new_file_no_go_write.bin";
+/* Strict rsync parity: a brand-new destination file with no -p follows
+ * rsync's source_mode & ~umask base, so group/other write in the source mode is
+ * honored exactly as the umask allows (it is no longer force-cleared). */
+static void test_new_file_mode_honors_source_and_umask() {
+  const char* path = "test_new_file_mode.bin";
   unlink(path);
   FileMetadata m;
   memset(&m, 0, sizeof(m));
@@ -1058,19 +1058,15 @@ static void test_new_file_mode_never_group_other_writable() {
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
-  EXPECT_EQ_INT((int)(st.st_mode & (S_IWGRP | S_IWOTH)), 0);
-  /* The rest of the source mode is still honored (owner write survives). */
-  EXPECT_EQ_INT((int)(st.st_mode & S_IWUSR), S_IWUSR);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), (int)(0666 & ~(mode_t)file_process_umask()));
   unlink(path);
 }
 
-/* Security: a client-supplied special-node mode must never materialize a
- * group/other-writable FIFO.  file_save_special_to_disk() sanitizes the
- * creation bits the same way the regular-file policy does: under -p the source
- * mode loses S_IWGRP|S_IWOTH (0777 -> 0755), and without -p a safe 0644 default
- * is used.  The daemon runs with umask(0) (server.c), so the explicit strip is
- * what keeps the node safe -- the test clears the umask to prove it. */
-static void test_special_fifo_mode_never_group_other_writable_impl() {
+/* Strict rsync parity for recreated special nodes: with -p the source mode is
+ * copied exactly (0777 -> 0777), and without -p the same source & ~umask base
+ * as any other new entry applies.  The process umask is cleared so the source
+ * bits are what reaches mkfifo. */
+static void test_special_fifo_mode_honors_source_and_umask_impl() {
   const char* root = "test_special_mode_tmp";
   const char* with_p = "test_special_mode_tmp/with_p.fifo";
   const char* no_p = "test_special_mode_tmp/no_p.fifo";
@@ -1089,7 +1085,7 @@ static void test_special_fifo_mode_never_group_other_writable_impl() {
   meta.gid = getegid();
   meta.mtime_sec = 1000000000;
 
-  /* -p: the source mode is honored minus group/other write. */
+  /* -p: the source mode (including group/other write) is copied exactly. */
   File* f = file_create("with_p.fifo");
   EXPECT_NOT_NULL(f);
   f->is_special = true;
@@ -1101,12 +1097,11 @@ static void test_special_fifo_mode_never_group_other_writable_impl() {
   struct stat st;
   EXPECT_EQ_INT(lstat(with_p, &st), 0);
   EXPECT_TRUE(S_ISFIFO(st.st_mode));
-  EXPECT_EQ_INT((int)(st.st_mode & (S_IWGRP | S_IWOTH)), 0);
-  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0777);
   f->metadata = NULL;
   file_destroy(f);
 
-  /* No -p: the fixed safe default, never the source's 0777. */
+  /* No -p: source & ~umask (umask is cleared, so 0777). */
   f = file_create("no_p.fifo");
   EXPECT_NOT_NULL(f);
   f->is_special = true;
@@ -1115,8 +1110,7 @@ static void test_special_fifo_mode_never_group_other_writable_impl() {
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
   EXPECT_EQ_INT(lstat(no_p, &st), 0);
   EXPECT_TRUE(S_ISFIFO(st.st_mode));
-  EXPECT_EQ_INT((int)(st.st_mode & (S_IWGRP | S_IWOTH)), 0);
-  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0777);
   f->metadata = NULL;
   file_destroy(f);
 
@@ -1126,15 +1120,15 @@ static void test_special_fifo_mode_never_group_other_writable_impl() {
   rmdir(root);
 }
 
-/* The receiver daemon runs umask(0), so an unsanitized source mode would reach
- * mkfifo unmasked.  Run the body with umask(0) to exercise the explicit strip,
- * and restore the process umask from this wrapper so a failing EXPECT inside the
- * body (which returns from the body only) cannot leak umask(0) into later
- * tests. */
-static void test_special_fifo_mode_never_group_other_writable() {
+/* The receiver daemon runs umask(0), so the source mode reaches mkfifo
+ * unmasked.  Run the body with umask(0) and refresh the cached process umask so
+ * file_process_umask() agrees, then restore both. */
+static void test_special_fifo_mode_honors_source_and_umask() {
   mode_t saved_umask = umask(0);
-  test_special_fifo_mode_never_group_other_writable_impl();
+  file_umask_capture();
+  test_special_fifo_mode_honors_source_and_umask_impl();
   umask(saved_umask);
+  file_umask_capture();
 }
 
 /* --specials recreates a unix-domain socket via mknod(S_IFSOCK), which Linux
@@ -1930,8 +1924,8 @@ void test_file() {
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();
   test_atomic_no_perms_preserves_destination_mode();
-  test_new_file_mode_never_group_other_writable();
-  test_special_fifo_mode_never_group_other_writable();
+  test_new_file_mode_honors_source_and_umask();
+  test_special_fifo_mode_honors_source_and_umask();
   test_special_socket_recreated();
   test_inplace_overwrite_truncates_shorter_payload();
   test_inplace_refuses_fifo_destination();

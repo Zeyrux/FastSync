@@ -95,14 +95,14 @@ class TestPreservePerms:
         source = os.path.join(TEST_DATA_DIR, "perms_nop_new_src")
         dest = os.path.join(TEST_DATA_DIR, "perms_nop_new_dst")
         # 0664 has group/other bits that the umask strips, so the result is not
-        # just the source mode.  FastSync additionally never grants group/other
-        # write from a client-supplied mode (S_IWGRP|S_IWOTH are always
-        # cleared), so the expected mode masks those too.
+        # just the source mode.  Under strict rsync parity the source mode is
+        # masked only by the umask (group/other write is no longer force-cleared
+        # on top of it).
         _seed_file(source, dest, "f.txt", b"new\n", 0o664)
 
         result, _ = run_client(source, dest, flags=["-t"], port=shared_server.port)
-        assert result.returncode == 0, f"-t failed: {(result.stderr or '')[:300]}"
-        want = 0o664 & ~_process_umask() & ~0o022
+        assert result.returncode == 0, f"-t failed: {(result.stderr or result.stdout)[:300]}"
+        want = 0o664 & ~_process_umask()
         got = os.stat(_received(dest, source, "f.txt")).st_mode & 0o777
         assert got == want, \
             f"new no--p destination mode: want {oct(want)}, got {oct(got)}"
@@ -254,15 +254,15 @@ class TestDirectoryModes:
         assert got == 0o750, f"-p must apply the source directory mode, got {oct(got)}"
 
     @pytest.mark.ci
-    def test_p_sanitizes_directory_group_other_write(self, shared_server):
-        # A 0777 source directory must never produce a group/other-writable
-        # destination directory: the file-mode sanitization is applied to dirs.
-        source, dest, _ = self._tree("dirmode_sanitize", 0o777, pin_mtime=False)
+    def test_p_preserves_directory_group_other_write(self, shared_server):
+        # Strict rsync parity: -p copies the source directory mode exactly,
+        # including group/other write (the old sanitization is gone).
+        source, dest, _ = self._tree("dirmode_go_write", 0o777, pin_mtime=False)
         result, _ = run_client(source, dest, flags=["-p"], port=shared_server.port)
         assert result.returncode == 0, f"-p failed: {(result.stderr or result.stdout)[:300]}"
         mode = os.stat(os.path.join(get_dest_received_dir(dest, source), "sub")).st_mode & 0o777
-        assert mode & 0o022 == 0, \
-            f"directory must never be group/other writable, got {oct(mode)}"
+        assert mode == 0o777, \
+            f"-p must preserve the source directory mode exactly, got {oct(mode)}"
 
     @pytest.mark.ci
     def test_omit_dir_times_suppresses_times_not_modes(self, shared_server):
@@ -443,14 +443,13 @@ class TestPreserveFeatureMatrix:
 
 
 class TestSpecialNodeModes:
-    """Security: a client can never grant group/other write, including on a
-    recreated special node (FIFO).  The special-node creation path sanitizes
-    S_IWGRP|S_IWOTH just like the regular-file and directory paths, so a source
-    FIFO with mode 0777 must land as 0755 (owner/group/other read+exec from the
-    source otherwise preserved).  FIFOs are created unprivileged via mkfifo."""
+    """Strict rsync parity: with -p the source FIFO mode is copied exactly,
+    including group/other write.  Without -p the node follows the same
+    source & ~umask base as any other new entry.  FIFOs are created
+    unprivileged via mkfifo."""
 
     @pytest.mark.ci
-    def test_specials_p_sanitizes_fifo_group_other_write(self):
+    def test_specials_p_preserves_fifo_mode(self):
         source = os.path.join(TEST_DATA_DIR, "specialmode_src")
         dest = os.path.join(TEST_DATA_DIR, "specialmode_dst")
         clean_dir(source)
@@ -464,8 +463,8 @@ class TestSpecialNodeModes:
         # Production daemonizes with umask(0) (server.c) so the source mode is
         # what reaches mkfifo.  The session server runs in the foreground and
         # would inherit the runner's umask, which alone would strip the write
-        # bits and mask a regression in the sanitization.  Start a dedicated
-        # foreground server under umask(0) to exercise the real path.
+        # bits and mask a regression.  Start a dedicated foreground server under
+        # umask(0) to exercise the real path.
         server = ServerManager()
         saved_umask = os.umask(0)
         try:
@@ -486,7 +485,5 @@ class TestSpecialNodeModes:
         st = os.lstat(received)
         assert stat.S_ISFIFO(st.st_mode), f"received entry is not a FIFO: {oct(st.st_mode)}"
         mode = st.st_mode & 0o777
-        assert mode & 0o022 == 0, \
-            f"recreated FIFO must never be group/other writable, got {oct(mode)}"
-        assert mode == 0o755, \
-            f"-p must preserve the source FIFO mode minus group/other write (want 0o755), got {oct(mode)}"
+        assert mode == 0o777, \
+            f"-p must preserve the source FIFO mode exactly (want 0o777), got {oct(mode)}"
