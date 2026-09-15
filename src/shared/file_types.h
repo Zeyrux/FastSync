@@ -2,6 +2,7 @@
 #define FILE_TYPES_H
 
 #include "data.h"
+#include "format.h"
 #include "xattr.h"
 #include <stdbool.h>
 #include <sys/stat.h>
@@ -86,6 +87,12 @@ typedef struct {
    * Receiver: parsed off the wire, attached here, and applied fd-relative on
    * the written file.  NULL/0 == the file carries no xattrs. */
   FileXattrList* xattrs;
+  /* Sender-side output-parity state (never serialized): the receiver-reported
+   * pre-transfer destination snapshot for this entry, filled by the per-file
+   * STATUS_CHECK exchange when report_dest_info is set.  `known` is false when
+   * no report was requested/received, in which case -i/--out-format treats the
+   * entry conservatively as newly created. */
+  OutputDestState dest_state;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

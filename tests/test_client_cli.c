@@ -338,8 +338,8 @@ static void test_parse_args_protocol_accept_current() {
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
   static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
-                                             "2.18.0", "2.19.0", "2.20.0", "2.21.0", "216",
-                                             "31",     "abc",    ""};
+                                             "2.18.0", "2.19.0", "2.20.0", "2.21.0", "2.22.0",
+                                             "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -3942,6 +3942,12 @@ static void test_parse_args_inline_equals_forms() {
   EXPECT_EQ_STR(cfg->exclude_patterns[0], "*.log");
   EXPECT_EQ_INT(cfg->include_count, 1);
   EXPECT_EQ_STR(cfg->include_patterns[0], "*.txt");
+  /* The same patterns are compiled, in command-line order, into the shared
+   * ordered --filter rule list (rsync first-match-wins). */
+  EXPECT_NOT_NULL(cfg->filters);
+  EXPECT_EQ_INT(cfg->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg->filters->items[0], "- *.log");
+  EXPECT_EQ_STR((char*)cfg->filters->items[1], "+ *.txt");
   config_delete(cfg);
 
   const char* list_path = "cli_inline_patterns.txt";
@@ -3987,6 +3993,41 @@ static void test_parse_args_inline_equals_forms() {
   EXPECT_TRUE(cfg->chunk_size == 4096ULL);
   EXPECT_TRUE(cfg->delta_max_file_size == 1048576ULL);
   config_delete(cfg);
+}
+
+/* --exclude/--include compile into the SAME ordered filter list as --filter, so
+ * rsync's first-match-wins semantics hold: the common `--include='*.txt'
+ * --exclude='*'` idiom keeps the .txt files and drops the rest, and an
+ * --include rule with no matching exclude is not a mandatory whitelist. */
+static void test_parse_args_include_exclude_order() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--include=*.txt", "--exclude=*", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_NOT_NULL(cfg->filters);
+  EXPECT_EQ_INT(cfg->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg->filters->items[0], "+ *.txt");
+  EXPECT_EQ_STR((char*)cfg->filters->items[1], "- *");
+  /* The order is reversible on the command line and the list follows it. */
+  Config* cfg2 = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--exclude=*", "--include=*.txt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg2, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg2->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg2->filters->items[0], "- *");
+  EXPECT_EQ_STR((char*)cfg2->filters->items[1], "+ *.txt");
+  /* --filter and --exclude/--include interleave in command-line order. */
+  Config* cfg3 = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--filter=- *.tmp", "--include=*.txt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg3, 5, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg3->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg3->filters->items[0], "- *.tmp");
+  EXPECT_EQ_STR((char*)cfg3->filters->items[1], "+ *.txt");
+  config_delete(cfg);
+  config_delete(cfg2);
+  config_delete(cfg3);
 }
 
 /* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive) must never
@@ -4224,6 +4265,7 @@ void test_client_cli() {
   test_parse_args_short_clustering();
   test_parse_args_attached_short_values();
   test_parse_args_inline_equals_forms();
+  test_parse_args_include_exclude_order();
   test_parse_args_noop_does_not_consume_argv();
   test_parse_args_backup_copy_links_shorts();
   test_parse_args_rejects_unsupported_short();

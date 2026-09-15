@@ -163,7 +163,18 @@ enum NET_STATUS {
    * stored; the sender maps this to rsync's exit code 25 ("the --max-delete
    * limit stopped deletions").  Appended after STATUS_DRY_RUN_TRANSFER so no
    * existing status is renumbered. */
-  STATUS_DELETE_LIMIT
+  STATUS_DELETE_LIMIT,
+  /* Destination-state report for output parity (protocol 2.23.0).  When the
+   * wire config carries report_dest_info=true, the receiver answers every
+   * per-file STATUS_CHECK request with STATUS_DEST_INFO FIRST, followed by a
+   * fixed record describing the pre-transfer destination entry
+   * (int32 has_old; uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode;
+   * int32 uid; int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict
+   * follows, so the sender can render rsync-accurate -i/--out-format columns
+   * (new vs modified, and which of size/time/perms/owner/group differ) without
+   * changing the transfer decision itself.  Appended after
+   * STATUS_DELETE_LIMIT so no existing status is renumbered. */
+  STATUS_DEST_INFO
 };
 
 void io_set_fds(int read_fd, int write_fd);

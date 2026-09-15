@@ -11,6 +11,7 @@
 #include "file.h"
 #include "file_list.h"
 #include "filter.h"
+#include "format.h"
 #include "hardlink.h"
 #include "metadata.h"
 #include "motd.h"
@@ -69,32 +70,61 @@ static int progress_thread_fn(void* arg);
 
 static const char* display_bytes(unsigned long long bytes, bool human_readable, char* buffer,
                                  size_t buffer_size) {
-  if (human_readable && format_human_bytes(bytes, buffer, buffer_size))
+  if (human_readable && format_human_size_decimal(bytes, buffer, buffer_size))
     return buffer;
   snprintf(buffer, buffer_size, "%.1f MB", (double)bytes / (double)BYTES_PER_MIB);
   return buffer;
 }
 
-/* Print the canonical `--stats` line.  Shared by the single-threaded and
-   multithreaded send paths so both honor --stats, --human-readable and --quiet
-   identically; `start` marks the beginning of the transfer for the rate. */
+/* rsync byte count: human-readable decimal when -h was given, otherwise a
+ * comma-grouped integer (rsync's big_num in the C locale). */
+static const char* stats_bytes(const Config* config, unsigned long long bytes, char* buffer,
+                               size_t buffer_size) {
+  if (!format_big_num(bytes, config->human_readable, buffer, buffer_size))
+    snprintf(buffer, buffer_size, "%llu", bytes);
+  return buffer;
+}
+
+/* Print the rsync `--stats` block on stdout.  FastSync is a push sender, so a
+   few receiver-only counters (matched data, file-list bytes, deletion count)
+   are not observable and are reported as 0; the labels and layout match rsync
+   3.4.1.  Shared by the single-threaded and multithreaded send paths. */
 static void report_transfer_stats(const Config* config, int total_files,
                                   unsigned long long total_bytes, time_t start) {
   if (!config->stats || config->quiet)
     return;
   double elapsed = difftime(time(NULL), start);
-  double rate = elapsed > 0.0 ? (double)total_bytes / ((double)BYTES_PER_MIB * elapsed) : 0.0;
+  double rate = elapsed > 0.0 ? (double)total_bytes / elapsed : 0.0;
+  char total_buffer[32];
+  char rate_buffer[32];
+  char human_rate[32];
+  const char* total = stats_bytes(config, total_bytes, total_buffer, sizeof(total_buffer));
+  const char* rate_str = rate_buffer;
   if (config->human_readable) {
-    char total_buffer[32];
-    char rate_buffer[32];
-    fprintf(stderr, "Stats: %d files, %s, %s/s\n", total_files,
-            display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
-            display_bytes((unsigned long long)(rate * (double)BYTES_PER_MIB), true, rate_buffer,
-                          sizeof(rate_buffer)));
+    if (!format_human_size_decimal((unsigned long long)rate, human_rate, sizeof(human_rate)))
+      snprintf(human_rate, sizeof(human_rate), "0");
+    rate_str = human_rate;
   } else {
-    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files,
-            (double)total_bytes / (double)BYTES_PER_MIB, rate);
+    snprintf(rate_buffer, sizeof(rate_buffer), "%.2f", rate);
   }
+  printf("\n");
+  printf("Number of files: %d\n", total_files);
+  printf("Number of created files: %d\n", total_files);
+  printf("Number of deleted files: 0\n");
+  printf("Number of regular files transferred: %d\n", total_files);
+  printf("Total file size: %s bytes\n", total);
+  printf("Total transferred file size: %s bytes\n", total);
+  printf("Literal data: %s bytes\n", total);
+  printf("Matched data: 0 bytes\n");
+  printf("File list size: 0\n");
+  printf("File list generation time: 0.000 seconds\n");
+  printf("File list transfer time: 0.000 seconds\n");
+  printf("Total bytes sent: %s\n", total);
+  printf("Total bytes received: 0\n");
+  printf("\n");
+  printf("sent %s bytes  received 0 bytes  %s bytes/sec\n", total, rate_str);
+  printf("total size is %s  speedup is %.2f\n", total, 1.0);
+  fflush(stdout);
 }
 
 /* Compiled scanner inputs that are shared read-only across scanner instances
@@ -146,10 +176,16 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->preserve_xattrs = config->preserve_xattrs;
   options->preserve_acls = config->preserve_acls;
   options->chunk_size = config->chunk_size;
-  options->exclude_patterns = config->exclude_patterns;
-  options->exclude_count = config->exclude_count;
-  options->include_patterns = config->include_patterns;
-  options->include_count = config->include_count;
+  /* --exclude/--include are compiled, in command-line order, into the SAME
+   * ordered filter rule list as --filter/-f (see config_add_selection_rule), so
+   * the legacy per-kind arrays are deliberately NOT passed to the scanner:
+   * doing so would re-apply them with the old "excludes first, then includes as
+   * a mandatory whitelist" precedence and defeat rsync's first-match-wins
+   * ordering.  The arrays remain populated purely for the Config API surface. */
+  options->exclude_patterns = NULL;
+  options->exclude_count = 0;
+  options->include_patterns = NULL;
+  options->include_count = 0;
   options->max_size = config->max_size;
   options->min_size = config->min_size;
   options->max_depth = config->max_depth;
@@ -469,7 +505,7 @@ static void receive_daemon_motd(Client* client, const Config* config) {
 static Client* connect_transfer_client(const Config* config) {
   if (config->transport == TRANSPORT_SSH) {
     if (config->use_sendfile) {
-      log_message(LOG_LEVEL_ERROR, "-f/--sendfile is not supported with SSH transport");
+      log_message(LOG_LEVEL_ERROR, "--sendfile is not supported with SSH transport");
       return NULL;
     }
     return client_connect_ssh(config->ssh_destination, config->ssh_port,
@@ -796,30 +832,53 @@ static int send_dry_run_manifest(const Config* config) {
 }
 
 typedef struct {
-  char* path;
+  char* name; /* transfer-relative name ("" == the source root) */
   mode_t mode;
   unsigned long long size;
   time_t mtime;
+  long mtime_nsec;
+  bool is_dir;
+  bool is_symlink;
+  char* link_target;
 } ListEntry;
 
 static void list_entries_destroy(ListEntry* entries, size_t count) {
   if (entries == NULL)
     return;
-  for (size_t i = 0; i < count; i++)
-    free(entries[i].path);
+  for (size_t i = 0; i < count; i++) {
+    free(entries[i].name);
+    free(entries[i].link_target);
+  }
   free(entries);
 }
 
 static int compare_list_entries(const void* left, const void* right) {
   const ListEntry* a = (const ListEntry*)left;
   const ListEntry* b = (const ListEntry*)right;
-  return strcmp(a->path, b->path);
+  return strcmp(a->name, b->name);
 }
 
-/* --list-only: print an ls-style listing of the files that WOULD be
+/* Relative path of an entry below `root` ("" for the root itself).  Mirrors
+ * change_list's relative_name for list-only rendering. */
+static char* list_relative_name(const char* root, const char* full) {
+  if (root == NULL || full == NULL)
+    return str_dup(full != NULL ? full : "");
+  size_t root_len = strlen(root);
+  while (root_len > 1 && root[root_len - 1] == '/')
+    root_len--;
+  if (strncmp(root, full, root_len) == 0) {
+    if (full[root_len] == '\0')
+      return str_dup("");
+    if (full[root_len] == '/')
+      return str_dup(full + root_len + 1);
+  }
+  return str_dup(full);
+}
+
+/* --list-only: print an ls-style listing of the entries that WOULD be
  * transferred and exit without contacting the server or writing anything.
- * Directory lines are not printed because the scanner only yields regular
- * transfer candidates. Returns 0 on success, 1 on error. */
+ * Names are transfer-relative (rsync prints `a.txt`, `sub/b.txt`, `.`) and
+ * directory entries are included.  Returns 0 on success, 1 on error. */
 static int send_list_only(const Config* config) {
   int skipped = 0;
   if (!files_from_list_check(config, NULL, &skipped))
@@ -828,6 +887,7 @@ static int send_list_only(const Config* config) {
   if (!prepare_scanner(config, 0, &prepared))
     return 1;
   prepared.options.use_metadata = true; /* capture mode + mtime for the listing */
+  prepared.options.list_dirs = true;
   DirectoryScanner* scanner =
       directory_scanner_create_with_options(config->send_directory, &prepared.options);
   if (!scanner) {
@@ -837,9 +897,31 @@ static int send_list_only(const Config* config) {
   ListEntry* entries = NULL;
   size_t count = 0;
   size_t capacity = 0;
-  Chunk* chunk;
   bool oom = false;
-  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+
+  /* rsync lists the source root itself (as ".").  Only when the source is a
+   * directory and no --files-from subset is in effect. */
+  if (config->files_from_set == NULL && config->send_directory != NULL) {
+    struct stat st;
+    if (stat(config->send_directory, &st) == 0 && S_ISDIR(st.st_mode)) {
+      capacity = 64;
+      entries = calloc(capacity, sizeof(ListEntry));
+      if (entries == NULL) {
+        oom = true;
+      } else {
+        entries[0].name = str_dup("");
+        entries[0].mode = st.st_mode;
+        entries[0].mtime = st.st_mtime;
+        entries[0].mtime_nsec = st.st_mtim.tv_nsec;
+        entries[0].size = (unsigned long long)st.st_size;
+        entries[0].is_dir = true;
+        count = 1;
+      }
+    }
+  }
+
+  Chunk* chunk;
+  while (!oom && (chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
       File* f = chunk->items[i];
       if (f == NULL)
@@ -856,34 +938,47 @@ static int send_list_only(const Config* config) {
           break;
         }
         entries = grown;
+        memset(entries + capacity, 0, (new_capacity - capacity) * sizeof(ListEntry));
         capacity = new_capacity;
       }
-      char* path = str_dup(file_wire_path(f));
-      if (!path) {
+      char* name = list_relative_name(config->send_directory, file_wire_path(f));
+      if (!name) {
         oom = true;
         break;
       }
       mode_t mode = 0;
       time_t mtime = 0;
+      long mtime_nsec = 0;
       if (f->metadata != NULL) {
         mode = f->metadata->mode;
         mtime = f->metadata->mtime_sec;
+        mtime_nsec = f->metadata->mtime_nsec;
       } else {
         struct stat st;
-        if (stat(f->path, &st) == 0) {
+        if (lstat(f->path, &st) == 0) {
           mode = st.st_mode;
           mtime = st.st_mtime;
+          mtime_nsec = st.st_mtim.tv_nsec;
         }
       }
-      entries[count].path = path;
+      entries[count].name = name;
       entries[count].mode = mode;
       entries[count].mtime = mtime;
-      entries[count].size = f->data != NULL ? f->data->size : 0;
+      entries[count].mtime_nsec = mtime_nsec;
+      if (f->is_symlink)
+        entries[count].size = f->symlink_target != NULL ? strlen(f->symlink_target) : 0;
+      else if (f->is_dir) {
+        struct stat dir_st;
+        entries[count].size = stat(f->path, &dir_st) == 0 ? (unsigned long long)dir_st.st_size : 0;
+      } else
+        entries[count].size = f->data != NULL ? f->data->size : 0;
+      entries[count].is_dir = f->is_dir;
+      entries[count].is_symlink = f->is_symlink;
+      entries[count].link_target =
+          f->is_symlink && f->symlink_target ? str_dup(f->symlink_target) : NULL;
       count++;
     }
     chunk_destroy(chunk);
-    if (oom)
-      break;
   }
   bool failed = oom || directory_scanner_failed(scanner) || directory_scanner_had_io_error(scanner);
   directory_scanner_destroy(scanner);
@@ -897,8 +992,18 @@ static int send_list_only(const Config* config) {
   if (count > 1)
     qsort(entries, count, sizeof(ListEntry), compare_list_entries);
   for (size_t i = 0; i < count; i++) {
-    char* line = change_render_list_line(entries[i].mode, entries[i].size, entries[i].mtime,
-                                         entries[i].path);
+    ChangeEvent event;
+    memset(&event, 0, sizeof(event));
+    event.name = entries[i].name;
+    event.path = entries[i].name;
+    event.mode = entries[i].mode;
+    event.size = entries[i].size;
+    event.mtime_sec = entries[i].mtime;
+    event.mtime_nsec = entries[i].mtime_nsec;
+    event.is_directory = entries[i].is_dir;
+    event.is_symlink = entries[i].is_symlink;
+    event.symlink_target = entries[i].link_target;
+    char* line = change_render_list_line(config, &event);
     if (line != NULL) {
       char* escaped = output_escape(line, config->eight_bit_output);
       printf("%s\n", escaped != NULL ? escaped : line);
@@ -1087,6 +1192,19 @@ static int incremental_check(Client* client, File* file, const Config* config,
   Status s;
   if (!receive_status(client->file_descriptor, &s))
     return -1;
+  /* Output parity: when dest-info reporting is negotiated the receiver sends
+   * the pre-transfer destination snapshot BEFORE its ordinary verdict.  Consume
+   * it here so the following status read stays in sync. */
+  if (config->report_dest_info) {
+    if (s != STATUS_DEST_INFO ||
+        !format_dest_state_receive(client->file_descriptor, &file->dest_state)) {
+      log_message(LOG_LEVEL_ERROR, "Unexpected reply to the destination-state report");
+      send_status(client->file_descriptor, STATUS_ERROR);
+      return -1;
+    }
+    if (!receive_status(client->file_descriptor, &s))
+      return -1;
+  }
   if (s == STATUS_ERROR) {
     log_server_rejection("Server reported error for file");
     return -1;

@@ -172,6 +172,26 @@ bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entr
   return !one_file_system || entry_device == root_device;
 }
 
+/* Build a payload-less directory File carrying the captured metadata (when
+ * requested).  Used by -x mount-point emission and --list-only directory
+ * entries.  Returns NULL on allocation failure. */
+static File* scanner_build_dir_file(const char* path, const struct stat* stats,
+                                    const ScannerOptions* options) {
+  File* dir = file_create(path);
+  if (dir == NULL)
+    return NULL;
+  dir->is_dir = true;
+  if (options->use_metadata) {
+    dir->metadata =
+        file_metadata_create(dir->path, stats, options->preserve_atimes, options->preserve_crtimes);
+    if (!dir->metadata) {
+      file_destroy(dir);
+      return NULL;
+    }
+  }
+  return dir;
+}
+
 /* Relative path of an on-disk path below `root`. The transfer root may be
  * given with a trailing slash; the returned rel path never has one and is ""
  * for the root itself. A root of "/" is handled (its children start at "/").
@@ -1160,8 +1180,30 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       free(rel_copy);
       if (!scanner_same_filesystem(scanner->options.one_file_system, scanner->root_dev,
                                    stats.st_dev)) {
+        /* rsync's -x/--one-file-system emits the mount-point directory entry
+           itself (so the destination gets an empty directory) but does NOT
+           descend into it.  Build a payload-less directory File and hand it to
+           the caller; never enqueue it for traversal. */
+        File* mount = scanner_build_dir_file(cur_path, &stats, &scanner->options);
+        if (mount == NULL || !array_list_add(chunk_data, mount)) {
+          file_destroy(mount);
+          free(cur_path);
+          scanner->failed = true;
+          break;
+        }
         free(cur_path);
         continue;
+      }
+      /* --list-only: list directory entries too (rsync prints them), even
+         though a real transfer never sends them explicitly. */
+      if (scanner->options.list_dirs) {
+        File* dir = scanner_build_dir_file(cur_path, &stats, &scanner->options);
+        if (dir == NULL || !array_list_add(chunk_data, dir)) {
+          file_destroy(dir);
+          free(cur_path);
+          scanner->failed = true;
+          break;
+        }
       }
       int next_depth = scanner->current_depth + 1;
       if (scanner->options.max_depth <= 0 || next_depth < scanner->options.max_depth) {
@@ -1512,7 +1554,28 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   if (is_dir) {
     free(rel);
     if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
+      /* -x/--one-file-system: emit the mount-point directory entry (empty) but
+         do not descend into it (see the sequential scanner for the same rule). */
+      File* mount = file_create(cur_path);
       free(cur_path);
+      if (mount == NULL) {
+        ps->failed = true;
+        return;
+      }
+      mount->is_dir = true;
+      if (options->use_metadata) {
+        mount->metadata = file_metadata_create(mount->path, &st, options->preserve_atimes,
+                                               options->preserve_crtimes);
+        if (!mount->metadata) {
+          file_destroy(mount);
+          ps->failed = true;
+          return;
+        }
+      }
+      if (!array_list_add(root_files, mount)) {
+        file_destroy(mount);
+        ps->failed = true;
+      }
       return;
     }
     if (!array_list_add(subdirs, cur_path)) {

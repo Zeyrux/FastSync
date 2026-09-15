@@ -19,6 +19,7 @@
 #include "delay_updates.h"
 #include "delta.h"
 #include "file.h"
+#include "format.h"
 #include "identity.h"
 #include "log.h"
 #include "metadata.h"
@@ -1871,6 +1872,33 @@ static IncrementalCheckOutcome incremental_check_open_destination(IncrementalChe
   return INCREMENTAL_CONTINUE;
 }
 
+/* Output parity (protocol 2.23.0): when the wire config asked for it, report a
+   snapshot of the pre-transfer destination entry BEFORE the ordinary verdict so
+   the sender can render rsync-accurate -i/--out-format columns.  A missing
+   destination is reported explicitly (existed=false) rather than omitted, so
+   the sender can distinguish "new" from "unknown". */
+static IncrementalCheckOutcome incremental_check_report_dest_info(IncrementalCheckState* state) {
+  if (!state->config->report_dest_info)
+    return INCREMENTAL_CONTINUE;
+  OutputDestState info;
+  memset(&info, 0, sizeof(info));
+  info.known = true;
+  info.existed = state->has_old_file;
+  if (state->has_old_file) {
+    info.size = (unsigned long long)state->old_st.st_size;
+    info.mtime_sec = (long long)state->old_st.st_mtime;
+#ifdef __linux__
+    info.mtime_nsec = state->old_st.st_mtim.tv_nsec;
+#endif
+    info.mode = (uint32_t)state->old_st.st_mode;
+    info.uid = (int32_t)state->old_st.st_uid;
+    info.gid = (int32_t)state->old_st.st_gid;
+  }
+  if (!send_status(state->fd, STATUS_DEST_INFO) || !format_dest_state_send(state->fd, &info))
+    return INCREMENTAL_ERROR;
+  return INCREMENTAL_CONTINUE;
+}
+
 /* Metadata-only (and, when --checksum forces it, content) up-to-date decision.
    Loads the old contents only when a checksum comparison or delta needs them. */
 static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckState* state,
@@ -2312,6 +2340,10 @@ File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
     goto done;
 
   outcome = incremental_check_open_destination(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+
+  outcome = incremental_check_report_dest_info(&state);
   if (outcome == INCREMENTAL_ERROR)
     goto done;
 

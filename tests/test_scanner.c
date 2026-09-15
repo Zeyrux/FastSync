@@ -644,17 +644,19 @@ static void test_scanner_one_file_system_cross_device() {
   EXPECT_EQ_INT(seq_off_rc, 0);
   EXPECT_TRUE(seq_off_found);
   EXPECT_EQ_INT(seq_off_total, 2);
-  /* Sequential: with -x the cross-device subtree is dropped, keep.txt remains. */
+  /* Sequential: with -x the cross-device subtree is not descended into, but
+   * rsync-compatible behavior still emits the mount-point directory entry as an
+   * empty directory File, so keep.txt plus that entry are present. */
   EXPECT_EQ_INT(seq_on_rc, 0);
   EXPECT_FALSE(seq_on_found);
-  EXPECT_EQ_INT(seq_on_total, 1);
+  EXPECT_EQ_INT(seq_on_total, 2);
   /* Parallel: same behavior, worker path (depth > 1). */
   EXPECT_EQ_INT(par_off_rc, 0);
   EXPECT_TRUE(par_off_found);
   EXPECT_EQ_INT(par_off_total, 2);
   EXPECT_EQ_INT(par_on_rc, 0);
   EXPECT_FALSE(par_on_found);
-  EXPECT_EQ_INT(par_on_total, 1);
+  EXPECT_EQ_INT(par_on_total, 2);
 }
 
 /* Collect emitted file paths (relative to `root`) from a sequential scan.
@@ -881,6 +883,35 @@ static void test_filter_rules(bool parallel) {
   EXPECT_EQ_INT(rc, 0);
   EXPECT_EQ_INT(count, 1);
   EXPECT_TRUE(has_path(paths, count, "a.txt"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  /* The common include idiom (the exact rule order the CLI compiles from
+   * --include='*.txt' --exclude='*'): only .txt files survive. */
+  const char* idiom[] = {"+ *.txt", "- *"};
+  base = filter_base_build(idiom, 2, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  options.base_filters = base;
+  rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "a.txt"));
+  EXPECT_TRUE(has_path(paths, count, "c.txt"));
+  EXPECT_FALSE(has_path(paths, count, "b.tmp"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  /* An include rule alone is NOT a mandatory whitelist (rsync semantics): only
+   * the matching file is affected, everything else is still transferred. */
+  const char* include_alone[] = {"+ *.txt"};
+  base = filter_base_build(include_alone, 1, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  options.base_filters = base;
+  rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 3);
   free_paths(paths, count);
   filter_rule_list_free(base);
 

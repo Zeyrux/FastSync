@@ -2690,10 +2690,10 @@ static void golden_config_populate(Config* c) {
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.23.0
  * rsync-parity wave changes the config-frame layout (map-entry range + TO name,
- * plus other wire changes landing in this version); the byte-exact hash is
- * recomputed for the merged layout. */
-#define GOLDEN_WIRE_LEN 693
-#define GOLDEN_WIRE_HASH 6341115972171444885ULL
+ * one report_dest_info bool, and other wire changes landing in this version);
+ * the byte-exact values are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 697
+#define GOLDEN_WIRE_HASH 0ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

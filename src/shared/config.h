@@ -81,7 +81,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.22.0).
+ * Config wire-field table (single source of truth for protocol 2.23.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -246,6 +246,13 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   X(copy_as_uid, int32_t, 0, COPY_AS_ID)                                                           \
   X(copy_as_gid, int32_t, 0, COPY_AS_ID)
 
+/* Output-parity wave (protocol 2.23.0).  report_dest_info tells the receiver to
+ * answer every per-file STATUS_CHECK with a STATUS_DEST_INFO snapshot of the
+ * pre-transfer destination entry (see protocol.h).  It is set by the client
+ * only when -i/--itemize-changes or --out-format asks for per-file change
+ * output; the transfer decision itself is unchanged. */
+#define CONFIG_WIRE_OUTPUT_FIELDS(X) X(report_dest_info, bool, false, BOOL)
+
 /* All serialized fields, in exact wire order.  Concatenating the per-segment
  * lists here is what keeps the declaration order = the wire order. */
 #define CONFIG_WIRE_FIELDS(X)                                                                      \
@@ -266,7 +273,8 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   CONFIG_WIRE_DAEMON_AUTH_FIELDS(X)                                                                \
   CONFIG_WIRE_ICONV_FIELDS(X)                                                                      \
   CONFIG_WIRE_PRIVILEGE_FIELDS(X)                                                                  \
-  CONFIG_WIRE_COPY_AS_FIELDS(X)
+  CONFIG_WIRE_COPY_AS_FIELDS(X)                                                                    \
+  CONFIG_WIRE_OUTPUT_FIELDS(X)
 
 typedef struct Config {
   /* -j/--threads=N: number of parallel scanner worker threads for the -m
@@ -892,7 +900,17 @@ typedef struct Config {
  * version: a 2.22 peer would desynchronize on the new entry bytes, the extra
  * trailing section or the unknown status, and the strict same-version handshake
  * (config_receive rejects a mismatched version before parsing anything else) is
- * what keeps a 2.23 client and a 2.22 server from ever reaching that state. */
+ * what keeps a 2.23 client and a 2.22 server from ever reaching that state.
+ *
+ * (3) Output parity (#291/#292): -i/--itemize-changes and --out-format must
+ * compare the source against the PRE-TRANSFER destination entry (new vs
+ * modified, and which of size/time/perms/owner/group differ), but FastSync's
+ * push sender never sees the destination.  The receiver therefore answers a
+ * per-file STATUS_CHECK with a new STATUS_DEST_INFO frame (a fixed-width
+ * snapshot of the old entry) before its ordinary verdict when the config frame
+ * carries the new report_dest_info bool appended after the --copy-as block.
+ * This is both a config-frame layout change (one trailing bool) and a frame
+ * sequence change (the new status). */
 #define PROTOCOL_VERSION "2.23.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */

@@ -1151,6 +1151,7 @@ CONFIG_DEFINE_SEND(send_daemon_auth, CONFIG_WIRE_DAEMON_AUTH_FIELDS)
 CONFIG_DEFINE_SEND(send_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
 CONFIG_DEFINE_SEND(send_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_SEND(send_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
+CONFIG_DEFINE_SEND(send_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
 
 CONFIG_DEFINE_RECV(receive_core_fields, CONFIG_WIRE_CORE_FIELDS)
 CONFIG_DEFINE_RECV(receive_delta_fields, CONFIG_WIRE_DELTA_FIELDS)
@@ -1169,6 +1170,7 @@ CONFIG_DEFINE_RECV(receive_daemon_auth, CONFIG_WIRE_DAEMON_AUTH_FIELDS)
 CONFIG_DEFINE_RECV(receive_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
 CONFIG_DEFINE_RECV(receive_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_RECV(receive_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
+CONFIG_DEFINE_RECV(receive_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
 
 #undef XSEND
 #undef XRECV
@@ -1285,7 +1287,8 @@ bool config_send_wire_block(int file_descriptor, const Config* config) {
          send_daemon_module(file_descriptor, config) && send_daemon_auth(file_descriptor, config) &&
          send_iconv_spec(file_descriptor, config) &&
          send_privilege_options(file_descriptor, config) &&
-         send_copy_as_options(file_descriptor, config);
+         send_copy_as_options(file_descriptor, config) &&
+         send_output_options(file_descriptor, config);
 }
 
 bool config_send(int file_descriptor, const Config* config) {
@@ -1355,7 +1358,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_daemon_auth(file_descriptor, config, &budget) ||
       !receive_iconv_spec(file_descriptor, config, &budget) ||
       !receive_privilege_options(file_descriptor, config, &budget) ||
-      !receive_copy_as_options(file_descriptor, config, &budget))
+      !receive_copy_as_options(file_descriptor, config, &budget) ||
+      !receive_output_options(file_descriptor, config, &budget))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
       strcmp(config->compress_choice, "none") != 0) {

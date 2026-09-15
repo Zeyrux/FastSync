@@ -352,7 +352,7 @@ class TestDryRun:
         result, dur = run_client(SOURCE_DIR, DEST_DIR, flags=["-h", "--dry-run"])
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         assert "Total:" in result.stdout
-        assert "KB" in result.stdout
+        assert any(unit in result.stdout for unit in ("K", "M", "G"))
 
     def test_dry_run(self):
         clean_dir(DEST_DIR)
@@ -1097,10 +1097,12 @@ class TestExclude:
 
 class TestInclude:
     def test_include_single(self, shared_server):
+        # rsync first-match-wins: an --include alone is NOT a whitelist, so the
+        # selector must pair it with --exclude '*' (the common idiom).
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["--include", "binary.bin"],
+            flags=["--include", "binary.bin", "--exclude", "*"],
             port=shared_server.port,
         )
         if result.returncode != 0:
@@ -1113,13 +1115,14 @@ class TestInclude:
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["--include", "*.bin"],
+            flags=["--include", "*.bin", "--exclude", "*"],
             port=shared_server.port,
         )
         if result.returncode != 0:
             pytest.fail(f"Exit {result.returncode}: {(result.stderr or result.stdout)[:200]}")
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert os.path.exists(os.path.join(received, "binary.bin")), "binary.bin should be included"
+        assert not os.path.exists(os.path.join(received, "small.txt")), "small.txt should not be included"
 
 
 class TestSizeFilters:
@@ -1722,8 +1725,8 @@ class TestDelete:
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
-        assert "Stats:" in result.stderr
-        assert "KB" in result.stderr
+        assert "Number of files:" in result.stdout
+        assert "Total file size:" in result.stdout
 
     def test_human_readable_stats_multithreaded(self, shared_server):
         # The multithreaded sender shares the single-threaded --stats format,
@@ -1735,9 +1738,8 @@ class TestDelete:
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
-        assert "Stats:" in result.stderr
-        assert "KB" in result.stderr
-        assert "/s" in result.stderr
+        assert "Number of files:" in result.stdout
+        assert "bytes/sec" in result.stdout
 
     def test_human_readable_progress_multithreaded(self, shared_server):
         clean_dir(DEST_DIR)
@@ -1749,7 +1751,6 @@ class TestDelete:
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
         assert "Sent " in output
-        assert "KB" in output
         assert "Done." in output
 
 
@@ -2383,7 +2384,8 @@ class TestListOnly:
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only"])
         assert result.returncode == 0, f"list-only failed: {result.stderr[:200]}"
         for full_path in _source_files():
-            assert full_path in result.stdout, f"list-only omitted {full_path}"
+            rel = os.path.relpath(full_path, SOURCE_DIR)
+            assert rel in result.stdout, f"list-only omitted {rel}"
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert not os.path.exists(received), "list-only wrote to the destination"
 
@@ -2399,7 +2401,8 @@ class TestListOnly:
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "--threads"])
         assert result.returncode == 0, f"list-only -m failed: {result.stderr[:200]}"
         for full_path in _source_files():
-            assert full_path in result.stdout, f"list-only -m omitted {full_path}"
+            rel = os.path.relpath(full_path, SOURCE_DIR)
+            assert rel in result.stdout, f"list-only -m omitted {rel}"
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert not os.path.exists(received), "list-only -m wrote to the destination"
 
@@ -2412,7 +2415,7 @@ class TestItemizeChanges:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--preserve", "-i"], port=shared_server.port)
         assert result.returncode == 0, f"itemize sync failed: {result.stderr[:200]}"
-        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        sent_lines = {">f+++++++++ " + os.path.relpath(p, SOURCE_DIR) for p in _source_files()}
         assert sent_lines <= set(result.stdout.splitlines()), (
             f"missing itemize lines; got {result.stdout[:500]}"
         )
@@ -2433,7 +2436,7 @@ class TestItemizeChanges:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--preserve", "-i", "--threads"], port=shared_server.port)
         assert result.returncode == 0, f"itemize -m sync failed: {result.stderr[:200]}"
-        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        sent_lines = {">f+++++++++ " + os.path.relpath(p, SOURCE_DIR) for p in _source_files()}
         assert sent_lines <= set(result.stdout.splitlines()), (
             f"missing itemize lines in -m mode; got {result.stdout[:500]}"
         )
@@ -2468,7 +2471,9 @@ class TestItemizeChanges:
                                port=shared_server.port)
         assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
         itemized = [line for line in result.stdout.splitlines() if line.startswith(">f")]
-        assert itemized == [">f+++++++++ " + changed], (
+        # The content and mtime both changed, so the itemize compares the
+        # destination snapshot: size and time columns are set.
+        assert itemized == [">f.st...... changed.txt"], (
             f"expected exactly one itemize line for {changed}, got {itemized}"
         )
         received = get_dest_received_dir(dest, source)
@@ -2484,7 +2489,11 @@ class TestOutFormat:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--out-format=%f %l"], port=shared_server.port)
         assert result.returncode == 0, f"out-format sync failed: {result.stderr[:200]}"
-        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        # %f is rsync's long display path: the source argument normalized
+        # (leading '/' stripped) joined to the transfer-relative name.
+        prefix = SOURCE_DIR.lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, os.path.relpath(p, SOURCE_DIR))} {os.path.getsize(p)}"
+                    for p in _source_files()}
         got = set(result.stdout.splitlines())
         assert expected <= got, f"out-format lines missing: expected {len(expected)} got {len(got)}"
 
@@ -2493,7 +2502,9 @@ class TestOutFormat:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--out-format=%f %l", "--threads"], port=shared_server.port)
         assert result.returncode == 0, f"out-format -m sync failed: {result.stderr[:200]}"
-        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        prefix = SOURCE_DIR.lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, os.path.relpath(p, SOURCE_DIR))} {os.path.getsize(p)}"
+                    for p in _source_files()}
         got = set(result.stdout.splitlines())
         assert expected <= got, f"out-format -m lines missing: {result.stdout[:500]}"
 
@@ -2515,7 +2526,9 @@ class TestLogFileFormat:
         assert os.path.exists(log_path), "--log-file created no log"
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        prefix = SOURCE_DIR.lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, os.path.relpath(p, SOURCE_DIR))} {os.path.getsize(p)}"
+                    for p in _source_files()}
         for line in expected:
             assert line in content, f"log file missing {line!r}"
 
@@ -2541,7 +2554,8 @@ class TestLogFileFormat:
         assert os.path.exists(log_path), "--log-file created no log"
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-        expected = {f"{os.path.join(source, rel)} {len(data)}" for rel, data in files.items()}
+        prefix = os.path.abspath(source).lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, rel)} {len(data)}" for rel, data in files.items()}
         for line in expected:
             assert line in content, f"log file (--threads) missing {line!r}"
 

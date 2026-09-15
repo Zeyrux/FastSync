@@ -118,8 +118,8 @@ class TestProtocol:
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
         _seed_protocol_source(source)
-        for bad in ("2.21.0", "2.20.0", "2.19.0", "2.18.0", "2.17.0", "2.15.0", "2.16.0", "216",
-                    "31"):
+        for bad in ("2.22.0", "2.21.0", "2.20.0", "2.19.0", "2.18.0", "2.17.0", "2.15.0", "2.16.0",
+                    "216", "31"):
             result, _ = run_client(source, dest, flags=[f"--protocol={bad}"],
                                    port=shared_server.port)
             assert result.returncode != 0, f"--protocol={bad} should be rejected"
