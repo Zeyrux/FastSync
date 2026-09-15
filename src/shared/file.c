@@ -112,21 +112,16 @@ unsigned file_process_umask(void) {
 
 /* Base mode applied when the policy does not take the source mode wholesale
  * (i.e. --perms is off).  A pre-existing destination keeps its own mode; a
- * brand-new file is created like rsync: source_mode & 0777 & ~umask, with
- * S_IWGRP|S_IWOTH always cleared so a client mode can never grant group/other
- * write (the daemon runs with umask(0)).  Only when no metadata is available at
- * all does the historical fixed 0644 default apply.  The -E rule (and no-op for
- * a plain -t) is layered on top of this base. */
+ * brand-new file is created like rsync: source_mode & 0777 & ~umask (special
+ * bits are not part of a mode-preserving transfer without -p).  Only when no
+ * metadata is available at all does the historical fixed 0644 default apply.
+ * The -E rule (and no-op for a plain -t) is layered on top of this base. */
 static mode_t file_mode_base(const FileMetadata* metadata, bool existing_known,
                              mode_t existing_mode) {
   if (existing_known)
     return existing_mode;
   if (metadata)
-    /* A brand-new file follows rsync's source_mode & ~umask base, but a
-     * client-supplied source mode must never grant group/other write (the
-     * daemon runs with umask(0), so an unmasked 0666 would otherwise create a
-     * world-writable file).  S_IWGRP|S_IWOTH are always cleared. */
-    return metadata->mode & 0777 & ~(mode_t)file_process_umask() & ~(S_IWGRP | S_IWOTH);
+    return metadata->mode & 0777 & ~(mode_t)file_process_umask();
   return S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 }
 

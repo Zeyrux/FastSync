@@ -453,10 +453,12 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     create_mode = S_IFIFO;
   }
   const char* node_kind = (is_char || is_blk) ? "device" : (is_fifo ? "FIFO" : "socket");
-  /* The creation permission bits come from the source only under -p/--perms;
-   * otherwise a safe default (0644, group/other write never granted) keeps an
-   * unprivileged no--p run from materializing a world-writable node. */
-  mode_t perms = config->preserve_perms ? (mode & 0777 & ~(S_IWGRP | S_IWOTH)) : 0644;
+  /* Under -p/--perms rsync copies the source's permission and special bits; a
+   * kernel that denies setuid/setgid/sticky reports the failure rather than
+   * having them masked here.  Without -p the node is created like any other new
+   * entry: source_mode & 0777 & ~umask. */
+  mode_t perms = config->preserve_perms ? (mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777))
+                                        : (mode & 0777 & ~(mode_t)file_process_umask());
 
   int rc = is_fifo ? mkfifoat(parent_fd, leaf, perms)
                    : mknodat(parent_fd, leaf, create_mode | perms, rdev);
@@ -2640,11 +2642,9 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
         mode_ready = false;
       }
       if (mode_ready) {
-        /* Route the directory mode through the SAME sanitization as the
-         * regular-file policy: a client-supplied mode never grants group/other
-         * write. */
-        mode_t safe_mode =
-            (dir_mode & 0777 & ~(S_IWGRP | S_IWOTH)) | (dir_mode & (S_ISGID | S_ISVTX));
+        /* rsync -p copies the source directory mode exactly, including
+         * group/other write and the setgid/sticky bits. */
+        mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
         if (dir_fd < 0) {
           char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",

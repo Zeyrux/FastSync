@@ -202,7 +202,8 @@ void print_usage(void) {
   printf("                      --copy-as); --numeric-ids only changes how ids map\n");
   printf("  --no-super          Forbid those super-user activities even when the\n");
   printf("                      receiver is running as root\n");
-  printf("  --chmod <changes>   Modify transferred permissions (rsync syntax)\n");
+  printf(
+      "  --chmod <changes>   Modify new/transferred permissions (rsync syntax; implies no -p)\n");
   printf("  --numeric-ids       Map uid/gid by id instead of by name (a modifier, not\n");
   printf("                      an ownership request: combine with -o/-g or a map)\n");
   printf("  --usermap=MAP       Map usernames when applying ownership: comma-separated\n");

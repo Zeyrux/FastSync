@@ -117,6 +117,27 @@ static int set_string_option(char** dest, const char* value, const char* option_
   return 0;
 }
 
+/* Append a --chmod clause list to the accumulated spec with a comma.  rsync
+ * 3.2.4+ makes repeated --chmod options cumulative, so they must not replace
+ * the previous ones.  Returns 0 on success, -1 on failure. */
+static int append_chmod_spec(char** dest, const char* value) {
+  if (!*dest)
+    return set_string_option(dest, value, "--chmod");
+  size_t old_len = strlen(*dest);
+  size_t add_len = strlen(value);
+  char* merged = malloc(old_len + add_len + 2);
+  if (!merged) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --chmod");
+    return -1;
+  }
+  memcpy(merged, *dest, old_len);
+  merged[old_len] = ',';
+  memcpy(merged + old_len + 1, value, add_len + 1);
+  free(*dest);
+  *dest = merged;
+  return 0;
+}
+
 /* Parse a string as a positive integer into *dest. Returns 0 on success, -1 on error. */
 static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
@@ -966,6 +987,8 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   case OPT_NOOP:
     return 0;
   case OPT_STRING:
+    if (entry->offset == offsetof(Config, chmod_spec))
+      return append_chmod_spec((char**)field, value);
     return set_string_option((char**)field, value, entry->name);
   case OPT_POS_INT:
     return set_positive_int_option((int*)field, value, entry->name);
@@ -1224,7 +1247,6 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
           ctx->exit_code = -1;
           return true;
         }
-        config->preserve_perms = true;
       }
       /* Remember that --server-host was explicitly given (the field itself
          defaults to 127.0.0.1, so a value check cannot distinguish it).  Used
@@ -1271,7 +1293,7 @@ static bool cli_handle_inline_chmod(CliParseCtx* ctx) {
   const char* arg = ctx->argv[ctx->i];
   if (strncmp(arg, "--chmod=", 8) != 0)
     return false;
-  if (set_string_option(&config->chmod_spec, arg + 8, "--chmod") != 0) {
+  if (append_chmod_spec(&config->chmod_spec, arg + 8) != 0) {
     ctx->exit_code = -1;
     return true;
   }
@@ -1281,7 +1303,6 @@ static bool cli_handle_inline_chmod(CliParseCtx* ctx) {
     ctx->exit_code = -1;
     return true;
   }
-  config->preserve_perms = true;
   return true;
 }
 

@@ -377,13 +377,12 @@ static void test_fake_super_restore() {
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 07777), 0751);
 
-  /* Mode sanitization: the normal metadata path never grants group/other write
-     bits, and fake-super replay must not re-add them (a recorded 0666 restores
-     as 0644, never as world-writable). */
+  /* Strict rsync parity: -p restores the recorded mode exactly, including
+     group/other write (a recorded 0666 restores as 0666). */
   fake_super_store_fd(fd, 1001, 1002, 0666, 1700000000, 0);
   EXPECT_TRUE(fake_super_restore_fd(fd, policy));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0666);
 
   /* Restore with a malformed record must skip without failing. */
   time_t before = st.st_mtime;

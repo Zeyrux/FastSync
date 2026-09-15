@@ -213,8 +213,11 @@ bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrP
                               mode_t* out_mode) {
   const mode_t execute_bits = S_IXUSR | S_IXGRP | S_IXOTH;
   if (policy.perms) {
-    /* Group/other write is never granted from a client-supplied mode. */
-    *out_mode = source_mode & 0777 & ~(S_IWGRP | S_IWOTH);
+    /* rsync --perms copies the source's permission and special bits exactly,
+     * including group/other write and setuid/setgid/sticky.  The kernel may
+     * still clear setgid when the receiver is not in the file's group; the
+     * caller logs a failed chmod rather than silently masking the bits here. */
+    *out_mode = source_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
     return true;
   }
   if (policy.executability) {
@@ -223,9 +226,9 @@ bool metadata_mode_for_policy(mode_t source_mode, mode_t current_mode, FileAttrP
      * bits from the DESTINATION's own read bits (so a class that can read may
      * execute); otherwise clear every execute bit.  This runs on the
      * destination-derived base (pre-existing dest mode, or source&~umask for a
-     * new file), and leaves special bits untouched.  --perms wins when both are
-     * set (handled above). */
-    mode_t base = current_mode & 0777;
+     * new file), and leaves the special bits untouched.  --perms wins when both
+     * are set (handled above). */
+    mode_t base = current_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
     if (source_mode & 0111)
       *out_mode = base | ((base & 0444) >> 2);
     else
@@ -310,7 +313,7 @@ bool file_restore_symlink_metadata(const char* path, const FileMetadata* metadat
      platforms that support it and quietly ignore the unsupported case so the
      transfer never fails over it. */
   if (policy.perms) {
-    mode_t link_mode = metadata->mode & 0777 & ~(S_IWGRP | S_IWOTH);
+    mode_t link_mode = metadata->mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
     if (fchmodat(parent_fd, leaf, link_mode, AT_SYMLINK_NOFOLLOW) != 0 && errno != EOPNOTSUPP &&
         errno != ENOTSUP && errno != ENOSYS) {
       log_message(LOG_LEVEL_DEBUG, "Could not set symlink mode on %s: %s", path, strerror(errno));
@@ -343,15 +346,6 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, FileAttrPoli
   if (fd < 0 || metadata == NULL)
     return metadata == NULL;
   bool ok = true;
-  if (policy.perms || policy.executability) {
-    struct stat current;
-    if (fstat(fd, &current) != 0)
-      return false;
-    mode_t safe_mode = 0;
-    bool apply_mode = metadata_mode_for_policy(metadata->mode, current.st_mode, policy, &safe_mode);
-    if (apply_mode && fchmod(fd, safe_mode) != 0)
-      ok = false;
-  }
   /* Client uid/gid values are deliberately not authoritative UNLESS the client
      explicitly opted in with an identity flag (--numeric-ids / --usermap /
      --groupmap / --chown / -o/-g).  identity_apply_ownership is the controlled,
@@ -362,9 +356,20 @@ bool file_restore_metadata_fd(int fd, const FileMetadata* metadata, FileAttrPoli
      marks this entry as failed instead of reporting a wrong-owner write as
      success.  With no identity flag set it is a no-op, so a default or plain -M
      transfer keeps FastSync's existing behavior of never applying client
-     ownership. */
+     ownership.  Ownership runs BEFORE the mode because a chown clears
+     setuid/setgid; rsync likewise chowns first and then restores the source
+     mode (including its special bits). */
   if (!identity_apply_ownership(fd, (int32_t)metadata->uid, (int32_t)metadata->gid))
     ok = false;
+  if (policy.perms || policy.executability) {
+    struct stat current;
+    if (fstat(fd, &current) != 0)
+      return false;
+    mode_t safe_mode = 0;
+    bool apply_mode = metadata_mode_for_policy(metadata->mode, current.st_mode, policy, &safe_mode);
+    if (apply_mode && fchmod(fd, safe_mode) != 0)
+      ok = false;
+  }
   /* --crtimes captures and transmits the source birth time, but there is no
    * portable way to set a birth time (utimensat can only set atime/mtime), so
    * the receiver deliberately does NOT apply it.  This is explicit, honest
