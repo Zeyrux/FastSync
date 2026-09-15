@@ -2325,11 +2325,11 @@ class TestRemoteOptionTransport:
 
 
 class TestTrustSenderServerPath:
-    """--trust-sender is a receiver-local policy: only the receiving SERVER's
-    own flag matters.  For a push, a client --trust-sender is never sent to the
-    peer, so it must not relax a server that did not opt in; a server started
-    with --trust-sender must copy an escaping symlink target verbatim (its
-    normal mode skips it while still confining the link itself)."""
+    """--trust-sender is a receiver-local file-list validation policy.  Symlink
+    targets are stored verbatim like rsync (an absolute/`..` target is copied as
+    a symlink by default); the sender-side --safe-links is what suppresses
+    unsafe links.  A client --trust-sender is never sent to the peer, so it
+    cannot change how the receiving server stores links."""
 
     def _make_source(self, name):
         source = os.path.join(TEST_DATA_DIR, name)
@@ -2353,18 +2353,24 @@ class TestTrustSenderServerPath:
             server.stop()
 
     @pytest.mark.ci
-    def test_client_flag_does_not_relax_server(self):
-        result, link = self._run_with_server([], ["--trust-sender"], "client")
+    def test_escaping_symlink_stored_verbatim_by_default(self):
+        result, link = self._run_with_server([], [], "default")
         assert result.returncode == 0, result.stderr[:200]
-        assert not os.path.lexists(link), \
-            "a client --trust-sender must not relax a server that did not opt in"
+        assert os.path.islink(link), "rsync parity: -l stores the link verbatim"
+        assert os.readlink(link) == "/etc/passwd"
 
     @pytest.mark.ci
-    def test_server_flag_materializes_escaping_symlink(self):
-        result, link = self._run_with_server(["--trust-sender"], [], "server")
+    def test_client_trust_sender_does_not_change_server_storage(self):
+        result, link = self._run_with_server([], ["--trust-sender"], "client")
         assert result.returncode == 0, result.stderr[:200]
-        assert os.path.islink(link), "server --trust-sender should materialize the symlink"
-        assert os.readlink(link) == "/etc/passwd"
+        assert os.path.islink(link) and os.readlink(link) == "/etc/passwd", \
+            "a client --trust-sender must not change how the server stores links"
+
+    @pytest.mark.ci
+    def test_safe_links_skips_escaping_symlink(self):
+        result, link = self._run_with_server([], ["--safe-links"], "safe")
+        assert result.returncode == 0, result.stderr[:200]
+        assert not os.path.lexists(link), "--safe-links must skip an unsafe target"
 
 
 def _source_files():
