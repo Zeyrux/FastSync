@@ -54,7 +54,7 @@
    FastSync is push-only; see `RSYNC_COMPAT.md#direction`.
 
 ## Key facts / commands
-- CI image: `gitea.tap-tap.win/taptap/fastsync-ci:v10` (alias `fastsync-ci:local`).
+- CI image: `gitea.tap-tap.win/taptap/fastsync-ci:v11` (alias `fastsync-ci:local`).
 - Build/test: `cmake -B build -S . -DSTRICT_WARNINGS=ON && cmake --build build -j$(nproc) && ./build/tests`
   then `python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"`.
 - Dev shell: `nix-shell` (provides clang-format, cppcheck, pytest-xdist, openssh,
