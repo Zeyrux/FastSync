@@ -3924,7 +3924,7 @@ static void test_parse_args_attached_short_values() {
   cfg = valid_client_config();
   positional_count = 0;
   char* argv_m[] = {"fastsync", "-Mfoo=bar", "--source-dir", "/src", "--dest-dir", "/dst"};
-  EXPECT_EQ_INT(parse_args(cfg, 7, argv_m, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv_m, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->remote_option_count, 1);
   EXPECT_EQ_STR(cfg->remote_options[0], "foo=bar");
   config_delete(cfg);

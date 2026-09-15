@@ -96,8 +96,8 @@ static void report_transfer_stats(const Config* config, int total_files,
   double elapsed = difftime(time(NULL), start);
   double rate = elapsed > 0.0 ? (double)total_bytes / elapsed : 0.0;
   char total_buffer[32];
-  char rate_buffer[32];
-  char human_rate[32];
+  char rate_buffer[32] = {0};
+  char human_rate[32] = {0};
   const char* total = stats_bytes(config, total_bytes, total_buffer, sizeof(total_buffer));
   const char* rate_str = rate_buffer;
   if (config->human_readable) {
