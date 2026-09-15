@@ -41,6 +41,10 @@ typedef struct PipelineContextReceiver {
      transfer truly succeeded.  NULL in the early delete modes (which delete at
      the manifest). */
   DeleteManifest* deferred_manifest;
+  /* Set by server.c when the deferred delete commit hit the --max-delete
+     budget; the terminal success frame then carries STATUS_DELETE_LIMIT
+     (rsync exit 25) while the transfer itself still succeeds. */
+  bool delete_limit_reached;
   /* P7 Wave D: directory metadata collected by write_thread from received
      directory entries.  Only write_thread mutates it (before it joins); the
      caller (server.c) applies it after the delete/delay-updates phase. */

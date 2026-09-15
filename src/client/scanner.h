@@ -73,17 +73,32 @@ typedef struct {
   bool prune_empty_dirs;
   /* Delete-excluded protection sink (optional): when non-NULL the scanner
    * appends the destination-relative path of every entry it prunes because a
-   * USER SELECTION rule excluded it (--filter/-C/per-dir rules, the legacy
-   * --exclude/--include layer, and --max-size/--min-size).  The sender turns
-   * this list into the manifest's protected prefixes so `--delete` leaves the
-   * destination mirror of excluded source paths alone (rsync's default), and
-   * empties it when --delete-excluded opts back into deleting them.  NOT
-   * recorded for --files-from subset pruning (whose delete semantics stay
-   * keep-set-only) or for -R/--files-from relative wire paths.  When
-   * `excluded_mutex` is non-NULL it is taken around every append (the parallel
-   * scanner shares one list across its worker threads). */
+   * USER SELECTION rule excluded it (--filter/-C/per-dir rules and the legacy
+   * --exclude/--include layer).  The sender turns this list into the manifest's
+   * protected prefixes so `--delete` leaves the destination mirror of excluded
+   * source paths alone (rsync's default), and drops it when --delete-excluded
+   * opts back into deleting them.  NOT recorded for --files-from subset pruning
+   * (whose delete semantics derive from the synchronized-directory set) or for
+   * -R/--files-from relative wire paths.  When `excluded_mutex` is non-NULL it
+   * is taken around every append (the parallel scanner shares one list across
+   * its worker threads). */
   ArrayList* excluded_paths;
   mtx_t* excluded_mutex;
+  /* Size-prune protection sink (optional): when non-NULL the scanner appends
+   * the destination-relative path of every entry it skipped because of
+   * --max-size/--min-size.  rsync never deletes a size-skipped source mirror,
+   * even under --delete-excluded, so the sender always transmits this list as
+   * protected prefixes (unlike excluded_paths, which --delete-excluded drops).
+   * Guarded by `excluded_mutex` like excluded_paths. */
+  ArrayList* size_skipped_paths;
+  /* Synchronized-directory sink (optional): when non-NULL the scanner appends
+   * the destination-relative path of every directory it is about to traverse
+   * that lies inside a --files-from listed directory (or of every traversed
+   * directory when there is no list).  The sender sends this set with the delete
+   * manifest so the receiver confines its extras walk to synchronized
+   * directories, exactly like rsync; the receive root is the "." sentinel.
+   * Guarded by `excluded_mutex`. */
+  ArrayList* synced_dirs;
   /* --ignore-errors: an unreadable directory during the scan is recorded as an
    * I/O error and skipped instead of aborting the scan.  Client-only. */
   bool ignore_io_errors;

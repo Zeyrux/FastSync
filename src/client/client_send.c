@@ -175,6 +175,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
+  options->size_skipped_paths = NULL;
+  options->synced_dirs = NULL;
   options->hardlinks = NULL;
   /* P7 Wave D: capture source directory metadata when a directory attribute is
      requested (-p for modes, -t for times unless -O omits them).  Whether they
@@ -654,7 +656,10 @@ static void mark_sender_done(PipelineContextSender* context) {
    file it processed, in send order: STATUS_NEXT means the file was written,
    STATUS_OK means the file was skipped/unchanged.  Skipped sources are marked
    so the later removal pass keeps them. */
-static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources) {
+static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources,
+                              bool* delete_limit_out) {
+  if (delete_limit_out)
+    *delete_limit_out = false;
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     return false;
   if (config->remove_source_files && remove_sources) {
@@ -677,6 +682,15 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
   Status status;
   if (!receive_status(client->file_descriptor, &status))
     return false;
+  /* A capped --max-delete commit is a successful transfer that the client must
+     report with rsync's exit code 25 (not an error). */
+  if (status == STATUS_DELETE_LIMIT) {
+    log_message(LOG_LEVEL_ERROR,
+                "Deletions stopped due to --max-delete limit; some deletions were skipped");
+    if (delete_limit_out)
+      *delete_limit_out = true;
+    return true;
+  }
   if (status != STATUS_OK) {
     log_server_rejection("Receiver reported transfer failure");
     return false;
@@ -910,7 +924,8 @@ static int send_list_only(const Config* config) {
    frame.  A heavily filtered source whose exclusion list is large therefore
    fails the run cleanly on the receiver rather than being truncated. */
 static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes,
-                                ArrayList* missing_args) {
+                                ArrayList* size_skipped, ArrayList* missing_args,
+                                ArrayList* synced_dirs) {
   if (!send_status(fd, STATUS_MANIFEST))
     return -1;
   int keep_count = manifest ? manifest->size : 0;
@@ -920,18 +935,37 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
     if (!send_wire_str(fd, (char*)manifest->items[i]))
       return -1;
   }
-  int protected_count = protected_prefixes ? protected_prefixes->size : 0;
+  /* The receiver has ONE protected-prefix section; filter-excluded prefixes
+     (dropped under --delete-excluded) and size-pruned prefixes (always
+     protected) are concatenated into it. */
+  int protected_count =
+      (protected_prefixes ? protected_prefixes->size : 0) + (size_skipped ? size_skipped->size : 0);
   if (!send_int(fd, protected_count))
     return -1;
-  for (int i = 0; i < protected_count; i++) {
-    if (!send_wire_str(fd, (char*)protected_prefixes->items[i]))
-      return -1;
+  if (protected_prefixes) {
+    for (int i = 0; i < protected_prefixes->size; i++) {
+      if (!send_wire_str(fd, (char*)protected_prefixes->items[i]))
+        return -1;
+    }
+  }
+  if (size_skipped) {
+    for (int i = 0; i < size_skipped->size; i++) {
+      if (!send_wire_str(fd, (char*)size_skipped->items[i]))
+        return -1;
+    }
   }
   int missing_count = missing_args ? missing_args->size : 0;
   if (!send_int(fd, missing_count))
     return -1;
   for (int i = 0; i < missing_count; i++) {
     if (!send_wire_str(fd, (char*)missing_args->items[i]))
+      return -1;
+  }
+  int dirs_count = synced_dirs ? synced_dirs->size : 0;
+  if (!send_int(fd, dirs_count))
+    return -1;
+  for (int i = 0; i < dirs_count; i++) {
+    if (!send_wire_str(fd, (char*)synced_dirs->items[i]))
       return -1;
   }
   return 0;
@@ -953,11 +987,12 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
 #define DELETE_ACK_KEEPALIVE_SEC 10
 
 static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
-                                       ArrayList* protected_prefixes, ArrayList* missing_args) {
+                                       ArrayList* protected_prefixes, ArrayList* size_skipped,
+                                       ArrayList* missing_args, ArrayList* synced_dirs) {
   if (!client || !manifest)
     return false;
-  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes, missing_args) !=
-      0)
+  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes, size_skipped,
+                           missing_args, synced_dirs) != 0)
     return false;
   Status ack;
   /* The wait is long (up to an hour) and runs inline on this thread: a helper
@@ -1761,7 +1796,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     /* The keep-set manifest was prebuilt by a path-only pre-scan.  Transmit it
        and wait for the receiver to delete extras before streaming any data. */
     if (!send_delete_manifest_early(client, context->manifest, context->excluded_paths,
-                                    context->missing_args)) {
+                                    context->size_skipped_paths, context->missing_args,
+                                    context->synced_dirs)) {
       pipeline_cancel(context);
       disconnect_transfer_client(client);
       mark_sender_done(context);
@@ -1868,13 +1904,15 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       goto send_fail;
     }
     if (send_delete_manifest(client->file_descriptor, context->manifest, context->excluded_paths,
-                             context->missing_args) != 0)
+                             context->size_skipped_paths, context->missing_args,
+                             context->synced_dirs) != 0)
       goto send_fail;
   } else if (context->config->delete_missing_args && !context->early_delete) {
     /* --delete-missing-args without --delete: no keep-set is built, but the
        exact-delete paths still ride the same manifest frame (commit once the
        transfer succeeded). */
-    if (send_delete_manifest(client->file_descriptor, NULL, NULL, context->missing_args) != 0)
+    if (send_delete_manifest(client->file_descriptor, NULL, NULL, NULL, context->missing_args,
+                             NULL) != 0)
       goto send_fail;
   }
   /* P7 Wave D: transmit the captured directory times last.  The scanner thread
@@ -1884,11 +1922,12 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   if (!context->scan_stopped_early &&
       !send_dir_times(client, context->config, context->dir_entries))
     goto send_fail;
-  bool ok = finalize_transfer(client, context->config, context->remove_source_files);
+  bool delete_limit = false;
+  bool ok = finalize_transfer(client, context->config, context->remove_source_files, &delete_limit);
+  context->delete_limit = delete_limit;
   if (!ok && context->config->use_delete)
     log_message(LOG_LEVEL_ERROR,
-                "server reported a deletion failure (--delete); see the server log for the "
-                "reason (a --max-delete limit that the run would exceed deletes nothing)");
+                "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(context->config, context->remove_source_files);
   mtx_lock(&context->mutex_progress);
@@ -1931,11 +1970,18 @@ static int scan_directory_multithreaded(void* pipeline_context) {
   prepared.options.dir_entries = context->dir_entries;
   prepared.options.dir_entries_mutex = &context->dir_entries_mutex;
   /* The keep-set manifest for the late modes is built from this data pass, so
-     the parallel scanner records the protected excluded prefixes here.  The
-     early modes already transmitted the pre-scan keep-set and its protected
-     list, so the data pass must not append to it again. */
-  if (!context->early_delete)
+     the parallel scanner records the protected excluded prefixes and the
+     synchronized directories here (the size-prune protection is collected in
+     every mode).  The early modes already transmitted the pre-scan keep-set and
+     its protected lists, so the data pass must not append to them again. */
+  if (!context->early_delete) {
     prepared.options.excluded_paths = context->excluded_paths;
+    /* The root marker for a full recursive transfer is already in the list; do
+       not let the scanner append every directory to it. */
+    if (context->config->files_from_set != NULL)
+      prepared.options.synced_dirs = context->synced_dirs;
+  }
+  prepared.options.size_skipped_paths = context->size_skipped_paths;
   bool dirs_mode = prepared.options.dirs;
   /* -H also selects the sequential scanner (see the comment at the branch),
    * so the loop below must choose the scanner by which object exists, not by
@@ -2242,6 +2288,9 @@ int send_files(Config* config) {
   ArrayList* dir_entries = NULL;
   /* Protected excluded prefixes (delete-excluded default protection). */
   ArrayList* excluded = NULL;
+  /* Size-pruned prefixes (always protected) and synchronized directories. */
+  ArrayList* size_skipped = NULL;
+  ArrayList* synced_dirs = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
   bool send_failed = false;
   bool had_scan_io = false;
@@ -2265,11 +2314,31 @@ int send_files(Config* config) {
      by user-selection rules so the receiver protects their destination mirrors
      from --delete (rsync's default).  Only scans that build the keep-set get the
      sink attached (prescan for early timing, the streaming data pass otherwise). */
-  if (config->use_delete && !config->delete_excluded) {
-    excluded = array_list_create(free);
-    if (!excluded)
+  if (config->use_delete) {
+    if (!config->delete_excluded) {
+      excluded = array_list_create(free);
+      if (!excluded)
+        goto send_fail;
+      prepared.options.excluded_paths = excluded;
+    }
+    size_skipped = array_list_create(free);
+    synced_dirs = array_list_create(free);
+    if (!size_skipped || !synced_dirs)
       goto send_fail;
-    prepared.options.excluded_paths = excluded;
+    prepared.options.size_skipped_paths = size_skipped;
+    /* Only a --files-from subset confines the extras walk to the directories
+       the scan synchronized; a full recursive transfer deletes throughout the
+       receive root, so mark the root itself (the "." sentinel) and let the
+       scanner record nothing extra. */
+    if (config->files_from_set == NULL) {
+      char* root_marker = str_dup(".");
+      if (!root_marker || !array_list_add(synced_dirs, root_marker)) {
+        free(root_marker);
+        goto send_fail;
+      }
+    } else {
+      prepared.options.synced_dirs = synced_dirs;
+    }
   }
   /* The late-timing modes (plain --delete / --delete-after / --delete-delay)
      build the manifest while streaming and send it after the last data frame.
@@ -2296,13 +2365,16 @@ int send_files(Config* config) {
                     "with an empty keep-set (--delete)");
         prescan_ok = false;
       } else {
-        early_ok = send_delete_manifest_early(client, early_manifest, excluded, missing_args);
+        early_ok = send_delete_manifest_early(client, early_manifest, excluded, size_skipped,
+                                              missing_args, synced_dirs);
       }
     }
     array_list_delete(early_manifest);
-    /* The keep-set (and its protected prefixes) are already on the wire; the
-       data pass must not append to the exclusion list again. */
+    /* The keep-set (and its protected prefixes and synchronized directories) are
+       already on the wire; the data pass must not append to those lists again. */
     prepared.options.excluded_paths = NULL;
+    prepared.options.size_skipped_paths = NULL;
+    prepared.options.synced_dirs = NULL;
     if (!prescan_ok || !early_ok)
       goto send_fail;
   } else if (config->use_delete) {
@@ -2446,7 +2518,8 @@ int send_files(Config* config) {
          --delete-missing-args exact-path deletions only after the transfer
          succeeds.  In the early modes (--delete-before/--delete-during) the
          manifest already went out up front, so nothing is re-sent here. */
-      if (send_delete_manifest(client->file_descriptor, manifest, excluded, missing_args) != 0) {
+      if (send_delete_manifest(client->file_descriptor, manifest, excluded, size_skipped,
+                               missing_args, synced_dirs) != 0) {
         if (manifest) {
           array_list_delete(manifest);
           manifest = NULL;
@@ -2464,11 +2537,11 @@ int send_files(Config* config) {
      applying them until after its own deletion/publication phase. */
   if (!send_dir_times(client, config, dir_entries))
     goto send_fail;
-  bool ok = finalize_transfer(client, config, remove_sources);
+  bool delete_limit = false;
+  bool ok = finalize_transfer(client, config, remove_sources, &delete_limit);
   if (!ok && config->use_delete)
     log_message(LOG_LEVEL_ERROR,
-                "server reported a deletion failure (--delete); see the server log for the "
-                "reason (a --max-delete limit that the run would exceed deletes nothing)");
+                "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(config, remove_sources);
   if (config->show_progress && !config->quiet)
@@ -2477,8 +2550,13 @@ int send_files(Config* config) {
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    (double)total_bytes / (double)BYTES_PER_MIB);
   /* --ignore-errors: an unreadable source directory was skipped but the run
-     still completed (and deleted); report the run as errored like rsync does. */
-  ret = (ok && !had_scan_io) ? 0 : 1;
+     still completed (and deleted); report the run as errored like rsync does.
+     A --max-delete-capped commit is a successful transfer that rsync reports
+     with exit code 25. */
+  if (!ok || had_scan_io)
+    ret = 1;
+  else
+    ret = delete_limit ? 25 : 0;
 
 send_fail:
   /* Single cleanup path for all exits. The manifest is intentionally deleted
@@ -2487,6 +2565,10 @@ send_fail:
     array_list_delete(manifest);
   if (excluded)
     array_list_delete(excluded);
+  if (size_skipped)
+    array_list_delete(size_skipped);
+  if (synced_dirs)
+    array_list_delete(synced_dirs);
   if (missing_args)
     array_list_delete(missing_args);
   if (remove_sources)
@@ -2592,16 +2674,41 @@ int send_files_multithreaded(Config** config_ptr) {
         return 1;
       }
     }
+    /* Size-pruned mirrors stay protected under every mode (even
+       --delete-excluded); synchronized directories confine the walk.  A full
+       recursive transfer marks the receive root itself (".") so the walk is not
+       confined; only a --files-from subset records concrete directories. */
+    context->size_skipped_paths = array_list_create(free);
+    context->synced_dirs = array_list_create(free);
+    if (!context->size_skipped_paths || !context->synced_dirs) {
+      pipeline_context_sender_destroy(context);
+      return 1;
+    }
+    if (config->files_from_set == NULL) {
+      char* root_marker = str_dup(".");
+      if (!root_marker || !array_list_add(context->synced_dirs, root_marker)) {
+        free(root_marker);
+        pipeline_context_sender_destroy(context);
+        return 1;
+      }
+    }
     if (config_delete_timing_early(config)) {
       /* --delete-before/--delete-during: build the complete keep-set manifest
          (paths only, nothing loaded or sent) up front so the sender thread can
          transmit it before the first data byte.  The path-only pre-scan also
-         fills the protected excluded prefixes. */
+         fills the protected excluded prefixes and synchronized directories. */
       PreparedScanner prepared;
       memset(&prepared, 0, sizeof(prepared));
       bool prepared_ok = prepare_scanner(config, config->scanner_threads, &prepared);
-      if (prepared_ok && context->excluded_paths)
-        prepared.options.excluded_paths = context->excluded_paths;
+      if (prepared_ok) {
+        if (context->excluded_paths)
+          prepared.options.excluded_paths = context->excluded_paths;
+        prepared.options.size_skipped_paths = context->size_skipped_paths;
+        /* The root marker for a full recursive transfer is already in the list;
+           only a --files-from subset needs the scanner to record directories. */
+        if (config->files_from_set != NULL)
+          prepared.options.synced_dirs = context->synced_dirs;
+      }
       bool prebuilt = prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
                                                      &context->scan_had_io_error);
       prepared_scanner_destroy(&prepared);
@@ -2683,9 +2790,13 @@ int send_files_multithreaded(Config** config_ptr) {
   scan_io = context->scan_had_io_error;
   mtx_unlock(&context->mutex_scanner);
   bool sender_ok = sender_result == thrd_success;
+  bool delete_limit = context->delete_limit;
   /* --ignore-errors: the run completed (and deleted) past an unreadable source
-     directory; report it as errored like rsync does. */
+     directory; report it as errored like rsync does.  A --max-delete-capped
+     commit is a successful transfer that rsync reports with exit code 25. */
   pipeline_context_sender_destroy(context);
   client_set_abort_armed(false);
-  return sender_ok && !scan_io ? 0 : 1;
+  if (!sender_ok || scan_io)
+    return 1;
+  return delete_limit ? 25 : 0;
 }

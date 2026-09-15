@@ -849,8 +849,25 @@ typedef struct Config {
  * version before parsing anything else) is what keeps a 2.22 client and a 2.21
  * server from ever reaching that state.  The fixed-width FileMetadata layout is
  * UNCHANGED: the receiver still gates attribute application on use_metadata,
- * which is now DERIVED from these attributes by config_derived_use_metadata(). */
-#define PROTOCOL_VERSION "2.22.0"
+ * which is now DERIVED from these attributes by config_derived_use_metadata().
+ *
+ * Delete-Semantics Wave (#290): 2.22.0 -> 2.23.0.
+ *
+ * WHY the bump, grounded in the wire: the delete-manifest frame gains a fourth
+ * trailing section (protocol 2.23.0): a synchronized-directory count followed by
+ * that many destination-relative directory paths (the receive root is ".").
+ * The receiver confines its extras walk to these directories, so `--files-from`
+ * with `--delete` only removes inside listed directory subtrees (rsync parity)
+ * instead of deleting every untransmitted path under the receive root.  The
+ * frame stream also gains STATUS_DELETE_LIMIT, the terminal success status sent
+ * instead of STATUS_OK when a --max-delete commit removes up to the bound and
+ * skips the rest (the sender then exits 25 like rsync).  The config-frame LAYOUT
+ * is unchanged.  Any manifest/frame-sequence change must bump the protocol
+ * version: a 2.22 peer would desynchronize on the extra trailing section or the
+ * unknown status, and the strict same-version handshake (config_receive rejects
+ * a mismatched version before parsing anything else) is what keeps a 2.23 client
+ * and a 2.22 server from ever reaching that state. */
+#define PROTOCOL_VERSION "2.23.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

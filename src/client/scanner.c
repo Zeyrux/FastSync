@@ -122,9 +122,13 @@ typedef struct {
   bool is_symlink;
   char* link_target;
   /* True when the entry was pruned by a user selection rule (--filter/-C/per-dir
-     rules, the --exclude/--include layer, or --max-size/--min-size) rather than
-     skipped for another reason (unreadable, symlink policy, not applicable). */
+     rules or the --exclude/--include layer) rather than skipped for another
+     reason (unreadable, symlink policy, not applicable). */
   bool excluded;
+  /* True when the entry was skipped specifically by --max-size/--min-size.
+     Size pruning protects the destination mirror even under --delete-excluded,
+     so it is recorded into a separate sink from `excluded`. */
+  bool size_excluded;
 } ScannerEntry;
 
 /* --one-file-system (-x) decision. Only directories can carry a different
@@ -257,17 +261,47 @@ static bool excluded_sink_append(ArrayList* list, mtx_t* mtx, const char* rel) {
   return ok;
 }
 
-/* Record one pruned-by-user-selection filesystem path in the scanner's
-   exclusion sink (see ScannerOptions.excluded_paths).  The stored form is the
-   entry's wire/destination-relative path (a single leading '/' removed, exactly
-   how manifest keep entries are stored), so the receiver's walker prefixes
-   match the destination layout.  An allocation failure is a fatal scan error. */
-static void scanner_record_excluded(DirectoryScanner* scanner, const char* fs_path) {
-  if (!scanner->options.excluded_paths || !fs_path)
+/* Record one pruned filesystem path in a delete-protection sink.  The stored
+   form is the entry's wire/destination-relative path (a single leading '/'
+   removed, exactly how manifest keep entries are stored), so the receiver's
+   walker prefixes match the destination layout.  An allocation failure is a
+   fatal scan error. */
+static void scanner_record_protected(DirectoryScanner* scanner, const char* fs_path,
+                                     ArrayList* sink) {
+  if (!sink || !fs_path)
     return;
   const char* rel = *fs_path == '/' ? fs_path + 1 : fs_path;
-  if (!excluded_sink_append(scanner->options.excluded_paths, scanner->options.excluded_mutex, rel))
+  if (!excluded_sink_append(sink, scanner->options.excluded_mutex, rel))
     scanner->failed = true;
+}
+
+/* A user-selection exclusion (--filter/-C/per-dir or --exclude/--include). */
+static void scanner_record_excluded(DirectoryScanner* scanner, const char* fs_path) {
+  scanner_record_protected(scanner, fs_path, scanner->options.excluded_paths);
+}
+
+/* A --max-size/--min-size prune (always protected, even under --delete-excluded). */
+static void scanner_record_size_skipped(DirectoryScanner* scanner, const char* fs_path) {
+  scanner_record_protected(scanner, fs_path, scanner->options.size_skipped_paths);
+}
+
+/* Record a directory the scan synchronized.  `fs_path` is its absolute path and
+   `rel` its path relative to the transfer root ("" for the root); the stored
+   form matches the wire layout (the bare relative path in -R+--files-from, else
+   the source path with a leading '/' removed, with "." for the receive root).
+   Returns false on allocation failure. */
+static bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_path,
+                                      const char* rel, bool relative_mode) {
+  if (!options->synced_dirs)
+    return true;
+  if (!file_list_dir_in_scope(options->file_list, rel))
+    return true;
+  const char* dest = relative_mode ? rel : fs_path;
+  if (dest[0] == '/')
+    dest++;
+  if (dest[0] == '\0')
+    dest = ".";
+  return excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
 }
 
 /* Merge the open directory's own .rsync-filter rules into the inherited
@@ -311,6 +345,7 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* sour
                                  const char* containing_dir, const char* name,
                                  ScannerEntry* entry) {
   entry->excluded = false;
+  entry->size_excluded = false;
   entry->is_symlink = false;
   entry->link_target = NULL;
   entry->path = path_cat(containing_dir, name);
@@ -420,6 +455,7 @@ apply_filters:
   if ((options->max_size > 0 && (unsigned long long)entry->stats.st_size > options->max_size) ||
       (options->min_size > 0 && (unsigned long long)entry->stats.st_size < options->min_size)) {
     entry->excluded = true;
+    entry->size_excluded = true;
     goto skip;
   }
   return 1;
@@ -697,6 +733,18 @@ static int open_next_directory(DirectoryScanner* scanner) {
       scanner->current_dir = NULL;
       free(scanner->current_path);
       scanner->current_path = NULL;
+      return -1;
+    }
+    /* A successfully opened directory is synchronized for --delete: record it
+       so the receiver confines its extras walk to these (and the root sentinel
+       ".") instead of the whole receive root. */
+    if (!scanner_record_synced_dir(&scanner->options, scanner->current_path, scanner->current_rel,
+                                   scanner->relative_mode)) {
+      closedir(scanner->current_dir);
+      scanner->current_dir = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
+      scanner->failed = true;
       return -1;
     }
     if (scanner->options.capture_dir_times &&
@@ -985,16 +1033,19 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       break;
     }
     if (inspection == 0) {
-      /* The entry was pruned by a user selection rule (exclude/include/size) or
-         skipped for another reason; only the user-selection prunes protect the
-         corresponding destination mirror from --delete. */
+      /* A user-selection exclude protects its destination mirror from --delete
+         unless --delete-excluded; a size prune is always protected.  Other
+         skips (unreadable, symlink policy) protect nothing. */
       if (inspected.excluded) {
         char* abs_path = path_cat(scanner->current_path, entry->d_name);
         if (!abs_path) {
           scanner->failed = true;
           break;
         }
-        scanner_record_excluded(scanner, abs_path);
+        if (inspected.size_excluded)
+          scanner_record_size_skipped(scanner, abs_path);
+        else
+          scanner_record_excluded(scanner, abs_path);
         free(abs_path);
       }
       continue;
@@ -1341,16 +1392,19 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     return;
   }
   if (inspection == 0) {
-    if (inspected.excluded && options->excluded_paths) {
-      /* A root-level user-selection prune protects the destination mirror of
-         the same-named wire path (at the root the bare name is the wire path in
-         every layout). */
+    ArrayList* sink = NULL;
+    if (inspected.excluded)
+      sink = inspected.size_excluded ? options->size_skipped_paths : options->excluded_paths;
+    if (sink) {
+      /* A root-level prune protects the destination mirror of the same-named
+         wire path (at the root the bare name is the wire path in every
+         layout). */
       char* abs_path = path_cat(root_directory, entry->d_name);
       if (!abs_path) {
         ps->failed = true;
       } else {
         const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
-        if (!excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel))
+        if (!excluded_sink_append(sink, options->excluded_mutex, rel))
           ps->failed = true;
         free(abs_path);
       }
@@ -1463,6 +1517,14 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
   DIR* dir = opendir(root_directory);
   if (!dir) {
     log_perror("Could not open root directory for parallel scan");
+    return false;
+  }
+  /* The parallel scanner opens the transfer root directly (not through
+     open_next_directory), so record it as synchronized here. */
+  if (!scanner_record_synced_dir(options, root_directory, "",
+                                 options->relative && options->file_list != NULL)) {
+    closedir(dir);
+    ps->failed = true;
     return false;
   }
   const struct dirent* entry;

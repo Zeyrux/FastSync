@@ -136,7 +136,8 @@ static void test_walker_removes_extras_keeps_manifest_and_protected() {
   EXPECT_NOT_NULL(manifest);
   DeleteSkipEntry skip = {"prot", false};
   size_t deleted = 0;
-  DeleteWalkResult result = delete_extras_limited(root, manifest, 100000, &skip, 1, &deleted);
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, NULL, 100000, &skip, 1, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_FALSE(file_exists(root, "a.txt"));
   EXPECT_TRUE(file_exists(root, "keep.txt"));
@@ -170,7 +171,8 @@ static void test_walker_keeps_nested_manifest_dirs() {
   ArrayList* manifest = make_manifest_strings(keeps, 3);
   EXPECT_NOT_NULL(manifest);
   size_t deleted = 0;
-  DeleteWalkResult result = delete_extras_limited(root, manifest, 100000, NULL, 0, &deleted);
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_FALSE(file_exists(root, "extra.txt"));
   EXPECT_TRUE(file_exists(root, "keepdir/deep/keep.txt"));
@@ -187,7 +189,9 @@ static void test_walker_keeps_nested_manifest_dirs() {
   free(root);
 }
 
-static void test_walker_max_delete_exceeded_deletes_nothing() {
+/* --max-delete is a partial cap (rsync parity): delete up to the limit, skip
+   the rest, and report DELETE_WALK_LIMIT_REACHED. */
+static void test_walker_max_delete_partial_deletes_up_to_cap() {
   char* root = make_walk_root("maxdel");
   EXPECT_NOT_NULL(root);
   EXPECT_TRUE(write_file_at(root, "a.txt", "extra"));
@@ -197,12 +201,15 @@ static void test_walker_max_delete_exceeded_deletes_nothing() {
   ArrayList* manifest = make_manifest_strings(keeps, 0);
   EXPECT_NOT_NULL(manifest);
   size_t deleted = 999;
-  DeleteWalkResult result = delete_extras_limited(root, manifest, 2, NULL, 0, &deleted);
-  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_LIMIT_EXCEEDED);
-  EXPECT_EQ_INT((int)deleted, 0);
-  EXPECT_TRUE(file_exists(root, "a.txt"));
-  EXPECT_TRUE(file_exists(root, "b.txt"));
-  EXPECT_TRUE(file_exists(root, "c.txt"));
+  size_t skipped = 0;
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, NULL, 2, NULL, 0, &deleted, &skipped);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_LIMIT_REACHED);
+  EXPECT_EQ_INT((int)deleted, 2);
+  EXPECT_EQ_INT((int)skipped, 1);
+  int remaining = (file_exists(root, "a.txt") ? 1 : 0) + (file_exists(root, "b.txt") ? 1 : 0) +
+                  (file_exists(root, "c.txt") ? 1 : 0);
+  EXPECT_EQ_INT(remaining, 1);
   array_list_delete(manifest);
   remove_walk_tree(root);
   free(root);
@@ -217,12 +224,83 @@ static void test_walker_max_delete_exact_bound_deletes() {
   ArrayList* manifest = make_manifest_strings(keeps, 0);
   EXPECT_NOT_NULL(manifest);
   size_t deleted = 0;
-  DeleteWalkResult result = delete_extras_limited(root, manifest, 2, NULL, 0, &deleted);
+  DeleteWalkResult result = delete_extras_limited(root, manifest, NULL, 2, NULL, 0, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_EQ_INT((int)deleted, 2);
   EXPECT_FALSE(file_exists(root, "a.txt"));
   EXPECT_FALSE(file_exists(root, "b.txt"));
   array_list_delete(manifest);
+  remove_walk_tree(root);
+  free(root);
+}
+
+/* Extraneous destination symlinks (including one pointing at a directory) must
+   be unlinked, never followed, so their targets survive. */
+static void test_walker_removes_extraneous_symlinks() {
+  char* root = make_walk_root("symlink");
+  char* outside = make_walk_root("symlink_out");
+  EXPECT_NOT_NULL(root);
+  EXPECT_NOT_NULL(outside);
+  EXPECT_TRUE(write_file_at(outside, "secret.txt", "keep"));
+  EXPECT_TRUE(write_file_at(root, "keep.txt", "kept"));
+  char* link_file = path_cat(root, "link_file");
+  char* link_dir = path_cat(root, "link_dir");
+  char* link_broken = path_cat(root, "link_broken");
+  EXPECT_NOT_NULL(link_file);
+  EXPECT_NOT_NULL(link_dir);
+  EXPECT_NOT_NULL(link_broken);
+  EXPECT_EQ_INT(symlink("keep.txt", link_file), 0);
+  EXPECT_EQ_INT(symlink(outside, link_dir), 0);
+  EXPECT_EQ_INT(symlink("/nonexistent-target", link_broken), 0);
+  const char* keeps[] = {"keep.txt"};
+  ArrayList* manifest = make_manifest_strings(keeps, 1);
+  EXPECT_NOT_NULL(manifest);
+  size_t deleted = 0;
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, &deleted, NULL);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
+  EXPECT_FALSE(file_exists(root, "link_file"));
+  EXPECT_FALSE(file_exists(root, "link_dir"));
+  EXPECT_FALSE(file_exists(root, "link_broken"));
+  EXPECT_TRUE(file_exists(root, "keep.txt"));
+  EXPECT_TRUE(file_exists(outside, "secret.txt"));
+  free(link_file);
+  free(link_dir);
+  free(link_broken);
+  array_list_delete(manifest);
+  remove_walk_tree(root);
+  remove_walk_tree(outside);
+  free(root);
+  free(outside);
+}
+
+/* With a synchronized-dir set, extras outside it survive while extras directly
+   inside a listed directory are removed; the receive root is the "." sentinel. */
+static void test_walker_confines_deletion_to_synced_dirs() {
+  char* root = make_walk_root("synced");
+  EXPECT_NOT_NULL(root);
+  EXPECT_TRUE(write_file_at(root, "rootextra.txt", "keep"));
+  EXPECT_EQ_INT(make_subdir(root, "inscope"), 0);
+  EXPECT_TRUE(write_file_at(root, "inscope/extra.txt", "delete"));
+  EXPECT_TRUE(write_file_at(root, "inscope/keep.txt", "kept"));
+  EXPECT_EQ_INT(make_subdir(root, "outscope"), 0);
+  EXPECT_TRUE(write_file_at(root, "outscope/extra.txt", "keep"));
+  const char* keeps[] = {"inscope/keep.txt"};
+  ArrayList* manifest = make_manifest_strings(keeps, 1);
+  ArrayList* dirs = array_list_create(free);
+  EXPECT_NOT_NULL(manifest);
+  EXPECT_NOT_NULL(dirs);
+  EXPECT_TRUE(array_list_add(dirs, str_dup("inscope")));
+  size_t deleted = 0;
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, dirs, 100000, NULL, 0, &deleted, NULL);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
+  EXPECT_TRUE(file_exists(root, "rootextra.txt"));
+  EXPECT_FALSE(file_exists(root, "inscope/extra.txt"));
+  EXPECT_TRUE(file_exists(root, "inscope/keep.txt"));
+  EXPECT_TRUE(file_exists(root, "outscope/extra.txt"));
+  array_list_delete(manifest);
+  array_list_delete(dirs);
   remove_walk_tree(root);
   free(root);
 }
@@ -242,53 +320,6 @@ static void test_walker_unlimited_deletes_all() {
   EXPECT_FALSE(dir_exists(root, "emptydir"));
   array_list_delete(manifest);
   remove_walk_tree(root);
-  free(root);
-}
-
-/* The 100000-entry server hard bound (MAX_SERVER_DELETE_COUNT, which this test
-   exercises through a literal to avoid reaching into file_receive.c) is also
-   all-or-nothing: a destination holding more extras than the bound must be left
-   completely untouched.  Skipped under valgrind: 100k file creations would be
-   far too slow under instrumentation. */
-static void test_walker_hard_bound_all_or_nothing() {
-  if (is_running_under_valgrind())
-    return;
-  enum { HARD_BOUND = 100000 };
-  char* root = make_walk_root("hardbound");
-  EXPECT_NOT_NULL(root);
-  int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  EXPECT_TRUE(rootfd >= 0);
-  bool created = true;
-  for (int i = 0; created && i < HARD_BOUND + 1; i++) {
-    char name[32];
-    snprintf(name, sizeof(name), "f%d", i);
-    int fd = openat(rootfd, name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-      created = false;
-    else
-      close(fd);
-  }
-  EXPECT_TRUE(created);
-  const char* keeps[1] = {NULL};
-  ArrayList* manifest = make_manifest_strings(keeps, 0);
-  EXPECT_NOT_NULL(manifest);
-  size_t deleted = 999;
-  DeleteWalkResult result = delete_extras_limited(root, manifest, HARD_BOUND, NULL, 0, &deleted);
-  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_LIMIT_EXCEEDED);
-  EXPECT_EQ_INT((int)deleted, 0);
-  EXPECT_TRUE(file_exists(root, "f0"));
-  EXPECT_TRUE(file_exists(root, "f100000"));
-  array_list_delete(manifest);
-  /* Fast cleanup: unlink every created name through the still-open root fd. */
-  if (rootfd >= 0) {
-    for (int i = 0; i < HARD_BOUND + 1; i++) {
-      char name[32];
-      snprintf(name, sizeof(name), "f%d", i);
-      (void)unlinkat(rootfd, name, 0);
-    }
-    close(rootfd);
-  }
-  rmdir(root);
   free(root);
 }
 
@@ -553,10 +584,11 @@ void test_shared_utils() {
   test_getdelim_bounded();
   test_walker_removes_extras_keeps_manifest_and_protected();
   test_walker_keeps_nested_manifest_dirs();
-  test_walker_max_delete_exceeded_deletes_nothing();
+  test_walker_max_delete_partial_deletes_up_to_cap();
   test_walker_max_delete_exact_bound_deletes();
+  test_walker_removes_extraneous_symlinks();
+  test_walker_confines_deletion_to_synced_dirs();
   test_walker_unlimited_deletes_all();
-  test_walker_hard_bound_all_or_nothing();
   test_loopback_helpers();
   test_fd_peer_ip();
 

@@ -949,8 +949,13 @@ void handler(int file_descriptor) {
          --delay-updates run; the walker skips the staging directory.  A
          server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
-        if (!manifest_delete_all(config, context->deferred_manifest)) {
+        DeleteCommitResult deletion = manifest_delete_all(config, context->deferred_manifest);
+        if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
+        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+          /* The transfer still succeeds; the terminal frame reports the capped
+             deletion so the sender exits 25 like rsync. */
+          context->delete_limit_reached = true;
         }
         delete_manifest_free(context->deferred_manifest);
         context->deferred_manifest = NULL;
@@ -974,7 +979,8 @@ void handler(int file_descriptor) {
         dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
     }
     if (transfer_ok) {
-      if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
+      Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
+      if (!receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
         transfer_ok = false;
     } else {
       send_error_detail(file_descriptor, "transfer failed on receiver");

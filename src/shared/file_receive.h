@@ -85,11 +85,18 @@ typedef struct DeleteManifest {
   ArrayList* keeps;
   ArrayList* protected;
   ArrayList* missing;
+  /* Destination-relative paths of the directories the sender synchronized for
+     this run.  The extras walker only removes entries directly inside one of
+     these (the receive root is the "." sentinel); `--files-from` runs therefore
+     leave untransmitted directories and the unlisted parts of listed ones
+     alone, matching rsync's "delete only in synchronized directories". */
+  ArrayList* dirs;
 } DeleteManifest;
 
 void delete_manifest_free(DeleteManifest* manifest);
-/* Read a delete-manifest frame: keep count + keeps, then protected count +
-   protected prefixes, then missing count + missing paths (self-delimiting; the
+/* Read a delete-manifest frame (protocol 2.23.0): keep count + keeps, then
+   protected count + protected prefixes, then missing count + missing paths,
+   then synchronized-directory count + directory paths (self-delimiting; the
    leading STATUS_MANIFEST code has been consumed).  Returns an owned
    DeleteManifest, or NULL after signalling STATUS_ERROR on a malformed frame. */
 DeleteManifest* receive_manifest_entries(int fd);
@@ -108,11 +115,22 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
    confinement or I/O error (the run then fails); tolerated per-path cases are
    reported and skipped. */
 bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest);
+/* Outcome of committing a delete manifest.  LIMIT_REACHED reports rsync's
+   partial --max-delete result: the budget allowed some deletions and the rest
+   were skipped (the run still stores all file data but the client exits 25). */
+typedef enum {
+  DELETE_COMMIT_OK = 0,
+  DELETE_COMMIT_LIMIT_REACHED,
+  DELETE_COMMIT_ERROR
+} DeleteCommitResult;
+
 /* Run every deletion family the manifest carries: the --delete-missing-args
    exact-path deletions first (user requests are not blocked by exclusion
-   protection), then the ordinary extras walk when --delete is active.  Returns
-   true when nothing to do or everything committed. */
-bool manifest_delete_all(const Config* config, DeleteManifest* manifest);
+   protection), then the ordinary extras walk when --delete is active.  Both
+   share one --max-delete budget.  Returns DELETE_COMMIT_OK when nothing was to
+   do or everything committed, DELETE_COMMIT_LIMIT_REACHED when the budget
+   stopped part of the work, or DELETE_COMMIT_ERROR on a genuine failure. */
+DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest);
 
 /* Outcome of a single file_save_to_disk operation.  The receiver needs to
    distinguish "written" from "skipped" so --remove-source-files can be told

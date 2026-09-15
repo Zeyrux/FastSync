@@ -98,10 +98,10 @@ bool glob_match(const char* pattern, const char* str);
 typedef enum {
   /* Every extra entry was removed (or there were none). */
   DELETE_WALK_OK = 0,
-  /* The destination holds more extras than the numeric cap for this run.  With
-     the all-or-nothing max-delete semantics NOTHING was removed (the walker
-     counts first and refuses to start when the run would exceed the limit). */
-  DELETE_WALK_LIMIT_EXCEEDED,
+  /* The numeric cap for this run was reached before every extra was removed.
+     The walker removed exactly the entries the cap allowed and skipped (without
+     removing) the rest, matching rsync's partial --max-delete behavior. */
+  DELETE_WALK_LIMIT_REACHED,
   /* A traversal or unlink failure aborted the deletion (partial removal is
      possible, mirroring the delete pass). */
   DELETE_WALK_ERROR
@@ -122,19 +122,22 @@ typedef struct {
    only DIRECT children of the destination root, i.e. child_rel has no '/'). */
 bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSkipEntry* skips,
                             int skip_count);
-/* Remove files/dirs under dest_root that are not listed in manifest without
-   ever descending into a protected prefix (see DeleteSkipEntry).  When
-   max_delete is not SIZE_MAX the run is all-or-nothing: extras are counted
-   first and DELETE_WALK_LIMIT_EXCEEDED is returned (with nothing removed) when
-   the count would exceed the cap.  `deleted_out` optionally receives the number
-   of entries actually removed.  The all-or-nothing guarantee holds only while
-   the destination tree is not being concurrently modified: the rehearsal pass
-   and the delete pass are two separate walks, so a concurrent change between
-   them (another process adding/removing entries) can make the second pass
-   delete a different set than the first one counted. */
+/* Remove files/dirs/symlinks under dest_root that are not listed in manifest
+   without ever descending into a protected prefix (see DeleteSkipEntry).  When
+   `synced_dirs` is non-NULL, extras are only removed directly inside a directory
+   whose destination-relative path is an exact entry in that list (the receive
+   root is the "." sentinel); directories outside the synchronized set are still
+   descended into so kept content below a listed directory is preserved, but
+   nothing in them is removed.  A NULL `synced_dirs` keeps the legacy behavior of
+   treating the whole destination tree as deletable.  `max_delete` caps the
+   number of removed entries (SIZE_MAX = unlimited): the walker removes up to the
+   cap and returns DELETE_WALK_LIMIT_REACHED when more extras remained.
+   `deleted_out`/`skipped_out` optionally receive the number of entries removed
+   and the number skipped because of the cap. */
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
-                                       size_t max_delete, const DeleteSkipEntry* skips,
-                                       int skip_count, size_t* deleted_out);
+                                       const ArrayList* synced_dirs, size_t max_delete,
+                                       const DeleteSkipEntry* skips, int skip_count,
+                                       size_t* deleted_out, size_t* skipped_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
 bool utils_set_authorized_root(int fd, const char* canonical_path);
 /* The fd-only compatibility form is fail-closed for path-based operations;

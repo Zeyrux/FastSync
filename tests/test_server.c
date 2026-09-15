@@ -645,9 +645,10 @@ static void test_late_second_manifest_frees_both() {
   config_delete(cfg);
 }
 
-/* A delete-manifest frame with a third (missing-args) section round-trips: the
-   receiver keeps all three sections and the missing paths are confined exactly
-   like the keep-set (a traversal entry in the missing section is rejected).
+/* A delete-manifest frame with all four sections round-trips: the receiver
+   keeps the keep-set, protected prefixes, missing-args paths and synchronized
+   directories, and every section is confined exactly like the keep-set (a
+   traversal entry in the missing section is rejected).
    receive_manifest_entries() reads the counts directly (the leading
    STATUS_MANIFEST code is consumed by the caller, so these frames do not send
    it). */
@@ -666,6 +667,9 @@ static void test_receive_manifest_three_sections() {
   EXPECT_TRUE(send_int(p[1], 2));
   EXPECT_TRUE(send_str(p[1], "gone.txt"));
   EXPECT_TRUE(send_str(p[1], "dir/gone.bin"));
+  EXPECT_TRUE(send_int(p[1], 2));
+  EXPECT_TRUE(send_str(p[1], "."));
+  EXPECT_TRUE(send_str(p[1], "dir"));
 
   DeleteManifest* manifest = receive_manifest_entries(p[0]);
   EXPECT_NOT_NULL(manifest);
@@ -676,9 +680,12 @@ static void test_receive_manifest_three_sections() {
   EXPECT_EQ_INT(manifest->missing->size, 2);
   EXPECT_EQ_STR((char*)manifest->missing->items[0], "gone.txt");
   EXPECT_EQ_STR((char*)manifest->missing->items[1], "dir/gone.bin");
+  EXPECT_EQ_INT(manifest->dirs->size, 2);
+  EXPECT_EQ_STR((char*)manifest->dirs->items[0], ".");
+  EXPECT_EQ_STR((char*)manifest->dirs->items[1], "dir");
   delete_manifest_free(manifest);
 
-  /* A traversal entry in the third section is rejected like every other. */
+  /* A traversal entry in the missing section is rejected like every other. */
   EXPECT_TRUE(send_int(p[1], 0));
   EXPECT_TRUE(send_int(p[1], 0));
   EXPECT_TRUE(send_int(p[1], 1));
@@ -780,6 +787,7 @@ static void test_receiver_pending_commits_missing_args() {
   EXPECT_TRUE(send_int(p[1], 2));
   EXPECT_TRUE(send_str(p[1], "gone.txt"));
   EXPECT_TRUE(send_str(p[1], "never_here.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* no synchronized directories */
   EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
 
   /* NULL pending: the single-threaded commit path deletes at FINISHED.  The
