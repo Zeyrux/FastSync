@@ -42,6 +42,18 @@ typedef struct {
      scanner's exclusion sink) or, in the early modes, by the path-only pre-scan
      on the calling thread before the pipeline starts. */
   ArrayList* excluded_paths;
+  /* --max-size/--min-size pruned source paths.  These are ALWAYS sent as
+     protected prefixes (even with --delete-excluded), so the destination
+     mirrors of size-skipped files survive --delete like rsync.  Populated by
+     the scanner thread (workers append under mutex_scanner) or, in the early
+     modes, by the path-only pre-scan on the calling thread. */
+  ArrayList* size_skipped_paths;
+  /* Destination-relative paths of the directories the source scan synchronized
+     for this run (the receive root is the "." sentinel).  Sent with the
+     manifest so the receiver confines its extras walk to them, matching rsync's
+     "delete only in synchronized directories" (notably for --files-from).
+     Populated by the scanner thread or the early pre-scan. */
+  ArrayList* synced_dirs;
   /* --delete-missing-args: the destination-relative mirrors of the --files-from
      entries that are missing under the source.  Computed by the preflight on
      the calling thread before the pipeline starts; the sender thread transmits
@@ -83,6 +95,10 @@ typedef struct {
   ArrayList* dir_entries;
   mtx_t dir_entries_mutex;
   bool dir_entries_mutex_init;
+  /* Set by the sender thread when the receiver reported a --max-delete-capped
+     deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
+     exit 25 like rsync.  Read by the caller after the sender thread is joined. */
+  bool delete_limit;
 } PipelineContextSender;
 
 /* `config` is borrowed and must outlive the context: destroy does NOT free it,

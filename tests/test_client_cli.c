@@ -317,7 +317,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.22.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.23.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -327,7 +327,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.22.0"};
+                        "/dst",     "--protocol",   "2.23.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -2602,10 +2602,13 @@ static void test_parse_args_delete_policy_invalid_values() {
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 
+  /* A negative --max-delete is rsync's deprecated "no client limit" spelling:
+     parse succeeds and every negative value clamps to -1. */
   cfg = config_create();
   char* argv2[] = {"fastsync", "--max-delete=-3", "/src", "/dst"};
   positional_count = 0;
-  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->max_delete, -1);
   config_delete(cfg);
 }
 

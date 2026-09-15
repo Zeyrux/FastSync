@@ -2854,8 +2854,9 @@ class TestRelativeFilesFrom:
             "bare relative layout must not appear without -R"
 
     def test_relative_delete_manifest_stays_consistent(self):
-        """--delete derives from the sent (-R) relative paths, so a later
-        subset run removes unlisted relative entries but keeps listed ones."""
+        """--delete with --files-from is confined to the synchronized directories
+        (rsync parity): listing a FILE does not make its parent a delete scope,
+        but listing the DIRECTORY does."""
         source = _make_relative_source("rel_del_src")
         dest = os.path.join(TEST_DATA_DIR, "rel_del_dst")
         clean_dir(dest)
@@ -2867,14 +2868,27 @@ class TestRelativeFilesFrom:
             assert result.returncode == 0, f"seed -R sync failed: {result.stderr[:200]}"
             assert os.path.isfile(os.path.join(dest, "sub", "y.txt"))
 
+            # A file-only listing leaves sub/ unsynchronized: y.txt survives.
             subset = _write_rel_list(b"sub/x.txt\n")
             result, _ = run_client(source, dest,
                                    flags=["--files-from", subset, "-R", "--delete"],
                                    port=server.port)
             assert result.returncode == 0, f"-R delete sync failed: {result.stderr[:200]}"
             assert os.path.isfile(os.path.join(dest, "sub", "x.txt")), "listed file was deleted"
+            assert os.path.exists(os.path.join(dest, "sub", "y.txt")), \
+                "file-only --files-from made the parent a delete scope (rsync keeps it)"
+
+            # Listing the directory synchronizes it: a source-removed y.txt is now
+            # an in-scope extra and is deleted.
+            os.unlink(os.path.join(source, "sub", "y.txt"))
+            listed_dir = _write_rel_list(b"sub/\n")
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", listed_dir, "-R", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, f"-R dir delete sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(dest, "sub", "x.txt"))
             assert not os.path.exists(os.path.join(dest, "sub", "y.txt")), \
-                "unlisted relative file was not deleted"
+                "directory-listed --delete did not remove the in-scope extra"
 
 
 class TestMissingArgs:
@@ -2991,14 +3005,15 @@ class TestMissingArgs:
             assert os.path.isfile(os.path.join(dest, "a.txt"))
             assert os.path.isfile(os.path.join(dest, "sub", "b.txt"))
 
-            # Now with --delete the unrelated extra is an ordinary extra and must go.
+            # --delete is confined to synchronized directories: no listed
+            # directory, so the root-level unrelated extra survives (rsync parity).
             lst2 = _write_rel_list(b"a.txt\ngone.txt\nsub/b.txt\n")
             flags2 = ["--files-from", lst2, "-R", "--delete-missing-args", "--delete"] + \
                      (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags2, port=server.port)
             assert result.returncode == 0, f"delete-missing + delete sync failed: {result.stderr[:300]}"
-            assert not os.path.exists(os.path.join(dest, "unrelated.txt")), \
-                "--delete did not remove the unrelated extra"
+            assert os.path.isfile(os.path.join(dest, "unrelated.txt")), \
+                "--delete under --files-from removed an extra outside a listed directory"
             assert not os.path.exists(os.path.join(dest, "gone.txt"))
             assert os.path.isfile(os.path.join(dest, "a.txt"))
 
@@ -3027,6 +3042,64 @@ class TestMissingArgs:
             assert result.returncode == 0, f"delete-missing no-R sync failed: {result.stderr[:300]}"
             assert not os.path.exists(os.path.join(received, "gone.txt")), \
                 "the full-source-mirror path of the missing entry was not deleted"
+            assert os.path.isfile(os.path.join(received, "a.txt"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_missing_args_respects_max_delete_budget(self, mt):
+        """#290 (5): --delete-missing-args deletions draw from the same
+        --max-delete budget as the ordinary extras walk: only the first N happen
+        and the run exits 25 like rsync."""
+        source = self._make_source("mg_budget_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_budget_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            for name in ("gone1.txt", "gone2.txt", "gone3.txt"):
+                with open(os.path.join(received, name), "w") as fh:
+                    fh.write("stale")
+            lst = _write_rel_list(b"a.txt\ngone1.txt\ngone2.txt\ngone3.txt\n")
+            flags = ["--files-from", lst, "--delete-missing-args", "--max-delete=2"] + \
+                    (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, \
+                f"--delete-missing-args --max-delete=2 should exit 25: {result.stderr[:300]}"
+            remaining = [n for n in ("gone1.txt", "gone2.txt", "gone3.txt")
+                         if os.path.exists(os.path.join(received, n))]
+            assert len(remaining) == 1, \
+                f"missing-args deletions ignored the --max-delete budget: {remaining}"
+            assert os.path.isfile(os.path.join(received, "a.txt"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_missing_nonempty_dir_counts_each_entry_against_budget(self, mt):
+        """A non-empty missing-arg directory with --force/--delete is removed
+        entry-by-entry, each counting toward --max-delete (rsync parity): with a
+        small cap the run stops after N files and leaves the rest in place."""
+        source = self._make_source("mg_dirbudget_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_dirbudget_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            gone = os.path.join(received, "gone")
+            os.makedirs(gone)
+            for i in range(4):
+                with open(os.path.join(gone, f"f{i}"), "w") as fh:
+                    fh.write("stale")
+            lst = _write_rel_list(b"a.txt\ngone\n")
+            flags = ["--files-from", lst, "--delete-missing-args", "--force",
+                     "--max-delete=2"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, \
+                f"non-empty missing-arg dir should cap at 2 and exit 25: {result.stderr[:300]}"
+            assert os.path.isdir(gone), \
+                "the non-empty missing-arg directory should survive a capped run"
+            remaining = len(os.listdir(gone))
+            assert remaining == 2, f"expected 2 entries left, found {remaining}"
             assert os.path.isfile(os.path.join(received, "a.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
@@ -3061,8 +3134,10 @@ class TestMissingArgs:
                 "the explicit missing-arg deletion was blocked by exclusion protection"
             assert os.path.isfile(os.path.join(received, "prot", "kept.txt")), \
                 "the excluded-but-present destination file must stay (default protection)"
-            assert not os.path.exists(os.path.join(received, "extra.txt")), \
-                "--delete did not remove the unrelated extra"
+            # A file-only --files-from listing synchronizes no directory, so the
+            # root-level extra is outside the delete scope (rsync parity).
+            assert os.path.isfile(os.path.join(received, "extra.txt")), \
+                "--delete under --files-from removed an extra outside a listed directory"
             assert os.path.isfile(os.path.join(received, "a.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
@@ -3087,8 +3162,10 @@ class TestMissingArgs:
             assert not os.path.exists(os.path.join(dest, "gone.txt")), \
                 "early timing did not remove the missing-arg mirror"
             assert os.path.isfile(os.path.join(dest, "a.txt")), "a.txt was not transferred"
-            assert not os.path.exists(os.path.join(dest, "extra.txt")), \
-                "--delete-before implies --delete: unrelated extras must go"
+            # --delete-before implies --delete, but the extras walk is still
+            # confined to synchronized directories: no listed directory here.
+            assert os.path.isfile(os.path.join(dest, "extra.txt")), \
+                "--delete-before under --files-from removed an extra outside a listed directory"
 
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("relative", [False, True])
@@ -3098,6 +3175,12 @@ class TestMissingArgs:
         exact-path deletions must not abort the --delete extras walk.  Covers
         the -R bare-relative layout and the full source-mirror layout."""
         source = self._make_source("mg_deep_src")
+        # A listed directory gives the extras walk a synchronized scope to work
+        # in, so the test can prove the absent-parent missing entry did not abort
+        # it.
+        os.makedirs(os.path.join(source, "scope"))
+        with open(os.path.join(source, "scope", "keep.txt"), "w") as fh:
+            fh.write("kept\n")
         dest = os.path.join(TEST_DATA_DIR, "mg_deep_dst")
         clean_dir(dest)
         rel_flags = ["-R"] if relative else []
@@ -3117,16 +3200,22 @@ class TestMissingArgs:
                 assert os.path.isfile(os.path.join(target_root, "a.txt"))
             with open(os.path.join(target_root, "extra.txt"), "w") as fh:
                 fh.write("extra")
+            os.makedirs(os.path.join(target_root, "scope"), exist_ok=True)
+            with open(os.path.join(target_root, "scope", "extra.txt"), "w") as fh:
+                fh.write("extra")
 
-            lst = _write_rel_list(b"a.txt\nsub/gone.txt\n")
+            lst = _write_rel_list(b"a.txt\nscope/\nsub/gone.txt\n")
             flags = ["--files-from", lst, "--delete-missing-args", "--delete"] + rel_flags + \
                     (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"deep missing-entry sync failed: {result.stderr[:300]}"
             assert _read_file(os.path.join(target_root, "a.txt")) == b"a\n"
-            assert not os.path.exists(os.path.join(target_root, "extra.txt")), \
+            assert _read_file(os.path.join(target_root, "scope", "keep.txt")) == b"kept\n"
+            assert not os.path.exists(os.path.join(target_root, "scope", "extra.txt")), \
                 "--delete extras walk was aborted by the absent-parent missing entry"
+            # The root-level extra is outside every listed directory: it survives.
+            assert os.path.exists(os.path.join(target_root, "extra.txt"))
             assert not os.path.exists(os.path.join(target_root, "sub")), \
                 "the absent parent directory of the missing entry was created"
 
@@ -3535,6 +3624,154 @@ def _seed_delete_tree(tag, entries, dest):
     return source, received
 
 
+class TestDeleteScope:
+    """#290 (1): --delete with --files-from is confined to the directories the
+    transfer synchronized (rsync parity), so untransmitted paths outside a
+    listed directory subtree are never deleted.  Data-loss capable."""
+
+    def _write(self, path, content):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(content)
+
+    def _seed(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"dscope_{tag}_src")
+        clean_dir(source)
+        for rel, content in {
+            "listed.txt": b"listed\n",
+            "unlisted.txt": b"unlisted\n",
+            "other/c.txt": b"c\n",
+            "sub/x.txt": b"x\n",
+            "sub/y.txt": b"y\n",
+        }.items():
+            self._write(os.path.join(source, rel), content)
+        dest = os.path.join(TEST_DATA_DIR, f"dscope_{tag}_dst")
+        clean_dir(dest)
+        server = ServerManager()
+        server.start(extra_args=["--allow-delete"])
+        result, _ = run_client(source, dest, port=server.port)
+        assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        self._write(os.path.join(received, "sub", "extra.txt"), b"in-scope extra\n")
+        self._write(os.path.join(received, "rootextra.txt"), b"root extra\n")
+        self._write(os.path.join(received, "other", "extra.txt"), b"other extra\n")
+        return source, dest, received, server
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
+    def test_files_from_delete_confined_to_listed_dirs(self, mt):
+        source, dest, received, server = self._seed(f"dir_{mt}")
+        try:
+            listed = _write_rel_list(b"listed.txt\nsub/\n")
+            flags = ["--files-from", listed, "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"delete failed: {result.stderr[:300]}"
+            assert not os.path.exists(os.path.join(received, "sub", "extra.txt")), \
+                "in-scope extra under a listed directory was not deleted"
+            assert os.path.isfile(os.path.join(received, "sub", "x.txt"))
+            assert os.path.exists(os.path.join(received, "unlisted.txt")), \
+                "unlisted path outside a listed directory was deleted (data loss)"
+            assert os.path.exists(os.path.join(received, "other", "c.txt")), \
+                "unlisted sibling directory was deleted (data loss)"
+            assert os.path.exists(os.path.join(received, "rootextra.txt")), \
+                "receive-root extra outside a listed directory was deleted (data loss)"
+        finally:
+            server.stop()
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
+    def test_files_from_delete_file_listing_keeps_parent_extras(self, mt):
+        source, dest, received, server = self._seed(f"file_{mt}")
+        try:
+            # Listing a FILE does not synchronize its parent directory, so the
+            # parent's extras survive exactly like rsync.
+            listed = _write_rel_list(b"listed.txt\nsub/x.txt\n")
+            flags = ["--files-from", listed, "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"delete failed: {result.stderr[:300]}"
+            assert os.path.exists(os.path.join(received, "sub", "extra.txt")), \
+                "a file-only --files-from made its parent a delete scope"
+            assert os.path.exists(os.path.join(received, "rootextra.txt"))
+            assert os.path.exists(os.path.join(received, "unlisted.txt"))
+        finally:
+            server.stop()
+
+
+class TestDeleteExtraneousSymlinks:
+    """#290 (3): --delete unlinks extraneous destination symlinks (never follows
+    them), matching rsync, and leaves their targets intact."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
+    def test_delete_unlinks_extraneous_symlinks(self, mt):
+        source = os.path.join(TEST_DATA_DIR, f"dsym_{mt}_src")
+        clean_dir(source)
+        with open(os.path.join(source, "keep.txt"), "wb") as fh:
+            fh.write(b"kept\n")
+        dest = os.path.join(TEST_DATA_DIR, f"dsym_{mt}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            outside = os.path.join(TEST_DATA_DIR, f"dsym_{mt}_outside")
+            clean_dir(outside)
+            with open(os.path.join(outside, "secret.txt"), "wb") as fh:
+                fh.write(b"secret\n")
+            os.symlink("keep.txt", os.path.join(received, "link_file"))
+            os.symlink(outside, os.path.join(received, "link_dir"))
+            os.symlink("/nonexistent-target", os.path.join(received, "link_broken"))
+            os.makedirs(os.path.join(received, "realdir"), exist_ok=True)
+            os.symlink("../realdir", os.path.join(received, "realdir", "self"))
+
+            flags = ["--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"delete failed: {result.stderr[:300]}"
+            assert not os.path.lexists(os.path.join(received, "link_file")), \
+                "extraneous symlink to a file was not unlinked"
+            assert not os.path.lexists(os.path.join(received, "link_dir")), \
+                "extraneous symlink to a directory was not unlinked"
+            assert not os.path.lexists(os.path.join(received, "link_broken")), \
+                "extraneous dangling symlink was not unlinked"
+            assert not os.path.lexists(os.path.join(received, "realdir", "self")), \
+                "extraneous self-referential symlink was not unlinked"
+            assert os.path.isfile(os.path.join(received, "keep.txt"))
+            assert os.path.isfile(os.path.join(outside, "secret.txt")), \
+                "an extraneous symlink was followed and its target deleted"
+
+
+class TestSizePruneProtection:
+    """#290 (2): --max-size/--min-size pruned source mirrors survive --delete
+    even with --delete-excluded (rsync keeps them)."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("flag", ["--max-size=1000", "--min-size=1000"])
+    @pytest.mark.ci
+    def test_size_pruned_mirror_survives_delete_excluded(self, mt, flag):
+        source = os.path.join(TEST_DATA_DIR, f"dsize_{mt}_{flag.strip('-=')}_src")
+        clean_dir(source)
+        with open(os.path.join(source, "small.txt"), "wb") as fh:
+            fh.write(b"small\n")
+        with open(os.path.join(source, "big.bin"), "wb") as fh:
+            fh.write(b"0" * 5000)
+        dest = os.path.join(TEST_DATA_DIR, f"dsize_{mt}_{flag.strip('-=')}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+
+            flags = [flag, "--delete", "--delete-excluded"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"size delete failed: {result.stderr[:300]}"
+            assert os.path.isfile(os.path.join(received, "small.txt")), \
+                "size-pruned small mirror was deleted under --delete-excluded"
+            assert os.path.isfile(os.path.join(received, "big.bin")), \
+                "size-pruned big mirror was deleted under --delete-excluded"
+
+
 class TestDeletePolicy:
     """Deletion-policy family: --delete-excluded, --max-delete, --force,
     --ignore-errors and --prune-empty-dirs."""
@@ -3631,8 +3868,9 @@ class TestDeletePolicy:
 
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("timing", ["--delete", "--delete-before"])
-    def test_max_delete_exceeded_fails_without_deleting(self, mt, timing):
-        """A run that would exceed --max-delete deletes nothing and fails."""
+    def test_max_delete_exceeded_deletes_up_to_cap_and_exits_25(self, mt, timing):
+        """rsync parity: --max-delete=N deletes up to N extras, skips the rest and
+        still succeeds as a transfer, exiting 25 with a diagnostic."""
         source = os.path.join(TEST_DATA_DIR, f"maxdel_{timing.strip('-')}_{mt}_src")
         clean_dir(source)
         self._write(os.path.join(source, "keep.txt"), b"kept\n")
@@ -3643,19 +3881,51 @@ class TestDeletePolicy:
             result, _ = run_client(source, dest, port=server.port)
             assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
             received = get_dest_received_dir(dest, source)
-            extras = []
             for i in range(4):
-                name = f"e{i}.txt"
-                self._write(os.path.join(received, name), b"extra\n")
-                extras.append(os.path.join(received, name))
+                self._write(os.path.join(received, f"e{i}.txt"), b"extra\n")
 
             flags = ["--max-delete=2", timing] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
-            assert result.returncode != 0, \
-                f"--max-delete=2 with 4 extras unexpectedly succeeded: {result.stderr[:300]}"
-            for path in extras:
-                assert os.path.exists(path), \
-                    "--max-delete overrun deleted files (must be all-or-nothing)"
+            assert result.returncode == 25, \
+                f"--max-delete=2 with 4 extras should exit 25: {result.stderr[:300]}"
+            remaining = [i for i in range(4)
+                         if os.path.exists(os.path.join(received, f"e{i}.txt"))]
+            assert len(remaining) == 2, \
+                f"--max-delete=2 deleted {4 - len(remaining)} extras, expected 2"
+            assert os.path.isfile(os.path.join(received, "keep.txt"))
+            assert "--max-delete" in (result.stderr or result.stdout)
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_max_delete_zero_and_negative(self, mt):
+        """--max-delete=0 warns about every extra without deleting (exit 25);
+        a negative value is rsync's deprecated unlimited spelling (exit 0)."""
+        source = os.path.join(TEST_DATA_DIR, f"maxdelzn_{mt}_src")
+        clean_dir(source)
+        self._write(os.path.join(source, "keep.txt"), b"kept\n")
+        dest = os.path.join(TEST_DATA_DIR, f"maxdelzn_{mt}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            for i in range(3):
+                self._write(os.path.join(received, f"e{i}.txt"), b"extra\n")
+            flags = ["--max-delete=0", "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, f"--max-delete=0 should exit 25: {result.stderr[:300]}"
+            for i in range(3):
+                assert os.path.exists(os.path.join(received, f"e{i}.txt")), \
+                    "--max-delete=0 deleted an extra"
+
+            # -1 (and any negative) means no client limit: every extra goes.
+            flags = ["--max-delete=-1", "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"--max-delete=-1 should be unlimited: {result.stderr[:300]}"
+            for i in range(3):
+                assert not os.path.exists(os.path.join(received, f"e{i}.txt")), \
+                    "--max-delete=-1 did not remove every extra"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_max_delete_not_exceeded_deletes_exactly(self, mt):
@@ -3718,16 +3988,16 @@ class TestDeletePolicy:
                 "--force did not replace the directory with the file"
             assert _read_file(os.path.join(received, "sub")) == b"now a file\n"
 
-    def test_force_inert_under_delay_updates(self):
-        """Documented divergence: --force acts on the immediate-install path; a
-        --delay-updates run stages into its own tree and its publication renames
-        over regular files only, so a blocking directory is not cleared and the
-        run fails."""
-        source = os.path.join(TEST_DATA_DIR, "force_delay_src")
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_force_replaces_dir_under_delay_updates(self, mt):
+        """rsync parity: --force also acts during a --delay-updates publication,
+        clearing a non-empty destination directory that blocks an incoming file
+        (without --force the run fails and the directory survives)."""
+        source = os.path.join(TEST_DATA_DIR, f"force_delay_{mt}_src")
         clean_dir(source)
         self._write(os.path.join(source, "sub", "old.txt"), b"old\n")
         self._write(os.path.join(source, "keep.txt"), b"kept\n")
-        dest = os.path.join(TEST_DATA_DIR, "force_delay_dst")
+        dest = os.path.join(TEST_DATA_DIR, f"force_delay_{mt}_dst")
         clean_dir(dest)
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
@@ -3737,14 +4007,24 @@ class TestDeletePolicy:
             os.unlink(os.path.join(source, "sub", "old.txt"))
             os.rmdir(os.path.join(source, "sub"))
             self._write(os.path.join(source, "sub"), b"now a file\n")
-            result, _ = run_client(source, dest, flags=["--force", "--delay-updates"],
+
+            # Without --force the blocking directory is untouched and the run fails.
+            result, _ = run_client(source, dest, flags=["--delay-updates"] + (["--threads"] if mt else []),
                                    port=server.port)
             assert result.returncode != 0, \
-                "--force --delay-updates unexpectedly replaced the blocking directory"
-            assert os.path.isdir(os.path.join(received, "sub")), \
-                "blocking directory was cleared although --delay-updates should keep --force inert"
-            assert os.path.exists(os.path.join(received, "sub", "old.txt")), \
-                "blocking directory content was lost"
+                "--delay-updates replaced a non-empty directory without --force"
+            assert os.path.isdir(os.path.join(received, "sub"))
+            assert os.path.exists(os.path.join(received, "sub", "old.txt"))
+
+            # With --force the publication clears it and installs the file.
+            result, _ = run_client(source, dest,
+                                   flags=["--force", "--delay-updates"] + (["--threads"] if mt else []),
+                                   port=server.port)
+            assert result.returncode == 0, \
+                f"--force --delay-updates failed: {result.stderr[:300]}"
+            assert os.path.isfile(os.path.join(received, "sub")), \
+                "--force under --delay-updates did not replace the blocking directory"
+            assert _read_file(os.path.join(received, "sub")) == b"now a file\n"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_prune_empty_dirs_dirs_mode(self, mt):

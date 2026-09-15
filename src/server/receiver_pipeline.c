@@ -27,6 +27,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->queued_bytes = 0;
   context->max_queue_bytes = 0;
   context->deferred_manifest = NULL;
+  context->delete_limit_reached = false;
   atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
@@ -135,6 +136,15 @@ static bool receiver_enqueue_file(File* file, void* context_pointer) {
   return pipeline_context_receiver_enqueue_file(context, file);
 }
 
+/* Early delete modes (--delete-before/--delete-during) commit the manifest
+   inside receiver_process_pending on this thread; record a capped commit so
+   server.c's terminal frame can report STATUS_DELETE_LIMIT.  The plain bool is
+   safe: receive_thread writes it before the main thread joins the thread. */
+static void receiver_pipeline_note_delete_limit(void* context_pointer) {
+  PipelineContextReceiver* context = (PipelineContextReceiver*)context_pointer;
+  context->delete_limit_reached = true;
+}
+
 static void receiver_thread_fail(PipelineContextReceiver* context) {
   mtx_lock(&context->mutex);
   atomic_store(&context->cancelled, true);
@@ -152,7 +162,8 @@ int receive_thread(void* pipeline_context) {
   const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
-  ReceiverSink sink = {receiver_enqueue_file, context, false, false, NULL};
+  ReceiverSink sink = {
+      receiver_enqueue_file, context, false, false, NULL, receiver_pipeline_note_delete_limit};
   if (receiver_process_pending((Config*)config, file_descriptor, &sink,
                                &context->deferred_manifest) != 0) {
     receiver_thread_fail(context);

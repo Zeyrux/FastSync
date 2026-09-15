@@ -2845,8 +2845,10 @@ File* file_receive_special(int file_descriptor) {
 /* Read a delete-manifest frame (the STATUS_MANIFEST leading code has already
    been consumed): a keep-set entry count followed by that many
    destination-relative paths, then a protected-prefix count followed by that
-   many destination-relative prefixes, then (protocol 2.10.0+) a missing-args
-   count followed by that many destination-relative delete paths.  The frame is
+   many destination-relative prefixes, then a missing-args count followed by that
+   many destination-relative delete paths, then (protocol 2.23.0) a
+   synchronized-directory count followed by that many destination-relative
+   directory paths (the receive root is the "." sentinel).  The frame is
    self-delimiting (the counts are authoritative), so the caller decides what to
    do next and continues reading the following STATUS_* frame.  Every section is
    validated identically: an entry must be non-empty, relative and traversal-free
@@ -2891,7 +2893,8 @@ DeleteManifest* receive_manifest_entries(int fd) {
   manifest->keeps = array_list_create(free);
   manifest->protected = array_list_create(free);
   manifest->missing = array_list_create(free);
-  if (!manifest->keeps || !manifest->protected || !manifest->missing) {
+  manifest->dirs = array_list_create(free);
+  if (!manifest->keeps || !manifest->protected || !manifest->missing || !manifest->dirs) {
     delete_manifest_free(manifest);
     send_status(fd, STATUS_ERROR);
     return NULL;
@@ -2900,7 +2903,8 @@ DeleteManifest* receive_manifest_entries(int fd) {
   size_t manifest_entries = 0;
   if (!receive_manifest_section(fd, manifest->keeps, &manifest_bytes, &manifest_entries) ||
       !receive_manifest_section(fd, manifest->protected, &manifest_bytes, &manifest_entries) ||
-      !receive_manifest_section(fd, manifest->missing, &manifest_bytes, &manifest_entries)) {
+      !receive_manifest_section(fd, manifest->missing, &manifest_bytes, &manifest_entries) ||
+      !receive_manifest_section(fd, manifest->dirs, &manifest_bytes, &manifest_entries)) {
     delete_manifest_free(manifest);
     return NULL;
   }
@@ -2913,18 +2917,33 @@ void delete_manifest_free(DeleteManifest* manifest) {
   array_list_delete(manifest->keeps);
   array_list_delete(manifest->protected);
   array_list_delete(manifest->missing);
+  array_list_delete(manifest->dirs);
   free(manifest);
 }
 
+/* Shared --max-delete budget for one receiver-side deletion commit.  Both the
+   --delete-missing-args exact-path removals and the ordinary extras walk draw
+   from the same tally, matching rsync (whose --max-delete counts every deleted
+   file or directory).  `max_delete` is SIZE_MAX for an unlimited budget. */
+typedef struct {
+  size_t max_delete;
+  size_t deleted;
+  size_t skipped;
+  bool limit_hit;
+} DeleteBudgetState;
+
 /* Remove every destination entry under the receive root that is not in the
-   keep-set, bounded by MAX_SERVER_DELETE_COUNT (or a smaller client
-   --max-delete=NUM, which is all-or-nothing), using the symlink-safe delete
-   walker.  With --delay-updates the not-yet-published staging directory is a
+   keep-set, bounded by the shared budget (a smaller client --max-delete=NUM
+   replaces the server hard bound; rsync deletes up to the bound and skips the
+   rest).  With --delay-updates the not-yet-published staging directory is a
    direct child of the receive root and must not be treated as a set of extras;
-   the manifest's protected prefixes (paths excluded on the source) and the
+   the manifest's protected prefixes (paths excluded on the source), the
+   size-pruned prefixes (--max-size/--min-size, always protected) and the
    alternate basis directories are never destination content and are skipped at
-   any depth.  Prints a notice and returns true on success. */
-bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
+   any depth.  Returns true unless a traversal/unlink error aborted the walk;
+   the budget's limit_hit/skipped fields report a cap-stopped run. */
+static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifest,
+                                   DeleteBudgetState* budget) {
   if (!config || !manifest || !manifest->keeps)
     return false;
   fprintf(stderr, "Deleting files not in manifest...\n");
@@ -2936,9 +2955,10 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
        at any depth: they are extra comparison snapshots the user pointed at,
        not destination content, and deleting them would destroy the very files a
        --link-dest run just linked into place;
-     - the sender-side protected prefixes (source paths excluded by filters), at
-       any depth, so an excluded destination mirror survives --delete unless
-       --delete-excluded opts back into removing it. */
+     - the sender-side protected prefixes (source paths excluded by filters and
+       paths pruned by --max-size/--min-size), at any depth, so their destination
+       mirror survives --delete unless --delete-excluded opts back into removing
+       the filter-excluded ones (size-pruned entries are always protected). */
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
                    (manifest->protected ? manifest->protected->size : 0);
   DeleteSkipEntry* skips = NULL;
@@ -2963,30 +2983,19 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
       idx++;
     }
   }
-  /* A client --max-delete=NUM smaller than the server's hard bound replaces it
-     for this run; both still bound the walk.  The walker is all-or-nothing, so
-     a run that would delete more than the bound removes nothing and fails with
-     an error that names the bound that was hit. */
-  bool user_limited =
-      config->max_delete >= 0 && (size_t)config->max_delete < MAX_SERVER_DELETE_COUNT;
-  size_t cap = user_limited ? (size_t)config->max_delete : MAX_SERVER_DELETE_COUNT;
-  size_t deleted_count = 0;
-  DeleteWalkResult result = delete_extras_limited(config->receive_root_directory, manifest->keeps,
-                                                  cap, skips, skip_count, &deleted_count);
+  size_t remaining =
+      budget->max_delete == SIZE_MAX ? SIZE_MAX : budget->max_delete - budget->deleted;
+  size_t deleted = 0;
+  size_t skipped = 0;
+  DeleteWalkResult result =
+      delete_extras_limited(config->receive_root_directory, manifest->keeps, manifest->dirs,
+                            remaining, skips, skip_count, &deleted, &skipped);
   free(skips);
-  if (result == DELETE_WALK_LIMIT_EXCEEDED) {
-    if (user_limited) {
-      log_message(LOG_LEVEL_ERROR,
-                  "deletion stopped: the destination holds more than --max-delete=%d extraneous "
-                  "entries; no files were deleted",
-                  config->max_delete);
-    } else {
-      log_message(LOG_LEVEL_ERROR,
-                  "deletion stopped: the destination holds more than %u extraneous entries "
-                  "(server deletion limit); no files were deleted",
-                  (unsigned)MAX_SERVER_DELETE_COUNT);
-    }
-    return false;
+  budget->deleted += deleted;
+  budget->skipped += skipped;
+  if (result == DELETE_WALK_LIMIT_REACHED) {
+    budget->limit_hit = true;
+    return true;
   }
   if (result != DELETE_WALK_OK) {
     log_message(LOG_LEVEL_ERROR, "deletion failed while removing extraneous files");
@@ -3004,10 +3013,12 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
    removed recursively only when --delete or --force is in effect (rsync parity:
    the man page says a non-empty directory mirror is only deleted with --force
    or --delete); otherwise it is left with a warning and the run continues.  A
-   mirror that does not exist is a no-op.  Returns false only on a genuine error
-   (a confinement failure on a validated path or an I/O error), which fails the
-   run. */
-bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
+   mirror that does not exist is a no-op.  Each removal draws from the shared
+   --max-delete budget: once it is exhausted the remaining requests are skipped
+   and counted.  Returns false only on a genuine error (a confinement failure on
+   a validated path or an I/O error), which fails the run. */
+static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* manifest,
+                                         DeleteBudgetState* budget) {
   if (!config || !manifest)
     return false;
   if (!manifest->missing || manifest->missing->size == 0)
@@ -3081,6 +3092,16 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       free(full);
       continue;
     }
+    /* An entry that exists is one deletion: skip it (and count it) when the
+       shared --max-delete budget is already exhausted. */
+    if (budget->deleted >= budget->max_delete) {
+      budget->limit_hit = true;
+      budget->skipped++;
+      close(parent_fd);
+      free(leaf);
+      free(full);
+      continue;
+    }
     bool removed = false;
     if (S_ISDIR(st.st_mode)) {
       if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0) {
@@ -3091,10 +3112,35 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
         free(leaf);
         leaf = NULL;
         if (config->use_delete || config->force_delete) {
-          if (!file_remove_tree_secure(full))
+          /* Remove the contents entry-by-entry through the budgeted extras
+             walker so every deleted file/dir counts toward --max-delete (rsync
+             parity); the now-empty directory itself costs one more.  A run that
+             hits the cap leaves the remaining entries in place. */
+          ArrayList* no_keeps = array_list_create(free);
+          size_t remaining = budget->max_delete - budget->deleted;
+          size_t contents_deleted = 0;
+          size_t contents_skipped = 0;
+          DeleteWalkResult walk =
+              no_keeps ? delete_extras_limited(full, no_keeps, NULL, remaining, NULL, 0,
+                                               &contents_deleted, &contents_skipped)
+                       : DELETE_WALK_ERROR;
+          if (no_keeps)
+            array_list_delete(no_keeps);
+          budget->deleted += contents_deleted;
+          budget->skipped += contents_skipped;
+          if (walk == DELETE_WALK_LIMIT_REACHED) {
+            budget->limit_hit = true;
+          } else if (walk != DELETE_WALK_OK) {
             ok = false;
-          else
+          } else if (budget->deleted >= budget->max_delete) {
+            budget->limit_hit = true;
+            budget->skipped++;
+          } else if (file_remove_tree_secure(full)) {
+            budget->deleted++;
             removed = true;
+          } else {
+            ok = false;
+          }
         } else {
           char* escaped = output_escape(rel, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING,
@@ -3114,6 +3160,7 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       }
     }
     if (removed) {
+      budget->deleted++;
       char* escaped = output_escape(rel, log_get_8_bit_output());
       fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);
@@ -3129,24 +3176,58 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
   return ok;
 }
 
+/* Public wrappers used outside the commit path (and by unit tests): no
+   --max-delete budget. */
+bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
+  DeleteBudgetState budget = {
+      .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
+  return delete_extras_budgeted(config, manifest, &budget);
+}
+
+bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
+  DeleteBudgetState budget = {
+      .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
+  return delete_missing_args_budgeted(config, manifest, &budget);
+}
+
 /* Commit every deletion family the manifest carries.  The --delete-missing-args
    exact-path deletions run FIRST: they are explicit user requests and must not
    be blocked by the extras walker's filter-exclusion protection (a protected
    leftover inside a missing-argument directory must not make that user-requested
    removal fail).  The ordinary extras walk then runs when --delete is active.
-   Returns true when there was nothing to do or every requested deletion
-   committed. */
-bool manifest_delete_all(const Config* config, DeleteManifest* manifest) {
+   Both draw from one --max-delete budget; the result reports a cap-stopped
+   (partial) commit distinctly so the client can exit 25 like rsync. */
+DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest) {
   if (!config || !manifest)
-    return false;
+    return DELETE_COMMIT_ERROR;
   /* Central no-mutation guard: a dry-run never deletes.  No manifest is sent on
      the dry-run path, but a hostile/buggy peer could; treat it as a no-op so
      the receiver can never remove anything. */
   if (config->dry_run)
-    return true;
-  if (config->delete_missing_args && !manifest_delete_missing_args(config, manifest))
-    return false;
-  if (config->use_delete && !manifest_delete_extras(config, manifest))
-    return false;
-  return true;
+    return DELETE_COMMIT_OK;
+  /* A client --max-delete=NUM smaller than the server's hard bound replaces it
+     for this run; both still bound the commit. */
+  bool user_limited =
+      config->max_delete >= 0 && (size_t)config->max_delete < MAX_SERVER_DELETE_COUNT;
+  DeleteBudgetState budget = {.max_delete = user_limited ? (size_t)config->max_delete
+                                                         : MAX_SERVER_DELETE_COUNT,
+                              .deleted = 0,
+                              .skipped = 0,
+                              .limit_hit = false};
+  if (config->delete_missing_args && !delete_missing_args_budgeted(config, manifest, &budget))
+    return DELETE_COMMIT_ERROR;
+  if (config->use_delete && !delete_extras_budgeted(config, manifest, &budget))
+    return DELETE_COMMIT_ERROR;
+  if (budget.limit_hit) {
+    if (user_limited) {
+      log_message(LOG_LEVEL_ERROR, "Deletions stopped due to --max-delete limit (%zu skipped)",
+                  budget.skipped);
+    } else {
+      log_message(LOG_LEVEL_ERROR,
+                  "Deletions stopped due to the server deletion limit of %u (%zu skipped)",
+                  (unsigned)MAX_SERVER_DELETE_COUNT, budget.skipped);
+    }
+    return DELETE_COMMIT_LIMIT_REACHED;
+  }
+  return DELETE_COMMIT_OK;
 }

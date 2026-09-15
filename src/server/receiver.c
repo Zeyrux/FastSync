@@ -43,17 +43,19 @@ void receiver_outcomes_destroy(ReceiverOutcomes* outcomes) {
 /* End-of-transfer success frame.  When --remove-source-files was negotiated
    each processed data file is acknowledged first (STATUS_NEXT = written,
    STATUS_OK = skipped) so the sender never removes a source the receiver did
-   not actually store.  The frame always ends with a plain STATUS_OK. */
-bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes) {
+   not actually store.  The frame ends with `final_status` (STATUS_OK, or
+   STATUS_DELETE_LIMIT when a --max-delete commit was capped). */
+bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes,
+                                 Status final_status) {
   if (!config->remove_source_files)
-    return send_status(fd, STATUS_OK);
+    return send_status(fd, final_status);
   size_t count = outcomes ? outcomes->count : 0;
   for (size_t i = 0; i < count; i++) {
     Status per_file = outcomes->entries[i] == FILE_SAVE_WRITTEN ? STATUS_NEXT : STATUS_OK;
     if (!send_status(fd, per_file))
       return false;
   }
-  return send_status(fd, STATUS_OK);
+  return send_status(fd, final_status);
 }
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
@@ -346,15 +348,19 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            moment it arrives, before any file data.  Delete now and acknowledge
            so the sender only starts streaming once the deletion committed (or
            failed).  This is the rsync delete-before/delete-during window: a
-           later transfer failure does not restore these deletions. */
-        bool deletion_ok = (config->use_delete || config->delete_missing_args)
-                               ? manifest_delete_all(config, manifest)
-                               : true;
+           later transfer failure does not restore these deletions.  A
+           --max-delete-capped commit still succeeds and the transfer proceeds;
+           the terminal success frame reports the cap. */
+        DeleteCommitResult deletion = (config->use_delete || config->delete_missing_args)
+                                          ? manifest_delete_all(config, manifest)
+                                          : DELETE_COMMIT_OK;
         delete_manifest_free(manifest);
-        if (!deletion_ok) {
+        if (deletion == DELETE_COMMIT_ERROR) {
           send_status(file_descriptor, STATUS_ERROR);
           goto fail;
         }
+        if (deletion == DELETE_COMMIT_LIMIT_REACHED && sink->note_delete_limit)
+          sink->note_delete_limit(sink->context);
         if (!send_status(file_descriptor, STATUS_OK))
           goto fail;
       } else if (config->use_delete || config->delete_missing_args) {
@@ -407,13 +413,15 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       *pending_manifest = deferred_manifest;
       deferred_manifest = NULL;
     } else {
-      bool deletion_ok = manifest_delete_all(config, deferred_manifest);
+      DeleteCommitResult deletion = manifest_delete_all(config, deferred_manifest);
       delete_manifest_free(deferred_manifest);
       deferred_manifest = NULL;
-      if (!deletion_ok) {
+      if (deletion == DELETE_COMMIT_ERROR) {
         send_status(file_descriptor, STATUS_ERROR);
         goto fail;
       }
+      if (deletion == DELETE_COMMIT_LIMIT_REACHED && sink->note_delete_limit)
+        sink->note_delete_limit(sink->context);
     }
   }
   if (sink->send_success) {
@@ -454,6 +462,9 @@ typedef struct {
      after the whole transfer (and its delete/publication phases) has run so a
      child write never clobbers a directory mtime. */
   DirTimeList dir_times;
+  /* Set when a --max-delete commit was capped; the terminal frame then carries
+     STATUS_DELETE_LIMIT so the sender exits 25 like rsync. */
+  bool delete_limit_reached;
 } ReceiverSaveContext;
 
 static bool receiver_save_file(File* file, void* context_pointer) {
@@ -494,12 +505,18 @@ static bool receiver_save_file(File* file, void* context_pointer) {
   return result != FILE_SAVE_ERROR;
 }
 
+static void receiver_note_delete_limit(void* context_pointer) {
+  ReceiverSaveContext* context = context_pointer;
+  context->delete_limit_reached = true;
+}
+
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
+  Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
   /* Server-contacting --dry-run: nothing was staged or written, so there is
      nothing to publish and no directory times to stamp. */
   if (context->config->dry_run)
-    return receiver_send_final_success(fd, context->config, &context->outcomes);
+    return receiver_send_final_success(fd, context->config, &context->outcomes, final_status);
   /* --delay-updates: the whole protocol stream (including manifest/delete
      handling, which ran inside receiver_process) has succeeded and every
      staged file was fully written.  Publish them atomically now, before the
@@ -517,13 +534,14 @@ static bool receiver_send_success_frame(int fd, void* context_pointer) {
      before calling this success frame. */
   dir_metadata_list_apply(&context->dir_times, context->config->receive_root_directory,
                           context->config);
-  return receiver_send_final_success(fd, context->config, &context->outcomes);
+  return receiver_send_final_success(fd, context->config, &context->outcomes, final_status);
 }
 
 int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
   dir_time_list_init(&context.dir_times);
-  ReceiverSink sink = {receiver_save_file, &context, true, true, receiver_send_success_frame};
+  ReceiverSink sink = {receiver_save_file,        &context, true, true, receiver_send_success_frame,
+                       receiver_note_delete_limit};
   int ret = receiver_process(config, file_descriptor, &sink);
   if (ret != 0 && config->delay_updates && config->delay_context)
     delay_updates_cleanup(config->delay_context);

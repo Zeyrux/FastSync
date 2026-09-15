@@ -155,7 +155,15 @@ enum NET_STATUS {
    * (the receiver reads none in dry-run).  STATUS_OK keeps its meaning in this
    * path ("already up to date / nothing to do").  Appended after
    * STATUS_ERROR_DETAIL so no existing status is renumbered. */
-  STATUS_DRY_RUN_TRANSFER
+  STATUS_DRY_RUN_TRANSFER,
+  /* --max-delete budget exhausted (protocol 2.23.0).  Sent by the receiver as
+   * the terminal success status INSTEAD of STATUS_OK when a --delete/
+   * --delete-missing-args commit removed up to the --max-delete bound but had
+   * to skip further extras.  The transfer itself succeeded and all file data is
+   * stored; the sender maps this to rsync's exit code 25 ("the --max-delete
+   * limit stopped deletions").  Appended after STATUS_DRY_RUN_TRANSFER so no
+   * existing status is renumbered. */
+  STATUS_DELETE_LIMIT
 };
 
 void io_set_fds(int read_fd, int write_fd);

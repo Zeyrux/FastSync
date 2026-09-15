@@ -240,3 +240,29 @@ bool file_list_affects(const FileListSet* set, const char* rel) {
      entry (binary search for the first entry at or after `rel` + '/'). */
   return path_index_has_descendant(&set->index, rel);
 }
+
+bool file_list_dir_in_scope(const FileListSet* set, const char* rel) {
+  if (!set || set->whole_tree)
+    return true;
+  if (!rel || rel[0] == '\0')
+    return false;
+  /* `rel` itself is listed, or one of its ancestor prefixes is an exact listed
+     directory (a listed prefix of a directory path is necessarily a
+     directory). */
+  size_t len = strlen(rel);
+  while (len > 0) {
+    const char* slash = NULL;
+    for (size_t i = len; i-- > 0;) {
+      if (rel[i] == '/') {
+        slash = rel + i;
+        break;
+      }
+    }
+    if (!slash)
+      break;
+    len = (size_t)(slash - rel);
+    if (path_index_contains_n(&set->index, rel, len))
+      return true;
+  }
+  return path_index_contains(&set->index, rel);
+}

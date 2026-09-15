@@ -248,6 +248,25 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
   return 0;
 }
 
+/* Parse a signed integer, clamping every negative value to -1.  rsync's
+   --max-delete treats a negative argument (the deprecated -1 spelling) as "no
+   client limit", so -2/-5 must behave identically rather than being rejected. */
+static int set_signed_clamped_int_option(int* dest, const char* value, const char* option_name) {
+  if (!value || *value == '\0') {
+    log_message(LOG_LEVEL_ERROR, "%s must be an integer", option_name);
+    return -1;
+  }
+  char* endptr;
+  errno = 0;
+  long parsed = strtol(value, &endptr, 10);
+  if (errno != 0 || *endptr != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+    log_message(LOG_LEVEL_ERROR, "%s must be an integer", option_name);
+    return -1;
+  }
+  *dest = parsed < 0 ? -1 : (int)parsed;
+  return 0;
+}
+
 /* Forward decl: config_add_pattern is defined below, but the --remote-option
  * helper above needs it. */
 static int config_add_pattern(char*** patterns, int* count, const char* value, const char* optname);
@@ -616,6 +635,9 @@ typedef enum {
   OPT_POS_INT,
   OPT_NONNEG_INT,
   OPT_ULL,
+  /* A signed integer whose negative values are clamped to -1 (rsync's
+     "no limit" spelling for --max-delete). */
+  OPT_SIGNED_INT,
 } OptKind;
 
 typedef struct {
@@ -730,7 +752,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
     {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
     {"--delete-excluded", NULL, OPT_FLAG, offsetof(Config, delete_excluded)},
-    {"--max-delete", NULL, OPT_NONNEG_INT, offsetof(Config, max_delete)},
+    {"--max-delete", NULL, OPT_SIGNED_INT, offsetof(Config, max_delete)},
     {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
     {"--force", NULL, OPT_FLAG, offsetof(Config, force_delete)},
     {"--prune-empty-dirs", "-m", OPT_FLAG, offsetof(Config, prune_empty_dirs)},
@@ -854,7 +876,8 @@ static const OptionEntry* find_table_option_with_equals(const char* arg, const c
         (entry->alias && strlen(entry->alias) == name_len &&
          strncmp(arg, entry->alias, name_len) == 0)) {
       if (entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
-          entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL) {
+          entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL ||
+          entry->kind == OPT_SIGNED_INT) {
         *value = equals + 1;
         return entry;
       }
@@ -922,6 +945,8 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
     return set_positive_int_option((int*)field, value, entry->name);
   case OPT_NONNEG_INT:
     return set_nonneg_int_option((int*)field, value, entry->name);
+  case OPT_SIGNED_INT:
+    return set_signed_clamped_int_option((int*)field, value, entry->name);
   case OPT_ULL: {
     unsigned long long v;
     /* Size-limit options accept rsync-style suffixes (e.g. --max-size=2G); a
@@ -2158,7 +2183,7 @@ static bool cli_long_takes_separate_value(const char* arg) {
   const OptionEntry* entry = find_table_option(arg);
   if (entry)
     return entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
-           entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL;
+           entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL || entry->kind == OPT_SIGNED_INT;
   static const char* const extra[] = {
       "--ssh-port",        "--exclude",      "--include",       "--exclude-from",
       "--include-from",    "--files-from",   "--filter",        "--delta-block",
