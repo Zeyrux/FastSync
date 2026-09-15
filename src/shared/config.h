@@ -39,15 +39,20 @@ typedef struct BasisDest {
   char* path; /* relative to the destination root (receiver-confined) */
 } BasisDest;
 
-/* One resolved FROM:TO identity-mapping rule (--usermap / --groupmap).  Both
- * fields are numeric ids.  IDENTITY_MATCH_ANY (-1) in `from` is rsync's '*'
- * wildcard (matches any transmitted id); IDENTITY_CURRENT (-1) in `to` makes
- * the receiver resolve the receiving process's own current euid/egid at apply
- * time.  Names are resolved to numbers at parse time on the client (see
- * identity.h for the exact subset). */
+/* One FROM:TO identity-mapping rule (--usermap / --groupmap).  `from`/`from_hi`
+ * describe the sender-side FROM matcher (a single id when from_hi == from, an
+ * inclusive LOW-HIGH range, IDENTITY_MATCH_ANY for rsync's '*', or
+ * IDENTITY_MATCH_UNNAMED for rsync's empty FROM).  `to` is the receiver-side TO
+ * numeric id (IDENTITY_CURRENT = the receiving process's own euid/egid) UNLESS
+ * `to_name` is non-NULL, in which case the receiver resolves the name against
+ * its own account database at apply time (rsync resolves TO names on the
+ * receiver) and `to` is ignored.  FROM names/ranges/globs are resolved on the
+ * client (the sender) exactly as rsync matches them against sender names. */
 typedef struct {
   int32_t from;
+  int32_t from_hi;
   int32_t to;
+  char* to_name;
 } IdentityMap;
 
 /* --sockopts=OPTIONS allowlist.  Only these option names are accepted; anything
@@ -577,13 +582,17 @@ typedef struct Config {
    * targets and, with -K, follows an in-root destination symlink-to-directory);
    * -k/--copy-dirlinks is sender-only and is never serialized. */
   /* numeric_ids */
-  /* --numeric-ids: no name lookup, use the transmitted numeric ids raw. */
+  /* --numeric-ids: a mapping MODIFIER only -- no name lookup, use the
+   * transmitted numeric ids raw.  It does NOT by itself request ownership. */
   /* chown_uid_set */
   /* --chown USER (owner) override; IDENTITY_CURRENT = the receiver's euid. */
   /* chown_gid_set */
   /* --chown :GROUP (group) override; IDENTITY_CURRENT = the receiver's egid. */
   /* usermap */
-  /* --usermap / --groupmap entries, in order (first match wins). */
+  /* --usermap / --groupmap entries, in order (first match wins).  Each entry's
+   * from/from_hi are a single id, an inclusive range, IDENTITY_MATCH_ANY ('*'),
+   * or IDENTITY_MATCH_UNNAMED (empty FROM); to_name carries a receiver-resolved
+   * TO name (rsync resolves TO names on the receiving side). */
   /* preserve_atimes */
   /* -U/--atimes: preserve source access times on the destination. */
   /* preserve_crtimes */
@@ -611,8 +620,11 @@ typedef struct Config {
    * --copy-as) imply it. */
   /* fake_super */
   /* --fake-super: receiver-only.  When set, each written file additionally gets
-   * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
-   * so a later privileged restore could re-apply them.  Crosses the wire. */
+   * a reserved user.fastsync.stat xattr recording the RESOLVED uid/gid (the
+   * source's own when no ownership request is active, else the --chown/--usermap
+   * result) plus mode/mtime so a later privileged restore could re-apply them.
+   * It NEVER real-chowns: the point is to record the source ownership on an
+   * unprivileged receiver.  Crosses the wire. */
   /* module */
   /* Daemon module selection (Wave A, protocol 2.15.0).  Client-composed from a
    * host::module/path destination; NULL or "" means "no module" (the ordinary
@@ -852,22 +864,35 @@ typedef struct Config {
  * UNCHANGED: the receiver still gates attribute application on use_metadata,
  * which is now DERIVED from these attributes by config_derived_use_metadata().
  *
- * Delete-Semantics Wave (#290): 2.22.0 -> 2.23.0.
+ * Rsync-Parity Wave: 2.22.0 -> 2.23.0.
  *
- * WHY the bump, grounded in the wire: the delete-manifest frame gains a fourth
- * trailing section (protocol 2.23.0): a synchronized-directory count followed by
- * that many destination-relative directory paths (the receive root is ".").
- * The receiver confines its extras walk to these directories, so `--files-from`
- * with `--delete` only removes inside listed directory subtrees (rsync parity)
+ * WHY the bump, grounded in the wire.  Several independent changes land in this
+ * protocol version:
+ *
+ * (1) Ownership parity (#286/#294): each --usermap/--groupmap wire entry grows
+ * from two int32s to [from][from_hi][to][to_name]; `from_hi` carries an
+ * inclusive LOW-HIGH range (== from for a single/any/unnamed matcher) and the
+ * trailing string carries a TO NAME for the receiver to resolve (rsync resolves
+ * TO names on the receiving side).  The STATUS_MKDIR and STATUS_DIR_TIMES frames
+ * also gain a bounded per-entry xattr block when -X/-A is negotiated, so
+ * directory xattrs/ACLs (including default ACLs) are preserved like regular-file
+ * xattrs.
+ *
+ * (2) Delete semantics (#290): the delete-manifest frame gains a fourth trailing
+ * section -- a synchronized-directory count followed by that many
+ * destination-relative directory paths (the receive root is ".").  The receiver
+ * confines its extras walk to these directories, so `--files-from` with
+ * `--delete` only removes inside listed directory subtrees (rsync parity)
  * instead of deleting every untransmitted path under the receive root.  The
  * frame stream also gains STATUS_DELETE_LIMIT, the terminal success status sent
  * instead of STATUS_OK when a --max-delete commit removes up to the bound and
- * skips the rest (the sender then exits 25 like rsync).  The config-frame LAYOUT
- * is unchanged.  Any manifest/frame-sequence change must bump the protocol
- * version: a 2.22 peer would desynchronize on the extra trailing section or the
- * unknown status, and the strict same-version handshake (config_receive rejects
- * a mismatched version before parsing anything else) is what keeps a 2.23 client
- * and a 2.22 server from ever reaching that state. */
+ * skips the rest (the sender then exits 25 like rsync).
+ *
+ * Any config-frame layout or frame-sequence change must bump the protocol
+ * version: a 2.22 peer would desynchronize on the new entry bytes, the extra
+ * trailing section or the unknown status, and the strict same-version handshake
+ * (config_receive rejects a mismatched version before parsing anything else) is
+ * what keeps a 2.23 client and a 2.22 server from ever reaching that state. */
 #define PROTOCOL_VERSION "2.23.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
@@ -893,9 +918,11 @@ typedef struct Config {
 
 /* Identity-mapping sentinels and bounds (see identity.h for semantics).
  * IDENTITY_MATCH_ANY is a usermap/groupmap FROM '*' (matches any id);
- * IDENTITY_CURRENT is a chown / map TO '*' (resolve to the receiver's current
- * euid/egid at apply time). */
+ * IDENTITY_MATCH_UNNAMED is a FROM with an empty token (rsync's "ids with no
+ * name on the sender"); IDENTITY_CURRENT is a chown / map TO '*' (resolve to
+ * the receiver's current euid/egid at apply time). */
 #define IDENTITY_MATCH_ANY (-1)
+#define IDENTITY_MATCH_UNNAMED (-2)
 #define IDENTITY_CURRENT (-1)
 #define MAX_IDENTITY_MAP 128
 

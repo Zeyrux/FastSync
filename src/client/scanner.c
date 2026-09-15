@@ -645,7 +645,8 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
  * allocation failure is fatal and reported to the caller. */
 static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const char* root_path,
                                      const char* fs_path, bool relative_mode, bool preserve_atimes,
-                                     bool preserve_crtimes) {
+                                     bool preserve_crtimes, bool preserve_xattrs,
+                                     bool preserve_acls) {
   if (!dir_entries || !root_path || !fs_path)
     return true;
   struct stat st;
@@ -672,6 +673,11 @@ static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const
     file_destroy(file);
     return false;
   }
+  /* Directory xattrs/ACLs (-X/-A): captured here so the deferred
+     STATUS_DIR_TIMES frame can carry them and the receiver can re-apply them
+     fd-relative (a regular file's per-file block never covered directories). */
+  if (preserve_xattrs || preserve_acls)
+    file->xattrs = xattr_capture_path(fs_path, preserve_acls);
   if (relative_mode) {
     file->send_path = rel;
     rel = NULL;
@@ -771,10 +777,11 @@ static int open_next_directory(DirectoryScanner* scanner) {
       return -1;
     }
     if (scanner->options.capture_dir_times &&
-        !scanner_capture_dir_time(scanner->options.dir_entries, scanner->options.dir_entries_mutex,
-                                  scanner->root_path, scanner->current_path, scanner->relative_mode,
-                                  scanner->options.preserve_atimes,
-                                  scanner->options.preserve_crtimes)) {
+        !scanner_capture_dir_time(
+            scanner->options.dir_entries, scanner->options.dir_entries_mutex, scanner->root_path,
+            scanner->current_path, scanner->relative_mode, scanner->options.preserve_atimes,
+            scanner->options.preserve_crtimes, scanner->options.preserve_xattrs,
+            scanner->options.preserve_acls)) {
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
       free(scanner->current_path);
@@ -824,6 +831,7 @@ static File* dirs_root_dir_file(DirectoryScanner* scanner) {
       return NULL;
     }
   }
+  scanner_capture_xattrs(scanner, file);
   return file;
 }
 
@@ -937,6 +945,7 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
       return NULL;
     }
   }
+  scanner_capture_xattrs(scanner, file);
   return file;
 }
 
@@ -1760,7 +1769,8 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   if (options->capture_dir_times &&
       !scanner_capture_dir_time(options->dir_entries, options->dir_entries_mutex, root_directory,
                                 root_directory, options->relative && options->file_list != NULL,
-                                options->preserve_atimes, options->preserve_crtimes)) {
+                                options->preserve_atimes, options->preserve_crtimes,
+                                options->preserve_xattrs, options->preserve_acls)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);

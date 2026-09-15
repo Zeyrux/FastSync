@@ -1464,7 +1464,11 @@ static bool send_directory_entry(const Client* client, File* file, const Config*
   if (!send_status(client->file_descriptor, STATUS_MKDIR) ||
       !send_wire_str(client->file_descriptor, file_wire_path(file)))
     return false;
-  return !config->use_metadata || metadata_send(client->file_descriptor, file->metadata);
+  if (config->use_metadata && !metadata_send(client->file_descriptor, file->metadata))
+    return false;
+  /* Directory xattrs/ACLs (-X/-A) ride the same trailing block as regular files
+     when the xattr transport was negotiated. */
+  return !config->use_xattrs || xattr_send(client->file_descriptor, file->xattrs);
 }
 
 /* P7 Wave D: transmit every captured source directory's metadata in terminal
@@ -1495,6 +1499,9 @@ static bool send_dir_times(const Client* client, const Config* config, ArrayList
       if (!file || !file_wire_path(file))
         return false;
       if (!send_wire_str(fd, file_wire_path(file)) || !metadata_send(fd, file->metadata))
+        return false;
+      /* Directory xattrs/ACLs travel with the deferred directory metadata. */
+      if (config->use_xattrs && !xattr_send(fd, file->xattrs))
         return false;
     }
     index += chunk;

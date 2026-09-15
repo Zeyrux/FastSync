@@ -379,7 +379,9 @@ static void test_fuzz_config_receive_huge_map_count() {
   }
   c->usermap_count = 1;
   c->usermap[0].from = sentinel_from;
+  c->usermap[0].from_hi = sentinel_from;
   c->usermap[0].to = sentinel_to;
+  c->usermap[0].to_name = NULL;
 
   unsigned char* frame = NULL;
   size_t len = 0;
@@ -390,9 +392,12 @@ static void test_fuzz_config_receive_huge_map_count() {
     return;
   }
 
-  unsigned char pattern[8];
+  /* One wire entry is [from][from_hi][to][to_name]; search the fixed-width
+     prefix (the to_name length-prefixed string follows). */
+  unsigned char pattern[12];
   memcpy(pattern, &sentinel_from, sizeof(sentinel_from));
-  memcpy(pattern + sizeof(sentinel_from), &sentinel_to, sizeof(sentinel_to));
+  memcpy(pattern + sizeof(sentinel_from), &sentinel_from, sizeof(sentinel_from));
+  memcpy(pattern + 2 * sizeof(sentinel_from), &sentinel_to, sizeof(sentinel_to));
   size_t entry_off = find_bytes(frame, len, pattern, sizeof(pattern));
   if (entry_off == SIZE_MAX || entry_off < sizeof(int32_t)) {
     free(frame);

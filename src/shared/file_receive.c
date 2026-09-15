@@ -2434,11 +2434,14 @@ File* file_receive(const Config* config, int file_descriptor) {
 
 bool dir_metadata_should_capture(const Config* config) {
   /* Directory metadata is captured when a directory attribute is actually
-   * requested: -p/--perms (directory modes) or -t/--times (directory mtimes,
-   * unless -O/--omit-dir-times suppresses them).  --atimes/-U alone does not
-   * pull directory metadata (matching the original dir-time bundle). */
+   * requested: -p/--perms (directory modes), -t/--times (directory mtimes,
+   * unless -O/--omit-dir-times suppresses them), -o/-g (directory ownership),
+   * or -X/-A (directory xattrs/ACLs).  --atimes/-U alone does not pull
+   * directory metadata (matching the original dir-time bundle). */
   return config && config->use_metadata &&
-         (config->preserve_perms || (config->preserve_times && !config->omit_dir_times));
+         (config->preserve_perms || (config->preserve_times && !config->omit_dir_times) ||
+          config->preserve_owner || config->preserve_group || config->preserve_xattrs ||
+          config->preserve_acls);
 }
 
 void dir_time_list_init(DirTimeList* list) {
@@ -2446,6 +2449,7 @@ void dir_time_list_init(DirTimeList* list) {
     return;
   list->paths = NULL;
   list->entries = NULL;
+  list->xattrs = NULL;
   list->count = 0;
   list->capacity = 0;
   list->bytes = 0;
@@ -2454,18 +2458,23 @@ void dir_time_list_init(DirTimeList* list) {
 void dir_time_list_free(DirTimeList* list) {
   if (!list)
     return;
-  for (size_t i = 0; i < list->count; i++)
+  for (size_t i = 0; i < list->count; i++) {
     free(list->paths[i]);
+    xattr_list_free(list->xattrs ? list->xattrs[i] : NULL);
+  }
   free(list->paths);
   free(list->entries);
+  free(list->xattrs);
   list->paths = NULL;
   list->entries = NULL;
+  list->xattrs = NULL;
   list->count = 0;
   list->capacity = 0;
   list->bytes = 0;
 }
 
-bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata) {
+bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata,
+                       const FileXattrList* xattrs) {
   if (!list || !wire_path || !metadata)
     return true; /* nothing to remember; never a hard error */
   /* Cumulative, not per-frame: the sender may stream a tree across unbounded
@@ -2474,9 +2483,14 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
      transfer, which becomes a clean protocol error). */
   size_t path_len = strlen(wire_path);
   /* Charge the whole per-entry cost (path copy + pointer slot + metadata
-     struct), not just the path, so the array growth is bounded by the same
-     cumulative budget. */
-  size_t entry_cost = path_len + sizeof(FileMetadata) + sizeof(char*);
+     struct + captured xattrs), not just the path, so the array growth is
+     bounded by the same cumulative budget. */
+  size_t xattr_cost = 0;
+  if (xattrs) {
+    for (int i = 0; i < xattrs->count; i++)
+      xattr_cost += strlen(xattrs->items[i].name) + xattrs->items[i].value_len + sizeof(FileXattr);
+  }
+  size_t entry_cost = path_len + sizeof(FileMetadata) + 2 * sizeof(char*) + xattr_cost;
   if (list->count >= MAX_DIR_TIME_ENTRIES || entry_cost > MAX_DIR_TIME_BYTES - list->bytes)
     return false;
   if (list->count == list->capacity) {
@@ -2485,10 +2499,9 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
       return false;
     /* Assign each grown array as soon as its realloc succeeds: the old block is
        already freed by then, so discarding the pointer would dangle.  capacity
-       is advanced only after BOTH reallocs succeed, so a partial failure leaves
-       capacity no larger than the entries allocation (the paths array may be
-       over-allocated, which is harmless) -- never a mismatched list the next
-       add could write past. */
+       is advanced only after ALL reallocs succeed, so a partial failure leaves
+       capacity no larger than the smallest allocation -- never a mismatched
+       list the next add could write past. */
     char** grown_paths = realloc(list->paths, new_capacity * sizeof(char*));
     if (!grown_paths)
       return false;
@@ -2497,13 +2510,23 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
     if (!grown_entries)
       return false;
     list->entries = grown_entries;
+    FileXattrList** grown_xattrs = realloc(list->xattrs, new_capacity * sizeof(FileXattrList*));
+    if (!grown_xattrs)
+      return false;
+    list->xattrs = grown_xattrs;
     list->capacity = new_capacity;
   }
   char* copy = str_dup(wire_path);
   if (!copy)
     return false;
+  FileXattrList* xattr_copy = xattr_list_clone(xattrs);
+  if (xattrs && !xattr_copy) {
+    free(copy);
+    return false;
+  }
   list->paths[list->count] = copy;
   list->entries[list->count] = *metadata;
+  list->xattrs[list->count] = xattr_copy;
   list->count++;
   list->bytes += entry_cost;
   return true;
@@ -2515,7 +2538,12 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
     return;
   bool apply_times = config->preserve_times && !config->omit_dir_times;
   bool apply_mode = config->preserve_perms;
-  if (!apply_times && !apply_mode)
+  bool apply_xattrs = config->use_xattrs;
+  /* Ownership is applied through the active identity snapshot (which no-ops
+   * unless an ownership request is active), and xattrs only when -X/-A was
+   * negotiated.  Times/mode keep their own per-attribute gates. */
+  bool have_any = apply_times || apply_mode || apply_xattrs || identity_active_enabled();
+  if (!have_any)
     return;
   for (size_t i = 0; i < list->count; i++) {
     char* dir_path = path_cat(root_directory, list->paths[i]);
@@ -2544,6 +2572,13 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
       free(dir_path);
       continue;
     }
+    /* One O_DIRECTORY|O_NOFOLLOW fd drives ownership/mode/xattr application so
+       none of them can follow a same-named symlink planted after the fstatat. */
+    int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    /* Ownership first: a chown clears setuid/setgid, so it must precede mode. */
+    if (dir_fd >= 0)
+      identity_apply_ownership(dir_fd, (int32_t)list->entries[i].uid,
+                               (int32_t)list->entries[i].gid);
     if (apply_times) {
       struct timespec times[2] = {
           {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
@@ -2573,28 +2608,28 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
       if (mode_ready) {
         /* Route the directory mode through the SAME sanitization as the
          * regular-file policy: a client-supplied mode never grants group/other
-         * write.  Open the directory with O_DIRECTORY|O_NOFOLLOW (never
-         * following a same-named symlink) and fchmod the fd, avoiding the
-         * fchmodat(..., 0) TOCTOU/symlink-follow hole. */
+         * write. */
         mode_t safe_mode =
             (dir_mode & 0777 & ~(S_IWGRP | S_IWOTH)) | (dir_mode & (S_ISGID | S_ISVTX));
-        int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (dir_fd < 0) {
           char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
                       escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
           free(escaped_path);
-        } else {
-          if (fchmod(dir_fd, safe_mode) != 0) {
-            char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-            log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
-                        escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-            free(escaped_path);
-          }
-          close(dir_fd);
+        } else if (fchmod(dir_fd, safe_mode) != 0) {
+          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+          log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
+                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+          free(escaped_path);
         }
       }
     }
+    /* xattrs/ACLs last: a mode change can rewrite the ACL mask, so the ACL
+       xattrs must be (re)applied after fchmod. */
+    if (apply_xattrs && dir_fd >= 0 && list->xattrs)
+      xattr_apply_fd(dir_fd, list->xattrs[i]);
+    if (dir_fd >= 0)
+      close(dir_fd);
     close(parent_fd);
     free(leaf);
     free(dir_path);
@@ -2634,6 +2669,11 @@ File* file_receive_directory(int file_descriptor, const Config* config) {
       return NULL;
     }
   }
+  /* Directory xattrs/ACLs (-X/-A) ride after the metadata when negotiated. */
+  if (config && !receive_file_xattrs(file, file_descriptor, config)) {
+    file_destroy(file);
+    return NULL;
+  }
   return file;
 }
 
@@ -2669,6 +2709,12 @@ File* file_receive_dir_time(int file_descriptor, const Config* config) {
       file_destroy(file);
       return NULL;
     }
+  }
+  /* Directory xattrs/ACLs (-X/-A) ride after the metadata, mirroring the
+     sender's send_dir_times(). */
+  if (config && !receive_file_xattrs(file, file_descriptor, config)) {
+    file_destroy(file);
+    return NULL;
   }
   return file;
 }

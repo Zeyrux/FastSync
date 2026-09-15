@@ -1885,6 +1885,75 @@ static bool cli_handle_checksum_options(CliParseCtx* ctx) {
   return false;
 }
 
+/* Determine whether a --chown spec sets the owner and/or group side, honoring
+ * the same escape-aware splitting as identity_parse_chown(): a `\:` is a literal
+ * colon, not a field separator. */
+static void chown_spec_sides(const char* value, bool* has_owner, bool* has_group) {
+  *has_owner = false;
+  *has_group = false;
+  if (!value)
+    return;
+  bool split = false;
+  for (const char* p = value; *p; p++) {
+    if (*p == '\\' && p[1] == ':') {
+      p++;
+      continue;
+    }
+    if (*p == ':') {
+      split = true;
+      continue;
+    }
+    if (split)
+      *has_group = true;
+    else
+      *has_owner = true;
+  }
+}
+
+/* rsync refuses to mix --chown with --usermap/--groupmap on the SAME side
+ * ("--usermap conflicts with prior --chown").  `chown_value` is non-NULL only
+ * for the --chown option itself.  Returns true and records a parse error when
+ * the new option conflicts with one already seen. */
+static bool mapping_option_conflicts(CliParseCtx* ctx, const char* optname, bool is_group,
+                                     const char* chown_value) {
+  const Config* config = ctx->config;
+  if (chown_value) {
+    bool has_owner;
+    bool has_group;
+    chown_spec_sides(chown_value, &has_owner, &has_group);
+    if (has_owner && config->usermap_count > 0) {
+      log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --usermap", optname);
+      ctx->exit_code = -1;
+      return true;
+    }
+    if (has_group && config->groupmap_count > 0) {
+      log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --groupmap", optname);
+      ctx->exit_code = -1;
+      return true;
+    }
+    return false;
+  }
+  if (!is_group && config->chown_uid_set) {
+    log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --chown", optname);
+    ctx->exit_code = -1;
+    return true;
+  }
+  if (is_group && config->chown_gid_set) {
+    log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --chown", optname);
+    ctx->exit_code = -1;
+    return true;
+  }
+  return false;
+}
+
+static bool usermap_conflicts_with_chown(CliParseCtx* ctx, const char* optname, bool is_group) {
+  return mapping_option_conflicts(ctx, optname, is_group, NULL);
+}
+
+static bool chown_conflicts_with_map(CliParseCtx* ctx, const char* optname, const char* value) {
+  return mapping_option_conflicts(ctx, optname, false, value);
+}
+
 /* Remote-option, basis-directory and identity-mapping options.  Returns true
  * when the argument was consumed. */
 static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
@@ -1957,6 +2026,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--usermap=", 10) == 0) {
+    if (usermap_conflicts_with_chown(ctx, "--usermap", false))
+      return true;
     if (identity_parse_map(config, arg + 10, false) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1970,6 +2041,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (usermap_conflicts_with_chown(ctx, "--usermap", false))
+      return true;
     if (identity_parse_map(config, ctx->argv[++ctx->i], false) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1978,6 +2051,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--groupmap=", 11) == 0) {
+    if (usermap_conflicts_with_chown(ctx, "--groupmap", true))
+      return true;
     if (identity_parse_map(config, arg + 11, true) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1991,6 +2066,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (usermap_conflicts_with_chown(ctx, "--groupmap", true))
+      return true;
     if (identity_parse_map(config, ctx->argv[++ctx->i], true) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1999,6 +2076,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--chown=", 8) == 0) {
+    if (chown_conflicts_with_map(ctx, "--chown", arg + 8))
+      return true;
     if (identity_parse_chown(config, arg + 8) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -2015,6 +2094,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (chown_conflicts_with_map(ctx, "--chown", ctx->argv[ctx->i + 1]))
+      return true;
     if (identity_parse_chown(config, ctx->argv[++ctx->i]) != 0) {
       ctx->exit_code = -1;
       return true;

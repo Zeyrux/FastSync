@@ -127,6 +127,14 @@ bool identity_explicit_ownership_requested(const Config* config);
  * is active returns true. */
 bool identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid);
 
+/* Resolve the ownership that --fake-super should RECORD in the reserved xattr
+ * (rather than chown for real).  A requested side (--copy-as / usermap /
+ * --chown / -o / -g, with --numeric-ids as the raw-id modifier) yields the
+ * resolved target; a side that was not requested keeps the transmitted source
+ * id.  Must be called after identity_set_active(). */
+void identity_resolve_storage_ids(int32_t source_uid, int32_t source_gid, uint32_t* out_uid,
+                                  uint32_t* out_gid);
+
 /* P7 Wave D: the no-follow (symlink) counterpart.  Resolves the same
  * usermap/groupmap/chown/numeric-ids/copy-as policy but applies it with
  * fchownat(..., AT_SYMLINK_NOFOLLOW) so a symlink's own ownership is changed

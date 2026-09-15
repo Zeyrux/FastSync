@@ -5009,9 +5009,11 @@ class TestIdentityMapping:
         clean_dir(dest)
         with open(os.path.join(source, "f.txt"), "wb") as f:
             f.write(b"mapped")
+        # #294: --chown cannot be mixed with --usermap/--groupmap on the same
+        # side, so the maps travel together and --chown is exercised separately.
         result, _ = run_client(
             source, dest,
-            flags=["--preserve", "--usermap=@1000:@1001", "--groupmap=@100:@101", "--chown=@2000:@2001"],
+            flags=["--preserve", "--usermap=@1000:@1001", "--groupmap=@100:@101"],
             port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:200]}"
@@ -5019,8 +5021,14 @@ class TestIdentityMapping:
         with open(os.path.join(received, "f.txt"), "rb") as f:
             assert f.read() == b"mapped"
 
+        result, _ = run_client(source, dest, flags=["--preserve", "--chown=@2000:@2001"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"chown exit {result.returncode}: {(result.stderr or '')[:200]}"
+
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
-    def test_numeric_ids_applies_ownership_as_root(self, shared_server):
+    def test_numeric_ids_alone_does_not_apply_ownership_as_root(self, shared_server):
+        # #286.1: --numeric-ids is a mapping modifier, not an ownership request.
         source = os.path.join(TEST_DATA_DIR, "identity_root_source")
         dest = os.path.join(TEST_DATA_DIR, "identity_root_dest")
         clean_dir(source)
@@ -5038,8 +5046,8 @@ class TestIdentityMapping:
         dst_file = os.path.join(received, "f.txt")
         assert os.path.exists(dst_file)
         st = os.stat(dst_file)
-        assert st.st_uid == 12345 and st.st_gid == 12346, \
-            f"owner not applied: uid={st.st_uid} gid={st.st_gid}"
+        assert st.st_uid != 12345, \
+            f"--numeric-ids alone must not chown: uid={st.st_uid} gid={st.st_gid}"
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
     def test_chown_overrides_ownership_as_root(self, shared_server):
@@ -5126,21 +5134,21 @@ class TestSuperPrivilege:
             f"--super alone must not apply ownership (uid={st.st_uid} gid={st.st_gid})"
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
-    def test_super_with_numeric_ids_applies_ownership_as_root(self, shared_server):
-        """Control: an explicit identity policy is what enables ownership, so
-        --numeric-ids --super still applies the raw ids as root (the very
-        ownership --no-super suppresses)."""
+    def test_super_with_owner_numeric_ids_applies_ownership_as_root(self, shared_server):
+        """Control: an explicit ownership request is what enables ownership, so
+        -a --numeric-ids --super applies the raw ids as root (the very ownership
+        --no-super suppresses).  --numeric-ids itself is only the modifier."""
         source, dest = self._seed("supernumeric")
         os.chown(os.path.join(source, "f.txt"), 12345, 12346)
         result, _ = run_client(source, dest,
-                               flags=["--preserve", "--numeric-ids", "--super"],
+                               flags=["-a", "--numeric-ids", "--super"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:300]}"
         received = get_dest_received_dir(dest, source)
         st = os.stat(os.path.join(received, "f.txt"))
         assert (st.st_uid, st.st_gid) == (12345, 12346), \
-            f"--numeric-ids --super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
+            f"-a --numeric-ids --super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
 
     @pytest.mark.ci
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
@@ -6063,6 +6071,79 @@ class TestExtendedAttributes:
         assert len(fields) == 5
         assert fields[0] == str(uid), f"reserved uid field {fields[0]} != source uid {uid}"
 
+    @pytest.mark.ci
+    def test_fake_super_records_resolved_chown_without_real_chown(self, shared_server):
+        """#294: --fake-super must NOT real-chown the recorded owner; it records
+        the RESOLVED ownership (here a --chown mapping) in the reserved xattr."""
+        source, dest = self._source_and_dest("fakesuper_chown")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"fake-super chown\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support xattrs")
+
+        result, _ = run_client(source, dest,
+                               flags=["--fake-super", "--chown=@33333:@44444"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--fake-super --chown sync failed: {(result.stderr or result.stdout)[:300]}"
+        dst = os.path.join(get_dest_received_dir(dest, source), "data.txt")
+        record = os.getxattr(dst, "user.fastsync.stat").decode().split(":")
+        assert record[0] == "33333", f"recorded owner {record[0]} != resolved 33333"
+        assert record[1] == "44444", f"recorded group {record[1]} != resolved 44444"
+        st = os.stat(dst)
+        assert st.st_uid != 33333, "--fake-super must not real-chown the recorded owner"
+
+    @pytest.mark.ci
+    def test_directory_xattrs_preserved(self, shared_server):
+        """#286.3: -aX must preserve user.* xattrs on DIRECTORIES, not just files."""
+        source, dest = self._source_and_dest("dirxattr")
+        os.makedirs(os.path.join(source, "sub"))
+        if not _xattr_supported(source):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(source, "user.rootdir", b"r")
+        os.setxattr(os.path.join(source, "sub"), "user.subdir", b"s")
+        with open(os.path.join(source, "sub", "f.txt"), "wb") as fh:
+            fh.write(b"x\n")
+
+        result, _ = run_client(source, dest, flags=["-aX"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-aX dir sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(received, "user.rootdir") == b"r"
+        assert os.getxattr(os.path.join(received, "sub"), "user.subdir") == b"s"
+
+    @pytest.mark.ci
+    def test_directory_default_acl_preserved(self, shared_server):
+        """#286.3: -aA must preserve a directory's default POSIX ACL (the
+        system.posix_acl_default xattr), which regular-file ACLs do not cover."""
+        source, dest = self._source_and_dest("diracl")
+        sub = os.path.join(source, "sub")
+        os.makedirs(sub)
+        # A child is needed because FastSync deliberately does not materialize
+        # empty directories; the implicit parent is created by the child write.
+        with open(os.path.join(sub, "f.txt"), "wb") as fh:
+            fh.write(b"acl dir\n")
+        if not _xattr_supported(sub):
+            pytest.skip("filesystem does not support xattrs")
+        if shutil.which("setfacl") is None:
+            pytest.skip("setfacl is not available")
+        acl = subprocess.run(["setfacl", "-m", "d:u::rwx,d:g::rx,d:o::---", sub],
+                             capture_output=True, text=True)
+        if acl.returncode != 0:
+            pytest.skip(f"cannot set a default ACL: {acl.stderr.strip()}")
+        try:
+            before = os.getxattr(sub, "system.posix_acl_default")
+        except OSError as e:
+            pytest.skip(f"no default ACL xattr: {e}")
+
+        result, _ = run_client(source, dest, flags=["-aA"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-aA dir sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "sub"),
+                           "system.posix_acl_default") == before
+
 
 class TestConnectivityClientOptions:
     """Phase 5 connectivity launch options (--outbuf, --blocking-io).
@@ -6488,8 +6569,8 @@ class TestCopyAs:
     @pytest.mark.ci
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
     def test_root_copy_as_with_fake_super_keeps_target_owner(self, shared_server):
-        """--fake-super must not let the recorded source owner override the
-        --copy-as forced owner (copy-as is authoritative)."""
+        """#294: --fake-super records the RESOLVED copy-as ownership without
+        real-chowning; the recorded source owner can never override copy-as."""
         source = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_src")
         dest = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_dst")
         clean_dir(source)
@@ -6497,6 +6578,8 @@ class TestCopyAs:
         src_file = os.path.join(source, "mixed.txt")
         with open(src_file, "wb") as fh:
             fh.write(b"copy-as wins over fake-super\n")
+        if not _xattr_supported(src_file):
+            pytest.skip("filesystem does not support user xattrs")
         os.chown(src_file, 12345, 12346)
 
         result, _ = run_client(source, dest,
@@ -6507,7 +6590,13 @@ class TestCopyAs:
             f"{(result.stderr or result.stdout)[:400]}"
         )
         received = get_dest_received_dir(dest, source)
-        st = os.lstat(os.path.join(received, "mixed.txt"))
-        assert (st.st_uid, st.st_gid) == (65534, 65534), (
-            f"--fake-super overrode --copy-as: uid={st.st_uid} gid={st.st_gid}"
+        dst = os.path.join(received, "mixed.txt")
+        record = os.getxattr(dst, "user.fastsync.stat").decode().split(":")
+        assert (record[0], record[1]) == ("65534", "65534"), (
+            f"fake-super must record the resolved copy-as ownership: {record[:2]}"
+        )
+        st = os.lstat(dst)
+        assert (st.st_uid, st.st_gid) != (12345, 12346), (
+            f"--fake-super must not real-chown the recorded source owner: "
+            f"uid={st.st_uid} gid={st.st_gid}"
         )

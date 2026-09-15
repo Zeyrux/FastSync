@@ -2864,6 +2864,92 @@ static void test_parse_args_usermap_name_resolution() {
   config_delete(cfg);
 }
 
+/* #294: rsync map FROM forms -- inclusive numeric ranges, '*' (any), and the
+ * empty token (ids with no name on the sender).  A TO name is transmitted as a
+ * NAME for the receiver to resolve (rsync resolves TO names on the receiving
+ * side), not resolved against the client's database. */
+static void test_parse_args_usermap_rsync_forms() {
+  int positional_args[2];
+
+  Config* cfg = config_create();
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--usermap=0-99:nobody", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].from, 0);
+  EXPECT_EQ_INT(cfg->usermap[0].from_hi, 99);
+  EXPECT_TRUE(cfg->preserve_owner);
+  config_delete(cfg);
+
+  /* Empty FROM => IDENTITY_MATCH_UNNAMED. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--usermap=:@0", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].from, IDENTITY_MATCH_UNNAMED);
+  EXPECT_EQ_INT(cfg->usermap[0].from_hi, IDENTITY_MATCH_UNNAMED);
+  config_delete(cfg);
+
+  /* '*' FROM => IDENTITY_MATCH_ANY. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--groupmap=*:@0", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->groupmap[0].from, IDENTITY_MATCH_ANY);
+  EXPECT_EQ_INT(cfg->groupmap[0].from_hi, IDENTITY_MATCH_ANY);
+  config_delete(cfg);
+
+  /* A TO name is kept as a receiver-resolved name, NOT resolved locally. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--usermap=0:nobody", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_NOT_NULL(cfg->usermap[0].to_name);
+  if (cfg->usermap[0].to_name)
+    EXPECT_EQ_STR(cfg->usermap[0].to_name, "nobody");
+  config_delete(cfg);
+}
+
+/* #294: rsync refuses to mix --chown with --usermap/--groupmap on the same
+ * side (either order).  --chown=USER conflicts with a prior --usermap;
+ * --chown=:GROUP conflicts with a prior --groupmap; the opposite side is fine. */
+static void test_parse_args_identity_map_chown_conflict() {
+  int positional_args[2];
+  struct {
+    const char* a;
+    const char* b;
+  } bad[] = {
+      {"--usermap=0:1", "--chown=2:3"},  {"--chown=2:3", "--usermap=0:1"},
+      {"--chown=2", "--usermap=0:1"},    {"--chown=2:3", "--groupmap=0:1"},
+      {"--groupmap=0:1", "--chown=2:3"}, {"--chown=:3", "--groupmap=0:1"},
+  };
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)bad[i].a, (char*)bad[i].b, "/src", "/dst"};
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  /* The opposite-side combinations rsync allows must still parse. */
+  struct {
+    const char* a;
+    const char* b;
+  } ok[] = {
+      {"--chown=2", "--groupmap=0:1"},
+      {"--chown=:3", "--usermap=0:1"},
+  };
+  for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)ok[i].a, (char*)ok[i].b, "/src", "/dst"};
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    config_delete(cfg);
+  }
+}
+
 /* --chown parses USER:GROUP / USER / :GROUP, numeric ids, and '*'. */
 static void test_parse_args_chown() {
   Config* cfg = config_create();
@@ -2981,8 +3067,10 @@ static void test_parse_args_rejects_malformed_identity() {
     const char* val;
   } bad[] = {
       {"--usermap", "@1000"},
-      {"--usermap", ":1000"},
       {"--usermap", "definitely_not_a_real_user_zzz:@1"},
+      {"--usermap", "0-"},
+      {"--usermap", "5-2:@1"},
+      {"--usermap", "roo*:@1"},
       {"--groupmap", "@1"},
       {"--groupmap", "no_such_group_qqq:x"},
       {"--chown", "a:b:c"},
@@ -3962,6 +4050,8 @@ void test_client_cli() {
   test_parse_args_usermap();
   test_parse_args_groupmap();
   test_parse_args_usermap_name_resolution();
+  test_parse_args_usermap_rsync_forms();
+  test_parse_args_identity_map_chown_conflict();
   test_parse_args_chown();
   test_parse_args_copy_as();
   test_parse_args_rejects_malformed_identity();

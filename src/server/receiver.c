@@ -487,7 +487,7 @@ static bool receiver_save_file(File* file, void* context_pointer) {
      receiver_send_success_frame). */
   if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
       dir_metadata_should_capture(context->config) &&
-      !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+      !dir_time_list_add(&context->dir_times, file->path, file->metadata, file->xattrs)) {
     file_destroy(file);
     return false;
   }

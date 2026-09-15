@@ -986,13 +986,18 @@ static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXat
                              bool fake_super, FileAttrPolicy policy) {
   xattr_apply_fd(fd, xattrs);
   if (fake_super && metadata) {
-    fake_super_store_fd(fd, (uint32_t)metadata->uid, (uint32_t)metadata->gid,
-                        (uint32_t)metadata->mode, metadata->mtime_sec, metadata->mtime_nsec);
-    /* Replay: re-apply the recorded uid/gid/mode/mtime fd-relative so a save
-       under --fake-super restores the attrs (when privileged) instead of only
-       recording them.  Best-effort; fake_super_restore_fd silently skips a
-       non-root fchown EPERM/EACCES and never fatal.  The replayed mode/mtime
-       honor the per-attribute policy so fake-super cannot bypass the split. */
+    /* Record the ownership that WOULD have been applied: when an explicit
+       ownership request (--chown/--usermap/--groupmap/--copy-as or -o/-g) is
+       active, the resolved mapping; otherwise the source's own id.  The real
+       chown is suppressed (identity_apply_ownership early-returns under
+       --fake-super) so recording never defeats the flag.  Mode/mtime are still
+       replayed (policy-gated) so unprivileged --fake-super keeps working. */
+    uint32_t store_uid;
+    uint32_t store_gid;
+    identity_resolve_storage_ids((int32_t)metadata->uid, (int32_t)metadata->gid, &store_uid,
+                                 &store_gid);
+    fake_super_store_fd(fd, store_uid, store_gid, (uint32_t)metadata->mode, metadata->mtime_sec,
+                        metadata->mtime_nsec);
     fake_super_restore_fd(fd, policy);
   }
 }
