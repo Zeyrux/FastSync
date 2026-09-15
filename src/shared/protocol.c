@@ -104,6 +104,10 @@ int protocol_get_io_timeout_sec(void) {
   return session->io_timeout_sec > 0 ? session->io_timeout_sec : 0;
 }
 
+int protocol_server_io_timeout_sec(int client_timeout) {
+  return client_timeout > 0 ? client_timeout : SERVER_IO_TIMEOUT_SEC;
+}
+
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc) {
   if (!session)
     session = bound_session ? bound_session : &legacy_io_session;
@@ -495,6 +499,8 @@ static const char* status_to_string(Status status) {
     return "ERROR_DETAIL";
   case STATUS_DRY_RUN_TRANSFER:
     return "DRY_RUN_TRANSFER";
+  case STATUS_DELETE_LIMIT:
+    return "DELETE_LIMIT";
   case STATUS_DEST_INFO:
     return "DEST_INFO";
   default:

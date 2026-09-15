@@ -254,6 +254,13 @@ def _wait_for_port(port, timeout=5):
 
 
 def _wait_proc(proc, timeout=5):
+    """Stop a long-lived subprocess promptly.  The server installs a SIGTERM
+    handler, so signal first and only escalate to SIGKILL if it does not exit;
+    waiting without signalling would burn the full timeout on every stop."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    proc.terminate()
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:

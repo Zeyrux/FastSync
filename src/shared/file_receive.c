@@ -295,12 +295,17 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     free(destination_path);
     return absent_result;
   }
-  /* Resolve a relative --temp-dir against the destination root, exactly as the
-   * primary save path does; an absolute one is used verbatim. */
+  /* Resolve a relative --temp-dir under the destination root, exactly as the
+   * primary save path does; an absolute or `..`-escaping value is rejected. */
   char* resolved_temp = NULL;
   if (cfg->temp_dir) {
-    resolved_temp =
-        cfg->temp_dir[0] == '/' ? str_dup(cfg->temp_dir) : path_cat(root_directory, cfg->temp_dir);
+    if (cfg->temp_dir[0] == '/' || has_path_traversal(cfg->temp_dir)) {
+      free(content);
+      free(first_disk);
+      free(destination_path);
+      return FILE_SAVE_ERROR;
+    }
+    resolved_temp = path_cat(root_directory, cfg->temp_dir);
     if (!resolved_temp) {
       free(content);
       free(first_disk);
@@ -772,15 +777,16 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return file_save_hardlink_sibling(root_directory, file, config);
   }
 
-  /* These options arrive from the client.  --backup-dir and --partial-dir are
-     names below the server root, never independent filesystem roots: an
-     absolute or `..`-escaping value is rejected outright.  --temp-dir is
-     deliberately NOT confined: rsync accepts any temp dir (absolute, or
-     relative to the destination root), including one outside the destination
-     tree or on another filesystem, and falls back to a non-atomic copy when
-     the install rename hits EXDEV. */
+  /* These options arrive from the client.  --backup-dir, --partial-dir and
+     --temp-dir are names below the server root, never independent filesystem
+     roots: an absolute or `..`-escaping value is rejected outright (rsync's
+     daemon confines temp-dir to the module the same way).  A relative temp dir
+     is resolved under the receive root below; if that resolution still lands on
+     a different filesystem than the destination the install falls back to a
+     non-atomic copy (see file_to_disk_secure_impl), never an abort. */
   if ((backup_dir && (backup_dir[0] == '/' || has_path_traversal(backup_dir))) ||
-      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))))
+      (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))) ||
+      (temp_dir && (temp_dir[0] == '/' || has_path_traversal(temp_dir))))
     return FILE_SAVE_ERROR;
   if (backup_dir && !(confined_backup = path_cat(root_directory, backup_dir)))
     return FILE_SAVE_ERROR;
@@ -906,20 +912,16 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
 
   /* A configured --temp-dir sends the temporary working copy to a scratch
      directory; the engine then atomically renames the completed file into the
-     final destination directory.  rsync resolves a relative temp dir against
-     the destination directory and uses an absolute one verbatim, requiring
-     that it already exist; the engine falls back to a non-atomic copy on
-     EXDEV.  The partial-dir flow already keeps its working copy in a separate
-     directory and --inplace writes directly, so neither diverts through the
-     scratch dir (matching rsync, where --inplace/--partial-dir supersede
-     --temp-dir). */
+     final destination directory.  A relative temp dir is resolved under the
+     receive root and must already exist (an absolute or `..`-escaping value was
+     rejected above); the engine falls back to a non-atomic copy on EXDEV.  The
+     partial-dir flow already keeps its working copy in a separate directory and
+     --inplace writes directly, so neither diverts through the scratch dir
+     (matching rsync, where --inplace/--partial-dir supersede --temp-dir). */
   char* confined_temp = NULL;
   bool use_temp_dir = temp_dir != NULL && !inplace && !use_partial_root;
   if (use_temp_dir) {
-    if (temp_dir[0] == '/')
-      confined_temp = str_dup(temp_dir);
-    else
-      confined_temp = path_cat(root_directory, temp_dir);
+    confined_temp = path_cat(root_directory, temp_dir);
     if (!confined_temp)
       goto fail;
     /* A user-supplied trailing slash would leave the scratch path ending in
@@ -3061,8 +3063,15 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
       idx++;
     }
   }
-  size_t remaining =
-      budget->max_delete == SIZE_MAX ? SIZE_MAX : budget->max_delete - budget->deleted;
+  /* Clamp rather than subtract: an accounting bug where deleted already exceeds
+     max_delete must never underflow into an effectively unlimited budget. */
+  size_t remaining;
+  if (budget->max_delete == SIZE_MAX)
+    remaining = SIZE_MAX;
+  else if (budget->deleted >= budget->max_delete)
+    remaining = 0;
+  else
+    remaining = budget->max_delete - budget->deleted;
   size_t deleted = 0;
   size_t skipped = 0;
   DeleteWalkResult result =
@@ -3195,7 +3204,11 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
              parity); the now-empty directory itself costs one more.  A run that
              hits the cap leaves the remaining entries in place. */
           ArrayList* no_keeps = array_list_create(free);
-          size_t remaining = budget->max_delete - budget->deleted;
+          /* Never let an accounting slip (deleted > max_delete) underflow the
+             remaining budget into SIZE_MAX, which would grant unlimited
+             deletions. */
+          size_t remaining =
+              budget->deleted >= budget->max_delete ? 0 : budget->max_delete - budget->deleted;
           size_t contents_deleted = 0;
           size_t contents_skipped = 0;
           DeleteWalkResult walk =
@@ -3214,7 +3227,8 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
             budget->limit_hit = true;
             budget->skipped++;
           } else if (file_remove_tree_secure(full)) {
-            budget->deleted++;
+            /* The shared `if (removed)` tail charges this directory exactly
+               once; counting it here too would consume two budget units. */
             removed = true;
           } else {
             ok = false;

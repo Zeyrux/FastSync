@@ -34,6 +34,11 @@
 #define DEFAULT_MAX_ALLOC (1ULL * 1024 * 1024 * 1024)
 /* Server policy ceiling for a client-provided allocation limit. */
 #define MAX_SERVER_ALLOC (256ULL * 1024 * 1024)
+/* Server-owned floor for the per-message I/O deadline.  A client --timeout=0
+   (rsync's default) disables the client's own deadlines, but a server session
+   must never be held open forever by a silent peer (slow-loris), so the server
+   floors the effective deadline at this value. */
+#define SERVER_IO_TIMEOUT_SEC 60
 /* Bounded cumulative per-connection receive budget.  In-flight wire buffers,
    decompression buffers and queued (not yet written) file payloads for a
    connection must stay within this ceiling. */
@@ -59,10 +64,12 @@ typedef struct ProtocolSession {
   bool eight_bit_output;
   unsigned long long max_alloc;
   /* Per-session deadline (seconds) applied to every protocol send/receive by
-   * protocol_send_n_data / protocol_receive_n_data.  Defaults to the built-in
-   * 60 s window; a value <= 0 falls back to that default.  Set from the
-   * negotiated Config->timeout so --timeout is honored by the poll()-driven
-   * protocol I/O, not just the socket SO_RCVTIMEO/SO_SNDTIMEO. */
+   * protocol_send_n_data / protocol_receive_n_data.  The initialized default is
+   * the built-in 60 s window; a value <= 0 disables the deadline (rsync's
+   * --timeout=0).  Set from the negotiated Config->timeout so --timeout is
+   * honored by the poll()-driven protocol I/O, not just the socket
+   * SO_RCVTIMEO/SO_SNDTIMEO.  The server does not propagate a client 0 here: it
+   * installs protocol_server_io_timeout_sec() so its sessions keep a floor. */
   int io_timeout_sec;
 } ProtocolSession;
 
@@ -189,15 +196,20 @@ void protocol_session_unbind(void);
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc);
-/* Override the per-message send/receive deadline for this session.
- * `sec` <= 0 restores the built-in 60 s default (used for --timeout=0/unset).
- * An explicit long deadline (e.g. the delete-ack wait) is applied per-call by
- * protocol_receive_status_timed and is unaffected by this setter. */
+/* Override the per-message send/receive deadline for this session.  The value
+ * is stored verbatim: a positive value sets the deadline, `sec` <= 0 disables
+ * it (rsync's --timeout=0).  An explicit long deadline (e.g. the delete-ack
+ * wait) is applied per-call by protocol_receive_status_timed and is unaffected
+ * by this setter. */
 void protocol_session_set_io_timeout(ProtocolSession* session, int sec);
-/* Effective per-message I/O deadline (seconds) for the currently-bound session,
- * falling back to the built-in default.  Used by the plaintext sendfile path
- * which bypasses the protocol send primitive. */
+/* Effective per-message I/O deadline (seconds) for the currently-bound session.
+ * Zero means the deadline is disabled (rsync's --timeout=0).  Used by the
+ * plaintext sendfile path which bypasses the protocol send primitive. */
 int protocol_get_io_timeout_sec(void);
+/* The server-side effective deadline for a client-requested timeout: a positive
+ * client value is honored, otherwise the SERVER_IO_TIMEOUT_SEC floor applies so
+ * a silent peer can never hold a session open forever. */
+int protocol_server_io_timeout_sec(int client_timeout);
 void* protocol_alloc(size_t size);
 void* protocol_realloc(void* ptr, size_t size);
 void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled);

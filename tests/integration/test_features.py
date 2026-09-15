@@ -1379,6 +1379,20 @@ class TestChecksumChoice:
                                    port=shared_server.port)
             assert result.returncode != 0, f"{bad} must be rejected"
 
+    @pytest.mark.ci
+    def test_compress_choice_auto_transfers(self, shared_server):
+        """--compress-choice=auto is normalized to zstd client-side, so the
+        receiver never rejects the transfer (#4)."""
+        clean_dir(DEST_DIR)
+        flags = ["-z", "--compress-choice=auto"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--compress-choice=auto sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
     @pytest.mark.parametrize("algo", ["xxh64", "xxh3", "xxh128", "md5"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_unchanged_skipped_and_bytes_preserved(self, shared_server, algo, mt):
@@ -2215,17 +2229,10 @@ class TestTempDir:
                                port=shared_server.port)
         assert result.returncode != 0, "a missing relative --temp-dir must fail"
 
-        missing_abs = os.path.join(TEST_DATA_DIR, "no_such_abs_scratch")
-        assert not os.path.lexists(missing_abs)
-        clean_dir(dest)
-        result, _ = run_client(source, dest, flags=["--temp-dir", missing_abs],
-                               port=shared_server.port)
-        assert result.returncode != 0, "a missing absolute --temp-dir must fail"
-
-    def test_temp_dir_absolute_outside_root_is_used(self, shared_server):
-        """rsync accepts any temp dir, including one outside the destination
-        tree; the completed files are still installed below the root and no
-        temp files remain in the scratch dir."""
+    def test_temp_dir_absolute_rejected(self, shared_server):
+        """The receiver confines --temp-dir to the destination root: an absolute
+        (or `..`-escaping) value is rejected before any write, so a client can
+        never make the receiver create scratch files in an arbitrary directory."""
         source = self._make_source("tempdir_abs_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_abs_dst")
         clean_dir(dest)
@@ -2235,13 +2242,14 @@ class TestTempDir:
 
         result, _ = run_client(source, dest, flags=["--temp-dir", scratch],
                                port=shared_server.port)
-        assert result.returncode == 0, f"absolute temp-dir sync failed: {result.stderr[:200]}"
-        received = get_dest_received_dir(dest, source)
-        mismatches, missing = verify_transfer(source, received)
-        assert not missing, f"Missing: {missing}"
-        assert not mismatches, f"Mismatch: {mismatches}"
-        self._assert_clean_scratch(scratch)
+        assert result.returncode != 0, "an absolute --temp-dir must be rejected"
+        assert os.listdir(scratch) == [], "receiver wrote into an unconfined temp dir"
+        # A relative traversal is rejected for the same reason.
+        result, _ = run_client(source, dest, flags=["--temp-dir=../escape_scratch"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "a `..` --temp-dir must be rejected"
         shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(os.path.join(TEST_DATA_DIR, "escape_scratch"), ignore_errors=True)
 
 
 class TestTimeoutAndAllocLimits:
@@ -2285,7 +2293,8 @@ class TestTimeoutAndAllocLimits:
         assert not missing and not mismatches
 
     def test_temp_dir_cross_filesystem_fallback(self, shared_server):
-        """A --temp-dir on another filesystem must fall back to a non-atomic
+        """A confined relative --temp-dir that resolves (via a symlink under the
+        destination root) to another filesystem must fall back to a non-atomic
         copy instead of aborting (rsync parity).  Skipped when no second
         filesystem is available."""
         shm = "/dev/shm"
@@ -2298,14 +2307,18 @@ class TestTimeoutAndAllocLimits:
         os.makedirs(scratch)
         try:
             source, dest = self._seed("tempdir_xdev_src")
-            result, _ = run_client(source, dest, flags=["--temp-dir", scratch],
+            # The receiver resolves a relative temp dir under the destination
+            # root; a symlink there points the scratch at the second filesystem.
+            link = os.path.join(dest, "xdev_scratch")
+            os.symlink(scratch, link)
+            result, _ = run_client(source, dest, flags=["--temp-dir", "xdev_scratch"],
                                    port=shared_server.port)
             assert result.returncode == 0, f"cross-fs temp-dir failed: {result.stderr[:300]}"
             received = get_dest_received_dir(dest, source)
             mismatches, missing = verify_transfer(source, received)
             assert not missing, f"Missing: {missing}"
             assert not mismatches, f"Mismatch: {mismatches}"
-            assert os.listdir(scratch) == [], "temp files left behind"
+            assert os.listdir(scratch) == [], "temp files left behind in the cross-fs scratch"
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
@@ -2909,6 +2922,43 @@ class TestRelativeFilesFrom:
             assert os.path.isfile(os.path.join(dest, "sub", "x.txt"))
             assert not os.path.exists(os.path.join(dest, "sub", "y.txt")), \
                 "directory-listed --delete did not remove the in-scope extra"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_relative_root_size_prune_protects_mirror_from_delete(self, mt):
+        """#12: a root-level --max-size prune under -R + --files-from must record
+        the bare relative wire path as its delete-protected prefix, so the
+        size-pruned entry's destination mirror survives --delete (rsync parity)."""
+        source = _make_relative_source("rel_rootsize_src")
+        # Big enough that a 100-byte cap prunes only this entry.
+        with open(os.path.join(source, "big.txt"), "wb") as fh:
+            fh.write(b"b" * 1000)
+        dest = os.path.join(TEST_DATA_DIR, "rel_rootsize_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            # "." lists the whole tree, so the receive root is a delete scope
+            # (a file-only list would leave the root out of scope, masking the
+            # protected-prefix mismatch this test targets).
+            lst = _write_rel_list(b".\n")
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", lst, "-R"] + (["--threads"] if mt else []),
+                                   port=server.port)
+            assert result.returncode == 0, f"seed -R sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(dest, "big.txt"))
+            with open(os.path.join(dest, "unrelated.txt"), "w") as fh:
+                fh.write("x")
+
+            # --max-size=100 prunes only big.txt; its dest mirror is always protected.
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", lst, "-R", "--delete", "--max-size=100"] +
+                                         (["--threads"] if mt else []),
+                                   port=server.port)
+            assert result.returncode == 0, f"-R size+delete sync failed: {result.stderr[:300]}"
+            assert not os.path.exists(os.path.join(dest, "unrelated.txt")), "delete not active"
+            assert os.path.isfile(os.path.join(dest, "big.txt")), \
+                "the size-pruned entry's mirror was wrongly deleted (protected prefix mismatch)"
+            assert os.path.isfile(os.path.join(dest, "sub", "x.txt"))
+            assert os.path.isfile(os.path.join(dest, "top.txt"))
 
 
 class TestMissingArgs:

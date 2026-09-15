@@ -752,10 +752,11 @@ void handler(int file_descriptor) {
   protocol_set_8_bit_output(config->eight_bit_output);
   /* Server-side per-message protocol deadline for every frame from here on.
    * `timeout` is not serialized, so this is the server's own config (the server
-   * has no --timeout CLI and defaults it to 0): the built-in 60 s window stays
-   * in effect.  A client's --timeout tightens only that client's own protocol
-   * I/O and the server's socket read/write timeout is the transport default. */
-  protocol_session_set_io_timeout(&session, config->timeout);
+   * has no --timeout CLI and defaults it to 0).  A client's --timeout tightens
+   * only that client's own protocol I/O; the server floors its own deadline at
+   * SERVER_IO_TIMEOUT_SEC so a silent peer can never hold a session slot
+   * forever (the socket layer gets the same floor at startup). */
+  protocol_session_set_io_timeout(&session, protocol_server_io_timeout_sec(config->timeout));
   const char* authorized_root = utils_get_authorized_root_path();
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
@@ -904,7 +905,8 @@ void handler(int file_descriptor) {
       goto done;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
-    protocol_session_set_io_timeout(&context->session, config->timeout);
+    protocol_session_set_io_timeout(&context->session,
+                                    protocol_server_io_timeout_sec(config->timeout));
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
     pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);
@@ -1220,6 +1222,10 @@ int main(int argc, char* argv[]) {
   server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
+  /* Server-owned socket deadline floor: the client default --timeout=0 would
+   * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
+   * silent peer hold a connection (and its process slot) forever. */
+  tcp_set_timeouts(SERVER_IO_TIMEOUT_SEC, SERVER_IO_TIMEOUT_SEC);
 
   if (opts.stdio_mode) {
     /* SSH authenticates the stdio transport outside of FastSync. */

@@ -46,9 +46,11 @@ static void config_set_defaults(Config* config) {
   config->server_port_set = false;
   config->server_host_set = false;
   /* rsync defaults: --timeout=0 (I/O timeouts disabled) and --contimeout=60.
-   * A value of 0 disables the deadline on both the socket layer
+   * A value of 0 disables the client's own deadline on both the socket layer
    * (tcp_set_timeouts) and the protocol layer
-   * (protocol_session_set_io_timeout); a positive value sets it. */
+   * (protocol_session_set_io_timeout); a positive value sets it.  A server
+   * session floors the deadline at SERVER_IO_TIMEOUT_SEC so 0 can never hold a
+   * connection open forever. */
   config->timeout = 0;
   config->contimeout = 60;
   config->quiet = false;
@@ -207,7 +209,8 @@ static bool validate_received_config(const Config* config) {
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
-         config->max_delete >= -1 && config->skip_compress_count >= 0 &&
+         config->max_delete >= -1 && config->max_alloc <= MAX_SERVER_ALLOC &&
+         config->skip_compress_count >= 0 &&
          config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
@@ -788,13 +791,14 @@ void config_delete(Config* config) {
  * ------------------------------------------------------------------------- */
 
 /* --max-alloc: raw 64-bit value, clamped server-side and installed as the
- * session allocation ceiling.  Zero means "no alloc limit" (rsync's
- * --max-alloc=0) and is passed through; a non-zero value is clamped to the
- * server's own ceiling. */
+ * session allocation ceiling.  A received 0 is rsync's "no alloc limit"; on the
+ * receive path it is mapped to the server ceiling so a client can never disable
+ * it (client-side 0 remains unlimited).  Any value above the ceiling is clamped
+ * to it. */
 static bool config_receive_max_alloc(int fd, unsigned long long* value) {
   if (!receive_n_data(fd, value, sizeof(*value)))
     return false;
-  if (*value > MAX_SERVER_ALLOC)
+  if (*value == 0 || *value > MAX_SERVER_ALLOC)
     *value = MAX_SERVER_ALLOC;
   protocol_session_set_max_alloc(NULL, *value);
   return true;
@@ -1362,7 +1366,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_output_options(file_descriptor, config, &budget))
     goto error;
   if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
-      strcmp(config->compress_choice, "none") != 0) {
+      strcmp(config->compress_choice, "none") != 0 &&
+      strcmp(config->compress_choice, "auto") != 0) {
     char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
     log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
                 escaped_choice ? escaped_choice : "<allocation failed>");
@@ -1372,6 +1377,15 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
     send_error_detail(file_descriptor, detail);
     free(escaped_choice);
     goto error;
+  }
+  /* Defensive: an older/hostile client may still send "auto"; canonicalize it
+     to zstd (its effective choice) so the stored value is always concrete. */
+  if (strcmp(config->compress_choice, "auto") == 0) {
+    char* canonical = str_dup("zstd");
+    if (!canonical)
+      goto error;
+    free(config->compress_choice);
+    config->compress_choice = canonical;
   }
   if (!validate_received_config(config)) {
     log_message(LOG_LEVEL_ERROR, "Invalid configuration received from client");

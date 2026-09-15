@@ -552,6 +552,83 @@ static void test_config_send_receive() {
   }
 }
 
+/* #5: a received --max-alloc=0 (rsync's "no limit") is floored to the server
+ * ceiling on the receive path, so a client cannot disable it. */
+static void test_config_receive_max_alloc_zero_floored() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  send_cfg->max_alloc = 0;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->max_alloc == MAX_SERVER_ALLOC;
+    config_delete(recv_cfg);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[0]);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* #4: a hostile/older client that still sends compress_choice=auto must be
+ * accepted (as zstd) rather than failing the whole transfer. */
+static void test_config_receive_compress_choice_auto_canonicalized() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  free(send_cfg->compress_choice);
+  send_cfg->compress_choice = str_dup("auto");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && strcmp(recv_cfg->compress_choice, "zstd") == 0;
+    config_delete(recv_cfg);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[0]);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 static void test_config_send_receive_version_mismatch() {
   /* A peer using the previous wire format must be rejected. */
   Config* cfg = config_create();
@@ -3051,6 +3128,8 @@ void test_config() {
   test_pipeline_receiver_lifecycle();
   if (!is_running_under_valgrind()) {
     test_config_send_receive();
+    test_config_receive_max_alloc_zero_floored();
+    test_config_receive_compress_choice_auto_canonicalized();
     test_config_local_only_fields_not_serialized();
     test_config_send_receive_version_mismatch();
     test_config_receive_truncated();

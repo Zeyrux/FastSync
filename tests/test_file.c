@@ -28,6 +28,10 @@ static void test_file_create() {
   EXPECT_NULL(f->data->data);
   EXPECT_EQ_INT((int)f->data->size, 0);
   EXPECT_NULL(f->metadata);
+  /* An unset destination snapshot must read as known == false, never
+     indeterminate bytes (-i/--out-format without --incremental). */
+  EXPECT_FALSE(f->dest_state.known);
+  EXPECT_FALSE(f->dest_state.existed);
   file_destroy(f);
 }
 
@@ -324,6 +328,52 @@ static void test_file_save_to_disk_partial_install() {
   config_delete(config);
   unlink(dest_file);
   rmdir(root);
+}
+
+/* --temp-dir is a client-controlled wire value that must be confined below the
+ * receive root: an absolute or `..`-escaping value is rejected (a client must
+ * never make the receiver write scratch files in an arbitrary directory), while
+ * a relative one resolves under the root and is used for the atomic install. */
+static void test_file_save_to_disk_temp_dir_confined() {
+  const char* root = "test_temp_confine_tmp";
+  const char* dest_file = "test_temp_confine_tmp/file.txt";
+  char outside[PATH_MAX];
+  snprintf(outside, sizeof(outside), "/tmp/fastsync_temp_outside_%d", (int)getpid());
+  unlink(dest_file);
+  rmdir("test_temp_confine_tmp/scratch");
+  rmdir(root);
+  mkdir(root, 0755);
+  mkdir("test_temp_confine_tmp/scratch", 0755);
+  mkdir(outside, 0755);
+
+  File* f = file_create("file.txt");
+  EXPECT_NOT_NULL(f);
+  const char* content = "confined temp dir";
+  f->data->data = malloc(strlen(content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, content, strlen(content));
+  f->data->size = strlen(content);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->temp_dir = str_dup(outside);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
+  EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  free(config->temp_dir);
+  config->temp_dir = str_dup("../escape");
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
+  EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  free(config->temp_dir);
+  config->temp_dir = str_dup("scratch");
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(access(dest_file, F_OK), 0);
+
+  file_destroy(f);
+  config_delete(config);
+  unlink(dest_file);
+  rmdir("test_temp_confine_tmp/scratch");
+  rmdir(root);
+  rmdir(outside);
 }
 
 /* Issue #251: file_save_to_disk_full must distinguish receiver-side skips
@@ -1883,6 +1933,81 @@ static void test_keep_dirlinks_secure_open() {
   file_set_keep_dirlinks(false);
 }
 
+/* Build an ArrayList of str_dup'd strings (NULL on allocation failure). */
+static ArrayList* make_manifest_string_list(const char* const* entries, int count) {
+  ArrayList* list = array_list_create(free);
+  if (!list)
+    return NULL;
+  for (int i = 0; i < count; i++) {
+    char* dup = str_dup(entries[i]);
+    if (!dup || !array_list_add(list, dup)) {
+      free(dup);
+      array_list_delete(list);
+      return NULL;
+    }
+  }
+  return list;
+}
+
+/* Regression (#3): a non-empty --delete-missing-args directory charges each
+ * removed entry exactly once.  The directory itself must not be counted twice;
+ * if it were, `deleted` would exceed --max-delete and the extras walk would
+ * underflow its remaining budget and delete past the user's cap. */
+static void test_manifest_delete_missing_dir_budget_double_count() {
+  char root[PATH_MAX];
+  snprintf(root, sizeof(root), "/tmp/fastsync_mgdir_%d", (int)getpid());
+  char* gone = path_cat(root, "gone");
+  char* gone_file = path_cat(gone, "f0");
+  char* extra = path_cat(root, "extra.txt");
+  EXPECT_NOT_NULL(gone);
+  EXPECT_NOT_NULL(gone_file);
+  EXPECT_NOT_NULL(extra);
+  mkdir(root, 0755);
+  mkdir(gone, 0755);
+  EXPECT_EQ_INT(access(extra, F_OK), -1);
+  EXPECT_TRUE(file_write_to_disk(extra, "extra", 5, false, false));
+  /* The missing-arg directory holds N-1 == 2 entries; with the directory itself
+     that is exactly --max-delete=3. */
+  EXPECT_TRUE(file_write_to_disk(gone_file, "x", 1, false, false));
+  char* gone_file2 = path_cat(gone, "f1");
+  EXPECT_TRUE(gone_file2 != NULL && file_write_to_disk(gone_file2, "x", 1, false, false));
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  cfg->delete_missing_args = true;
+  cfg->max_delete = 3;
+
+  const char* missing_names[] = {"gone"};
+  const char* synced[] = {"."};
+  DeleteManifest manifest = {0};
+  manifest.keeps = make_manifest_string_list(NULL, 0);
+  manifest.missing = make_manifest_string_list(missing_names, 1);
+  manifest.dirs = make_manifest_string_list(synced, 1);
+  EXPECT_NOT_NULL(manifest.keeps);
+  EXPECT_NOT_NULL(manifest.missing);
+  EXPECT_NOT_NULL(manifest.dirs);
+
+  DeleteCommitResult result = manifest_delete_all(cfg, &manifest);
+  EXPECT_EQ_INT((int)result, (int)DELETE_COMMIT_LIMIT_REACHED);
+  /* The whole missing-arg directory is gone (dir + its 2 entries == 3). */
+  EXPECT_EQ_INT(access(gone, F_OK), -1);
+  /* The saturated budget must leave the in-scope extra untouched. */
+  EXPECT_EQ_INT(access(extra, F_OK), 0);
+
+  array_list_delete(manifest.keeps);
+  array_list_delete(manifest.missing);
+  array_list_delete(manifest.dirs);
+  config_delete(cfg);
+  unlink(extra);
+  free(gone);
+  free(gone_file);
+  free(gone_file2);
+  free(extra);
+  rmdir(root);
+}
+
 void test_file() {
   test_file_create();
   test_file_special_rdev_valid();
@@ -1896,6 +2021,7 @@ void test_file() {
   test_file_save_to_disk_ignore_existing();
   test_file_save_to_disk_ignore_existing_entry_types();
   test_file_save_to_disk_partial_install();
+  test_file_save_to_disk_temp_dir_confined();
   test_file_save_to_disk_reports_skips();
   test_file_write_to_disk_sparse_preserves_holes();
   test_file_write_to_disk_partial_retention();
@@ -1936,4 +2062,5 @@ void test_file() {
   test_inplace_overwrite_truncates_shorter_payload();
   test_inplace_refuses_fifo_destination();
   test_inplace_refuses_device_destination();
+  test_manifest_delete_missing_dir_budget_double_count();
 }

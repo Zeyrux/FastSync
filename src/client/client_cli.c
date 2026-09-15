@@ -132,16 +132,20 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
  * zstd choice; any other rsync choice is rejected by name instead of being
  * silently accepted and ignored. */
 static int set_compression_choice(Config* config, const char* value) {
-  if (strcmp(value, "zstd") != 0 && strcmp(value, "none") != 0 && strcmp(value, "auto") != 0) {
+  /* rsync's "auto" is normalized to the canonical "zstd" at parse time (like
+     --checksum-choice=auto), so the value that crosses the wire is always one
+     the receiver accepts. */
+  const char* canonical = strcmp(value, "auto") == 0 ? "zstd" : value;
+  if (strcmp(canonical, "zstd") != 0 && strcmp(canonical, "none") != 0) {
     log_message(LOG_LEVEL_ERROR,
                 "--compress-choice '%s' is not implemented; FastSync supports zstd, none or auto "
                 "(rsync's lz4/zlib/zlibx are rejected, never silently ignored)",
                 value);
     return -1;
   }
-  if (set_string_option(&config->compress_choice, value, "--compress-choice") != 0)
+  if (set_string_option(&config->compress_choice, canonical, "--compress-choice") != 0)
     return -1;
-  config->use_compression = strcmp(value, "none") != 0;
+  config->use_compression = strcmp(canonical, "none") != 0;
   return 0;
 }
 
@@ -1992,11 +1996,6 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
-  if (strncmp(arg, "-M=", 3) == 0) {
-    if (config_add_remote_option(config, arg + 3, "-M") != 0)
-      ctx->exit_code = -1;
-    return true;
-  }
   if (opt_is(arg, "--remote-option", "-M")) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for --remote-option");
@@ -2271,10 +2270,12 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * --no-xattrs/--no-acls negation) so the sender's wire gate always matches
    * the flags the receiver will recompute from the received config. */
   config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
-  /* Output parity: -i/--itemize-changes and --out-format need the pre-transfer
-   * destination snapshot (new vs modified and which attributes differ), so ask
-   * the receiver to report it on every per-file check.  This is a wire field. */
-  config->report_dest_info = config->itemize_changes || config->out_format != NULL;
+  /* Output parity: -i/--itemize-changes, --out-format and --log-file-format
+   * need the pre-transfer destination snapshot (new vs modified and which
+   * attributes differ), so ask the receiver to report it on every per-file
+   * check.  This is a wire field. */
+  config->report_dest_info = config->itemize_changes || config->out_format != NULL ||
+                             (config->log_file != NULL && config->log_file_format != NULL);
   return 0;
 }
 
@@ -2306,7 +2307,7 @@ static bool cli_long_takes_separate_value(const char* arg) {
       "--checksum-choice", "--cc",           "--checksum-seed", "--sockopts",
       "--remote-option",   "--compare-dest", "--copy-dest",     "--link-dest",
       "--usermap",         "--groupmap",     "--chown",         "--copy-as",
-      "--outbuf",          "--debug",        "--info",
+      "--outbuf",          "--debug",        "--info",          "--skip-compress",
   };
   for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++)
     if (strcmp(arg, extra[i]) == 0)

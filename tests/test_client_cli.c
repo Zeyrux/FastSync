@@ -1518,6 +1518,9 @@ static void test_parse_args_compress_choice_parity() {
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    /* "auto" is normalized to the canonical "zstd" the receiver accepts. */
+    EXPECT_EQ_STR(cfg->compress_choice, strcmp(good[i], "auto") == 0 ? "zstd" : good[i]);
+    EXPECT_EQ_INT(cfg->use_compression, strcmp(good[i], "none") != 0 ? 1 : 0);
     config_delete(cfg);
   }
   static const char* const bad[] = {"lz4", "zlib", "zlibx", "bogus"};
@@ -2326,6 +2329,8 @@ static void test_parse_args_log_file_format() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->log_file_format, "%n %M");
+  /* The format alone is inert (no --log-file): no destination report needed. */
+  EXPECT_FALSE(cfg->report_dest_info);
   config_delete(cfg);
 
   cfg = config_create();
@@ -2333,6 +2338,61 @@ static void test_parse_args_log_file_format() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, separate_argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->log_file_format, "%n %M");
+  config_delete(cfg);
+
+  /* With --log-file the log-format is a real output mode whose %i/%n columns
+     need the receiver's destination snapshot (same as -i/--out-format). */
+  const char* log_path = "cli_log_fmt_test.txt";
+  cfg = config_create();
+  char log_arg[64];
+  snprintf(log_arg, sizeof(log_arg), "--log-file=%s", log_path);
+  char* both_argv[] = {"fastsync", log_arg, "--log-file-format=%i %n", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, both_argv, positional_args, &positional_count), 0);
+  EXPECT_NOT_NULL(cfg->log_file);
+  EXPECT_TRUE(cfg->report_dest_info);
+  config_delete(cfg);
+  remove(log_path);
+}
+
+/* --skip-compress takes a separate value even when it starts with '-' (e.g. a
+ * suffix typed as "-foo"); the cluster expander must copy it verbatim rather
+ * than treat it as a short-option cluster. */
+static void test_parse_args_skip_compress_dash_value() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--skip-compress", "-foo/bar", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->skip_compress_set);
+  EXPECT_EQ_INT(cfg->skip_compress_count, 2);
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[0], "-foo");
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[1], "bar");
+  config_delete(cfg);
+}
+
+/* -i and --out-format also request the destination snapshot. */
+static void test_parse_args_report_dest_info_modes() {
+  Config* cfg = config_create();
+  char* itemize_argv[] = {"fastsync", "-i", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, itemize_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->report_dest_info);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* out_argv[] = {"fastsync", "--out-format=%n", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, out_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->report_dest_info);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* plain_argv[] = {"fastsync", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, plain_argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->report_dest_info);
   config_delete(cfg);
 }
 
@@ -3344,6 +3404,24 @@ static void test_parse_args_remote_option_multiple() {
   config_delete(cfg);
 }
 
+/* The -M=value and -Mvalue short forms are expanded by the cluster expander to
+ * "-M value" before parsing; both must still collect the remote option (there
+ * is no dedicated -M= branch). */
+static void test_parse_args_remote_option_short_forms() {
+  static const char* const forms[] = {"-M=--allow-delete", "-M--allow-delete"};
+  for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+    Config* cfg = valid_client_config();
+    EXPECT_NOT_NULL(cfg);
+    char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst", (char*)forms[i]};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->remote_option_count, 1);
+    EXPECT_EQ_STR(cfg->remote_options[0], "--allow-delete");
+    config_delete(cfg);
+  }
+}
+
 /* Space-separated form "--remote-option OPT" also parses. */
 static void test_parse_args_remote_option_space_form() {
   Config* cfg = valid_client_config();
@@ -4225,6 +4303,8 @@ void test_client_cli() {
   test_parse_args_list_only();
   test_parse_args_out_format();
   test_parse_args_log_file_format();
+  test_parse_args_report_dest_info_modes();
+  test_parse_args_skip_compress_dash_value();
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
   test_parse_args_checksum_choice_equals_forms();
@@ -4253,6 +4333,7 @@ void test_client_cli() {
   test_parse_args_trust_sender_default_false();
   test_parse_args_trust_sender();
   test_parse_args_remote_option_multiple();
+  test_parse_args_remote_option_short_forms();
   test_parse_args_remote_option_space_form();
   test_parse_args_remote_option_missing_value();
   test_parse_args_remote_option_rejects_bad_values();

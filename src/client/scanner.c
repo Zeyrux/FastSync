@@ -1120,18 +1120,23 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     if (inspection == 0) {
       /* A user-selection exclude protects its destination mirror from --delete
          unless --delete-excluded; a size prune is always protected.  Other
-         skips (unreadable, symlink policy) protect nothing. */
+         skips (unreadable, symlink policy) protect nothing.  Under -R +
+         --files-from the protected prefix must be the entry's bare relative
+         wire path, not its source path (which would not match the destination
+         layout and would leave the mirror deletable). */
       if (inspected.excluded) {
-        char* abs_path = path_cat(scanner->current_path, entry->d_name);
-        if (!abs_path) {
+        char* protected_path = scanner->relative_mode
+                                   ? child_rel_path(scanner->current_rel, entry->d_name)
+                                   : path_cat(scanner->current_path, entry->d_name);
+        if (!protected_path) {
           scanner->failed = true;
           break;
         }
         if (inspected.size_excluded)
-          scanner_record_size_skipped(scanner, abs_path);
+          scanner_record_size_skipped(scanner, protected_path);
         else
-          scanner_record_excluded(scanner, abs_path);
-        free(abs_path);
+          scanner_record_excluded(scanner, protected_path);
+        free(protected_path);
       }
       continue;
     }
@@ -1510,17 +1515,23 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     if (inspected.excluded)
       sink = inspected.size_excluded ? options->size_skipped_paths : options->excluded_paths;
     if (sink) {
-      /* A root-level prune protects the destination mirror of the same-named
-         wire path (at the root the bare name is the wire path in every
-         layout). */
-      char* abs_path = path_cat(root_directory, entry->d_name);
-      if (!abs_path) {
-        ps->failed = true;
-      } else {
-        const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
-        if (!excluded_sink_append(sink, options->excluded_mutex, rel))
+      /* A root-level prune protects the destination mirror of the entry's wire
+         path: under -R + --files-from that is the bare relative name, otherwise
+         it is the full source path with a leading '/' removed (matching the
+         send_path/file_wire_path the scanner hands the sender). */
+      if (options->relative && options->file_list != NULL) {
+        if (!excluded_sink_append(sink, options->excluded_mutex, entry->d_name))
           ps->failed = true;
-        free(abs_path);
+      } else {
+        char* abs_path = path_cat(root_directory, entry->d_name);
+        if (!abs_path) {
+          ps->failed = true;
+        } else {
+          const char* rel = *abs_path == '/' ? abs_path + 1 : abs_path;
+          if (!excluded_sink_append(sink, options->excluded_mutex, rel))
+            ps->failed = true;
+          free(abs_path);
+        }
       }
     }
     return;

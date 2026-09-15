@@ -522,10 +522,19 @@ static void test_data_create_starts_uncharged_and_unowned() {
   data_destroy(reserved);
 }
 
+/* The server floors a client --timeout=0 at SERVER_IO_TIMEOUT_SEC so a silent
+ * peer can never hold a session slot forever (slow-loris). */
+static void test_protocol_server_io_timeout_floor() {
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(0), SERVER_IO_TIMEOUT_SEC);
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(-7), SERVER_IO_TIMEOUT_SEC);
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(30), 30);
+  EXPECT_TRUE(SERVER_IO_TIMEOUT_SEC > 0);
+}
+
 static void test_protocol_session_io_timeout() {
-  /* Default is the built-in 60 s window; the setter stores exactly what it is
-   * given (<= 0 means "fall back to the default") so callers can propagate
-   * --timeout without special-casing 0. */
+  /* The default is the built-in 60 s window; the setter stores exactly what it
+   * is given (<= 0 disables the deadline, matching rsync's --timeout=0) so
+   * callers can propagate --timeout without special-casing 0. */
   ProtocolSession session;
   protocol_session_init(&session, -1, -1);
   EXPECT_EQ_INT(session.io_timeout_sec, 60);
@@ -670,6 +679,7 @@ void test_protocol() {
   test_send_receive_int();
   test_send_receive_status();
   test_protocol_session_io_timeout();
+  test_protocol_server_io_timeout_floor();
   test_send_receive_status_timed();
   test_receive_status_keepalive_skips_reply();
   test_receive_status_keepalive_aborts();

@@ -908,8 +908,10 @@ static int send_list_only(const Config* config) {
       entries = calloc(capacity, sizeof(ListEntry));
       if (entries == NULL) {
         oom = true;
+      } else if ((entries[0].name = str_dup("")) == NULL) {
+        /* A NULL name would be dereferenced by qsort/render: fail the listing. */
+        oom = true;
       } else {
-        entries[0].name = str_dup("");
         entries[0].mode = st.st_mode;
         entries[0].mtime = st.st_mtime;
         entries[0].mtime_nsec = st.st_mtim.tv_nsec;
@@ -1015,15 +1017,18 @@ static int send_list_only(const Config* config) {
   return 0;
 }
 
-/* Send the delete manifest (keep-set paths plus the protected excluded
-   prefixes and the --delete-missing-args exact-delete paths) to the server.
-   Returns 0 on success, -1 on failure.  When --delete-excluded is given
-   `protected` is empty: excluded destination mirrors are then ordinary extras
-   and are removed.  When --delete-missing-args is active `missing_args` holds
-   the destination mirrors of missing --files-from entries: each is an explicit
-   receiver-side deletion request, independent of the extras walk.  A NULL
-   keep-set / protected / missing list transmits an empty section.  All three
-   sections are unbounded on the sender; the receiver enforces
+/* Send the delete manifest to the server.  Returns 0 on success, -1 on
+   failure.  It carries FOUR sections: the keep-set paths, the protected
+   excluded prefixes, the --delete-missing-args exact-delete paths, and the
+   destination-relative directories the sender synchronized this run.
+   When --delete-excluded is given `protected` is empty: excluded destination
+   mirrors are then ordinary extras and are removed.  When
+   --delete-missing-args is active `missing_args` holds the destination mirrors
+   of missing --files-from entries: each is an explicit receiver-side deletion
+   request, independent of the extras walk.  `synced_dirs` confines the extras
+   walk to entries directly inside a synchronized directory.  A NULL
+   keep-set / protected / missing / dirs list transmits an empty section.  All
+   four sections are unbounded on the sender; the receiver enforces
    MAX_MANIFEST_ENTRIES per section and a single MAX_MANIFEST_BYTES budget
    shared across the sections, rejecting (with STATUS_ERROR) an over-budget
    frame.  A heavily filtered source whose exclusion list is large therefore
