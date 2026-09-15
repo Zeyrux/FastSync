@@ -52,7 +52,7 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
   if (!config)
     return FILE_SAVE_ERROR;
   bool sparse = config->preserve_sparse;
-  bool preserve_executability = config->use_executability;
+  FileAttrPolicy policy = file_attr_policy_from_config(config);
 
   if (config->existing && !file_path_exists_secure(destination_path))
     return FILE_SAVE_SKIPPED;
@@ -91,13 +91,12 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
   bool ok;
   if (file->basis_link) {
     ok = file_to_disk_secure_link(staged_path, file->basis_link, file->data->data, file->data->size,
-                                  config->preallocate, metadata, preserve_executability,
-                                  config->use_fsync, NULL);
+                                  config->preallocate, metadata, policy, config->use_fsync, NULL);
   } else {
-    ok = file_to_disk_secure_attrs(staged_path, file->data->data, file->data->size, false, sparse,
-                                   config->preallocate, metadata, preserve_executability, false,
-                                   false, config->use_fsync, file->xattrs, config->fake_super,
-                                   false, NULL);
+    ok =
+        file_to_disk_secure_attrs(staged_path, file->data->data, file->data->size, false, sparse,
+                                  config->preallocate, metadata, policy, false, false,
+                                  config->use_fsync, file->xattrs, config->fake_super, false, NULL);
   }
   if (!ok) {
     free(staged_path);
@@ -229,7 +228,7 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
   }
 
   bool preallocate = cfg && cfg->preallocate;
-  bool preserve_executability = cfg && cfg->use_executability;
+  FileAttrPolicy policy = file_attr_policy_from_config(cfg);
   bool use_fsync = cfg && cfg->use_fsync;
 
   if (cfg->delay_updates) {
@@ -265,9 +264,9 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     }
     FileXattrList* sibling_xattrs =
         cfg->use_xattrs ? xattr_capture_path(staged_first, cfg->preserve_acls) : NULL;
-    bool ok = file_to_disk_secure_link_attrs(
-        staged_sibling, staged_first, content, content_size, preallocate, file->metadata,
-        preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, NULL);
+    bool ok = file_to_disk_secure_link_attrs(staged_sibling, staged_first, content, content_size,
+                                             preallocate, file->metadata, policy, use_fsync,
+                                             sibling_xattrs, cfg ? cfg->fake_super : false, NULL);
     xattr_list_free(sibling_xattrs);
     free(content);
     if (ok)
@@ -298,9 +297,9 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
   const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
   FileXattrList* sibling_xattrs =
       cfg->use_xattrs ? xattr_capture_path(first_disk, cfg->preserve_acls) : NULL;
-  bool ok = file_to_disk_secure_link_attrs(
-      destination_path, first_disk, content, content_size, preallocate, file->metadata,
-      preserve_executability, use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
+  bool ok = file_to_disk_secure_link_attrs(destination_path, first_disk, content, content_size,
+                                           preallocate, file->metadata, policy, use_fsync,
+                                           sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
   xattr_list_free(sibling_xattrs);
   free(content);
   free(first_disk);
@@ -437,7 +436,10 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   } else {
     create_mode = S_IFIFO;
   }
-  mode_t perms = mode & 0777;
+  /* The creation permission bits come from the source only under -p/--perms;
+   * otherwise a safe default (0644, group/other write never granted) keeps an
+   * unprivileged no--p run from materializing a world-writable node. */
+  mode_t perms = config->preserve_perms ? (mode & 0777 & ~(S_IWGRP | S_IWOTH)) : 0644;
 
   int rc = is_fifo ? mkfifoat(parent_fd, leaf, perms)
                    : mknodat(parent_fd, leaf, create_mode | perms, rdev);
@@ -481,11 +483,23 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     return FILE_SAVE_SKIPPED;
   }
 
-  /* Apply mtime on the fresh node (utimensat, no-follow). */
-  struct timespec times[2] = {
-      {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-      {.tv_sec = file->metadata->mtime_sec, .tv_nsec = file->metadata->mtime_nsec}};
-  utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
+  /* Apply times on the fresh node (utimensat, no-follow) per the negotiated
+   * per-attribute policy: mtime only under -t, atime only under -U.  The slot
+   * not requested stays UTIME_OMIT so it is left untouched. */
+  FileAttrPolicy policy = file_attr_policy_from_config(config);
+  if (policy.times || (policy.atimes && file->metadata->atime_valid)) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = 0, .tv_nsec = UTIME_OMIT}};
+    if (policy.times) {
+      times[1].tv_sec = file->metadata->mtime_sec;
+      times[1].tv_nsec = file->metadata->mtime_nsec;
+    }
+    if (policy.atimes && file->metadata->atime_valid) {
+      times[0].tv_sec = file->metadata->atime_sec;
+      times[0].tv_nsec = file->metadata->atime_nsec;
+    }
+    utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW);
+  }
   /* P7 Wave E: apply the negotiated ownership to the node ITSELF.  A FIFO is
      created unprivileged, but --copy-as and explicit identity policies own
      every entry (a char/block node path is already privilege-gated above).  The
@@ -592,7 +606,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   bool backup_enabled = config && config->backup && !config->ignore_existing;
   bool inplace = config && config->inplace;
   bool sparse = config && config->preserve_sparse;
-  bool preserve_executability = config && config->use_executability;
+  FileAttrPolicy policy = file_attr_policy_from_config(config);
   const char* backup_suffix = (config && config->suffix) ? config->suffix : "~";
   const char* backup_dir = (config && config->backup_dir) ? config->backup_dir : NULL;
   const char* partial_dir = (config && config->partial_dir) ? config->partial_dir : NULL;
@@ -734,8 +748,11 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
        (utimensat/lchown/fchmodat AT_SYMLINK_NOFOLLOW).  -J/--omit-link-times
        suppresses the timestamps; ownership stays gated by the identity policy.
        A symlink has no children, so this can be applied immediately. */
-    if (ok && config && config->use_metadata)
-      ok = file_restore_symlink_metadata(link_path, file->metadata, config->omit_link_times);
+    if (ok && config && config->use_metadata) {
+      FileAttrPolicy link_policy = file_attr_policy_from_config(config);
+      ok = file_restore_symlink_metadata(link_path, file->metadata, link_policy,
+                                         config->omit_link_times);
+    }
     free(link_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
@@ -904,16 +921,15 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      policy decision. */
   bool ok;
   if (config && file->basis_link) {
-    ok = file_to_disk_secure_link_attrs(disk_path, file->basis_link, file->data->data,
-                                        file->data->size, config->preallocate, metadata,
-                                        preserve_executability, config->use_fsync, file->xattrs,
-                                        config->fake_super, confined_temp);
+    ok = file_to_disk_secure_link_attrs(
+        disk_path, file->basis_link, file->data->data, file->data->size, config->preallocate,
+        metadata, policy, config->use_fsync, file->xattrs, config->fake_super, confined_temp);
   } else {
     /* The plain no-replace / update / with-fsync engines, plus per-file xattr
        (-X/-A) and --fake-super application on the written fd. */
     ok = file_to_disk_secure_attrs(
         disk_path, file->data->data, file->data->size, inplace, sparse,
-        config && config->preallocate, metadata, preserve_executability, config && config->update,
+        config && config->preallocate, metadata, policy, config && config->update,
         config && config->ignore_existing, config && config->use_fsync, file->xattrs,
         config ? config->fake_super : false, config ? config->partial : false, confined_temp);
   }
@@ -2401,10 +2417,15 @@ File* file_receive(const Config* config, int file_descriptor) {
   return file;
 }
 
-/* ---- P7 Wave D: deferred directory times ---- */
+/* ---- P7 Wave D: deferred directory metadata ---- */
 
-bool dir_times_should_capture(const Config* config) {
-  return config->use_metadata && !config->omit_dir_times;
+bool dir_metadata_should_capture(const Config* config) {
+  /* Directory metadata is captured when a directory attribute is actually
+   * requested: -p/--perms (directory modes) or -t/--times (directory mtimes,
+   * unless -O/--omit-dir-times suppresses them).  --atimes/-U alone does not
+   * pull directory metadata (matching the original dir-time bundle). */
+  return config && config->use_metadata &&
+         (config->preserve_perms || (config->preserve_times && !config->omit_dir_times));
 }
 
 void dir_time_list_init(DirTimeList* list) {
@@ -2475,8 +2496,13 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
   return true;
 }
 
-void dir_time_list_apply(const DirTimeList* list, const char* root_directory) {
-  if (!list || !root_directory)
+void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory,
+                             const Config* config) {
+  if (!list || !root_directory || !config)
+    return;
+  bool apply_times = config->preserve_times && !config->omit_dir_times;
+  bool apply_mode = config->preserve_perms;
+  if (!apply_times && !apply_mode)
     return;
   for (size_t i = 0; i < list->count; i++) {
     char* dir_path = path_cat(root_directory, list->paths[i]);
@@ -2484,7 +2510,8 @@ void dir_time_list_apply(const DirTimeList* list, const char* root_directory) {
       continue;
     char* leaf = NULL;
     /* The parent walk is fd-relative and O_NOFOLLOW, so a symlink planted in a
-       parent component can never redirect the utimensat outside the root. */
+       parent component can never redirect the utimensat/chmod outside the
+       root. */
     int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
     if (parent_fd < 0) {
       free(dir_path);
@@ -2493,8 +2520,8 @@ void dir_time_list_apply(const DirTimeList* list, const char* root_directory) {
     /* A dir-time entry only records metadata: the directory is (deliberately)
        not created from it, so an empty source directory (or one pruned by
        -m/--prune-empty-dirs) may well not exist here.  Skip absent paths
-       QUIETLY rather than warning for every one, and apply the times only to a
-       real directory that does exist.  AT_SYMLINK_NOFOLLOW keeps a same-named
+       QUIETLY rather than warning for every one, and apply the metadata only to
+       a real directory that does exist.  AT_SYMLINK_NOFOLLOW keeps a same-named
        symlink from being followed; a pre-existing regular file/symlink is not a
        directory, so it is left completely untouched. */
     struct stat st;
@@ -2504,18 +2531,56 @@ void dir_time_list_apply(const DirTimeList* list, const char* root_directory) {
       free(dir_path);
       continue;
     }
-    struct timespec times[2] = {
-        {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-        {.tv_sec = list->entries[i].mtime_sec, .tv_nsec = list->entries[i].mtime_nsec}};
-    if (list->entries[i].atime_valid) {
-      times[0].tv_sec = list->entries[i].atime_sec;
-      times[0].tv_nsec = list->entries[i].atime_nsec;
+    if (apply_times) {
+      struct timespec times[2] = {
+          {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+          {.tv_sec = list->entries[i].mtime_sec, .tv_nsec = list->entries[i].mtime_nsec}};
+      if (config->preserve_atimes && list->entries[i].atime_valid) {
+        times[0].tv_sec = list->entries[i].atime_sec;
+        times[0].tv_nsec = list->entries[i].atime_nsec;
+      }
+      if (utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+        char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+        log_message(LOG_LEVEL_WARNING, "Failed to set directory timestamps on %s: %s",
+                    escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+        free(escaped_path);
+      }
     }
-    if (utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
-      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-      log_message(LOG_LEVEL_WARNING, "Failed to set directory timestamps on %s: %s",
-                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-      free(escaped_path);
+    if (apply_mode) {
+      mode_t dir_mode = list->entries[i].mode;
+      bool mode_ready = true;
+      if (config->chmod_spec && *config->chmod_spec &&
+          !chmod_apply(dir_mode, config->chmod_spec, &dir_mode)) {
+        char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+        log_message(LOG_LEVEL_WARNING, "Failed to apply --chmod to directory %s",
+                    escaped_path ? escaped_path : "<allocation failed>");
+        free(escaped_path);
+        mode_ready = false;
+      }
+      if (mode_ready) {
+        /* Route the directory mode through the SAME sanitization as the
+         * regular-file policy: a client-supplied mode never grants group/other
+         * write.  Open the directory with O_DIRECTORY|O_NOFOLLOW (never
+         * following a same-named symlink) and fchmod the fd, avoiding the
+         * fchmodat(..., 0) TOCTOU/symlink-follow hole. */
+        mode_t safe_mode =
+            (dir_mode & 0777 & ~(S_IWGRP | S_IWOTH)) | (dir_mode & (S_ISGID | S_ISVTX));
+        int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dir_fd < 0) {
+          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+          log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
+                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+          free(escaped_path);
+        } else {
+          if (fchmod(dir_fd, safe_mode) != 0) {
+            char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+            log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
+                        escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+            free(escaped_path);
+          }
+          close(dir_fd);
+        }
+      }
     }
     close(parent_fd);
     free(leaf);

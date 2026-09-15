@@ -470,11 +470,12 @@ static bool receiver_save_file(File* file, void* context_pointer) {
   } else {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
   }
-  /* A directory's times are deferred, never applied inline: collect the
-     metadata now and apply it at the end.  -O/--omit-dir-times is honored by
-     dir_time_list_apply's caller (see receiver_send_success_frame). */
+  /* A directory's metadata is deferred, never applied inline: collect it now
+     and apply it at the end.  -O/--omit-dir-times and --preserve_perms/-times
+     are honored by dir_metadata_list_apply's caller (see
+     receiver_send_success_frame). */
   if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
-      dir_times_should_capture(context->config) &&
+      dir_metadata_should_capture(context->config) &&
       !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
     file_destroy(file);
     return false;
@@ -514,7 +515,8 @@ static bool receiver_send_success_frame(int fd, void* context_pointer) {
      phases have committed, so it is finally safe to stamp directory times.
      This runs after the deferred deletion because receiver_process commits it
      before calling this success frame. */
-  dir_time_list_apply(&context->dir_times, context->config->receive_root_directory);
+  dir_metadata_list_apply(&context->dir_times, context->config->receive_root_directory,
+                          context->config);
   return receiver_send_final_success(fd, context->config, &context->outcomes);
 }
 

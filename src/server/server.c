@@ -389,8 +389,12 @@ static const char* module_gate_check_ownership(const Config* config, const Daemo
                                                ModuleGateContext* gate_ctx) {
   if (module->client_owner)
     return NULL;
-  /* Ownership: refuse the whole transfer up front (a clear failure). */
-  if (identity_ownership_requested(config)) {
+  /* Ownership: refuse the whole transfer up front (a clear failure) for a
+   * client-CHOSEN owner/group request.  A plain -o/-g/-a preserve-source
+   * request is deliberately not in this narrow set: it falls through to the
+   * super-mode override below, which forces all ownership activity off for this
+   * connection so no chown happens (the transfer itself still succeeds). */
+  if (identity_explicit_ownership_requested(config)) {
     log_message(LOG_LEVEL_ERROR,
                 "daemon module '%s' refuses client-chosen ownership/super-user activities "
                 "(no `client owner = yes` opt-in); refusing",
@@ -737,6 +741,14 @@ void handler(int file_descriptor) {
    * received config. */
   if (gate_ctx.super_mode_override != -1)
     config->super_mode = (SuperMode)gate_ctx.super_mode_override;
+  /* If the client requested ownership but the effective super mode forbids it
+   * (operator --no-super, a privileged standalone receiver's secure default, or
+   * a daemon module without `client owner = yes`), say so ONCE per connection so
+   * a successful -a/-o/-g transfer is not mistaken for preserved ownership. */
+  if (config->super_mode == SUPER_MODE_OFF && identity_ownership_requested(config))
+    log_message(LOG_LEVEL_WARNING,
+                "requested ownership will NOT be applied: super-user activities are disabled "
+                "for this connection (operator veto, or module without `client owner = yes`)");
   protocol_set_8_bit_output(config->eight_bit_output);
   /* Server-side per-message protocol deadline for every frame from here on.
    * `timeout` is not serialized, so this is the server's own config (the server
@@ -959,7 +971,7 @@ void handler(int file_descriptor) {
          to stamp directory times; a directory's mtime must not be clobbered by
          its children or by an extra removal. */
       if (transfer_ok)
-        dir_time_list_apply(&context->dir_times, config->receive_root_directory);
+        dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
     }
     if (transfer_ok) {
       if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
@@ -1127,10 +1139,18 @@ static bool daemonize(void) {
   if (chdir("/") != 0)
     log_message(LOG_LEVEL_WARNING, "daemon: chdir to / failed: %s", strerror(errno));
   umask(0);
+  /* Refresh the cached umask: main() captured the launch umask before this
+   * (single-threaded) umask(0), and file_mode_base() must see the daemon's
+   * actual umask. */
+  file_umask_capture();
   return true;
 }
 
 int main(int argc, char* argv[]) {
+  /* Capture the process umask now, while still single-threaded: the cached
+   * value is what file_mode_base() uses, and reading it later would race with
+   * receiver threads creating files. */
+  file_umask_capture();
   ServerCliOptions opts;
   char cli_err[512];
   int parse_result = server_cli_parse(argc, argv, &opts, cli_err, sizeof(cli_err));

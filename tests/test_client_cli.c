@@ -10,6 +10,7 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <pwd.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -200,9 +201,19 @@ static void test_cli_archive_flags() {
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->follow_symlinks);
-  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->preserve_owner);
+  EXPECT_TRUE(cfg->preserve_group);
   EXPECT_TRUE(cfg->preserve_devices);
   EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_FALSE(cfg->preserve_acls);
+  EXPECT_FALSE(cfg->preserve_xattrs);
+  EXPECT_FALSE(cfg->use_xattrs);
+  EXPECT_FALSE(cfg->preserve_atimes);
+  EXPECT_FALSE(cfg->preserve_crtimes);
+  EXPECT_FALSE(cfg->preserve_hard_links);
   EXPECT_FALSE(cfg->use_compression);
   EXPECT_FALSE(cfg->use_multithreading);
 
@@ -306,7 +317,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.21.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.22.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -316,7 +327,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.21.0"};
+                        "/dst",     "--protocol",   "2.22.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -326,9 +337,9 @@ static void test_parse_args_protocol_accept_current() {
 /* Any --protocol value other than the current PROTOCOL_VERSION must end in
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
-  static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0",
-                                             "2.17.0", "2.18.0", "2.19.0", "2.20.0",
-                                             "216",    "31",     "abc",    ""};
+  static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
+                                             "2.18.0", "2.19.0", "2.20.0", "2.21.0", "216",
+                                             "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -373,6 +384,7 @@ static void test_parse_args_xattrs_acls() {
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->preserve_xattrs);
   EXPECT_FALSE(cfg->preserve_acls);
+  EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_xattrs);
   EXPECT_TRUE(cfg->use_metadata);
   config_delete(cfg);
@@ -382,6 +394,7 @@ static void test_parse_args_xattrs_acls() {
   char* argv_long[] = {"fastsync", "--acls", "/src", "/dst"};
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_xattrs);
   EXPECT_TRUE(cfg->use_metadata);
   config_delete(cfg);
@@ -392,6 +405,7 @@ static void test_parse_args_xattrs_acls() {
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_neg, positional_args, &positional_count), 0);
   EXPECT_FALSE(cfg->preserve_xattrs);
   EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_xattrs);
   config_delete(cfg);
 }
@@ -503,6 +517,7 @@ static void test_parse_args_executability() {
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->use_executability);
+  EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
 
   config_delete(cfg);
@@ -515,6 +530,7 @@ static void test_parse_args_chmod() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->chmod_spec, "u=rw,go=r");
+  EXPECT_TRUE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
   mode_t result;
   EXPECT_TRUE(chmod_apply(0777, cfg->chmod_spec, &result));
@@ -529,6 +545,7 @@ static void test_parse_args_numeric_chmod() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->chmod_spec, "7777");
+  EXPECT_TRUE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
   config_delete(cfg);
 }
@@ -1280,9 +1297,13 @@ static void test_parse_args_archive() {
   int ret = parse_args(cfg, 4, argv, positional_args, &positional_count);
   EXPECT_EQ_INT(ret, 0);
   EXPECT_TRUE(cfg->follow_symlinks);
-  EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->preserve_owner);
+  EXPECT_TRUE(cfg->preserve_group);
   EXPECT_TRUE(cfg->preserve_devices);
   EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_TRUE(cfg->use_metadata);
   EXPECT_FALSE(cfg->use_compression);
   EXPECT_FALSE(cfg->use_multithreading);
 
@@ -2659,6 +2680,7 @@ static void test_parse_args_usermap() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_owner);
   EXPECT_EQ_INT(cfg->usermap_count, 1);
   EXPECT_EQ_INT(cfg->usermap[0].from, 1000);
   EXPECT_EQ_INT(cfg->usermap[0].to, 1001);
@@ -2693,6 +2715,7 @@ static void test_parse_args_groupmap() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_group);
   EXPECT_EQ_INT(cfg->groupmap_count, 1);
   EXPECT_EQ_INT(cfg->groupmap[0].from, 100);
   EXPECT_EQ_INT(cfg->groupmap[0].to, 101);
@@ -2724,6 +2747,8 @@ static void test_parse_args_chown() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->use_metadata);
+  EXPECT_TRUE(cfg->preserve_owner);
+  EXPECT_TRUE(cfg->preserve_group);
   EXPECT_TRUE(cfg->chown_uid_set);
   EXPECT_EQ_INT(cfg->chown_uid, 1000);
   EXPECT_TRUE(cfg->chown_gid_set);
@@ -2736,7 +2761,9 @@ static void test_parse_args_chown() {
   char* argv2[] = {"fastsync", "--chown=:@1001", "/src", "/dst"};
   EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
   EXPECT_FALSE(cfg->chown_uid_set);
+  EXPECT_FALSE(cfg->preserve_owner);
   EXPECT_TRUE(cfg->chown_gid_set);
+  EXPECT_TRUE(cfg->preserve_group);
   EXPECT_EQ_INT(cfg->chown_gid, 1001);
   config_delete(cfg);
 
@@ -2746,8 +2773,10 @@ static void test_parse_args_chown() {
   char* argv3[] = {"fastsync", "--chown=@1000", "/src", "/dst"};
   EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
   EXPECT_TRUE(cfg->chown_uid_set);
+  EXPECT_TRUE(cfg->preserve_owner);
   EXPECT_EQ_INT(cfg->chown_uid, 1000);
   EXPECT_FALSE(cfg->chown_gid_set);
+  EXPECT_FALSE(cfg->preserve_group);
   config_delete(cfg);
 
   /* '*' means current user/group. */
@@ -2894,6 +2923,8 @@ static void test_parse_args_metadata_times() {
   EXPECT_TRUE(cfg->omit_dir_times);
   EXPECT_TRUE(cfg->omit_link_times);
   EXPECT_TRUE(cfg->open_noatime);
+  /* -U/-N govern atimes/crtimes only; they do NOT enable -t/--times. */
+  EXPECT_FALSE(cfg->preserve_times);
   /* -U/-N carry their times inside the metadata payload, so they imply it. */
   EXPECT_TRUE(cfg->use_metadata);
   EXPECT_TRUE(validate_config(cfg));
@@ -3327,6 +3358,280 @@ static void test_validate_config_dry_run_rejects_write_batch() {
   config_delete(cfg);
 }
 
+/* -p/-t/-o/-g are independent per-attribute preservation flags: each sets only
+ * its own bit and enables metadata transmission (config_derived_use_metadata). */
+static void test_parse_args_preserve_attributes_are_independent() {
+  struct {
+    const char* arg;
+    size_t offset;
+  } cases[] = {
+      {"-p", offsetof(Config, preserve_perms)}, {"--perms", offsetof(Config, preserve_perms)},
+      {"-t", offsetof(Config, preserve_times)}, {"--times", offsetof(Config, preserve_times)},
+      {"-o", offsetof(Config, preserve_owner)}, {"--owner", offsetof(Config, preserve_owner)},
+      {"-g", offsetof(Config, preserve_group)}, {"--group", offsetof(Config, preserve_group)},
+  };
+  const size_t all[] = {offsetof(Config, preserve_perms), offsetof(Config, preserve_times),
+                        offsetof(Config, preserve_owner), offsetof(Config, preserve_group)};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    char* argv[] = {"fastsync", (char*)cases[i].arg, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    for (size_t j = 0; j < sizeof(all) / sizeof(all[0]); j++) {
+      bool expected = all[j] == cases[i].offset;
+      EXPECT_TRUE(*(bool*)((char*)cfg + all[j]) == expected);
+    }
+    EXPECT_TRUE(cfg->use_metadata);
+    config_delete(cfg);
+  }
+}
+
+/* --preserve is the long-only rsync alias for perms+times (NOT owner/group). */
+static void test_parse_args_preserve_long_form() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--preserve", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_FALSE(cfg->preserve_owner);
+  EXPECT_FALSE(cfg->preserve_group);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+/* --no-perms/--no-times/--no-owner/--no-group (long and short) clear only
+ * their own attribute bit; they never set metadata_explicitly_disabled. */
+static void test_parse_args_preserve_negations() {
+  struct {
+    const char* arg;
+    size_t offset;
+  } cases[] = {
+      {"--no-perms", offsetof(Config, preserve_perms)},
+      {"--no-p", offsetof(Config, preserve_perms)},
+      {"--no-times", offsetof(Config, preserve_times)},
+      {"--no-t", offsetof(Config, preserve_times)},
+      {"--no-owner", offsetof(Config, preserve_owner)},
+      {"--no-o", offsetof(Config, preserve_owner)},
+      {"--no-group", offsetof(Config, preserve_group)},
+      {"--no-g", offsetof(Config, preserve_group)},
+  };
+  const size_t all[] = {offsetof(Config, preserve_perms), offsetof(Config, preserve_times),
+                        offsetof(Config, preserve_owner), offsetof(Config, preserve_group)};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    char* argv[] = {"fastsync", "-a", (char*)cases[i].arg, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    for (size_t j = 0; j < sizeof(all) / sizeof(all[0]); j++) {
+      bool expected = all[j] != cases[i].offset;
+      EXPECT_TRUE(*(bool*)((char*)cfg + all[j]) == expected);
+    }
+    EXPECT_FALSE(cfg->metadata_explicitly_disabled);
+    /* -a's devices/specials keep the metadata frame on. */
+    EXPECT_TRUE(cfg->use_metadata);
+    config_delete(cfg);
+  }
+}
+
+/* Negations are order-dependent like rsync: -a after --no-owner re-enables it. */
+static void test_parse_args_preserve_negation_order() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* argv1[] = {"fastsync", "-a", "--no-owner", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv1, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->preserve_owner);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->preserve_group);
+  config_delete(cfg);
+
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--no-owner", "-a", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_owner);
+  config_delete(cfg);
+}
+
+/* --no-preserve clears the whole four-attribute bundle and records the explicit
+ * metadata opt-out, so the incremental/delta implication stays off. */
+static void test_parse_args_no_preserve_disables_bundle() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--incremental", "--preserve", "--no-preserve", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->preserve_perms);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_FALSE(cfg->preserve_owner);
+  EXPECT_FALSE(cfg->preserve_group);
+  EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_FALSE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+/* MAJOR 4: --incremental/--delta historically auto-enabled mode+mtime
+ * preservation (README: "--incremental Auto-enables --preserve"), while an
+ * explicit per-attribute negation must still win. */
+static void test_parse_args_incremental_implies_preserve() {
+  int positional_args[2];
+  int positional_count = 0;
+
+  /* --incremental alone implies both perms and times. */
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* argv[] = {"fastsync", "--incremental", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  /* --incremental --no-perms keeps the auto-preserved times but not perms. */
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--incremental", "--no-perms", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  /* --incremental --no-times keeps perms but not times. */
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--incremental", "--no-times", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv3, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  /* --incremental --no-preserve turns the whole implication off. */
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--incremental", "--no-preserve", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->preserve_perms);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+  EXPECT_FALSE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+/* config_derived_use_metadata via the CLI: representative options that turn the
+ * transport bit on, and a bare run / --no-preserve that leave it off. */
+static void test_parse_args_derived_use_metadata() {
+  static const char* const true_args[] = {"-p",           "-t",
+                                          "-o",           "-g",
+                                          "-U",           "-N",
+                                          "-E",           "--chmod=u=rw",
+                                          "--fake-super", "-D",
+                                          "--devices",    "-X",
+                                          "-A",           "--copy-as=@1:@1",
+                                          "-u",           "--incremental",
+                                          "--delta"};
+  for (size_t i = 0; i < sizeof(true_args) / sizeof(true_args[0]); i++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    char* argv[] = {"fastsync", (char*)true_args[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->use_metadata);
+    config_delete(cfg);
+  }
+
+  /* A bare run does not derive metadata. */
+  Config* bare = config_create();
+  EXPECT_NOT_NULL(bare);
+  char* bare_argv[] = {"fastsync", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(bare, 3, bare_argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(bare->use_metadata);
+  config_delete(bare);
+
+  /* --no-preserve suppresses the derived bit entirely. */
+  Config* neg = config_create();
+  EXPECT_NOT_NULL(neg);
+  positional_count = 0;
+  char* neg_argv[] = {"fastsync", "-p", "--no-preserve", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(neg, 5, neg_argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(neg->use_metadata);
+  config_delete(neg);
+}
+
+/* -U/--atimes and -N/--crtimes govern only their own time attribute: each
+ * carries its time inside the metadata payload (so it enables metadata
+ * transmission), but neither may imply -t/--times. */
+static void test_parse_args_atimes_crtimes_do_not_imply_times() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* argv_short_u[] = {"fastsync", "-U", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_short_u, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_atimes);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_FALSE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  positional_count = 0;
+  char* argv_long_n[] = {"fastsync", "--crtimes", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_long_n, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_crtimes);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_FALSE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+/* -A/--acls implies --perms (ACL application goes through the mode path);
+ * -X/--xattrs preserves only the extended attributes and must NOT set
+ * preserve_perms.  Either enables the derived xattr transport bit. */
+static void test_parse_args_acls_implies_perms_xattrs_does_not() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  char* argv_x[] = {"fastsync", "-X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_x, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  EXPECT_FALSE(cfg->preserve_acls);
+  EXPECT_FALSE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->use_xattrs);
+  config_delete(cfg);
+
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  positional_count = 0;
+  char* argv_a[] = {"fastsync", "-A", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_a, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->use_xattrs);
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -3412,6 +3717,15 @@ void test_client_cli() {
   test_parse_args_info_verbose_order();
   test_parse_args_rejects_invalid_info_flag();
   test_parse_args_archive();
+  test_parse_args_preserve_attributes_are_independent();
+  test_parse_args_preserve_long_form();
+  test_parse_args_preserve_negations();
+  test_parse_args_preserve_negation_order();
+  test_parse_args_no_preserve_disables_bundle();
+  test_parse_args_incremental_implies_preserve();
+  test_parse_args_derived_use_metadata();
+  test_parse_args_atimes_crtimes_do_not_imply_times();
+  test_parse_args_acls_implies_perms_xattrs_does_not();
   test_parse_args_negations();
   test_parse_args_negate_preserve_without_devices();
   test_parse_args_negation_order();

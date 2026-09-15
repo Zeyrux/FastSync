@@ -176,9 +176,10 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
   options->hardlinks = NULL;
-  /* P7 Wave D: capture source directory times whenever metadata rides the
-     wire.  Whether they are APPLIED is decided receiver-side (-O skips). */
-  options->capture_dir_times = config->use_metadata;
+  /* P7 Wave D: capture source directory metadata when a directory attribute is
+     requested (-p for modes, -t for times unless -O omits them).  Whether they
+     are APPLIED is decided receiver-side. */
+  options->capture_dir_times = dir_metadata_should_capture(config);
   options->dir_entries = NULL;
   options->dir_entries_mutex = NULL;
   if (config->preserve_hard_links) {
@@ -1444,7 +1445,8 @@ static bool send_directory_entry(const Client* client, File* file, const Config*
    stays within the receiver's bound, and a frame that would exceed it is never
    emitted. */
 static bool send_dir_times(const Client* client, const Config* config, ArrayList* dir_entries) {
-  if (!client || !config || !config->use_metadata || !dir_entries || dir_entries->size == 0)
+  if (!client || !config || !dir_metadata_should_capture(config) || !dir_entries ||
+      dir_entries->size == 0)
     return true;
   int fd = client->file_descriptor;
   int index = 0;
@@ -2250,7 +2252,7 @@ int send_files(Config* config) {
   receive_daemon_motd(client, config);
   if (!prepare_scanner(config, 0, &prepared))
     goto send_fail;
-  if (config->use_metadata) {
+  if (dir_metadata_should_capture(config)) {
     dir_entries = array_list_create(file_destroy);
     if (!dir_entries)
       goto send_fail;

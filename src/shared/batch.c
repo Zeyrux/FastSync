@@ -2,6 +2,7 @@
 #include "data.h"
 #include "file.h"
 #include "file_receive.h"
+#include "identity.h"
 #include "log.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -10,11 +11,15 @@
 
 /* Serialization metadata mode for the batch stream, captured from the config at
  * batch_write_header time.  The header persists it into the file so a batch is
- * self-describing: batch_read_apply re-reads it from the file (not from the
- * reading config), so a batch written with -M is applied identically by an
- * invoking process regardless of its own -M setting.  The batch driver is a
- * single sequential scan pass within one thread, so this module-level flag is
- * safe. */
+ * self-describing about whether per-entry metadata was CAPTURED in the stream:
+ * batch_read_apply re-reads it from the file (not from the reading config) to
+ * decode the chunk records correctly.  Which attributes are actually APPLIED,
+ * however, comes from the INVOKING process's per-attribute config (the
+ * FileAttrPolicy and the dir-metadata gate), so a batch written with -M is NOT
+ * automatically applied identically by an invoking process with a different
+ * -p/-t/-o/-g: --read-batch must be invoked with the same -p/-t/-o/-g as the
+ * write side (rsync requires the same options).  The batch driver is a single
+ * sequential scan pass within one thread, so this module-level flag is safe. */
 static bool batch_metadata_mode = false;
 
 static bool write_all_bytes(int fd, const void* data, size_t size) {
@@ -91,22 +96,37 @@ int batch_read_apply(int fd, const Config* config, const char* dest_root) {
   if (fd < 0 || dest_root == NULL || dest_root[0] == '\0')
     return -1;
 
+  /* Directory metadata is deferred to the end of the apply (a child write would
+   * otherwise clobber its parent's mtime/mode).  The batch header's single
+   * metadata bit only says whether metadata is present in the stream; which
+   * attributes are APPLIED comes from the invoking process's config, so
+   * --read-batch must be invoked with the same -p/-t/-o/-g as the write side
+   * (rsync requires the same options).  The identity snapshot is activated so
+   * -o/-g and the explicit ownership flags can apply. */
+  DirTimeList dir_times;
+  dir_time_list_init(&dir_times);
+  int result = -1;
+  if (!identity_set_active(config)) {
+    log_message(LOG_LEVEL_ERROR, "batch: could not activate the identity policy");
+    goto done;
+  }
+
   char magic[BATCH_MAGIC_LEN];
   bool eof = false;
   if (!read_exact(fd, magic, BATCH_MAGIC_LEN, &eof) || eof ||
       memcmp(magic, BATCH_MAGIC, BATCH_MAGIC_LEN) != 0) {
     log_message(LOG_LEVEL_ERROR, "batch: malformed header (bad magic)");
-    return -1;
+    goto done;
   }
   unsigned char version;
   if (!read_exact(fd, &version, 1, &eof) || eof || version != BATCH_FORMAT_VERSION) {
     log_message(LOG_LEVEL_ERROR, "batch: malformed header (bad or missing format version)");
-    return -1;
+    goto done;
   }
   unsigned char mode;
   if (!read_exact(fd, &mode, 1, &eof) || eof || (mode != 0 && mode != 1)) {
     log_message(LOG_LEVEL_ERROR, "batch: malformed header (bad metadata flag)");
-    return -1;
+    goto done;
   }
   bool use_metadata = mode == 1;
 
@@ -114,47 +134,62 @@ int batch_read_apply(int fd, const Config* config, const char* dest_root) {
     unsigned long long length;
     if (!read_exact(fd, &length, sizeof(length), &eof)) {
       log_message(LOG_LEVEL_ERROR, "batch: truncated length prefix");
-      return -1;
+      goto done;
     }
     if (eof)
       break; /* clean end of stream */
     if (length == 0 || length > BATCH_MAX_RECORD) {
       log_message(LOG_LEVEL_ERROR, "batch: rejected record length %llu (valid range 1..%llu)",
                   length, (unsigned long long)BATCH_MAX_RECORD);
-      return -1;
+      goto done;
     }
     char* record = (char*)malloc((size_t)length);
     if (record == NULL) {
       log_message(LOG_LEVEL_ERROR, "batch: could not allocate a %llu-byte record", length);
-      return -1;
+      goto done;
     }
     if (!read_exact(fd, record, (size_t)length, &eof) || eof) {
       log_message(LOG_LEVEL_ERROR, "batch: truncated chunk record");
       free(record);
-      return -1;
+      goto done;
     }
     Data* data = data_create(record, (size_t)length);
     if (data == NULL)
-      return -1; /* data_create frees `record` on failure */
+      goto done; /* data_create frees `record` on failure */
     Chunk* chunk = chunk_deserialize(data, use_metadata);
     data_destroy(data);
     if (chunk == NULL) {
       log_message(LOG_LEVEL_ERROR, "batch: rejected malformed chunk record");
-      return -1;
+      goto done;
     }
     for (int i = 0; i < chunk->element_count; i++) {
       File* file = chunk->items[i];
       chunk->items[i] = NULL;
       if (file == NULL)
         continue;
-      FileSaveResult result = file_save_to_disk_full(dest_root, file, config);
-      file_destroy(file);
-      if (result == FILE_SAVE_ERROR) {
+      FileSaveResult save = file_save_to_disk_full(dest_root, file, config);
+      /* Accumulate directory metadata (when it applies) before the File is
+       * destroyed; applied once the whole stream has been consumed. */
+      if (save != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
+          dir_metadata_should_capture(config) &&
+          !dir_time_list_add(&dir_times, file->path, file->metadata)) {
+        file_destroy(file);
         chunk_destroy(chunk);
-        return -1;
+        goto done;
+      }
+      file_destroy(file);
+      if (save == FILE_SAVE_ERROR) {
+        chunk_destroy(chunk);
+        goto done;
       }
     }
     chunk_destroy(chunk);
   }
-  return 0;
+  dir_metadata_list_apply(&dir_times, dest_root, config);
+  result = 0;
+
+done:
+  identity_clear_active();
+  dir_time_list_free(&dir_times);
+  return result;
 }

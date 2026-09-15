@@ -881,9 +881,16 @@ class TestExecutability:
         assert result.returncode == 0, f"Executability sync failed: {result.stderr[:200]}"
         received_file = os.path.join(get_dest_received_dir(dest, source), "tool.sh")
         received_mode = os.stat(received_file).st_mode
-        assert received_mode & 0o111 == 0o111
-        assert received_mode & 0o600 == 0o600
-        assert received_mode & 0o077 == 0o011
+        # rsync -E on a fresh destination: the base is source & ~umask, then the
+        # execute bits are derived from that base's read bits.  For a source of
+        # 0751 this is exactly source & ~umask (owner rwx, group r-x, other --x
+        # under the usual 022 umask => group/other bits 0o051, not 0o011).
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        expected_mode = 0o751 & ~current_umask
+        assert received_mode & 0o777 == expected_mode, (
+            f"expected mode {oct(expected_mode)}, got {oct(received_mode & 0o777)}"
+        )
 
 
 class TestChmod:

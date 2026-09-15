@@ -9,6 +9,7 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <signal.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <string.h>
@@ -1292,6 +1293,9 @@ static void test_config_metadata_times_wire_roundtrip() {
   send_cfg->preserve_crtimes = true;
   send_cfg->omit_dir_times = true;
   send_cfg->omit_link_times = true;
+  /* The preservation attributes now require the metadata frame to travel
+   * (config_invariants_error rejects them otherwise). */
+  send_cfg->use_metadata = true;
   /* --open-noatime is client-only and must NOT cross the wire. */
   send_cfg->open_noatime = true;
 
@@ -2056,6 +2060,46 @@ static void test_identity_ownership_requested() {
   config_delete(gm);
 }
 
+/* The narrow client-CHOSEN ownership predicate the daemon module gate refuses:
+ * a preserve-source -o/-g (or -a) must NOT be in it (it is handled by forcing
+ * super-user activity off instead), while every explicit identity flag is. */
+static void test_identity_explicit_ownership_requested() {
+  EXPECT_FALSE(identity_explicit_ownership_requested(NULL));
+
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_FALSE(identity_explicit_ownership_requested(c));
+  c->preserve_owner = true;
+  EXPECT_FALSE(identity_explicit_ownership_requested(c));
+  EXPECT_TRUE(identity_ownership_requested(c)); /* general awareness does see -o */
+  c->preserve_group = true;
+  EXPECT_FALSE(identity_explicit_ownership_requested(c));
+  c->preserve_owner = false;
+  c->preserve_group = false;
+
+  c->numeric_ids = true;
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  c->numeric_ids = false;
+  c->chown_uid_set = true;
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  c->chown_uid_set = false;
+  c->chown_gid_set = true;
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  c->chown_gid_set = false;
+  c->copy_as_set = true;
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  c->copy_as_set = false;
+  c->fake_super = true;
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  c->fake_super = false;
+  c->super_mode = SUPER_MODE_ON;
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  c->super_mode = SUPER_MODE_AUTO;
+  EXPECT_EQ_INT(identity_parse_map(c, "@1:@2", false), 0);
+  EXPECT_TRUE(identity_explicit_ownership_requested(c));
+  config_delete(c);
+}
+
 /* P7 Wave E hardening (A3): --super no longer implies raw numeric-id
    preservation, so it must never enable ownership application on its own; an
    explicit identity flag is required. */
@@ -2069,6 +2113,32 @@ static void test_super_does_not_imply_numeric() {
   c->numeric_ids = true;
   EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(identity_active_enabled());
+  identity_clear_active();
+  config_delete(c);
+}
+
+/* The preserve-source -o/-g requests enable ownership application through the
+ * active snapshot (identity_active_enabled) even though they are deliberately
+ * absent from the narrow client-chosen identity_explicit_ownership_requested()
+ * gate. */
+static void test_identity_active_enabled_includes_preserve_attrs() {
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->use_metadata = true;
+  EXPECT_TRUE(identity_set_active(c));
+  EXPECT_FALSE(identity_active_enabled());
+
+  c->preserve_owner = true;
+  EXPECT_TRUE(identity_set_active(c));
+  EXPECT_TRUE(identity_active_enabled());
+  EXPECT_FALSE(identity_explicit_ownership_requested(c));
+
+  c->preserve_owner = false;
+  c->preserve_group = true;
+  EXPECT_TRUE(identity_set_active(c));
+  EXPECT_TRUE(identity_active_enabled());
+  EXPECT_FALSE(identity_explicit_ownership_requested(c));
+
   identity_clear_active();
   config_delete(c);
 }
@@ -2190,6 +2260,95 @@ static void test_config_invariants_error_all_combinations() {
   c->copy_as_set = true;
   c->use_metadata = false;
   EXPECT_NOT_NULL(config_invariants_error(c)); /* copy-as without metadata */
+  config_delete(c);
+}
+
+/* Every per-attribute preservation flag requires the metadata frame to travel:
+ * the invariant rejects any of them while use_metadata is false, and setting
+ * use_metadata clears the violation. */
+static void test_config_preservation_requires_metadata() {
+  static const size_t attrs[] = {
+      offsetof(Config, preserve_perms),    offsetof(Config, preserve_times),
+      offsetof(Config, preserve_owner),    offsetof(Config, preserve_group),
+      offsetof(Config, preserve_atimes),   offsetof(Config, preserve_crtimes),
+      offsetof(Config, use_executability),
+  };
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_NULL(config_invariants_error(c));
+  for (size_t i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+    bool* field = (bool*)((char*)c + attrs[i]);
+    *field = true;
+    EXPECT_NOT_NULL(config_invariants_error(c));
+    c->use_metadata = true;
+    EXPECT_NULL(config_invariants_error(c));
+    c->use_metadata = false;
+    *field = false;
+  }
+  config_delete(c);
+}
+
+/* config_derived_use_metadata is the single source of truth for the derived
+ * transport bit: each representative flag turns it on, and it stays off for a
+ * bare config (numeric_ids alone, omit flags, whole-file, ...). */
+static void test_config_derived_use_metadata() {
+  static const size_t true_flags[] = {
+      offsetof(Config, preserve_perms),    offsetof(Config, preserve_times),
+      offsetof(Config, preserve_owner),    offsetof(Config, preserve_group),
+      offsetof(Config, preserve_atimes),   offsetof(Config, preserve_crtimes),
+      offsetof(Config, use_executability), offsetof(Config, preserve_xattrs),
+      offsetof(Config, preserve_acls),     offsetof(Config, fake_super),
+      offsetof(Config, preserve_devices),  offsetof(Config, preserve_specials),
+      offsetof(Config, copy_devices),      offsetof(Config, write_devices),
+      offsetof(Config, copy_as_set),       offsetof(Config, chown_uid_set),
+      offsetof(Config, chown_gid_set),     offsetof(Config, update),
+  };
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_FALSE(config_derived_use_metadata(c));
+  EXPECT_FALSE(config_derived_use_metadata(NULL));
+  for (size_t i = 0; i < sizeof(true_flags) / sizeof(true_flags[0]); i++) {
+    bool* field = (bool*)((char*)c + true_flags[i]);
+    *field = true;
+    EXPECT_TRUE(config_derived_use_metadata(c));
+    *field = false;
+  }
+
+  /* A non-empty --chmod spec. */
+  c->chmod_spec = str_dup("u=rw");
+  EXPECT_TRUE(config_derived_use_metadata(c));
+  free(c->chmod_spec);
+  c->chmod_spec = NULL;
+
+  /* Identity-map counts. */
+  c->usermap_count = 1;
+  EXPECT_TRUE(config_derived_use_metadata(c));
+  c->usermap_count = 0;
+  c->groupmap_count = 1;
+  EXPECT_TRUE(config_derived_use_metadata(c));
+  c->groupmap_count = 0;
+
+  /* Incremental/delta imply metadata unless --no-preserve disabled it. */
+  c->use_incremental = true;
+  EXPECT_TRUE(config_derived_use_metadata(c));
+  c->metadata_explicitly_disabled = true;
+  EXPECT_FALSE(config_derived_use_metadata(c));
+  c->metadata_explicitly_disabled = false;
+  c->use_incremental = false;
+  c->use_delta = true;
+  EXPECT_TRUE(config_derived_use_metadata(c));
+  c->metadata_explicitly_disabled = true;
+  EXPECT_FALSE(config_derived_use_metadata(c));
+  c->metadata_explicitly_disabled = false;
+  c->use_delta = false;
+
+  /* Flags that must NOT imply metadata on their own. */
+  c->numeric_ids = true;
+  c->omit_dir_times = true;
+  c->omit_link_times = true;
+  c->whole_file = true;
+  c->ignore_times = true;
+  EXPECT_FALSE(config_derived_use_metadata(c));
   config_delete(c);
 }
 
@@ -2355,6 +2514,34 @@ static void test_config_wire_roundtrip_all_fields() {
   config_delete(populated);
 }
 
+/* Each of the four split-out preservation bools must survive a frame
+ * round-trip on its own.  The all-fields golden sets an alternating
+ * true/false pattern precisely because a run of identical adjacent booleans
+ * would let a same-KIND field swap produce the same bytes; isolating one true
+ * bit at a time pins each new field's position and width independently. */
+static void test_config_preserve_attribute_wire_roundtrip() {
+  if (is_running_under_valgrind())
+    return;
+  static const size_t attrs[] = {
+      offsetof(Config, preserve_perms),
+      offsetof(Config, preserve_times),
+      offsetof(Config, preserve_owner),
+      offsetof(Config, preserve_group),
+  };
+  for (size_t i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+    Config* c = config_create();
+    EXPECT_NOT_NULL(c);
+    c->send_directory = str_dup("/src");
+    c->receive_root_directory = str_dup("/dst");
+    /* The preservation invariant requires the metadata frame to travel, so set
+     * the transport bit; otherwise config_receive() legitimately refuses. */
+    c->use_metadata = true;
+    *(bool*)((char*)c + attrs[i]) = true;
+    EXPECT_TRUE(roundtrip_and_compare(c));
+    config_delete(c);
+  }
+}
+
 /* Populate every serialized field with a non-default value so the wire frame
  * exercises each table entry.  Boolean runs deliberately alternate true/false:
  * a run of identical booleans would make an adjacent swap (same KIND) produce
@@ -2427,7 +2614,7 @@ static void golden_config_populate(Config* c) {
   c->modify_window = 3;
   c->compress_choice = str_dup("zstd");
   /* "u=rwx,go=rx" is the same 11 bytes as the original "u=rwX,go=rX" (so the
-   * frame stays 637 bytes) but X is not in FastSync's chmod grammar, and the
+   * frame stays 653 bytes) but X is not in FastSync's chmod grammar, and the
    * receive-side golden validates the frame. */
   c->chmod_spec = str_dup("u=rwx,go=rx");
   c->skip_compress_set = true;
@@ -2459,6 +2646,12 @@ static void golden_config_populate(Config* c) {
   c->preserve_crtimes = false;
   c->omit_dir_times = true;
   c->omit_link_times = false;
+  /* Mixed true/false so a field reorder or a dropped attribute changes the
+   * pinned hash rather than passing silently. */
+  c->preserve_perms = true;
+  c->preserve_times = false;
+  c->preserve_owner = true;
+  c->preserve_group = false;
   c->munge_links = true;
   c->keep_dirlinks = false;
   c->fake_super = true;
@@ -2472,13 +2665,14 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.21.0).  The values below are the only
+/* The pinned golden frame (protocol 2.22.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The combined
- * 2.21.0 wave appends the serialized dry_run bool to CONFIG_WIRE_CORE_FIELDS
- * and keeps the protocol version string at 2.21.0. */
-#define GOLDEN_WIRE_LEN 637
-#define GOLDEN_WIRE_HASH 13228626061067899189ULL
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.22.0
+ * preserve-attribute split appends four serialized bools
+ * (preserve_perms/times/owner/group) to CONFIG_WIRE_METADATA_TIMES_FIELDS after
+ * omit_link_times. */
+#define GOLDEN_WIRE_LEN 653
+#define GOLDEN_WIRE_HASH 95530566005420798ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2560,7 +2754,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.21.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.22.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())
@@ -2613,6 +2807,9 @@ static void test_config_wire_golden_receive() {
            !recv->use_multithreading;
       ok = ok && recv->compression_level == 7 && recv->chunk_size == 65536;
       ok = ok && recv->use_delta && !recv->whole_file && recv->use_xattrs;
+      /* Per-attribute preservation split decoded from the pinned bytes. */
+      ok = ok && recv->preserve_perms && !recv->preserve_times && recv->preserve_owner &&
+           !recv->preserve_group;
       /* Bounded/validated KINDs decoded from the pinned bytes. */
       ok = ok && recv->checksum_algo == CHECKSUM_ALGO_MD5;
       ok = ok && recv->super_mode == SUPER_MODE_ON;
@@ -2867,15 +3064,20 @@ void test_config() {
     test_config_receive_rejects_oversized_string_budget();
     test_config_receive_with_validate_rejects();
     test_config_invariants_error_all_combinations();
+    test_config_preservation_requires_metadata();
+    test_config_derived_use_metadata();
     test_config_receive_rejects_unified_invariants();
     test_config_wire_golden();
     test_config_wire_golden_receive();
     test_config_wire_receive_bounds();
     test_config_receive_rejects_overcap_counts();
     test_config_wire_roundtrip_all_fields();
+    test_config_preserve_attribute_wire_roundtrip();
   }
   test_identity_copy_as_refused();
   test_identity_ownership_requested();
+  test_identity_explicit_ownership_requested();
+  test_identity_active_enabled_includes_preserve_attrs();
   test_super_does_not_imply_numeric();
   test_privilege_super_permitted_modes();
   test_config_delete_timing_early_helper();

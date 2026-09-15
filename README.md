@@ -65,19 +65,21 @@ replacement for every rsync feature or protocol mode.
 
 - The FastSync wire protocol is not the rsync wire protocol.
 - SSH mode requires `fastsync-server` on the remote host.
-- Archive mode covers rsync's `-rlptD` behavior — links, permissions, times,
-  devices, and special files — and does not imply compression or multithreading
-  (see [Client](#client)). Owner/group (`-o`/`-g`) are NOT implied; identity is
-  applied only through the opt-in identity flags (`--chown`/`--usermap`/
-  `--groupmap`/`--numeric-ids`/`--copy-as`).
+- Archive mode covers rsync's `-rlptgoD` behavior — links, permissions, times,
+  owner, group, devices, and special files — and does not imply compression or
+  multithreading (see [Client](#client)). Ownership application is still
+  privilege-gated: a receiver that cannot `chown` logs a warning and skips it,
+  and a client-supplied mode can never grant group/other write (see
+  [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md)).
 - Symlink transfer recreates only relative, `..`-free link targets
   (`-l`/`--links`); an absolute target or any target containing a `..` component
   is dropped rather than created, even if it would resolve within the receive
   root. This containment check is skipped under `--trust-sender`.
 - Hard links (`-H`/`--hard-links`), extended attributes (`-X`/`--xattrs`), and
-  POSIX ACLs (`-A`/`--acls`) are preserved; owner/group is applied only through
-  the opt-in identity flags (`--chown`/`--usermap`/`--groupmap`/`--numeric-ids`/
-  `--copy-as`) and only when the receiver has permission. See
+  POSIX ACLs (`-A`/`--acls`) are preserved; owner/group is applied through
+  `-o`/`-g` (or an `-a`/`--archive` transfer), through the opt-in identity flags
+  (`--chown`/`--usermap`/`--groupmap`/`--numeric-ids`/`--copy-as`), and only when
+  the receiver has permission. See
   [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md) for the exact semantics and documented
   divergences.
 - Device and special-file preservation is implemented with documented
@@ -120,7 +122,7 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | Positional | `<source> <dest>` — automatic SSH detection if dest contains `:` |
 | `-c, --checksum` | Verify content by checksum instead of size+mtime |
 | `-z, --compress [level]` | Enable streaming zstd compression (level 1–22, default 5) |
-| `-a, --archive` | rsync archive mode (`-rlptD`): links, metadata, devices and specials; owner/group (`-o`/`-g`) are not implied and stay opt-in via the identity flags (not compression/multithreading) |
+| `-a, --archive` | rsync archive mode (`-rlptgoD`): links, perms, times, owner, group, devices and specials; ownership application stays privilege-gated (not compression/multithreading) |
 | `-j, --threads[=N]` | Multithreading mode; `N` (1–256) sets the parallel scanner worker count, bare `-j`/`--threads` uses the default |
 | `-m` | rsync `--prune-empty-dirs` (short form now rsync-parity) |
 | `-d, --dirs` | Transfer the named directory entries without recursing into their contents; aliases `--old-dirs`/`--old-d` |
@@ -134,10 +136,14 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `-W, --whole-file` | Transfer changed files without delta processing |
 | `-I, --ignore-times` | Transfer files even when size and mtime match |
 | `--size-only` | Skip incremental files matching in size, ignoring mtime |
-| `--preserve` | Preserve file metadata (mode and mtime; add `-U`/`--atimes` for atime, or an identity flag for owner/group; `-N`/`--crtimes` captures birth time but cannot apply it) |
+| `--preserve` | Preserve mode and mtime (`-p` + `-t`; add `-o`/`-g` for owner/group or `-U`/`--atimes` for atime; `-N`/`--crtimes` captures birth time but cannot apply it) |
 | `-U, --atimes` | Preserve access times. Captured with the metadata payload; does not enable ownership. |
 | `-N, --crtimes` | Capture birth time; cannot be applied (documented divergence) |
-| `-p, --perms` | Preserve permission bits (part of the metadata bundle) |
+| `-p, --perms` | Preserve permission bits (a client mode never grants group/other write) |
+| `-t, --times` | Preserve modification times |
+| `-o, --owner` | Preserve the source owner (privilege-gated; mapped by name on the receiver with a numeric fallback) |
+| `-g, --group` | Preserve the source group (privilege-gated; mapped by name on the receiver with a numeric fallback) |
+| `--no-perms`, `--no-times`, `--no-owner`, `--no-group`, `--no-preserve` | Negate the per-attribute flags (short `--no-p`/`--no-t`/`--no-o`/`--no-g`; `--no-preserve` clears all four) |
 | `-E, --executability` | Preserve executable permission bits |
 | `-X, --xattrs` | Preserve user `user.*` extended attributes |
 | `-A, --acls` | Preserve POSIX ACLs |
@@ -494,8 +500,8 @@ is `--remote-option`, `-f` is `--filter`, `-s` is `--secluded-args`, `-p` is
 long-form-only or new shorts: multithreading is `-j`/`--threads`, metadata
 is `--preserve`, sendfile is `--sendfile`, chunk serialization is
 `--chunk-serialization`, timeout is `--timeout`, and SSH port is `--ssh-port`.
-`-a`/`--archive` is now rsync archive `-rlptD`; owner/group (`-o`/`-g`) are not
-implied and remain opt-in via the identity flags.
+`-a`/`--archive` is now rsync archive `-rlptgoD` (owner/group implied, but the
+receiver still needs privilege to apply them).
 
 `--secluded-args` (and its short form `-s`) is accepted as a compatibility
 no-op. It does not change FastSync's transport or protocol behavior, because
@@ -507,7 +513,7 @@ remote SSH argv is already built injection-safe.
 
 | Option | Description |
 |---|---|
-| `-a`, `--archive` | rsync archive mode (`-rlptD`): links, metadata, devices and specials; owner/group (`-o`/`-g`) are not implied (opt in via the identity flags). |
+| `-a`, `--archive` | rsync archive mode (`-rlptgoD`): links, perms, times, owner, group, devices and specials; ownership application stays privilege-gated. |
 | `-n`, `--dry-run` | Report what would be transferred without mutating the destination. Since protocol 2.21.0 a server-routed target contacts the receiver and reports would-transfer based on receiver state; a plain local destination keeps the client-side scan. Never mutates or deletes. |
 | `--remove-source-files` | Remove regular source files after a successful transfer. |
 | `--incremental` | Skip files matching destination size and mtime. Auto-enables `--preserve`. Incompatible with `--chunk-serialization`. |
@@ -556,10 +562,14 @@ remote SSH argv is already built injection-safe.
 
 | Option | Description |
 |---|---|
-| `--preserve` | Preserve mode and mtime (long form only). Add `-U`/`--atimes` for atime, or an identity flag (`--chown`/`--usermap`/`--groupmap`/`--numeric-ids`/`--copy-as`) for owner/group. |
+| `--preserve` | Preserve mode and mtime (long form only; equivalent to `-p` + `-t`). Add `-o`/`-g` for owner/group, `-U`/`--atimes` for atime, or an identity flag (`--chown`/`--usermap`/`--groupmap`/`--numeric-ids`/`--copy-as`) for mapped ownership. |
 | `-U`, `--atimes` | Preserve access times. Captured with the metadata payload; does not enable ownership. |
 | `-N`, `--crtimes` | Capture birth time and transmit it; it cannot be applied because no portable filesystem call can set a birth time (documented divergence). |
-| `-p`, `--perms` | Preserve permission bits (part of the metadata bundle). |
+| `-p`, `--perms` | Preserve permission bits. One of the four per-attribute preserve flags (with `-t`/`-o`/`-g`); a client-supplied mode never grants group/other write. |
+| `-t`, `--times` | Preserve modification times. Independent of the other attributes; `-O`/`--omit-dir-times` suppresses directories only. |
+| `-o`, `--owner` | Preserve the source owner (uid). Mapped by name on the receiver with a raw-numeric fallback (only numeric ids cross the wire); application is privilege-gated. |
+| `-g`, `--group` | Preserve the source group (gid). Same name-mapping/numeric-fallback and privilege gating as `-o`. |
+| `--no-perms`, `--no-times`, `--no-owner`, `--no-group` | Negate each per-attribute flag (also `--no-p`/`--no-t`/`--no-o`/`--no-g`); `--no-preserve` clears all four. |
 | `-E`, `--executability` | Preserve executable permission bits. |
 | `-X`, `--xattrs` | Preserve user `user.*` extended attributes. |
 | `-A`, `--acls` | Preserve POSIX ACLs. |
@@ -732,7 +742,7 @@ before the module list, before authentication, and the connecting peer address
 
 ## Protocol and Security
 
-FastSync protocol version `2.21.0` is shared by the client and server. The
+FastSync protocol version `2.22.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
 manifests, keep-alives, abort handling, per-file remove-source results, and
@@ -800,10 +810,10 @@ The project will reach the drop-in replacement goal in stages:
    and `--option=value` syntax.
 2. Add differential tests that compare FastSync and rsync contents, metadata,
    links, deletes, filters, dry runs, and exit codes.
-3. `-a` now implements the expected recursive, links, permissions, times, and
-   supported device/special-file behavior; owner/group (`-o`/`-g`) stay opt-in
-   via the identity flags, and remaining work is the documented
-   device/special-file divergences.
+3. `-a` now implements the expected recursive, links, permissions, times,
+   owner/group (`-o`/`-g`), and supported device/special-file behavior (full
+   rsync `-rlptgoD`); ownership application stays privilege-gated and remaining
+   work is the documented device/special-file divergences.
 4. Symlink, sparse-file, metadata, delete-policy, and resumable-write semantics
    are implemented; remaining work is the documented edge cases.
 5. Add rsync remote-shell and daemon protocol interoperability.

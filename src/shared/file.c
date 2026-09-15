@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +71,63 @@ static int preallocate_fd(int fd, unsigned long long size) {
 static unsigned long long next_temp_sequence(void) {
   static atomic_ullong sequence;
   return atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+}
+
+/* Process-wide umask, captured exactly once.  Reading the umask requires a
+ * get+set round trip (umask(0); umask(old)); doing that per write would be racy
+ * in the multithreaded receiver, so the value is captured at process startup by
+ * file_umask_capture() (called at the top of main(), before any threads exist).
+ * The pthread_once fallback keeps a caller that never called the capture (e.g. a
+ * unit test) correct. */
+static unsigned g_process_umask;
+static atomic_bool g_process_umask_captured;
+static pthread_once_t g_process_umask_once = PTHREAD_ONCE_INIT;
+
+static void file_capture_umask_now(void) {
+  mode_t mask = umask(0);
+  umask(mask);
+  g_process_umask = (unsigned)mask;
+  atomic_store_explicit(&g_process_umask_captured, true, memory_order_release);
+}
+
+static void file_capture_umask_once(void) {
+  if (atomic_load_explicit(&g_process_umask_captured, memory_order_acquire))
+    return;
+  file_capture_umask_now();
+}
+
+/* Re-captures the umask.  Must only be called while the process is still
+ * single-threaded (startup, or the daemon's post-fork setup after umask(0)),
+ * so a later re-capture can refresh the cached value before any receiver
+ * thread exists. */
+void file_umask_capture(void) {
+  file_capture_umask_now();
+}
+
+unsigned file_process_umask(void) {
+  if (!atomic_load_explicit(&g_process_umask_captured, memory_order_acquire))
+    pthread_once(&g_process_umask_once, file_capture_umask_once);
+  return g_process_umask;
+}
+
+/* Base mode applied when the policy does not take the source mode wholesale
+ * (i.e. --perms is off).  A pre-existing destination keeps its own mode; a
+ * brand-new file is created like rsync: source_mode & 0777 & ~umask, with
+ * S_IWGRP|S_IWOTH always cleared so a client mode can never grant group/other
+ * write (the daemon runs with umask(0)).  Only when no metadata is available at
+ * all does the historical fixed 0644 default apply.  The -E rule (and no-op for
+ * a plain -t) is layered on top of this base. */
+static mode_t file_mode_base(const FileMetadata* metadata, bool existing_known,
+                             mode_t existing_mode) {
+  if (existing_known)
+    return existing_mode;
+  if (metadata)
+    /* A brand-new file follows rsync's source_mode & ~umask base, but a
+     * client-supplied source mode must never grant group/other write (the
+     * daemon runs with umask(0), so an unmasked 0666 would otherwise create a
+     * world-writable file).  S_IWGRP|S_IWOTH are always cleared. */
+    return metadata->mode & 0777 & ~(mode_t)file_process_umask() & ~(S_IWGRP | S_IWOTH);
+  return S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 }
 
 bool file_checksum(File* file, ChecksumAlgo algo, uint64_t seed, uint8_t* out, size_t out_capacity,
@@ -861,7 +919,7 @@ int file_open_private_dir(const char* dir_path) {
  * destination file) and best-effort: a per-attribute or privilege failure is
  * logged and skipped, never fatal. */
 static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXattrList* xattrs,
-                             bool fake_super) {
+                             bool fake_super, FileAttrPolicy policy) {
   xattr_apply_fd(fd, xattrs);
   if (fake_super && metadata) {
     fake_super_store_fd(fd, (uint32_t)metadata->uid, (uint32_t)metadata->gid,
@@ -869,15 +927,16 @@ static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXat
     /* Replay: re-apply the recorded uid/gid/mode/mtime fd-relative so a save
        under --fake-super restores the attrs (when privileged) instead of only
        recording them.  Best-effort; fake_super_restore_fd silently skips a
-       non-root fchown EPERM/EACCES and never fatal. */
-    fake_super_restore_fd(fd);
+       non-root fchown EPERM/EACCES and never fatal.  The replayed mode/mtime
+       honor the per-attribute policy so fake-super cannot bypass the split. */
+    fake_super_restore_fd(fd, policy);
   }
 }
 
 static bool file_to_disk_secure_impl(const char* path, const void* data,
                                      unsigned long long data_size, bool inplace, bool sparse,
                                      bool preallocate, const FileMetadata* metadata,
-                                     bool preserve_executability, bool update, bool no_replace,
+                                     FileAttrPolicy policy, bool update, bool no_replace,
                                      bool use_fsync, const char* temp_dir,
                                      const FileXattrList* xattrs, bool fake_super,
                                      bool keep_partial) {
@@ -887,6 +946,13 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
     return false;
   int fd = -1;
   bool ok = false;
+  /* The base mode applied when --perms is off (neither the source mode nor an
+   * exec-only change is taken wholesale): a pre-existing destination keeps its
+   * own mode (special bits dropped), while a brand-new file uses
+   * source&~umask when metadata is available (see file_mode_base) or 0644 when
+   * there is none.  Captured from the destination probe before the write. */
+  mode_t existing_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+  bool existing_mode_known = false;
   if (inplace) {
     /* --inplace writes directly into the destination; a scratch --temp-dir
        does not apply and must never redirect these writes. */
@@ -897,10 +963,16 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
        super-mode gate (a client-controlled device write).  fstatat with
        AT_SYMLINK_NOFOLLOW does not follow a symlink and does not block. */
     struct stat pre_stat;
-    if (fstatat(dirfd, leaf, &pre_stat, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISREG(pre_stat.st_mode)) {
-      close(dirfd);
-      free(leaf);
-      return false;
+    if (fstatat(dirfd, leaf, &pre_stat, AT_SYMLINK_NOFOLLOW) == 0) {
+      if (!S_ISREG(pre_stat.st_mode)) {
+        close(dirfd);
+        free(leaf);
+        return false;
+      }
+      /* Capture the old destination mode before the overwrite so a no--p/-E
+       * write can restore it (the write itself may clear setuid/setgid). */
+      existing_mode = pre_stat.st_mode & 0777;
+      existing_mode_known = true;
     }
     /* O_NONBLOCK: a no-op for a regular file, but a raced-in FIFO cannot block
        the open before the post-open S_ISREG re-check rejects it. */
@@ -953,15 +1025,25 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
           /* Normalize the mode: apply the metadata-derived safe mode when the
              sender supplied metadata (setuid/setgid/sticky are never honored);
              otherwise fall back to a safe default so dangerous bits on an
-             existing destination cannot survive an overwrite. */
+             existing destination cannot survive an overwrite.  When the policy
+             requests neither -p nor -E the source mode is deliberately ignored
+             and the pre-existing destination mode (or 0644 for a new file) is
+             restored instead.  The exec-bits-only -E change is likewise applied
+             on top of that destination-derived base, not the scratch file's
+             0600. */
           if (ok) {
-            if (metadata)
-              ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
-            else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
+            if (metadata) {
+              if (!policy.perms &&
+                  fchmod(fd, file_mode_base(metadata, existing_mode_known, existing_mode)) != 0)
+                ok = false;
+              if (ok)
+                ok = file_restore_metadata_fd(fd, metadata, policy);
+            } else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0) {
               ok = false;
+            }
           }
           if (ok)
-            restore_extra_fd(fd, metadata, xattrs, fake_super);
+            restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
           if (ok && use_fsync)
             ok = fsync(fd) == 0;
         }
@@ -974,16 +1056,21 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
        install failure (partial data may exist, --partial may retain it) from a
        pre-write validation failure (nothing to retain). */
     bool write_attempted = false;
-    if (update && metadata) {
-      /* This check protects the normal atomic path as far as possible.  A
-         concurrent replacement can still occur before the final rename. */
-      struct stat destination_stat;
-      if (fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
-          S_ISREG(destination_stat.st_mode) && stat_is_newer(&destination_stat, metadata)) {
-        close(dirfd);
-        free(leaf);
-        return true;
-      }
+    /* Probe the destination ONCE up front: it both drives the --update check
+       and records the pre-existing mode the no--p/-E fallback preserves. */
+    struct stat destination_stat;
+    bool destination_is_regular =
+        fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(destination_stat.st_mode);
+    if (destination_is_regular) {
+      existing_mode = destination_stat.st_mode & 0777;
+      existing_mode_known = true;
+    }
+    if (update && metadata && destination_is_regular &&
+        stat_is_newer(&destination_stat, metadata)) {
+      close(dirfd);
+      free(leaf);
+      return true;
     }
     /* Scratch directory for the temporary working copy.  When NULL the temp
        file is created in the destination directory, exactly as historically. */
@@ -1061,10 +1148,19 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                    ? file_store_write_sparse(fd, (const unsigned char*)data, data_size)
                    : write_all(fd, data, data_size);
         }
-        if (ok && metadata)
-          ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+        if (ok) {
+          if (metadata) {
+            if (!policy.perms &&
+                fchmod(fd, file_mode_base(metadata, existing_mode_known, existing_mode)) != 0)
+              ok = false;
+            if (ok)
+              ok = file_restore_metadata_fd(fd, metadata, policy);
+          } else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0) {
+            ok = false;
+          }
+        }
         if (ok)
-          restore_extra_fd(fd, metadata, xattrs, fake_super);
+          restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
         if (ok && use_fsync)
           ok = fsync(fd) == 0;
       }
@@ -1129,38 +1225,33 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
 
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
-                         bool preserve_executability, const char* temp_dir) {
+                         FileAttrPolicy policy, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, false, false, false, temp_dir, NULL,
-                                  false, false);
+                                  policy, false, false, false, temp_dir, NULL, false, false);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
                                 bool inplace, bool sparse, bool preallocate,
-                                const FileMetadata* metadata, bool preserve_executability,
+                                const FileMetadata* metadata, FileAttrPolicy policy,
                                 const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, true, false, false, temp_dir, NULL, false,
-                                  false);
+                                  policy, true, false, false, temp_dir, NULL, false, false);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
                                     bool preallocate, const FileMetadata* metadata,
-                                    bool preserve_executability, bool use_fsync,
-                                    const char* temp_dir) {
+                                    FileAttrPolicy policy, bool use_fsync, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, false, false, use_fsync, temp_dir, NULL,
-                                  false, false);
+                                  policy, false, false, use_fsync, temp_dir, NULL, false, false);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse, bool preallocate,
-                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const FileMetadata* metadata, FileAttrPolicy policy,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
-                                  preserve_executability, false, true, false, temp_dir, NULL, false,
-                                  false);
+                                  policy, false, true, false, temp_dir, NULL, false, false);
 }
 
 /* Receiver write-path variant that also applies the per-file xattrs (-X/-A)
@@ -1170,13 +1261,12 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
  * failed write's temp.  See file_to_disk_secure_impl for the semantics. */
 bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
                                bool inplace, bool sparse, bool preallocate,
-                               const FileMetadata* metadata, bool preserve_executability,
-                               bool update, bool no_replace, bool use_fsync,
-                               const FileXattrList* xattrs, bool fake_super, bool keep_partial,
-                               const char* temp_dir) {
+                               const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+                               bool no_replace, bool use_fsync, const FileXattrList* xattrs,
+                               bool fake_super, bool keep_partial, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, update, no_replace, use_fsync, temp_dir,
-                                  xattrs, fake_super, keep_partial);
+                                  policy, update, no_replace, use_fsync, temp_dir, xattrs,
+                                  fake_super, keep_partial);
 }
 
 /* Atomic --link-dest install.  The destination is replaced (via a temporary
@@ -1197,7 +1287,7 @@ bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long
 static bool file_to_disk_secure_link_impl(const char* path, const char* basis_path,
                                           const void* data, unsigned long long data_size,
                                           bool preallocate, const FileMetadata* metadata,
-                                          bool preserve_executability, bool use_fsync,
+                                          FileAttrPolicy policy, bool use_fsync,
                                           const FileXattrList* xattrs, bool fake_super,
                                           const char* temp_dir) {
   if (!path || !basis_path)
@@ -1286,8 +1376,8 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
     /* The basis file could not be linked in (missing, cross-device, refused
        by the filesystem).  Write a byte-identical local copy instead. */
     return file_to_disk_secure_attrs(path, data, data_size, false, false, preallocate, metadata,
-                                     preserve_executability, false, false, use_fsync, xattrs,
-                                     fake_super, false, temp_dir);
+                                     policy, false, false, use_fsync, xattrs, fake_super, false,
+                                     temp_dir);
   }
 
   if (scratch_dirfd >= 0)
@@ -1299,25 +1389,25 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
 
 bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
                               unsigned long long data_size, bool preallocate,
-                              const FileMetadata* metadata, bool preserve_executability,
-                              bool use_fsync, const char* temp_dir) {
+                              const FileMetadata* metadata, FileAttrPolicy policy, bool use_fsync,
+                              const char* temp_dir) {
   return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
-                                       preserve_executability, use_fsync, NULL, false, temp_dir);
+                                       policy, use_fsync, NULL, false, temp_dir);
 }
 
 bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, const void* data,
                                     unsigned long long data_size, bool preallocate,
-                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const FileMetadata* metadata, FileAttrPolicy policy,
                                     bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                     const char* temp_dir) {
   return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
-                                       preserve_executability, use_fsync, xattrs, fake_super,
-                                       temp_dir);
+                                       policy, use_fsync, xattrs, fake_super, temp_dir);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, false, NULL);
+  FileAttrPolicy policy = {false, false, false, false};
+  return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, policy, NULL);
 }
