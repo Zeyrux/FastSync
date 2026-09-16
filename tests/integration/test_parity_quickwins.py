@@ -844,3 +844,29 @@ class TestInfoDebugFlagParity:
             assert result.returncode != 0, f"{flag} must be rejected"
             assert name in (result.stderr or ""), \
                 f"{flag} must be rejected by name, got: {result.stderr[:200]}"
+
+
+class TestStopAtParity:
+    """#62: --stop-at accepts rsync's full date/time form."""
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_stop_at_rsync_date_forms_accepted(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "qw_stop_src")
+        dest = os.path.join(TEST_DATA_DIR, "qw_stop_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "qw_stop_rdst")
+        clean_dir(source)
+        with open(os.path.join(source, "a.txt"), "wb") as fh:
+            fh.write(b"a\n")
+        # rsync's documented --stop-at forms, all in the future or resolvable.
+        forms = ["2030-12-31T23:59", "2030/12/31T23:59", "2030-12-31", ":59", "1-30", "1"]
+        for form in forms:
+            rs = _rsync(["-a", "--stop-at=" + form, source + "/", rdst + "/"])
+            assert rs.returncode == 0, f"rsync rejected {form}: {rs.stderr}"
+            clean_dir(rdst)
+            clean_dir(dest)
+            result, _ = run_client(source, dest, flags=["--stop-at=" + form],
+                                   port=shared_server.port)
+            assert result.returncode == 0, (
+                f"--stop-at={form} must be accepted like rsync: {result.stderr[:200]}"
+            )
