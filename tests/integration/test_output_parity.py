@@ -324,21 +324,62 @@ class TestWireStatsParity:
     @requires_rsync
     @pytest.mark.ci
     def test_out_format_b_is_wire_bytes(self, shared_server):
-        """%b is true transferred (wire) bytes, not the source length: it must
-        differ from %l (the source length) and exceed it for a framed transfer."""
+        """%b is the bytes actually transferred (wire), not the source length.
+
+        A differential run against rsync confirms both implementations report a
+        framed value greater than %l.  The exact numbers are not compared: each
+        counts its own protocol framing and checksum trailer, so the two are
+        protocol-specific and cannot be numerically equal (documented
+        divergence)."""
         source = os.path.join(TEST_DATA_DIR, "wire_b_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_b_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_b_rdst")
         _make_one_file(source, "f.bin", 5000)
         clean_dir(dest)
-        result, _ = run_client(source, dest, flags=["-a", "--out-format=%b %l %c"],
+        clean_dir(rdst)
+        fmt = "%b %l"
+        rsync_result = _rsync(["-a", "--out-format=" + fmt, source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--out-format=" + fmt],
                                port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
-        line = result.stdout.strip()
-        parts = line.split()
-        assert len(parts) == 3 and all(p.isdigit() for p in parts), line
-        wire_b, src_l, wire_c = (int(p) for p in parts)
-        assert src_l == 5000, line
-        assert wire_b > src_l, f"%b must include wire framing: {line}"
+        rb, rl = (int(x) for x in rsync_result.stdout.split()[:2])
+        fb, fl = (int(x) for x in result.stdout.split()[:2])
+        assert rl == fl == 5000, (rsync_result.stdout, result.stdout)
+        assert rb > rl, f"rsync %b must include framing: {rsync_result.stdout!r}"
+        assert fb > fl, f"fastsync %b must include framing: {result.stdout!r}"
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_out_format_c_whole_file_matches_rsync(self, shared_server):
+        """%c is the block-checksum bytes received.  rsync reports its 16-byte
+        sum header even for a whole-file transfer (no basis), so `%c` must match
+        rsync exactly for the whole-file case."""
+        source = os.path.join(TEST_DATA_DIR, "wire_c_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_c_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_c_rdst")
+        _make_one_file(source, "f.bin", 5000)
+        clean_dir(dest)
+        clean_dir(rdst)
+        fmt = "%c %l %n"
+        rsync_result = _rsync(["-a", "--out-format=" + fmt, source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--out-format=" + fmt],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        def file_lines(text):
+            return [
+                line for line in text.splitlines()
+                if line and not line.rsplit(" ", 1)[-1].endswith("/")
+            ]
+
+        assert file_lines(result.stdout) == file_lines(rsync_result.stdout), (
+            f"rsync={rsync_result.stdout!r} fastsync={result.stdout!r}"
+        )
+        assert result.stdout.split()[0] == rsync_result.stdout.split()[0] == "16", (
+            f"%c must be rsync's 16-byte sum header: {result.stdout!r}"
+        )
 
     @requires_rsync
     @pytest.mark.ci

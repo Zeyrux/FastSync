@@ -590,7 +590,15 @@ void change_emit_file_sent_bytes(const Config* config, const File* file,
     event.bytes_sent = 0;
   } else {
     event.bytes_sent = bytes_sent;
-    event.bytes_read = bytes_read;
+    /* rsync's %c is the block-checksum bytes received for the file.  Even a
+     * whole-file transfer (no basis; --append/--inplace included) receives
+     * rsync's 16-byte sum header, so rsync reports 16; a dry run transfers
+     * nothing and reports 0.  FastSync's whole-file path has no sum header, so
+     * report rsync's value for parity.  With delta enabled the real received
+     * bytes are kept, but FastSync's signature framing differs from rsync's so
+     * those stay numerically divergent. */
+    bool delta_active = config->use_delta && !config->whole_file;
+    event.bytes_read = (!config->dry_run && !delta_active) ? 16 : bytes_read;
   }
   char* name = NULL;
   char* path = NULL;
