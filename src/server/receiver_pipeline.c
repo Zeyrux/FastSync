@@ -162,8 +162,14 @@ int receive_thread(void* pipeline_context) {
   const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
-  ReceiverSink sink = {
-      receiver_enqueue_file, context, false, false, NULL, receiver_pipeline_note_delete_limit};
+  ReceiverSink sink = {receiver_enqueue_file,
+                       context,
+                       false,
+                       false,
+                       NULL,
+                       receiver_pipeline_note_delete_limit,
+                       NULL,
+                       NULL};
   if (receiver_process_pending((Config*)config, file_descriptor, &sink,
                                &context->deferred_manifest) != 0) {
     receiver_thread_fail(context);
