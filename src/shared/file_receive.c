@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -1401,7 +1402,8 @@ static bool basis_match_find(const Config* config, const char* check_path,
  * transfer).  A fuzzy basis can therefore waste bandwidth but never corrupt a
  * file.
  *
- * Similarity heuristic (deterministic, deliberately simpler than rsync's):
+ * Similarity heuristic (rsync 3.4.1 parity, util1.c fuzzy_distance /
+ * find_filename_suffix + generator.c find_fuzzy):
  *   * candidates are the target's sibling entries in its destination
  *     directory, opened through the confined root (file_open_secure_parent +
  *     openat O_NOFOLLOW, fstatat AT_SYMLINK_NOFOLLOW) -- symlinks are never
@@ -1410,12 +1412,15 @@ static bool basis_match_find(const Config* config, const char* check_path,
  *     temp scratch names are never candidates;
  *   * size gate = the delta engine's own bounds (delta_should_attempt: both
  *     files >= DELTA_MIN_FILE_SIZE, <= delta_max_file_size, ratio <= 10x),
- *     NOT rsync's ~1.5x size window;
- *   * name gate = Levenshtein edit distance between the basenames, accepted
- *     only when distance <= half the length of the longer basename;
- *   * the single best candidate (smallest distance; tie-break: size closest
- *     to the incoming file, then lexicographically smaller basename) is read
- *     and returned as the basis.
+ *     because FastSync's delta engine cannot use a basis outside them;
+ *   * first pass = an exact size+mtime match wins regardless of name (rsync's
+ *     "fuzzy size/modtime match");
+ *   * otherwise the winner minimizes rsync's weighted Levenshtein distance
+ *     (substitution ± byte difference, insertion UNIT+byte, 16.16 fixed point)
+ *     plus ten times the suffix distance, accepted only when <= 25*UNIT; the
+ *     tie-break (smallest size gap, then lexical name) keeps the result
+ *     deterministic across filesystem readdir order (rsync leaves equal
+ *     distances to its file-list order).
  * ------------------------------------------------------------------------- */
 
 /* A directory scan is linear in the number of entries; the fuzzy search stops
@@ -1433,107 +1438,109 @@ static bool basis_match_find(const Config* config, const char* check_path,
 typedef struct {
   char name[FUZZY_NAME_LIMIT + 1];
   unsigned long long size;
-  size_t distance;
+  uint32_t distance;
   unsigned long long size_gap;
 } FuzzyCandidate;
 
-/* Two-row DP scratch, allocated once per directory scan (not per candidate) so
- * a 4096-entry directory never performs 4096 malloc/free pairs. */
-typedef struct {
-  size_t* prev;
-  size_t* cur;
-} FuzzyEditBuffer;
+/* rsync's fuzzy distance is a weighted Levenshtein variant in 16.16 fixed point
+ * (util1.c fuzzy_distance): a substitution costs UNIT +/- the byte difference
+ * and an insertion costs UNIT + the inserted byte, so similar names score low.
+ * The search keeps only distances <= 25*UNIT.  Ported verbatim for parity. */
+#define FUZZY_DIST_UNIT (1u << 16)
+#define FUZZY_DIST_REJECT (0xFFFFu * FUZZY_DIST_UNIT + 1)
+#define FUZZY_DIST_LIMIT (25u * FUZZY_DIST_UNIT)
 
-static bool fuzzy_edit_buffer_init(FuzzyEditBuffer* buf) {
-  buf->prev = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
-  buf->cur = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
-  if (!buf->prev || !buf->cur) {
-    free(buf->prev);
-    free(buf->cur);
-    buf->prev = NULL;
-    buf->cur = NULL;
-    return false;
-  }
-  return true;
-}
-
-static void fuzzy_edit_buffer_destroy(FuzzyEditBuffer* buf) {
-  free(buf->prev);
-  free(buf->cur);
-  buf->prev = NULL;
-  buf->cur = NULL;
-}
-
-/* Cheap lower bounds used to reject a candidate BEFORE the DP:
- *  - any edit script must at least absorb the length gap: d >= |la - lb|;
- *  - any character of `a` that does not occur in `b` at all must be deleted or
- *    substituted at its own position: d >= (count of such characters).
- * The acceptance gate is d*2 <= longer, so a candidate whose max of these two
- * bounds already violates it can be skipped without computing the distance. */
-static size_t fuzzy_absent_char_bound(const char* a, size_t la, const char* b, size_t lb) {
-  if (lb == 0)
-    return la;
-  bool present[256] = {false};
-  for (size_t i = 0; i < lb; i++)
-    present[(uint8_t)b[i]] = true;
-  size_t absent = 0;
-  for (size_t i = 0; i < la; i++)
-    if (!present[(uint8_t)a[i]])
-      absent++;
-  return absent;
-}
-
-/* Levenshtein edit distance between the two basenames.  A shared prefix and a
- * (non-overlapping) shared suffix can always be aligned at no cost, so the DP
- * only runs over the differing middles; its two rows come from `buf` (allocated
- * once by the caller).  Callers enforce la, lb <= FUZZY_NAME_LIMIT. */
-static size_t fuzzy_edit_distance(FuzzyEditBuffer* buf, const char* a, size_t la, const char* b,
-                                  size_t lb) {
-  size_t p = 0;
-  while (p < la && p < lb && a[p] == b[p])
-    p++;
-  /* Trim the common suffix (never overlapping the prefix).  Working with two
-     moving end indices keeps the region arithmetic explicit and safe. */
-  size_t ae = la;
-  size_t be = lb;
-  while (ae > p && be > p && a[ae - 1] == b[be - 1]) {
-    ae--;
-    be--;
-  }
-  size_t ma = ae - p;
-  size_t mb = be - p;
-  /* cppcheck-suppress knownConditionTrueFalse -- the prefix/suffix trims above
-     only run while the corresponding ends match, so a middle can remain; the
-     analysis unsoundly concludes the trims always consume everything. */
-  if (ma == 0)
-    return mb;
-  if (mb == 0)
-    return ma;
-  const char* A = a + p;
-  const char* B = b + p;
-  size_t* prev = buf->prev;
-  size_t* cur = buf->cur;
-  for (size_t j = 0; j <= mb; j++)
-    prev[j] = j;
-  for (size_t i = 1; i <= ma; i++) {
-    cur[0] = i;
-    for (size_t j = 1; j <= mb; j++) {
-      size_t cost = A[i - 1] == B[j - 1] ? 0 : 1;
-      size_t del = prev[j] + 1;
-      size_t ins = cur[j - 1] + 1;
-      size_t sub = prev[j - 1] + cost;
-      size_t m = del < ins ? del : ins;
-      cur[j] = m < sub ? m : sub;
+static uint32_t fuzzy_distance(const char* s1, unsigned len1, const char* s2, unsigned len2,
+                               uint32_t upperlimit, uint32_t* scratch) {
+  if ((len1 > len2 ? len1 - len2 : len2 - len1) * FUZZY_DIST_UNIT > upperlimit)
+    return FUZZY_DIST_REJECT;
+  if (!len1 || !len2) {
+    if (!len1) {
+      s1 = s2;
+      len1 = len2;
     }
-    size_t* tmp = prev;
-    prev = cur;
-    cur = tmp;
+    uint32_t cost = 0;
+    for (unsigned i = 0; i < len1; i++)
+      cost += (uint8_t)s1[i];
+    return (uint32_t)len1 * FUZZY_DIST_UNIT + cost;
   }
-  return prev[mb];
+  uint32_t* a = scratch;
+  for (unsigned i2 = 0; i2 < len2; i2++)
+    a[i2] = (i2 + 1) * FUZZY_DIST_UNIT;
+  for (unsigned i1 = 0; i1 < len1; i1++) {
+    uint32_t diag = i1 * FUZZY_DIST_UNIT;
+    uint32_t above = (i1 + 1) * FUZZY_DIST_UNIT;
+    for (unsigned i2 = 0; i2 < len2; i2++) {
+      uint32_t left = a[i2];
+      int32_t cost = (int32_t)(uint8_t)s1[i1] - (int32_t)(uint8_t)s2[i2];
+      if (cost != 0)
+        cost = cost < 0 ? (int32_t)(FUZZY_DIST_UNIT - (uint32_t)(-cost))
+                        : (int32_t)(FUZZY_DIST_UNIT + (uint32_t)cost);
+      uint32_t diag_inc = diag + (uint32_t)cost;
+      uint32_t left_inc = left + FUZZY_DIST_UNIT + (uint8_t)s1[i1];
+      uint32_t above_inc = above + FUZZY_DIST_UNIT + (uint8_t)s2[i2];
+      a[i2] = above = left < above ? (left_inc < diag_inc ? left_inc : diag_inc)
+                                   : (above_inc < diag_inc ? above_inc : diag_inc);
+      diag = left;
+    }
+  }
+  return a[len2 - 1];
 }
 
-/* Deterministic ordering of two fuzzy candidates: smallest edit distance,
- * then the size closest to the incoming file, then the lexical basename. */
+/* rsync's find_filename_suffix (util1.c): return the last significant filename
+ * suffix (its dot included).  Leading dots are not a suffix; a trailing "~" is
+ * ignored; .bak/.old/.orig and a "~/<num>" backup marker are skipped. */
+static const char* fuzzy_find_suffix(const char* fn, int fn_len, int* len_ptr) {
+  const char* suf;
+  const char* s;
+  bool had_tilde;
+  int s_len;
+
+  while (fn_len && *fn == '.') {
+    fn++;
+    fn_len--;
+  }
+  if (fn_len > 1 && fn[fn_len - 1] == '~') {
+    fn_len--;
+    had_tilde = true;
+  } else {
+    had_tilde = false;
+  }
+  suf = "";
+  *len_ptr = 0;
+  for (s = fn + fn_len; fn_len > 1;) {
+    while (--s != fn && *s != '.') {
+    }
+    if (s == fn)
+      break;
+    s_len = fn_len - (int)(s - fn);
+    fn_len = (int)(s - fn);
+    if (s_len == 4) {
+      if (strcmp(s + 1, "bak") == 0 || strcmp(s + 1, "old") == 0)
+        continue;
+    } else if (s_len == 5) {
+      if (strcmp(s + 1, "orig") == 0)
+        continue;
+    } else if (s_len > 2 && had_tilde && s[1] == '~' && isdigit((unsigned char)s[2])) {
+      continue;
+    }
+    *len_ptr = s_len;
+    suf = s;
+    if (s_len == 1)
+      break;
+    for (s++, s_len--; s_len > 0; s++, s_len--) {
+      if (!isdigit((unsigned char)*s))
+        return suf;
+    }
+    s = suf;
+  }
+  return suf;
+}
+
+
+/* Deterministic ordering of two fuzzy candidates with equal rsync distance:
+ * smallest size gap, then the lexical basename (rsync itself takes the last
+ * equal-distance candidate in file-list order). */
 static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandidate* best) {
   if (!best->name[0])
     return true;
@@ -1550,8 +1557,8 @@ static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandid
  * = 0) when no candidate qualifies, which means the caller performs the normal
  * whole-file transfer. */
 static void* fuzzy_basis_find_and_load(const Config* config, const char* check_path,
-                                       unsigned long long check_size,
-                                       unsigned long long* out_size) {
+                                       unsigned long long check_size, time_t check_mtime,
+                                       long check_mtime_nsec, unsigned long long* out_size) {
   *out_size = 0;
   if (!config || !config->receive_root_directory || !config->fuzzy || !config->use_delta ||
       !check_path || check_size < DELTA_MIN_FILE_SIZE || check_size > config->delta_max_file_size ||
@@ -1594,18 +1601,28 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     return NULL;
   }
 
-  /* The DP scratch rows are allocated once per scan (not once per candidate). */
-  FuzzyEditBuffer ebuf;
-  if (!fuzzy_edit_buffer_init(&ebuf)) {
+  /* The weighted-distance scratch row is allocated once per scan (not once per
+     candidate). */
+  uint32_t* dist_scratch = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(uint32_t));
+  if (!dist_scratch) {
     closedir(dir);
     close(dir_fd);
     free(leaf);
     free(full_path);
     return NULL;
   }
+  int fname_suf_len = 0;
+  const char* fname_suf = fuzzy_find_suffix(leaf, (int)target_len, &fname_suf_len);
 
   FuzzyCandidate best;
   memset(&best, 0, sizeof(best));
+  uint32_t lowest_dist = FUZZY_DIST_LIMIT;
+  /* rsync's fuzzy search runs an exact size+mtime pass before the name-distance
+     pass; such a candidate is almost certainly the same content and wins
+     regardless of how dissimilar its name is.  The first one (directory order,
+     deterministic) is kept. */
+  FuzzyCandidate exact;
+  memset(&exact, 0, sizeof(exact));
   const struct dirent* entry;
   size_t scanned = 0;
   /* readdir() yields entries in filesystem-dependent order, so the SET of
@@ -1625,22 +1642,32 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE ||
         !delta_should_attempt(cand_size, check_size, config->delta_max_file_size))
       continue;
-    /* Cheap pre-name gates run BEFORE the edit-distance DP.  The edit distance
-       is bounded below by the length gap |la-lb| and by the number of
-       characters of one basename that are absent from the other (each such
-       position costs at least one op), so a candidate whose acceptance gate
-       (distance*2 <= longer) already fails on the max of those bounds is
-       skipped without running the DP. */
-    size_t longer = target_len > name_len ? target_len : name_len;
-    size_t bound = longer - (target_len < name_len ? target_len : name_len);
-    size_t absent = fuzzy_absent_char_bound(leaf, target_len, name, name_len);
-    if (absent > bound)
-      bound = absent;
-    if (bound * 2 > longer)
+    long cand_nsec = 0;
+#ifdef __linux__
+    cand_nsec = st.st_mtim.tv_nsec;
+#endif
+    if (!exact.name[0] && cand_size == check_size &&
+        metadata_mtime_matches(st.st_mtime, cand_nsec, check_mtime, check_mtime_nsec,
+                               config->modify_window)) {
+      memcpy(exact.name, name, name_len + 1);
+      exact.size = cand_size;
+      exact.size_gap = 0;
       continue;
-    size_t distance = fuzzy_edit_distance(&ebuf, leaf, target_len, name, name_len);
-    if (distance * 2 > longer)
+    }
+    /* rsync's name-distance pass: a weighted Levenshtein distance over the full
+       basenames, plus ten times the same distance over the filename suffixes,
+       accepted only when it does not exceed the running lowest distance. */
+    int name_suf_len = 0;
+    const char* name_suf = fuzzy_find_suffix(name, (int)name_len, &name_suf_len);
+    uint32_t distance =
+        fuzzy_distance(name, (unsigned)name_len, leaf, (unsigned)target_len, lowest_dist, dist_scratch);
+    if (distance < 0xFFFF0000U)
+      distance += fuzzy_distance(name_suf, (unsigned)name_suf_len, fname_suf, (unsigned)fname_suf_len,
+                                 0xFFFF0000U, dist_scratch) *
+                  10;
+    if (distance > lowest_dist)
       continue;
+    lowest_dist = distance;
     FuzzyCandidate cand;
     memcpy(cand.name, name, name_len + 1);
     cand.size = cand_size;
@@ -1651,7 +1678,11 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
   }
   closedir(dir);
   free(leaf);
-  fuzzy_edit_buffer_destroy(&ebuf);
+  free(dist_scratch);
+
+  /* Prefer the exact size+mtime candidate over any name-distance winner. */
+  if (exact.name[0])
+    best = exact;
 
   void* basis = NULL;
   if (best.name[0]) {
@@ -2373,7 +2404,8 @@ static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState
     return INCREMENTAL_CONTINUE;
   unsigned long long fuzzy_size = 0;
   void* fuzzy_basis =
-      fuzzy_basis_find_and_load(config, state->check_path, state->check_size, &fuzzy_size);
+      fuzzy_basis_find_and_load(config, state->check_path, state->check_size,
+                                (time_t)state->check_mtime, (long)state->check_mtime_nsec, &fuzzy_size);
   if (fuzzy_basis != NULL) {
     bool fuzzy_failed = false;
     File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, fuzzy_basis,
