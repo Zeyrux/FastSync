@@ -169,6 +169,36 @@ class TestDirsOneLevel:
                 == os.path.isfile(os.path.join(rdst, "unrelated", "keep.txt")))
         assert _tree(dest) == _tree(rdst)
 
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_relative_delete_protects_excluded_mirror(self, mt):
+        """-R --delete with --exclude must protect the destination mirror of an
+        excluded source path (recorded as a prefix-relative wire path)."""
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_delexc_src"))
+        with open(os.path.join(source, "foo", "secret.tmp"), "wb") as fh:
+            fh.write(b"secret\n")
+        dest = os.path.join(TEST_DATA_DIR, "sel_delexc_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "sel_delexc_rdst")
+        for root in (dest, rdst):
+            clean_dir(root)
+            os.makedirs(os.path.join(root, "foo"))
+            with open(os.path.join(root, "foo", "secret.tmp"), "wb") as fh:
+                fh.write(b"secret\n")
+            with open(os.path.join(root, "foo", "extra.txt"), "wb") as fh:
+                fh.write(b"extra\n")
+        spec = source + "/./foo"
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            r = _rsync(["-aR", "--delete", "--exclude=*.tmp", spec, rdst + "/"])
+            assert r.returncode == 0, r.stderr
+            flags = ["-a", "-R", "--delete", "--exclude=*.tmp"] + (["--threads"] if mt else [])
+            result, _ = run_client(spec, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, result.stderr[:300]
+        assert _tree(dest) == _tree(rdst)
+        assert os.path.isfile(os.path.join(dest, "foo", "secret.tmp"))
+        assert not os.path.exists(os.path.join(dest, "foo", "extra.txt"))
+
 
 class TestClientAliases:
     """#5: safe rsync option aliases accepted client-side."""

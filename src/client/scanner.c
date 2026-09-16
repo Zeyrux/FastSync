@@ -1289,9 +1289,17 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
          wire path, not its source path (which would not match the destination
          layout and would leave the mirror deletable). */
       if (inspected.excluded) {
-        char* protected_path = scanner->relative_mode
-                                   ? child_rel_path(scanner->current_rel, entry->d_name)
-                                   : path_cat(scanner->current_path, entry->d_name);
+        char* protected_path;
+        if (scanner->relative_mode) {
+          protected_path = child_rel_path(scanner->current_rel, entry->d_name);
+        } else if (scanner->options.relative_prefix) {
+          char* relc = child_rel_path(scanner->current_rel, entry->d_name);
+          protected_path =
+              relc ? scanner_prefix_send_path(scanner->options.relative_prefix, relc) : NULL;
+          free(relc);
+        } else {
+          protected_path = path_cat(scanner->current_path, entry->d_name);
+        }
         if (!protected_path) {
           scanner->failed = true;
           break;
@@ -1753,8 +1761,20 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
     if (!files_from_prune && !use_rel && options->excluded_paths) {
       const char* rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
+      char* prefixed = NULL;
+      if (options->relative_prefix) {
+        prefixed = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
+        if (!prefixed) {
+          free(rel);
+          free(cur_path);
+          ps->failed = true;
+          return;
+        }
+        rel_path = prefixed;
+      }
       if (!excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
         ps->failed = true;
+      free(prefixed);
     }
     free(rel);
     free(cur_path);
