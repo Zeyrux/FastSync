@@ -2561,15 +2561,35 @@ static void test_parse_args_filter_rules() {
   EXPECT_EQ_INT(parse_args(cfg, 4, missing_argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 
-  /* rsync shorthands/modifiers we do not support are rejected instead of being
-   * silently parsed as literal patterns. */
-  static const char* const unsupported[] = {
-      ": .rsync-filter", ". /tmp/rules", "-s foo", "-p bar", "-C", "-! *.o", "!",
+  /* Full rsync grammar (rule words, modifiers, clear) is supported. */
+  cfg = config_create();
+  positional_count = 0;
+  char* grammar_argv[] = {"fastsync",
+                          "--filter=hide *.tmp",
+                          "--filter=show *.txt",
+                          "--filter=protect *.bak",
+                          "--filter=risk *.o",
+                          "--filter=-s foo",
+                          "--filter=-p bar",
+                          "--filter=-! *.o",
+                          "--filter=dir-merge .rules",
+                          "--filter=!",
+                          "/src",
+                          "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 11, grammar_argv, positional_args, &positional_count), 0);
+  config_delete(cfg);
+
+  /* Genuinely malformed rules are still rejected. */
+  static const char* const malformed[] = {
+      "merge",          /* merge requires a filename */
+      "dir-merge",      /* dir-merge requires a filename */
+      "clear extra",    /* clear takes no pattern */
+      "no-such-rule x", /* unknown rule word */
   };
-  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
     cfg = config_create();
     positional_count = 0;
-    char* rule_argv[] = {"fastsync", "--filter", (char*)unsupported[i], "/src", "/dst"};
+    char* rule_argv[] = {"fastsync", "--filter", (char*)malformed[i], "/src", "/dst"};
     EXPECT_EQ_INT(parse_args(cfg, 5, rule_argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }

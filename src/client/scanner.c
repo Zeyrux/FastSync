@@ -51,29 +51,64 @@ static FilterNode* filter_node_alloc(FilterNode* parent, FilterRuleList* own) {
   return node;
 }
 
-/* Evaluate a rule chain for an entry inside the directory whose content
- * context is `node`. rsync precedence, highest first: the innermost (current)
- * directory's .rsync-filter rules, then each ancestor's, then the root's, and
- * finally the command-line base rules (--filter/-C). A deeper per-directory
- * file therefore overrides a shallower one, and per-directory files override
- * the base rules by default. Returns FILTER_ACTION_NONE when nothing matched. */
-static FilterAction chain_rules_apply(const FilterRuleList* base, const FilterNode* node,
-                                      const char* rel, const char* leaf, bool is_dir) {
-  if (node) {
-    FilterAction own_action = filter_rules_apply(node->own, rel, leaf, is_dir);
-    if (own_action != FILTER_ACTION_NONE)
-      return own_action;
-    return chain_rules_apply(base, node->parent, rel, leaf, is_dir);
+/* Evaluate a rule chain for one entry.  rsync precedence, highest first: the
+ * innermost (current) directory's .rsync-filter rules, then each ancestor's,
+ * then the root's, and finally the command-line base rules (--filter/-C).  The
+ * sender-side verdict decides whether the entry is hidden from the transfer;
+ * the receiver-side verdict decides whether its destination mirror is protected
+ * from --delete.  Each side takes the FIRST matching rule independently. */
+typedef struct {
+  bool hide;    /* sender-side exclude matched */
+  bool protect; /* receiver-side exclude matched */
+} FilterOutcome;
+
+static void chain_rules_outcome(const FilterRuleList* base, const FilterNode* node,
+                                const char* rel, const char* leaf, bool is_dir,
+                                FilterOutcome* out) {
+  memset(out, 0, sizeof(*out));
+  bool sender_decided = false;
+  bool receiver_decided = false;
+  const FilterNode* n = node;
+  while (!sender_decided || !receiver_decided) {
+    const FilterRuleList* list = n ? n->own : base;
+    if (list) {
+      if (!sender_decided) {
+        FilterAction action = filter_rules_apply_side(list, rel, leaf, is_dir, FILTER_SIDE_SENDER);
+        if (action != FILTER_ACTION_NONE) {
+          out->hide = action == FILTER_ACTION_EXCLUDE;
+          sender_decided = true;
+        }
+      }
+      if (!receiver_decided) {
+        FilterAction action =
+            filter_rules_apply_side(list, rel, leaf, is_dir, FILTER_SIDE_RECEIVER);
+        if (action != FILTER_ACTION_NONE) {
+          out->protect = action == FILTER_ACTION_PROTECT;
+          receiver_decided = true;
+        }
+      }
+    }
+    if (!n)
+      break;
+    n = n->parent;
   }
-  return base ? filter_rules_apply(base, rel, leaf, is_dir) : FILTER_ACTION_NONE;
 }
 
 static bool entry_allowed(const FilterRuleList* base, const FilterNode* node, const char* rel,
-                          const char* leaf, bool is_dir, bool per_dir_filters) {
-  /* -F: per-directory .rsync-filter files are never transferred. */
-  if (per_dir_filters && !is_dir && strcmp(leaf, ".rsync-filter") == 0)
+                          const char* leaf, bool is_dir, bool exclude_filter_files,
+                          bool* protect_out) {
+  /* -FF: per-directory .rsync-filter files are never transferred (single -F
+     transfers them, matching rsync). */
+  if (exclude_filter_files && !is_dir && strcmp(leaf, ".rsync-filter") == 0) {
+    if (protect_out)
+      *protect_out = false;
     return false;
-  return chain_rules_apply(base, node, rel, leaf, is_dir) != FILTER_ACTION_EXCLUDE;
+  }
+  FilterOutcome outcome;
+  chain_rules_outcome(base, node, rel, leaf, is_dir, &outcome);
+  if (protect_out)
+    *protect_out = outcome.protect;
+  return !outcome.hide;
 }
 
 static void dir_entry_destroy(void* item) {
@@ -227,14 +262,19 @@ static char* child_rel_path(const char* parent_rel, const char* name) {
   return path_cat(parent_rel, name);
 }
 
-/* Apply the --files-from allow-set and the filter layer to one entry. */
+/* Apply the --files-from allow-set and the filter layer to one entry.  On
+ * return `*protect_out` is true when a receiver-side rule protects the entry's
+ * destination mirror from deletion. */
 static bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* base,
                                    const FilterNode* node, const char* rel, const char* leaf,
-                                   bool is_dir, bool per_dir_filters) {
+                                   bool is_dir, bool per_dir_filters, bool exclude_filter_files,
+                                   bool* protect_out) {
+  if (protect_out)
+    *protect_out = false;
   if (file_list && !file_list_affects(file_list, rel))
     return false;
   if (base || per_dir_filters)
-    return entry_allowed(base, node, rel, leaf, is_dir, per_dir_filters);
+    return entry_allowed(base, node, rel, leaf, is_dir, exclude_filter_files, protect_out);
   return true;
 }
 
@@ -375,28 +415,77 @@ static bool scanner_record_synced_dir(const ScannerOptions* options, const char*
   return excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
 }
 
-/* Merge the open directory's own .rsync-filter rules into the inherited
- * context, returning the context used for this directory's entries. On a parse
- * error the scanner is marked failed. Returns 0 on success, -1 on failure. */
+/* Read every per-directory filter file that applies to `dir_path` (its
+ * .rsync-filter when -F is active, plus each registered "dir-merge NAME") into a
+ * fresh list.  Returns NULL on allocation/parse failure (message in `err`);
+ * returns an empty list (and *any_exists=false) when no file exists. */
+static FilterRuleList* read_dir_filters(const ScannerOptions* options, const char* dir_path,
+                                        const char* rel, bool* any_exists, char* err,
+                                        size_t err_size) {
+  if (err && err_size > 0)
+    err[0] = '\0';
+  const FilterRuleList* base = options->base_filters;
+  bool have_names = options->per_dir_filters || (base && base->dir_merge_count > 0);
+  if (any_exists)
+    *any_exists = false;
+  if (!have_names)
+    return NULL;
+  FilterRuleList* own = filter_rule_list_create();
+  if (!own) {
+    snprintf(err, err_size, "memory allocation failed");
+    return NULL;
+  }
+  FilterParseOptions opts = {.delete_excluded = options->delete_excluded, .cvs_exclude = false};
+  bool exists = false;
+  if (options->per_dir_filters) {
+    if (!filter_file_append(own, dir_path, ".rsync-filter", rel, &opts, &exists, err, err_size))
+      goto fail;
+    if (exists && any_exists)
+      *any_exists = true;
+  }
+  if (base) {
+    for (int i = 0; i < base->dir_merge_count; i++) {
+      if (!filter_file_append(own, dir_path, base->dir_merge_names[i], rel, &opts, &exists, err,
+                              err_size))
+        goto fail;
+      if (exists && any_exists)
+        *any_exists = true;
+    }
+  }
+  return own;
+fail:
+  filter_rule_list_free(own);
+  return NULL;
+}
+
+/* Merge the open directory's own per-directory filter files (the default
+ * .rsync-filter when -F is active, plus every "dir-merge NAME" registered on the
+ * base rule list) into the inherited context, returning the context used for
+ * this directory's entries. On a parse error the scanner is marked failed.
+ * Returns 0 on success, -1 on failure. */
 static int open_directory_filter_context(DirectoryScanner* scanner, const FilterNode* inherited) {
-  if (!scanner->options.per_dir_filters) {
+  char err[256];
+  bool any_exists = false;
+  FilterRuleList* own = read_dir_filters(&scanner->options, scanner->current_path,
+                                         scanner->current_rel ? scanner->current_rel : "",
+                                         &any_exists, err, sizeof(err));
+  if (!own && any_exists) {
     scanner->current_node = (FilterNode*)inherited;
     return 0;
   }
-  char err[256];
-  bool exists = false;
-  FilterRuleList* own =
-      filter_file_read(scanner->current_path, scanner->current_rel ? scanner->current_rel : "",
-                       &exists, err, sizeof(err));
   if (!own) {
+    if (err[0] == '\0') {
+      scanner->current_node = (FilterNode*)inherited;
+      return 0;
+    }
     char* escaped_path = output_escape(scanner->current_path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_ERROR, "invalid .rsync-filter in %s: %s",
+    log_message(LOG_LEVEL_ERROR, "invalid per-directory filter in %s: %s",
                 escaped_path ? escaped_path : "<allocation failed>", err);
     free(escaped_path);
     scanner->failed = true;
     return -1;
   }
-  if (exists && own->count > 0) {
+  if (any_exists && (own->count > 0 || own->dir_merge_count > 0)) {
     FilterNode* node = filter_node_alloc((FilterNode*)inherited, own);
     if (!node || !array_list_add(scanner->filter_nodes, node)) {
       filter_node_destroy(node);
@@ -1164,10 +1253,15 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       scanner->failed = true;
       break;
     }
+    bool protect = false;
     bool passes_selection = entry_passes_selection(
         scanner->options.file_list, scanner->options.base_filters, scanner->current_node, rel,
-        entry->d_name, is_dir, scanner->options.per_dir_filters);
-    if (!passes_selection) {
+        entry->d_name, is_dir, scanner->options.per_dir_filters,
+        scanner->options.exclude_per_dir_filter_files, &protect);
+    /* A sender-side hide leaves the entry out of the transfer; an independent
+       receiver-side protect rule keeps a transferred entry's destination mirror
+       from being deleted.  Both are recorded in the same protection set. */
+    if (!passes_selection || protect) {
       /* --files-from subset pruning is not a filter exclusion: its delete
          semantics stay keep-set-only (an unlisted source path is treated as
          absent, so its destination mirror is a deletable extra).  A rule-based
@@ -1559,22 +1653,27 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     ps->failed = true;
     return;
   }
+  bool protect = false;
   bool passes = entry_passes_selection(options->file_list, options->base_filters, root_node, rel,
-                                       entry->d_name, is_dir, options->per_dir_filters);
+                                       entry->d_name, is_dir, options->per_dir_filters,
+                                       options->exclude_per_dir_filter_files, &protect);
   /* -R + --files-from: root-level files keep their bare relative send path. */
   bool use_rel = options->relative && options->file_list != NULL;
-  if (!passes) {
+  if (!passes || protect) {
     /* --files-from subset pruning is not a filter exclusion; -R bare-wire-path
        exclusions are never recorded (see ScannerOptions.excluded_paths). */
     bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
-    if (!files_from_prune && !use_rel && options->excluded_paths) {
+    if ((!files_from_prune && !use_rel) || protect) {
       const char* rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
-      if (!excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
+      if (options->excluded_paths &&
+          !excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
         ps->failed = true;
     }
-    free(rel);
-    free(cur_path);
-    return;
+    if (!passes) {
+      free(rel);
+      free(cur_path);
+      return;
+    }
   }
   if (is_dir) {
     free(rel);
@@ -1815,22 +1914,25 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     root_dev = root_stats.st_dev;
   }
 
-  /* Build the root directory's .rsync-filter context once; workers seed their
-   * scanners with it so per-dir rules behave identically to the sequential
+  /* Build the root directory's per-directory filter context once; workers seed
+   * their scanners with it so per-dir rules behave identically to the sequential
    * scanner. */
   FilterNode* root_node = NULL;
-  if (options->per_dir_filters) {
+  {
     char err[256];
-    bool exists = false;
-    FilterRuleList* own = filter_file_read(root_directory, "", &exists, err, sizeof(err));
-    if (!own) {
-      log_message(LOG_LEVEL_ERROR, "invalid .rsync-filter in %s: %s", root_directory, err);
-      array_list_delete(root_files);
-      array_list_delete(subdirs);
-      parallel_scanner_destroy(ps);
-      return NULL;
-    }
-    if (exists && own->count > 0) {
+    bool any_exists = false;
+    FilterRuleList* own = read_dir_filters(options, root_directory, "", &any_exists, err, sizeof(err));
+    if (!own && any_exists) {
+      /* no files exist: leave root_node NULL */
+    } else if (!own) {
+      if (err[0] != '\0') {
+        log_message(LOG_LEVEL_ERROR, "invalid per-directory filter in %s: %s", root_directory, err);
+        array_list_delete(root_files);
+        array_list_delete(subdirs);
+        parallel_scanner_destroy(ps);
+        return NULL;
+      }
+    } else if (any_exists && (own->count > 0 || own->dir_merge_count > 0)) {
       root_node = filter_node_alloc(NULL, own);
       if (!root_node) {
         filter_rule_list_free(own);

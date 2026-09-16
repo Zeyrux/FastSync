@@ -656,16 +656,25 @@ static int config_add_pattern(char*** patterns, int* count, const char* value,
 
 /* Validate and append one --filter=RULE string. Returns 0 on success, -1 on error. */
 static int config_add_filter(Config* config, const char* rule) {
-  char err[160];
-  FilterRule* parsed = filter_rule_parse(rule, err, sizeof(err));
-  if (!parsed) {
+  char err[256];
+  /* Validate through the full list parser so clear/merge/dir-merge and the rule
+     modifiers are accepted (and a merge file is readable) at parse time. */
+  FilterParseOptions opts = {.delete_excluded = config->delete_excluded,
+                             .cvs_exclude = config->cvs_exclude};
+  FilterRuleList* probe = filter_rule_list_create();
+  if (!probe) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --filter");
+    return -1;
+  }
+  bool ok = filter_rule_list_parse_append(probe, rule, &opts, NULL, err, sizeof(err));
+  filter_rule_list_free(probe);
+  if (!ok) {
     char* escaped = output_escape(rule, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "invalid --filter rule '%s': %s",
                 escaped ? escaped : "<allocation failed>", err);
     free(escaped);
     return -1;
   }
-  filter_rule_free(parsed);
   if (!config->filters) {
     config->filters = array_list_create(free);
     if (!config->filters) {
@@ -1324,6 +1333,11 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
   }
   if (entry->offset == offsetof(Config, eight_bit_output))
     protocol_set_8_bit_output(true);
+  /* -F is repeatable: rsync's single -F transfers .rsync-filter files, a
+     repeated -FF excludes them.  Count the occurrences so the scanner can
+     distinguish the two. */
+  if (entry->offset == offsetof(Config, per_dir_filter) && config->per_dir_filter_count < INT_MAX)
+    config->per_dir_filter_count++;
   /* A delete-timing flag selects when --delete removes extras, so it
      implies --delete exactly like the rsync options do. */
   if (entry->offset == offsetof(Config, delete_before) ||

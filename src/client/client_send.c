@@ -159,7 +159,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   }
   if (rule_count > 0 || config->cvs_exclude) {
     char err[160];
-    out->base_filters = filter_base_build(texts, rule_count, config->cvs_exclude, err, sizeof(err));
+    out->base_filters = filter_base_build(texts, rule_count, config->cvs_exclude,
+                                          config->delete_excluded, err, sizeof(err));
     free(texts);
     if (!out->base_filters) {
       log_message(LOG_LEVEL_ERROR, "invalid filter rule: %s", err);
@@ -204,6 +205,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->file_list = (const FileListSet*)config->files_from_set;
   options->base_filters = out->base_filters;
   options->per_dir_filters = config->per_dir_filter;
+  options->delete_excluded = config->delete_excluded;
+  options->exclude_per_dir_filter_files = config->per_dir_filter_count >= 2;
   options->dirs = config->dirs;
   options->relative = config->relative;
   options->prune_empty_dirs = config->prune_empty_dirs;

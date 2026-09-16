@@ -63,6 +63,12 @@ typedef struct {
   const FileListSet* file_list;       /* --files-from allow-set, or NULL */
   const FilterRuleList* base_filters; /* command-line + -C rules, or NULL */
   bool per_dir_filters;               /* -F: read .rsync-filter per directory */
+  /* --delete-excluded: per-directory plain rules become sender-only, so they no
+     longer protect the receiver from deletion. */
+  bool delete_excluded;
+  /* -FF: also exclude the per-directory filter files themselves from the
+     transfer (single -F transfers them). */
+  bool exclude_per_dir_filter_files;
   bool dirs;                          /* -d/--dirs: transfer dir entries, no recursion */
   bool relative;                      /* -R/--relative (dest rel paths, with --files-from) */
   /* --list-only: emit an is_dir File for every traversed directory (the listing

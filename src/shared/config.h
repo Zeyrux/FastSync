@@ -377,6 +377,10 @@ typedef struct Config {
   bool from0;           /* -0/--from0: NUL-delimited *-from files */
   bool cvs_exclude;     /* -C/--cvs-exclude: standard CVS ignore set */
   bool per_dir_filter;  /* -F: apply per-directory .rsync-filter files */
+  /* -F click count.  rsync's single -F means --filter='dir-merge
+   * /.rsync-filter' (the .rsync-filter files themselves are transferred); a
+   * repeated -F adds --filter='- .rsync-filter' so they are excluded too. */
+  int per_dir_filter_count;
   bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
   /* --no-implied-dirs: client-only.  With -R + --files-from, refuse to place a
    * listed file whose ancestor directory is not itself explicitly listed. */

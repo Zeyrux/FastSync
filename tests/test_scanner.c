@@ -855,7 +855,7 @@ static void test_filter_rules(bool parallel) {
   /* - *.tmp excludes only the tmp file; other files remain (default include). */
   const char* exclude_only[] = {"- *.tmp"};
   char err[160];
-  FilterRuleList* base = filter_base_build(exclude_only, 1, false, err, sizeof(err));
+  FilterRuleList* base = filter_base_build(exclude_only, 1, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   ScannerOptions options = {0};
   options.base_filters = base;
@@ -875,7 +875,7 @@ static void test_filter_rules(bool parallel) {
 
   /* Anchored include then exclude-all: only root-level keep* survives. */
   const char* anchored[] = {"+ /a.txt", "- *"};
-  base = filter_base_build(anchored, 2, false, err, sizeof(err));
+  base = filter_base_build(anchored, 2, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   options.base_filters = base;
   rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
@@ -889,7 +889,7 @@ static void test_filter_rules(bool parallel) {
   /* The common include idiom (the exact rule order the CLI compiles from
    * --include='*.txt' --exclude='*'): only .txt files survive. */
   const char* idiom[] = {"+ *.txt", "- *"};
-  base = filter_base_build(idiom, 2, false, err, sizeof(err));
+  base = filter_base_build(idiom, 2, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   options.base_filters = base;
   rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
@@ -905,7 +905,7 @@ static void test_filter_rules(bool parallel) {
   /* An include rule alone is NOT a mandatory whitelist (rsync semantics): only
    * the matching file is affected, everything else is still transferred. */
   const char* include_alone[] = {"+ *.txt"};
-  base = filter_base_build(include_alone, 1, false, err, sizeof(err));
+  base = filter_base_build(include_alone, 1, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   options.base_filters = base;
   rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
@@ -932,7 +932,7 @@ static void test_filter_dir_only_and_anchored(bool parallel) {
 
   const char* rules[] = {"- /sub/"};
   char err[160];
-  FilterRuleList* base = filter_base_build(rules, 1, false, err, sizeof(err));
+  FilterRuleList* base = filter_base_build(rules, 1, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   ScannerOptions options = {0};
   options.base_filters = base;
@@ -966,7 +966,7 @@ static void test_cvs_defaults(bool parallel) {
   create_test_file("test_scan_cvs/keep.txt", "keep");
 
   char err[160];
-  FilterRuleList* base = filter_base_build(NULL, 0, true, err, sizeof(err));
+  FilterRuleList* base = filter_base_build(NULL, 0, true, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   ScannerOptions options = {0};
   options.base_filters = base;
@@ -1005,6 +1005,7 @@ static void test_per_dir_filter(bool parallel) {
 
   ScannerOptions options = {0};
   options.per_dir_filters = true;
+  options.exclude_per_dir_filter_files = true; /* -FF */
   if (parallel)
     options.num_threads = 2;
   char** paths = NULL;
@@ -1084,6 +1085,7 @@ static void test_per_dir_filter_override(bool parallel) {
 
   ScannerOptions options = {0};
   options.per_dir_filters = true;
+  options.exclude_per_dir_filter_files = true; /* -FF */
   if (parallel)
     options.num_threads = 2;
   char** paths = NULL;
