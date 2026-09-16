@@ -233,6 +233,42 @@ class TestDeleteTimingFinalStateParity:
         )
 
 
+class TestDeleteTimingTypeConflictParity:
+    """A destination entry whose type differs from the source is replaced, in
+    both per-directory timings and in both directions, exactly like rsync."""
+
+    @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
+    @requires_rsync
+    def test_type_conflicts_match_rsync(self, timing):
+        source = os.path.join(TEST_DATA_DIR, "dtc_src")
+        clean_dir(source)
+        _write(os.path.join(source, "foo"), b"now a file\n")
+        _write(os.path.join(source, "bar", "inner.txt"), b"now a dir\n")
+
+        def seed_dest(root):
+            clean_dir(root)
+            _write(os.path.join(root, "foo", "inner.txt"), b"was a dir\n")
+            _write(os.path.join(root, "bar"), b"was a file\n")
+
+        rsync_dst = os.path.join(TEST_DATA_DIR, "dtc_rsync_dst")
+        seed_dest(rsync_dst)
+        rsync_result = _rsync(["-a", timing, source + "/", rsync_dst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        rsync_tree = _tree(rsync_dst)
+
+        dest = os.path.join(TEST_DATA_DIR, "dtc_dst")
+        clean_dir(dest)
+        received = get_dest_received_dir(dest, source)
+        seed_dest(received)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=[timing], port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert _tree(received) == rsync_tree, (
+            f"{timing}: fastsync tree {_tree(received)} != rsync tree {rsync_tree}"
+        )
+
+
 class TestDeleteTimingFailure:
     """A mid-transfer failure distinguishes during from delay."""
 
