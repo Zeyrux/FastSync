@@ -435,20 +435,22 @@ static bool valid_name(const char* value) {
          strchr(value, '/') == NULL;
 }
 
-static bool read_section(int fd, ArrayList* list, bool rel_path) {
+/* Read one count-prefixed section.  `bytes` is the running per-frame budget,
+ * shared across every section of the frame so a hostile peer cannot retain more
+ * than MAX_MANIFEST_BYTES from one STATUS_DELETE_PLAN frame. */
+static bool read_section(int fd, ArrayList* list, bool rel_path, size_t* bytes) {
   int count;
   if (!receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
     return false;
-  size_t bytes = 0;
   for (int i = 0; i < count; i++) {
     char* value = receive_wire_str(fd);
     bool ok = value && (rel_path ? valid_rel_path(value) : valid_name(value));
     if (ok) {
       size_t entry_size = strlen(value) + sizeof(char*) + 16;
-      if (entry_size > MAX_MANIFEST_BYTES - bytes) {
+      if (entry_size > MAX_MANIFEST_BYTES - *bytes) {
         ok = false;
       } else {
-        bytes += entry_size;
+        *bytes += entry_size;
         ok = array_list_add(list, value);
       }
     }
@@ -747,10 +749,11 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
     send_status(fd, STATUS_ERROR);
     return -1;
   }
+  size_t bytes = 0;
   if (has_config) {
-    if (session->config_seen || !read_section(fd, session->protected_prefixes, true) ||
-        !read_section(fd, session->size_skipped, true) ||
-        !read_section(fd, session->missing, true)) {
+    if (session->config_seen || !read_section(fd, session->protected_prefixes, true, &bytes) ||
+        !read_section(fd, session->size_skipped, true, &bytes) ||
+        !read_section(fd, session->missing, true, &bytes)) {
       send_status(fd, STATUS_ERROR);
       return -1;
     }
@@ -760,7 +763,7 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
   ArrayList* dirs = array_list_create(free);
   ArrayList* files = array_list_create(free);
   bool parsed = dir && (strcmp(dir, ".") == 0 || valid_rel_path(dir)) && dirs && files &&
-                read_section(fd, dirs, false) && read_section(fd, files, false);
+                read_section(fd, dirs, false, &bytes) && read_section(fd, files, false, &bytes);
   if (!parsed) {
     free(dir);
     array_list_delete(dirs);
