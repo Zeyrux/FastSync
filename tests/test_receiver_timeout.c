@@ -65,7 +65,7 @@ static void test_receiver_aborts_idle_keepalive() {
   ssize_t wrote = write(sv[0], &keepalive, sizeof(keepalive));
   int result = -2;
   if (wrote == (ssize_t)sizeof(keepalive))
-    result = receiver_process_pending(config, sv[1], &sink, NULL);
+    result = receiver_process_pending(config, sv[1], &sink, NULL, NULL);
   Status reply = STATUS_OK;
   ssize_t got = -1;
   if (result == -1)

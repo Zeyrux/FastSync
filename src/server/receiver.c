@@ -3,6 +3,7 @@
 #include "charset.h"
 #include "chunk.h"
 #include "config.h"
+#include "delete_plan.h"
 #include "delay_updates.h"
 #include "file.h"
 #include "file_receive.h"
@@ -244,7 +245,7 @@ static bool receiver_note_status(const struct timespec* session_start,
 }
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink) {
-  return receiver_process_pending(config, file_descriptor, sink, NULL);
+  return receiver_process_pending(config, file_descriptor, sink, NULL, NULL);
 }
 
 /* Runs the whole receive loop.  The delete manifest may legitimately arrive
@@ -258,7 +259,7 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    the whole transfer succeeded.  See receiver_process_pending() for how the -m
    receiver defers that commit until its disk writer has drained. */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             DeleteManifest** pending_manifest) {
+                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return -1;
@@ -272,14 +273,22 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor, sink))
     return -1;
   bool early_delete = config_delete_timing_early(config);
+  bool per_dir_delete = config_delete_timing_per_dir(config);
   /* Parked keep-set for the late/commit timing.  Every exit path below frees it
      exactly once; the only exception is the successful FINISHED handoff, which
      transfers ownership to *pending_manifest (used by the -m receiver). */
   DeleteManifest* deferred_manifest = NULL;
+  /* Per-directory delete session for --delete-during/--delete-delay.  During the
+     loop it applies plans inline (during) or snapshots their extras (delay); on
+     a successful FINISHED it is either committed here or handed to
+     *pending_plans so the -m caller commits after its disk writer drained. */
+  DeletePlanSession* plan_session = NULL;
+  bool delete_limit_noted = false;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
          status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK ||
-         status == STATUS_SYMLINK || status == STATUS_SPECIAL || status == STATUS_DIR_TIMES) {
+         status == STATUS_SYMLINK || status == STATUS_SPECIAL || status == STATUS_DIR_TIMES ||
+         status == STATUS_DELETE_PLAN) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
         goto fail;
@@ -344,11 +353,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         goto next_status;
       }
       if (early_delete) {
-        /* --delete-before / --delete-during: the manifest is authoritative the
-           moment it arrives, before any file data.  Delete now and acknowledge
-           so the sender only starts streaming once the deletion committed (or
-           failed).  This is the rsync delete-before/delete-during window: a
-           later transfer failure does not restore these deletions.  A
+        /* --delete-before: the whole-tree manifest is authoritative the moment
+           it arrives, before any file data.  Delete now and acknowledge so the
+           sender only starts streaming once the deletion committed (or failed).
+           A later transfer failure does not restore these deletions.  A
            --max-delete-capped commit still succeeds and the transfer proceeds;
            the terminal success frame reports the cap. */
         DeleteCommitResult deletion = (config->use_delete || config->delete_missing_args)
@@ -364,9 +372,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         if (!send_status(file_descriptor, STATUS_OK))
           goto fail;
       } else if (config->use_delete || config->delete_missing_args) {
-        /* Plain --delete / --delete-after / --delete-delay and the
-           --delete-missing-args exact-path deletions: hold the manifest and
-           commit it only after STATUS_FINISHED. */
+        /* Plain --delete / --delete-after and the --delete-missing-args
+           exact-path deletions: hold the manifest and commit it only after
+           STATUS_FINISHED.  The per-directory modes never send this frame. */
         if (deferred_manifest) {
           log_message(LOG_LEVEL_ERROR, "Received a second delete manifest");
           delete_manifest_free(deferred_manifest);
@@ -378,6 +386,23 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         deferred_manifest = manifest;
       } else {
         delete_manifest_free(manifest);
+      }
+      goto next_status;
+    } else if (status == STATUS_DELETE_PLAN) {
+      if (!per_dir_delete) {
+        log_message(LOG_LEVEL_ERROR, "Received a per-directory delete plan without a per-dir "
+                                     "delete timing");
+        send_status(file_descriptor, STATUS_ERROR);
+        goto fail;
+      }
+      if (!plan_session)
+        plan_session = delete_plan_session_create(config);
+      if (!plan_session || delete_plan_session_receive(plan_session, config, file_descriptor) != 0)
+        goto fail;
+      if (delete_plan_session_limit_reached(plan_session) && !delete_limit_noted &&
+          sink->note_delete_limit) {
+        sink->note_delete_limit(sink->context);
+        delete_limit_noted = true;
       }
       goto next_status;
     } else {
@@ -424,6 +449,28 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         sink->note_delete_limit(sink->context);
     }
   }
+  /* Per-directory deletion: --delete-during already applied each plan inline, so
+     this only finishes the missing-args deletions; --delete-delay committed
+     nothing yet and applies its decompressed snapshot here.  The -m receiver
+     hands the session to its caller instead, which commits after the disk
+     writer drained. */
+  if (plan_session) {
+    if (pending_plans) {
+      *pending_plans = plan_session;
+      plan_session = NULL;
+    } else {
+      DeleteCommitResult deletion = delete_plan_session_commit(plan_session, config);
+      bool limit = delete_plan_session_limit_reached(plan_session);
+      delete_plan_session_destroy(plan_session);
+      plan_session = NULL;
+      if (deletion == DELETE_COMMIT_ERROR) {
+        send_status(file_descriptor, STATUS_ERROR);
+        goto fail;
+      }
+      if (limit && !delete_limit_noted && sink->note_delete_limit)
+        sink->note_delete_limit(sink->context);
+    }
+  }
   if (sink->send_success) {
     if (sink->send_success_frame) {
       if (!sink->send_success_frame(file_descriptor, sink->context))
@@ -436,11 +483,14 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
 
 fail:
   /* Failure exits that must not (or already did) report a STATUS_ERROR.  The
-     parked keep-set is dropped: never commit a deletion for a failed stream. */
+     parked keep-set/session is dropped: never commit a deletion for a failed
+     stream. */
   if (deferred_manifest) {
     delete_manifest_free(deferred_manifest);
     deferred_manifest = NULL;
   }
+  if (plan_session)
+    delete_plan_session_destroy(plan_session);
   return -1;
 
 receive_error:
@@ -448,6 +498,8 @@ receive_error:
     delete_manifest_free(deferred_manifest);
     deferred_manifest = NULL;
   }
+  if (plan_session)
+    delete_plan_session_destroy(plan_session);
   if (sink->send_error)
     send_status(file_descriptor, STATUS_ERROR);
   return -1;

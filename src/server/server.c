@@ -962,6 +962,19 @@ void handler(int file_descriptor) {
         delete_manifest_free(context->deferred_manifest);
         context->deferred_manifest = NULL;
       }
+      /* --delete-delay: receive_thread snapshotted each plan's extras as it
+         arrived; with the disk writer drained, commit the deferred removals.
+         --delete-during already applied its plans on the receive thread. */
+      if (context->deferred_plans) {
+        DeleteCommitResult deletion = delete_plan_session_commit(context->deferred_plans, config);
+        if (deletion == DELETE_COMMIT_ERROR) {
+          transfer_ok = false;
+        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+          context->delete_limit_reached = true;
+        }
+        delete_plan_session_destroy(context->deferred_plans);
+        context->deferred_plans = NULL;
+      }
     }
     if (transfer_ok && !config->dry_run) {
       /* --delay-updates: receive_thread has finished the whole protocol stream

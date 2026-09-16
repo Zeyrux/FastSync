@@ -2,6 +2,7 @@
 #define RECEIVER_H
 
 #include "config.h"
+#include "delete_plan.h"
 #include "file.h"
 #include "file_receive.h"
 #include "protocol.h"
@@ -53,10 +54,12 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    when `pending_manifest` is non-NULL the receiver does NOT delete at
    STATUS_FINISHED itself; instead it stores the owned keep-set manifest there
    (leaving *pending_manifest untouched on early modes/errors) so the caller can
-   commit the deletion only after its disk writer has fully drained.  Pass NULL
-   to keep the default behaviour (delete before the success frame). */
+   commit the deletion only after its disk writer has fully drained.  Likewise,
+   when `pending_plans` is non-NULL the --delete-delay per-directory session is
+   handed to the caller instead of being committed at STATUS_FINISHED.  Pass NULL
+   for either to keep the default behaviour (delete before the success frame). */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             DeleteManifest** pending_manifest);
+                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans);
 int receiver_receive_files(Config* config, int file_descriptor);
 
 /* ---- Connection time bounds (anti-slowloris) ----

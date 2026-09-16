@@ -3755,15 +3755,15 @@ class TestDeleteTiming:
             assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n", \
                 f"{flag}: nested file was not written after the early deletion"
 
-    @pytest.mark.parametrize("flag", ["--delete", "--delete-after", "--delete-delay"])
+    @pytest.mark.parametrize("flag", ["--delete", "--delete-after"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_flags_commit_only_after_success(self, flag, mt):
-        """Plain --delete/--delete-after/--delete-delay defer deletion until the
-        whole transfer succeeds: a mid-transfer write failure must leave every
-        extra in place (commit-style safety).  The -m receiver must also keep
-        the extras: the deferred keep-set is committed by the server only after
-        the disk-writer thread has finished, and a failing writer means the
-        manifest is freed, never applied."""
+        """Plain --delete/--delete-after defer deletion until the whole transfer
+        succeeds: a mid-transfer write failure must leave every extra in place
+        (commit-style safety).  The -m receiver must also keep the extras: the
+        deferred keep-set is committed by the server only after the disk-writer
+        thread has finished, and a failing writer means the manifest is freed,
+        never applied."""
         source = self._seed("late")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_late_dst")
         clean_dir(dest)
@@ -3789,10 +3789,42 @@ class TestDeleteTiming:
             assert os.path.isfile(blocker), \
                 f"{flag} (mt={mt}) deleted the blocker although the transfer failed"
 
-    def test_early_flag_respected_when_server_refuses_delete(self, shared_server):
-        """With an --allow-delete-less server the client's early timing still
-        completes (no deadlock on the pre-delete ack) and simply never deletes,
-        exactly like the plain server policy."""
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_delay_clears_type_conflict_like_rsync(self, mt):
+        """rsync clears a destination file that blocks a source directory even
+        when the deletion itself is deferred (--delete-delay); the type conflict
+        is resolved immediately so the nested write succeeds.  The transfer must
+        therefore succeed and the unrelated extra must still be removed."""
+        source = self._seed("delayconflict")
+        dest = os.path.join(TEST_DATA_DIR, "deltiming_delayconflict_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            extra = os.path.join(received, "extra.txt")
+            with open(extra, "wb") as fh:
+                fh.write(b"extra file")
+            blocker = os.path.join(received, "sub")
+            shutil.rmtree(blocker)
+            with open(blocker, "wb") as fh:
+                fh.write(b"blocks the nested destination directory")
+
+            flags = ["--delete-delay"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"--delete-delay (mt={mt}) did not clear the type conflict: " \
+                f"{(result.stderr or result.stdout)[:300]}"
+            assert os.path.isdir(blocker), "blocker file was not replaced by the source directory"
+            assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n"
+            assert not os.path.exists(extra), "--delete-delay did not remove the extra"
+
+    @pytest.mark.parametrize("flag", ["--delete-before", "--delete-during", "--delete-delay"])
+    def test_early_flag_respected_when_server_refuses_delete(self, flag, shared_server):
+        """With an --allow-delete-less server the client's timing still completes
+        (no deadlock on the pre-delete ack, no per-directory deletion) and simply
+        never deletes, exactly like the plain server policy."""
         source = self._seed("refused")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_refused_dst")
         clean_dir(dest)
@@ -3802,9 +3834,9 @@ class TestDeleteTiming:
         extra = os.path.join(received, "extra.txt")
         with open(extra, "wb") as fh:
             fh.write(b"extra file")
-        result, _ = run_client(source, dest, flags=["--delete-before"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=[flag], port=shared_server.port)
         assert result.returncode == 0, \
-            f"--delete-before against a refuse-delete server failed: {result.stderr[:300]}"
+            f"{flag} against a refuse-delete server failed: {result.stderr[:300]}"
         assert os.path.exists(extra), "unauthorized delete removed an extra file"
 
 
@@ -3899,6 +3931,31 @@ class TestDeleteScope:
         finally:
             server.stop()
 
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
+    @pytest.mark.ci
+    def test_files_from_per_dir_timing_confined_to_listed_dirs(self, mt, timing):
+        """The per-directory timings honor the same --files-from scope: an extra
+        inside a listed directory is removed, while unlisted siblings and the
+        receive-root extra survive."""
+        source, dest, received, server = self._seed(f"pd_{timing.strip('-')}_{mt}")
+        try:
+            listed = _write_rel_list(b"listed.txt\nsub/\n")
+            flags = ["--files-from", listed, timing] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"{timing} delete failed: {result.stderr[:300]}"
+            assert not os.path.exists(os.path.join(received, "sub", "extra.txt")), \
+                f"{timing} did not delete the in-scope extra"
+            assert os.path.isfile(os.path.join(received, "sub", "x.txt"))
+            assert os.path.exists(os.path.join(received, "unlisted.txt")), \
+                f"{timing} deleted an unlisted path (data loss)"
+            assert os.path.exists(os.path.join(received, "other", "c.txt")), \
+                f"{timing} deleted an unlisted sibling directory (data loss)"
+            assert os.path.exists(os.path.join(received, "rootextra.txt")), \
+                f"{timing} deleted the receive-root extra (data loss)"
+        finally:
+            server.stop()
+
 
 class TestDeleteExtraneousSymlinks:
     """#290 (3): --delete unlinks extraneous destination symlinks (never follows
@@ -3986,7 +4043,8 @@ class TestDeletePolicy:
 
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("timing",
-                             ["--delete", "--delete-before", "--delete-after", "--delete-delay"])
+                             ["--delete", "--delete-before", "--delete-after", "--delete-delay",
+                              "--delete-during"])
     def test_delete_protects_excluded_by_default_and_delete_excluded_removes(self, mt, timing):
         """rsync parity: with a --delete timing the destination mirror path whose
         source was excluded survives (protected by default); --delete-excluded
@@ -4070,7 +4128,7 @@ class TestDeletePolicy:
                 "--delete-excluded did not remove the excluded dir subtree"
 
     @pytest.mark.parametrize("mt", [False, True])
-    @pytest.mark.parametrize("timing", ["--delete", "--delete-before"])
+    @pytest.mark.parametrize("timing", ["--delete", "--delete-before", "--delete-during"])
     def test_max_delete_exceeded_deletes_up_to_cap_and_exits_25(self, mt, timing):
         """rsync parity: --max-delete=N deletes up to N extras, skips the rest and
         still succeeds as a transfer, exiting 25 with a diagnostic."""

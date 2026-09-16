@@ -7,6 +7,7 @@
 #include "array_list.h"
 #include "chunk.h"
 #include "config.h"
+#include "delete_plan.h"
 #include "file.h"
 #include "protocol.h"
 #include "queue.h"
@@ -66,11 +67,16 @@ typedef struct {
      --ignore-errors kept the run going. */
   bool scan_had_io_error;
   ArrayList* remove_source_files;
-  /* True when --delete-before/--delete-during require the keep-set manifest to
-     be transmitted before any file data: context->manifest is then prebuilt by
-     a path-only pre-scan on the calling thread and the pipeline scanner must
-     not append to it.  Set once before the worker threads start. */
+  /* True when --delete-before requires the whole-tree keep-set manifest to be
+     transmitted before any file data: context->manifest is then prebuilt by a
+     path-only pre-scan on the calling thread and the pipeline scanner must not
+     append to it.  Set once before the worker threads start. */
   bool early_delete;
+  /* Non-NULL for --delete-during/--delete-delay: the per-directory plan set
+     prebuilt by the path-only pre-scan on the calling thread.  The sender
+     thread transmits the root plan before any data and the remaining plans
+     alongside the chunks.  Set once before the worker threads start. */
+  DeletePlanSender* delete_plans;
   mtx_t mutex_progress;
   int total_files;
   unsigned long long progress_bytes;

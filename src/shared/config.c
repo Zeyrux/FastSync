@@ -228,7 +228,13 @@ Config* config_create(void) {
 bool config_delete_timing_early(const Config* config) {
   if (!config)
     return false;
-  return config->delete_before || config->delete_during;
+  return config->delete_before;
+}
+
+bool config_delete_timing_per_dir(const Config* config) {
+  if (!config)
+    return false;
+  return config->delete_during || config->delete_delay;
 }
 
 /* A delete-timing flag is only meaningful together with --delete.  At most one

@@ -7,6 +7,7 @@
 #include "compression.h"
 #include "config.h"
 #include "data.h"
+#include "delete_plan.h"
 #include "delta.h"
 #include "file.h"
 #include "file_list.h"
@@ -1250,7 +1251,7 @@ static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
    directory and *io_error_out reports it (the caller still performs the
    deletion but reports the run as errored). */
 static bool scan_paths_only(const Config* config, const ScannerOptions* options,
-                            ArrayList* manifest, bool* io_error_out) {
+                            ArrayList* manifest, DeletePlanSender* plans, bool* io_error_out) {
   if (io_error_out)
     *io_error_out = false;
   DirectoryScanner* scanner =
@@ -1260,10 +1261,26 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
   bool ok = true;
   Chunk* chunk;
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
-    if (!add_chunk_to_manifest(manifest, chunk)) {
+    if (manifest && !add_chunk_to_manifest(manifest, chunk)) {
       ok = false;
       chunk_destroy(chunk);
       break;
+    }
+    if (plans) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        File* f = chunk->items[i];
+        if (!f)
+          continue;
+        const char* path = file_wire_path(f);
+        if (!delete_plan_sender_add(plans, path, f->is_dir)) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) {
+        chunk_destroy(chunk);
+        break;
+      }
     }
     chunk_destroy(chunk);
   }
@@ -1273,6 +1290,25 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
     *io_error_out = directory_scanner_had_io_error(scanner);
   directory_scanner_destroy(scanner);
   return ok;
+}
+
+/* Transmit any not-yet-sent per-directory delete plan needed by the entries in
+ * `chunk` (ancestors root-first, then the entry's own directory for --dirs
+ * entries) before its data frames go out, so --delete-during/--delete-delay
+ * clear a directory's extras (and any type conflict) before the directory's
+ * first write. */
+static int send_chunk_delete_plans(Client* client, DeletePlanSender* plans, const Chunk* chunk) {
+  if (!plans)
+    return 0;
+  for (int i = 0; i < chunk->element_count; i++) {
+    File* f = chunk->items[i];
+    if (!f)
+      continue;
+    if (delete_plan_send_for_path(client->file_descriptor, plans, file_wire_path(f), f->is_dir) !=
+        0)
+      return -1;
+  }
+  return 0;
 }
 
 static int incremental_check(Client* client, File* file, const Config* config,
@@ -2048,6 +2084,16 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       protocol_session_unbind();
       return thrd_error;
     }
+  } else if (context->delete_plans) {
+    /* --delete-during/--delete-delay: transmit the receive root's plan before
+       any data, exactly like rsync's first generator directory. */
+    if (delete_plan_send_root(client->file_descriptor, context->delete_plans) != 0) {
+      pipeline_cancel(context);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
+      return thrd_error;
+    }
   }
 
   while (true) {
@@ -2086,6 +2132,15 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         return thrd_error;
       }
       break;
+    }
+    if (send_chunk_delete_plans(client, context->delete_plans, current_chunk) != 0) {
+      log_message(LOG_LEVEL_ERROR, "unexpected error while sending delete plan");
+      chunk_destroy(current_chunk);
+      pipeline_cancel(context);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
+      return thrd_error;
     }
     if (send_chunk_with_removal(client, current_chunk, context->config,
                                 context->remove_source_files) != 0) {
@@ -2134,7 +2189,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                   "unscanned source mirrors are not deleted");
     else
       log_message(LOG_LEVEL_WARNING, "transfer stopped early (stop deadline)");
-  } else if (context->config->use_delete && !context->early_delete) {
+  } else if (context->config->use_delete && !context->early_delete && !context->delete_plans) {
     /* Empty keep-set + scan I/O error must not delete the whole destination
        (the source may not be genuinely empty -- see send_files). */
     bool empty_io;
@@ -2151,7 +2206,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                              context->size_skipped_paths, context->missing_args,
                              context->synced_dirs) != 0)
       goto send_fail;
-  } else if (context->config->delete_missing_args && !context->early_delete) {
+  } else if (context->config->delete_missing_args && !context->early_delete &&
+             !context->delete_plans) {
     /* --delete-missing-args without --delete: no keep-set is built, but the
        exact-delete paths still ride the same manifest frame (commit once the
        transfer succeeded). */
@@ -2223,14 +2279,15 @@ static int scan_directory_multithreaded(void* pipeline_context) {
      synchronized directories here (the size-prune protection is collected in
      every mode).  The early modes already transmitted the pre-scan keep-set and
      its protected lists, so the data pass must not append to them again. */
-  if (!context->early_delete) {
+  if (!context->early_delete && !context->delete_plans) {
     prepared.options.excluded_paths = context->excluded_paths;
     /* The root marker for a full recursive transfer is already in the list; do
        not let the scanner append every directory to it. */
     if (context->config->files_from_set != NULL)
       prepared.options.synced_dirs = context->synced_dirs;
   }
-  prepared.options.size_skipped_paths = context->size_skipped_paths;
+  if (!context->delete_plans)
+    prepared.options.size_skipped_paths = context->size_skipped_paths;
   bool dirs_mode = prepared.options.dirs;
   /* -H also selects the sequential scanner (see the comment at the branch),
    * so the loop below must choose the scanner by which object exists, not by
@@ -2268,7 +2325,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       failed = use_dscanner ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
       break;
     }
-    if (context->config->use_delete && !context->early_delete) {
+    if (context->config->use_delete && !context->early_delete && !context->delete_plans) {
       mtx_lock(&context->mutex_scanner);
       bool manifest_ok = add_chunk_to_manifest(context->manifest, current_chunk);
       mtx_unlock(&context->mutex_scanner);
@@ -2531,6 +2588,7 @@ int send_files(Config* config) {
   int ret = 1;
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
+  DeletePlanSender* plan_sender = NULL;
   ArrayList* remove_sources = NULL;
   /* P7 Wave D: captured source directory times, transmitted in trailing
      STATUS_DIR_TIMES frame(s) (only when metadata rides the wire). */
@@ -2541,6 +2599,10 @@ int send_files(Config* config) {
   ArrayList* size_skipped = NULL;
   ArrayList* synced_dirs = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
+  /* -d/--dirs does not recurse, so a per-directory plan would carry no child
+     information and could delete the contents of an untraversed directory;
+     fall back to the whole-tree end-of-transfer commit for that mode. */
+  bool delete_per_dir = config->use_delete && config_delete_timing_per_dir(config) && !config->dirs;
   bool send_failed = false;
   bool had_scan_io = false;
   PreparedScanner prepared;
@@ -2591,10 +2653,11 @@ int send_files(Config* config) {
       prepared.options.synced_dirs = synced_dirs;
     }
   }
-  /* The late-timing modes (plain --delete / --delete-after / --delete-delay)
-     build the manifest while streaming and send it after the last data frame.
-     The early modes (--delete-before/--delete-during) send it up front from a
-     dedicated path-only pre-scan, so no manifest is kept during the data pass. */
+  /* The late-timing modes (plain --delete / --delete-after) build the manifest
+     while streaming and send it after the last data frame.  --delete-before
+     sends a whole-tree keep-set up front; --delete-during/--delete-delay build a
+     per-directory plan set up front (paths only) and stream the plans alongside
+     the data, so no manifest is kept during the data pass. */
   if (delete_early) {
     /* Pass 1: collect the complete keep-set (paths only, no data loaded) and
        transmit it now, before any file data.  The receiver removes extras and
@@ -2602,7 +2665,8 @@ int send_files(Config* config) {
     ArrayList* early_manifest = array_list_create(free);
     if (!early_manifest)
       goto send_fail;
-    bool prescan_ok = scan_paths_only(config, &prepared.options, early_manifest, &had_scan_io);
+    bool prescan_ok =
+        scan_paths_only(config, &prepared.options, early_manifest, NULL, &had_scan_io);
     bool early_ok = false;
     if (prescan_ok) {
       /* A scan that hit an I/O error and produced NO keep entries is ambiguous
@@ -2627,6 +2691,33 @@ int send_files(Config* config) {
     prepared.options.size_skipped_paths = NULL;
     prepared.options.synced_dirs = NULL;
     if (!prescan_ok || !early_ok)
+      goto send_fail;
+  } else if (delete_per_dir) {
+    /* --delete-during/--delete-delay: build one plan per source directory from a
+       path-only pre-scan and transmit the root plan now, before any data, so the
+       receive root's extras are handled exactly like rsync's first generator
+       directory.  The remaining plans are streamed with the data below. */
+    plan_sender = delete_plan_sender_create();
+    if (!plan_sender)
+      goto send_fail;
+    bool prescan_ok = scan_paths_only(config, &prepared.options, NULL, plan_sender, &had_scan_io);
+    bool plans_ok = false;
+    if (prescan_ok) {
+      delete_plan_sender_finalize(plan_sender, config->files_from_set ? synced_dirs : NULL);
+      delete_plan_sender_set_config(plan_sender, excluded, size_skipped, missing_args);
+      if (had_scan_io && delete_plan_sender_empty(plan_sender)) {
+        log_message(LOG_LEVEL_ERROR,
+                    "source scan hit an I/O error before finding any file; refusing to delete "
+                    "with an empty keep-set (--delete)");
+        prescan_ok = false;
+      } else {
+        plans_ok = delete_plan_send_root(client->file_descriptor, plan_sender) == 0;
+      }
+    }
+    prepared.options.excluded_paths = NULL;
+    prepared.options.size_skipped_paths = NULL;
+    prepared.options.synced_dirs = NULL;
+    if (!prescan_ok || !plans_ok)
       goto send_fail;
   } else if (config->use_delete) {
     manifest = array_list_create(free);
@@ -2706,6 +2797,11 @@ int send_files(Config* config) {
         goto send_fail;
       }
     }
+    if (send_chunk_delete_plans(client, plan_sender, current_chunk) != 0) {
+      chunk_destroy(current_chunk);
+      send_failed = true;
+      break;
+    }
     if (send_chunk_with_removal(client, current_chunk, config, remove_sources) != 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
       chunk_destroy(current_chunk);
@@ -2763,12 +2859,13 @@ int send_files(Config* config) {
                   "an empty keep-set (--delete)");
       goto send_fail;
     }
-    if ((manifest || config->delete_missing_args) && !delete_early) {
+    if ((manifest || config->delete_missing_args) && !delete_early && !delete_per_dir) {
       /* Late (commit) ordering: all file data is out; transmit the manifest so
          the receiver commits the extras walk (--delete) and/or the
          --delete-missing-args exact-path deletions only after the transfer
-         succeeds.  In the early modes (--delete-before/--delete-during) the
-         manifest already went out up front, so nothing is re-sent here. */
+         succeeds.  In the early modes (--delete-before) and the per-directory
+         modes the deletion already went out with the data, so nothing is
+         re-sent here. */
       if (send_delete_manifest(client->file_descriptor, manifest, excluded, size_skipped,
                                missing_args, synced_dirs) != 0) {
         if (manifest) {
@@ -2817,6 +2914,8 @@ send_fail:
      here even on success without --delete, fixing a pre-existing leak. */
   if (manifest)
     array_list_delete(manifest);
+  if (plan_sender)
+    delete_plan_sender_destroy(plan_sender);
   if (excluded)
     array_list_delete(excluded);
   if (size_skipped)
@@ -2916,11 +3015,6 @@ int send_files_multithreaded(Config** config_ptr) {
                           config->stop_at, now_mono);
   bool collect_excluded = config->use_delete && !config->delete_excluded;
   if (config->use_delete) {
-    context->manifest = array_list_create(free);
-    if (!context->manifest) {
-      pipeline_context_sender_destroy(context);
-      return 1;
-    }
     if (collect_excluded) {
       context->excluded_paths = array_list_create(free);
       if (!context->excluded_paths) {
@@ -2946,11 +3040,15 @@ int send_files_multithreaded(Config** config_ptr) {
         return 1;
       }
     }
-    if (config_delete_timing_early(config)) {
-      /* --delete-before/--delete-during: build the complete keep-set manifest
+    /* -d/--dirs does not recurse, so a per-directory plan would carry no child
+       information and could delete the contents of an untraversed directory;
+       fall back to the whole-tree end-of-transfer commit for that mode. */
+    bool per_dir = config_delete_timing_per_dir(config) && !config->dirs;
+    if (config_delete_timing_early(config) || per_dir) {
+      /* --delete-before / --delete-during / --delete-delay: build the keep-set
          (paths only, nothing loaded or sent) up front so the sender thread can
-         transmit it before the first data byte.  The path-only pre-scan also
-         fills the protected excluded prefixes and synchronized directories. */
+         transmit it before/with the data.  The path-only pre-scan also fills the
+         protected excluded prefixes and synchronized directories. */
       PreparedScanner prepared;
       memset(&prepared, 0, sizeof(prepared));
       bool prepared_ok = prepare_scanner(config, config->scanner_threads, &prepared);
@@ -2963,12 +3061,29 @@ int send_files_multithreaded(Config** config_ptr) {
         if (config->files_from_set != NULL)
           prepared.options.synced_dirs = context->synced_dirs;
       }
-      bool prebuilt = prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
-                                                     &context->scan_had_io_error);
+      if (per_dir) {
+        context->delete_plans = delete_plan_sender_create();
+        prepared_ok = prepared_ok && context->delete_plans != NULL;
+      } else {
+        context->manifest = array_list_create(free);
+        prepared_ok = prepared_ok && context->manifest != NULL;
+      }
+      bool prebuilt =
+          prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
+                                         context->delete_plans, &context->scan_had_io_error);
       prepared_scanner_destroy(&prepared);
-      if (prebuilt && context->scan_had_io_error && context->manifest->size == 0) {
-        /* Empty keep-set + scan I/O error: refusing an empty keep-set manifest
-           would have deleted the whole destination (see send_files). */
+      if (per_dir && prebuilt) {
+        delete_plan_sender_finalize(context->delete_plans,
+                                    config->files_from_set ? context->synced_dirs : NULL);
+        delete_plan_sender_set_config(context->delete_plans, context->excluded_paths,
+                                      context->size_skipped_paths, context->missing_args);
+      }
+      bool empty = per_dir
+                       ? (context->delete_plans && delete_plan_sender_empty(context->delete_plans))
+                       : (context->manifest && context->manifest->size == 0);
+      if (prebuilt && context->scan_had_io_error && empty) {
+        /* Empty keep-set + scan I/O error: refusing an empty keep-set would
+           have deleted the whole destination (see send_files). */
         log_message(LOG_LEVEL_ERROR,
                     "source scan hit an I/O error before finding any file; refusing to delete "
                     "with an empty keep-set (--delete)");
@@ -2978,12 +3093,19 @@ int send_files_multithreaded(Config** config_ptr) {
         pipeline_context_sender_destroy(context);
         return 1;
       }
-      context->early_delete = true;
+      if (!per_dir)
+        context->early_delete = true;
+    } else {
+      context->manifest = array_list_create(free);
+      if (!context->manifest) {
+        pipeline_context_sender_destroy(context);
+        return 1;
+      }
     }
   }
   if (config->remove_source_files)
     context->remove_source_files = array_list_create(source_file_destroy);
-  if ((config->use_delete && !context->manifest) ||
+  if ((config->use_delete && !context->manifest && !context->delete_plans) ||
       (config->remove_source_files && !context->remove_source_files)) {
     pipeline_context_sender_destroy(context);
     return 1;

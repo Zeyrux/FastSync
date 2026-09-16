@@ -60,7 +60,7 @@ bool path_is_within_root(const char* root, const char* path) {
  * two differ in create-vs-no-create, in what path component they stop at, and
  * in the extra receiver policies they apply, so they are intentionally kept
  * separate.  Both rely on the shared lexical path_is_within_root check. */
-static int open_authorized_destination(const char* dest_root) {
+int utils_open_authorized_destination(const char* dest_root) {
   int root_fd = utils_get_authorized_root_fd();
   const char* root_path = utils_get_authorized_root_path();
   if (root_fd < 0 || !root_path || !dest_root || !path_is_within_root(root_path, dest_root))
@@ -752,7 +752,7 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
   int root_fd = utils_get_authorized_root_fd();
   if (root_fd >= 0) {
     if (utils_get_authorized_root_path())
-      rootfd = open_authorized_destination(dest_root);
+      rootfd = utils_open_authorized_destination(dest_root);
     else if (dest_root == NULL)
       rootfd = dup(root_fd);
     else

@@ -3472,6 +3472,21 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
   return delete_missing_args_budgeted(config, manifest, &budget);
 }
 
+bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
+                                          size_t max_delete, size_t* deleted, size_t* skipped,
+                                          bool* limit_hit) {
+  DeleteBudgetState budget = {
+      .max_delete = max_delete, .deleted = 0, .skipped = 0, .limit_hit = false};
+  bool ok = delete_missing_args_budgeted(config, manifest, &budget);
+  if (deleted)
+    *deleted = budget.deleted;
+  if (skipped)
+    *skipped = budget.skipped;
+  if (limit_hit)
+    *limit_hit = budget.limit_hit;
+  return ok;
+}
+
 /* Commit every deletion family the manifest carries.  The --delete-missing-args
    exact-path deletions run FIRST: they are explicit user requests and must not
    be blocked by the extras walker's filter-exclusion protection (a protected

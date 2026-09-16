@@ -566,7 +566,7 @@ static Config* make_late_delete_config(const char* root) {
 
 static int run_pending_receiver(Config* cfg, int fd, DeleteManifest** pending) {
   ReceiverSink sink = {0};
-  return receiver_process_pending(cfg, fd, &sink, pending);
+  return receiver_process_pending(cfg, fd, &sink, pending, NULL);
 }
 
 static void test_late_manifest_abort_frees_keepset() {
@@ -797,7 +797,7 @@ static void test_receiver_pending_commits_missing_args() {
   /* NULL pending: the single-threaded commit path deletes at FINISHED.  The
      sink sends the terminal STATUS_OK success frame. */
   ReceiverSink sink = {.send_success = true};
-  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL), 0);
+  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL, NULL), 0);
   Status ack;
   EXPECT_TRUE(receive_status(p[1], &ack));
   EXPECT_EQ_INT(ack, STATUS_OK);
