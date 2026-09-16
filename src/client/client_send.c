@@ -65,9 +65,6 @@ static void log_server_rejection(const char* context) {
   }
 }
 
-/* Forward declaration for progress-reporting thread used in multithreaded send. */
-static int progress_thread_fn(void* arg);
-
 static const char* display_bytes(unsigned long long bytes, bool human_readable, char* buffer,
                                  size_t buffer_size) {
   if (human_readable && format_human_size_decimal(bytes, buffer, buffer_size))
@@ -137,6 +134,93 @@ static void report_transfer_stats(const Config* config, int total_files,
   printf("sent %s bytes  received %s bytes  %s bytes/sec\n", sent_s, recv_s, rate_str);
   printf("total size is %s  speedup is %.2f%s\n", total, speedup,
          config->dry_run ? " (DRY RUN)" : "");
+  fflush(stdout);
+}
+
+/* ---- rsync-style per-file --progress ------------------------------------
+ * rsync prints, for each transferred regular file, the file name followed by a
+ * two-frame progress line: the first at the initial 32 KiB read window (always
+ * 0.00 kB/s / 0:00:00 on a sub-second transfer) and a final 100% frame carrying
+ * `(xfr#N, to-chk=X/Y)`.  Rates are wall-clock dependent, so only the final
+ * rate is measured here; the layout matches rsync 3.4.1's progress.c. */
+#define RSYNC_PROGRESS_IO_WINDOW (32ULL * 1024ULL)
+
+static const char* delete_display_path(const Config* config, const char* path);
+
+static bool g_progress_active;
+static unsigned long long g_progress_xferred;
+static unsigned long long g_progress_seen;
+static struct timespec g_progress_file_start;
+
+static void progress_first_frame(unsigned long long size, char* out, size_t out_size) {
+  char ofs_buf[32];
+  unsigned long long ofs = size < RSYNC_PROGRESS_IO_WINDOW ? size : RSYNC_PROGRESS_IO_WINDOW;
+  if (!format_big_num(ofs, false, ofs_buf, sizeof(ofs_buf)))
+    snprintf(ofs_buf, sizeof(ofs_buf), "%llu", ofs);
+  int pct = size == 0 ? 100 : (ofs == size ? 100 : (int)(100.0 * (double)ofs / (double)size));
+  snprintf(out, out_size, "\r%15s %3d%% %7.2f%s %s%s", ofs_buf, pct, 0.0, "kB/s", "   0:00:00",
+           "  ");
+}
+
+static void progress_final_frame(unsigned long long size, char* out, size_t out_size) {
+  char ofs_buf[32];
+  char rembuf[32];
+  unsigned long long last_ofs = size < RSYNC_PROGRESS_IO_WINDOW ? size : RSYNC_PROGRESS_IO_WINDOW;
+  if (!format_big_num(size, false, ofs_buf, sizeof(ofs_buf)))
+    snprintf(ofs_buf, sizeof(ofs_buf), "%llu", size);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long diff_ms = (long long)(now.tv_sec - g_progress_file_start.tv_sec) * 1000 +
+                      (now.tv_nsec - g_progress_file_start.tv_nsec) / 1000000;
+  if (diff_ms <= 0)
+    diff_ms = 1;
+  double rate = size > last_ofs
+                    ? (double)(size - last_ofs) * 1000.0 / (double)diff_ms / 1024.0
+                    : 0.0;
+  const char* units = "kB/s";
+  if (rate > 1024.0 * 1024.0) {
+    rate /= 1024.0 * 1024.0;
+    units = "GB/s";
+  } else if (rate > 1024.0) {
+    rate /= 1024.0;
+    units = "MB/s";
+  }
+  unsigned long long remain = (unsigned long long)(diff_ms / 1000);
+  snprintf(rembuf, sizeof(rembuf), "%4u:%02u:%02u", (unsigned)(remain / 3600),
+           (unsigned)((remain / 60) % 60), (unsigned)(remain % 60));
+  unsigned long long to_chk = g_progress_seen > g_progress_xferred ? g_progress_seen - g_progress_xferred : 0;
+  snprintf(out, out_size, "\r%15s %3d%% %7.2f%s %s (xfr#%llu, to-chk=%llu/%llu)\n", ofs_buf, 100,
+           rate, units, rembuf, g_progress_xferred, to_chk, g_progress_seen);
+}
+
+static void client_progress_begin(const Config* config) {
+  g_progress_active = config->show_progress && !config->quiet;
+  g_progress_xferred = 0;
+  g_progress_seen = 0;
+  if (!g_progress_active)
+    return;
+  printf("sending incremental file list\n");
+  fflush(stdout);
+}
+
+/* Emit the name (unless itemize/out-format already did) and the two progress
+ * frames for one transferred regular file. */
+static void client_progress_file(const Config* config, const File* file) {
+  if (!g_progress_active || file == NULL || !file->data)
+    return;
+  g_progress_seen++;
+  g_progress_xferred++;
+  unsigned long long size = file->data->size;
+  if (!config->itemize_changes && config->out_format == NULL) {
+    const char* name = delete_display_path(config, file_wire_path(file));
+    printf("%s\n", name ? name : "");
+  }
+  clock_gettime(CLOCK_MONOTONIC, &g_progress_file_start);
+  char frame[160];
+  progress_first_frame(size, frame, sizeof(frame));
+  fputs(frame, stdout);
+  progress_final_frame(size, frame, sizeof(frame));
+  fputs(frame, stdout);
   fflush(stdout);
 }
 
@@ -735,14 +819,17 @@ static const char* delete_display_path(const Config* config, const char* path) {
   const char* root = config->send_directory;
   while (*root == '/')
     root++;
+  const char* rel = path;
+  while (*rel == '/')
+    rel++;
   size_t root_len = strlen(root);
   while (root_len > 0 && root[root_len - 1] == '/')
     root_len--;
   if (root_len == 0)
-    return path;
-  if (strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0'))
-    return path + root_len + (path[root_len] == '/' ? 1 : 0);
-  return path;
+    return rel;
+  if (strncmp(rel, root, root_len) == 0 && (rel[root_len] == '/' || rel[root_len] == '\0'))
+    return rel + root_len + (rel[root_len] == '/' ? 1 : 0);
+  return rel;
 }
 
 /* Send the final STATUS_FINISHED frame and await the receiver's verdict.
@@ -2038,6 +2125,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     }
     change_emit_file_sent_bytes(config, f, protocol_bytes_written() - bytes_before,
                                 protocol_bytes_read() - read_before);
+    client_progress_file(config, f);
     if (source && !array_list_add(remove_sources, source)) {
       source_file_destroy(source);
       return -1;
@@ -2085,6 +2173,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     }
   }
 
+  client_progress_begin(context->config);
   while (true) {
     /* Graceful abort (Ctrl-C/SIGTERM): tell the receiver to clean up instead of
        dying abruptly.  Best-effort: a failed send just means the peer is gone.
@@ -2394,58 +2483,6 @@ static int load_files_multithreaded(void* pipeline_context) {
   }
 }
 
-/* Print a one-line transfer progress report to stderr. `suffix` ends the
-   line (e.g. "Done.\n") or is "" for in-place refresh. Shared by the
-   single-threaded loop and the multithreaded progress thread. */
-static void print_transfer_progress(unsigned long long total_bytes, time_t start,
-                                    const char* suffix, bool human_readable) {
-  double elapsed = difftime(time(NULL), start);
-  double rate = elapsed > 0.0 ? (double)total_bytes / ((double)BYTES_PER_MIB * elapsed) : 0.0;
-  if (human_readable) {
-    char total_buffer[32];
-    char rate_buffer[32];
-    fprintf(stderr, "\rSent %s  (%s/s)  %s",
-            display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
-            display_bytes((unsigned long long)(rate * (double)BYTES_PER_MIB), true, rate_buffer,
-                          sizeof(rate_buffer)),
-            suffix);
-  } else {
-    fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  %s", (double)total_bytes / (double)BYTES_PER_MIB,
-            rate, suffix);
-  }
-  fflush(stderr);
-}
-
-/* Progress-reporting thread for multithreaded send. Runs in parallel with
-   the scanner/loader/sender threads and prints periodic progress to stderr. */
-static int progress_thread_fn(void* arg) {
-  PipelineContextSender* context = (PipelineContextSender*)arg;
-  time_t last_progress = 0;
-  time_t start = time(NULL);
-
-  while (true) {
-    mtx_lock(&context->mutex_progress);
-    bool done = context->sender_done;
-    unsigned long long total = context->progress_bytes;
-    mtx_unlock(&context->mutex_progress);
-
-    if (done) {
-      print_transfer_progress(total, start, "Done.\n", context->config->human_readable);
-      break;
-    }
-
-    time_t now = time(NULL);
-    if (now - last_progress >= 1) {
-      last_progress = now;
-      print_transfer_progress(total, start, "", context->config->human_readable);
-    }
-
-    struct timespec ts = {0, 100 * 1000000L}; /* 100 ms */
-    thrd_sleep(&ts, NULL);
-  }
-  return thrd_success;
-}
-
 /* Phase 6 residual-batch (client-only).  --write-batch=FILE / --only-write-batch
  * emit a self-contained single-file batch of a whole source tree from a
  * deterministic separate scan pass.  Each chunk's file images are fully loaded
@@ -2686,8 +2723,8 @@ int send_files(Config* config) {
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   int total_files = 0;
-  time_t last_progress = 0;
   time_t start = time(NULL);
+  client_progress_begin(config);
   /* True when the stop deadline cut the scan short so the keep-set manifest is
      only a prefix of the source. */
   bool scan_stopped_early = false;
@@ -2744,13 +2781,6 @@ int send_files(Config* config) {
       break;
     }
     total_bytes += chunk_bytes;
-    if (config->show_progress && !config->quiet) {
-      time_t now = time(NULL);
-      if (now - last_progress >= 1) {
-        last_progress = now;
-        print_transfer_progress(total_bytes, start, "", config->human_readable);
-      }
-    }
     chunk_destroy(current_chunk);
   }
   if (send_failed) {
@@ -3047,28 +3077,10 @@ int send_files_multithreaded(Config** config_ptr) {
     return 1;
   }
 
-  thrd_t progress;
-  bool progress_created = false;
-  if (config->show_progress && !config->quiet) {
-    progress_created = (thrd_create(&progress, progress_thread_fn, context) == thrd_success);
-    if (!progress_created) {
-      log_perror("Error creating progress thread");
-      /* Non-fatal; continue without progress reporting */
-    }
-  }
-
   int sender_result;
   thrd_join(scanner, NULL);
   thrd_join(loader, NULL);
   thrd_join(sender, &sender_result);
-
-  if (progress_created) {
-    /* Signal progress thread to exit if it hasn't already */
-    mtx_lock(&context->mutex_progress);
-    context->sender_done = true;
-    mtx_unlock(&context->mutex_progress);
-    thrd_join(progress, NULL);
-  }
 
   bool scan_io;
   mtx_lock(&context->mutex_scanner);

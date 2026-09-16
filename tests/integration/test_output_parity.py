@@ -12,7 +12,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import TEST_DATA_DIR, run_client, clean_dir, get_dest_received_dir
+from common import TEST_DATA_DIR, run_client, clean_dir, get_dest_received_dir, ServerManager
 
 RSYNC = shutil.which("rsync")
 requires_rsync = pytest.mark.skipif(RSYNC is None, reason="rsync 3.4.1 not installed")
@@ -280,3 +280,166 @@ class TestListOnlyParity:
         assert fast_lines == rsync_lines, (
             f"rsync={rsync_lines}\nfastsync={fast_lines}"
         )
+
+
+def _make_one_file(root, name="f.bin", size=100):
+    clean_dir(root)
+    with open(os.path.join(root, name), "wb") as fh:
+        fh.write(bytes((i * 7 + 3) & 0xFF for i in range(size)))
+
+
+class TestWireStatsParity:
+    """Wire-counter output parity: --out-format %b/%c/%C, --progress and
+    --stats versus real rsync 3.4.1."""
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_out_format_checksum_matches_rsync(self, shared_server):
+        """%C (whole-file xxh128, seed 0) is protocol-independent, so the full
+        `%C %l %n` line must be byte-identical to rsync."""
+        source = os.path.join(TEST_DATA_DIR, "wire_ck_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_ck_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_ck_rdst")
+        _make_one_file(source, "f.bin", 200000)
+        clean_dir(dest)
+        clean_dir(rdst)
+        fmt = "%C %l %n"
+        rsync_result = _rsync(["-a", "--out-format=" + fmt, source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--out-format=" + fmt],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert result.stdout.splitlines() == rsync_result.stdout.splitlines(), (
+            f"rsync={rsync_result.stdout!r} fastsync={result.stdout!r}"
+        )
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_out_format_b_is_wire_bytes(self, shared_server):
+        """%b is true transferred (wire) bytes, not the source length: it must
+        differ from %l (the source length) and exceed it for a framed transfer."""
+        source = os.path.join(TEST_DATA_DIR, "wire_b_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_b_dst")
+        _make_one_file(source, "f.bin", 5000)
+        clean_dir(dest)
+        result, _ = run_client(source, dest, flags=["-a", "--out-format=%b %l %c"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        line = result.stdout.strip()
+        parts = line.split()
+        assert len(parts) == 3 and all(p.isdigit() for p in parts), line
+        wire_b, src_l, wire_c = (int(p) for p in parts)
+        assert src_l == 5000, line
+        assert wire_b > src_l, f"%b must include wire framing: {line}"
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_progress_first_frame_matches_rsync(self, shared_server):
+        """For a sub-32 KiB file the first --progress frame is deterministic
+        (0.00 kB/s, 0:00:00) and must be byte-identical to rsync's."""
+        source = os.path.join(TEST_DATA_DIR, "wire_pg_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_pg_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_pg_rdst")
+        _make_one_file(source, "f.bin", 100)
+        clean_dir(dest)
+        clean_dir(rdst)
+        rsync_result = _rsync(["-a", "--progress", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--progress"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        def frames(text):
+            # subprocess text mode normalizes \r to \n (universal newlines).
+            return [p for p in text.split("\n") if "%" in p]
+
+        rsync_frames = frames(rsync_result.stdout)
+        fast_frames = frames(result.stdout)
+        assert rsync_frames and fast_frames, (rsync_result.stdout, result.stdout)
+        assert fast_frames[0] == rsync_frames[0], (rsync_frames[0], fast_frames[0])
+        assert "(xfr#1," in fast_frames[-1], fast_frames[-1]
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_stats_selected_lines_match_rsync(self, shared_server):
+        """The protocol-independent --stats lines must match rsync exactly."""
+        source = os.path.join(TEST_DATA_DIR, "wire_st_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_st_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_st_rdst")
+        _make_one_file(source, "f.bin", 6000)
+        clean_dir(dest)
+        clean_dir(rdst)
+        rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--stats"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        keys = (
+            "Number of regular files transferred",
+            "Total file size",
+            "Total transferred file size",
+            "Literal data",
+            "Matched data",
+            "Number of deleted files",
+        )
+
+        def pick(text):
+            out = {}
+            for line in text.splitlines():
+                for key in keys:
+                    if line.startswith(key + ":"):
+                        out[key] = line
+            return out
+
+        assert pick(result.stdout) == pick(rsync_result.stdout), (
+            f"rsync={pick(rsync_result.stdout)} fastsync={pick(result.stdout)}"
+        )
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_dry_run_delete_lines_match_rsync(self):
+        """-n --delete emits transfer-relative `*deleting` lines like rsync."""
+        source = os.path.join(TEST_DATA_DIR, "wire_del_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_del_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_del_rdst")
+        clean_dir(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+        with open(os.path.join(source, "a.txt"), "wb") as fh:
+            fh.write(b"a\n")
+        for root, entries in (
+            (rdst, {"extra.txt": b"x\n"}),
+            (rdst, {"sub/y.txt": b"y\n", "extradir/z.txt": b"z\n"}),
+        ):
+            for rel, data in entries.items():
+                full = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "wb") as fh:
+                    fh.write(data)
+        # FastSync mirrors the source's absolute path under dest.
+        received = get_dest_received_dir(dest, source)
+        for rel, data in (
+            ("extra.txt", b"x\n"),
+            ("sub/y.txt", b"y\n"),
+            ("extradir/z.txt", b"z\n"),
+        ):
+            full = os.path.join(received, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(data)
+
+        rsync_result = _rsync(["-a", "-n", "--delete", "-i", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        rsync_del = sorted(
+            line for line in rsync_result.stdout.splitlines() if line.startswith("*deleting")
+        )
+        # The shared session server refuses deletion; start one that allows it.
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["-a", "-n", "--delete", "-i"],
+                                   port=server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        fast_del = sorted(
+            line for line in result.stdout.splitlines() if line.startswith("*deleting")
+        )
+        assert fast_del == rsync_del, f"rsync={rsync_del}\nfastsync={fast_del}"
