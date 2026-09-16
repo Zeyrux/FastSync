@@ -317,7 +317,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.23.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.26.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -327,7 +327,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.23.0"};
+                        "/dst",     "--protocol",   "2.26.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -1499,22 +1499,25 @@ static void test_parse_args_checksum_choice_equals_forms() {
   config_delete(cfg);
 }
 
-/* An algorithm FastSync does not support must be rejected, never a silent
-   no-op. */
+/* An algorithm FastSync does not support, an empty half, a lone/extra comma or
+   a malformed separator must be rejected, never a silent no-op.  A single
+   md4/sha1/none name and the two-name transfer,pre-transfer form are valid. */
 static void test_parse_args_checksum_choice_rejects_unsupported() {
-  static const char* const bad[] = {"md4",  "sha1",  "sha256",    "crc32",
-                                    "none", "bogus", "xxh64,md5", "xxhash:md5"};
+  static const char* const bad[] = {"sha256", "crc32", "bogus",       "xxhash:md5",
+                                    "md5,",   ",md5",  "md5,md4,sha1"};
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--checksum-choice", (char*)bad[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
     config_delete(cfg);
   }
 }
 
-/* xxh3/xxh128 are accepted; "auto" keeps the default algorithm. */
+/* xxh3/xxh128/md4/sha1/none and the two-name form are accepted; "auto"
+   resolves to FastSync's negotiated default xxh128. */
 static void test_parse_args_checksum_choice_new_algos() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--checksum-choice=xxh3", "/src", "/dst"};
@@ -1535,7 +1538,69 @@ static void test_parse_args_checksum_choice_new_algos() {
   char* argv3[] = {"fastsync", "--checksum-choice=auto", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH64);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH128);
+  config_delete(cfg);
+
+  /* A single md4/sha1 name selects it for both transfer and pre-transfer. */
+  static const int single[] = {(int)CHECKSUM_ALGO_MD4, (int)CHECKSUM_ALGO_SHA1};
+  static const char* const single_names[] = {"md4", "sha1"};
+  for (size_t i = 0; i < 2; i++) {
+    cfg = config_create();
+    char* arg = (char*)single_names[i];
+    char* argv4[] = {"fastsync", "--cc", arg, "/src", "/dst"};
+    positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->checksum_algo, single[i]);
+    EXPECT_EQ_INT(cfg->checksum_transfer_algo, single[i]);
+    config_delete(cfg);
+  }
+
+  /* Two-name form: first is the transfer checksum, second the pre-transfer one
+     that FastSync actually uses. */
+  cfg = config_create();
+  char* argv5[] = {"fastsync", "--cc=sha1,md4", "/checksum/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_SHA1);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD4);
+  config_delete(cfg);
+
+  /* "none" is accepted without --checksum but forces --whole-file like rsync. */
+  cfg = config_create();
+  char* argv6[] = {"fastsync", "--cc=none", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv6, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_NONE);
+  EXPECT_TRUE(cfg->whole_file);
+  config_delete(cfg);
+}
+
+/* rsync rejects "none" as the pre-transfer checksum with --checksum (exit 4),
+   regardless of option order. */
+static void test_parse_args_checksum_none_with_checksum_rejected() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum", "--cc=none", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--checksum", "--cc=md5,none", "/checksum/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+
+  /* "none" as the TRANSFER checksum with a real pre-transfer checksum is
+     accepted (rsync allows none,md5 with -c). */
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--checksum", "--cc=none,md5", "/checksum/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
+  EXPECT_TRUE(cfg->whole_file);
   config_delete(cfg);
 }
 
@@ -1594,28 +1659,40 @@ static void test_parse_args_timeout_zero_and_no_forms() {
   config_delete(cfg);
 }
 
-/* rsync's --compress-choice choices FastSync does not implement are rejected by
- * name; zstd/none/auto are accepted. */
+/* Every rsync 3.4.1 --compress-choice name is accepted and mapped to a real
+ * codec; "auto" resolves to the negotiated default (zstd).  An unknown name is
+ * rejected with rsync's exit code 4. */
 static void test_parse_args_compress_choice_parity() {
-  static const char* const good[] = {"zstd", "none", "auto"};
+  struct {
+    const char* name;
+    CompressionAlgo algo;
+    bool enabled;
+  } good[] = {
+      {"zstd", COMPRESSION_ALGO_ZSTD, true},  {"lz4", COMPRESSION_ALGO_LZ4, true},
+      {"zlib", COMPRESSION_ALGO_ZLIB, true},  {"zlibx", COMPRESSION_ALGO_ZLIBX, true},
+      {"none", COMPRESSION_ALGO_NONE, false}, {"auto", COMPRESSION_ALGO_ZSTD, true},
+      {"ZSTD", COMPRESSION_ALGO_ZSTD, true},
+  };
   for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
     Config* cfg = config_create();
-    char* argv[] = {"fastsync", "--compress-choice", (char*)good[i], "/src", "/dst"};
+    char* argv[] = {"fastsync", "--compress-choice", (char*)good[i].name, "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
     /* "auto" is normalized to the canonical "zstd" the receiver accepts. */
-    EXPECT_EQ_STR(cfg->compress_choice, strcmp(good[i], "auto") == 0 ? "zstd" : good[i]);
-    EXPECT_EQ_INT(cfg->use_compression, strcmp(good[i], "none") != 0 ? 1 : 0);
+    EXPECT_EQ_STR(cfg->compress_choice, compression_algo_name(good[i].algo));
+    EXPECT_EQ_INT(cfg->compression_algo, (int)good[i].algo);
+    EXPECT_EQ_INT(cfg->use_compression, good[i].enabled ? 1 : 0);
     config_delete(cfg);
   }
-  static const char* const bad[] = {"lz4", "zlib", "zlibx", "bogus"};
+  static const char* const bad[] = {"bogus", "", "zstd,lz4"};
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--compress-choice", (char*)bad[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
     config_delete(cfg);
   }
 }
@@ -4400,6 +4477,7 @@ void test_client_cli() {
   test_parse_args_checksum_choice_equals_forms();
   test_parse_args_checksum_choice_rejects_unsupported();
   test_parse_args_checksum_choice_new_algos();
+  test_parse_args_checksum_none_with_checksum_rejected();
   test_parse_args_checksum_implies_incremental_only();
   test_parse_args_no_whole_file();
   test_parse_args_timeout_zero_and_no_forms();

@@ -18,9 +18,9 @@
 
 /* P8 config-frame tail: super_mode (4) + copy-as presence (4) + uid (4) + gid (4). */
 #define P8_TAIL_BYTES 16
-/* Protocol 2.23.0 appends one trailing bool (report_dest_info) AFTER the P8
- * tail, so the P8 fields sit this many bytes before the end of the frame. */
-#define OUTPUT_TAIL_BYTES 4
+/* Bytes after the P8 tail: report_dest_info (4) and, since protocol 2.26.0,
+ * compression_algo (4).  The P8 fields sit this many bytes before the end. */
+#define POST_P8_TAIL_BYTES 8
 
 /* Smoke test for chunk_deserialize fuzz target */
 static void test_fuzz_chunk_deserialize() {
@@ -323,7 +323,7 @@ static void test_fuzz_config_receive_p8_tail() {
   size_t len = 0;
   bool captured = capture_config_frame(c, &frame, &len);
   config_delete(c);
-  if (!captured || len <= P8_TAIL_BYTES) {
+  if (!captured || len <= P8_TAIL_BYTES + POST_P8_TAIL_BYTES) {
     free(frame);
     EXPECT_TRUE(false);
     return;
@@ -337,31 +337,31 @@ static void test_fuzz_config_receive_p8_tail() {
 
   /* super_mode outside the 0..2 tri-state is refused. */
   memcpy(mut, frame, len);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES, 99);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, 99);
   EXPECT_FALSE(receive_config_frame(mut, len));
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES, -1);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, -1);
   EXPECT_FALSE(receive_config_frame(mut, len));
 
   /* A negative (sentinel) and an extreme copy-as uid/gid are refused. */
   memcpy(mut, frame, len);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES, SUPER_MODE_AUTO);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES + 4, 1);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES + 8, -1);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES + 12, 0);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, SUPER_MODE_AUTO);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 4, 1);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 8, -1);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 12, 0);
   EXPECT_FALSE(receive_config_frame(mut, len));
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES + 8, 0);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES + 12, INT32_MIN);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 8, 0);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 12, INT32_MIN);
   EXPECT_FALSE(receive_config_frame(mut, len));
 
   /* A presence int that is not a wire bool is refused. */
   memcpy(mut, frame, len);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES, SUPER_MODE_AUTO);
-  put_i32(mut, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES + 4, 2);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, SUPER_MODE_AUTO);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 4, 2);
   EXPECT_FALSE(receive_config_frame(mut, len));
 
   /* Truncating anywhere inside the P8 tail is refused. */
   EXPECT_FALSE(receive_config_frame(frame, len - 2));
-  EXPECT_FALSE(receive_config_frame(frame, len - OUTPUT_TAIL_BYTES - P8_TAIL_BYTES));
+  EXPECT_FALSE(receive_config_frame(frame, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES));
 
   free(mut);
   free(frame);

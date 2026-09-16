@@ -1491,20 +1491,101 @@ class TestChecksumChoice:
             assert fh.read() == b"same content\n"
 
     @pytest.mark.ci
-    def test_checksum_choice_md4_single_name_rejected(self, shared_server):
-        for bad in ("md4", "sha1", "none", "xxh64,md5"):
+    @pytest.mark.parametrize("algo", ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"])
+    def test_checksum_choice_all_algorithms_transfer(self, shared_server, algo):
+        """Every rsync 3.4.1 checksum algorithm is accepted and transfers
+        byte-exactly.  'none' is covered separately (it needs no digest)."""
+        clean_dir(DEST_DIR)
+        flags = ["--preserve", "--incremental", "--checksum", f"--checksum-choice={algo}"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"checksum-choice={algo} failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_two_name_form(self, shared_server):
+        """The rsync 'TRANSFER,PRE-TRANSFER' form is accepted; FastSync uses the
+        second (pre-transfer) algorithm for its whole-file digest."""
+        clean_dir(DEST_DIR)
+        flags = ["--preserve", "--incremental", "--checksum", "--cc=md4,sha1"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"two-name --cc=md4,sha1 failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_none_accepted_without_checksum(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--preserve", "--incremental", "--cc=none"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--cc=none failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_none_rejected_with_checksum(self, shared_server):
+        """rsync rejects 'none' as the pre-transfer checksum with --checksum and
+        exits 4; mirror both the rejection and the exit code."""
+        for choice in ("none", "md5,none"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=["--checksum", f"--cc={choice}"],
+                                   port=shared_server.port)
+            assert result.returncode == 4, \
+                f"--cc={choice} --checksum must exit 4, got {result.returncode}: " \
+                f"{(result.stderr or result.stdout)[:200]}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_unknown_rejected_exit_4(self, shared_server):
+        for bad in ("sha256", "bogus", "md5,", "md4,md5,sha1"):
             result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                    flags=[f"--checksum-choice={bad}"],
                                    port=shared_server.port)
-            assert result.returncode != 0, f"{bad} must be rejected"
+            assert result.returncode == 4, \
+                f"--checksum-choice={bad} must exit 4, got {result.returncode}"
 
     @pytest.mark.ci
-    def test_compress_choice_unsupported_rejected(self, shared_server):
-        for bad in ("lz4", "zlib", "zlibx"):
+    @pytest.mark.parametrize("algo", ["zstd", "lz4", "zlib", "zlibx"])
+    def test_compress_choice_all_algorithms_transfer(self, shared_server, algo):
+        """Every rsync 3.4.1 compression codec is accepted and transfers
+        byte-exactly through its own codec."""
+        clean_dir(DEST_DIR)
+        flags = ["-z", f"--compress-choice={algo}"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--compress-choice={algo} failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    @pytest.mark.ci
+    def test_compress_choice_unknown_rejected_exit_4(self, shared_server):
+        for bad in ("bogus", "zstd,lz4", ""):
             result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                    flags=[f"--compress-choice={bad}"],
                                    port=shared_server.port)
-            assert result.returncode != 0, f"{bad} must be rejected"
+            assert result.returncode == 4, \
+                f"--compress-choice={bad} must exit 4, got {result.returncode}"
+
+    @pytest.mark.ci
+    def test_compress_choice_none_disables_compression(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-z", "--compress-choice=none"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--compress-choice=none failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
 
     @pytest.mark.ci
     def test_compress_choice_auto_transfers(self, shared_server):
