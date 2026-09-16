@@ -1,5 +1,7 @@
 #include "change_list.h"
+#include "checksum.h"
 #include "utils.h"
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -200,6 +202,83 @@ char* change_render_itemize(const Config* config, const ChangeEvent* event) {
 
 /* ---- --out-format / --log-file-format ---- */
 
+/* rsync 3.4.1's `%C` uses the negotiated transfer checksum; with the default
+ * "auto" choice on both ends that is xxh128.  FastSync's internal XXH64 default
+ * is not an rsync algorithm, so map it to xxh128 for parity. */
+static ChecksumAlgo out_format_checksum_algo(const Config* config) {
+  switch ((ChecksumAlgo)config->checksum_algo) {
+  case CHECKSUM_ALGO_MD5:
+    return CHECKSUM_ALGO_MD5;
+  case CHECKSUM_ALGO_XXH3:
+    return CHECKSUM_ALGO_XXH3;
+  case CHECKSUM_ALGO_XXH128:
+    return CHECKSUM_ALGO_XXH128;
+  case CHECKSUM_ALGO_XXH64:
+  default:
+    return CHECKSUM_ALGO_XXH128;
+  }
+}
+
+/* Render a digest as rsync's sum_as_hex: for xxh128 the HIGH 64-bit half is
+ * printed before the low half; every other algorithm prints its bytes in order. */
+static void digest_to_hex(ChecksumAlgo algo, const uint8_t* digest, size_t len, char* out) {
+  if (algo == CHECKSUM_ALGO_XXH128 && len == 16) {
+    uint64_t low = 0;
+    uint64_t high = 0;
+    memcpy(&low, digest, sizeof(low));
+    memcpy(&high, digest + 8, sizeof(high));
+    snprintf(out, len * 2 + 1, "%016llx%016llx", (unsigned long long)high,
+             (unsigned long long)low);
+    return;
+  }
+  static const char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    out[i * 2] = hex[(digest[i] >> 4) & 0xf];
+    out[i * 2 + 1] = hex[digest[i] & 0xf];
+  }
+  out[len * 2] = '\0';
+}
+
+static bool format_uses_checksum(const char* format) {
+  if (format == NULL)
+    return false;
+  for (const char* p = format; *p != '\0';) {
+    if (*p != '%') {
+      p++;
+      continue;
+    }
+    char token = p[1];
+    if (token == '\0')
+      break;
+    if (token == 'C')
+      return true;
+    p += 2;
+  }
+  return false;
+}
+
+/* Fill event->checksum/checksum_known for a transferred regular file.  A
+ * non-regular entry (or a hard-link sibling) leaves checksum_known false, which
+ * renders as spaces like rsync. */
+static void fill_event_checksum(const Config* config, const File* file, ChangeEvent* event) {
+  if (file == NULL || file->is_dir || file->is_symlink || file->is_special ||
+      (file->link_group != 0 && !file->link_first))
+    return;
+  if (!format_uses_checksum(config->out_format) && !format_uses_checksum(config->log_file_format))
+    return;
+  if (file->path == NULL)
+    return;
+  ChecksumAlgo algo = out_format_checksum_algo(config);
+  uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
+  size_t len = 0;
+  /* rsync's %C is the transfer checksum, which is always seeded with 0 (it is
+   * independent of --checksum-seed, as rsync 3.4.1 demonstrates). */
+  if (!checksum_digest_file(algo, 0, file->path, digest, sizeof(digest), &len))
+    return;
+  digest_to_hex(algo, digest, len, event->checksum);
+  event->checksum_known = true;
+}
+
 char* change_render_format(const char* format, const Config* config, const ChangeEvent* event) {
   if (format == NULL || event == NULL)
     return NULL;
@@ -244,6 +323,22 @@ char* change_render_format(const char* format, const Config* config, const Chang
       char digits[32];
       int written = snprintf(digits, sizeof(digits), "%llu", event->bytes_sent);
       ok = written >= 0 && (size_t)written < sizeof(digits) && strbuf_append(&line, digits);
+    } break;
+    case 'c': {
+      char digits[32];
+      int written = snprintf(digits, sizeof(digits), "%llu", event->bytes_read);
+      ok = written >= 0 && (size_t)written < sizeof(digits) && strbuf_append(&line, digits);
+    } break;
+    case 'C': {
+      if (event->checksum_known) {
+        ok = strbuf_append(&line, event->checksum);
+      } else {
+        /* rsync pads a non-regular / untransferred entry with spaces. */
+        ChecksumAlgo algo = out_format_checksum_algo(config);
+        int width = checksum_digest_len(algo) * 2;
+        for (int i = 0; i < width && ok; i++)
+          ok = strbuf_append_char(&line, ' ');
+      }
     } break;
     case 'M': {
       char when[32];
@@ -464,7 +559,8 @@ static void fill_event_from_file(const Config* config, const File* file, ChangeE
   }
 }
 
-void change_emit_file_sent(const Config* config, const File* file) {
+void change_emit_file_sent_bytes(const Config* config, const File* file,
+                                 unsigned long long bytes_sent, unsigned long long bytes_read) {
   if (file == NULL || !change_list_enabled(config))
     return;
   ChangeEvent event;
@@ -489,17 +585,25 @@ void change_emit_file_sent(const Config* config, const File* file) {
     event.hardlink_target = file->hardlink_target;
     event.bytes_sent = 0;
   } else {
-    /* Literal payload bytes delivered; compressed/delta wire bytes are not
-     * separately counted. */
-    event.bytes_sent = event.size;
+    event.bytes_sent = bytes_sent;
+    event.bytes_read = bytes_read;
   }
   char* name = NULL;
   char* path = NULL;
   fill_event_from_file(config, file, &event, &name, &path);
-  if (name != NULL && path != NULL)
+  if (name != NULL && path != NULL) {
+    fill_event_checksum(config, file, &event);
     change_emit(config, &event);
+  }
   free(name);
   free(path);
+}
+
+void change_emit_file_sent(const Config* config, const File* file) {
+  if (file == NULL)
+    return;
+  unsigned long long payload = file->data != NULL ? file->data->size : 0;
+  change_emit_file_sent_bytes(config, file, payload, 0);
 }
 
 void change_emit_dir_sent(const Config* config, const File* file) {

@@ -2,6 +2,7 @@
 #define CHANGE_LIST_H
 
 #include "config.h"
+#include "checksum.h"
 #include "file_types.h"
 #include "format.h"
 #include <stdbool.h>
@@ -37,7 +38,13 @@ typedef struct {
   const char* symlink_target;
   const char* hardlink_target;
   unsigned long long size;       /* source file length in bytes */
-  unsigned long long bytes_sent; /* literal data bytes actually transferred */
+  unsigned long long bytes_sent; /* wire bytes actually transferred (rsync %b) */
+  unsigned long long bytes_read; /* wire bytes read back for this file (rsync %c) */
+  /* rsync %C: whole-file checksum hex for a transferred regular file.  Only
+   * filled when the active format uses %C (checksum_known == false otherwise,
+   * which renders as spaces like rsync for non-regular entries). */
+  bool checksum_known;
+  char checksum[CHECKSUM_MAX_DIGEST_LEN * 2 + 1];
   time_t mtime_sec;
   long mtime_nsec;
   mode_t mode;
@@ -61,7 +68,9 @@ char* change_render_itemize_code(const Config* config, const ChangeEvent* event)
 /* Expand an --out-format/--log-file-format template.  Supported tokens:
  *   %i  itemize code            %n  transfer-relative name (dir: trailing /)
  *   %f  long display path       %l  file length in bytes
- *   %b  bytes actually sent     %M  mtime (YYYY/MM/DD-HH:MM:SS)
+ *   %b  wire bytes transferred  %c  wire bytes read back for the file
+ *   %C  whole-file checksum hex (xxh128 by default; spaces for non-regular)
+ *   %M  mtime (YYYY/MM/DD-HH:MM:SS)
  *   %t  current time            %o  operation ("send"/"del.")
  *   %p  pid                     %B  permission bits without the type char
  *   %U  uid                     %G  gid
@@ -80,7 +89,14 @@ char* change_render_list_line(const Config* config, const ChangeEvent* event);
  * CHANGE_UP_TO_DATE events produce no output. */
 void change_emit(const Config* config, const ChangeEvent* event);
 
-/* Build and emit a CHANGE_SENT event for a file the client just sent. */
+/* Build and emit a CHANGE_SENT event for a file the client just sent.  `bytes_sent`
+ * / `bytes_read` are the process-wide wire-byte deltas for this file (rsync's
+ * %b / %c); pass 0 when unknown. */
+void change_emit_file_sent_bytes(const Config* config, const File* file,
+                                 unsigned long long bytes_sent, unsigned long long bytes_read);
+
+/* Build and emit a CHANGE_SENT event for a file the client just sent, deriving
+ * the wire byte counts from the source payload length. */
 void change_emit_file_sent(const Config* config, const File* file);
 
 /* Build and emit a CHANGE_SENT event for an explicit directory entry (-d). */

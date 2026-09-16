@@ -2763,14 +2763,13 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.23.0).  The values below are the only
+/* The pinned golden frame (protocol 2.25.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.23.0
- * rsync-parity wave changes the config-frame layout (map-entry range + TO name,
- * one report_dest_info bool, and other wire changes landing in this version);
- * the byte-exact values are recomputed for the merged layout. */
-#define GOLDEN_WIRE_LEN 697
-#define GOLDEN_WIRE_HASH 7835017034643051109ULL
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.25.0
+ * wire-stats wave appends one report_stats bool to the config frame; the
+ * byte-exact values are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 701
+#define GOLDEN_WIRE_HASH 16170466870400670271ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

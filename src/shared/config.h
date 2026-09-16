@@ -250,8 +250,17 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  * answer every per-file STATUS_CHECK with a STATUS_DEST_INFO snapshot of the
  * pre-transfer destination entry (see protocol.h).  It is set by the client
  * only when -i/--itemize-changes or --out-format asks for per-file change
- * output; the transfer decision itself is unchanged. */
-#define CONFIG_WIRE_OUTPUT_FIELDS(X) X(report_dest_info, bool, false, BOOL)
+ * output; the transfer decision itself is unchanged.
+ *
+ * Wire-stats wave (protocol 2.25.0).  report_stats tells the receiver to send a
+ * STATUS_STATS frame immediately before its terminal success status carrying
+ * the receiver-only counters (matched data, deleted/created file counts) and,
+ * for -n/--dry-run --delete, the destination-relative paths it WOULD have
+ * deleted.  It is set by the client only when --stats, --progress/-P, an
+ * --out-format token needs a wire counter (%b/%c), or a dry-run carries
+ * --delete; the transfer decision itself is unchanged. */
+#define CONFIG_WIRE_OUTPUT_FIELDS(X)                                                               \
+  X(report_dest_info, bool, false, BOOL) X(report_stats, bool, false, BOOL)
 
 /* All serialized fields, in exact wire order.  Concatenating the per-segment
  * lists here is what keeps the declaration order = the wire order. */
@@ -911,8 +920,17 @@ typedef struct Config {
  * snapshot of the old entry) before its ordinary verdict when the config frame
  * carries the new report_dest_info bool appended after the --copy-as block.
  * This is both a config-frame layout change (one trailing bool) and a frame
- * sequence change (the new status). */
-#define PROTOCOL_VERSION "2.23.0"
+ * sequence change (the new status).
+ *
+ * (4) Wire-stats parity (protocol 2.25.0): --stats, --progress/-P and the
+ * --out-format %b/%c tokens need receiver-only and wire counters that the push
+ * sender cannot observe, and -n/--dry-run --delete must report the extras it
+ * would have removed without deleting anything.  The config frame gains one
+ * trailing report_stats bool and the receiver emits a new STATUS_STATS frame
+ * (carrying matched data, created/deleted counts and the would-delete path
+ * list) immediately before its terminal success status.  Both a config-frame
+ * layout change and a frame-sequence change, hence the bump. */
+#define PROTOCOL_VERSION "2.25.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

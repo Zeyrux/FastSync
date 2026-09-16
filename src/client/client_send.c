@@ -1878,6 +1878,8 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
                          (stream && !config->use_compression)) &&
                         source_is_regular_file(f);
     SourceFile* source = remove_sources ? source_file_create(f) : NULL;
+    unsigned long long bytes_before = protocol_bytes_written();
+    unsigned long long read_before = protocol_bytes_read();
     int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
     if (rc == 1) {
       source_file_destroy(source);
@@ -1887,7 +1889,8 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       source_file_destroy(source);
       return -1;
     }
-    change_emit_file_sent(config, f);
+    change_emit_file_sent_bytes(config, f, protocol_bytes_written() - bytes_before,
+                                protocol_bytes_read() - read_before);
     if (source && !array_list_add(remove_sources, source)) {
       source_file_destroy(source);
       return -1;

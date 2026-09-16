@@ -18,9 +18,10 @@
 
 /* P8 config-frame tail: super_mode (4) + copy-as presence (4) + uid (4) + gid (4). */
 #define P8_TAIL_BYTES 16
-/* Protocol 2.23.0 appends one trailing bool (report_dest_info) AFTER the P8
- * tail, so the P8 fields sit this many bytes before the end of the frame. */
-#define OUTPUT_TAIL_BYTES 4
+/* Protocol 2.25.0 appends two trailing bools (report_dest_info, report_stats)
+ * AFTER the P8 tail, so the P8 fields sit this many bytes before the end of the
+ * frame. */
+#define OUTPUT_TAIL_BYTES 8
 
 /* Smoke test for chunk_deserialize fuzz target */
 static void test_fuzz_chunk_deserialize() {

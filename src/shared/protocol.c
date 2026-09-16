@@ -29,6 +29,13 @@ static unsigned long long io_bwlimit = 0;
 static mtx_t bw_mutex;
 static once_flag bw_mutex_once = ONCE_FLAG_INIT;
 
+/* Process-wide wire byte counters, used by the client to render rsync's
+ * --stats/--progress totals and the --out-format %b/%c tokens.  The zero-copy
+ * sendfile path bypasses protocol_send_n_data, so it reports its bytes through
+ * protocol_note_bytes_written. */
+static atomic_ullong io_bytes_written = 0;
+static atomic_ullong io_bytes_read = 0;
+
 static unsigned long long global_bwlimit(void);
 
 static bool protocol_reserve_memory(ProtocolSession* session, size_t charge) {
@@ -242,6 +249,18 @@ SSL* io_get_ssl(void) {
   return io_ssl;
 }
 
+unsigned long long protocol_bytes_written(void) {
+  return atomic_load(&io_bytes_written);
+}
+
+unsigned long long protocol_bytes_read(void) {
+  return atomic_load(&io_bytes_read);
+}
+
+void protocol_note_bytes_written(unsigned long long bytes) {
+  atomic_fetch_add(&io_bytes_written, bytes);
+}
+
 static ProtocolSession* legacy_session(int read_fd, int write_fd) {
   if (bound_session)
     return bound_session;
@@ -343,6 +362,7 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
       wait_events = POLLOUT;
   }
   log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zu", total_bytes_send);
+  atomic_fetch_add(&io_bytes_written, (unsigned long long)total_bytes_send);
   return true;
 }
 
@@ -430,6 +450,7 @@ static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, 
       wait_events = POLLIN;
   }
   log_debug_message(LOG_DEBUG_IO, "    Received n Data: %zu", total_bytes_received);
+  atomic_fetch_add(&io_bytes_read, (unsigned long long)total_bytes_received);
   return true;
 }
 
