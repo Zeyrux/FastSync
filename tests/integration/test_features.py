@@ -3755,15 +3755,15 @@ class TestDeleteTiming:
             assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n", \
                 f"{flag}: nested file was not written after the early deletion"
 
-    @pytest.mark.parametrize("flag", ["--delete", "--delete-after", "--delete-delay"])
+    @pytest.mark.parametrize("flag", ["--delete", "--delete-after"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_flags_commit_only_after_success(self, flag, mt):
-        """Plain --delete/--delete-after/--delete-delay defer deletion until the
-        whole transfer succeeds: a mid-transfer write failure must leave every
-        extra in place (commit-style safety).  The -m receiver must also keep
-        the extras: the deferred keep-set is committed by the server only after
-        the disk-writer thread has finished, and a failing writer means the
-        manifest is freed, never applied."""
+        """Plain --delete/--delete-after defer deletion until the whole transfer
+        succeeds: a mid-transfer write failure must leave every extra in place
+        (commit-style safety).  The -m receiver must also keep the extras: the
+        deferred keep-set is committed by the server only after the disk-writer
+        thread has finished, and a failing writer means the manifest is freed,
+        never applied."""
         source = self._seed("late")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_late_dst")
         clean_dir(dest)
@@ -3788,6 +3788,37 @@ class TestDeleteTiming:
                 f"{flag} (mt={mt}) removed an extra although the transfer failed"
             assert os.path.isfile(blocker), \
                 f"{flag} (mt={mt}) deleted the blocker although the transfer failed"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_delay_clears_type_conflict_like_rsync(self, mt):
+        """rsync clears a destination file that blocks a source directory even
+        when the deletion itself is deferred (--delete-delay); the type conflict
+        is resolved immediately so the nested write succeeds.  The transfer must
+        therefore succeed and the unrelated extra must still be removed."""
+        source = self._seed("delayconflict")
+        dest = os.path.join(TEST_DATA_DIR, "deltiming_delayconflict_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            extra = os.path.join(received, "extra.txt")
+            with open(extra, "wb") as fh:
+                fh.write(b"extra file")
+            blocker = os.path.join(received, "sub")
+            shutil.rmtree(blocker)
+            with open(blocker, "wb") as fh:
+                fh.write(b"blocks the nested destination directory")
+
+            flags = ["--delete-delay"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"--delete-delay (mt={mt}) did not clear the type conflict: " \
+                f"{(result.stderr or result.stdout)[:300]}"
+            assert os.path.isdir(blocker), "blocker file was not replaced by the source directory"
+            assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n"
+            assert not os.path.exists(extra), "--delete-delay did not remove the extra"
 
     def test_early_flag_respected_when_server_refuses_delete(self, shared_server):
         """With an --allow-delete-less server the client's early timing still

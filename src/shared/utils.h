@@ -139,6 +139,11 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
                                        const DeleteSkipEntry* skips, int skip_count,
                                        size_t* deleted_out, size_t* skipped_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
+/* Open the existing destination directory at `dest_root`, confined to the
+   authorized root with an O_NOFOLLOW component walk (the same confinement the
+   deletion walker uses for its root).  Returns a new fd the caller owns, or -1
+   on error (including a destination that does not exist). */
+int utils_open_authorized_destination(const char* dest_root);
 bool utils_set_authorized_root(int fd, const char* canonical_path);
 /* The fd-only compatibility form is fail-closed for path-based operations;
  * callers should use utils_set_authorized_root with the canonical identity. */

@@ -852,13 +852,15 @@ static void test_config_delete_timing_early_helper() {
   cfg->use_delete = true;
   cfg->delete_before = true;
   EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
   cfg = config_create();
   cfg->use_delete = true;
   cfg->delete_during = true;
-  EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
@@ -866,6 +868,7 @@ static void test_config_delete_timing_early_helper() {
   cfg->use_delete = true;
   cfg->delete_delay = true;
   EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
@@ -873,6 +876,7 @@ static void test_config_delete_timing_early_helper() {
   cfg->use_delete = true;
   cfg->delete_after = true;
   EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
@@ -2763,14 +2767,14 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.23.0).  The values below are the only
+/* The pinned golden frame (protocol 2.24.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.23.0
- * rsync-parity wave changes the config-frame layout (map-entry range + TO name,
- * one report_dest_info bool, and other wire changes landing in this version);
- * the byte-exact values are recomputed for the merged layout. */
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
+ * per-directory delete-plan wave changes only the version string in the config
+ * frame (the frame layout itself is unchanged from 2.23.0); the byte-exact hash
+ * is recomputed for the new version bytes. */
 #define GOLDEN_WIRE_LEN 697
-#define GOLDEN_WIRE_HASH 7835017034643051109ULL
+#define GOLDEN_WIRE_HASH 13736055061412501670ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2852,7 +2856,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.23.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.24.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())

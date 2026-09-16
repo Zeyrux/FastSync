@@ -41,6 +41,11 @@ typedef struct PipelineContextReceiver {
      transfer truly succeeded.  NULL in the early delete modes (which delete at
      the manifest). */
   DeleteManifest* deferred_manifest;
+  /* Per-directory delete session for --delete-delay: receive_thread snapshots
+     each plan's extras as it arrives and hands the session here instead of
+     committing while the disk writer may still be draining; server.c commits it
+     after both threads joined.  NULL for every other timing. */
+  DeletePlanSession* deferred_plans;
   /* Set by server.c when the deferred delete commit hit the --max-delete
      budget; the terminal success frame then carries STATUS_DELETE_LIMIT
      (rsync exit 25) while the transfer itself still succeeds. */

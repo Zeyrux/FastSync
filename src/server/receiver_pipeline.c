@@ -27,6 +27,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->queued_bytes = 0;
   context->max_queue_bytes = 0;
   context->deferred_manifest = NULL;
+  context->deferred_plans = NULL;
   context->delete_limit_reached = false;
   atomic_init(&context->cancelled, false);
   int init = 0;
@@ -58,6 +59,8 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   config_delete(context->config);
   if (context->deferred_manifest)
     delete_manifest_free(context->deferred_manifest);
+  if (context->deferred_plans)
+    delete_plan_session_destroy(context->deferred_plans);
   queue_destroy(context->queue);
   receiver_outcomes_destroy(&context->outcomes);
   dir_time_list_free(&context->dir_times);
@@ -165,7 +168,7 @@ int receive_thread(void* pipeline_context) {
   ReceiverSink sink = {
       receiver_enqueue_file, context, false, false, NULL, receiver_pipeline_note_delete_limit};
   if (receiver_process_pending((Config*)config, file_descriptor, &sink,
-                               &context->deferred_manifest) != 0) {
+                               &context->deferred_manifest, &context->deferred_plans) != 0) {
     receiver_thread_fail(context);
     protocol_session_unbind();
     return thrd_error;

@@ -912,7 +912,7 @@ typedef struct Config {
  * carries the new report_dest_info bool appended after the --copy-as block.
  * This is both a config-frame layout change (one trailing bool) and a frame
  * sequence change (the new status). */
-#define PROTOCOL_VERSION "2.23.0"
+#define PROTOCOL_VERSION "2.24.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
@@ -1006,13 +1006,17 @@ int config_parse_daemon_dest(Config* config);
  * 0. */
 int config_parse_transport_dest(Config* config);
 
-/* True when the negotiated delete timing performs the extra-file deletion
- * BEFORE the transfer data (--delete-before / --delete-during).  The flag is
- * a pure function of the config and is used identically on the sender (to pick
+/* True for the whole-tree delete-before timing: a complete keep-set manifest is
+ * transmitted before any data and committed (with an ack) before the first data
+ * byte.  Pure function of the config, used identically on the sender (to pick
  * the manifest-first frame order) and the receiver (to delete when the early
- * manifest arrives).  When false the deletion is committed only after the whole
- * transfer succeeded (--delete / --delete-after / --delete-delay). */
+ * manifest arrives). */
 bool config_delete_timing_early(const Config* config);
+/* True for the per-directory timings (--delete-during / --delete-delay).  The
+ * sender streams a delete plan per source directory in directory order; the
+ * receiver applies each plan on arrival (during) or snapshots its extras and
+ * commits them only after a fully-successful transfer (delay). */
+bool config_delete_timing_per_dir(const Config* config);
 /* Delete-timing sanity: with deletion enabled at most one timing flag may be
  * set (none = the default delete-after commit timing); without deletion no
  * timing flag may be set (each timing flag implies --delete). */

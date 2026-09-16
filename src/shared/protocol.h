@@ -181,7 +181,21 @@ enum NET_STATUS {
    * (new vs modified, and which of size/time/perms/owner/group differ) without
    * changing the transfer decision itself.  Appended after
    * STATUS_DELETE_LIMIT so no existing status is renumbered. */
-  STATUS_DEST_INFO
+  STATUS_DEST_INFO,
+  /* Per-directory delete plan (protocol 2.24.0).  The sender of a
+   * --delete-during/--delete-delay transfer streams one frame per source
+   * directory in directory order instead of a single whole-tree keep-set
+   * manifest.  The receiver applies the plan when it arrives
+   * (--delete-during removes that directory's extras immediately) or records
+   * the extras and applies them only after the whole transfer succeeded
+   * (--delete-delay).  Payload: an int32 has_config flag (1 on the first plan
+   * of the run, 0 afterwards); when set, the three global config sections
+   * (protected-prefix count+paths, size-skipped count+paths, missing-args
+   * count+paths); then the destination-relative directory path wire string
+   * ("." for the receive root); then the child-directory count + names and the
+   * child-file count + names that must be kept.  Appended after
+   * STATUS_DEST_INFO so no existing status is renumbered. */
+  STATUS_DELETE_PLAN
 };
 
 void io_set_fds(int read_fd, int write_fd);

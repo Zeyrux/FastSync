@@ -36,6 +36,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
   context->early_delete = false;
+  context->delete_plans = NULL;
   context->scan_stopped_early = false;
   context->total_files = 0;
   context->progress_bytes = 0;
@@ -187,6 +188,8 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
+  if (context->delete_plans)
+    delete_plan_sender_destroy(context->delete_plans);
   if (context->excluded_paths)
     array_list_delete(context->excluded_paths);
   if (context->size_skipped_paths)

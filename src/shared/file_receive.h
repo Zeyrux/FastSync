@@ -118,6 +118,14 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
    confinement or I/O error (the run then fails); tolerated per-path cases are
    reported and skipped. */
 bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest);
+/* Budgeted form of manifest_delete_missing_args for the per-directory delete
+   session: each removed mirror draws from `max_delete` (SIZE_MAX = unlimited)
+   and the tallies are accumulated into `*deleted`/`*skipped`.  `*limit_hit` is set
+   when the budget stopped the pass with entries left over.  Returns false only
+   on a genuine deletion error. */
+bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
+                                          size_t max_delete, size_t* deleted, size_t* skipped,
+                                          bool* limit_hit);
 /* Outcome of committing a delete manifest.  LIMIT_REACHED reports rsync's
    partial --max-delete result: the budget allowed some deletions and the rest
    were skipped (the run still stores all file data but the client exits 25). */
