@@ -5,6 +5,7 @@ differential tests run the SAME transfer with real ``rsync 3.4.1`` and with
 fastsync and compare stdout, so they are skipped when rsync is unavailable.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -383,19 +384,22 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
-    def test_progress_first_frame_matches_rsync(self, shared_server):
-        """For a sub-32 KiB file the first --progress frame is deterministic
-        (0.00 kB/s, 0:00:00) and must be byte-identical to rsync's."""
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("progress_flag", ["--progress", "-P"])
+    def test_progress_first_frame_matches_rsync(self, shared_server, progress_flag, mt):
+        """For a sub-32 KiB file the first --progress/-P frame is deterministic
+        (0.00 kB/s, 0:00:00) and must be byte-identical to rsync's, in both the
+        single-threaded and --threads send paths."""
         source = os.path.join(TEST_DATA_DIR, "wire_pg_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_pg_dst")
         rdst = os.path.join(TEST_DATA_DIR, "wire_pg_rdst")
         _make_one_file(source, "f.bin", 100)
         clean_dir(dest)
         clean_dir(rdst)
-        rsync_result = _rsync(["-a", "--progress", source + "/", rdst + "/"])
+        rsync_result = _rsync(["-a", progress_flag, source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
-        result, _ = run_client(source, dest, flags=["-a", "--progress"],
-                               port=shared_server.port)
+        flags = ["-a", progress_flag] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
 
         def frames(text):
@@ -410,8 +414,10 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
-    def test_stats_selected_lines_match_rsync(self, shared_server):
-        """The protocol-independent --stats lines must match rsync exactly."""
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_stats_selected_lines_match_rsync(self, shared_server, mt):
+        """The protocol-independent --stats lines must match rsync exactly, in
+        both the single-threaded and --threads (multithreaded) send paths."""
         source = os.path.join(TEST_DATA_DIR, "wire_st_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_st_dst")
         rdst = os.path.join(TEST_DATA_DIR, "wire_st_rdst")
@@ -420,8 +426,8 @@ class TestWireStatsParity:
         clean_dir(rdst)
         rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
-        result, _ = run_client(source, dest, flags=["-a", "--stats"],
-                               port=shared_server.port)
+        flags = ["-a", "--stats"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
         keys = (
             "Number of regular files transferred",
@@ -430,6 +436,7 @@ class TestWireStatsParity:
             "Literal data",
             "Matched data",
             "Number of deleted files",
+            "File list size",
         )
 
         def pick(text):
@@ -446,8 +453,68 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
-    def test_dry_run_delete_lines_match_rsync(self):
-        """-n --delete emits transfer-relative `*deleting` lines like rsync."""
+    def test_stats_file_count_breakdown_residual(self, shared_server):
+        """Residual (row #3): rsync prints the `Number of files` and
+        `Number of created files` lines with a per-type breakdown
+        (`(reg: X, dir: Y, link: Z)`).
+
+        FastSync cannot reproduce it from what the sender currently knows: the
+        scanner does not put directory entries in the transfer list (directories
+        are created implicitly), and without a per-entry destination-probe the
+        sender cannot tell which entries the receiver newly created.  So FastSync
+        prints the bare transferred-entry count.  This test pins the divergence
+        explicitly -- the row must not be marked ✅.
+        """
+        source = os.path.join(TEST_DATA_DIR, "wire_stc_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_stc_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_stc_rdst")
+        _make_one_file(source, "f.bin", 6000)
+        clean_dir(dest)
+        clean_dir(rdst)
+        rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--stats"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        def stats_line(text, key):
+            for line in text.splitlines():
+                if line.startswith(key + ":"):
+                    return line
+            return None
+
+        r_files = stats_line(rsync_result.stdout, "Number of files")
+        r_created = stats_line(rsync_result.stdout, "Number of created files")
+        f_files = stats_line(result.stdout, "Number of files")
+        f_created = stats_line(result.stdout, "Number of created files")
+
+        # rsync always carries the type breakdown (the source root counts as a
+        # directory; the single regular file as reg).
+        assert re.match(r"Number of files: 2 \(reg: 1, dir: 1\)$", r_files), r_files
+        assert re.match(r"Number of created files: 1 \(reg: 1\)$", r_created), r_created
+        # FastSync prints only the bare count: no directory accounting and no
+        # per-entry "created" knowledge.
+        assert re.fullmatch(r"Number of files: 1", f_files), f_files
+        assert re.fullmatch(r"Number of created files: 1", f_created), f_created
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                reason="known gap: the --threads dry-run delete path does not "
+                       "consume the receiver's STATUS_STATS delete list yet, so "
+                       "`-n --delete` emits no *deleting lines (tracked by the "
+                       "parity-blockers STATUS_STATS fix)",
+                strict=False,
+            ),
+        ),
+    ])
+    def test_dry_run_delete_lines_match_rsync(self, mt):
+        """-n --delete emits transfer-relative `*deleting` lines like rsync
+        (single-threaded; the --threads variant is a documented xfail)."""
         source = os.path.join(TEST_DATA_DIR, "wire_del_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_del_dst")
         rdst = os.path.join(TEST_DATA_DIR, "wire_del_rdst")
@@ -483,10 +550,10 @@ class TestWireStatsParity:
             line for line in rsync_result.stdout.splitlines() if line.startswith("*deleting")
         )
         # The shared session server refuses deletion; start one that allows it.
+        flags = ["-a", "-n", "--delete", "-i"] + (["--threads"] if mt else [])
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(source, dest, flags=["-a", "-n", "--delete", "-i"],
-                                   port=server.port)
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
         assert result.returncode == 0, result.stderr[:300]
         fast_del = sorted(
             line for line in result.stdout.splitlines() if line.startswith("*deleting")

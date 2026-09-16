@@ -101,15 +101,24 @@ class _SlicingProxy:
     """Forward the client stream to a server, optionally cutting it or invoking a
     hook after a byte threshold.  ``forward_limit`` mode resets both ends after
     that many client bytes (a mid-transfer failure).  ``hook`` mode calls the
-    hook once and keeps forwarding to completion."""
+    hook once and keeps forwarding to completion.
+
+    With ``wait_for_reply`` the hook is a real barrier, not a timing guess: it
+    fires only after the server has sent *any* reply, which the receiver does
+    only after it has consumed the frames that precede the payload (the
+    per-directory delete plan for ``--delete-delay``).  The caller pairs it with
+    ``--incremental`` so a per-file handshake reply is guaranteed mid-transfer.
+    """
 
     def __init__(self, target_port, forward_limit=None, hook=None, hook_after=0,
-                 throttle=0.0):
+                 throttle=0.0, wait_for_reply=False):
         self.target = ("127.0.0.1", target_port)
         self.forward_limit = forward_limit
         self.hook = hook
         self.hook_after = hook_after
         self.throttle = throttle
+        self.wait_for_reply = wait_for_reply
+        self.server_replied = threading.Event()
         self.hook_called = threading.Event()
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -158,15 +167,7 @@ class _SlicingProxy:
                             data = data[:room]
                         backend.sendall(data)
                         forwarded += len(data)
-                        if (self.hook is not None and not self.hook_called.is_set()
-                                and forwarded >= self.hook_after):
-                            # Give the receiver time to process the (tiny) plan
-                            # frames that precede this offset before the hook
-                            # mutates the destination.
-                            if self.throttle > 0:
-                                time.sleep(0.2)
-                            self.hook()
-                            self.hook_called.set()
+                        self._maybe_hook(forwarded)
                         if self.forward_limit is not None and forwarded >= self.forward_limit:
                             socks = []
                             break
@@ -174,6 +175,10 @@ class _SlicingProxy:
                             time.sleep(self.throttle)
                     else:
                         client.sendall(data)
+                        # Any server reply proves the receiver consumed the
+                        # frames that precede it, so the hook barrier is met.
+                        self.server_replied.set()
+                        self._maybe_hook(forwarded)
         except OSError:
             pass
         for sock in (client, backend):
@@ -189,6 +194,19 @@ class _SlicingProxy:
             self.listener.close()
         except OSError:
             pass
+
+    def _maybe_hook(self, forwarded):
+        """Fire the one-shot hook once its barrier is satisfied: enough client
+        bytes have been forwarded and, when ``wait_for_reply`` is set, the
+        server has sent a reply proving it processed the preceding frames."""
+        if self.hook is None or self.hook_called.is_set():
+            return
+        if forwarded < self.hook_after:
+            return
+        if self.wait_for_reply and not self.server_replied.is_set():
+            return
+        self.hook()
+        self.hook_called.set()
 
     def finish(self):
         self._thread.join(30)
@@ -317,8 +335,16 @@ class TestDeleteDelayVsAfterSnapshot:
                     # after the directory's plan (delay) has been processed.
                     _write(new_extra, b"created mid-transfer\n")
 
-                proxy = _SlicingProxy(server.port, hook=hook, hook_after=MID_TRANSFER_BYTES, throttle=PROXY_THROTTLE)
-                flags = [timing] + (["--threads"] if mt else [])
+                # --incremental gives the receiver a mid-transfer handshake
+                # reply; the proxy waits for it (wait_for_reply) so the hook is
+                # causally after the plan frame, never a timing guess.
+                # --ignore-times forces the big file to transfer on the second
+                # timing too (the first run already installed it), keeping the
+                # mid-transfer reply present in both iterations.
+                proxy = _SlicingProxy(server.port, hook=hook,
+                                      hook_after=MID_TRANSFER_BYTES,
+                                      throttle=PROXY_THROTTLE, wait_for_reply=True)
+                flags = [timing, "--incremental", "--ignore-times"] + (["--threads"] if mt else [])
                 result, _ = run_client(source, dest, flags=flags, port=proxy.port)
                 proxy.finish()
                 assert result.returncode == 0, (
