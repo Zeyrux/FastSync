@@ -3,6 +3,7 @@
 
 #include "array_list.h"
 #include "checksum.h"
+#include "compression.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -81,7 +82,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.23.0).
+ * Config wire-field table (single source of truth for protocol 2.26.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -203,7 +204,7 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
 #define CONFIG_WIRE_FUZZY_FIELDS(X) X(fuzzy, bool, false, BOOL)
 
 #define CONFIG_WIRE_CHECKSUM_FIELDS(X)                                                             \
-  X(checksum_algo, int, CHECKSUM_ALGO_XXH64, INT_CHECKSUM_ALGO)                                    \
+  X(checksum_algo, int, CHECKSUM_ALGO_DEFAULT, INT_CHECKSUM_ALGO)                                  \
   X(checksum_seed, uint64_t, 0, RAW)
 
 #define CONFIG_WIRE_IDENTITY_FIELDS(X)                                                             \
@@ -262,6 +263,27 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
 #define CONFIG_WIRE_OUTPUT_FIELDS(X)                                                               \
   X(report_dest_info, bool, false, BOOL) X(report_stats, bool, false, BOOL)
 
+/* Codec-negotiation wave (protocol 2.26.0).  compression_algo is the concrete
+ * codec the client selected for this transfer (a CompressionAlgo id) and is the
+ * value the receiver validates and installs.  It is the resolved result of
+ * --compress-choice / the "auto" negotiation so both peers agree exactly.
+ *
+ * Negotiation model: FastSync enforces a strict same-version handshake, so both
+ * peers carry the identical compiled-in codec set.  The client resolves the
+ * effective algorithm deterministically and serializes it here; "auto" picks
+ * the first entry of the rsync 3.4.1 preference order
+ * (compression: zstd lz4 zlibx zlib none; checksum: xxh128 xxh3 xxh64 md5 md4
+ * sha1 none), and an explicit request wins.  The receiver rejects (before
+ * STATUS_OK) any algorithm outside its own supported set, which is rsync's
+ * "no common choice is an error" behavior.  The same resolver runs on both
+ * sides (compression_negotiate_default / checksum_negotiate_default), so the
+ * fallback is consistent.
+ *
+ * The field is appended after the output block so every pre-2.26 field keeps
+ * its wire position. */
+#define CONFIG_WIRE_CODEC_FIELDS(X)                                                                \
+  X(compression_algo, int, COMPRESSION_ALGO_ZSTD, INT_COMPRESSION_ALGO)
+
 /* All serialized fields, in exact wire order.  Concatenating the per-segment
  * lists here is what keeps the declaration order = the wire order. */
 #define CONFIG_WIRE_FIELDS(X)                                                                      \
@@ -283,7 +305,8 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   CONFIG_WIRE_ICONV_FIELDS(X)                                                                      \
   CONFIG_WIRE_PRIVILEGE_FIELDS(X)                                                                  \
   CONFIG_WIRE_COPY_AS_FIELDS(X)                                                                    \
-  CONFIG_WIRE_OUTPUT_FIELDS(X)
+  CONFIG_WIRE_OUTPUT_FIELDS(X)                                                                     \
+  CONFIG_WIRE_CODEC_FIELDS(X)
 
 typedef struct Config {
   /* -j/--threads=N: number of parallel scanner worker threads for the -m
@@ -377,6 +400,16 @@ typedef struct Config {
    * failing the run.  Sender-side only: nothing is sent for it and it never
    * enters the keep-set.  Implied by --delete-missing-args. */
   bool ignore_missing_args;
+
+  /* Codec-negotiation CLI state (all client-only, never serialized).  The
+   * effective pre-transfer checksum is Config->checksum_algo (serialized);
+   * checksum_transfer_algo is the rsync "transfer" half of a two-name
+   * --checksum-choice form (validated and used only to mirror rsync's
+   * whole-file forcing, since FastSync's per-block strong hash is fixed).
+   * cli_exit_code carries a parser-requested process exit status (rsync uses 4
+   * for an unsupported checksum/compress algorithm) so main() can mirror it. */
+  int checksum_transfer_algo;
+  int cli_exit_code;
 
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).
@@ -941,9 +974,21 @@ typedef struct Config {
  * would have removed without deleting anything.  The config frame gains one
  * trailing report_stats bool and the receiver emits a new STATUS_STATS frame
  * (carrying matched data, the deleted-file count and the would-delete path
- * list) immediately before its terminal success status.  Both a config-frame
- * layout change and a frame-sequence change, hence the bump. */
-#define PROTOCOL_VERSION "2.25.0"
+ * list) immediately before its terminal success status.
+ *
+ * (6) Codec breadth + negotiation (protocol 2.26.0): the config frame gains one
+ * trailing int, compression_algo (a CompressionAlgo id), appended after the
+ * output block.  It is the negotiated/effective compression codec and is what
+ * the receiver's self-describing decompressor validates against its own
+ * supported set.  The checksum_algo wire value now also accepts md4/sha1/none,
+ * and its default changes to the rsync 3.4.1 auto-negotiated xxh128.
+ *
+ * Any config-frame layout change must bump the protocol version: a peer that
+ * does not parse the new trailing bytes would desynchronize on the frame
+ * boundary, and the strict same-version handshake (config_receive rejects a
+ * mismatched version before parsing anything else) keeps mixed deployments from
+ * ever reaching that state. */
+#define PROTOCOL_VERSION "2.26.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

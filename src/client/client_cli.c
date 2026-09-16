@@ -150,47 +150,96 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
 }
 
 /* Set and validate the compression algorithm selected by the client.  rsync
- * 3.4.1 can be built with zstd, none, lz4, zlibx, zlib and auto; FastSync only
- * implements zstd (and no compression).  "auto" is accepted as the default
- * zstd choice; any other rsync choice is rejected by name instead of being
- * silently accepted and ignored. */
+ * 3.4.1 can be built with zstd, none, lz4, zlibx, zlib and auto; all of those
+ * names are accepted and mapped to a real codec here.  "auto" resolves through
+ * FastSync's compiled-in preference order (rsync 3.4.1's list).  An unknown
+ * name is a hard error with rsync's exit code 4, never a silent no-op. */
 static int set_compression_choice(Config* config, const char* value) {
-  /* rsync's "auto" is normalized to the canonical "zstd" at parse time (like
-     --checksum-choice=auto), so the value that crosses the wire is always one
-     the receiver accepts. */
-  const char* canonical = strcmp(value, "auto") == 0 ? "zstd" : value;
-  if (strcmp(canonical, "zstd") != 0 && strcmp(canonical, "none") != 0) {
-    log_message(LOG_LEVEL_ERROR,
-                "--compress-choice '%s' is not implemented; FastSync supports zstd, none or auto "
-                "(rsync's lz4/zlib/zlibx are rejected, never silently ignored)",
-                value);
+  if (!value) {
+    config->cli_exit_code = 4;
     return -1;
   }
+  int algo;
+  if (strcasecmp(value, "auto") == 0)
+    algo = (int)compression_negotiate_default();
+  else
+    algo = compression_algo_from_name(value);
+  if (algo < 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--compress-choice '%s' is not a supported algorithm; FastSync supports zstd, "
+                "lz4, zlib, zlibx, none or auto",
+                value);
+    config->cli_exit_code = 4;
+    return -1;
+  }
+  const char* canonical = compression_algo_name((CompressionAlgo)algo);
   if (set_string_option(&config->compress_choice, canonical, "--compress-choice") != 0)
     return -1;
-  config->use_compression = strcmp(canonical, "none") != 0;
+  config->compression_algo = algo;
+  config->use_compression = (algo != (int)COMPRESSION_ALGO_NONE);
   return 0;
 }
 
-/* Validate and store the --checksum-choice/--cc algorithm.  Only the algorithms
- * the engine genuinely supports are accepted (xxh64/xxhash, xxh3, xxh128, md5);
- * rsync's compiled-in choices that FastSync does not implement (md4, sha1,
- * none) and the two-name transfer/pre-transfer syntax are a clear error, never
- * a silent no-op.  "auto" (rsync's default automatic choice) selects FastSync's
- * default algorithm. */
+/* Store one algorithm name into *out.  Returns 0 for a valid name, 1 for
+ * "auto" (caller resolves it), -1 for an unknown/too-long name. */
+static int resolve_checksum_name(const char* name, size_t len, int* out) {
+  char buf[64];
+  if (len == 0 || len >= sizeof(buf))
+    return -1;
+  memcpy(buf, name, len);
+  buf[len] = '\0';
+  if (strcasecmp(buf, "auto") == 0)
+    return 1;
+  int algo = checksum_algo_from_name(buf);
+  if (algo < 0)
+    return -1;
+  *out = algo;
+  return 0;
+}
+
+/* Validate and store the --checksum-choice/--cc algorithm.  rsync 3.4.1 accepts
+ * a single name (used for both the transfer and pre-transfer checksums) or the
+ * two-name "TRANSFER,PRE-TRANSFER" form (only one comma is significant).  The
+ * pre-transfer half is FastSync's whole-file digest; the transfer half is
+ * validated for parity and, when "none", forces --whole-file like rsync.  An
+ * unknown name (including an empty half or a second comma) is exit 4.  "auto"
+ * resolves to FastSync's negotiated default (xxh128). */
 static int set_checksum_choice(Config* config, const char* value) {
-  if (strcasecmp(value, "auto") == 0)
-    return 0;
-  int algo = checksum_algo_from_name(value);
-  if (algo < 0) {
-    log_message(LOG_LEVEL_ERROR,
-                "--checksum-choice '%s' is not implemented; FastSync supports xxh64 (or xxhash), "
-                "xxh3, xxh128, md5 or auto (rsync's md4/sha1/none and the two-name "
-                "transfer,pre-transfer form are rejected, never silently ignored)",
-                value);
+  if (!value) {
+    config->cli_exit_code = 4;
     return -1;
   }
-  config->checksum_algo = algo;
+  const char* comma = strchr(value, ',');
+  const char* name1 = value;
+  size_t len1 = comma ? (size_t)(comma - value) : strlen(value);
+  const char* name2 = comma ? comma + 1 : NULL;
+  size_t len2 = name2 ? strlen(name2) : 0;
+
+  int transfer = -1;
+  int pre = -1;
+  int rc1 = resolve_checksum_name(name1, len1, &transfer);
+  int rc2 = name2 ? resolve_checksum_name(name2, len2, &pre) : 1;
+  if (rc1 < 0 || rc2 < 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--checksum-choice '%s' is invalid; FastSync supports xxh64 (or xxhash), xxh128, "
+                "xxh3, md5, md4, sha1, none or auto, optionally as 'transfer,pre-transfer'",
+                value);
+    config->cli_exit_code = 4;
+    return -1;
+  }
+  ChecksumAlgo negotiated = checksum_negotiate_default();
+  if (rc1 == 1)
+    transfer = (int)negotiated;
+  if (!name2)
+    pre = transfer;
+  else if (rc2 == 1)
+    pre = (int)negotiated;
+
+  config->checksum_algo = pre;
+  config->checksum_transfer_algo = transfer;
+  /* rsync: "none" for the transfer checksum forces --whole-file. */
+  if (transfer == (int)CHECKSUM_ALGO_NONE)
+    config->whole_file = true;
   return 0;
 }
 
@@ -2326,8 +2375,23 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
  * -1 on error. */
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
   set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
-  if (config->compress_choice)
-    config->use_compression = strcmp(config->compress_choice, "none") != 0;
+  if (config->compress_choice) {
+    int algo = compression_algo_from_name(config->compress_choice);
+    if (algo >= 0) {
+      config->compression_algo = algo;
+      config->use_compression = (algo != (int)COMPRESSION_ALGO_NONE);
+    }
+  }
+  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE)
+    config->compression_algo = (int)compression_negotiate_default();
+  /* rsync parity: "none" as the pre-transfer checksum cannot be combined with
+   * --checksum (exit 4).  The check runs here because --checksum may appear on
+   * either side of --checksum-choice. */
+  if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
+    config->cli_exit_code = 4;
+    return -1;
+  }
 
   /* rsync randomizes the checksum seed for every transfer when the user did not
    * supply one (a seed of 0, including an explicit --checksum-seed=0), using
@@ -2786,7 +2850,7 @@ int main(int argc, char* argv[]) {
   int parse_ret = parse_args(config, argc, argv, positional_args, &positional_count);
   if (parse_ret != 0) {
     if (parse_ret < 0)
-      exit_code = 1;
+      exit_code = config->cli_exit_code ? config->cli_exit_code : 1;
     goto cleanup;
   }
 
@@ -2875,6 +2939,11 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto cleanup;
   }
+
+  /* Install the negotiated codec for this process before any transfer thread
+   * is spawned; the compressed frames are self-describing, so the receiver's
+   * decompressor does not need this, but the sender compressor does. */
+  compression_set_algo((CompressionAlgo)config->compression_algo);
 
   /* --iconv: install the sender-side local->wire conversion before any path is
      scanned or serialized (the scanner and the chunk/data path read windows are

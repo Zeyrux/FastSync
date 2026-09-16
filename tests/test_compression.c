@@ -157,20 +157,22 @@ static void test_chunk_compress_decompress_roundtrip() {
 
 /* Build a zstd frame whose header omits the content size (the content size
  * flag is cleared), which ZSTD_getFrameContentSize reports as
- * ZSTD_CONTENTSIZE_UNKNOWN. */
+ * ZSTD_CONTENTSIZE_UNKNOWN.  The frame carries the codec-id prefix the
+ * decompressor dispatches on. */
 static Data* make_unknown_size_frame(const void* src, size_t len) {
   ZSTD_CCtx* cctx = ZSTD_createCCtx();
   if (!cctx)
     return NULL;
   ZSTD_CCtx_setParameter(cctx, ZSTD_c_contentSizeFlag, 0);
   size_t cap = ZSTD_compressBound(len);
-  Data* out = data_create_empty(cap);
+  Data* out = data_create_empty(cap + 1);
   if (!out) {
     ZSTD_freeCCtx(cctx);
     return NULL;
   }
+  ((uint8_t*)out->data)[0] = (uint8_t)COMPRESSION_ALGO_ZSTD;
   ZSTD_inBuffer in = {src, len, 0};
-  ZSTD_outBuffer ob = {out->data, cap, 0};
+  ZSTD_outBuffer ob = {(uint8_t*)out->data + 1, cap, 0};
   size_t ret;
   do {
     ret = ZSTD_compressStream2(cctx, &ob, &in, ZSTD_e_end);
@@ -180,7 +182,7 @@ static Data* make_unknown_size_frame(const void* src, size_t len) {
       return NULL;
     }
   } while (ret > 0);
-  out->size = ob.pos;
+  out->size = ob.pos + 1;
   ZSTD_freeCCtx(cctx);
   return out;
 }
@@ -199,8 +201,9 @@ static void test_data_decompress_unknown_size_frame() {
   Data* frame = make_unknown_size_frame(buf, len);
   free(buf);
   EXPECT_NOT_NULL(frame);
-  /* Guard the premise of the test: the frame really has no stored size. */
-  EXPECT_EQ_INT((int)ZSTD_getFrameContentSize(frame->data, frame->size),
+  /* Guard the premise of the test: the frame (after the codec byte) really has
+   * no stored size. */
+  EXPECT_EQ_INT((int)ZSTD_getFrameContentSize((uint8_t*)frame->data + 1, frame->size - 1),
                 (int)ZSTD_CONTENTSIZE_UNKNOWN);
 
   Data* decompressed = data_decompress(frame);
@@ -326,6 +329,89 @@ static void test_data_decompress_truncated_frame_fails() {
   data_destroy(input);
 }
 
+/* Every codec must round-trip byte-exactly through the self-describing frame,
+ * including the empty and a highly compressible large payload. */
+static void codec_roundtrip(CompressionAlgo algo) {
+  const char* samples[] = {
+      "",
+      "Hello, World! This is test data for compression round-trip!",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  };
+  for (size_t s = 0; s < sizeof(samples) / sizeof(samples[0]); s++) {
+    size_t len = strlen(samples[s]);
+    Data* original = data_create_empty(len);
+    EXPECT_NOT_NULL(original);
+    if (len > 0)
+      memcpy(original->data, samples[s], len);
+    original->size = len;
+
+    Data* compressed = data_compress_codec(original, algo, 3, 0);
+    EXPECT_NOT_NULL(compressed);
+    EXPECT_EQ_INT((int)((uint8_t*)compressed->data)[0], (int)algo);
+    Data* decompressed = data_decompress(compressed);
+    EXPECT_NOT_NULL(decompressed);
+    EXPECT_EQ_INT((int)decompressed->size, (int)len);
+    EXPECT_EQ_INT(memcmp(decompressed->data, original->data, len), 0);
+    data_destroy(decompressed);
+    data_destroy(compressed);
+    data_destroy(original);
+  }
+}
+
+static void test_codec_roundtrips() {
+  codec_roundtrip(COMPRESSION_ALGO_NONE);
+  codec_roundtrip(COMPRESSION_ALGO_ZSTD);
+  codec_roundtrip(COMPRESSION_ALGO_LZ4);
+  codec_roundtrip(COMPRESSION_ALGO_ZLIB);
+  codec_roundtrip(COMPRESSION_ALGO_ZLIBX);
+}
+
+static void test_codec_name_mapping() {
+  EXPECT_EQ_INT(compression_algo_from_name("zstd"), (int)COMPRESSION_ALGO_ZSTD);
+  EXPECT_EQ_INT(compression_algo_from_name("ZSTD"), (int)COMPRESSION_ALGO_ZSTD);
+  EXPECT_EQ_INT(compression_algo_from_name("lz4"), (int)COMPRESSION_ALGO_LZ4);
+  EXPECT_EQ_INT(compression_algo_from_name("zlib"), (int)COMPRESSION_ALGO_ZLIB);
+  EXPECT_EQ_INT(compression_algo_from_name("zlibx"), (int)COMPRESSION_ALGO_ZLIBX);
+  EXPECT_EQ_INT(compression_algo_from_name("none"), (int)COMPRESSION_ALGO_NONE);
+  EXPECT_TRUE(compression_algo_from_name("bogus") < 0);
+  EXPECT_TRUE(compression_algo_from_name(NULL) < 0);
+  EXPECT_TRUE(compression_algo_valid((int)COMPRESSION_ALGO_LZ4));
+  EXPECT_TRUE(compression_algo_valid((int)COMPRESSION_ALGO_ZLIB));
+  EXPECT_TRUE(compression_algo_valid((int)COMPRESSION_ALGO_ZLIBX));
+  EXPECT_FALSE(compression_algo_valid(99));
+  EXPECT_EQ_STR(compression_algo_name(COMPRESSION_ALGO_ZSTD), "zstd");
+  EXPECT_EQ_STR(compression_algo_name(COMPRESSION_ALGO_LZ4), "lz4");
+  EXPECT_EQ_STR(compression_algo_name(COMPRESSION_ALGO_ZLIB), "zlib");
+  EXPECT_EQ_STR(compression_algo_name(COMPRESSION_ALGO_ZLIBX), "zlibx");
+  EXPECT_EQ_STR(compression_algo_name(COMPRESSION_ALGO_NONE), "none");
+  /* rsync 3.4.1 auto-negotiates zstd first. */
+  EXPECT_EQ_INT((int)compression_negotiate_default(), (int)COMPRESSION_ALGO_ZSTD);
+  EXPECT_FALSE(compression_algo_enabled(COMPRESSION_ALGO_NONE));
+  EXPECT_TRUE(compression_algo_enabled(COMPRESSION_ALGO_ZSTD));
+}
+
+/* The process-global codec selects what the legacy wrappers produce. */
+static void test_codec_global_selection() {
+  Data* original = data_create_empty(64);
+  EXPECT_NOT_NULL(original);
+  memset(original->data, 'q', 64);
+  original->size = 64;
+
+  compression_set_algo(COMPRESSION_ALGO_LZ4);
+  Data* compressed = data_compress(original, 3);
+  EXPECT_NOT_NULL(compressed);
+  EXPECT_EQ_INT((int)((uint8_t*)compressed->data)[0], (int)COMPRESSION_ALGO_LZ4);
+  Data* decompressed = data_decompress(compressed);
+  EXPECT_NOT_NULL(decompressed);
+  EXPECT_TRUE(memcmp(decompressed->data, original->data, 64) == 0);
+  data_destroy(decompressed);
+  data_destroy(compressed);
+
+  /* Restore the default so later tests are unaffected. */
+  compression_set_algo(COMPRESSION_ALGO_ZSTD);
+  data_destroy(original);
+}
+
 void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
@@ -335,4 +421,7 @@ void test_compression() {
   test_data_compress_with_threads_roundtrip();
   test_data_compress_reused_contexts_multithreaded();
   test_chunk_compress_decompress_roundtrip();
+  test_codec_roundtrips();
+  test_codec_name_mapping();
+  test_codec_global_selection();
 }

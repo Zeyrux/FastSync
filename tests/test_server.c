@@ -1072,10 +1072,10 @@ static void test_incremental_check_basis_fifo_does_not_hang() {
     EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
     EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
     /* config_has_basis() makes the request carry the source digest. */
-    uint8_t wire_len = 8;
-    uint8_t digest[8] = {0};
+    uint8_t wire_len = checksum_digest_len((ChecksumAlgo)cfg->checksum_algo);
+    uint8_t digest[CHECKSUM_MAX_DIGEST_LEN] = {0};
     EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
-    EXPECT_TRUE(send_n_data(p[1], digest, sizeof(digest)));
+    EXPECT_TRUE(send_n_data(p[1], digest, wire_len));
     Status s;
     EXPECT_TRUE(receive_status(p[1], &s));
     EXPECT_EQ_INT(s, STATUS_NEXT);

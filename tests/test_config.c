@@ -1368,6 +1368,61 @@ static void test_config_receive_rejects_invalid_checksum_algo() {
   EXPECT_FALSE(roundtrip_config_ok(c));
   config_delete(c);
 }
+
+/* The negotiated codec id and the human --compress-choice spelling must agree,
+ * and the id itself must be a known codec. */
+static void test_config_receive_rejects_invalid_compression_algo() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->compression_algo = 99;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+static void test_config_receive_rejects_codec_mismatch() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  free(c->compress_choice);
+  c->compress_choice = str_dup("lz4");
+  c->use_compression = true;
+  c->compression_algo = (int)COMPRESSION_ALGO_ZSTD; /* does not match lz4 */
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+static void test_config_receive_rejects_none_codec_with_compression() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->use_compression = true;
+  c->compression_algo = (int)COMPRESSION_ALGO_NONE;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+static void test_config_receive_rejects_checksum_none_with_checksum() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->checksum = true;
+  c->checksum_algo = (int)CHECKSUM_ALGO_NONE;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
 /* The identity-mapping fields (--numeric-ids / --usermap / --groupmap /
    --chown) cross the config wire unchanged: the receiver needs them to apply
    ownership with the same policy the client requested. */
@@ -2549,6 +2604,7 @@ static bool basis_equal(const Config* a, const Config* b) {
 #define CONFIG_CMP_STR_MODULE(a, b, name) str_opt_equal((a)->name, (b)->name)
 #define CONFIG_CMP_STR_REDACTED_AUTH(a, b, name) str_opt_equal((a)->name, (b)->name)
 #define CONFIG_CMP_INT_CHECKSUM_ALGO(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT_COMPRESSION_ALGO(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_SUPERMODE(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_INT_IDENTITY(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_INT_SKIPCOUNT(a, b, name) ((a)->name == (b)->name)
@@ -2775,14 +2831,14 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.25.0).  The values below are the only
+/* The pinned golden frame (protocol 2.26.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
- * per-directory delete-plan wave changed only the version string in the config
- * frame; the 2.25.0 wire-stats wave appends one report_stats bool.  The
+ * delete-plan wave changed only the version string; 2.25.0 appended the
+ * report_stats bool and 2.26.0 appended the compression_algo int.  The
  * byte-exact values are recomputed for the merged layout. */
-#define GOLDEN_WIRE_LEN 701
-#define GOLDEN_WIRE_HASH 16170466870400670271ULL
+#define GOLDEN_WIRE_LEN 705
+#define GOLDEN_WIRE_HASH 4673424031554175633ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -3159,6 +3215,10 @@ void test_config() {
     test_config_basis_normalization();
     test_config_checksum_options_wire_roundtrip();
     test_config_receive_rejects_invalid_checksum_algo();
+    test_config_receive_rejects_invalid_compression_algo();
+    test_config_receive_rejects_codec_mismatch();
+    test_config_receive_rejects_none_codec_with_compression();
+    test_config_receive_rejects_checksum_none_with_checksum();
     test_config_identity_wire_roundtrip();
     test_config_receive_rejects_invalid_identity();
     test_config_metadata_times_wire_roundtrip();
