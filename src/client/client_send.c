@@ -1189,7 +1189,8 @@ static int send_chunk_delete_plans(Client* client, DeletePlanSender* plans, cons
     File* f = chunk->items[i];
     if (!f)
       continue;
-    if (delete_plan_send_for_path(client->file_descriptor, plans, file_wire_path(f), f->is_dir) != 0)
+    if (delete_plan_send_for_path(client->file_descriptor, plans, file_wire_path(f), f->is_dir) !=
+        0)
       return -1;
   }
   return 0;

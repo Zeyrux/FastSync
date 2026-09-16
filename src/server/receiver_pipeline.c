@@ -167,8 +167,8 @@ int receive_thread(void* pipeline_context) {
 
   ReceiverSink sink = {
       receiver_enqueue_file, context, false, false, NULL, receiver_pipeline_note_delete_limit};
-  if (receiver_process_pending((Config*)config, file_descriptor, &sink,
-                               &context->deferred_manifest, &context->deferred_plans) != 0) {
+  if (receiver_process_pending((Config*)config, file_descriptor, &sink, &context->deferred_manifest,
+                               &context->deferred_plans) != 0) {
     receiver_thread_fail(context);
     protocol_session_unbind();
     return thrd_error;

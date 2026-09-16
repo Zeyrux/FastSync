@@ -484,7 +484,8 @@ typedef struct PlanSkips {
   int count;
 } PlanSkips;
 
-static bool build_plan_skips(const Config* config, const DeletePlanSession* session, PlanSkips* out) {
+static bool build_plan_skips(const Config* config, const DeletePlanSession* session,
+                             PlanSkips* out) {
   out->entries = NULL;
   out->count = 0;
   int count = (config->delay_updates ? 1 : 0) + config->basis_count +
@@ -569,8 +570,8 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
     return false;
   }
   bool survives = false;
-  bool ok = process_children(childfd, child_rel, NULL, NULL, false, force_now, skips, session,
-                             &survives);
+  bool ok =
+      process_children(childfd, child_rel, NULL, NULL, false, force_now, skips, session, &survives);
   close(childfd);
   if (!ok)
     return false;
@@ -637,8 +638,8 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    char* child_rel = (strcmp(dir_rel, ".") == 0) ? str_dup(entry->d_name)
-                                                  : path_cat(dir_rel, entry->d_name);
+    char* child_rel =
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entry->d_name) : path_cat(dir_rel, entry->d_name);
     if (!child_rel) {
       operation_ok = false;
       continue;
@@ -704,8 +705,8 @@ static bool apply_plan_dir(DeletePlanSession* session, const Config* config, con
     return false;
   }
   bool survives = false;
-  bool ok = process_children(dirfd, dir, dirs, files, strcmp(dir, ".") == 0, false, &skips,
-                             session, &survives);
+  bool ok = process_children(dirfd, dir, dirs, files, strcmp(dir, ".") == 0, false, &skips, session,
+                             &survives);
   free(skips.entries);
   close(dirfd);
   if (!ok)
@@ -719,8 +720,8 @@ static bool apply_missing(DeletePlanSession* session, const Config* config) {
   session->missing_applied = true;
   if (session->missing->size == 0)
     return true;
-  DeleteManifest manifest = {.keeps = NULL, .protected = NULL, .missing = session->missing,
-                             .dirs = NULL};
+  DeleteManifest manifest = {
+      .keeps = NULL, .protected = NULL, .missing = session->missing, .dirs = NULL};
   size_t remaining = budget_available(session) ? session->max_delete - session->deleted : 0;
   size_t deleted = 0;
   size_t skipped = 0;

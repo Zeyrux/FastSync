@@ -259,8 +259,7 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    the whole transfer succeeded.  See receiver_process_pending() for how the -m
    receiver defers that commit until its disk writer has drained. */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             DeleteManifest** pending_manifest,
-                             DeletePlanSession** pending_plans) {
+                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return -1;
