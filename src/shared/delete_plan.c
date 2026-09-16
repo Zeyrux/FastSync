@@ -48,6 +48,10 @@ struct DeletePlanSender {
   const ArrayList* size_skipped;
   const ArrayList* missing_args;
   size_t entries;
+  /* Transmitted FILE entries only.  The caller's "empty scan" safety guard keys
+     off this (an I/O error that hid every file must refuse to delete even when
+     some directories were traversed), so directory keep entries do not count. */
+  size_t file_entries;
 };
 
 static size_t plan_hash(const char* key) {
@@ -254,8 +258,11 @@ bool delete_plan_sender_add(DeletePlanSender* sender, const char* path, bool is_
   }
   if (ok)
     ok = plan_ensure_ancestors(sender, parent);
-  if (ok)
+  if (ok) {
     sender->entries++;
+    if (!is_dir)
+      sender->file_entries++;
+  }
   free(clean);
   free(parent);
   free(base);
@@ -272,7 +279,7 @@ void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* sync
 }
 
 bool delete_plan_sender_empty(const DeletePlanSender* sender) {
-  return !sender || sender->entries == 0;
+  return !sender || sender->file_entries == 0;
 }
 
 void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* protected_prefixes,

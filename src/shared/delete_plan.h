@@ -43,7 +43,9 @@ bool delete_plan_sender_add(DeletePlanSender* sender, const char* path, bool is_
  * recursive transfer and for --files-from. */
 void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* synced_dirs,
                                  const char* walk_root);
-/* True when no transmitted entry was recorded (an ambiguous empty scan). */
+/* True when no transmitted FILE entry was recorded (an ambiguous empty scan).
+   Directory keep entries do not count, so an I/O error that hid every file
+   still refuses to delete. */
 bool delete_plan_sender_empty(const DeletePlanSender* sender);
 /* Attach the global config sections advertised on the first plan frame. */
 void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* protected_prefixes,
