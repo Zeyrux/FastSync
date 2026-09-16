@@ -20,7 +20,9 @@
 #include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <langinfo.h>
 #include <limits.h>
+#include <locale.h>
 #include <time.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -792,6 +794,9 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
     {"--secluded-args", "-s", OPT_NOOP, 0},
+    /* rsync's pre-3.2.6 name for --secluded-args (--protect-args) is accepted
+     * as the same secure-argv no-op. */
+    {"--protect-args", NULL, OPT_NOOP, 0},
     /* rsync -r/--recursive: FastSync is always recursive, so this is a
      * faithful no-op (accepted silently, never consumes an argument). */
     {"--recursive", "-r", OPT_NOOP, 0},
@@ -820,6 +825,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--out-format", NULL, OPT_STRING, offsetof(Config, out_format)},
     {"--log-file-format", NULL, OPT_STRING, offsetof(Config, log_file_format)},
     {"--existing", NULL, OPT_FLAG, offsetof(Config, existing)},
+    /* rsync's man-page alias for --existing (--ignore-non-existing). */
+    {"--ignore-non-existing", NULL, OPT_FLAG, offsetof(Config, existing)},
     {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
     {"--delay-updates", NULL, OPT_FLAG, offsetof(Config, delay_updates)},
     {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
@@ -1034,6 +1041,26 @@ static int apply_negation(Config* config, const char* arg) {
   return 0;
 }
 
+/* rsync's --iconv accepted extra spellings beyond explicit charset pairs:
+ * "." selects the locale's default charset for both directions, and "-" (or
+ * --no-iconv) disables conversion entirely.  Normalize both here so the rest
+ * of the pipeline only ever sees a real charset spec or NULL. */
+static int set_iconv_option(char** field, const char* value) {
+  if (value && strcmp(value, "-") == 0) {
+    free(*field);
+    *field = NULL;
+    return 0;
+  }
+  if (value && strcmp(value, ".") == 0) {
+    setlocale(LC_ALL, "");
+    const char* codeset = nl_langinfo(CODESET);
+    if (!codeset || codeset[0] == '\0')
+      codeset = "UTF-8";
+    return set_string_option(field, codeset, "--iconv");
+  }
+  return set_string_option(field, value, "--iconv");
+}
+
 static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
   if (entry->kind == OPT_NOOP)
     return 0;
@@ -1047,6 +1074,8 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   case OPT_STRING:
     if (entry->offset == offsetof(Config, chmod_spec))
       return append_chmod_spec((char**)field, value);
+    if (entry->offset == offsetof(Config, iconv_spec))
+      return set_iconv_option((char**)field, value);
     return set_string_option((char**)field, value, entry->name);
   case OPT_POS_INT:
     return set_positive_int_option((int*)field, value, entry->name);
@@ -1125,6 +1154,19 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
     config->no_implied_dirs = true;
     return true;
   }
+  /* "--no-iconv" is a real rsync option name that turns charset conversion off
+   * (the negation of the argument-taking --iconv), so it is handled before the
+   * generic --no-* negation branch. */
+  if (strcmp(arg, "--no-iconv") == 0) {
+    free(config->iconv_spec);
+    config->iconv_spec = NULL;
+    return true;
+  }
+  /* "--no-msgs2stderr" is the deprecated spelling of --stderr=client (rsync
+   * 3.4.1).  FastSync has no separate client message channel, so the closest
+   * supported mode is the errors-only default. */
+  if (strcmp(arg, "--no-msgs2stderr") == 0)
+    return set_stderr_mode("errors") == 0;
   /* "--no-motd" is a real rsync option name (client-side daemon MOTD display
    * suppression), not a negation of a "--motd" flag, so it is handled before
    * the generic --no-* negation branch. */
@@ -1792,6 +1834,12 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
   }
   if (opt_is(arg, "--stderr", NULL)) {
     if (ctx->i + 1 >= ctx->argc || set_stderr_mode(ctx->argv[++ctx->i]) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
+  /* rsync's deprecated spelling of --stderr=all. */
+  if (opt_is(arg, "--msgs2stderr", NULL)) {
+    if (set_stderr_mode("all") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -2505,6 +2553,13 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   }
 
   int result = -1;
+  /* rsync treats a lone -h as a help request (it only means human-readable
+   * when combined with a source/destination or other options). */
+  if (exp_argc == 2 && strcmp(exp_argv[1], "-h") == 0) {
+    print_usage();
+    result = 1;
+    goto done;
+  }
   int output_ret = cli_apply_output_controls(config, exp_argc, exp_argv);
   if (output_ret != 0) {
     result = output_ret;
