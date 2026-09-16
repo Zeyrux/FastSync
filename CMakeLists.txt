@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(FastFileTransfer VERSION 2.23.0)
+project(FastFileTransfer VERSION 2.26.0)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 11)
@@ -66,6 +66,16 @@ find_package(Threads REQUIRED)
 find_library(ZSTD_LIBRARY zstd)
 if(NOT ZSTD_LIBRARY)
 	message(FATAL_ERROR "zstd library not found. Ensure it is in your nix-shell!")
+endif()
+
+find_library(ZLIB_LIBRARY z)
+if(NOT ZLIB_LIBRARY)
+	message(FATAL_ERROR "zlib library not found. Ensure zlib1g-dev / nix zlib is available!")
+endif()
+
+find_library(LZ4_LIBRARY lz4)
+if(NOT LZ4_LIBRARY)
+	message(FATAL_ERROR "lz4 library not found. Ensure liblz4-dev / nix lz4 is available!")
 endif()
 
 find_package(OpenSSL REQUIRED)
@@ -135,8 +145,8 @@ set(CLIENT_MAIN_SRCS src/client/client_cli.c)
 # --- Library targets ---
 add_library(fastsync_shared STATIC ${SHARED_SRCS})
 target_include_directories(fastsync_shared PUBLIC src/shared)
-target_link_libraries(fastsync_shared PUBLIC Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL
-											OpenSSL::Crypto xxhash)
+target_link_libraries(fastsync_shared PUBLIC Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY}
+											${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_library(fastsync_client_core STATIC ${CLIENT_CORE_SRCS})
 target_include_directories(fastsync_client_core PUBLIC src/client)
@@ -275,7 +285,7 @@ if(ENABLE_FUZZ)
 		target_include_directories(${FUZZ_NAME} PRIVATE tests src/shared src/server)
 		target_compile_options(${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
 		target_link_options(${FUZZ_NAME} PRIVATE -fsanitize=fuzzer,address,undefined)
-		target_link_libraries(${FUZZ_NAME} PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL
-												  OpenSSL::Crypto xxhash)
+		target_link_libraries(${FUZZ_NAME} PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY}
+												  ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 	endforeach()
 endif()

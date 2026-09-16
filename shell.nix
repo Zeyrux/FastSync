@@ -38,6 +38,8 @@ pkgs.mkShell {
 
   buildInputs = with pkgs; [
     zstd
+    zlib
+    lz4
     openssl
   ];
 
