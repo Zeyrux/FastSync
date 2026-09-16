@@ -398,10 +398,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            --max-delete-capped commit still succeeds and the transfer proceeds;
            the terminal success frame reports the cap. */
         size_t deleted = 0;
-        DeleteCommitResult deletion =
-            (config->use_delete || config->delete_missing_args)
-                ? manifest_delete_all_counted(config, manifest, &deleted)
-                : DELETE_COMMIT_OK;
+        DeleteCommitResult deletion = (config->use_delete || config->delete_missing_args)
+                                          ? manifest_delete_all_counted(config, manifest, &deleted)
+                                          : DELETE_COMMIT_OK;
         receiver_tally_deleted(sink, deleted);
         delete_manifest_free(manifest);
         if (deletion == DELETE_COMMIT_ERROR) {

@@ -975,9 +975,9 @@ void handler(int file_descriptor) {
       if (context->deferred_plans) {
         /* Defence in depth (the enclosing block already excludes dry-run): a
            -n run never commits a deletion. */
-        DeleteCommitResult deletion = config->dry_run ? DELETE_COMMIT_OK
-                                                      : delete_plan_session_commit(
-                                                            context->deferred_plans, config);
+        DeleteCommitResult deletion =
+            config->dry_run ? DELETE_COMMIT_OK
+                            : delete_plan_session_commit(context->deferred_plans, config);
         context->stats.deleted_files += delete_plan_session_deleted(context->deferred_plans);
         if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
