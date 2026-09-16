@@ -294,8 +294,8 @@ static bool append_implied_dir_times(const Config* config, ArrayList* dir_entrie
   while (flen > 1 && fs[flen - 1] == '/')
     fs[--flen] = '\0';
   bool ok = true;
-  /* Walk the source path upwards one component at a time; the previous
-     iteration's truncation is restored so every ancestor is stat'ed in full. */
+  /* Walk the source path upwards one component at a time (fs is truncated in
+     place, so each step targets the next implied ancestor). */
   for (int depth = ncomp - 2; depth >= 0 && ok; depth--) {
     char* slash = strrchr(fs, '/');
     if (!slash || slash == fs)
