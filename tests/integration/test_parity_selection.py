@@ -141,6 +141,34 @@ class TestDirsOneLevel:
         assert result.returncode == 0, result.stderr[:300]
         assert _tree(rdst) == _tree(dest)
 
+    @requires_rsync
+    @pytest.mark.ci
+    def test_relative_delete_scope_matches_rsync(self):
+        """-R --delete must be confined to the transferred prefix subtree so a
+        sibling destination directory survives (rsync parity)."""
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_delscope_src"))
+        dest = os.path.join(TEST_DATA_DIR, "sel_delscope_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "sel_delscope_rdst")
+        spec = source + "/./foo"
+        for root in (dest, rdst):
+            clean_dir(root)
+            os.makedirs(os.path.join(root, "foo"))
+            with open(os.path.join(root, "foo", "extra.txt"), "wb") as fh:
+                fh.write(b"extra\n")
+            os.makedirs(os.path.join(root, "unrelated"))
+            with open(os.path.join(root, "unrelated", "keep.txt"), "wb") as fh:
+                fh.write(b"keep\n")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            r = _rsync(["-aR", "--delete", spec, rdst + "/"])
+            assert r.returncode == 0, r.stderr
+            result, _ = run_client(spec, dest, flags=["-a", "-R", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, result.stderr[:300]
+        assert (os.path.isfile(os.path.join(dest, "unrelated", "keep.txt"))
+                == os.path.isfile(os.path.join(rdst, "unrelated", "keep.txt")))
+        assert _tree(dest) == _tree(rdst)
+
 
 class TestClientAliases:
     """#5: safe rsync option aliases accepted client-side."""

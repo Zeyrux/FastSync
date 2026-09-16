@@ -335,6 +335,24 @@ static bool append_implied_dir_times(const Config* config, ArrayList* dir_entrie
   return ok;
 }
 
+/* The delete-walk root scope for a full (non---files-from) transfer: rsync
+ * confines --delete to the directories it actually transferred.  A plain
+ * recursive run mirrors the source under the receive root, so "." (the whole
+ * tree) is correct; an -R run transfers only the reconstructed prefix subtree,
+ * so the walk is scoped to that prefix instead.  Returns a malloc'd wire path
+ * (or "."), or NULL on allocation failure. */
+static char* delete_scope_root_marker(const Config* config) {
+  if (config->relative && config->files_from_set == NULL && config->send_directory) {
+    char* prefix = scanner_relative_prefix(config->send_directory);
+    if (!prefix)
+      return NULL;
+    if (prefix[0] != '\0')
+      return prefix;
+    free(prefix);
+  }
+  return str_dup(".");
+}
+
 /* True when some --files-from entry is an ancestor-or-equal directory of
  * `rel` (an empty entry -- the whole tree "." -- counts as the root). */
 static bool file_list_ancestor_listed(const FileListSet* set, const char* rel) {
@@ -2561,7 +2579,7 @@ int send_files(Config* config) {
        receive root, so mark the root itself (the "." sentinel) and let the
        scanner record nothing extra. */
     if (config->files_from_set == NULL) {
-      char* root_marker = str_dup(".");
+      char* root_marker = delete_scope_root_marker(config);
       if (!root_marker || !array_list_add(synced_dirs, root_marker)) {
         free(root_marker);
         goto send_fail;
@@ -2918,7 +2936,7 @@ int send_files_multithreaded(Config** config_ptr) {
       return 1;
     }
     if (config->files_from_set == NULL) {
-      char* root_marker = str_dup(".");
+      char* root_marker = delete_scope_root_marker(config);
       if (!root_marker || !array_list_add(context->synced_dirs, root_marker)) {
         free(root_marker);
         pipeline_context_sender_destroy(context);
