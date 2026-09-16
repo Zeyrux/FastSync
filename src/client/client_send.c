@@ -1607,6 +1607,9 @@ static int send_dry_run_remote(Config* config) {
   protocol_session_bind(&session);
 
   int ret = 1;
+  time_t dry_start = time(NULL);
+  ReceiverStats dry_stats;
+  memset(&dry_stats, 0, sizeof(dry_stats));
   PreparedScanner prepared;
   memset(&prepared, 0, sizeof(prepared));
   DirectoryScanner* scanner = NULL;
@@ -1737,12 +1740,10 @@ static int send_dry_run_remote(Config* config) {
   if (!receive_status(client->file_descriptor, &status))
     goto dry_fail;
   if (status == STATUS_STATS) {
-    ReceiverStats stats;
-    memset(&stats, 0, sizeof(stats));
     ArrayList* would_delete = array_list_create(free);
     if (!would_delete)
       goto dry_fail;
-    if (!receive_stats_record(client->file_descriptor, &stats, would_delete)) {
+    if (!receive_stats_record(client->file_descriptor, &dry_stats, would_delete)) {
       array_list_delete(would_delete);
       goto dry_fail;
     }
@@ -1785,6 +1786,7 @@ static int send_dry_run_remote(Config* config) {
     else
       printf("Total: %d files, %.1f MB\n", file_count, (double)total_bytes / (double)BYTES_PER_MIB);
   }
+  report_transfer_stats(config, file_count, total_bytes, dry_start, &dry_stats);
   ret = io_error ? 1 : 0;
 
 dry_fail:
