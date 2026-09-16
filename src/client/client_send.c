@@ -2479,7 +2479,10 @@ int send_files(Config* config) {
   ArrayList* size_skipped = NULL;
   ArrayList* synced_dirs = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
-  bool delete_per_dir = config->use_delete && config_delete_timing_per_dir(config);
+  /* -d/--dirs does not recurse, so a per-directory plan would carry no child
+     information and could delete the contents of an untraversed directory;
+     fall back to the whole-tree end-of-transfer commit for that mode. */
+  bool delete_per_dir = config->use_delete && config_delete_timing_per_dir(config) && !config->dirs;
   bool send_failed = false;
   bool had_scan_io = false;
   PreparedScanner prepared;
@@ -2915,12 +2918,15 @@ int send_files_multithreaded(Config** config_ptr) {
         return 1;
       }
     }
-    if (config_delete_timing_early(config) || config_delete_timing_per_dir(config)) {
+    /* -d/--dirs does not recurse, so a per-directory plan would carry no child
+       information and could delete the contents of an untraversed directory;
+       fall back to the whole-tree end-of-transfer commit for that mode. */
+    bool per_dir = config_delete_timing_per_dir(config) && !config->dirs;
+    if (config_delete_timing_early(config) || per_dir) {
       /* --delete-before / --delete-during / --delete-delay: build the keep-set
          (paths only, nothing loaded or sent) up front so the sender thread can
          transmit it before/with the data.  The path-only pre-scan also fills the
          protected excluded prefixes and synchronized directories. */
-      bool per_dir = config_delete_timing_per_dir(config);
       PreparedScanner prepared;
       memset(&prepared, 0, sizeof(prepared));
       bool prepared_ok = prepare_scanner(config, config->scanner_threads, &prepared);

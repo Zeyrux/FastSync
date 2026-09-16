@@ -718,7 +718,9 @@ static bool apply_missing(DeletePlanSession* session, const Config* config) {
   if (session->missing_applied)
     return true;
   session->missing_applied = true;
-  if (session->missing->size == 0)
+  /* The server clears delete_missing_args when its --allow-delete policy is
+     off; never honor the client's exact-path requests then. */
+  if (!config->delete_missing_args || session->missing->size == 0)
     return true;
   DeleteManifest manifest = {
       .keeps = NULL, .protected = NULL, .missing = session->missing, .dirs = NULL};
