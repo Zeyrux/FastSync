@@ -182,3 +182,41 @@ class TestClientAliases:
         assert result.returncode == 0, result.stderr[:300]
         received = get_dest_received_dir(dest, source)
         assert os.path.isfile(os.path.join(received, "top.txt"))
+
+
+class TestFilesFromEdges:
+    """#8/#58: --files-from empty list succeeds; rsync 3.4.1 rejects the
+    --no-ignore-missing-args negation, so FastSync must reject it too."""
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_empty_files_from_list_succeeds(self, shared_server):
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_ff_src"))
+        dest = os.path.join(TEST_DATA_DIR, "sel_ff_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "sel_ff_rdst")
+        clean_dir(dest)
+        clean_dir(rdst)
+        lst = os.path.join(TEST_DATA_DIR, "sel_ff_empty")
+        with open(lst, "w") as fh:
+            fh.write("")
+        r = _rsync(["-a", "--files-from=" + lst, source + "/", rdst + "/"])
+        assert r.returncode == 0, r.stderr
+        result, _ = run_client(source, dest, flags=["--files-from", lst],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert _tree(rdst) == []
+        assert _tree(dest) == []
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_no_ignore_missing_args_rejected_like_rsync(self):
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_nima_src"))
+        r = _rsync(["-a", "--no-ignore-missing-args", source + "/",
+                    os.path.join(TEST_DATA_DIR, "sel_nima_rdst") + "/"])
+        assert r.returncode != 0, "rsync unexpectedly accepted --no-ignore-missing-args"
+
+        cmd = CLIENT_CMD + ["--source-dir", source, "--dest-dir",
+                            os.path.join(TEST_DATA_DIR, "sel_nima_dst"), "--save-to-disk",
+                            "--no-ignore-missing-args"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0, "FastSync unexpectedly accepted the negation"
