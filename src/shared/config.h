@@ -254,7 +254,7 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  *
  * Wire-stats wave (protocol 2.25.0).  report_stats tells the receiver to send a
  * STATUS_STATS frame immediately before its terminal success status carrying
- * the receiver-only counters (matched data, deleted/created file counts) and,
+ * the receiver-only counters (matched data, deleted-file count) and,
  * for -n/--dry-run --delete, the destination-relative paths it WOULD have
  * deleted.  It is set by the client only when --stats, --progress/-P, an
  * --out-format token needs a wire counter (%b/%c), or a dry-run carries
@@ -927,7 +927,7 @@ typedef struct Config {
  * sender cannot observe, and -n/--dry-run --delete must report the extras it
  * would have removed without deleting anything.  The config frame gains one
  * trailing report_stats bool and the receiver emits a new STATUS_STATS frame
- * (carrying matched data, created/deleted counts and the would-delete path
+ * (carrying matched data, the deleted-file count and the would-delete path
  * list) immediately before its terminal success status.  Both a config-frame
  * layout change and a frame-sequence change, hence the bump. */
 #define PROTOCOL_VERSION "2.25.0"
