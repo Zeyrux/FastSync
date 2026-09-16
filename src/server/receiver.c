@@ -83,6 +83,13 @@ bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats
   return true;
 }
 
+/* Add a delete commit's tally to the sink's end-of-transfer wire counters (when
+   the sink reports them).  Runs on the receiving thread, so no locking. */
+static void receiver_tally_deleted(const ReceiverSink* sink, size_t deleted) {
+  if (sink && sink->stats && deleted > 0)
+    sink->stats->deleted_files += deleted;
+}
+
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
   if (!chunk || !sink || !sink->store_file)
     return false;
@@ -390,9 +397,12 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            A later transfer failure does not restore these deletions.  A
            --max-delete-capped commit still succeeds and the transfer proceeds;
            the terminal success frame reports the cap. */
-        DeleteCommitResult deletion = (config->use_delete || config->delete_missing_args)
-                                          ? manifest_delete_all(config, manifest)
-                                          : DELETE_COMMIT_OK;
+        size_t deleted = 0;
+        DeleteCommitResult deletion =
+            (config->use_delete || config->delete_missing_args)
+                ? manifest_delete_all_counted(config, manifest, &deleted)
+                : DELETE_COMMIT_OK;
+        receiver_tally_deleted(sink, deleted);
         delete_manifest_free(manifest);
         if (deletion == DELETE_COMMIT_ERROR) {
           send_status(file_descriptor, STATUS_ERROR);
@@ -469,7 +479,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       *pending_manifest = deferred_manifest;
       deferred_manifest = NULL;
     } else {
-      DeleteCommitResult deletion = manifest_delete_all(config, deferred_manifest);
+      size_t deleted = 0;
+      DeleteCommitResult deletion =
+          manifest_delete_all_counted(config, deferred_manifest, &deleted);
+      receiver_tally_deleted(sink, deleted);
       delete_manifest_free(deferred_manifest);
       deferred_manifest = NULL;
       if (deletion == DELETE_COMMIT_ERROR) {
@@ -496,6 +509,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
     } else {
       DeleteCommitResult deletion = delete_plan_session_commit(plan_session, config);
       bool limit = delete_plan_session_limit_reached(plan_session);
+      receiver_tally_deleted(sink, delete_plan_session_deleted(plan_session));
       delete_plan_session_destroy(plan_session);
       plan_session = NULL;
       if (deletion == DELETE_COMMIT_ERROR) {
@@ -572,6 +586,10 @@ static bool receiver_save_file(File* file, void* context_pointer) {
   } else {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
   }
+  /* Wire-stats tally: bytes reconstructed from the basis file (delta matches)
+     count as matched data in the end-of-transfer report. */
+  if (result != FILE_SAVE_ERROR && file->matched_bytes > 0)
+    context->stats.matched_data += file->matched_bytes;
   /* A directory's metadata is deferred, never applied inline: collect it now
      and apply it at the end.  -O/--omit-dir-times and --preserve_perms/-times
      are honored by dir_metadata_list_apply's caller (see

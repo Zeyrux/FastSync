@@ -955,7 +955,10 @@ void handler(int file_descriptor) {
          --delay-updates run; the walker skips the staging directory.  A
          server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
-        DeleteCommitResult deletion = manifest_delete_all(config, context->deferred_manifest);
+        size_t deleted = 0;
+        DeleteCommitResult deletion =
+            manifest_delete_all_counted(config, context->deferred_manifest, &deleted);
+        context->stats.deleted_files += deleted;
         if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
         } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
@@ -975,6 +978,7 @@ void handler(int file_descriptor) {
         DeleteCommitResult deletion = config->dry_run ? DELETE_COMMIT_OK
                                                       : delete_plan_session_commit(
                                                             context->deferred_plans, config);
+        context->stats.deleted_files += delete_plan_session_deleted(context->deferred_plans);
         if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
         } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
@@ -1003,7 +1007,11 @@ void handler(int file_descriptor) {
     }
     if (transfer_ok) {
       Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
-      if (!receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
+      /* Emit the optional wire-stats record first (protocol 2.25.0), then the
+         success/outcome frame, exactly like the single-threaded receiver. */
+      if (!receiver_send_stats_frame(file_descriptor, config, &context->stats,
+                                     context->would_delete) ||
+          !receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
         transfer_ok = false;
     } else {
       send_error_detail(file_descriptor, "transfer failed on receiver");

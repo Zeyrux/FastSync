@@ -2002,6 +2002,100 @@ static void test_manifest_delete_missing_dir_budget_double_count() {
   rmdir(root);
 }
 
+/* Blocker #7: when the receive root is "/", every absolute basis path is below
+   it and its child relative form must drop only the single leading slash. */
+static void test_basis_delete_relative_root_slash() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/");
+
+  char* rel = file_receive_basis_delete_relative(cfg, "/a");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "a");
+  free(rel);
+  rel = file_receive_basis_delete_relative(cfg, "/a/b");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "a/b");
+  free(rel);
+  /* The root itself is not a child. */
+  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/"));
+  /* A relative entry is already root-relative. */
+  rel = file_receive_basis_delete_relative(cfg, "x/y");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "x/y");
+  free(rel);
+  /* An absolute path outside a non-"/" root is unreachable. */
+  free(cfg->receive_root_directory);
+  cfg->receive_root_directory = str_dup("/root");
+  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/other/a"));
+  rel = file_receive_basis_delete_relative(cfg, "/root/a");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "a");
+  free(rel);
+  config_delete(cfg);
+}
+
+/* Blocker #6: -n --delete would-delete enumeration must normalize an absolute
+   basis directory under the receive root exactly like the real commit path, so
+   the basis snapshot is protected rather than reported as a deletable extra. */
+static void test_manifest_would_delete_protects_absolute_basis() {
+  char root[PATH_MAX];
+  snprintf(root, sizeof(root), "/tmp/fastsync_wdbasis_%d", (int)getpid());
+  char* basis = path_cat(root, "basis");
+  char* basis_file = path_cat(basis, "snapshot.bin");
+  char* extra = path_cat(root, "extra.txt");
+  EXPECT_NOT_NULL(basis);
+  EXPECT_NOT_NULL(basis_file);
+  EXPECT_NOT_NULL(extra);
+  mkdir(root, 0755);
+  mkdir(basis, 0755);
+  EXPECT_TRUE(file_write_to_disk(basis_file, "x", 1, false, false));
+  EXPECT_TRUE(file_write_to_disk(extra, "e", 1, false, false));
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_COMPARE, basis), 0);
+
+  const char* synced[] = {"."};
+  DeleteManifest manifest = {0};
+  manifest.keeps = make_manifest_string_list(NULL, 0);
+  manifest.protected = make_manifest_string_list(NULL, 0);
+  manifest.dirs = make_manifest_string_list(synced, 1);
+  EXPECT_NOT_NULL(manifest.keeps);
+  EXPECT_NOT_NULL(manifest.protected);
+  EXPECT_NOT_NULL(manifest.dirs);
+  ArrayList* out = array_list_create(free);
+  EXPECT_NOT_NULL(out);
+  size_t count = 0;
+  EXPECT_TRUE(manifest_would_delete_list(cfg, &manifest, out, &count));
+  bool saw_basis = false;
+  bool saw_extra = false;
+  for (int i = 0; i < out->size; i++) {
+    const char* p = (const char*)out->items[i];
+    if (strcmp(p, "basis") == 0 || strncmp(p, "basis/", 6) == 0)
+      saw_basis = true;
+    if (strcmp(p, "extra.txt") == 0)
+      saw_extra = true;
+  }
+  EXPECT_FALSE(saw_basis);
+  EXPECT_TRUE(saw_extra);
+
+  array_list_delete(out);
+  array_list_delete(manifest.keeps);
+  array_list_delete(manifest.protected);
+  array_list_delete(manifest.dirs);
+  config_delete(cfg);
+  unlink(basis_file);
+  rmdir(basis);
+  unlink(extra);
+  rmdir(root);
+  free(basis);
+  free(basis_file);
+  free(extra);
+}
+
 void test_file() {
   test_file_create();
   test_file_special_rdev_valid();
@@ -2057,4 +2151,6 @@ void test_file() {
   test_inplace_refuses_fifo_destination();
   test_inplace_refuses_device_destination();
   test_manifest_delete_missing_dir_budget_double_count();
+  test_basis_delete_relative_root_slash();
+  test_manifest_would_delete_protects_absolute_basis();
 }

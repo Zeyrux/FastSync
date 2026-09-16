@@ -1093,6 +1093,13 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       *failed = true;
       return NULL;
     }
+    /* Wire-stats tally: bytes taken straight from the basis file (matched
+       delta blocks).  Computed before the delta is destroyed. */
+    unsigned long long matched = 0;
+    for (uint32_t k = 0; k < delta->instruction_count; k++) {
+      if (delta->instructions[k].type == DELTA_INSTR_BLOCK_MATCH)
+        matched += delta->instructions[k].match.length;
+    }
     void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
     delta_destroy(delta);
 
@@ -1111,6 +1118,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       *failed = true;
       return NULL;
     }
+    file->matched_bytes = matched;
 
     if (config->use_metadata) {
       int meta_ok = 1;
@@ -3149,8 +3157,9 @@ typedef struct {
    compares paths relative to the receive root, so a relative entry is already
    in the right form; an absolute entry that lies below the root is converted to
    its root-relative form, and one outside the root returns NULL (the walk
-   cannot reach it, and it is not protected data beneath the root). */
-static char* basis_delete_relative(const Config* config, const char* path) {
+   cannot reach it, and it is not protected data beneath the root).  Exposed so
+   tests can exercise the root-of-"/" child mapping directly. */
+char* file_receive_basis_delete_relative(const Config* config, const char* path) {
   if (!path)
     return NULL;
   if (path[0] != '/')
@@ -3163,6 +3172,13 @@ static char* basis_delete_relative(const Config* config, const char* path) {
     root_len--;
   if (strncmp(path, root, root_len) != 0)
     return NULL;
+  if (root_len == 1 && root[0] == '/') {
+    /* The receive root is "/": every absolute path is below it, and the child
+       relative form is everything after the leading '/'. */
+    if (path[1] == '\0')
+      return NULL; /* identical to the root, not a child */
+    return str_dup(path + 1);
+  }
   if (path[root_len] != '/')
     return NULL; /* identical or a sibling sharing a name prefix */
   return str_dup(path + root_len + 1);
@@ -3217,7 +3233,7 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
     for (int i = 0; i < config->basis_count; i++) {
       /* An absolute basis outside the receive root is unreachable by this walk,
          so it contributes no protection prefix (and no slot). */
-      char* prefix = basis_delete_relative(config, config->basis_dirs[i].path);
+      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
       if (!prefix)
         continue;
       owned_prefixes[i] = prefix;
@@ -3304,7 +3320,7 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      char* prefix = basis_delete_relative(config, config->basis_dirs[i].path);
+      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
       if (!prefix)
         continue;
       owned_prefixes[i] = prefix;
@@ -3469,10 +3485,16 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
                    (manifest->protected ? manifest->protected->size : 0);
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -3480,7 +3502,14 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      /* Normalize exactly like the real commit path: a relative entry is
+         already root-relative, an absolute one inside the receive root is
+         converted, and one outside contributes no protection prefix. */
+      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
@@ -3489,9 +3518,15 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
   bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                               skips, skip_count, out, count_out);
+                               skips, used, out, count_out);
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
   return ok;
 }
@@ -3531,6 +3566,13 @@ bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* 
    Both draw from one --max-delete budget; the result reports a cap-stopped
    (partial) commit distinctly so the client can exit 25 like rsync. */
 DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest) {
+  return manifest_delete_all_counted(config, manifest, NULL);
+}
+
+DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
+                                               size_t* deleted) {
+  if (deleted)
+    *deleted = 0;
   if (!config || !manifest)
     return DELETE_COMMIT_ERROR;
   /* Central no-mutation guard: a dry-run never deletes.  No manifest is sent on
@@ -3551,6 +3593,8 @@ DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* man
     return DELETE_COMMIT_ERROR;
   if (config->use_delete && !delete_extras_budgeted(config, manifest, &budget))
     return DELETE_COMMIT_ERROR;
+  if (deleted)
+    *deleted = budget.deleted;
   if (budget.limit_hit) {
     if (user_limited) {
       log_message(LOG_LEVEL_ERROR, "Deletions stopped due to --max-delete limit (%zu skipped)",

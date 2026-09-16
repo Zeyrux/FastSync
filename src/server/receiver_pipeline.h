@@ -54,6 +54,13 @@ typedef struct PipelineContextReceiver {
      directory entries.  Only write_thread mutates it (before it joins); the
      caller (server.c) applies it after the delete/delay-updates phase. */
   DirTimeList dir_times;
+  /* End-of-transfer wire counters (protocol 2.25.0).  receive_thread accumulates
+     matched_data under `mutex`; server.c adds the delete-commit tallies after
+     both threads join and emits the STATUS_STATS frame. */
+  ReceiverStats stats;
+  /* -n/--dry-run --delete would-delete path list, collected by receive_thread
+     and reported in the STATUS_STATS frame. */
+  struct ArrayList* would_delete;
 } PipelineContextReceiver;
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,

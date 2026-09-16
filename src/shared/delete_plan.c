@@ -444,6 +444,10 @@ bool delete_plan_session_limit_reached(const DeletePlanSession* session) {
   return session && session->limit_hit;
 }
 
+size_t delete_plan_session_deleted(const DeletePlanSession* session) {
+  return session ? session->deleted : 0;
+}
+
 /* True for a destination-relative path section entry (non-empty, relative,
  * traversal-free). */
 static bool valid_rel_path(const char* value) {

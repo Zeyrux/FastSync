@@ -29,6 +29,8 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->deferred_manifest = NULL;
   context->deferred_plans = NULL;
   context->delete_limit_reached = false;
+  memset(&context->stats, 0, sizeof(context->stats));
+  context->would_delete = NULL;
   atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
@@ -41,6 +43,9 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
     goto fail;
   // cppcheck-suppress unreadVariable
   init++;
+  context->would_delete = array_list_create(free);
+  if (!context->would_delete)
+    goto fail;
   return context;
 
 fail:
@@ -64,6 +69,8 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   queue_destroy(context->queue);
   receiver_outcomes_destroy(&context->outcomes);
   dir_time_list_free(&context->dir_times);
+  if (context->would_delete)
+    array_list_delete(context->would_delete);
   mtx_destroy(&context->mutex);
   cnd_destroy(&context->condition_not_full);
   cnd_destroy(&context->condition_not_empty);
@@ -136,6 +143,11 @@ bool pipeline_context_receiver_enqueue_file(PipelineContextReceiver* context, Fi
 
 static bool receiver_enqueue_file(File* file, void* context_pointer) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)context_pointer;
+  if (file && file->matched_bytes > 0) {
+    mtx_lock(&context->mutex);
+    context->stats.matched_data += file->matched_bytes;
+    mtx_unlock(&context->mutex);
+  }
   return pipeline_context_receiver_enqueue_file(context, file);
 }
 
@@ -171,8 +183,8 @@ int receive_thread(void* pipeline_context) {
                        false,
                        NULL,
                        receiver_pipeline_note_delete_limit,
-                       NULL,
-                       NULL};
+                       &context->stats,
+                       context->would_delete};
   if (receiver_process_pending((Config*)config, file_descriptor, &sink, &context->deferred_manifest,
                                &context->deferred_plans) != 0) {
     receiver_thread_fail(context);

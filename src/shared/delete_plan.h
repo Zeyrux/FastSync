@@ -70,5 +70,8 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config);
 /* True once the shared --max-delete budget stopped part of a deletion. */
 bool delete_plan_session_limit_reached(const DeletePlanSession* session);
+/* Number of destination entries the session's plans removed (or, for
+   --delete-delay, snapshotted for removal), for the end-of-transfer stats. */
+size_t delete_plan_session_deleted(const DeletePlanSession* session);
 
 #endif

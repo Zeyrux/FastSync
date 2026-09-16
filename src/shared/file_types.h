@@ -93,6 +93,10 @@ typedef struct {
    * no report was requested/received, in which case -i/--out-format treats the
    * entry conservatively as newly created. */
   OutputDestState dest_state;
+  /* Receiver-only wire-stats tally: the number of bytes reconstructed from the
+   * basis file (matched delta blocks) for this entry.  0 when the file was sent
+   * whole.  Accumulated into ReceiverStats.matched_data by the receiver sink. */
+  unsigned long long matched_bytes;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

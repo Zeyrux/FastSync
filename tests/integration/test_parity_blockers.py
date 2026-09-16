@@ -80,3 +80,89 @@ class TestRelativePerDirDeleteScope:
         assert not os.path.exists(os.path.join(dest, "foo", "extra.txt"))
         assert not os.path.exists(os.path.join(rdst, "foo", "extra.txt"))
         assert _tree(dest) == _tree(rdst)
+
+
+def _stats_value(text, label):
+    for line in text.splitlines():
+        if line.startswith(label + ":"):
+            return int(line.split(":", 1)[1].strip().split()[0].replace(",", ""))
+    return None
+
+
+def _seed_delta_pair(tag):
+    """Source file plus a same-size/basis destination file whose mtime differs,
+    and an extra destination file to be deleted."""
+    source = os.path.join(TEST_DATA_DIR, f"stats_{tag}_src")
+    dest = os.path.join(TEST_DATA_DIR, f"stats_{tag}_dst")
+    rdst = os.path.join(TEST_DATA_DIR, f"stats_{tag}_rdst")
+    clean_dir(source)
+    clean_dir(dest)
+    clean_dir(rdst)
+    payload = (b"0123456789abcdef" * 16384)[:200000]
+    _write(os.path.join(source, "f.bin"), payload)
+    # Destination basis: same length, one byte changed, deliberately older.
+    basis = bytearray(payload)
+    basis[100000] ^= 0xFF
+    received = get_dest_received_dir(dest, source)
+    for root in (rdst, received):
+        _write(os.path.join(root, "f.bin"), bytes(basis))
+        _write(os.path.join(root, "extra.txt"), b"delete me\n")
+        old = 1000000
+        os.utime(os.path.join(root, "f.bin"), (old, old))
+    return source, dest, rdst
+
+
+class TestReceiverWireStats:
+    """Blocker #3/#4: the receiver must populate the STATUS_STATS counters
+    (matched data, deleted files) on both the single-threaded and -m paths."""
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("threads", [False, True])
+    def test_stats_reports_matched_and_deleted(self, threads):
+        source, dest, rdst = _seed_delta_pair(f"mt{int(threads)}")
+        rsync_result = _rsync(["-a", "--stats", "--delete", "--no-whole-file", source + "/",
+                               rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        assert _stats_value(rsync_result.stdout, "Matched data") > 0
+        assert _stats_value(rsync_result.stdout, "Number of deleted files") == 1
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            flags = ["-a", "--stats", "--delete", "--delta", "--incremental"]
+            if threads:
+                flags.append("--threads")
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert _stats_value(result.stdout, "Matched data") > 0, result.stdout
+        assert _stats_value(result.stdout, "Number of deleted files") == 1, result.stdout
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_threads_dry_run_delete_lines_match_rsync(self):
+        """-n --delete --threads must emit transfer-relative `*deleting` lines."""
+        source = os.path.join(TEST_DATA_DIR, "stats_drydel_src")
+        dest = os.path.join(TEST_DATA_DIR, "stats_drydel_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "stats_drydel_rdst")
+        clean_dir(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+        _write(os.path.join(source, "a.txt"), b"a\n")
+        for root in (rdst, get_dest_received_dir(dest, source)):
+            _write(os.path.join(root, "extra.txt"), b"x\n")
+            _write(os.path.join(root, "sub", "y.txt"), b"y\n")
+        rsync_result = _rsync(["-a", "-n", "--delete", "-i", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        rsync_del = sorted(
+            line for line in rsync_result.stdout.splitlines() if line.startswith("*deleting")
+        )
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest,
+                                   flags=["-a", "-n", "--delete", "-i", "--threads"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        fast_del = sorted(
+            line for line in result.stdout.splitlines() if line.startswith("*deleting")
+        )
+        assert fast_del and fast_del == rsync_del, f"rsync={rsync_del}\nfastsync={fast_del}"
