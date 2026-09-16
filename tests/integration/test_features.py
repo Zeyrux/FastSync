@@ -4963,15 +4963,20 @@ class TestFuzzy:
             "no-candidate fuzzy run should have sent the whole file"
 
     def test_dissimilar_sibling_is_not_used(self, shared_server):
-        # The destination holds a large sibling whose basename is too different
-        # from the incoming name; the name gate must reject it and fall back to
-        # a whole-file transfer.
+        # A sibling whose basename is too different from the incoming name is
+        # rejected by rsync's fuzzy distance window (the length gap exceeds
+        # 25), so the run falls back to a whole-file transfer.  A distinct
+        # mtime keeps rsync's exact size+mtime first pass from accepting it.
         source, dest = self._prepare("dissim")
         old_bytes, new_bytes = _random_payloads()
-        self._seed_dest(source, dest, {"totally-unrelated-notes.bin": old_bytes},
+        long_name = "totally-unrelated-notes-with-a-very-long-name.bin"
+        self._seed_dest(source, dest, {long_name: old_bytes},
                            shared_server.port)
         with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
             fh.write(new_bytes)
+        received_dir = get_dest_received_dir(dest, source)
+        os.utime(os.path.join(received_dir, long_name), (self.TS, self.TS))
+        os.utime(os.path.join(source, self.NEW_NAME), (self.TS + 100000, self.TS + 100000))
         result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
         assert result.returncode == 0, \
             f"--fuzzy dissimilar-sibling run failed: {(result.stderr or result.stdout)[:300]}"
@@ -4979,6 +4984,28 @@ class TestFuzzy:
         assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
         assert proxy.client_to_server > len(new_bytes) // 2, \
             "a dissimilar-named sibling must not be used as a fuzzy basis"
+
+    def test_exact_size_mtime_sibling_is_used(self, shared_server):
+        # rsync's fuzzy first pass accepts a sibling with an exact size+mtime
+        # match regardless of how unrelated its name is (its content is almost
+        # certainly the same).
+        source, dest = self._prepare("exact")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {"unrelated-blob.bin": old_bytes},
+                           shared_server.port)
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        received_dir = get_dest_received_dir(dest, source)
+        ts = 1600000000
+        os.utime(os.path.join(received_dir, "unrelated-blob.bin"), (ts, ts))
+        os.utime(os.path.join(source, self.NEW_NAME), (ts, ts))
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy exact size+mtime run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server < len(new_bytes) // 4, \
+            "an exact size+mtime sibling should be used as a fuzzy basis"
 
     def test_fuzzy_helps_when_dest_holds_an_unsuitable_file(self, shared_server):
         # The destination DOES hold the exact new name, but it is a tiny stale

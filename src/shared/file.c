@@ -40,19 +40,27 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
 }
 
 /* Preallocate `size` bytes on `fd` before any data is written (--preallocate).
- * posix_fallocate reserves real disk blocks, so an out-of-space condition
+ * fallocate(2) reserves real disk blocks, so an out-of-space condition
  * (ENOSPC/EDQUOT) surfaces up front instead of partway through a transfer;
- * unavoidable fragmentation of a streamed file is also reduced.  Some
- * filesystems (e.g. tmpfs, ZFS) do not support it and return EOPNOTSUPP/ENOSYS,
- * where we fall back to ftruncate, which still extends the logical size so the
- * fail-fast/contiguity intent degrades gracefully but never fails.  Genuine
- * allocation failures are propagated as the error code (caller fails the write).
- * posix_fallocate leaves the fd's file offset unchanged, so the subsequent
- * write_all at offset 0 is unaffected.  Returns 0 on success (including the
- * fallback) or a nonzero error code. */
+ * unavoidable fragmentation of a streamed file is also reduced.  rsync favors
+ * the syscall over glibc posix_fallocate (whose emulation can be subtly
+ * different), so try fallocate(2) first and only fall back to posix_fallocate,
+ * then to ftruncate on filesystems (e.g. tmpfs, ZFS) that support neither.  The
+ * logical size is always extended, so the fail-fast/contiguity intent degrades
+ * gracefully but never fails on an unsupported filesystem; genuine allocation
+ * failures are propagated as the error code (caller fails the write).  Neither
+ * leaves the fd's file offset guaranteed, so the caller seeks back to 0 before
+ * writing.  Returns 0 on success (including the fallback) or a nonzero error
+ * code. */
 static int preallocate_fd(int fd, unsigned long long size) {
   if (size == 0)
     return 0;
+#ifdef __linux__
+  if (fallocate(fd, 0, 0, (off_t)size) == 0)
+    return 0;
+  if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL)
+    return errno;
+#endif
   int rc = posix_fallocate(fd, 0, (off_t)size);
   if (rc == EOPNOTSUPP || rc == ENOSYS) {
     if (ftruncate(fd, (off_t)size) == 0)
@@ -1066,11 +1074,10 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       } else {
         /* Preallocate the expected payload size before writing so an
            out-of-space condition fails cleanly up front (--preallocate).
-           --sparse takes precedence: posix_fallocate would allocate every
-           block, defeating the holes the sparse writer would create, so the
-           two never combine here (the ftruncate presize below stays). */
+           rsync lets --preallocate win over --sparse (the reserved blocks
+           survive the sparse writer's seeks), so both flags can be active. */
         int prealloc_rc = 0;
-        if (preallocate && !sparse && data_size > 0) {
+        if (preallocate && data_size > 0) {
           prealloc_rc = preallocate_fd(fd, data_size);
           if (prealloc_rc != 0) {
             char* escaped_path = output_escape(path, log_get_8_bit_output());
@@ -1196,7 +1203,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (fd < 0)
         continue; /* EEXIST (or a transient open error): try a fresh name. */
       int prealloc_rc = 0;
-      if (preallocate && !sparse && data_size > 0) {
+      if (preallocate && data_size > 0) {
         prealloc_rc = preallocate_fd(fd, data_size);
         if (prealloc_rc != 0) {
           char* escaped_path = output_escape(path, log_get_8_bit_output());

@@ -329,30 +329,38 @@ bool config_has_basis(const Config* config) {
 }
 
 /* A basis-dir path travels from the client to the receiver and is resolved
- * below the destination root, so it must be a non-empty relative path with no
- * "." or ".." component and no traversal: an absolute or escaping path would
- * make the receiver read or link files outside its authorized root.
+ * below the destination root when relative, or used verbatim when absolute
+ * (matching rsync).  Either form must be non-empty, traversal-free (no "..")
+ * and free of "." components: an escaping path would make the receiver read or
+ * link files outside its authorized root.  An absolute path is still subject to
+ * the receiver's root confinement at open time (file_open_secure_parent), so a
+ * basis outside the authorized root is simply not found rather than an escape.
  *
  * Returns a malloc'd CANONICAL copy of an accepted path, or NULL when the path
  * is rejected.  Canonicalization collapses interior empty components ("a//b" ->
- * "a/b"), drops "." components and trailing "/"s, so validation, the delete
- * walker prefix match and the receiver's basis lookup all agree on one form.
- * The normalizer is the single source of truth for both config_basis_path_valid
- * and config_basis_append. */
+ * "a/b"), drops "." components and trailing "/"s, and preserves a leading '/'
+ * for absolute paths, so validation, the delete walker prefix match and the
+ * receiver's basis lookup all agree on one form.  The normalizer is the single
+ * source of truth for both config_basis_path_valid and config_basis_append. */
 static char* basis_path_normalize(const char* path) {
-  if (!path || path[0] == '\0' || path[0] == '/' || has_path_traversal(path))
+  if (!path || path[0] == '\0' || has_path_traversal(path))
     return NULL;
-  if (strcmp(path, ".") == 0)
+  bool absolute = path[0] == '/';
+  if (!absolute && strcmp(path, ".") == 0)
+    return NULL;
+  if (absolute && strcmp(path, "/") == 0)
     return NULL;
   char* dup = str_dup(path);
   if (!dup)
     return NULL;
   size_t out_len = 0;
-  char* out = malloc(strlen(path) + 1);
+  char* out = malloc(strlen(path) + 2);
   if (!out) {
     free(dup);
     return NULL;
   }
+  if (absolute)
+    out[out_len++] = '/';
   char* saveptr = NULL;
   bool ok = true;
   for (char* part = strtok_r(dup, "/", &saveptr); part; part = strtok_r(NULL, "/", &saveptr)) {
@@ -362,14 +370,14 @@ static char* basis_path_normalize(const char* path) {
     }
     if (strcmp(part, ".") == 0)
       continue;
-    if (out_len > 0)
+    if (out_len > 0 && out[out_len - 1] != '/')
       out[out_len++] = '/';
     size_t len = strlen(part);
     memcpy(out + out_len, part, len);
     out_len += len;
   }
   free(dup);
-  if (!ok || out_len == 0) {
+  if (!ok || out_len == 0 || (absolute && out_len == 1)) {
     free(out);
     return NULL;
   }

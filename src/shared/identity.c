@@ -589,6 +589,67 @@ static int identity_split_chown(const char* value, char** puser, char** pgroup) 
   return 0;
 }
 
+/* --chown is rsync's shorthand for "--usermap=*:USER --groupmap=*:GROUP", so a
+ * name TO value must be resolved on the RECEIVER, not on the sender.  Append the
+ * equivalent map rule (FROM matches every id).  The numeric/'*' forms are stored
+ * numerically exactly as rsync's id_parse/user_to_uid would.  Returns 0 on
+ * success, -1 on a malformed numeric token or allocation failure. */
+static int identity_append_chown_rule(Config* config, bool is_group, const char* token) {
+  IdentityMap rule;
+  memset(&rule, 0, sizeof(rule));
+  rule.from = IDENTITY_MATCH_ANY;
+  rule.from_hi = IDENTITY_MATCH_ANY;
+  if (strcmp(token, "*") == 0) {
+    rule.to = IDENTITY_CURRENT;
+  } else if (identity_all_digits(token[0] == '@' ? token + 1 : token)) {
+    if (identity_resolve_token(token, is_group, &rule.to) != 0) {
+      log_message(LOG_LEVEL_ERROR, "--chown numeric id is out of range: %s", token);
+      return -1;
+    }
+  } else {
+    rule.to = 0;
+    rule.to_name = str_dup(token);
+    if (!rule.to_name)
+      return -1;
+  }
+  if (identity_append_rule(is_group ? &config->groupmap : &config->usermap,
+                           is_group ? &config->groupmap_count : &config->usermap_count,
+                           &rule) != 0) {
+    free(rule.to_name);
+    log_message(LOG_LEVEL_ERROR, "--chown has too many rules (max %d)", MAX_IDENTITY_MAP);
+    return -1;
+  }
+  return 0;
+}
+
+/* Resolve/record one --chown side.  The source-side numeric value is kept in
+ * chown_uid/chown_gid purely as a fallback (the appended map rule resolves the
+ * name on the receiver and wins); a name that does not exist on the sender is
+ * accepted and left to receiver-side resolution, matching rsync. */
+static int identity_parse_chown_side(Config* config, bool is_group, const char* token) {
+  if (identity_append_chown_rule(config, is_group, token) != 0)
+    return -1;
+  bool numeric = identity_all_digits(token[0] == '@' ? token + 1 : token);
+  int32_t resolved;
+  if (identity_resolve_token(token, is_group, &resolved) == 0) {
+    if (is_group) {
+      config->chown_gid = resolved;
+      config->chown_gid_set = true;
+    } else {
+      config->chown_uid = resolved;
+      config->chown_uid_set = true;
+    }
+    return 0;
+  }
+  if (numeric) {
+    log_message(LOG_LEVEL_ERROR, "--chown could not resolve numeric id '%s'", token);
+    return -1;
+  }
+  /* Unknown sender-side name: rsync accepts it and resolves it (or warns) on
+   * the receiver; do the same instead of failing the whole run. */
+  return 0;
+}
+
 int identity_parse_chown(Config* config, const char* value) {
   if (!config || !value || *value == '\0') {
     log_message(LOG_LEVEL_ERROR, "--chown requires a value (USER:GROUP, USER, or :GROUP)");
@@ -627,32 +688,18 @@ int identity_parse_chown(Config* config, const char* value) {
     if (*user == '\0') {
       log_message(LOG_LEVEL_ERROR, "--chown requires a user or group (got '%s')", value);
       ret = -1;
-    } else if (identity_resolve_token(user, false, &config->chown_uid) != 0) {
-      log_message(LOG_LEVEL_ERROR,
-                  "--chown could not resolve user '%s' (use a name that exists "
-                  "on the source, '*', or @N)",
-                  value);
+    } else if (identity_parse_chown_side(config, false, user) != 0) {
       ret = -1;
-    } else {
-      config->chown_uid_set = true;
     }
   } else {
     /* --chown=USER:GROUP, --chown=:GROUP, --chown=USER: */
-    if (*user != '\0') {
-      if (identity_resolve_token(user, false, &config->chown_uid) != 0) {
-        log_message(LOG_LEVEL_ERROR, "--chown could not resolve user '%s'", value);
-        ret = -1;
-        goto done;
-      }
-      config->chown_uid_set = true;
+    if (*user != '\0' && identity_parse_chown_side(config, false, user) != 0) {
+      ret = -1;
+      goto done;
     }
-    if (*group != '\0') {
-      if (identity_resolve_token(group, true, &config->chown_gid) != 0) {
-        log_message(LOG_LEVEL_ERROR, "--chown could not resolve group '%s'", value);
-        ret = -1;
-        goto done;
-      }
-      config->chown_gid_set = true;
+    if (*group != '\0' && identity_parse_chown_side(config, true, group) != 0) {
+      ret = -1;
+      goto done;
     }
     if (!*user && !*group) {
       log_message(LOG_LEVEL_ERROR, "--chown must set a user, a group, or both (got '%s')", value);

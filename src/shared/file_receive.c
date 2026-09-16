@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -1335,7 +1336,11 @@ static bool basis_match_find(const Config* config, const char* check_path,
     return false;
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
-    char* basis_dir = path_cat(config->receive_root_directory, entry->path);
+    /* An absolute basis path is used verbatim (rsync semantics); a relative one
+       is resolved below the receive root.  Both remain subject to the receiver's
+       authorized-root confinement inside file_open_secure_parent. */
+    char* basis_dir = entry->path[0] == '/' ? str_dup(entry->path)
+                                            : path_cat(config->receive_root_directory, entry->path);
     if (!basis_dir)
       continue;
     char* candidate = path_cat(basis_dir, check_path);
@@ -1397,7 +1402,8 @@ static bool basis_match_find(const Config* config, const char* check_path,
  * transfer).  A fuzzy basis can therefore waste bandwidth but never corrupt a
  * file.
  *
- * Similarity heuristic (deterministic, deliberately simpler than rsync's):
+ * Similarity heuristic (rsync 3.4.1 parity, util1.c fuzzy_distance /
+ * find_filename_suffix + generator.c find_fuzzy):
  *   * candidates are the target's sibling entries in its destination
  *     directory, opened through the confined root (file_open_secure_parent +
  *     openat O_NOFOLLOW, fstatat AT_SYMLINK_NOFOLLOW) -- symlinks are never
@@ -1406,12 +1412,15 @@ static bool basis_match_find(const Config* config, const char* check_path,
  *     temp scratch names are never candidates;
  *   * size gate = the delta engine's own bounds (delta_should_attempt: both
  *     files >= DELTA_MIN_FILE_SIZE, <= delta_max_file_size, ratio <= 10x),
- *     NOT rsync's ~1.5x size window;
- *   * name gate = Levenshtein edit distance between the basenames, accepted
- *     only when distance <= half the length of the longer basename;
- *   * the single best candidate (smallest distance; tie-break: size closest
- *     to the incoming file, then lexicographically smaller basename) is read
- *     and returned as the basis.
+ *     because FastSync's delta engine cannot use a basis outside them;
+ *   * first pass = an exact size+mtime match wins regardless of name (rsync's
+ *     "fuzzy size/modtime match");
+ *   * otherwise the winner minimizes rsync's weighted Levenshtein distance
+ *     (substitution ± byte difference, insertion UNIT+byte, 16.16 fixed point)
+ *     plus ten times the suffix distance, accepted only when <= 25*UNIT; the
+ *     tie-break (smallest size gap, then lexical name) keeps the result
+ *     deterministic across filesystem readdir order (rsync leaves equal
+ *     distances to its file-list order).
  * ------------------------------------------------------------------------- */
 
 /* A directory scan is linear in the number of entries; the fuzzy search stops
@@ -1429,107 +1438,108 @@ static bool basis_match_find(const Config* config, const char* check_path,
 typedef struct {
   char name[FUZZY_NAME_LIMIT + 1];
   unsigned long long size;
-  size_t distance;
+  uint32_t distance;
   unsigned long long size_gap;
 } FuzzyCandidate;
 
-/* Two-row DP scratch, allocated once per directory scan (not per candidate) so
- * a 4096-entry directory never performs 4096 malloc/free pairs. */
-typedef struct {
-  size_t* prev;
-  size_t* cur;
-} FuzzyEditBuffer;
+/* rsync's fuzzy distance is a weighted Levenshtein variant in 16.16 fixed point
+ * (util1.c fuzzy_distance): a substitution costs UNIT +/- the byte difference
+ * and an insertion costs UNIT + the inserted byte, so similar names score low.
+ * The search keeps only distances <= 25*UNIT.  Ported verbatim for parity. */
+#define FUZZY_DIST_UNIT (1u << 16)
+#define FUZZY_DIST_REJECT (0xFFFFu * FUZZY_DIST_UNIT + 1)
+#define FUZZY_DIST_LIMIT (25u * FUZZY_DIST_UNIT)
 
-static bool fuzzy_edit_buffer_init(FuzzyEditBuffer* buf) {
-  buf->prev = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
-  buf->cur = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
-  if (!buf->prev || !buf->cur) {
-    free(buf->prev);
-    free(buf->cur);
-    buf->prev = NULL;
-    buf->cur = NULL;
-    return false;
-  }
-  return true;
-}
-
-static void fuzzy_edit_buffer_destroy(FuzzyEditBuffer* buf) {
-  free(buf->prev);
-  free(buf->cur);
-  buf->prev = NULL;
-  buf->cur = NULL;
-}
-
-/* Cheap lower bounds used to reject a candidate BEFORE the DP:
- *  - any edit script must at least absorb the length gap: d >= |la - lb|;
- *  - any character of `a` that does not occur in `b` at all must be deleted or
- *    substituted at its own position: d >= (count of such characters).
- * The acceptance gate is d*2 <= longer, so a candidate whose max of these two
- * bounds already violates it can be skipped without computing the distance. */
-static size_t fuzzy_absent_char_bound(const char* a, size_t la, const char* b, size_t lb) {
-  if (lb == 0)
-    return la;
-  bool present[256] = {false};
-  for (size_t i = 0; i < lb; i++)
-    present[(uint8_t)b[i]] = true;
-  size_t absent = 0;
-  for (size_t i = 0; i < la; i++)
-    if (!present[(uint8_t)a[i]])
-      absent++;
-  return absent;
-}
-
-/* Levenshtein edit distance between the two basenames.  A shared prefix and a
- * (non-overlapping) shared suffix can always be aligned at no cost, so the DP
- * only runs over the differing middles; its two rows come from `buf` (allocated
- * once by the caller).  Callers enforce la, lb <= FUZZY_NAME_LIMIT. */
-static size_t fuzzy_edit_distance(FuzzyEditBuffer* buf, const char* a, size_t la, const char* b,
-                                  size_t lb) {
-  size_t p = 0;
-  while (p < la && p < lb && a[p] == b[p])
-    p++;
-  /* Trim the common suffix (never overlapping the prefix).  Working with two
-     moving end indices keeps the region arithmetic explicit and safe. */
-  size_t ae = la;
-  size_t be = lb;
-  while (ae > p && be > p && a[ae - 1] == b[be - 1]) {
-    ae--;
-    be--;
-  }
-  size_t ma = ae - p;
-  size_t mb = be - p;
-  /* cppcheck-suppress knownConditionTrueFalse -- the prefix/suffix trims above
-     only run while the corresponding ends match, so a middle can remain; the
-     analysis unsoundly concludes the trims always consume everything. */
-  if (ma == 0)
-    return mb;
-  if (mb == 0)
-    return ma;
-  const char* A = a + p;
-  const char* B = b + p;
-  size_t* prev = buf->prev;
-  size_t* cur = buf->cur;
-  for (size_t j = 0; j <= mb; j++)
-    prev[j] = j;
-  for (size_t i = 1; i <= ma; i++) {
-    cur[0] = i;
-    for (size_t j = 1; j <= mb; j++) {
-      size_t cost = A[i - 1] == B[j - 1] ? 0 : 1;
-      size_t del = prev[j] + 1;
-      size_t ins = cur[j - 1] + 1;
-      size_t sub = prev[j - 1] + cost;
-      size_t m = del < ins ? del : ins;
-      cur[j] = m < sub ? m : sub;
+static uint32_t fuzzy_distance(const char* s1, unsigned len1, const char* s2, unsigned len2,
+                               uint32_t upperlimit, uint32_t* scratch) {
+  if ((len1 > len2 ? len1 - len2 : len2 - len1) * FUZZY_DIST_UNIT > upperlimit)
+    return FUZZY_DIST_REJECT;
+  if (!len1 || !len2) {
+    if (!len1) {
+      s1 = s2;
+      len1 = len2;
     }
-    size_t* tmp = prev;
-    prev = cur;
-    cur = tmp;
+    uint32_t cost = 0;
+    for (unsigned i = 0; i < len1; i++)
+      cost += (uint8_t)s1[i];
+    return (uint32_t)len1 * FUZZY_DIST_UNIT + cost;
   }
-  return prev[mb];
+  uint32_t* a = scratch;
+  for (unsigned i2 = 0; i2 < len2; i2++)
+    a[i2] = (i2 + 1) * FUZZY_DIST_UNIT;
+  for (unsigned i1 = 0; i1 < len1; i1++) {
+    uint32_t diag = i1 * FUZZY_DIST_UNIT;
+    uint32_t above = (i1 + 1) * FUZZY_DIST_UNIT;
+    for (unsigned i2 = 0; i2 < len2; i2++) {
+      uint32_t left = a[i2];
+      int32_t cost = (int32_t)(uint8_t)s1[i1] - (int32_t)(uint8_t)s2[i2];
+      if (cost != 0)
+        cost = cost < 0 ? (int32_t)(FUZZY_DIST_UNIT - (uint32_t)(-cost))
+                        : (int32_t)(FUZZY_DIST_UNIT + (uint32_t)cost);
+      uint32_t diag_inc = diag + (uint32_t)cost;
+      uint32_t left_inc = left + FUZZY_DIST_UNIT + (uint8_t)s1[i1];
+      uint32_t above_inc = above + FUZZY_DIST_UNIT + (uint8_t)s2[i2];
+      a[i2] = above = left < above ? (left_inc < diag_inc ? left_inc : diag_inc)
+                                   : (above_inc < diag_inc ? above_inc : diag_inc);
+      diag = left;
+    }
+  }
+  return a[len2 - 1];
 }
 
-/* Deterministic ordering of two fuzzy candidates: smallest edit distance,
- * then the size closest to the incoming file, then the lexical basename. */
+/* rsync's find_filename_suffix (util1.c): return the last significant filename
+ * suffix (its dot included).  Leading dots are not a suffix; a trailing "~" is
+ * ignored; .bak/.old/.orig and a "~/<num>" backup marker are skipped. */
+static const char* fuzzy_find_suffix(const char* fn, int fn_len, int* len_ptr) {
+  const char* suf;
+  const char* s;
+  bool had_tilde;
+
+  while (fn_len && *fn == '.') {
+    fn++;
+    fn_len--;
+  }
+  if (fn_len > 1 && fn[fn_len - 1] == '~') {
+    fn_len--;
+    had_tilde = true;
+  } else {
+    had_tilde = false;
+  }
+  suf = "";
+  *len_ptr = 0;
+  for (s = fn + fn_len; fn_len > 1;) {
+    int s_len;
+    while (--s != fn && *s != '.') {
+    }
+    if (s == fn)
+      break;
+    s_len = fn_len - (int)(s - fn);
+    fn_len = (int)(s - fn);
+    if (s_len == 4) {
+      if (strcmp(s + 1, "bak") == 0 || strcmp(s + 1, "old") == 0)
+        continue;
+    } else if (s_len == 5) {
+      if (strcmp(s + 1, "orig") == 0)
+        continue;
+    } else if (s_len > 2 && had_tilde && s[1] == '~' && isdigit((unsigned char)s[2])) {
+      continue;
+    }
+    *len_ptr = s_len;
+    suf = s;
+    if (s_len == 1)
+      break;
+    for (s++, s_len--; s_len > 0; s++, s_len--) {
+      if (!isdigit((unsigned char)*s))
+        return suf;
+    }
+    s = suf;
+  }
+  return suf;
+}
+
+/* Deterministic ordering of two fuzzy candidates with equal rsync distance:
+ * smallest size gap, then the lexical basename (rsync itself takes the last
+ * equal-distance candidate in file-list order). */
 static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandidate* best) {
   if (!best->name[0])
     return true;
@@ -1546,8 +1556,8 @@ static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandid
  * = 0) when no candidate qualifies, which means the caller performs the normal
  * whole-file transfer. */
 static void* fuzzy_basis_find_and_load(const Config* config, const char* check_path,
-                                       unsigned long long check_size,
-                                       unsigned long long* out_size) {
+                                       unsigned long long check_size, time_t check_mtime,
+                                       long check_mtime_nsec, unsigned long long* out_size) {
   *out_size = 0;
   if (!config || !config->receive_root_directory || !config->fuzzy || !config->use_delta ||
       !check_path || check_size < DELTA_MIN_FILE_SIZE || check_size > config->delta_max_file_size ||
@@ -1590,18 +1600,28 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     return NULL;
   }
 
-  /* The DP scratch rows are allocated once per scan (not once per candidate). */
-  FuzzyEditBuffer ebuf;
-  if (!fuzzy_edit_buffer_init(&ebuf)) {
+  /* The weighted-distance scratch row is allocated once per scan (not once per
+     candidate). */
+  uint32_t* dist_scratch = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(uint32_t));
+  if (!dist_scratch) {
     closedir(dir);
     close(dir_fd);
     free(leaf);
     free(full_path);
     return NULL;
   }
+  int fname_suf_len = 0;
+  const char* fname_suf = fuzzy_find_suffix(leaf, (int)target_len, &fname_suf_len);
 
   FuzzyCandidate best;
   memset(&best, 0, sizeof(best));
+  uint32_t lowest_dist = FUZZY_DIST_LIMIT;
+  /* rsync's fuzzy search runs an exact size+mtime pass before the name-distance
+     pass; such a candidate is almost certainly the same content and wins
+     regardless of how dissimilar its name is.  The first one (directory order,
+     deterministic) is kept. */
+  FuzzyCandidate exact;
+  memset(&exact, 0, sizeof(exact));
   const struct dirent* entry;
   size_t scanned = 0;
   /* readdir() yields entries in filesystem-dependent order, so the SET of
@@ -1621,22 +1641,32 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE ||
         !delta_should_attempt(cand_size, check_size, config->delta_max_file_size))
       continue;
-    /* Cheap pre-name gates run BEFORE the edit-distance DP.  The edit distance
-       is bounded below by the length gap |la-lb| and by the number of
-       characters of one basename that are absent from the other (each such
-       position costs at least one op), so a candidate whose acceptance gate
-       (distance*2 <= longer) already fails on the max of those bounds is
-       skipped without running the DP. */
-    size_t longer = target_len > name_len ? target_len : name_len;
-    size_t bound = longer - (target_len < name_len ? target_len : name_len);
-    size_t absent = fuzzy_absent_char_bound(leaf, target_len, name, name_len);
-    if (absent > bound)
-      bound = absent;
-    if (bound * 2 > longer)
+    long cand_nsec = 0;
+#ifdef __linux__
+    cand_nsec = st.st_mtim.tv_nsec;
+#endif
+    if (!exact.name[0] && cand_size == check_size &&
+        metadata_mtime_matches(st.st_mtime, cand_nsec, check_mtime, check_mtime_nsec,
+                               config->modify_window)) {
+      memcpy(exact.name, name, name_len + 1);
+      exact.size = cand_size;
+      exact.size_gap = 0;
       continue;
-    size_t distance = fuzzy_edit_distance(&ebuf, leaf, target_len, name, name_len);
-    if (distance * 2 > longer)
+    }
+    /* rsync's name-distance pass: a weighted Levenshtein distance over the full
+       basenames, plus ten times the same distance over the filename suffixes,
+       accepted only when it does not exceed the running lowest distance. */
+    int name_suf_len = 0;
+    const char* name_suf = fuzzy_find_suffix(name, (int)name_len, &name_suf_len);
+    uint32_t distance = fuzzy_distance(name, (unsigned)name_len, leaf, (unsigned)target_len,
+                                       lowest_dist, dist_scratch);
+    if (distance < 0xFFFF0000U)
+      distance += fuzzy_distance(name_suf, (unsigned)name_suf_len, fname_suf,
+                                 (unsigned)fname_suf_len, 0xFFFF0000U, dist_scratch) *
+                  10;
+    if (distance > lowest_dist)
       continue;
+    lowest_dist = distance;
     FuzzyCandidate cand;
     memcpy(cand.name, name, name_len + 1);
     cand.size = cand_size;
@@ -1647,7 +1677,11 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
   }
   closedir(dir);
   free(leaf);
-  fuzzy_edit_buffer_destroy(&ebuf);
+  free(dist_scratch);
+
+  /* Prefer the exact size+mtime candidate over any name-distance winner. */
+  if (exact.name[0])
+    best = exact;
 
   void* basis = NULL;
   if (best.name[0]) {
@@ -1764,6 +1798,7 @@ typedef struct {
   long long check_mtime_nsec;
   uint8_t check_digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t check_digest_len;
+  bool dest_exists; /* any destination entry exists (lstat succeeded) */
   bool has_old_file;
   int old_fd;
   struct stat old_st;
@@ -1860,6 +1895,9 @@ static IncrementalCheckOutcome incremental_check_open_destination(IncrementalChe
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full_path, &leaf, false);
   if (parent_fd >= 0) {
+    struct stat dest_st;
+    if (fstatat(parent_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
+      state->dest_exists = true;
     /* O_NONBLOCK: an existing FIFO at the destination must not block this
        openat(); the S_ISREG gate below rejects the non-regular entry. */
     state->old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -1900,6 +1938,82 @@ static IncrementalCheckOutcome incremental_check_report_dest_info(IncrementalChe
   }
   if (!send_status(state->fd, STATUS_DEST_INFO) || !format_dest_state_send(state->fd, &info))
     return INCREMENTAL_ERROR;
+  return INCREMENTAL_CONTINUE;
+}
+
+/* --ignore-existing short-circuit.  The receiver must answer "skip" (STATUS_OK)
+   BEFORE the sender transmits any payload, otherwise the whole file crosses the
+   wire only to be discarded at write time.  rsync skips an existing destination
+   entry regardless of its content or type, so the reply depends only on the
+   lstat existence probe; the ordinary --ignore-existing checks inside
+   file_receive remain as defense-in-depth for the frame types that have no
+   per-file check (directories/symlinks/specials/hard-links). */
+static IncrementalCheckOutcome
+incremental_check_ignore_existing(const IncrementalCheckState* state) {
+  if (!state->config->ignore_existing || !state->dest_exists)
+    return INCREMENTAL_CONTINUE;
+  if (!send_status(state->fd, STATUS_OK))
+    return INCREMENTAL_ERROR;
+  return INCREMENTAL_SKIP;
+}
+
+/* --link-dest relink of an already up-to-date destination.  rsync hard-links a
+   destination entry to a matching basis even when the entry is already correct,
+   so a run over an existing tree still maximizes sharing with the basis.  Only a
+   link-dest basis triggers this (copy-dest/compare-dest leave an up-to-date
+   destination untouched, matching rsync).  The ordinary basis path further down
+   handles every not-up-to-date case, so this helper only adds the relink that
+   the quick-skip would otherwise short-circuit. */
+static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalCheckState* state,
+                                                                  File** out_file) {
+  const Config* config = state->config;
+  if (!config_has_basis(config) || config->ignore_times || config->dry_run)
+    return INCREMENTAL_CONTINUE;
+  if (!state->has_old_file)
+    return INCREMENTAL_CONTINUE;
+  BasisMatch basis;
+  basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
+                   (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
+                   true, true, &basis);
+  /* Only a link-dest hit relinks; a copy-dest/compare-dest hit (or a miss) lets
+     the up-to-date check below keep the existing destination. */
+  if (!basis.hit || basis.type != BASIS_DEST_LINK) {
+    basis_match_free(&basis);
+    return INCREMENTAL_CONTINUE;
+  }
+  /* Already the basis inode: nothing to do, leave the destination alone. */
+  if (basis.st.st_dev == state->old_st.st_dev && basis.st.st_ino == state->old_st.st_ino) {
+    basis_match_free(&basis);
+    return INCREMENTAL_CONTINUE;
+  }
+  File* materialized = file_create(state->check_path);
+  if (materialized && basis.content) {
+    data_destroy(materialized->data);
+    materialized->data = basis.content;
+    basis.content = NULL;
+    materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
+    materialized->skip = true;
+    materialized->basis_link = basis.basis_path;
+    basis.basis_path = NULL;
+    if (!materialized->metadata) {
+      file_destroy(materialized);
+      materialized = NULL;
+    }
+  } else {
+    file_destroy(materialized);
+    materialized = NULL;
+  }
+  if (materialized) {
+    if (!send_status(state->fd, STATUS_OK)) {
+      basis_match_free(&basis);
+      file_destroy(materialized);
+      return INCREMENTAL_ERROR;
+    }
+    basis_match_free(&basis);
+    *out_file = materialized;
+    return INCREMENTAL_FILE;
+  }
+  basis_match_free(&basis);
   return INCREMENTAL_CONTINUE;
 }
 
@@ -2289,8 +2403,9 @@ static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState
   if (!config->fuzzy || !config->use_delta)
     return INCREMENTAL_CONTINUE;
   unsigned long long fuzzy_size = 0;
-  void* fuzzy_basis =
-      fuzzy_basis_find_and_load(config, state->check_path, state->check_size, &fuzzy_size);
+  void* fuzzy_basis = fuzzy_basis_find_and_load(config, state->check_path, state->check_size,
+                                                (time_t)state->check_mtime,
+                                                (long)state->check_mtime_nsec, &fuzzy_size);
   if (fuzzy_basis != NULL) {
     bool fuzzy_failed = false;
     File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, fuzzy_basis,
@@ -2349,6 +2464,24 @@ File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
 
   outcome = incremental_check_report_dest_info(&state);
   if (outcome == INCREMENTAL_ERROR)
+    goto done;
+
+  /* --ignore-existing must answer before any data is requested; it takes
+     precedence over the metadata up-to-date check below. */
+  outcome = incremental_check_ignore_existing(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_SKIP) {
+    *skipped = true;
+    goto done;
+  }
+
+  /* A --link-dest hit relinks even an already up-to-date destination before the
+     quick-skip can suppress it (rsync parity). */
+  outcome = incremental_check_link_dest_relink(&state, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_FILE)
     goto done;
 
   outcome = incremental_check_quick_skip(&state, &try_delta);
@@ -3012,6 +3145,29 @@ typedef struct {
   bool limit_hit;
 } DeleteBudgetState;
 
+/* Build the delete-walk protection prefix for one basis directory.  The walker
+   compares paths relative to the receive root, so a relative entry is already
+   in the right form; an absolute entry that lies below the root is converted to
+   its root-relative form, and one outside the root returns NULL (the walk
+   cannot reach it, and it is not protected data beneath the root). */
+static char* basis_delete_relative(const Config* config, const char* path) {
+  if (!path)
+    return NULL;
+  if (path[0] != '/')
+    return str_dup(path);
+  const char* root = config->receive_root_directory;
+  if (!root || root[0] != '/')
+    return NULL;
+  size_t root_len = strlen(root);
+  while (root_len > 1 && root[root_len - 1] == '/')
+    root_len--;
+  if (strncmp(path, root, root_len) != 0)
+    return NULL;
+  if (path[root_len] != '/')
+    return NULL; /* identical or a sibling sharing a name prefix */
+  return str_dup(path + root_len + 1);
+}
+
 /* Remove every destination entry under the receive root that is not in the
    keep-set, bounded by the shared budget (a smaller client --max-delete=NUM
    replaces the server hard bound; rsync deletes up to the bound and skips the
@@ -3042,10 +3198,16 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
                    (manifest->protected ? manifest->protected->size : 0);
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -3053,7 +3215,13 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      /* An absolute basis outside the receive root is unreachable by this walk,
+         so it contributes no protection prefix (and no slot). */
+      char* prefix = basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
@@ -3062,6 +3230,7 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
   /* Clamp rather than subtract: an accounting bug where deleted already exceeds
      max_delete must never underflow into an effectively unlimited budget. */
@@ -3076,7 +3245,12 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
   size_t skipped = 0;
   DeleteWalkResult result =
       delete_extras_limited(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                            remaining, skips, skip_count, &deleted, &skipped);
+                            remaining, skips, used, &deleted, &skipped);
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
   budget->deleted += deleted;
   budget->skipped += skipped;
@@ -3113,10 +3287,16 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
   fprintf(stderr, "Deleting destination mirrors of missing source arguments...\n");
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -3124,10 +3304,15 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      char* prefix = basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
   bool ok = true;
   for (int i = 0; i < manifest->missing->size; i++) {
@@ -3140,7 +3325,7 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
       continue;
     }
     bool at_root = strchr(rel, '/') == NULL;
-    if (path_under_skip_prefix(rel, at_root, skips, skip_count)) {
+    if (path_under_skip_prefix(rel, at_root, skips, used)) {
       char* escaped = output_escape(rel, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "missing-args path '%s' is protected (staging directory or basis snapshot); "
@@ -3264,6 +3449,11 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
     if (!ok)
       break;
   }
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
   return ok;
 }

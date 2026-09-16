@@ -1044,10 +1044,11 @@ static void test_parse_args_basis_dirs() {
   config_delete(cfg);
 }
 
-/* Absolute, escaping, or degenerate basis-dir values must be rejected up
-   front: they would resolve outside the destination root on the receiver. */
+/* Escaping or degenerate basis-dir values must be rejected up front (they would
+   resolve outside the destination root on the receiver); an absolute path is
+   accepted (rsync parity) and canonicalized with its leading '/' preserved. */
 static void test_parse_args_basis_invalid_paths() {
-  static const char* const invalid[] = {"/abs", "..", "a/../b", "."};
+  static const char* const invalid[] = {"..", "a/../b", ".", "/", ""};
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--link-dest", (char*)invalid[i], "/src", "/dst"};
@@ -1056,6 +1057,15 @@ static void test_parse_args_basis_invalid_paths() {
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--link-dest=/abs/dir", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->basis_count, 1);
+  EXPECT_EQ_STR(cfg->basis_dirs[0].path, "/abs/dir");
+  config_delete(cfg);
 }
 
 /* Basis dirs require the per-file incremental handshake, which -s disables. */
@@ -2551,15 +2561,35 @@ static void test_parse_args_filter_rules() {
   EXPECT_EQ_INT(parse_args(cfg, 4, missing_argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 
-  /* rsync shorthands/modifiers we do not support are rejected instead of being
-   * silently parsed as literal patterns. */
-  static const char* const unsupported[] = {
-      ": .rsync-filter", ". /tmp/rules", "-s foo", "-p bar", "-C", "-! *.o", "!",
+  /* Full rsync grammar (rule words, modifiers, clear) is supported. */
+  cfg = config_create();
+  positional_count = 0;
+  char* grammar_argv[] = {"fastsync",
+                          "--filter=hide *.tmp",
+                          "--filter=show *.txt",
+                          "--filter=protect *.bak",
+                          "--filter=risk *.o",
+                          "--filter=-s foo",
+                          "--filter=-p bar",
+                          "--filter=-! *.o",
+                          "--filter=dir-merge .rules",
+                          "--filter=!",
+                          "/src",
+                          "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 11, grammar_argv, positional_args, &positional_count), 0);
+  config_delete(cfg);
+
+  /* Genuinely malformed rules are still rejected. */
+  static const char* const malformed[] = {
+      "merge",          /* merge requires a filename */
+      "dir-merge",      /* dir-merge requires a filename */
+      "clear extra",    /* clear takes no pattern */
+      "no-such-rule x", /* unknown rule word */
   };
-  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
     cfg = config_create();
     positional_count = 0;
-    char* rule_argv[] = {"fastsync", "--filter", (char*)unsupported[i], "/src", "/dst"};
+    char* rule_argv[] = {"fastsync", "--filter", (char*)malformed[i], "/src", "/dst"};
     EXPECT_EQ_INT(parse_args(cfg, 5, rule_argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
@@ -3146,6 +3176,27 @@ static void test_parse_args_chown() {
   EXPECT_TRUE(cfg->chown_gid_set);
   EXPECT_EQ_INT(cfg->chown_gid, IDENTITY_CURRENT);
   config_delete(cfg);
+
+  /* A --chown NAME is converted to the equivalent receiver-resolved map rule
+   * (rsync implements --chown as --usermap=*:USER --groupmap=*:GROUP), so the
+   * name is carried on the wire as to_name instead of being resolved on the
+   * sender.  A name that does not exist on the sender is accepted and left for
+   * the receiver to resolve (or warn about), matching rsync. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv5[] = {"fastsync", "--chown=no_such_user_zzz:no_such_group_zzz", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_NOT_NULL(cfg->usermap[0].to_name);
+  if (cfg->usermap[0].to_name)
+    EXPECT_EQ_STR(cfg->usermap[0].to_name, "no_such_user_zzz");
+  EXPECT_FALSE(cfg->chown_uid_set);
+  EXPECT_EQ_INT(cfg->groupmap_count, 1);
+  EXPECT_NOT_NULL(cfg->groupmap[0].to_name);
+  if (cfg->groupmap[0].to_name)
+    EXPECT_EQ_STR(cfg->groupmap[0].to_name, "no_such_group_zzz");
+  EXPECT_FALSE(cfg->chown_gid_set);
+  config_delete(cfg);
 }
 
 /* --copy-as=USER[:GROUP] (P7 Wave E): resolve the user/group against the local
@@ -3220,7 +3271,6 @@ static void test_parse_args_rejects_malformed_identity() {
       {"--groupmap", "@1"},
       {"--groupmap", "no_such_group_qqq:x"},
       {"--chown", "a:b:c"},
-      {"--chown", "no_such_user_zzz:"},
       {"--copy-as", ""},
       {"--copy-as", ":"},
       {"--copy-as", "a:b:c"},
