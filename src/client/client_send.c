@@ -328,15 +328,15 @@ static char* files_from_missing_dest_path(const Config* config, const char* entr
 
 /* --files-from semantics: every listed entry must resolve under the source
  * root, otherwise rsync reports a hard error instead of silently transferring
- * nothing. An empty list is also an error. An entry of "." (the whole tree)
- * and listed-but-empty directories are valid.  With --ignore-missing-args
+ * nothing. An entry of "." (the whole tree) and listed-but-empty directories
+ * are valid.  An empty list is valid too: rsync transfers nothing and exits 0.
+ * With --ignore-missing-args
  * (implied by --delete-missing-args) a listed-but-missing entry is instead
  * skipped: nothing is transferred for it, it never enters the keep-set and the
  * run succeeds for the rest (an all-missing non-empty list succeeds
  * transferring nothing, matching rsync).  With --delete-missing-args
  * `missing_dest` (when non-NULL) collects the entry's destination-relative
- * mirror for the receiver's exact-deletion request.  An empty list stays a
- * hard error in every mode (nothing was requested at all).  Runs before any
+ * mirror for the receiver's exact-deletion request.  Runs before any
  * transfer so the failure/skip is surfaced uniformly in the single-threaded,
  * -m, dry-run and --list-only paths. */
 static bool files_from_list_check(const Config* config, ArrayList* missing_dest, int* skipped_out) {
@@ -349,12 +349,11 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
     return false;
   }
   if (set->count == 0) {
-    char* escaped_list =
-        output_escape(config->files_from ? config->files_from : "", log_get_8_bit_output());
-    log_message(LOG_LEVEL_ERROR, "--files-from file '%s' contains no entries; nothing to transfer",
-                escaped_list ? escaped_list : "<allocation failed>");
-    free(escaped_list);
-    return false;
+    /* rsync treats an empty --files-from list as "nothing to transfer" and
+       exits 0 (the source directory is still a valid source arg), so this is
+       not an error.  Nothing passes the (empty) allow-set, so no file is sent
+       and no keep-set entry is produced. */
+    return true;
   }
   bool ignore = config->ignore_missing_args || config->delete_missing_args;
   for (int i = 0; i < set->count; i++) {
@@ -2679,12 +2678,15 @@ int send_files(Config* config) {
   report_transfer_stats(config, total_files, total_bytes, start);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    (double)total_bytes / (double)BYTES_PER_MIB);
-  /* --ignore-errors: an unreadable source directory was skipped but the run
-     still completed (and deleted); report the run as errored like rsync does.
-     A --max-delete-capped commit is a successful transfer that rsync reports
+  /* A skipped source entry (--ignore-errors past an unreadable directory, or a
+     dereferenced symlink with no referent) makes rsync report a partial
+     transfer (exit 23) even though the rest of the run succeeded.  A
+     --max-delete-capped commit is a successful transfer that rsync reports
      with exit code 25. */
-  if (!ok || had_scan_io)
+  if (!ok)
     ret = 1;
+  else if (had_scan_io)
+    ret = 23;
   else
     ret = delete_limit ? 25 : 0;
 
@@ -2921,12 +2923,15 @@ int send_files_multithreaded(Config** config_ptr) {
   mtx_unlock(&context->mutex_scanner);
   bool sender_ok = sender_result == thrd_success;
   bool delete_limit = context->delete_limit;
-  /* --ignore-errors: the run completed (and deleted) past an unreadable source
-     directory; report it as errored like rsync does.  A --max-delete-capped
-     commit is a successful transfer that rsync reports with exit code 25. */
+  /* A skipped source entry (--ignore-errors past an unreadable directory, or a
+     dereferenced symlink with no referent) makes rsync report a partial
+     transfer (exit 23).  A --max-delete-capped commit is a successful transfer
+     that rsync reports with exit code 25. */
   pipeline_context_sender_destroy(context);
   client_set_abort_armed(false);
-  if (!sender_ok || scan_io)
+  if (!sender_ok)
     return 1;
+  if (scan_io)
+    return 23;
   return delete_limit ? 25 : 0;
 }

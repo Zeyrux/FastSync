@@ -395,6 +395,39 @@ static void apply_output_buffering(const Config* config) {
 static int read_patterns_from_file(const char* filepath, char*** patterns, int* count,
                                    Config* config, char sign, const char* optname);
 
+/* Split one --debug/--info item into its category name and an optional rsync
+ * verbosity level suffix (e.g. "io2", "all4", "none0").  The output `name` is
+ * NUL-terminated and `level` is >= 0 (0 silences the item).  Returns false for
+ * an empty token or a token that is all digits. */
+static bool split_flag_level(const char* token, char* name, size_t name_size, int* level) {
+  size_t len = strlen(token);
+  if (len == 0 || name_size == 0)
+    return false;
+  size_t end = len;
+  while (end > 0 && token[end - 1] >= '0' && token[end - 1] <= '9')
+    end--;
+  if (end == 0)
+    return false; /* all digits: not a category name */
+  size_t name_len = end < name_size - 1 ? end : name_size - 1;
+  for (size_t i = 0; i < name_len; i++) {
+    char c = token[i];
+    name[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  }
+  name[name_len] = '\0';
+  int lvl = 1;
+  if (end < len) {
+    lvl = 0;
+    for (size_t i = end; i < len; i++) {
+      int digit = token[i] - '0';
+      if (lvl > (1000 - digit) / 10)
+        return false;
+      lvl = lvl * 10 + digit;
+    }
+  }
+  *level = lvl;
+  return true;
+}
+
 static int parse_debug_flags(const char* value, Config* config) {
   if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
       strstr(value, ",,")) {
@@ -412,30 +445,40 @@ static int parse_debug_flags(const char* value, Config* config) {
   for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
        token = strtok_r(NULL, ",", &saveptr)) {
     uint32_t flag = 0;
-    if (strcmp(token, "help") == 0) {
+    char name[32];
+    int level = 1;
+    if (!split_flag_level(token, name, sizeof(name), &level)) {
+      log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    if (strcmp(name, "help") == 0) {
       print_debug_usage();
       free(flags);
       return 1;
-    } else if (strcmp(token, "all") == 0) {
-      parsed = LOG_DEBUG_ALL;
+    } else if (strcmp(name, "all") == 0) {
+      parsed = level == 0 ? 0 : LOG_DEBUG_ALL;
       continue;
-    } else if (strcmp(token, "none") == 0) {
+    } else if (strcmp(name, "none") == 0) {
       parsed = 0;
       continue;
-    } else if (strcmp(token, "io") == 0) {
+    } else if (strcmp(name, "io") == 0) {
       flag = LOG_DEBUG_IO;
-    } else if (strcmp(token, "proto") == 0) {
+    } else if (strcmp(name, "proto") == 0) {
       flag = LOG_DEBUG_PROTO;
-    } else if (strcmp(token, "pack") == 0) {
+    } else if (strcmp(name, "pack") == 0) {
       flag = LOG_DEBUG_PACK;
-    } else if (strcmp(token, "util") == 0) {
+    } else if (strcmp(name, "util") == 0) {
       flag = LOG_DEBUG_UTIL;
     } else {
       log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
       free(flags);
       return -1;
     }
-    parsed |= flag;
+    if (level == 0)
+      parsed &= ~flag;
+    else
+      parsed |= flag;
   }
   free(flags);
   config->debug_level = (int)parsed;
@@ -461,28 +504,43 @@ static int parse_info_flags(const char* value, Config* config) {
   for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
        token = strtok_r(NULL, ",", &saveptr)) {
     uint32_t flag = 0;
-    if (strcmp(token, "all") == 0) {
-      parsed = LOG_INFO_ALL;
+    char name[32];
+    int level = 1;
+    if (!split_flag_level(token, name, sizeof(name), &level)) {
+      log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    if (strcmp(name, "all") == 0) {
+      parsed = level == 0 ? 0 : LOG_INFO_ALL;
       continue;
     }
-    if (strcmp(token, "none") == 0) {
+    if (strcmp(name, "none") == 0) {
       parsed = 0;
       continue;
     }
-    if (strcmp(token, "copy") == 0)
+    if (strcmp(name, "help") == 0) {
+      print_info_usage();
+      free(flags);
+      return 1;
+    }
+    if (strcmp(name, "copy") == 0 || strcmp(name, "name") == 0)
       flag = LOG_INFO_COPY;
-    else if (strcmp(token, "misc") == 0)
+    else if (strcmp(name, "misc") == 0)
       flag = LOG_INFO_MISC;
-    else if (strcmp(token, "skip") == 0)
+    else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;
-    else if (strcmp(token, "stats") == 0)
+    else if (strcmp(name, "stats") == 0)
       flag = LOG_INFO_STATS;
     else {
       log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
       free(flags);
       return -1;
     }
-    parsed |= flag;
+    if (level == 0)
+      parsed &= ~flag;
+    else
+      parsed |= flag;
   }
   free(flags);
   config->info_level = (int)parsed;
@@ -1027,17 +1085,22 @@ typedef struct {
 } CliParseCtx;
 
 /* Apply output controls before processing other options so their order is
- * irrelevant.  Returns 0 on success, -1 on error. */
+ * irrelevant.  Returns 0 on success, a positive code for a help request
+ * (parse_args returns it verbatim), or -1 on error. */
 static int cli_apply_output_controls(Config* config, int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (strncmp(argv[i], "--info=", 7) == 0) {
-      if (parse_info_flags(argv[i] + 7, config) != 0)
-        return -1;
+      int ret = parse_info_flags(argv[i] + 7, config);
+      if (ret != 0)
+        return ret;
     } else if (strcmp(argv[i], "--info") == 0) {
-      if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
+      if (i + 1 >= argc)
         return -1;
+      int ret = parse_info_flags(argv[++i], config);
+      if (ret != 0)
+        return ret;
     }
   }
   return 0;
@@ -1842,13 +1905,19 @@ static bool cli_handle_logging_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--info=", 7) == 0) {
-    if (parse_info_flags(arg + 7, config) != 0)
-      ctx->exit_code = -1;
+    int info_ret = parse_info_flags(arg + 7, config);
+    if (info_ret != 0)
+      ctx->exit_code = info_ret;
     return true;
   }
   if (opt_is(arg, "--info", NULL)) {
-    if (ctx->i + 1 >= ctx->argc || parse_info_flags(ctx->argv[++ctx->i], config) != 0)
+    if (ctx->i + 1 >= ctx->argc) {
       ctx->exit_code = -1;
+      return true;
+    }
+    int info_ret = parse_info_flags(ctx->argv[++ctx->i], config);
+    if (info_ret != 0)
+      ctx->exit_code = info_ret;
     return true;
   }
   if (strncmp(arg, "--skip-compress=", 16) == 0) {
@@ -2436,8 +2505,11 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
   }
 
   int result = -1;
-  if (cli_apply_output_controls(config, exp_argc, exp_argv) != 0)
+  int output_ret = cli_apply_output_controls(config, exp_argc, exp_argv);
+  if (output_ret != 0) {
+    result = output_ret;
     goto done;
+  }
 
   CliParseCtx ctx = {
       .config = config,

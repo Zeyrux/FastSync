@@ -1317,7 +1317,66 @@ static void test_parse_args_rejects_invalid_info_flag() {
   config_delete(cfg);
 }
 
+/* rsync's info "name" category maps to fastsync's per-file name logging, and
+ * --info=help prints the flag list and exits without error. */
+static void test_parse_args_info_name_and_help() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=name", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_COPY);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* help_argv[] = {"fastsync", "--info=help"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 2, help_argv, positional_args, &positional_count), 1);
+  config_delete(cfg);
+}
+
 /* Test parse_args with --archive flag */
+/* rsync accepts a trailing level digit on --debug/--info items (e.g. io2,
+ * all4); level 0 silences the item. */
+static void test_parse_args_debug_info_levels() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--debug=io2,proto0,all", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* io0_argv[] = {"fastsync", "--debug=all,io0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, io0_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL & ~LOG_DEBUG_IO);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* info_argv[] = {"fastsync", "--info=stats2", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, info_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_STATS);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* bad_argv[] = {"fastsync", "--debug=123", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, bad_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+
+  /* rsync accepts category names case-insensitively. */
+  cfg = config_create();
+  char* upper_argv[] = {"fastsync", "--info=STATS2", "--debug=IO", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, upper_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_STATS);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_IO);
+  config_delete(cfg);
+}
+
 static void test_parse_args_archive() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--archive", "/src", "/dst"};
@@ -4255,6 +4314,7 @@ void test_client_cli() {
   test_parse_args_debug_flags();
   test_parse_args_debug_help();
   test_parse_args_debug_flags_validation();
+  test_parse_args_debug_info_levels();
   test_parse_args_modify_window();
   test_parse_args_rejects_invalid_modify_window();
   test_parse_args_skip_compress();
@@ -4278,6 +4338,7 @@ void test_client_cli() {
   test_parse_args_info_flags();
   test_parse_args_info_verbose_order();
   test_parse_args_rejects_invalid_info_flag();
+  test_parse_args_info_name_and_help();
   test_parse_args_archive();
   test_parse_args_preserve_attributes_are_independent();
   test_parse_args_preserve_long_form();

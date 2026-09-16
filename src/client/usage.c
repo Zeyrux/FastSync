@@ -171,8 +171,8 @@ void print_usage(void) {
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -q, --quiet         Suppress non-error output\n");
   printf("  --debug=FLAGS       Fine-grained debug logging (use --debug=help for flags)\n");
-  printf("  --info=FLAGS        Fine-grained info: copy,misc,skip,stats,all,none\n");
-  printf("                      none suppresses info even with --verbose\n");
+  printf("  --info=FLAGS        Fine-grained info: copy,name,misc,skip,stats,all,none\n");
+  printf("                      (use --info=help for flags; none suppresses --verbose)\n");
   printf("  --preserve          Preserve permissions and times (= -pt; long form only)\n");
   printf("  --no-perms          Negate -p/--perms\n");
   printf("  --no-times          Negate -t/--times\n");
@@ -340,5 +340,13 @@ void print_usage(void) {
 void print_debug_usage(void) {
   printf("Supported debug flags: IO,PROTO,PACK,UTIL,ALL,NONE\n");
   printf("Flags may be comma-separated, for example: --debug=io,proto\n");
-  printf("Other rsync debug flags are unsupported and rejected.\n");
+  printf("An optional level suffix is accepted (e.g. --debug=io2); level 0\n");
+  printf("silences that item.  Other rsync debug flags are unsupported and rejected.\n");
+}
+
+void print_info_usage(void) {
+  printf("Supported info flags: COPY,NAME,MISC,SKIP,STATS,ALL,NONE\n");
+  printf("Flags may be comma-separated, for example: --info=name,stats\n");
+  printf("An optional level suffix is accepted (e.g. --info=stats2); level 0\n");
+  printf("silences that item.  Other rsync info flags are unsupported and rejected.\n");
 }

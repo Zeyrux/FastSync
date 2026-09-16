@@ -1533,6 +1533,49 @@ static void test_scanner_entry_classification() {
   rmdir(root);
 }
 
+/* A dereferenced symlink with no referent (broken/unreadable) must record a
+ * non-fatal I/O error so the run can exit 23 like rsync, without aborting the
+ * scan or treating the condition as a fatal failure. */
+static void test_scanner_broken_referent_io_error(void) {
+  const char* root = "test_scan_broken_ref";
+  const char* good = "test_scan_broken_ref/good.txt";
+  const char* broken = "test_scan_broken_ref/broken";
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  create_test_file(good, "hello");
+  EXPECT_EQ_INT(symlink("/nonexistent/quickwins/target", broken), 0);
+
+  {
+    ScannerOptions options = {0};
+    options.copy_links = true;
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL)
+      chunk_destroy(chunk);
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(directory_scanner_had_io_error(scanner));
+    directory_scanner_destroy(scanner);
+  }
+
+  {
+    ScannerOptions options = {0};
+    options.copy_links = true;
+    ParallelScanner* scanner = parallel_scanner_create_with_options(root, &options, NULL);
+    EXPECT_NOT_NULL(scanner);
+    Chunk* chunk;
+    while ((chunk = parallel_scanner_next(scanner)) != NULL)
+      chunk_destroy(chunk);
+    EXPECT_FALSE(parallel_scanner_failed(scanner));
+    EXPECT_TRUE(parallel_scanner_had_io_error(scanner));
+    parallel_scanner_destroy(scanner);
+  }
+
+  unlink(broken);
+  unlink(good);
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1551,6 +1594,7 @@ void test_scanner() {
   test_scanner_one_file_system_decision();
   test_scanner_one_file_system_same_device();
   test_parallel_scanner_one_file_system_same_device();
+  test_scanner_broken_referent_io_error();
   test_scanner_one_file_system_cross_device();
   test_files_from_subset(false);
   test_files_from_subset(true);

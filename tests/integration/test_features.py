@@ -3157,15 +3157,21 @@ class TestMissingArgs:
         assert not os.path.exists(os.path.join(received, "gone1.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
-    def test_empty_list_stays_a_hard_error(self, shared_server, mt):
+    def test_empty_list_succeeds_transferring_nothing(self, shared_server, mt):
+        """rsync 3.4.1 treats an empty --files-from list as "nothing to
+        transfer" and exits 0 (verified with the real binary), so fastsync must
+        too rather than reporting a hard error."""
         source = self._make_source("mg_empty_src")
         dest = os.path.join(TEST_DATA_DIR, "mg_empty_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"")
         flags = ["--files-from", lst, "--ignore-missing-args"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
-        assert result.returncode != 0, "an empty --files-from list must stay a hard error"
-        assert "contains no entries" in (result.stderr or result.stdout)
+        assert result.returncode == 0, \
+            f"an empty --files-from list must succeed like rsync: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(os.path.join(received, "a.txt")), \
+            "an empty --files-from list must transfer nothing"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_delete_missing_removes_mirror_not_unrelated(self, mt):

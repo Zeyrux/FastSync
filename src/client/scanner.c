@@ -163,6 +163,12 @@ typedef struct {
      Size pruning protects the destination mirror even under --delete-excluded,
      so it is recorded into a separate sink from `excluded`. */
   bool size_excluded;
+  /* True when a symlink selected for dereferencing (-L/--copy-links or an
+     unsafe target under --copy-unsafe-links) had no usable referent (a broken
+     link or a stat() failure).  rsync still reports this as a partial transfer
+     (exit 23) even though the entry is skipped, so the scanner records it as a
+     non-fatal I/O error. */
+  bool referent_error;
 } ScannerEntry;
 
 /* --one-file-system (-x) decision. Only directories can carry a different
@@ -412,6 +418,7 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* cont
                                  const char* link_rel, const char* name, ScannerEntry* entry) {
   entry->excluded = false;
   entry->size_excluded = false;
+  entry->referent_error = false;
   entry->is_symlink = false;
   entry->link_target = NULL;
   entry->path = path_cat(containing_dir, name);
@@ -438,12 +445,13 @@ static int scanner_inspect_entry(const ScannerOptions* options, const char* cont
     goto skip;
   case LINK_ACTION_DEREF:
     if (stat(entry->path, &entry->stats) != 0) {
-      /* rsync reports "symlink has no referent" and continues (exit 23); we
-         surface the same condition rather than silently dropping the entry. */
+      /* rsync reports "symlink has no referent" and continues with a partial
+         transfer (exit 23); record the error so the run exits 23 too. */
       char* escaped = output_escape(entry->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING, "symlink has no referent: %s",
                   escaped ? escaped : "<allocation failed>");
       free(escaped);
+      entry->referent_error = true;
       goto skip;
     }
     entry->is_directory = S_ISDIR(entry->stats.st_mode);
@@ -1118,6 +1126,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       break;
     }
     if (inspection == 0) {
+      /* A dereferenced symlink with no referent is a partial-transfer error
+         (rsync exit 23): record it as a non-fatal scan I/O error. */
+      if (inspected.referent_error)
+        scanner->io_error = true;
       /* A user-selection exclude protects its destination mirror from --delete
          unless --delete-excluded; a size prune is always protected.  Other
          skips (unreadable, symlink policy) protect nothing.  Under -R +
@@ -1511,6 +1523,8 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     return;
   }
   if (inspection == 0) {
+    if (inspected.referent_error)
+      ps->io_error = true;
     ArrayList* sink = NULL;
     if (inspected.excluded)
       sink = inspected.size_excluded ? options->size_skipped_paths : options->excluded_paths;
