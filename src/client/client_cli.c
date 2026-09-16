@@ -2349,6 +2349,15 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
       config->preserve_times = true;
   }
 
+  /* --ignore-existing is a receiver-side existence policy: the receiver must
+   * answer "skip" BEFORE the sender transmits any payload, which only the
+   * per-file STATUS_CHECK handshake provides.  Imply --incremental here (after
+   * the auto-preserve capture above, so a bare --ignore-existing does not gain
+   * -p/-t, which rsync likewise does not imply) so an existing destination is
+   * skipped on the wire instead of being streamed and discarded. */
+  if (config->ignore_existing)
+    config->use_incremental = true;
+
   /* Derive the transport bit from the FINAL parsed flags.  Every
    * preservation/ownership option that needs the metadata frame (per-attribute
    * perms/times/owner/group, atimes/crtimes, executability, xattrs/acls,

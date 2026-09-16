@@ -1764,6 +1764,7 @@ typedef struct {
   long long check_mtime_nsec;
   uint8_t check_digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t check_digest_len;
+  bool dest_exists; /* any destination entry exists (lstat succeeded) */
   bool has_old_file;
   int old_fd;
   struct stat old_st;
@@ -1860,6 +1861,9 @@ static IncrementalCheckOutcome incremental_check_open_destination(IncrementalChe
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full_path, &leaf, false);
   if (parent_fd >= 0) {
+    struct stat dest_st;
+    if (fstatat(parent_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
+      state->dest_exists = true;
     /* O_NONBLOCK: an existing FIFO at the destination must not block this
        openat(); the S_ISREG gate below rejects the non-regular entry. */
     state->old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -1901,6 +1905,21 @@ static IncrementalCheckOutcome incremental_check_report_dest_info(IncrementalChe
   if (!send_status(state->fd, STATUS_DEST_INFO) || !format_dest_state_send(state->fd, &info))
     return INCREMENTAL_ERROR;
   return INCREMENTAL_CONTINUE;
+}
+
+/* --ignore-existing short-circuit.  The receiver must answer "skip" (STATUS_OK)
+   BEFORE the sender transmits any payload, otherwise the whole file crosses the
+   wire only to be discarded at write time.  rsync skips an existing destination
+   entry regardless of its content or type, so the reply depends only on the
+   lstat existence probe; the ordinary --ignore-existing checks inside
+   file_receive remain as defense-in-depth for the frame types that have no
+   per-file check (directories/symlinks/specials/hard-links). */
+static IncrementalCheckOutcome incremental_check_ignore_existing(IncrementalCheckState* state) {
+  if (!state->config->ignore_existing || !state->dest_exists)
+    return INCREMENTAL_CONTINUE;
+  if (!send_status(state->fd, STATUS_OK))
+    return INCREMENTAL_ERROR;
+  return INCREMENTAL_SKIP;
 }
 
 /* Metadata-only (and, when --checksum forces it, content) up-to-date decision.
@@ -2350,6 +2369,16 @@ File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
   outcome = incremental_check_report_dest_info(&state);
   if (outcome == INCREMENTAL_ERROR)
     goto done;
+
+  /* --ignore-existing must answer before any data is requested; it takes
+     precedence over the metadata up-to-date check below. */
+  outcome = incremental_check_ignore_existing(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_SKIP) {
+    *skipped = true;
+    goto done;
+  }
 
   outcome = incremental_check_quick_skip(&state, &try_delta);
   if (outcome == INCREMENTAL_ERROR)
