@@ -906,18 +906,20 @@ static int open_next_directory(DirectoryScanner* scanner) {
 /* ---- --dirs mode ----
    With -d the scanner transfers directory entries and never recurses into
    contents.  A plain `-d <dir>` sends only the source-root directory mirror
-   (created empty at the destination).  With -d + --files-from exactly the
-   listed items are sent: listed directories become empty directory entries and
-   listed regular files are transferred as files; nothing else is scanned, so
-   no descent into a listed directory can happen. */
+   (created empty at the destination); `-d dir/`, `-d dir/.` and `-d .` list
+   the directory's immediate contents instead (files plus empty directory
+   entries), matching rsync.  With -d + --files-from exactly the listed items
+   are sent: listed directories become empty directory entries and listed
+   regular files are transferred as files; nothing else is scanned, so no
+   descent into a listed directory can happen. */
 
 /* Directory entries carry no payload, so the dirs generator also bounds every
    chunk by element count; chunk_deserialize refuses more than this many files
    per chunk (see MAX_FILES_PER_CHUNK in chunk.c). */
 #define DIRS_CHUNK_MAX_FILES 65536U
 
-/* Build the File for the transfer root directory itself (the `-d <dir>` and
- * "." cases). */
+/* Build the File for the transfer root directory itself (the `-d <dir>`
+ * no-trailing-slash case). */
 static File* dirs_root_dir_file(DirectoryScanner* scanner) {
   struct stat st;
   if (stat(scanner->root_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -935,6 +937,14 @@ static File* dirs_root_dir_file(DirectoryScanner* scanner) {
     file->metadata = file_metadata_create(scanner->root_path, &st, scanner->options.preserve_atimes,
                                           scanner->options.preserve_crtimes);
     if (!file->metadata) {
+      file_destroy(file);
+      scanner->failed = true;
+      return NULL;
+    }
+  }
+  if (scanner->options.relative_prefix && scanner->options.relative_prefix[0] != '\0') {
+    file->send_path = str_dup(scanner->options.relative_prefix);
+    if (!file->send_path) {
       file_destroy(file);
       scanner->failed = true;
       return NULL;
@@ -1044,6 +1054,13 @@ static File* dirs_file_for_entry(DirectoryScanner* scanner, const char* entry) {
       scanner->failed = true;
       return NULL;
     }
+  } else if (scanner->options.relative_prefix) {
+    file->send_path = scanner_prefix_send_path(scanner->options.relative_prefix, entry);
+    if (!file->send_path) {
+      file_destroy(file);
+      scanner->failed = true;
+      return NULL;
+    }
   }
   if (scanner->options.use_metadata) {
     file->metadata = file_metadata_create(file->path, &effective, scanner->options.preserve_atimes,
@@ -1077,9 +1094,63 @@ static bool dirs_source_dir_is_empty(const char* path) {
   return empty;
 }
 
+/* The next immediate child of the source root for a one-level --dirs listing
+ * (rsync: -d DIR/ lists DIR's immediate contents without recursing). */
+static File* dirs_next_child(DirectoryScanner* scanner) {
+  if (!scanner->current_dir)
+    return NULL;
+  const struct dirent* entry;
+  while ((entry = readdir(scanner->current_dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    File* file = dirs_file_for_entry(scanner, entry->d_name);
+    if (scanner->failed)
+      return NULL;
+    if (file && !entry_passes_selection(scanner->options.file_list, scanner->options.base_filters,
+                                        NULL, entry->d_name, entry->d_name, file->is_dir,
+                                        scanner->options.per_dir_filters)) {
+      file_destroy(file);
+      continue;
+    }
+    if (file && file->is_dir && scanner->options.prune_empty_dirs &&
+        dirs_source_dir_is_empty(file->path)) {
+      file_destroy(file);
+      continue;
+    }
+    if (file)
+      return file;
+  }
+  closedir(scanner->current_dir);
+  scanner->current_dir = NULL;
+  return NULL;
+}
+
 /* The next File from the --dirs generator, or NULL when exhausted. */
 static File* dirs_next_file(DirectoryScanner* scanner) {
   if (!scanner->options.file_list) {
+    const char* spec = scanner->root_path ? scanner->root_path : "";
+    size_t n = strlen(spec);
+    /* rsync: a trailing slash or "/." on the source argument lists the
+       directory's immediate contents (files and empty directory entries)
+       without recursing.  A bare directory sends only its own entry. */
+    bool list_children =
+        (n == 1 && spec[0] == '.') ||
+        (n > 0 && (spec[n - 1] == '/' || (n >= 2 && spec[n - 1] == '.' && spec[n - 2] == '/')));
+    if (list_children) {
+      if (!scanner->dirs_root_emitted) {
+        scanner->dirs_root_emitted = true;
+        if (scanner->options.prune_empty_dirs && dirs_source_dir_is_empty(scanner->root_path))
+          return NULL;
+        scanner->current_dir = opendir(scanner->root_path);
+        if (!scanner->current_dir) {
+          scanner->io_error = true;
+          log_perror("Could not open directory");
+          scanner->failed = true;
+          return NULL;
+        }
+      }
+      return dirs_next_child(scanner);
+    }
     if (scanner->dirs_root_emitted)
       return NULL;
     scanner->dirs_root_emitted = true;

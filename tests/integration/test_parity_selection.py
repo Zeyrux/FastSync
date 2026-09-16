@@ -105,6 +105,43 @@ class TestRelativeGeneral:
                     f"mtime mismatch for {rel} with {extra}"
 
 
+class TestDirsOneLevel:
+    """#13: -d with a trailing slash (or '.') lists the source's immediate
+    contents; FastSync mirrors them below the source-root mirror, so compare
+    rsync's destination tree against that mirror."""
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_dirs_trailing_slash_matches_rsync(self, shared_server):
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_dirs_src"))
+        os.makedirs(os.path.join(source, "empty"), exist_ok=True)
+        dest = os.path.join(TEST_DATA_DIR, "sel_dirs_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "sel_dirs_rdst")
+        clean_dir(dest)
+        clean_dir(rdst)
+        r = _rsync(["-d", source + "/", rdst + "/"])
+        assert r.returncode == 0, r.stderr
+        result, _ = run_client(source + "/", dest, flags=["-d"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        mirror = get_dest_received_dir(dest, source)
+        assert _tree(rdst) == _tree(mirror)
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_dirs_relative_matches_rsync(self, shared_server):
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_dirsr_src"))
+        dest = os.path.join(TEST_DATA_DIR, "sel_dirsr_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "sel_dirsr_rdst")
+        clean_dir(dest)
+        clean_dir(rdst)
+        spec = source + "/./foo"
+        r = _rsync(["-d", "-R", spec, rdst + "/"])
+        assert r.returncode == 0, r.stderr
+        result, _ = run_client(spec, dest, flags=["-d", "-R"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert _tree(rdst) == _tree(dest)
+
+
 class TestClientAliases:
     """#5: safe rsync option aliases accepted client-side."""
 
