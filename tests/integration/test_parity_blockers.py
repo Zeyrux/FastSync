@@ -51,9 +51,10 @@ class TestRelativePerDirDeleteScope:
 
     @requires_rsync
     @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
-    def test_prefix_scoped_delete_matches_rsync(self, timing):
-        source = os.path.join(TEST_DATA_DIR, "delblk_src")
+    def test_prefix_scoped_delete_matches_rsync(self, timing, mt):
+        source = os.path.join(TEST_DATA_DIR, f"delblk_src{int(mt)}")
         clean_dir(source)
         _write(os.path.join(source, "foo", "a.txt"), b"payload\n")
         spec = source + "/./foo"
@@ -63,15 +64,16 @@ class TestRelativePerDirDeleteScope:
             _write(os.path.join(root, "foo", "extra.txt"), b"stale\n")
             _write(os.path.join(root, "unrelated", "keep.txt"), b"keep\n")
 
-        rdst = os.path.join(TEST_DATA_DIR, "delblk_rdst")
-        dest = os.path.join(TEST_DATA_DIR, "delblk_dst")
+        rdst = os.path.join(TEST_DATA_DIR, f"delblk_rdst{int(mt)}")
+        dest = os.path.join(TEST_DATA_DIR, f"delblk_dst{int(mt)}")
         seed(rdst)
         seed(dest)
         r = _rsync(["-aR", timing, spec, rdst + "/"])
         assert r.returncode == 0, r.stderr
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(spec, dest, flags=["-a", "-R", timing], port=server.port)
+            flags = ["-a", "-R", timing] + (["--threads"] if mt else [])
+            result, _ = run_client(spec, dest, flags=flags, port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
 #The prefix's parent-directory sibling survives on both sides.
         assert os.path.isfile(os.path.join(dest, "unrelated", "keep.txt"))
@@ -268,11 +270,12 @@ class TestEmptySourceDirectoryDelete:
 
     @requires_rsync
     @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
-    def test_empty_source_dir_survives_matches_rsync(self, timing):
-        source = os.path.join(TEST_DATA_DIR, "emptydir_src")
-        dest = os.path.join(TEST_DATA_DIR, "emptydir_dst")
-        rdst = os.path.join(TEST_DATA_DIR, "emptydir_rdst")
+    def test_empty_source_dir_survives_matches_rsync(self, timing, mt):
+        source = os.path.join(TEST_DATA_DIR, f"emptydir_src{int(mt)}")
+        dest = os.path.join(TEST_DATA_DIR, f"emptydir_dst{int(mt)}")
+        rdst = os.path.join(TEST_DATA_DIR, f"emptydir_rdst{int(mt)}")
         clean_dir(source)
         os.makedirs(os.path.join(source, "empty"))
         _write(os.path.join(source, "keep.txt"), b"keep\n")
@@ -287,7 +290,8 @@ class TestEmptySourceDirectoryDelete:
         assert not os.path.exists(os.path.join(rdst, "empty", "extra.txt"))
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(source, dest, flags=["-a", timing], port=server.port)
+            flags = ["-a", timing] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
         assert os.path.isdir(os.path.join(received, "empty")), \
             "empty source directory was removed"
