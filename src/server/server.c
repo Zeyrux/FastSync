@@ -970,7 +970,11 @@ void handler(int file_descriptor) {
          arrived; with the disk writer drained, commit the deferred removals.
          --delete-during already applied its plans on the receive thread. */
       if (context->deferred_plans) {
-        DeleteCommitResult deletion = delete_plan_session_commit(context->deferred_plans, config);
+        /* Defence in depth (the enclosing block already excludes dry-run): a
+           -n run never commits a deletion. */
+        DeleteCommitResult deletion = config->dry_run ? DELETE_COMMIT_OK
+                                                      : delete_plan_session_commit(
+                                                            context->deferred_plans, config);
         if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
         } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {

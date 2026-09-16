@@ -850,6 +850,11 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config) {
   if (!session || !config)
     return DELETE_COMMIT_ERROR;
+  /* Central no-mutation guard (mirrors manifest_delete_all): a dry-run never
+     deletes.  The receive path already skips plan application, but a hostile or
+     buggy peer could still reach the commit, so treat it as a no-op. */
+  if (session->dry_run)
+    return DELETE_COMMIT_OK;
   bool ok = true;
   if (session->defer) {
     for (int i = 0; i < session->deferred->size && ok; i++)

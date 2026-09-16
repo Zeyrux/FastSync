@@ -489,6 +489,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
     if (pending_plans) {
       *pending_plans = plan_session;
       plan_session = NULL;
+    } else if (config->dry_run) {
+      /* Central dry-run no-op: never commit a deletion for a -n run. */
+      delete_plan_session_destroy(plan_session);
+      plan_session = NULL;
     } else {
       DeleteCommitResult deletion = delete_plan_session_commit(plan_session, config);
       bool limit = delete_plan_session_limit_reached(plan_session);

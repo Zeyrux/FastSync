@@ -1128,6 +1128,56 @@ static void test_receive_manifest_total_entry_cap() {
   config_delete(cfg);
 }
 
+/* A server-contacting --dry-run must never delete, even on the per-directory
+   (--delete-during/--delete-delay) commit path.  The receive path already skips
+   plan application under -n, but a plan frame carrying --delete-missing-args
+   exact deletions used to be honored by delete_plan_session_commit().  Seed a
+   destination mirror, stream a plan naming it, and prove it survives. */
+static void test_dry_run_delete_plan_commit_does_not_delete() {
+  char* root = make_check_root("drydelplan");
+  EXPECT_NOT_NULL(root);
+  write_check_file(root, "victim.txt", "must survive");
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  cfg->delete_during = true;
+  cfg->delete_missing_args = true;
+  cfg->dry_run = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_DELETE_PLAN));
+  EXPECT_TRUE(send_int(p[1], 1));  /* first frame carries the config sections */
+  EXPECT_TRUE(send_int(p[1], 0));  /* protected prefixes */
+  EXPECT_TRUE(send_int(p[1], 0));  /* size-skipped prefixes */
+  EXPECT_TRUE(send_int(p[1], 1));  /* missing-args exact deletions */
+  EXPECT_TRUE(send_str(p[1], "victim.txt"));
+  EXPECT_TRUE(send_str(p[1], ".")); /* receive root plan */
+  EXPECT_TRUE(send_int(p[1], 0));   /* kept child directories */
+  EXPECT_TRUE(send_int(p[1], 0));   /* kept child files */
+  EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
+
+  ReceiverSink sink = {.send_success = true};
+  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL, NULL), 0);
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/victim.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+  remove(path);
+  rmdir(root);
+  free(root);
+}
+
 void test_server() {
   test_special_socket_path_log_escaped();
   if (!is_running_under_valgrind()) {
@@ -1150,5 +1200,6 @@ void test_server() {
     test_receive_manifest_three_sections();
     test_manifest_delete_missing_args();
     test_receiver_pending_commits_missing_args();
+    test_dry_run_delete_plan_commit_does_not_delete();
   }
 }
