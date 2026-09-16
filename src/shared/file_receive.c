@@ -3172,9 +3172,10 @@ char* file_receive_basis_delete_relative(const Config* config, const char* path)
     root_len--;
   if (strncmp(path, root, root_len) != 0)
     return NULL;
-  if (root_len == 1 && root[0] == '/') {
-    /* The receive root is "/": every absolute path is below it, and the child
-       relative form is everything after the leading '/'. */
+  if (root_len == 1) {
+    /* `root` is "/" (the only single-character absolute root): every absolute
+       path is below it, and the child relative form is everything after the
+       leading '/'. */
     if (path[1] == '\0')
       return NULL; /* identical to the root, not a child */
     return str_dup(path + 1);
