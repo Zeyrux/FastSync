@@ -887,12 +887,33 @@ class TestFakeSuper:
             assert fh.read() == b"fake-super-data\n"
 
 
-class TestInfoDebugFlagParity:
-    """#01/#02: rsync's info/debug spellings are either mapped to real output or
-    rejected by name (never silently ignored)."""
+# rsync 3.4.1's full --info/--debug vocabularies (from `rsync --info=help` /
+# `--debug=help`).  FastSync must accept every one of them; only the categories
+# with an existing FastSync counterpart emit output, the rest are accepted but
+# currently silent.
+RSYNC_INFO_CATEGORIES = (
+    "backup", "copy", "del", "flist", "misc", "mount", "name", "nonreg",
+    "progress", "remove", "skip", "stats", "symsafe", "all", "none",
+)
+RSYNC_DEBUG_CATEGORIES = (
+    "acl", "backup", "bind", "chdir", "connect", "cmd", "del", "deltasum",
+    "dup", "exit", "filter", "flist", "fuzzy", "genr", "hash", "hlink",
+    "iconv", "io", "nstr", "own", "proto", "recv", "send", "time", "all",
+    "none",
+)
+# Extra categories FastSync also accepts: rsync's own help spells these
+# `symsafe`/`hlink`/`own`, but the historical aliases are kept working, and
+# `pack`/`util` are FastSync-specific debug channels.
+FASTSYNC_INFO_ALIASES = ("syms",)
+FASTSYNC_DEBUG_ALIASES = ("hl", "owner", "pack", "util")
 
-    @requires_rsync
-    def test_mapped_info_categories_accepted_like_rsync(self, shared_server):
+
+class TestInfoDebugFlagParity:
+    """#01/#02: FastSync accepts rsync 3.4.1's full --info/--debug vocabulary
+    (with level suffixes) so a valid rsync invocation is never rejected up
+    front.  Unknown names are still refused by name."""
+
+    def _tree(self):
         source = os.path.join(TEST_DATA_DIR, "qw_flags_src")
         dest = os.path.join(TEST_DATA_DIR, "qw_flags_dst")
         rdst = os.path.join(TEST_DATA_DIR, "qw_flags_rdst")
@@ -901,54 +922,78 @@ class TestInfoDebugFlagParity:
         clean_dir(rdst)
         with open(os.path.join(source, "a.txt"), "wb") as fh:
             fh.write(b"a\n")
-        for cat in ("stats2", "name", "copy", "misc", "skip", "STATS2"):
-            assert _rsync(["-a", "--info=" + cat, source + "/", rdst + "/"]).returncode == 0
+        return source, dest, rdst
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_info_vocabulary_accepted_like_rsync(self, shared_server):
+        source, dest, rdst = self._tree()
+        for cat in RSYNC_INFO_CATEGORIES:
+            rs = _rsync(["-a", "--info=" + cat, source + "/", rdst + "/"])
+            assert rs.returncode == 0, f"rsync rejected --info={cat}: {rs.stderr}"
             clean_dir(rdst)
             result, _ = run_client(source, dest, flags=["--info=" + cat],
                                    port=shared_server.port)
             assert result.returncode == 0, (
-                f"--info={cat} must be accepted: {result.stderr[:200]}"
-            )
-
-    @requires_rsync
-    def test_mapped_debug_categories_accepted_like_rsync(self, shared_server):
-        source = os.path.join(TEST_DATA_DIR, "qw_dflags_src")
-        dest = os.path.join(TEST_DATA_DIR, "qw_dflags_dst")
-        rdst = os.path.join(TEST_DATA_DIR, "qw_dflags_rdst")
-        clean_dir(source)
-        clean_dir(dest)
-        clean_dir(rdst)
-        with open(os.path.join(source, "a.txt"), "wb") as fh:
-            fh.write(b"a\n")
-        for cat in ("io2", "proto0", "all"):
-            assert _rsync(["-a", "--debug=" + cat, source + "/", rdst + "/"]).returncode == 0
-            clean_dir(rdst)
-            result, _ = run_client(source, dest, flags=["--debug=" + cat],
-                                   port=shared_server.port)
-            assert result.returncode == 0, (
-                f"--debug={cat} must be accepted: {result.stderr[:200]}"
+                f"--info={cat} must be accepted like rsync: {result.stderr[:200]}"
             )
 
     @requires_rsync
     @pytest.mark.ci
-    def test_unmapped_categories_rejected_by_name(self, shared_server):
-        """rsync accepts del/filter; fastsync has no mapping so it must refuse
-        loudly, naming the category, rather than silently ignoring it."""
-        source = os.path.join(TEST_DATA_DIR, "qw_umap_src")
-        dest = os.path.join(TEST_DATA_DIR, "qw_umap_dst")
-        clean_dir(source)
-        clean_dir(dest)
-        with open(os.path.join(source, "a.txt"), "wb") as fh:
-            fh.write(b"a\n")
-        # rsync accepts these (so they are valid rsync invocations).
-        assert _rsync(["-a", "--info=del", source + "/", dest + "/"]).returncode == 0
-        assert _rsync(["-a", "--debug=filter", source + "/", dest + "/"]).returncode == 0
-        for flag, name in (("--info=del", "del"), ("--debug=filter", "filter")):
+    def test_debug_vocabulary_accepted_like_rsync(self, shared_server):
+        source, dest, rdst = self._tree()
+        for cat in RSYNC_DEBUG_CATEGORIES:
+            rs = _rsync(["-a", "--debug=" + cat, source + "/", rdst + "/"])
+            assert rs.returncode == 0, f"rsync rejected --debug={cat}: {rs.stderr}"
+            clean_dir(rdst)
+            result, _ = run_client(source, dest, flags=["--debug=" + cat],
+                                   port=shared_server.port)
+            assert result.returncode == 0, (
+                f"--debug={cat} must be accepted like rsync: {result.stderr[:200]}"
+            )
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_level_suffixes_accepted_like_rsync(self, shared_server):
+        source, dest, rdst = self._tree()
+        for flag in ("--info=stats2", "--info=copy0", "--info=all0",
+                     "--debug=io2", "--debug=proto0", "--debug=all4"):
+            rs = _rsync(["-a", flag, source + "/", rdst + "/"])
+            assert rs.returncode == 0, f"rsync rejected {flag}: {rs.stderr}"
+            clean_dir(rdst)
+            result, _ = run_client(source, dest, flags=[flag],
+                                   port=shared_server.port)
+            assert result.returncode == 0, (
+                f"{flag} must be accepted like rsync: {result.stderr[:200]}"
+            )
+
+    def test_fastsync_alias_categories_accepted(self, shared_server):
+        """FastSync-specific/alias spellings: accepted (rsync spells them
+        symsafe/hlink/own) but not emitted."""
+        source, dest, _ = self._tree()
+        for flag in (["--info=" + c for c in FASTSYNC_INFO_ALIASES] +
+                     ["--debug=" + c for c in FASTSYNC_DEBUG_ALIASES]):
+            result, _ = run_client(source, dest, flags=[flag],
+                                   port=shared_server.port)
+            assert result.returncode == 0, (
+                f"{flag} must be accepted: {result.stderr[:200]}"
+            )
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_unknown_categories_rejected_by_name(self, shared_server):
+        """Truly unknown names are refused by name, exactly like rsync."""
+        source, dest, rdst = self._tree()
+        for flag, name in (("--info=bogus", "bogus"),
+                           ("--debug=bogus", "bogus")):
+            rs = _rsync(["-a", flag, source + "/", rdst + "/"])
+            assert rs.returncode != 0, f"rsync unexpectedly accepted {flag}"
             result, _ = run_client(source, dest, flags=[flag],
                                    port=shared_server.port)
             assert result.returncode != 0, f"{flag} must be rejected"
-            assert name in (result.stderr or ""), \
+            assert name in (result.stderr or ""), (
                 f"{flag} must be rejected by name, got: {result.stderr[:200]}"
+            )
 
 
 class TestStopAtParity:

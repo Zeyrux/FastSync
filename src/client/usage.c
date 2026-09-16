@@ -341,15 +341,20 @@ void print_usage(void) {
 }
 
 void print_debug_usage(void) {
-  printf("Supported debug flags: IO,PROTO,PACK,UTIL,ALL,NONE\n");
+  printf("Emitting debug flags: IO,PROTO,PACK,UTIL,ALL,NONE\n");
+  printf("Also accepted for rsync CLI parity (silent): ACL,BACKUP,BIND,CHDIR,\n");
+  printf("CONNECT,CMD,DEL,DELTASUM,DUP,EXIT,FILTER,FLIST,FUZZY,GENR,HASH,HLINK,\n");
+  printf("ICONV,NSTR,OWN,RECV,SEND,TIME.\n");
   printf("Flags may be comma-separated, for example: --debug=io,proto\n");
   printf("An optional level suffix is accepted (e.g. --debug=io2); level 0\n");
-  printf("silences that item.  Other rsync debug flags are unsupported and rejected.\n");
+  printf("silences that item.  Unknown names are rejected.\n");
 }
 
 void print_info_usage(void) {
-  printf("Supported info flags: COPY,NAME,MISC,SKIP,STATS,ALL,NONE\n");
+  printf("Emitting info flags: COPY,NAME,MISC,SKIP,STATS,ALL,NONE\n");
+  printf("Also accepted for rsync CLI parity (silent): BACKUP,DEL,FLIST,MOUNT,\n");
+  printf("NONREG,PROGRESS,REMOVE,SYMSAFE.\n");
   printf("Flags may be comma-separated, for example: --info=name,stats\n");
   printf("An optional level suffix is accepted (e.g. --info=stats2); level 0\n");
-  printf("silences that item.  Other rsync info flags are unsupported and rejected.\n");
+  printf("silences that item.  Unknown names are rejected.\n");
 }

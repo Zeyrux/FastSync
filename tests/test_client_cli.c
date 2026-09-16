@@ -776,7 +776,7 @@ static void test_parse_args_debug_help() {
 }
 
 static void test_parse_args_debug_flags_validation() {
-  static const char* const values[] = {"", "io,", ",io", "io,,proto", "acl", "tls", "unknown"};
+  static const char* const values[] = {"", "io,", ",io", "io,,proto", "tls", "unknown"};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     Config* cfg = config_create();
     char option[64];
@@ -1342,6 +1342,24 @@ static void test_parse_args_info_name_and_help() {
   char* help_argv[] = {"fastsync", "--info=help"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 2, help_argv, positional_args, &positional_count), 1);
+  config_delete(cfg);
+}
+
+/* rsync 3.4.1's remaining --info/--debug categories parse successfully but
+ * have no FastSync output wired to them, so they must not set any log flag. */
+static void test_parse_args_rsync_flag_vocabulary_accepted() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=backup,del,flist,mount,nonreg,progress,remove,symsafe,syms",
+                  "--debug=acl,backup,bind,chdir,cmd,connect,del,deltasum,dup,exit,"
+                  "filter,flist,fuzzy,genr,hash,hlink,iconv,nstr,own,recv,send,time,"
+                  "hl,owner",
+                  "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, 0);
+  EXPECT_EQ_INT(cfg->debug_level, 0);
   config_delete(cfg);
 }
 
@@ -4441,6 +4459,7 @@ void test_client_cli() {
   test_parse_args_debug_flags();
   test_parse_args_debug_help();
   test_parse_args_debug_flags_validation();
+  test_parse_args_rsync_flag_vocabulary_accepted();
   test_parse_args_debug_info_levels();
   test_parse_args_modify_window();
   test_parse_args_rejects_invalid_modify_window();
