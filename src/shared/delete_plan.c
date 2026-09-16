@@ -42,6 +42,10 @@ struct DeletePlanSender {
   bool config_sent;
   bool all_synced;
   const ArrayList* synced_dirs;
+  /* Owned by the caller's synced_dirs list; non-NULL only for a general -R
+     transfer, where it is the destination prefix the delete walk is confined
+     to.  NULL means the whole receive root (or a --files-from scope). */
+  const char* walk_root;
   const ArrayList* protected_prefixes;
   const ArrayList* size_skipped;
   const ArrayList* missing_args;
@@ -260,11 +264,13 @@ bool delete_plan_sender_add(DeletePlanSender* sender, const char* path, bool is_
   return ok;
 }
 
-void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* synced_dirs) {
+void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* synced_dirs,
+                                 const char* walk_root) {
   if (!sender)
     return;
   sender->synced_dirs = synced_dirs;
-  sender->all_synced = synced_dirs == NULL;
+  sender->all_synced = synced_dirs == NULL && walk_root == NULL;
+  sender->walk_root = walk_root;
 }
 
 bool delete_plan_sender_empty(const DeletePlanSender* sender) {
@@ -280,9 +286,20 @@ void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* pr
   sender->missing_args = missing_args;
 }
 
+/* True when `dir` is `root` itself or a descendant of it (path-component
+ * aware, so "foo" does not match "foobar"). */
+static bool path_at_or_under(const char* dir, const char* root) {
+  if (!dir || !root)
+    return false;
+  size_t n = strlen(root);
+  return strncmp(dir, root, n) == 0 && (dir[n] == '\0' || dir[n] == '/');
+}
+
 static bool plan_is_allowed(const DeletePlanSender* sender, const char* dir) {
   if (sender->all_synced)
     return true;
+  if (sender->walk_root)
+    return path_at_or_under(dir, sender->walk_root);
   return list_contains_str(sender->synced_dirs, dir);
 }
 
@@ -329,9 +346,10 @@ static int send_prefix_plan(int fd, DeletePlanSender* sender, const char* dir) {
 int delete_plan_send_root(int fd, DeletePlanSender* sender) {
   if (!sender)
     return -1;
-  if (!plan_ensure(sender, "."))
+  const char* root = sender->walk_root ? sender->walk_root : ".";
+  if (!plan_ensure(sender, root))
     return -1;
-  return send_prefix_plan(fd, sender, ".");
+  return send_prefix_plan(fd, sender, root);
 }
 
 int delete_plan_send_for_path(int fd, DeletePlanSender* sender, const char* path, bool is_dir) {
@@ -340,7 +358,10 @@ int delete_plan_send_for_path(int fd, DeletePlanSender* sender, const char* path
   char* clean = plan_clean_path(path);
   if (!clean)
     return -1;
-  int rc = send_prefix_plan(fd, sender, ".");
+  /* The walk root (the -R prefix, or ".") is sent up front by
+     delete_plan_send_root(); never emit the receive-root plan for a scoped -R
+     run, whose "." keep list would delete the prefix's siblings. */
+  int rc = sender->walk_root ? 0 : send_prefix_plan(fd, sender, ".");
   if (rc == 0 && *clean != '\0') {
     size_t len = strlen(clean);
     size_t end = len;

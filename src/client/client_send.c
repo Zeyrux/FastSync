@@ -454,6 +454,21 @@ static char* delete_scope_root_marker(const Config* config) {
   return str_dup(".");
 }
 
+/* The -R destination prefix that confines a per-directory delete walk, or NULL
+ * when the whole receive root is in scope.  The marker was installed into
+ * `synced_dirs` by delete_scope_root_marker(); for a plain recursive transfer
+ * it is "." (whole root) and for --files-from the list is not a single prefix. */
+static const char* delete_plan_walk_root(const Config* config, const ArrayList* synced_dirs) {
+  if (!config || config->files_from_set != NULL || !config->relative || !config->send_directory)
+    return NULL;
+  if (!synced_dirs || synced_dirs->size != 1)
+    return NULL;
+  const char* marker = (const char*)synced_dirs->items[0];
+  if (marker[0] == '\0' || strcmp(marker, ".") == 0)
+    return NULL;
+  return marker;
+}
+
 /* True when some --files-from entry is an ancestor-or-equal directory of
  * `rel` (an empty entry -- the whole tree "." -- counts as the root). */
 static bool file_list_ancestor_listed(const FileListSet* set, const char* rel) {
@@ -2898,7 +2913,9 @@ int send_files(Config* config) {
     bool prescan_ok = scan_paths_only(config, &prepared.options, NULL, plan_sender, &had_scan_io);
     bool plans_ok = false;
     if (prescan_ok) {
-      delete_plan_sender_finalize(plan_sender, config->files_from_set ? synced_dirs : NULL);
+      const char* walk_root = delete_plan_walk_root(config, synced_dirs);
+      const ArrayList* scope = config->files_from_set ? synced_dirs : (walk_root ? synced_dirs : NULL);
+      delete_plan_sender_finalize(plan_sender, scope, walk_root);
       delete_plan_sender_set_config(plan_sender, excluded, size_skipped, missing_args);
       if (had_scan_io && delete_plan_sender_empty(plan_sender)) {
         log_message(LOG_LEVEL_ERROR,
@@ -3261,8 +3278,10 @@ int send_files_multithreaded(Config** config_ptr) {
                                          context->delete_plans, &context->scan_had_io_error);
       prepared_scanner_destroy(&prepared);
       if (per_dir && prebuilt) {
-        delete_plan_sender_finalize(context->delete_plans,
-                                    config->files_from_set ? context->synced_dirs : NULL);
+        const char* walk_root = delete_plan_walk_root(config, context->synced_dirs);
+        const ArrayList* scope =
+            config->files_from_set ? context->synced_dirs : (walk_root ? context->synced_dirs : NULL);
+        delete_plan_sender_finalize(context->delete_plans, scope, walk_root);
         delete_plan_sender_set_config(context->delete_plans, context->excluded_paths,
                                       context->size_skipped_paths, context->missing_args);
       }

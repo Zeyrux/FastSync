@@ -34,8 +34,15 @@ void delete_plan_sender_destroy(DeletePlanSender* sender);
 bool delete_plan_sender_add(DeletePlanSender* sender, const char* path, bool is_dir);
 /* Drop plans for directories outside `synced_dirs` (the --files-from
  * synchronization scope; pass NULL when a full recursive transfer synchronized
- * every directory).  The receive root is the "." sentinel. */
-void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* synced_dirs);
+ * every directory).  The receive root is the "." sentinel.
+ *
+ * `walk_root` scopes a general -R transfer: when non-NULL it is the
+ * reconstructed destination prefix the run actually transferred, and only the
+ * plan for that prefix (and directories below it) is ever transmitted, so the
+ * prefix's parent-directory siblings are never walked.  Pass NULL for a plain
+ * recursive transfer and for --files-from. */
+void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* synced_dirs,
+                                 const char* walk_root);
 /* True when no transmitted entry was recorded (an ambiguous empty scan). */
 bool delete_plan_sender_empty(const DeletePlanSender* sender);
 /* Attach the global config sections advertised on the first plan frame. */
