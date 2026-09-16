@@ -114,10 +114,12 @@ void print_usage(void) {
   printf("  --files-from <file> Read the source file list from FILE (paths relative to the "
          "source root)\n");
   printf("  -0, --from0       Entries in --files-from are NUL-delimited\n");
-  printf("  -f, --filter=RULE rsync-style filter rule (+/- include/exclude; repeatable;\n");
-  printf("                  both --filter=RULE and the -f RULE / -f=RULE short forms work)\n");
+  printf("  -f, --filter=RULE rsync-style filter rule: exclude/- include/+ hide/H show/S\n");
+  printf("                  protect/P risk/R merge/. dir-merge/: clear/! with modifiers\n");
+  printf("                  (repeatable; --filter=RULE and -f RULE / -f=RULE both work)\n");
   printf("  -C, --cvs-exclude Auto-ignore common CVS/SCM files (.git/, .svn/, *.o, *~, ...)\n");
-  printf("  -F                Apply per-directory .rsync-filter files during the scan\n");
+  printf("  -F                Apply per-directory .rsync-filter files; repeated -FF also\n");
+  printf("                  excludes the .rsync-filter files themselves\n");
   printf("  --max-size <n>      Skip files larger than n bytes\n");
   printf("  --min-size <n>      Skip files smaller than n bytes\n");
   printf("  --max-alloc <SIZE>  Maximum single allocation (default: 1G; 0 = no limit,\n");

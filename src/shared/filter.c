@@ -453,7 +453,8 @@ static bool filter_list_merge_file(FilterRuleList* list, const char* name,
     snprintf(err, err_size, "merge requires a filename");
     return false;
   }
-  char* path = (base_dir && base_dir[0] && name[0] != '/') ? path_cat(base_dir, name) : str_dup(name);
+  char* path =
+      (base_dir && base_dir[0] && name[0] != '/') ? path_cat(base_dir, name) : str_dup(name);
   if (!path) {
     snprintf(err, err_size, "memory allocation failed");
     return false;
@@ -698,9 +699,9 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
   return true;
 }
 
-FilterRuleList* filter_file_read_named(const char* dir_path, const char* name, const char* owner_rel,
-                                       const FilterParseOptions* opts, bool* exists, char* err,
-                                       size_t err_size) {
+FilterRuleList* filter_file_read_named(const char* dir_path, const char* name,
+                                       const char* owner_rel, const FilterParseOptions* opts,
+                                       bool* exists, char* err, size_t err_size) {
   FilterRuleList* list = filter_rule_list_create();
   if (!list) {
     if (err && err_size > 0)

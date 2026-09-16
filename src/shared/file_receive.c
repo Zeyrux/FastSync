@@ -1494,7 +1494,6 @@ static const char* fuzzy_find_suffix(const char* fn, int fn_len, int* len_ptr) {
   const char* suf;
   const char* s;
   bool had_tilde;
-  int s_len;
 
   while (fn_len && *fn == '.') {
     fn++;
@@ -1509,6 +1508,7 @@ static const char* fuzzy_find_suffix(const char* fn, int fn_len, int* len_ptr) {
   suf = "";
   *len_ptr = 0;
   for (s = fn + fn_len; fn_len > 1;) {
+    int s_len;
     while (--s != fn && *s != '.') {
     }
     if (s == fn)
@@ -1536,7 +1536,6 @@ static const char* fuzzy_find_suffix(const char* fn, int fn_len, int* len_ptr) {
   }
   return suf;
 }
-
 
 /* Deterministic ordering of two fuzzy candidates with equal rsync distance:
  * smallest size gap, then the lexical basename (rsync itself takes the last
@@ -1659,11 +1658,11 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
        accepted only when it does not exceed the running lowest distance. */
     int name_suf_len = 0;
     const char* name_suf = fuzzy_find_suffix(name, (int)name_len, &name_suf_len);
-    uint32_t distance =
-        fuzzy_distance(name, (unsigned)name_len, leaf, (unsigned)target_len, lowest_dist, dist_scratch);
+    uint32_t distance = fuzzy_distance(name, (unsigned)name_len, leaf, (unsigned)target_len,
+                                       lowest_dist, dist_scratch);
     if (distance < 0xFFFF0000U)
-      distance += fuzzy_distance(name_suf, (unsigned)name_suf_len, fname_suf, (unsigned)fname_suf_len,
-                                 0xFFFF0000U, dist_scratch) *
+      distance += fuzzy_distance(name_suf, (unsigned)name_suf_len, fname_suf,
+                                 (unsigned)fname_suf_len, 0xFFFF0000U, dist_scratch) *
                   10;
     if (distance > lowest_dist)
       continue;
@@ -1949,7 +1948,8 @@ static IncrementalCheckOutcome incremental_check_report_dest_info(IncrementalChe
    lstat existence probe; the ordinary --ignore-existing checks inside
    file_receive remain as defense-in-depth for the frame types that have no
    per-file check (directories/symlinks/specials/hard-links). */
-static IncrementalCheckOutcome incremental_check_ignore_existing(IncrementalCheckState* state) {
+static IncrementalCheckOutcome
+incremental_check_ignore_existing(const IncrementalCheckState* state) {
   if (!state->config->ignore_existing || !state->dest_exists)
     return INCREMENTAL_CONTINUE;
   if (!send_status(state->fd, STATUS_OK))
@@ -1973,8 +1973,8 @@ static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalChe
     return INCREMENTAL_CONTINUE;
   BasisMatch basis;
   basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
-                   (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len, true,
-                   true, &basis);
+                   (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
+                   true, true, &basis);
   /* Only a link-dest hit relinks; a copy-dest/compare-dest hit (or a miss) lets
      the up-to-date check below keep the existing destination. */
   if (!basis.hit || basis.type != BASIS_DEST_LINK) {
@@ -2403,9 +2403,9 @@ static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState
   if (!config->fuzzy || !config->use_delta)
     return INCREMENTAL_CONTINUE;
   unsigned long long fuzzy_size = 0;
-  void* fuzzy_basis =
-      fuzzy_basis_find_and_load(config, state->check_path, state->check_size,
-                                (time_t)state->check_mtime, (long)state->check_mtime_nsec, &fuzzy_size);
+  void* fuzzy_basis = fuzzy_basis_find_and_load(config, state->check_path, state->check_size,
+                                                (time_t)state->check_mtime,
+                                                (long)state->check_mtime_nsec, &fuzzy_size);
   if (fuzzy_basis != NULL) {
     bool fuzzy_failed = false;
     File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, fuzzy_basis,

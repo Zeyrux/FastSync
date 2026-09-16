@@ -69,8 +69,8 @@ typedef struct {
   /* -FF: also exclude the per-directory filter files themselves from the
      transfer (single -F transfers them). */
   bool exclude_per_dir_filter_files;
-  bool dirs;                          /* -d/--dirs: transfer dir entries, no recursion */
-  bool relative;                      /* -R/--relative (dest rel paths, with --files-from) */
+  bool dirs;     /* -d/--dirs: transfer dir entries, no recursion */
+  bool relative; /* -R/--relative (dest rel paths, with --files-from) */
   /* --list-only: emit an is_dir File for every traversed directory (the listing
    * includes directory entries, matching rsync).  Client-only; never set on a
    * real transfer, which relies on implicit parent creation. */

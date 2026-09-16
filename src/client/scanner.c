@@ -62,9 +62,8 @@ typedef struct {
   bool protect; /* receiver-side exclude matched */
 } FilterOutcome;
 
-static void chain_rules_outcome(const FilterRuleList* base, const FilterNode* node,
-                                const char* rel, const char* leaf, bool is_dir,
-                                FilterOutcome* out) {
+static void chain_rules_outcome(const FilterRuleList* base, const FilterNode* node, const char* rel,
+                                const char* leaf, bool is_dir, FilterOutcome* out) {
   memset(out, 0, sizeof(*out));
   bool sender_decided = false;
   bool receiver_decided = false;
@@ -1921,7 +1920,8 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   {
     char err[256];
     bool any_exists = false;
-    FilterRuleList* own = read_dir_filters(options, root_directory, "", &any_exists, err, sizeof(err));
+    FilterRuleList* own =
+        read_dir_filters(options, root_directory, "", &any_exists, err, sizeof(err));
     if (!own && any_exists) {
       /* no files exist: leave root_node NULL */
     } else if (!own) {

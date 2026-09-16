@@ -54,7 +54,7 @@ typedef struct {
 } FilterRule;
 
 typedef struct {
-  FilterRule** items;      /* owned array of rule pointers */
+  FilterRule** items; /* owned array of rule pointers */
   int count;
   int capacity;
   /* Per-directory merge-file basenames registered by "dir-merge NAME"/": NAME"
@@ -105,9 +105,9 @@ FilterRuleList* filter_base_build(const char* const* rule_texts, int rule_count,
  * missing file yields an empty list with *exists=false; an unreadable file is
  * treated as missing.  Returns NULL only on parse or allocation failure
  * (message in `err`).  `opts` may be NULL. */
-FilterRuleList* filter_file_read_named(const char* dir_path, const char* name, const char* owner_rel,
-                                       const FilterParseOptions* opts, bool* exists, char* err,
-                                       size_t err_size);
+FilterRuleList* filter_file_read_named(const char* dir_path, const char* name,
+                                       const char* owner_rel, const FilterParseOptions* opts,
+                                       bool* exists, char* err, size_t err_size);
 
 /* Append the rules of "<dir_path>/<name>" into an existing list (each owned by
  * `owner_rel`).  A missing file yields *exists=false and no error.  Returns
