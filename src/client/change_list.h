@@ -69,7 +69,8 @@ char* change_render_itemize_code(const Config* config, const ChangeEvent* event)
 /* Expand an --out-format/--log-file-format template.  Supported tokens:
  *   %i  itemize code            %n  transfer-relative name (dir: trailing /)
  *   %f  long display path       %l  file length in bytes
- *   %b  wire bytes transferred  %c  wire bytes read back for the file
+ *   %b  wire bytes transferred  %c  block-checksum bytes received (rsync: 16
+ *                                   for a whole-file transfer, 0 for a dry run)
  *   %C  whole-file checksum hex (xxh128 by default; spaces for non-regular)
  *   %M  mtime (YYYY/MM/DD-HH:MM:SS)
  *   %t  current time            %o  operation ("send"/"del.")
@@ -91,8 +92,9 @@ char* change_render_list_line(const Config* config, const ChangeEvent* event);
 void change_emit(const Config* config, const ChangeEvent* event);
 
 /* Build and emit a CHANGE_SENT event for a file the client just sent.  `bytes_sent`
- * / `bytes_read` are the process-wide wire-byte deltas for this file (rsync's
- * %b / %c); pass 0 when unknown. */
+ * is the process-wide wire-byte delta for this file (rsync's %b) and `bytes_read`
+ * the received bytes used for the delta handshake; pass 0 when unknown.  For a
+ * whole-file transfer %c is pinned to rsync's 16-byte sum header regardless. */
 void change_emit_file_sent_bytes(const Config* config, const File* file,
                                  unsigned long long bytes_sent, unsigned long long bytes_read);
 

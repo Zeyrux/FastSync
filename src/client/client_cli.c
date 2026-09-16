@@ -480,6 +480,36 @@ static bool split_flag_level(const char* token, char* name, size_t name_size, in
   return true;
 }
 
+/* rsync --debug/--info categories that FastSync accepts for CLI parity but has
+ * no output wired to (yet).  They must parse successfully so a valid rsync
+ * invocation is not rejected up front; only categories with a FastSync
+ * counterpart set a log flag.  `pack`/`util` are FastSync-specific (packed
+ * metadata / general utility logging).  `syms`, `hl`, and `owner` are aliases
+ * of rsync's `symsafe`, `hlink`, and `own`. */
+static bool is_accepted_debug_category(const char* name) {
+  static const char* const categories[] = {
+      "acl",   "backup", "bind",   "chdir", "cmd",   "connect", "del",  "deltasum",
+      "dup",   "exit",   "filter", "flist", "fuzzy", "genr",    "hash", "hl",
+      "hlink", "iconv",  "nstr",   "own",   "owner", "recv",    "send", "time",
+  };
+  for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
+    if (strcmp(name, categories[i]) == 0)
+      return true;
+  }
+  return false;
+}
+
+static bool is_accepted_info_category(const char* name) {
+  static const char* const categories[] = {
+      "backup", "del", "flist", "mount", "nonreg", "progress", "remove", "syms", "symsafe",
+  };
+  for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
+    if (strcmp(name, categories[i]) == 0)
+      return true;
+  }
+  return false;
+}
+
 static int parse_debug_flags(const char* value, Config* config) {
   if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
       strstr(value, ",,")) {
@@ -522,6 +552,8 @@ static int parse_debug_flags(const char* value, Config* config) {
       flag = LOG_DEBUG_PACK;
     } else if (strcmp(name, "util") == 0) {
       flag = LOG_DEBUG_UTIL;
+    } else if (is_accepted_debug_category(name)) {
+      continue;
     } else {
       log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
       free(flags);
@@ -584,6 +616,8 @@ static int parse_info_flags(const char* value, Config* config) {
       flag = LOG_INFO_SKIP;
     else if (strcmp(name, "stats") == 0)
       flag = LOG_INFO_STATS;
+    else if (is_accepted_info_category(name))
+      continue;
     else {
       log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
       free(flags);
