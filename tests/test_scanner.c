@@ -1069,6 +1069,59 @@ static void test_scanner_path_relative() {
   EXPECT_NULL(scanner_path_relative("/tmp/foo", "/tmp/foobar"));
 }
 
+/* -R/--relative destination prefix: the '/./' cut point and normalization. */
+static void test_scanner_relative_prefix() {
+  char* p = NULL;
+
+  /* No cut: the whole spec with leading/trailing slashes removed. */
+  p = scanner_relative_prefix("/tmp/src/foo/");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "tmp/src/foo");
+  free(p);
+
+  p = scanner_relative_prefix("src/foo");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "src/foo");
+  free(p);
+
+  /* Trailing "/." is the directory itself, not a cut. */
+  p = scanner_relative_prefix("src/foo/.");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "src/foo");
+  free(p);
+
+  /* The first "/./" cuts everything before it. */
+  p = scanner_relative_prefix("/a/./b/c");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "b/c");
+  free(p);
+
+  p = scanner_relative_prefix("src/./");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "");
+  free(p);
+
+  /* A later "." component is normalized away. */
+  p = scanner_relative_prefix("a/./b/./c");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "b/c");
+  free(p);
+
+  /* A leading "./" is the cut at the start. */
+  p = scanner_relative_prefix("./s2");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "s2");
+  free(p);
+
+  p = scanner_relative_prefix(".");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "");
+  free(p);
+
+  EXPECT_NULL(scanner_relative_prefix(NULL));
+  EXPECT_NULL(scanner_relative_prefix(""));
+}
+
 /* rsync precedence: a deeper .rsync-filter overrides a shallower one, so an
  * inner "+ *.tmp" re-includes what the outer "- *.tmp" excluded. */
 static void test_per_dir_filter_override(bool parallel) {
@@ -1607,6 +1660,7 @@ void test_scanner() {
   test_per_dir_filter(false);
   test_per_dir_filter(true);
   test_scanner_path_relative();
+  test_scanner_relative_prefix();
   test_per_dir_filter_override(false);
   test_per_dir_filter_override(true);
   test_dirs_no_descent();

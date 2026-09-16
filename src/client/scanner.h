@@ -65,6 +65,11 @@ typedef struct {
   bool per_dir_filters;               /* -F: read .rsync-filter per directory */
   bool dirs;                          /* -d/--dirs: transfer dir entries, no recursion */
   bool relative;                      /* -R/--relative (dest rel paths, with --files-from) */
+  /* -R/--relative outside --files-from: the destination-relative path prefix
+   * reconstructed from the source spec (rsync's '/./' cut point), or NULL when
+   * -R is off or --files-from is in use (the bare-relative path then comes from
+   * the listed entry).  Borrowed read-only; owned by client_send. */
+  const char* relative_prefix;
   /* --list-only: emit an is_dir File for every traversed directory (the listing
    * includes directory entries, matching rsync).  Client-only; never set on a
    * real transfer, which relies on implicit parent creation. */
@@ -212,6 +217,13 @@ bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entr
  * when `fs_path` is not under `root`). Handles trailing slashes and a root of
  * "/". Exposed so tests can exercise the mapping directly. */
 char* scanner_path_relative(const char* root, const char* fs_path);
+
+/* -R/--relative destination-relative prefix reconstructed from a source spec:
+ * the path after rsync's first '.' path component (the '/./' cut point), with
+ * leading/trailing slashes removed, or the whole spec (normalized) when there
+ * is no cut.  Returns "" for the receive root, or NULL when `spec` is NULL or
+ * allocation fails.  Exposed so tests can exercise the mapping directly. */
+char* scanner_relative_prefix(const char* spec);
 
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
                                                       const ScannerOptions* options,

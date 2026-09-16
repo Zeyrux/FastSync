@@ -136,6 +136,7 @@ typedef struct {
   ScannerOptions options;
   FilterRuleList* base_filters; /* owned; may be NULL */
   HardLinkTable* hardlinks;     /* owned; may be NULL */
+  char* relative_prefix;        /* owned -R prefix; may be NULL */
 } PreparedScanner;
 
 /* Build the scanner options for one scan. Returns false and logs on failure. */
@@ -144,6 +145,7 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
     return false;
   out->base_filters = NULL;
   out->hardlinks = NULL;
+  out->relative_prefix = NULL;
   memset(&out->options, 0, sizeof(out->options));
 
   int rule_count = config->filters ? config->filters->size : 0;
@@ -206,6 +208,19 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->per_dir_filters = config->per_dir_filter;
   options->dirs = config->dirs;
   options->relative = config->relative;
+  /* -R/--relative outside --files-from reconstructs every destination path from
+   * the source spec (rsync's '/./' cut point).  With --files-from the listed
+   * entry already supplies the bare relative path, so no prefix is built. */
+  if (config->relative && config->files_from_set == NULL && config->send_directory) {
+    out->relative_prefix = scanner_relative_prefix(config->send_directory);
+    if (!out->relative_prefix) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed building --relative path prefix");
+      filter_rule_list_free(out->base_filters);
+      out->base_filters = NULL;
+      return false;
+    }
+    options->relative_prefix = out->relative_prefix;
+  }
   options->prune_empty_dirs = config->prune_empty_dirs;
   options->ignore_io_errors = config->ignore_errors;
   options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
@@ -239,6 +254,85 @@ static void prepared_scanner_destroy(PreparedScanner* prepared) {
   prepared->base_filters = NULL;
   hardlink_table_destroy(prepared->hardlinks);
   prepared->hardlinks = NULL;
+  free(prepared->relative_prefix);
+  prepared->relative_prefix = NULL;
+}
+
+/* -R/--relative implied directories: rsync transmits the metadata of the
+ * parent directories implied by the source path (every prefix component above
+ * the source root) so the receiver applies their attributes to the created
+ * parents.  FastSync's scan only covers the source root and below, so append
+ * one metadata-only directory entry per implied ancestor.  --no-implied-dirs
+ * suppresses this exactly like rsync.  A missing ancestor is never fatal. */
+static bool append_implied_dir_times(const Config* config, ArrayList* dir_entries) {
+  if (!dir_entries || !config->relative || config->files_from_set != NULL ||
+      config->no_implied_dirs || !config->send_directory)
+    return true;
+  char* prefix = scanner_relative_prefix(config->send_directory);
+  if (!prefix)
+    return true;
+  int ncomp = 0;
+  for (const char* s = prefix; *s;) {
+    while (*s == '/')
+      s++;
+    if (!*s)
+      break;
+    while (*s && *s != '/')
+      s++;
+    ncomp++;
+  }
+  if (ncomp <= 1) {
+    free(prefix);
+    return true;
+  }
+  char* fs = str_dup(config->send_directory);
+  if (!fs) {
+    free(prefix);
+    return true;
+  }
+  size_t flen = strlen(fs);
+  while (flen > 1 && fs[flen - 1] == '/')
+    fs[--flen] = '\0';
+  bool ok = true;
+  /* Walk the source path upwards one component at a time; the previous
+     iteration's truncation is restored so every ancestor is stat'ed in full. */
+  for (int depth = ncomp - 2; depth >= 0 && ok; depth--) {
+    char* slash = strrchr(fs, '/');
+    if (!slash || slash == fs)
+      break;
+    *slash = '\0';
+    char* p = prefix;
+    int c = 0;
+    while (c <= depth) {
+      while (*p == '/')
+        p++;
+      while (*p && *p != '/')
+        p++;
+      c++;
+    }
+    char saved = *p;
+    *p = '\0';
+    struct stat st;
+    if (stat(fs, &st) == 0 && S_ISDIR(st.st_mode)) {
+      File* file = file_create(fs);
+      if (!file) {
+        ok = false;
+      } else {
+        file->is_dir = true;
+        file->metadata =
+            file_metadata_create(fs, &st, config->preserve_atimes, config->preserve_crtimes);
+        file->send_path = str_dup(prefix);
+        if (!file->metadata || !file->send_path || !array_list_add(dir_entries, file)) {
+          file_destroy(file);
+          ok = false;
+        }
+      }
+    }
+    *p = saved;
+  }
+  free(fs);
+  free(prefix);
+  return ok;
 }
 
 /* True when some --files-from entry is an ancestor-or-equal directory of
@@ -2098,6 +2192,11 @@ static int scan_directory_multithreaded(void* pipeline_context) {
      parallel workers append under the context's dedicated mutex. */
   prepared.options.dir_entries = context->dir_entries;
   prepared.options.dir_entries_mutex = &context->dir_entries_mutex;
+  if (!append_implied_dir_times(context->config, context->dir_entries)) {
+    pipeline_cancel(context);
+    protocol_session_unbind();
+    return thrd_error;
+  }
   /* The keep-set manifest for the late modes is built from this data pass, so
      the parallel scanner records the protected excluded prefixes and the
      synchronized directories here (the size-prune protection is collected in
@@ -2433,6 +2532,8 @@ int send_files(Config* config) {
   if (dir_metadata_should_capture(config)) {
     dir_entries = array_list_create(file_destroy);
     if (!dir_entries)
+      goto send_fail;
+    if (!append_implied_dir_times(config, dir_entries))
       goto send_fail;
   }
   if (config->remove_source_files)

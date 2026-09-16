@@ -220,11 +220,58 @@ char* scanner_path_relative(const char* root, const char* fs_path) {
   return str_dup(fs_path + root_len + 1);
 }
 
+/* -R/--relative destination-relative prefix reconstructed from a source spec:
+ * everything after the first '.' path component (rsync's '/./' cut point),
+ * with leading/trailing slashes removed; or the whole spec (normalized) when
+ * there is no cut.  Returns "" for the receive root.  Exposed for tests. */
+char* scanner_relative_prefix(const char* spec) {
+  if (!spec || spec[0] == '\0')
+    return NULL;
+  const char* after = spec;
+  if (spec[0] == '.' && spec[1] == '/') {
+    after = spec + 2;
+  } else {
+    const char* cut = strstr(spec, "/./");
+    if (cut)
+      after = cut + 3;
+  }
+  size_t cap = strlen(spec) + 1;
+  char* out = malloc(cap);
+  if (!out)
+    return NULL;
+  size_t len = 0;
+  for (const char* s = after; *s;) {
+    while (*s == '/')
+      s++;
+    const char* comp = s;
+    while (*s && *s != '/')
+      s++;
+    size_t clen = (size_t)(s - comp);
+    if (clen == 0 || (clen == 1 && comp[0] == '.'))
+      continue;
+    if (len)
+      out[len++] = '/';
+    memcpy(out + len, comp, clen);
+    len += clen;
+  }
+  out[len] = '\0';
+  return out;
+}
+
 /* Relative path of a child entry below the current directory. */
 static char* child_rel_path(const char* parent_rel, const char* name) {
   if (!parent_rel || parent_rel[0] == '\0')
     return str_dup(name);
   return path_cat(parent_rel, name);
+}
+
+/* Destination-relative wire path for an entry under an -R prefix. */
+static char* scanner_prefix_send_path(const char* prefix, const char* rel) {
+  if (prefix[0] == '\0')
+    return str_dup(rel);
+  if (rel[0] == '\0')
+    return str_dup(prefix);
+  return path_cat(prefix, rel);
 }
 
 /* Apply the --files-from allow-set and the filter layer to one entry. */
@@ -367,12 +414,25 @@ static bool scanner_record_synced_dir(const ScannerOptions* options, const char*
     return true;
   if (!file_list_dir_in_scope(options->file_list, rel))
     return true;
-  const char* dest = relative_mode ? rel : fs_path;
+  char* prefixed = NULL;
+  const char* dest;
+  if (relative_mode) {
+    dest = rel;
+  } else if (options->relative_prefix) {
+    prefixed = scanner_prefix_send_path(options->relative_prefix, rel);
+    if (!prefixed)
+      return false;
+    dest = prefixed;
+  } else {
+    dest = fs_path;
+  }
   if (dest[0] == '/')
     dest++;
   if (dest[0] == '\0')
     dest = ".";
-  return excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
+  bool ok = excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
+  free(prefixed);
+  return ok;
 }
 
 /* Merge the open directory's own .rsync-filter rules into the inherited
@@ -672,7 +732,8 @@ static Chunk* chunk_data_to_chunk(ArrayList* chunk_data) {
  * non-directory path is silently skipped (the transfer is unaffected); an
  * allocation failure is fatal and reported to the caller. */
 static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const char* root_path,
-                                     const char* fs_path, bool relative_mode, bool preserve_atimes,
+                                     const char* fs_path, bool relative_mode,
+                                     const char* relative_prefix, bool preserve_atimes,
                                      bool preserve_crtimes, bool preserve_xattrs,
                                      bool preserve_acls) {
   if (!dir_entries || !root_path || !fs_path)
@@ -689,14 +750,30 @@ static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const
     free(rel);
     return true;
   }
+  char* prefixed = NULL;
+  if (relative_prefix) {
+    prefixed = scanner_prefix_send_path(relative_prefix, rel);
+    if (!prefixed) {
+      free(rel);
+      return false;
+    }
+    if (prefixed[0] == '\0') {
+      /* -R with a cut at the receive root: the root itself has no wire path. */
+      free(prefixed);
+      free(rel);
+      return true;
+    }
+  }
   File* file = file_create(fs_path);
   if (!file) {
+    free(prefixed);
     free(rel);
     return false;
   }
   file->is_dir = true;
   file->metadata = file_metadata_create(fs_path, &st, preserve_atimes, preserve_crtimes);
   if (!file->metadata) {
+    free(prefixed);
     free(rel);
     file_destroy(file);
     return false;
@@ -709,7 +786,11 @@ static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const
   if (relative_mode) {
     file->send_path = rel;
     rel = NULL;
+  } else if (prefixed) {
+    file->send_path = prefixed;
+    prefixed = NULL;
   }
+  free(prefixed);
   free(rel);
   bool added;
   if (mutex) {
@@ -807,9 +888,9 @@ static int open_next_directory(DirectoryScanner* scanner) {
     if (scanner->options.capture_dir_times &&
         !scanner_capture_dir_time(
             scanner->options.dir_entries, scanner->options.dir_entries_mutex, scanner->root_path,
-            scanner->current_path, scanner->relative_mode, scanner->options.preserve_atimes,
-            scanner->options.preserve_crtimes, scanner->options.preserve_xattrs,
-            scanner->options.preserve_acls)) {
+            scanner->current_path, scanner->relative_mode, scanner->options.relative_prefix,
+            scanner->options.preserve_atimes, scanner->options.preserve_crtimes,
+            scanner->options.preserve_xattrs, scanner->options.preserve_acls)) {
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
       free(scanner->current_path);
@@ -1175,14 +1256,28 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
          wire paths are never recorded (see ScannerOptions.excluded_paths). */
       bool files_from_prune =
           scanner->options.file_list && !file_list_affects(scanner->options.file_list, rel);
-      if (!files_from_prune && !scanner->relative_mode)
-        scanner_record_excluded(scanner, cur_path);
+      if (!files_from_prune && !scanner->relative_mode) {
+        if (scanner->options.relative_prefix) {
+          char* wrel = scanner_prefix_send_path(scanner->options.relative_prefix, rel);
+          if (!wrel) {
+            free(rel);
+            free(cur_path);
+            scanner->failed = true;
+            break;
+          }
+          scanner_record_excluded(scanner, wrel);
+          free(wrel);
+        } else {
+          scanner_record_excluded(scanner, cur_path);
+        }
+      }
     }
-    /* With -R + --files-from the wire/destination path is the entry's bare
-       relative path; keep `rel` alive to attach it to a transferred file. */
-    char* rel_copy = scanner->relative_mode ? str_dup(rel) : NULL;
+    /* With -R the wire/destination path is a reconstructed relative path, not
+       the source path; keep `rel` alive to build it for a transferred file. */
+    bool needs_rel = scanner->relative_mode || scanner->options.relative_prefix != NULL;
+    char* rel_copy = needs_rel ? str_dup(rel) : NULL;
     free(rel);
-    if (rel_copy == NULL && scanner->relative_mode) {
+    if (rel_copy == NULL && needs_rel) {
       free(cur_path);
       scanner->failed = true;
       break;
@@ -1257,6 +1352,15 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       if (scanner->relative_mode) {
         file->send_path = rel_copy;
         rel_copy = NULL;
+      } else if (scanner->options.relative_prefix) {
+        file->send_path = scanner_prefix_send_path(scanner->options.relative_prefix, rel_copy);
+        free(rel_copy);
+        rel_copy = NULL;
+        if (!file->send_path) {
+          file_destroy(file);
+          scanner->failed = true;
+          break;
+        }
       }
       /* --devices/--specials: a device/FIFO/socket entry marked for preservation
          becomes a node to recreate (is_special, no data, rdev captured); an
@@ -1536,6 +1640,15 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
       if (options->relative && options->file_list != NULL) {
         if (!excluded_sink_append(sink, options->excluded_mutex, entry->d_name))
           ps->failed = true;
+      } else if (options->relative_prefix) {
+        char* wrel = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
+        if (!wrel) {
+          ps->failed = true;
+        } else {
+          if (!excluded_sink_append(sink, options->excluded_mutex, wrel))
+            ps->failed = true;
+          free(wrel);
+        }
       } else {
         char* abs_path = path_cat(root_directory, entry->d_name);
         if (!abs_path) {
@@ -1577,13 +1690,13 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
     return;
   }
   if (is_dir) {
-    free(rel);
     if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
       /* -x/--one-file-system: emit the mount-point directory entry (empty) but
          do not descend into it (see the sequential scanner for the same rule). */
       File* mount = file_create(cur_path);
       free(cur_path);
       if (mount == NULL) {
+        free(rel);
         ps->failed = true;
         return;
       }
@@ -1592,17 +1705,29 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
         mount->metadata = file_metadata_create(mount->path, &st, options->preserve_atimes,
                                                options->preserve_crtimes);
         if (!mount->metadata) {
+          free(rel);
           file_destroy(mount);
           ps->failed = true;
           return;
         }
       }
+      if (options->relative_prefix) {
+        mount->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
+        if (!mount->send_path) {
+          free(rel);
+          file_destroy(mount);
+          ps->failed = true;
+          return;
+        }
+      }
+      free(rel);
       if (!array_list_add(root_files, mount)) {
         file_destroy(mount);
         ps->failed = true;
       }
       return;
     }
+    free(rel);
     if (!array_list_add(subdirs, cur_path)) {
       free(cur_path);
       ps->failed = true;
@@ -1628,6 +1753,15 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   if (use_rel) {
     file->send_path = rel;
     rel = NULL;
+  } else if (options->relative_prefix) {
+    file->send_path = scanner_prefix_send_path(options->relative_prefix, rel);
+    free(rel);
+    rel = NULL;
+    if (!file->send_path) {
+      file_destroy(file);
+      ps->failed = true;
+      return;
+    }
   }
   ScannerSpecial special = scanner_prepare_special(
       options->preserve_devices, options->preserve_specials, options->copy_devices, file, &st);
@@ -1857,8 +1991,9 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
   if (options->capture_dir_times &&
       !scanner_capture_dir_time(options->dir_entries, options->dir_entries_mutex, root_directory,
                                 root_directory, options->relative && options->file_list != NULL,
-                                options->preserve_atimes, options->preserve_crtimes,
-                                options->preserve_xattrs, options->preserve_acls)) {
+                                options->relative_prefix, options->preserve_atimes,
+                                options->preserve_crtimes, options->preserve_xattrs,
+                                options->preserve_acls)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);
