@@ -327,10 +327,10 @@ static int config_add_remote_option(Config* config, const char* value, const cha
 }
 
 /* Validate and append one --compare-dest/--copy-dest/--link-dest directory.
- * The path is interpreted on the receiver relative to the destination root,
- * so it must be a non-empty relative path with no "." / ".." components (an
- * absolute or escaping path is rejected up front instead of failing on the
- * server). Returns 0 on success, -1 on error. */
+ * A relative path is interpreted on the receiver below the destination root; an
+ * absolute path is used verbatim on the receiver (matching rsync), still subject
+ * to the receiver's authorized-root confinement. Either way the path must be
+ * non-empty and traversal-free (no ".."). Returns 0 on success, -1 on error. */
 static int set_basis_dest_option(Config* config, BasisDestType type, const char* value,
                                  const char* option_name) {
   if (!value || !value[0]) {
@@ -339,8 +339,9 @@ static int set_basis_dest_option(Config* config, BasisDestType type, const char*
   }
   if (config_basis_append(config, type, value) != 0) {
     log_message(LOG_LEVEL_ERROR,
-                "%s requires a non-empty relative directory name with no '.', '..', or absolute "
-                "path (resolved below the destination root)",
+                "%s requires a non-empty directory name with no '..' component "
+                "(relative paths resolve below the destination root; absolute paths are used "
+                "verbatim)",
                 option_name);
     return -1;
   }

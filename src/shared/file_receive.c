@@ -1335,7 +1335,11 @@ static bool basis_match_find(const Config* config, const char* check_path,
     return false;
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
-    char* basis_dir = path_cat(config->receive_root_directory, entry->path);
+    /* An absolute basis path is used verbatim (rsync semantics); a relative one
+       is resolved below the receive root.  Both remain subject to the receiver's
+       authorized-root confinement inside file_open_secure_parent. */
+    char* basis_dir = entry->path[0] == '/' ? str_dup(entry->path)
+                                            : path_cat(config->receive_root_directory, entry->path);
     if (!basis_dir)
       continue;
     char* candidate = path_cat(basis_dir, check_path);
@@ -1922,6 +1926,66 @@ static IncrementalCheckOutcome incremental_check_ignore_existing(IncrementalChec
   return INCREMENTAL_SKIP;
 }
 
+/* --link-dest relink of an already up-to-date destination.  rsync hard-links a
+   destination entry to a matching basis even when the entry is already correct,
+   so a run over an existing tree still maximizes sharing with the basis.  Only a
+   link-dest basis triggers this (copy-dest/compare-dest leave an up-to-date
+   destination untouched, matching rsync).  The ordinary basis path further down
+   handles every not-up-to-date case, so this helper only adds the relink that
+   the quick-skip would otherwise short-circuit. */
+static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalCheckState* state,
+                                                                  File** out_file) {
+  const Config* config = state->config;
+  if (!config_has_basis(config) || config->ignore_times || config->dry_run)
+    return INCREMENTAL_CONTINUE;
+  if (!state->has_old_file)
+    return INCREMENTAL_CONTINUE;
+  BasisMatch basis;
+  basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
+                   (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len, true,
+                   true, &basis);
+  /* Only a link-dest hit relinks; a copy-dest/compare-dest hit (or a miss) lets
+     the up-to-date check below keep the existing destination. */
+  if (!basis.hit || basis.type != BASIS_DEST_LINK) {
+    basis_match_free(&basis);
+    return INCREMENTAL_CONTINUE;
+  }
+  /* Already the basis inode: nothing to do, leave the destination alone. */
+  if (basis.st.st_dev == state->old_st.st_dev && basis.st.st_ino == state->old_st.st_ino) {
+    basis_match_free(&basis);
+    return INCREMENTAL_CONTINUE;
+  }
+  File* materialized = file_create(state->check_path);
+  if (materialized && basis.content) {
+    data_destroy(materialized->data);
+    materialized->data = basis.content;
+    basis.content = NULL;
+    materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
+    materialized->skip = true;
+    materialized->basis_link = basis.basis_path;
+    basis.basis_path = NULL;
+    if (!materialized->metadata) {
+      file_destroy(materialized);
+      materialized = NULL;
+    }
+  } else {
+    file_destroy(materialized);
+    materialized = NULL;
+  }
+  if (materialized) {
+    if (!send_status(state->fd, STATUS_OK)) {
+      basis_match_free(&basis);
+      file_destroy(materialized);
+      return INCREMENTAL_ERROR;
+    }
+    basis_match_free(&basis);
+    *out_file = materialized;
+    return INCREMENTAL_FILE;
+  }
+  basis_match_free(&basis);
+  return INCREMENTAL_CONTINUE;
+}
+
 /* Metadata-only (and, when --checksum forces it, content) up-to-date decision.
    Loads the old contents only when a checksum comparison or delta needs them. */
 static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckState* state,
@@ -2379,6 +2443,14 @@ File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
     *skipped = true;
     goto done;
   }
+
+  /* A --link-dest hit relinks even an already up-to-date destination before the
+     quick-skip can suppress it (rsync parity). */
+  outcome = incremental_check_link_dest_relink(&state, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_FILE)
+    goto done;
 
   outcome = incremental_check_quick_skip(&state, &try_delta);
   if (outcome == INCREMENTAL_ERROR)
@@ -3041,6 +3113,29 @@ typedef struct {
   bool limit_hit;
 } DeleteBudgetState;
 
+/* Build the delete-walk protection prefix for one basis directory.  The walker
+   compares paths relative to the receive root, so a relative entry is already
+   in the right form; an absolute entry that lies below the root is converted to
+   its root-relative form, and one outside the root returns NULL (the walk
+   cannot reach it, and it is not protected data beneath the root). */
+static char* basis_delete_relative(const Config* config, const char* path) {
+  if (!path)
+    return NULL;
+  if (path[0] != '/')
+    return str_dup(path);
+  const char* root = config->receive_root_directory;
+  if (!root || root[0] != '/')
+    return NULL;
+  size_t root_len = strlen(root);
+  while (root_len > 1 && root[root_len - 1] == '/')
+    root_len--;
+  if (strncmp(path, root, root_len) != 0)
+    return NULL;
+  if (path[root_len] != '/')
+    return NULL; /* identical or a sibling sharing a name prefix */
+  return str_dup(path + root_len + 1);
+}
+
 /* Remove every destination entry under the receive root that is not in the
    keep-set, bounded by the shared budget (a smaller client --max-delete=NUM
    replaces the server hard bound; rsync deletes up to the bound and skips the
@@ -3071,10 +3166,16 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
                    (manifest->protected ? manifest->protected->size : 0);
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -3082,7 +3183,13 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      /* An absolute basis outside the receive root is unreachable by this walk,
+         so it contributes no protection prefix (and no slot). */
+      char* prefix = basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
@@ -3091,6 +3198,7 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
   /* Clamp rather than subtract: an accounting bug where deleted already exceeds
      max_delete must never underflow into an effectively unlimited budget. */
@@ -3105,7 +3213,12 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
   size_t skipped = 0;
   DeleteWalkResult result =
       delete_extras_limited(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                            remaining, skips, skip_count, &deleted, &skipped);
+                            remaining, skips, used, &deleted, &skipped);
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
   budget->deleted += deleted;
   budget->skipped += skipped;
@@ -3142,10 +3255,16 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
   fprintf(stderr, "Deleting destination mirrors of missing source arguments...\n");
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -3153,10 +3272,15 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      char* prefix = basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
   bool ok = true;
   for (int i = 0; i < manifest->missing->size; i++) {
@@ -3169,7 +3293,7 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
       continue;
     }
     bool at_root = strchr(rel, '/') == NULL;
-    if (path_under_skip_prefix(rel, at_root, skips, skip_count)) {
+    if (path_under_skip_prefix(rel, at_root, skips, used)) {
       char* escaped = output_escape(rel, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "missing-args path '%s' is protected (staging directory or basis snapshot); "
@@ -3293,6 +3417,11 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
     if (!ok)
       break;
   }
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
   return ok;
 }
