@@ -768,8 +768,8 @@ static bool list_extras_fd(int dirfd, const char* rel_path, const PathIndex* kee
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       bool child_all_removed = false;
       if (childfd >= 0) {
-        if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count, deletable,
-                            &child_all_removed))
+        if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count,
+                            deletable, &child_all_removed))
           operation_ok = false;
         close(childfd);
       } else if (errno != ENOENT) {

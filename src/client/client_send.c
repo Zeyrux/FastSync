@@ -174,9 +174,8 @@ static void progress_final_frame(unsigned long long size, char* out, size_t out_
                       (now.tv_nsec - g_progress_file_start.tv_nsec) / 1000000;
   if (diff_ms <= 0)
     diff_ms = 1;
-  double rate = size > last_ofs
-                    ? (double)(size - last_ofs) * 1000.0 / (double)diff_ms / 1024.0
-                    : 0.0;
+  double rate =
+      size > last_ofs ? (double)(size - last_ofs) * 1000.0 / (double)diff_ms / 1024.0 : 0.0;
   const char* units = "kB/s";
   if (rate > 1024.0 * 1024.0) {
     rate /= 1024.0 * 1024.0;
@@ -188,7 +187,8 @@ static void progress_final_frame(unsigned long long size, char* out, size_t out_
   unsigned long long remain = (unsigned long long)(diff_ms / 1000);
   snprintf(rembuf, sizeof(rembuf), "%4u:%02u:%02u", (unsigned)(remain / 3600),
            (unsigned)((remain / 60) % 60), (unsigned)(remain % 60));
-  unsigned long long to_chk = g_progress_seen > g_progress_xferred ? g_progress_seen - g_progress_xferred : 0;
+  unsigned long long to_chk =
+      g_progress_seen > g_progress_xferred ? g_progress_seen - g_progress_xferred : 0;
   snprintf(out, out_size, "\r%15s %3d%% %7.2f%s %s (xfr#%llu, to-chk=%llu/%llu)\n", ofs_buf, 100,
            rate, units, rembuf, g_progress_xferred, to_chk, g_progress_seen);
 }
@@ -1716,7 +1716,8 @@ static int send_dry_run_remote(Config* config) {
      the terminal FINISHED. */
   bool early_delete = config->use_delete && config_delete_timing_early(config);
   if (dry_manifest) {
-    if (send_delete_manifest(client->file_descriptor, dry_manifest, NULL, NULL, NULL, dry_dirs) != 0)
+    if (send_delete_manifest(client->file_descriptor, dry_manifest, NULL, NULL, NULL, dry_dirs) !=
+        0)
       goto dry_fail;
     if (early_delete) {
       Status ack;

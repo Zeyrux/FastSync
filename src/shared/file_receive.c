@@ -3300,8 +3300,8 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
       idx++;
     }
   }
-  bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs, skips,
-                               skip_count, out, count_out);
+  bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
+                               skips, skip_count, out, count_out);
   free(skips);
   return ok;
 }

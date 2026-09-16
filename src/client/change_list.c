@@ -227,8 +227,7 @@ static void digest_to_hex(ChecksumAlgo algo, const uint8_t* digest, size_t len, 
     uint64_t high = 0;
     memcpy(&low, digest, sizeof(low));
     memcpy(&high, digest + 8, sizeof(high));
-    snprintf(out, len * 2 + 1, "%016llx%016llx", (unsigned long long)high,
-             (unsigned long long)low);
+    snprintf(out, len * 2 + 1, "%016llx%016llx", (unsigned long long)high, (unsigned long long)low);
     return;
   }
   static const char hex[] = "0123456789abcdef";

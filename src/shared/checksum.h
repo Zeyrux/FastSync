@@ -41,10 +41,10 @@ bool checksum_digest(ChecksumAlgo algo, uint64_t seed, const void* data, size_t 
 bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, uint8_t* out,
                           size_t out_capacity, size_t* out_len);
 
-/* Resolve a --checksum-choice string (case-insensitive) to an algorithm id. * Accepts "xxh64"/"xxhash", "xxh3", "xxh128" and "md5".  "auto", rsync's
- * default automatic choice, is resolved to the default by the caller (it is not
- * a distinct algorithm here).  Returns -1 for any name FastSync does not
- * implement (md4/sha1/none included). */
+/* Resolve a --checksum-choice string (case-insensitive) to an algorithm id. * Accepts
+ * "xxh64"/"xxhash", "xxh3", "xxh128" and "md5".  "auto", rsync's default automatic choice, is
+ * resolved to the default by the caller (it is not a distinct algorithm here).  Returns -1 for any
+ * name FastSync does not implement (md4/sha1/none included). */
 int checksum_algo_from_name(const char* name);
 
 /* Canonical name of an algorithm (used in CLI error messages). */

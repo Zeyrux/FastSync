@@ -71,7 +71,8 @@ bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats
     count = MAX_MANIFEST_ENTRIES;
   ReceiverStats record = *out;
   record.would_delete_count = count;
-  if (!send_status(fd, STATUS_STATS) || !format_stats_send(fd, &record) || !send_int(fd, (int)count))
+  if (!send_status(fd, STATUS_STATS) || !format_stats_send(fd, &record) ||
+      !send_int(fd, (int)count))
     return false;
   for (size_t i = 0; i < count; i++) {
     const char* path = (const char*)would_delete->items[i];
@@ -579,8 +580,14 @@ int receiver_receive_files(Config* config, int file_descriptor) {
   context.would_delete = array_list_create(free);
   if (!context.would_delete)
     return -1;
-  ReceiverSink sink = {receiver_save_file,        &context, true, true, receiver_send_success_frame,
-                       receiver_note_delete_limit, &context.stats, context.would_delete};
+  ReceiverSink sink = {receiver_save_file,
+                       &context,
+                       true,
+                       true,
+                       receiver_send_success_frame,
+                       receiver_note_delete_limit,
+                       &context.stats,
+                       context.would_delete};
   int ret = receiver_process(config, file_descriptor, &sink);
   if (ret != 0 && config->delay_updates && config->delay_context)
     delay_updates_cleanup(config->delay_context);

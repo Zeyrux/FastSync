@@ -119,8 +119,7 @@ bool format_stats_receive(int fd, ReceiverStats* stats) {
   unsigned long long deleted = 0;
   unsigned long long would = 0;
   if (!receive_n_data(fd, &matched, sizeof(matched)) ||
-      !receive_n_data(fd, &deleted, sizeof(deleted)) ||
-      !receive_n_data(fd, &would, sizeof(would)))
+      !receive_n_data(fd, &deleted, sizeof(deleted)) || !receive_n_data(fd, &would, sizeof(would)))
     return false;
   memset(stats, 0, sizeof(*stats));
   stats->matched_data = matched;
