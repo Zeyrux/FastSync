@@ -66,11 +66,11 @@ void print_usage(void) {
   printf("                      transfer has succeeded)\n");
   printf("  --delete-before     Delete extras before the transfer starts\n");
   printf("                      (implies --delete)\n");
-  printf("  --delete-during     Delete extras once the keep-set manifest is known,\n");
-  printf("                      before the data is applied (implies --delete)\n");
+  printf("  --delete-during     Delete a directory's extras as that directory is\n");
+  printf("                      processed (implies --delete)\n");
   printf("  --del               Alias for --delete-during\n");
-  printf("  --delete-delay      Delete extras only after a successful transfer\n");
-  printf("                      (implies --delete)\n");
+  printf("  --delete-delay      Record the extras during the scan but remove them\n");
+  printf("                      only after a successful transfer (implies --delete)\n");
   printf("  --delete-after      Delete only after the whole transfer succeeded\n");
   printf("                      (the default --delete timing; implies --delete)\n");
   printf("  --delete-excluded   Also delete destination files that were excluded on\n");

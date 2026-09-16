@@ -547,13 +547,17 @@ typedef struct Config {
   /* rsync deletion-timing family (real from Phase 3).  At most one of
      delete_before / delete_during / delete_delay / delete_after may be set, and
      only together with use_delete (the CLI implies --delete for each of them).
-     delete_before and delete_during select the EARLY engine mode: the keep-set
+     delete_before selects the EARLY engine mode: the whole-tree keep-set
      manifest is transmitted before any file data and extras are removed then,
-     acknowledged, before the first data byte.  delete_delay and delete_after
-     select the LATE commit mode: extras are removed only after the whole
-     transfer has succeeded (plain --delete keeps this mode).  The exact
-     semantics and the divergences from rsync are documented in RSYNC_COMPAT.md
-     and in config_delete_timing_early() below. */
+     acknowledged, before the first data byte.  delete_during and delete_delay
+     select the per-directory delete-plan mode (protocol 2.24.0): one plan per
+     source directory is streamed in directory order, and the receiver removes
+     each directory's extras when its plan arrives (during) or snapshots them
+     and removes them only after a successful transfer (delay).  delete_after
+     (and plain --delete) keep the whole-tree commit mode: extras are removed
+     from a fresh end-of-transfer destination scan only after the whole transfer
+     succeeded.  See config_delete_timing_early()/config_delete_timing_per_dir()
+     below. */
   /* partial_dir */
   // PR #174: Partial transfer resumption
   /* suffix */
