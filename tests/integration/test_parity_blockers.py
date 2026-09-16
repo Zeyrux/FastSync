@@ -73,10 +73,10 @@ class TestRelativePerDirDeleteScope:
             server.start(extra_args=["--allow-delete"])
             result, _ = run_client(spec, dest, flags=["-a", "-R", timing], port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
-        # The prefix's parent-directory sibling survives on both sides.
+#The prefix's parent-directory sibling survives on both sides.
         assert os.path.isfile(os.path.join(dest, "unrelated", "keep.txt"))
         assert os.path.isfile(os.path.join(rdst, "unrelated", "keep.txt"))
-        # The in-scope extra is removed on both sides.
+#The in - scope extra is removed on both sides.
         assert not os.path.exists(os.path.join(dest, "foo", "extra.txt"))
         assert not os.path.exists(os.path.join(rdst, "foo", "extra.txt"))
         assert _tree(dest) == _tree(rdst)
@@ -100,7 +100,7 @@ def _seed_delta_pair(tag):
     clean_dir(rdst)
     payload = (b"0123456789abcdef" * 16384)[:200000]
     _write(os.path.join(source, "f.bin"), payload)
-    # Destination basis: same length, one byte changed, deliberately older.
+#Destination basis : same length, one byte changed, deliberately older.
     basis = bytearray(payload)
     basis[100000] ^= 0xFF
     received = get_dest_received_dir(dest, source)
@@ -166,3 +166,130 @@ class TestReceiverWireStats:
             line for line in result.stdout.splitlines() if line.startswith("*deleting")
         )
         assert fast_del and fast_del == rsync_del, f"rsync={rsync_del}\nfastsync={fast_del}"
+
+
+class TestRelativeFilesFromProtect:
+    """Blocker #9: a -R + --files-from receiver-protect rule must record the bare
+    relative wire path so the protected destination mirror survives --delete."""
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_hidden_protected_mirror_survives_delete(self, mt):
+        source = os.path.join(TEST_DATA_DIR, "rfprot_src")
+        dest = os.path.join(TEST_DATA_DIR, "rfprot_dst")
+        clean_dir(source)
+        clean_dir(dest)
+#Root - level entry exercises the parallel root scanner; the nested one
+#exercises the sequential worker scanner.
+        _write(os.path.join(source, "root_secret.tmp"), b"root\n")
+        _write(os.path.join(source, "sub", "nested_secret.tmp"), b"nested\n")
+        _write(os.path.join(source, "sub", "keep.txt"), b"keep\n")
+        listfile = os.path.join(TEST_DATA_DIR, "rfprot.list")
+        with open(listfile, "w") as fh:
+            fh.write(".\n")
+#H hides from the sender, P protects the receiver mirror from-- delete.
+        filters = ["--filter=H root_secret.tmp", "--filter=P root_secret.tmp",
+                   "--filter=H sub/nested_secret.tmp", "--filter=P sub/nested_secret.tmp"]
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            seed = ["--files-from", listfile, "-R"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=seed, port=server.port)
+            assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+            assert os.path.isfile(os.path.join(dest, "root_secret.tmp"))
+            assert os.path.isfile(os.path.join(dest, "sub", "nested_secret.tmp"))
+            _write(os.path.join(dest, "extra.txt"), b"extra\n")
+            _write(os.path.join(dest, "sub", "extra.txt"), b"extra\n")
+            flags = seed + ["--delete"] + filters
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert os.path.isfile(os.path.join(dest, "root_secret.tmp")), \
+            "root-level protected mirror was deleted"
+        assert os.path.isfile(os.path.join(dest, "sub", "nested_secret.tmp")), \
+            "nested protected mirror was deleted"
+        assert not os.path.exists(os.path.join(dest, "extra.txt"))
+        assert not os.path.exists(os.path.join(dest, "sub", "extra.txt"))
+
+
+class TestInvalidPerDirFilter:
+    """Blocker #8: a per-directory filter file that fails to parse must fail the
+    scan even when an earlier merge file in the same directory existed."""
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_invalid_dir_filter_fails_scan(self, mt):
+        source = os.path.join(TEST_DATA_DIR, "badfilter_src")
+        dest = os.path.join(TEST_DATA_DIR, "badfilter_dst")
+        clean_dir(source)
+        clean_dir(dest)
+#A valid.rsync - filter makes any_exists true for the directory; the
+#invalid.rules must not then be silently ignored.
+        _write(os.path.join(source, ".rsync-filter"), b"- *.bak\n")
+        _write(os.path.join(source, ".rules"), b"protect\n")
+        _write(os.path.join(source, "a.txt"), b"a\n")
+        flags = ["-a", "-F", "--filter=: .rules"]
+        if mt:
+            flags.append("--threads")
+        with ServerManager() as server:
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+        assert result.returncode != 0, "invalid per-directory filter was silently ignored"
+        assert "invalid per-directory filter" in (result.stderr + result.stdout)
+
+
+class TestWouldDeleteEscaping:
+    """Blocker #5: -n --delete --out-format must escape control bytes in a
+    peer-supplied would-delete path so it cannot forge output lines."""
+
+    @pytest.mark.ci
+    def test_out_format_escapes_control_chars(self):
+        source = os.path.join(TEST_DATA_DIR, "esc_src")
+        dest = os.path.join(TEST_DATA_DIR, "esc_dst")
+        clean_dir(source)
+        _write(os.path.join(source, "a.txt"), b"a\n")
+        received = get_dest_received_dir(dest, source)
+        clean_dir(received)
+        _write(os.path.join(received, "a.txt"), b"a\n")
+#A newline in a destination filename must not split the printed line.
+        with open(os.path.join(received, "evil\nname.txt"), "wb") as fh:
+            fh.write(b"x\n")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest,
+                                   flags=["-a", "-n", "--delete", "--out-format=%n"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert "\\#012" in result.stdout, result.stdout
+        assert "evil\nname.txt" not in result.stdout, result.stdout
+
+
+class TestEmptySourceDirectoryDelete:
+    """Blocker #10: an empty in-scope source directory must survive
+    --delete-during/--delete-delay (rsync keeps it) while its extras are still
+    removed."""
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
+    def test_empty_source_dir_survives_matches_rsync(self, timing):
+        source = os.path.join(TEST_DATA_DIR, "emptydir_src")
+        dest = os.path.join(TEST_DATA_DIR, "emptydir_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "emptydir_rdst")
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "empty"))
+        _write(os.path.join(source, "keep.txt"), b"keep\n")
+        received = get_dest_received_dir(dest, source)
+        for root in (rdst, received):
+            clean_dir(root)
+            _write(os.path.join(root, "keep.txt"), b"keep\n")
+            _write(os.path.join(root, "empty", "extra.txt"), b"extra\n")
+        rsync_result = _rsync(["-a", timing, source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        assert os.path.isdir(os.path.join(rdst, "empty"))
+        assert not os.path.exists(os.path.join(rdst, "empty", "extra.txt"))
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["-a", timing], port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert os.path.isdir(os.path.join(received, "empty")), \
+            "empty source directory was removed"
+        assert not os.path.exists(os.path.join(received, "empty", "extra.txt"))
+        assert _tree(received) == _tree(rdst)

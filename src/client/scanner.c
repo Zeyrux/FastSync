@@ -449,7 +449,7 @@ static void scanner_record_size_skipped(DirectoryScanner* scanner, const char* f
    Returns false on allocation failure. */
 static bool scanner_record_synced_dir(const ScannerOptions* options, const char* fs_path,
                                       const char* rel, bool relative_mode) {
-  if (!options->synced_dirs)
+  if (!options->synced_dirs && !options->plan_dirs)
     return true;
   if (!file_list_dir_in_scope(options->file_list, rel))
     return true;
@@ -469,7 +469,14 @@ static bool scanner_record_synced_dir(const ScannerOptions* options, const char*
     dest++;
   if (dest[0] == '\0')
     dest = ".";
-  bool ok = excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
+  bool ok = true;
+  if (options->synced_dirs)
+    ok = excluded_sink_append(options->synced_dirs, options->excluded_mutex, dest);
+  /* The delete-plan keep set needs an entry for every traversed source
+     directory, including empty ones, so its destination mirror is kept rather
+     than deleted as an extra; the receive root (".") is implicit. */
+  if (ok && options->plan_dirs && strcmp(dest, ".") != 0)
+    ok = excluded_sink_append(options->plan_dirs, options->excluded_mutex, dest);
   free(prefixed);
   return ok;
 }
@@ -528,11 +535,11 @@ static int open_directory_filter_context(DirectoryScanner* scanner, const Filter
   FilterRuleList* own = read_dir_filters(&scanner->options, scanner->current_path,
                                          scanner->current_rel ? scanner->current_rel : "",
                                          &any_exists, err, sizeof(err));
-  if (!own && any_exists) {
-    scanner->current_node = (FilterNode*)inherited;
-    return 0;
-  }
   if (!own) {
+    /* read_dir_filters() leaves `err` set on a parse/allocation failure even
+       when an earlier merge file in the same directory existed (any_exists true);
+       key off the error text rather than any_exists so an invalid per-directory
+       filter file can never be silently ignored. */
     if (err[0] == '\0') {
       scanner->current_node = (FilterNode*)inherited;
       return 0;
@@ -1429,7 +1436,12 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
          wire paths are never recorded (see ScannerOptions.excluded_paths). */
       bool files_from_prune =
           scanner->options.file_list && !file_list_affects(scanner->options.file_list, rel);
-      if (!files_from_prune && !scanner->relative_mode) {
+      if (protect && scanner->relative_mode) {
+        /* -R + --files-from: the destination/wire path is the bare relative
+           name, so the protected mirror prefix must be `rel` (not the source
+           path) for the delete walker to match it. */
+        scanner_record_excluded(scanner, rel);
+      } else if (!files_from_prune && !scanner->relative_mode) {
         if (scanner->options.relative_prefix) {
           char* wrel = scanner_prefix_send_path(scanner->options.relative_prefix, rel);
           if (!wrel) {
@@ -1856,9 +1868,13 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
        exclusions are never recorded (see ScannerOptions.excluded_paths). */
     bool files_from_prune = options->file_list && !file_list_affects(options->file_list, rel);
     if ((!files_from_prune && !use_rel) || protect) {
-      const char* rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
+      const char* rel_path;
       char* prefixed = NULL;
-      if (options->relative_prefix) {
+      if (use_rel) {
+        /* -R + --files-from: the destination/wire path is the bare relative
+           name, not the source path. */
+        rel_path = rel;
+      } else if (options->relative_prefix) {
         prefixed = scanner_prefix_send_path(options->relative_prefix, entry->d_name);
         if (!prefixed) {
           free(rel);
@@ -1867,6 +1883,8 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
           return;
         }
         rel_path = prefixed;
+      } else {
+        rel_path = *cur_path == '/' ? cur_path + 1 : cur_path;
       }
       if (options->excluded_paths &&
           !excluded_sink_append(options->excluded_paths, options->excluded_mutex, rel_path))
@@ -2148,9 +2166,9 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     bool any_exists = false;
     FilterRuleList* own =
         read_dir_filters(options, root_directory, "", &any_exists, err, sizeof(err));
-    if (!own && any_exists) {
-      /* no files exist: leave root_node NULL */
-    } else if (!own) {
+    if (!own) {
+      /* A parse/allocation failure must fail the scan even when an earlier
+         merge file in the same directory existed (see the sequential scanner). */
       if (err[0] != '\0') {
         log_message(LOG_LEVEL_ERROR, "invalid per-directory filter in %s: %s", root_directory, err);
         array_list_delete(root_files);
@@ -2158,6 +2176,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
         parallel_scanner_destroy(ps);
         return NULL;
       }
+      /* no files exist: leave root_node NULL */
     } else if (any_exists && (own->count > 0 || own->dir_merge_count > 0)) {
       root_node = filter_node_alloc(NULL, own);
       if (!root_node) {

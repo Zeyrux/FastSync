@@ -55,6 +55,11 @@ typedef struct {
      "delete only in synchronized directories" (notably for --files-from).
      Populated by the scanner thread or the early pre-scan. */
   ArrayList* synced_dirs;
+  /* Destination-relative paths of every traversed source directory, for the
+     per-directory delete plan keep set (so an empty source directory survives
+     --delete rather than being removed as an extra).  Prebuilt by the path-only
+     pre-scan on the calling thread. */
+  ArrayList* plan_dirs;
   /* --delete-missing-args: the destination-relative mirrors of the --files-from
      entries that are missing under the source.  Computed by the preflight on
      the calling thread before the pipeline starts; the sender thread transmits

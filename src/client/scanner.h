@@ -114,6 +114,13 @@ typedef struct {
    * directories, exactly like rsync; the receive root is the "." sentinel.
    * Guarded by `excluded_mutex`. */
   ArrayList* synced_dirs;
+  /* Delete-plan directory sink (optional): when non-NULL the scanner appends
+   * the destination-relative path of every directory it traverses (except the
+   * receive root).  The per-directory --delete-during/--delete-delay plan
+   * builder uses this to keep an empty in-scope source directory (rsync keeps
+   * it) and to emit its plan after the data stream, when no file frame would
+   * otherwise trigger it.  Guarded by `excluded_mutex`. */
+  ArrayList* plan_dirs;
   /* --ignore-errors: an unreadable directory during the scan is recorded as an
    * I/O error and skipped instead of aborting the scan.  Client-only. */
   bool ignore_io_errors;

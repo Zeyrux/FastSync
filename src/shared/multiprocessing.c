@@ -32,6 +32,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->excluded_paths = NULL;
   context->size_skipped_paths = NULL;
   context->synced_dirs = NULL;
+  context->plan_dirs = NULL;
   context->missing_args = NULL;
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
@@ -196,6 +197,8 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
     array_list_delete(context->size_skipped_paths);
   if (context->synced_dirs)
     array_list_delete(context->synced_dirs);
+  if (context->plan_dirs)
+    array_list_delete(context->plan_dirs);
   if (context->missing_args)
     array_list_delete(context->missing_args);
   if (context->remove_source_files)

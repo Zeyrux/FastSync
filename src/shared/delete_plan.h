@@ -54,6 +54,10 @@ int delete_plan_send_root(int fd, DeletePlanSender* sender);
 /* Send the plans for every ancestor of `path` (root-first) and, when is_dir,
  * for `path` itself; already-sent plans are skipped. */
 int delete_plan_send_for_path(int fd, DeletePlanSender* sender, const char* path, bool is_dir);
+/* Send the plan for every directory in `dirs` that has not been transmitted
+ * yet.  Called after the data stream so an empty source directory's plan still
+ * clears its destination extras even though no file frame triggered it. */
+int delete_plan_send_remaining(int fd, DeletePlanSender* sender, const ArrayList* dirs);
 
 /* ---- Receiver: delete session ---- */
 

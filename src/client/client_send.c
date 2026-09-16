@@ -923,15 +923,27 @@ static bool receive_stats_record(int fd, ReceiverStats* stats, ArrayList* would_
   int count = 0;
   if (!receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
     return false;
+  /* Mirror the delete-plan parser: every retained path must be a valid
+     destination-relative path, and the whole list shares one MAX_MANIFEST_BYTES
+     budget so a hostile peer cannot make the client retain unbounded memory. */
+  size_t bytes = 0;
   for (int i = 0; i < count; i++) {
     char* path = receive_wire_str(fd);
     if (!path)
       return false;
-    if (would_delete) {
-      char* copy = str_dup(path);
+    if (path[0] == '\0' || path[0] == '/' || has_path_traversal(path)) {
       free(path);
-      if (!copy || !array_list_add(would_delete, copy)) {
-        free(copy);
+      return false;
+    }
+    if (would_delete) {
+      size_t entry_size = strlen(path) + sizeof(char*) + 16;
+      if (entry_size > MAX_MANIFEST_BYTES - bytes) {
+        free(path);
+        return false;
+      }
+      bytes += entry_size;
+      if (!array_list_add(would_delete, path)) {
+        free(path);
         return false;
       }
     } else {
@@ -1455,6 +1467,19 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
     }
     chunk_destroy(chunk);
   }
+  if (ok) {
+    /* Keep every traversed source directory, including empty ones, so a plan
+       no longer removes the destination directory itself.  Their own plans are
+       emitted after the data stream (no file frame triggers them). */
+    if (plans && options->plan_dirs) {
+      for (int i = 0; i < options->plan_dirs->size; i++) {
+        if (!delete_plan_sender_add(plans, (const char*)options->plan_dirs->items[i], true)) {
+          ok = false;
+          break;
+        }
+      }
+    }
+  }
   if (ok && directory_scanner_failed(scanner))
     ok = false;
   if (io_error_out)
@@ -1929,7 +1954,12 @@ static int send_dry_run_remote(Config* config) {
           event.path = path;
           char* line = change_render_format(config->out_format, config, &event);
           if (line) {
-            printf("%s\n", line);
+            /* Escape the whole rendered line, exactly like change_emit() does
+               for a real transfer, so a control byte in the peer-supplied path
+               cannot forge output. */
+            char* escaped = output_escape(line, config->eight_bit_output);
+            printf("%s\n", escaped ? escaped : line);
+            free(escaped);
             free(line);
           }
         } else {
@@ -2474,6 +2504,13 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                              NULL) != 0)
       goto send_fail;
   }
+  /* Emit the plans for source directories the data stream never triggered
+     (empty directories): their extras are still cleared while the directory
+     itself is kept. */
+  if (!context->scan_stopped_early && context->delete_plans && context->plan_dirs &&
+      delete_plan_send_remaining(client->file_descriptor, context->delete_plans,
+                                 context->plan_dirs) != 0)
+    goto send_fail;
   /* P7 Wave D: transmit the captured directory times last.  The scanner thread
      (and all parallel workers) has been joined before scanner_done was set, so
      the list is complete and race-free; on an early stop the list may be
@@ -2808,6 +2845,8 @@ int send_files(Config* config) {
   /* Size-pruned prefixes (always protected) and synchronized directories. */
   ArrayList* size_skipped = NULL;
   ArrayList* synced_dirs = NULL;
+  /* Traversed source directories for the per-directory delete keep set. */
+  ArrayList* plan_dirs = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
   /* -d/--dirs does not recurse, so a per-directory plan would carry no child
      information and could delete the contents of an untraversed directory;
@@ -2908,13 +2947,16 @@ int send_files(Config* config) {
        receive root's extras are handled exactly like rsync's first generator
        directory.  The remaining plans are streamed with the data below. */
     plan_sender = delete_plan_sender_create();
-    if (!plan_sender)
+    plan_dirs = array_list_create(free);
+    if (!plan_sender || !plan_dirs)
       goto send_fail;
+    prepared.options.plan_dirs = plan_dirs;
     bool prescan_ok = scan_paths_only(config, &prepared.options, NULL, plan_sender, &had_scan_io);
     bool plans_ok = false;
     if (prescan_ok) {
       const char* walk_root = delete_plan_walk_root(config, synced_dirs);
-      const ArrayList* scope = config->files_from_set ? synced_dirs : (walk_root ? synced_dirs : NULL);
+      const ArrayList* scope =
+          config->files_from_set ? synced_dirs : (walk_root ? synced_dirs : NULL);
       delete_plan_sender_finalize(plan_sender, scope, walk_root);
       delete_plan_sender_set_config(plan_sender, excluded, size_skipped, missing_args);
       if (had_scan_io && delete_plan_sender_empty(plan_sender)) {
@@ -2929,6 +2971,7 @@ int send_files(Config* config) {
     prepared.options.excluded_paths = NULL;
     prepared.options.size_skipped_paths = NULL;
     prepared.options.synced_dirs = NULL;
+    prepared.options.plan_dirs = NULL;
     if (!prescan_ok || !plans_ok)
       goto send_fail;
   } else if (config->use_delete) {
@@ -3085,6 +3128,12 @@ int send_files(Config* config) {
       }
     }
   }
+  /* Emit the plans for any source directories the data stream never triggered
+     (an empty directory has no file frame).  Sending them now still clears that
+     directory's destination extras while keeping the directory itself. */
+  if (!scan_stopped_early && plan_sender && plan_dirs &&
+      delete_plan_send_remaining(client->file_descriptor, plan_sender, plan_dirs) != 0)
+    goto send_fail;
   /* P7 Wave D: every directory has now been traversed (or the scan stopped
      early), so transmit the captured directory times last.  The receiver defers
      applying them until after its own deletion/publication phase. */
@@ -3127,6 +3176,8 @@ send_fail:
     array_list_delete(size_skipped);
   if (synced_dirs)
     array_list_delete(synced_dirs);
+  if (plan_dirs)
+    array_list_delete(plan_dirs);
   if (missing_args)
     array_list_delete(missing_args);
   if (remove_sources)
@@ -3268,7 +3319,10 @@ int send_files_multithreaded(Config** config_ptr) {
       }
       if (per_dir) {
         context->delete_plans = delete_plan_sender_create();
-        prepared_ok = prepared_ok && context->delete_plans != NULL;
+        context->plan_dirs = array_list_create(free);
+        prepared_ok = prepared_ok && context->delete_plans != NULL && context->plan_dirs != NULL;
+        if (prepared_ok)
+          prepared.options.plan_dirs = context->plan_dirs;
       } else {
         context->manifest = array_list_create(free);
         prepared_ok = prepared_ok && context->manifest != NULL;
@@ -3279,8 +3333,8 @@ int send_files_multithreaded(Config** config_ptr) {
       prepared_scanner_destroy(&prepared);
       if (per_dir && prebuilt) {
         const char* walk_root = delete_plan_walk_root(config, context->synced_dirs);
-        const ArrayList* scope =
-            config->files_from_set ? context->synced_dirs : (walk_root ? context->synced_dirs : NULL);
+        const ArrayList* scope = config->files_from_set ? context->synced_dirs
+                                                        : (walk_root ? context->synced_dirs : NULL);
         delete_plan_sender_finalize(context->delete_plans, scope, walk_root);
         delete_plan_sender_set_config(context->delete_plans, context->excluded_paths,
                                       context->size_skipped_paths, context->missing_args);

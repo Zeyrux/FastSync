@@ -4,9 +4,22 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Write a diagnostic message into the caller's optional buffer.  A NULL `err`
+ * (or a zero size) is a no-op, so a caller that only needs the boolean status
+ * may pass NULL without the snprintf-on-NULL undefined behaviour. */
+static void filter_set_error(char* err, size_t err_size, const char* fmt, ...) {
+  if (!err || err_size == 0)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(err, err_size, fmt, ap);
+  va_end(ap);
+}
 
 /* ---- Ordered rule lists ---- */
 
@@ -268,7 +281,7 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
   while (*p == ' ' || *p == '\t')
     p++;
   if (*p == '\0' || *p == '\n' || *p == '\r') {
-    snprintf(err, err_size, "empty filter rule");
+    filter_set_error(err, err_size, "empty filter rule");
     return NULL;
   }
 
@@ -279,27 +292,27 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
   size_t pat_len;
   if (!parse_rule_syntax(p, &kind, &sides, &sides_explicit, &negate, &anchored_mod, &perishable,
                          &xattr, &cvs_inject, &pat, &pat_len)) {
-    snprintf(err, err_size, "unrecognized filter rule syntax");
+    filter_set_error(err, err_size, "unrecognized filter rule syntax");
     return NULL;
   }
   if (cvs_inject) {
     /* The C modifier expands to the CVS defaults in place; the rule itself
        carries no pattern and is handled by the caller. */
-    snprintf(err, err_size, "the C modifier is handled by the rule-list parser");
+    filter_set_error(err, err_size, "the C modifier is handled by the rule-list parser");
     return NULL;
   }
   if (kind == RULE_KIND_MERGE || kind == RULE_KIND_DIR_MERGE) {
-    snprintf(err, err_size, "merge/dir-merge rules are handled by the rule-list parser");
+    filter_set_error(err, err_size, "merge/dir-merge rules are handled by the rule-list parser");
     return NULL;
   }
   if (kind == RULE_KIND_CLEAR) {
     if (pat_len != 0) {
-      snprintf(err, err_size, "clear takes no pattern");
+      filter_set_error(err, err_size, "clear takes no pattern");
       return NULL;
     }
     FilterRule* rule = calloc(1, sizeof(FilterRule));
     if (!rule) {
-      snprintf(err, err_size, "memory allocation failed");
+      filter_set_error(err, err_size, "memory allocation failed");
       return NULL;
     }
     rule->action = FILTER_ACTION_NONE; /* clear marker: no pattern */
@@ -335,7 +348,7 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
     sides = FILTER_SIDE_SENDER;
 
   if (pat_len == 0) {
-    snprintf(err, err_size, "filter rule has no pattern");
+    filter_set_error(err, err_size, "filter rule has no pattern");
     return NULL;
   }
 
@@ -352,7 +365,7 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
       pat_len--;
   }
   if (pat_len == 0) {
-    snprintf(err, err_size, "filter rule has no pattern after '/' anchor");
+    filter_set_error(err, err_size, "filter rule has no pattern after '/' anchor");
     return NULL;
   }
   bool dir_only = false;
@@ -361,19 +374,19 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
     pat_len--;
   }
   if (pat_len == 0) {
-    snprintf(err, err_size, "filter rule has no pattern");
+    filter_set_error(err, err_size, "filter rule has no pattern");
     return NULL;
   }
 
   FilterRule* rule = calloc(1, sizeof(FilterRule));
   if (!rule) {
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return NULL;
   }
   rule->pattern = malloc(pat_len + 1);
   if (!rule->pattern) {
     free(rule);
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return NULL;
   }
   memcpy(rule->pattern, pat_begin, pat_len);
@@ -450,18 +463,18 @@ static bool filter_list_merge_file(FilterRuleList* list, const char* name,
                                    const FilterParseOptions* opts, const char* base_dir, int depth,
                                    char* err, size_t err_size) {
   if (name[0] == '\0') {
-    snprintf(err, err_size, "merge requires a filename");
+    filter_set_error(err, err_size, "merge requires a filename");
     return false;
   }
   char* path =
       (base_dir && base_dir[0] && name[0] != '/') ? path_cat(base_dir, name) : str_dup(name);
   if (!path) {
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return false;
   }
   FILE* fp = fopen(path, "r");
   if (!fp) {
-    snprintf(err, err_size, "could not read merge file '%s': %s", path, strerror(errno));
+    filter_set_error(err, err_size, "could not read merge file '%s': %s", path, strerror(errno));
     free(path);
     return false;
   }
@@ -471,7 +484,7 @@ static bool filter_list_merge_file(FilterRuleList* list, const char* name,
   while (true) {
     ssize_t n = utils_getdelim_bounded(fp, &line, &cap, '\n', UTILS_MAX_LINE_LEN);
     if (n < 0) {
-      snprintf(err, err_size, "error reading merge file '%s'", path);
+      filter_set_error(err, err_size, "error reading merge file '%s'", path);
       ok = false;
       break;
     }
@@ -499,7 +512,7 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
                                            const FilterParseOptions* opts, const char* base_dir,
                                            int depth, char* err, size_t err_size) {
   if (depth > FILTER_MAX_MERGE_DEPTH) {
-    snprintf(err, err_size, "merge files nested too deeply");
+    filter_set_error(err, err_size, "merge files nested too deeply");
     return false;
   }
   const char* p = line;
@@ -515,7 +528,7 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
   size_t pat_len;
   if (!parse_rule_syntax(p, &kind, &sides, &sides_explicit, &negate, &anchored_mod, &perishable,
                          &xattr, &cvs_inject, &pat, &pat_len)) {
-    snprintf(err, err_size, "unrecognized filter rule syntax: %s", p);
+    filter_set_error(err, err_size, "unrecognized filter rule syntax: %s", p);
     return false;
   }
   (void)sides_explicit;
@@ -530,7 +543,7 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
   }
   if (kind == RULE_KIND_CLEAR) {
     if (pat_len != 0) {
-      snprintf(err, err_size, "clear takes no pattern");
+      filter_set_error(err, err_size, "clear takes no pattern");
       return false;
     }
     for (int i = 0; i < list->count; i++)
@@ -540,12 +553,12 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
   }
   if (kind == RULE_KIND_MERGE) {
     if (pat_len == 0) {
-      snprintf(err, err_size, "merge requires a filename");
+      filter_set_error(err, err_size, "merge requires a filename");
       return false;
     }
     char* name = malloc(pat_len + 1);
     if (!name) {
-      snprintf(err, err_size, "memory allocation failed");
+      filter_set_error(err, err_size, "memory allocation failed");
       return false;
     }
     memcpy(name, pat, pat_len);
@@ -556,12 +569,12 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
   }
   if (kind == RULE_KIND_DIR_MERGE) {
     if (pat_len == 0) {
-      snprintf(err, err_size, "dir-merge requires a filename");
+      filter_set_error(err, err_size, "dir-merge requires a filename");
       return false;
     }
     char* name = malloc(pat_len + 1);
     if (!name) {
-      snprintf(err, err_size, "memory allocation failed");
+      filter_set_error(err, err_size, "memory allocation failed");
       return false;
     }
     memcpy(name, pat, pat_len);
@@ -569,7 +582,7 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
     bool ok = filter_rule_list_add_dir_merge(list, name);
     free(name);
     if (!ok) {
-      snprintf(err, err_size, "memory allocation failed");
+      filter_set_error(err, err_size, "memory allocation failed");
       return false;
     }
     return true;
@@ -580,7 +593,7 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
     return false;
   if (!filter_rule_list_add(list, rule)) {
     filter_rule_free(rule);
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return false;
   }
   return true;
@@ -602,7 +615,7 @@ FilterRuleList* filter_base_build(const char* const* rule_texts, int rule_count,
     err[0] = '\0';
   FilterRuleList* list = filter_rule_list_create();
   if (!list) {
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return NULL;
   }
   FilterParseOptions opts = {.delete_excluded = delete_excluded, .cvs_exclude = cvs_exclude};
@@ -616,7 +629,7 @@ FilterRuleList* filter_base_build(const char* const* rule_texts, int rule_count,
   }
   if (cvs_exclude && !filter_list_append_cvs(list, FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER)) {
     filter_rule_list_free(list);
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return NULL;
   }
   return list;
@@ -635,7 +648,7 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
     return false;
   char* filter_path = path_cat(dir_path, name);
   if (!filter_path) {
-    snprintf(err, err_size, "memory allocation failed");
+    filter_set_error(err, err_size, "memory allocation failed");
     return false;
   }
   FILE* fp = fopen(filter_path, "r");
@@ -652,6 +665,7 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
   if (exists)
     *exists = true;
   int rules_before = list->count;
+  int dir_merges_before = list->dir_merge_count;
   char* line = NULL;
   size_t line_cap = 0;
   bool ok = true;
@@ -659,9 +673,10 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
     ssize_t n = utils_getdelim_bounded(fp, &line, &line_cap, '\n', UTILS_MAX_LINE_LEN);
     if (n < 0) {
       if (errno == EFBIG) {
-        snprintf(err, err_size, "line in %s exceeds %d bytes", name, (int)UTILS_MAX_LINE_LEN);
+        filter_set_error(err, err_size, "line in %s exceeds %d bytes", name,
+                         (int)UTILS_MAX_LINE_LEN);
       } else {
-        snprintf(err, err_size, "error reading %s: %s", name, strerror(errno));
+        filter_set_error(err, err_size, "error reading %s: %s", name, strerror(errno));
       }
       ok = false;
       break;
@@ -683,16 +698,19 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
   free(line);
   fclose(fp);
   if (!ok) {
-    /* Drop only the rules this file appended, leaving the caller's earlier
-       content untouched. */
+    /* Drop only the rules and dir-merge registrations this file appended,
+       leaving the caller's earlier content untouched. */
     for (int i = rules_before; i < list->count; i++)
       filter_rule_free(list->items[i]);
     list->count = rules_before;
+    for (int i = dir_merges_before; i < list->dir_merge_count; i++)
+      free(list->dir_merge_names[i]);
+    list->dir_merge_count = dir_merges_before;
     return false;
   }
   for (int i = rules_before; i < list->count; i++) {
     if (!set_rule_owner(list->items[i], owner_rel)) {
-      snprintf(err, err_size, "memory allocation failed");
+      filter_set_error(err, err_size, "memory allocation failed");
       return false;
     }
   }
@@ -705,7 +723,7 @@ FilterRuleList* filter_file_read_named(const char* dir_path, const char* name,
   FilterRuleList* list = filter_rule_list_create();
   if (!list) {
     if (err && err_size > 0)
-      snprintf(err, err_size, "memory allocation failed");
+      filter_set_error(err, err_size, "memory allocation failed");
     return NULL;
   }
   if (!filter_file_append(list, dir_path, name, owner_rel, opts, exists, err, err_size)) {

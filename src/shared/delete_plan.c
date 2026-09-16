@@ -20,8 +20,6 @@
  * the number of entries one deletion commit may remove.  A client
  * --max-delete=NUM smaller than this replaces it for the run. */
 #define DELETE_PLAN_SERVER_LIMIT 100000U
-/* Per-frame entry cap for the name sections (the dir/file child lists). */
-#define DELETE_PLAN_MAX_NAMES MAX_MANIFEST_ENTRIES
 
 /* ------------------------------------------------------------------ */
 /* Sender: plan builder                                               */
@@ -387,6 +385,17 @@ int delete_plan_send_for_path(int fd, DeletePlanSender* sender, const char* path
   return rc;
 }
 
+int delete_plan_send_remaining(int fd, DeletePlanSender* sender, const ArrayList* dirs) {
+  if (!sender || !dirs)
+    return 0;
+  for (int i = 0; i < dirs->size; i++) {
+    const char* dir = (const char*)dirs->items[i];
+    if (delete_plan_send_for_path(fd, sender, dir, true) != 0)
+      return -1;
+  }
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Receiver: delete session                                           */
 /* ------------------------------------------------------------------ */
@@ -398,6 +407,7 @@ struct DeletePlanSession {
   size_t deleted;
   size_t skipped;
   bool limit_hit;
+  bool limit_logged;
   bool config_seen;
   bool missing_applied;
   ArrayList* protected_prefixes;
@@ -811,9 +821,11 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
     send_status(fd, STATUS_ERROR);
     return -1;
   }
-  if (session->limit_hit)
+  if (session->limit_hit && !session->limit_logged) {
+    session->limit_logged = true;
     log_message(LOG_LEVEL_WARNING, "Deletions stopped due to the delete limit (%zu skipped)",
                 session->skipped);
+  }
   return 0;
 }
 
