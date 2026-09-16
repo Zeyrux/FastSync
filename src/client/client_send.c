@@ -843,31 +843,33 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
     *delete_limit_out = false;
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     return false;
-  if (config->remove_source_files && remove_sources) {
+  /* The receiver emits its optional wire-stats frame (protocol 2.25.0) FIRST,
+     then any per-file --remove-source-files acks, then the terminal status. */
+  Status status;
+  if (!receive_status(client->file_descriptor, &status))
+    return false;
+  if (status == STATUS_STATS) {
+    ReceiverStats scratch;
+    if (!receive_stats_record(client->file_descriptor, stats_out ? stats_out : &scratch, NULL))
+      return false;
+    if (!receive_status(client->file_descriptor, &status))
+      return false;
+  }
+  if (config->remove_source_files && remove_sources && remove_sources->size > 0) {
     for (int i = 0; i < remove_sources->size; i++) {
-      Status per_file;
-      if (!receive_status(client->file_descriptor, &per_file))
+      if (i > 0 && !receive_status(client->file_descriptor, &status))
         return false;
-      if (per_file == STATUS_ERROR) {
+      if (status == STATUS_ERROR) {
         log_server_rejection("Receiver reported a per-file error");
         return false;
       }
-      if (per_file == STATUS_OK) {
+      if (status == STATUS_OK) {
         ((SourceFile*)remove_sources->items[i])->skipped = true;
-      } else if (per_file != STATUS_NEXT) {
+      } else if (status != STATUS_NEXT) {
         log_message(LOG_LEVEL_ERROR, "Unexpected per-file status from receiver");
         return false;
       }
     }
-  }
-  Status status;
-  if (!receive_status(client->file_descriptor, &status))
-    return false;
-  /* Optional wire-stats frame (protocol 2.25.0) precedes the terminal status. */
-  if (status == STATUS_STATS) {
-    if (!receive_stats_record(client->file_descriptor, stats_out ? stats_out : &(ReceiverStats){0},
-                              NULL))
-      return false;
     if (!receive_status(client->file_descriptor, &status))
       return false;
   }
