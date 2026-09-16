@@ -2366,6 +2366,21 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * check.  This is a wire field. */
   config->report_dest_info = config->itemize_changes || config->out_format != NULL ||
                              (config->log_file != NULL && config->log_file_format != NULL);
+  /* Wire-stats parity: --stats, --progress/-P, an --out-format token that needs
+   * a wire counter (%b/%c), or a dry-run --delete need the receiver's
+   * end-of-transfer STATUS_STATS report.  This is a wire field (protocol
+   * 2.25.0). */
+  bool format_needs_wire = false;
+  if (config->out_format != NULL) {
+    for (const char* p = config->out_format; *p != '\0'; p++) {
+      if (p[0] == '%' && (p[1] == 'b' || p[1] == 'c')) {
+        format_needs_wire = true;
+        break;
+      }
+    }
+  }
+  config->report_stats = config->stats || config->show_progress || format_needs_wire ||
+                         (config->dry_run && config->use_delete);
   return 0;
 }
 

@@ -39,14 +39,27 @@ typedef struct {
   ReceiverSuccessFrame send_success_frame;
   /* Optional; may be NULL when the sink has no --max-delete handling. */
   ReceiverNoteDeleteLimit note_delete_limit;
+  /* Optional end-of-transfer wire counters (protocol 2.25.0).  When non-NULL
+     and the wire config carries report_stats, the success frame is preceded by
+     a STATUS_STATS record; `would_delete` (optional, receiver-owned strings)
+     carries the -n/--dry-run --delete path list. */
+  ReceiverStats* stats;
+  struct ArrayList* would_delete;
 } ReceiverSink;
 
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code);
 void receiver_outcomes_destroy(ReceiverOutcomes* outcomes);
+
 /* Send the terminal success frame.  `final_status` is usually STATUS_OK, or
    STATUS_DELETE_LIMIT when a --max-delete commit was capped. */
 bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes,
                                  Status final_status);
+
+/* Emit STATUS_STATS (a fixed ReceiverStats record plus, when `would_delete` is
+   non-NULL, a count and that many wire strings) when the wire config requested
+   report_stats.  A no-op otherwise. */
+bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats* stats,
+                               const struct ArrayList* would_delete);
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink);
 /* receiver_process with an escape hatch for the commit-style (late) deletion:

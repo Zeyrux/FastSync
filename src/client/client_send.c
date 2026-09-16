@@ -85,20 +85,31 @@ static const char* stats_bytes(const Config* config, unsigned long long bytes, c
   return buffer;
 }
 
-/* Print the rsync `--stats` block on stdout.  FastSync is a push sender, so a
-   few receiver-only counters (matched data, file-list bytes, deletion count)
-   are not observable and are reported as 0; the labels and layout match rsync
-   3.4.1.  Shared by the single-threaded and multithreaded send paths. */
+/* Print the rsync `--stats` block on stdout.  Byte totals use the process-wide
+   wire counters and the receiver-only counters come from the STATUS_STATS frame;
+   the labels, layout and rate/speedup formulas match rsync 3.4.1.  Shared by the
+   single-threaded and multithreaded send paths. */
 static void report_transfer_stats(const Config* config, int total_files,
-                                  unsigned long long total_bytes, time_t start) {
+                                  unsigned long long total_bytes, time_t start,
+                                  const ReceiverStats* recv) {
   if (!config->stats || config->quiet)
     return;
+  ReceiverStats none = {0};
+  if (recv == NULL)
+    recv = &none;
+  unsigned long long sent = protocol_bytes_written();
+  unsigned long long received = protocol_bytes_read();
+  /* rsync: bytes_per_sec = (written + read) / (0.5 + (end - start)). */
   double elapsed = difftime(time(NULL), start);
-  double rate = elapsed > 0.0 ? (double)total_bytes / elapsed : 0.0;
+  double rate = (double)(sent + received) / (0.5 + elapsed);
   char total_buffer[32];
+  char sent_buffer[32];
+  char recv_buffer[32];
   char rate_buffer[32] = {0};
   char human_rate[32] = {0};
   const char* total = stats_bytes(config, total_bytes, total_buffer, sizeof(total_buffer));
+  const char* sent_s = stats_bytes(config, sent, sent_buffer, sizeof(sent_buffer));
+  const char* recv_s = stats_bytes(config, received, recv_buffer, sizeof(recv_buffer));
   const char* rate_str = rate_buffer;
   if (config->human_readable) {
     if (!format_human_size_decimal((unsigned long long)rate, human_rate, sizeof(human_rate)))
@@ -107,23 +118,25 @@ static void report_transfer_stats(const Config* config, int total_files,
   } else {
     snprintf(rate_buffer, sizeof(rate_buffer), "%.2f", rate);
   }
+  double speedup = (sent + received) > 0 ? (double)total_bytes / (double)(sent + received) : 0.0;
   printf("\n");
   printf("Number of files: %d\n", total_files);
   printf("Number of created files: %d\n", total_files);
-  printf("Number of deleted files: 0\n");
+  printf("Number of deleted files: %llu\n", recv->deleted_files);
   printf("Number of regular files transferred: %d\n", total_files);
   printf("Total file size: %s bytes\n", total);
   printf("Total transferred file size: %s bytes\n", total);
   printf("Literal data: %s bytes\n", total);
-  printf("Matched data: 0 bytes\n");
+  printf("Matched data: %llu bytes\n", recv->matched_data);
   printf("File list size: 0\n");
   printf("File list generation time: 0.000 seconds\n");
   printf("File list transfer time: 0.000 seconds\n");
-  printf("Total bytes sent: %s\n", total);
-  printf("Total bytes received: 0\n");
+  printf("Total bytes sent: %s\n", sent_s);
+  printf("Total bytes received: %s\n", recv_s);
   printf("\n");
-  printf("sent %s bytes  received 0 bytes  %s bytes/sec\n", total, rate_str);
-  printf("total size is %s  speedup is %.2f\n", total, 1.0);
+  printf("sent %s bytes  received %s bytes  %s bytes/sec\n", sent_s, recv_s, rate_str);
+  printf("total size is %s  speedup is %.2f%s\n", total, speedup,
+         config->dry_run ? " (DRY RUN)" : "");
   fflush(stdout);
 }
 
@@ -686,13 +699,59 @@ static void mark_sender_done(PipelineContextSender* context) {
   mtx_unlock(&context->mutex_progress);
 }
 
+/* Read the optional STATUS_STATS record (protocol 2.25.0) that the receiver
+ * sends just before its terminal status when report_stats was negotiated.
+ * Consumes the would-delete path list into `would_delete` (optional). */
+static bool receive_stats_record(int fd, ReceiverStats* stats, ArrayList* would_delete) {
+  if (!format_stats_receive(fd, stats))
+    return false;
+  int count = 0;
+  if (!receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
+    return false;
+  for (int i = 0; i < count; i++) {
+    char* path = receive_wire_str(fd);
+    if (!path)
+      return false;
+    if (would_delete) {
+      char* copy = str_dup(path);
+      free(path);
+      if (!copy || !array_list_add(would_delete, copy)) {
+        free(copy);
+        return false;
+      }
+    } else {
+      free(path);
+    }
+  }
+  return true;
+}
+
+/* Strip the transfer-root prefix from a receiver-reported destination-relative
+ * delete path so a `*deleting` line matches rsync's transfer-relative name
+ * (FastSync's destination mirror includes the source's absolute path). */
+static const char* delete_display_path(const Config* config, const char* path) {
+  if (!config || !path || !config->send_directory)
+    return path;
+  const char* root = config->send_directory;
+  while (*root == '/')
+    root++;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  if (root_len == 0)
+    return path;
+  if (strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0'))
+    return path + root_len + (path[root_len] == '/' ? 1 : 0);
+  return path;
+}
+
 /* Send the final STATUS_FINISHED frame and await the receiver's verdict.
    When --remove-source-files is active the receiver acknowledges each data
    file it processed, in send order: STATUS_NEXT means the file was written,
    STATUS_OK means the file was skipped/unchanged.  Skipped sources are marked
    so the later removal pass keeps them. */
 static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources,
-                              bool* delete_limit_out) {
+                              bool* delete_limit_out, ReceiverStats* stats_out) {
   if (delete_limit_out)
     *delete_limit_out = false;
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
@@ -717,6 +776,14 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
   Status status;
   if (!receive_status(client->file_descriptor, &status))
     return false;
+  /* Optional wire-stats frame (protocol 2.25.0) precedes the terminal status. */
+  if (status == STATUS_STATS) {
+    if (!receive_stats_record(client->file_descriptor, stats_out ? stats_out : &(ReceiverStats){0},
+                              NULL))
+      return false;
+    if (!receive_status(client->file_descriptor, &status))
+      return false;
+  }
   /* A capped --max-delete commit is a successful transfer that the client must
      report with rsync's exit code 25 (not an error). */
   if (status == STATUS_DELETE_LIMIT) {
@@ -1433,13 +1500,6 @@ static int send_dry_run_remote(Config* config) {
      dry-run reports the same clear diagnostic instead of aborting mid-stream. */
   if (config_has_basis(config) && !basis_oversize_preflight(config))
     return 1;
-  /* Would-delete reporting requires a receiver-side read-only extras walk that
-     is not implemented yet; be explicit that --delete is a no-op in dry-run
-     rather than silently ignoring it. */
-  if ((config->use_delete || config->delete_missing_args) && !config->quiet)
-    log_message(LOG_LEVEL_WARNING,
-                "--dry-run: would-delete reporting is not available in this release; nothing is "
-                "deleted");
 
   /* A live session may follow, so arm graceful abort handling. */
   client_set_abort_armed(true);
@@ -1461,6 +1521,8 @@ static int send_dry_run_remote(Config* config) {
   PreparedScanner prepared;
   memset(&prepared, 0, sizeof(prepared));
   DirectoryScanner* scanner = NULL;
+  ArrayList* dry_manifest = NULL;
+  ArrayList* dry_dirs = NULL;
   if (!config_send(client->file_descriptor, config))
     goto dry_fail;
   receive_daemon_motd(client, config);
@@ -1473,10 +1535,34 @@ static int send_dry_run_remote(Config* config) {
   int file_count = 0;
   unsigned long long total_bytes = 0;
   char size_buffer[32];
+  /* -n --delete: build the same keep-set manifest a real run would send so the
+     receiver can enumerate (read-only) the destination extras.  Filter-excluded
+     and size-pruned protections are not propagated here, so a filtered dry-run
+     may over-report; the no-filter case is exact. */
+  dry_manifest = config->use_delete ? array_list_create(free) : NULL;
+  if (config->use_delete && !dry_manifest)
+    goto dry_fail;
+  /* Scope the receiver-side extras walk to the receive root (the "." sentinel),
+     exactly as the recursive transfer path does. */
+  if (config->use_delete) {
+    dry_dirs = array_list_create(free);
+    char* root_marker = dry_dirs ? str_dup(".") : NULL;
+    if (!dry_dirs || !root_marker || !array_list_add(dry_dirs, root_marker)) {
+      free(root_marker);
+      if (dry_dirs)
+        array_list_delete(dry_dirs);
+      dry_dirs = NULL;
+      goto dry_fail;
+    }
+  }
   if (!config->quiet)
     printf("Dry run: files to be transferred\n");
   Chunk* chunk;
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    if (dry_manifest && !add_chunk_to_manifest(dry_manifest, chunk)) {
+      chunk_destroy(chunk);
+      goto dry_fail;
+    }
     for (int i = 0; i < chunk->element_count; i++) {
       File* f = chunk->items[i];
       if (!f)
@@ -1538,12 +1624,69 @@ static int send_dry_run_remote(Config* config) {
     goto dry_fail;
   if (io_error)
     log_message(LOG_LEVEL_WARNING, "source scan hit an unreadable directory");
-  /* Terminate the stream so the receiver emits its success frame; no data
-     frame and no delete manifest are ever sent in dry-run. */
+  /* Send the keep-set manifest (no data frames) so the receiver can enumerate
+     the destination extras; an early-timing delete ACKs before it will accept
+     the terminal FINISHED. */
+  bool early_delete = config->use_delete && config_delete_timing_early(config);
+  if (dry_manifest) {
+    if (send_delete_manifest(client->file_descriptor, dry_manifest, NULL, NULL, NULL, dry_dirs) != 0)
+      goto dry_fail;
+    if (early_delete) {
+      Status ack;
+      if (!receive_status_keepalive(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC,
+                                    DELETE_ACK_KEEPALIVE_SEC, client_abort_pending) ||
+          ack != STATUS_OK)
+        goto dry_fail;
+    }
+  }
+  /* Terminate the stream so the receiver emits its success frame; no data frame
+     is ever sent in dry-run. */
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     goto dry_fail;
   Status status;
-  if (!receive_status(client->file_descriptor, &status) || status != STATUS_OK)
+  if (!receive_status(client->file_descriptor, &status))
+    goto dry_fail;
+  if (status == STATUS_STATS) {
+    ReceiverStats stats;
+    memset(&stats, 0, sizeof(stats));
+    ArrayList* would_delete = array_list_create(free);
+    if (!would_delete)
+      goto dry_fail;
+    if (!receive_stats_record(client->file_descriptor, &stats, would_delete)) {
+      array_list_delete(would_delete);
+      goto dry_fail;
+    }
+    /* rsync prints `*deleting   PATH` when itemizing (or `deleting PATH` with
+       --out-format / -v); the plain-total output used here has no delete
+       counterpart, so only the itemize/out-format cases are rendered. */
+    if (!config->quiet && (config->itemize_changes || config->out_format != NULL)) {
+      for (int i = 0; i < would_delete->size; i++) {
+        const char* raw = (const char*)would_delete->items[i];
+        const char* path = delete_display_path(config, raw);
+        if (config->out_format != NULL) {
+          ChangeEvent event;
+          memset(&event, 0, sizeof(event));
+          event.decision = CHANGE_SENT;
+          event.deleted = true;
+          event.name = path;
+          event.path = path;
+          char* line = change_render_format(config->out_format, config, &event);
+          if (line) {
+            printf("%s\n", line);
+            free(line);
+          }
+        } else {
+          char* escaped = output_escape(path, config->eight_bit_output);
+          printf("*deleting   %s\n", escaped ? escaped : path);
+          free(escaped);
+        }
+      }
+    }
+    array_list_delete(would_delete);
+    if (!receive_status(client->file_descriptor, &status))
+      goto dry_fail;
+  }
+  if (status != STATUS_OK)
     goto dry_fail;
   if (!config->quiet) {
     if (config->human_readable)
@@ -1555,6 +1698,10 @@ static int send_dry_run_remote(Config* config) {
   ret = io_error ? 1 : 0;
 
 dry_fail:
+  if (dry_manifest)
+    array_list_delete(dry_manifest);
+  if (dry_dirs)
+    array_list_delete(dry_dirs);
   if (scanner)
     directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);
@@ -2055,7 +2202,10 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       !send_dir_times(client, context->config, context->dir_entries))
     goto send_fail;
   bool delete_limit = false;
-  bool ok = finalize_transfer(client, context->config, context->remove_source_files, &delete_limit);
+  ReceiverStats recv_stats;
+  memset(&recv_stats, 0, sizeof(recv_stats));
+  bool ok = finalize_transfer(client, context->config, context->remove_source_files, &delete_limit,
+                              &recv_stats);
   context->delete_limit = delete_limit;
   if (!ok && context->config->use_delete)
     log_message(LOG_LEVEL_ERROR,
@@ -2066,7 +2216,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   int total_files = context->total_files;
   unsigned long long total_bytes = context->total_bytes;
   mtx_unlock(&context->mutex_progress);
-  report_transfer_stats(context->config, total_files, total_bytes, start);
+  report_transfer_stats(context->config, total_files, total_bytes, start, &recv_stats);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    (double)total_bytes / (double)BYTES_PER_MIB);
   disconnect_transfer_client(client);
@@ -2670,15 +2820,15 @@ int send_files(Config* config) {
   if (!send_dir_times(client, config, dir_entries))
     goto send_fail;
   bool delete_limit = false;
-  bool ok = finalize_transfer(client, config, remove_sources, &delete_limit);
+  ReceiverStats recv_stats;
+  memset(&recv_stats, 0, sizeof(recv_stats));
+  bool ok = finalize_transfer(client, config, remove_sources, &delete_limit, &recv_stats);
   if (!ok && config->use_delete)
     log_message(LOG_LEVEL_ERROR,
                 "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(config, remove_sources);
-  if (config->show_progress && !config->quiet)
-    print_transfer_progress(total_bytes, start, "Done.\n", config->human_readable);
-  report_transfer_stats(config, total_files, total_bytes, start);
+  report_transfer_stats(config, total_files, total_bytes, start, &recv_stats);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    (double)total_bytes / (double)BYTES_PER_MIB);
   /* A skipped source entry (--ignore-errors past an unreadable directory, or a

@@ -56,4 +56,21 @@ bool format_rsync_datetime(time_t when, bool dash, char* buffer, size_t buffer_s
 bool format_dest_state_send(int fd, const OutputDestState* state);
 bool format_dest_state_receive(int fd, OutputDestState* state);
 
+/* End-of-transfer receiver counters reported through STATUS_STATS (protocol
+ * 2.25.0) when the wire config carries report_stats.  `would_delete_count` is
+ * the number of destination-relative paths the receiver would have deleted in a
+ * -n/--dry-run --delete run; that many wire strings immediately follow the
+ * fixed record (sent/read by the caller). */
+typedef struct {
+  unsigned long long matched_data;
+  unsigned long long deleted_files;
+  unsigned long long would_delete_count;
+} ReceiverStats;
+
+/* Fixed-width STATUS_STATS counter record.  The status frame and the optional
+ * would-delete path list are sent/received by the caller.  Returns false on I/O
+ * failure. */
+bool format_stats_send(int fd, const ReceiverStats* stats);
+bool format_stats_receive(int fd, ReceiverStats* stats);
+
 #endif

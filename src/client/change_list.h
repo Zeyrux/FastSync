@@ -35,6 +35,7 @@ typedef struct {
   bool is_symlink;
   bool is_special;
   bool is_hardlink; /* a hard-link sibling (linked, no data sent) */
+  bool deleted;     /* a would-delete report (-n --delete); no source file */
   const char* symlink_target;
   const char* hardlink_target;
   unsigned long long size;       /* source file length in bytes */

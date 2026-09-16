@@ -3270,6 +3270,42 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
 
 /* Public wrappers used outside the commit path (and by unit tests): no
    --max-delete budget. */
+bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, ArrayList* out,
+                                size_t* count_out) {
+  if (count_out)
+    *count_out = 0;
+  if (!config || !manifest || !manifest->keeps || !out)
+    return false;
+  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
+                   (manifest->protected ? manifest->protected->size : 0);
+  DeleteSkipEntry* skips = NULL;
+  if (skip_count > 0) {
+    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
+    if (!skips)
+      return false;
+    int idx = 0;
+    if (config->delay_updates) {
+      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
+      skips[idx].top_level_only = true;
+      idx++;
+    }
+    for (int i = 0; i < config->basis_count; i++) {
+      skips[idx].prefix = config->basis_dirs[i].path;
+      skips[idx].top_level_only = false;
+      idx++;
+    }
+    for (int i = 0; i < manifest->protected->size; i++) {
+      skips[idx].prefix = (const char*)manifest->protected->items[i];
+      skips[idx].top_level_only = false;
+      idx++;
+    }
+  }
+  bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs, skips,
+                               skip_count, out, count_out);
+  free(skips);
+  return ok;
+}
+
 bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
   DeleteBudgetState budget = {
       .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};

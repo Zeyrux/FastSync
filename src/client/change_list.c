@@ -300,6 +300,11 @@ char* change_render_format(const char* format, const Config* config, const Chang
       ok = strbuf_append_char(&line, '%');
       break;
     case 'i': {
+      if (event->deleted) {
+        /* rsync's ITEM_DELETED itemize code: `*deleting  ` (11 chars). */
+        ok = strbuf_append(&line, "*deleting  ");
+        break;
+      }
       char code[12];
       itemize_code(config, event, code);
       ok = strbuf_append(&line, code);

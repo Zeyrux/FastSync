@@ -101,3 +101,30 @@ bool format_dest_state_receive(int fd, OutputDestState* state) {
   state->gid = gid;
   return true;
 }
+
+bool format_stats_send(int fd, const ReceiverStats* stats) {
+  if (!stats)
+    return false;
+  unsigned long long matched = stats->matched_data;
+  unsigned long long deleted = stats->deleted_files;
+  unsigned long long would = stats->would_delete_count;
+  return send_n_data(fd, &matched, sizeof(matched)) && send_n_data(fd, &deleted, sizeof(deleted)) &&
+         send_n_data(fd, &would, sizeof(would));
+}
+
+bool format_stats_receive(int fd, ReceiverStats* stats) {
+  if (!stats)
+    return false;
+  unsigned long long matched = 0;
+  unsigned long long deleted = 0;
+  unsigned long long would = 0;
+  if (!receive_n_data(fd, &matched, sizeof(matched)) ||
+      !receive_n_data(fd, &deleted, sizeof(deleted)) ||
+      !receive_n_data(fd, &would, sizeof(would)))
+    return false;
+  memset(stats, 0, sizeof(*stats));
+  stats->matched_data = matched;
+  stats->deleted_files = deleted;
+  stats->would_delete_count = would;
+  return true;
+}
