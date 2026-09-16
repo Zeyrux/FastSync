@@ -1192,7 +1192,10 @@ static void test_config_basis_wire_rejects_escaping() {
   c->basis_dirs = calloc(1, sizeof(BasisDest));
   c->basis_dirs[0].type = BASIS_DEST_LINK;
   c->basis_dirs[0].path = str_dup("/abs");
-  EXPECT_FALSE(roundtrip_config_ok(c));
+  /* An absolute basis dir is accepted (rsync parity); it is only usable when it
+     lies within the receiver's authorized root, which file_open_secure_parent
+     enforces at lookup time. */
+  EXPECT_TRUE(roundtrip_config_ok(c));
   config_delete(c);
 
   /* A well-formed list still round-trips even with a manually built struct. */
@@ -1225,8 +1228,13 @@ static void test_config_basis_normalization() {
   /* Degenerate values that normalize away to nothing stay rejected. */
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "."), -1);
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ".."), -1);
-  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/abs"), -1);
+  /* An absolute path is canonicalized (leading '/' preserved) and accepted. */
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/abs"), 0);
+  EXPECT_EQ_STR(c->basis_dirs[c->basis_count - 1].path, "/abs");
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/a//b/"), 0);
+  EXPECT_EQ_STR(c->basis_dirs[c->basis_count - 1].path, "/a/b");
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "a/../b"), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/"), -1);
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ""), -1);
   config_delete(c);
 }
