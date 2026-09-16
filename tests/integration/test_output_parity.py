@@ -384,6 +384,41 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
+    def test_out_format_c_delta_mode_divergence(self, shared_server):
+        """Documented residual: with delta enabled, rsync's %c is its 16-byte sum
+        header plus one checksum entry per block (protocol-specific, so it grows
+        with the basis size), while FastSync's %c is the bytes of its own delta
+        handshake.  FastSync's delta %c therefore cannot match rsync numerically;
+        only the whole-file case is aligned.  Pinned here so a future change is
+        noticed."""
+        source = os.path.join(TEST_DATA_DIR, "wire_cd_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_cd_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_cd_rdst")
+        _make_one_file(source, "f.bin", 5000)
+        clean_dir(dest)
+        clean_dir(rdst)
+        fmt = "%c %l"
+        # rsync local default is whole-file; force the block-delta path.
+        rsync_result = _rsync(["-a", "--no-whole-file", "--out-format=" + fmt,
+                               source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest,
+                               flags=["-a", "--incremental", "--delta",
+                                      "--out-format=" + fmt],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        rs_c = int(rsync_result.stdout.split()[0])
+        fs_c = int(result.stdout.split()[0])
+        # No basis exists, so rsync still reports only its sum header.
+        assert rs_c == 16, rsync_result.stdout
+        # FastSync reports its own handshake bytes and is not aligned.
+        assert fs_c > 16, (
+            f"FastSync delta %c changed to {fs_c}; the documented divergence "
+            "may be closable now"
+        )
+
+    @requires_rsync
+    @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("progress_flag", ["--progress", "-P"])
     def test_progress_first_frame_matches_rsync(self, shared_server, progress_flag, mt):
