@@ -136,10 +136,10 @@ void print_usage(void) {
   printf("  --link-dest <dir>   Like --copy-dest, but hard-links the unchanged file from DIR\n");
   printf("                    into the destination (repeatable; earlier DIRs win)\n");
   printf("  --checksum-choice, --cc <alg>  Whole-file checksum algorithm for --incremental/\n");
-  printf("                    --checksum compares.  Accepted: xxh64 (aka xxhash), xxh3,\n");
-  printf("                    xxh128, md5, or auto (default xxh64).  rsync choices FastSync\n");
-  printf("                    does not implement (md4, sha1, none) and the two-name\n");
-  printf("                    transfer,pre-transfer form are rejected by name\n");
+  printf("                    --checksum compares.  Accepted: xxh128 (default), xxh3, xxh64\n");
+  printf("                    (aka xxhash), md5, md4, sha1, or none.  A two-name\n");
+  printf("                    'transfer,pre-transfer' form is accepted like rsync; 'none' as\n");
+  printf("                    the pre-transfer algorithm is rejected with --checksum\n");
   printf("  --checksum-seed <num>  Seed for the whole-file xxHash digest (and the delta\n");
   printf("                    block strong hash, low 32 bits); md5 ignores the seed.  A seed\n");
   printf("                    of 0 (the default) is randomized per transfer, exactly like\n");
@@ -166,7 +166,8 @@ void print_usage(void) {
   printf("                      SSH argv is already built injection-safe)\n");
   printf("  --sendfile          Enable sendfile zero-copy (TCP only; long form only;\n");
   printf("                      -f is bound to --filter, not --sendfile)\n");
-  printf("  --compress-choice <alg>  Compression algorithm (default: zstd)\n");
+  printf("  --compress-choice <alg>  Compression algorithm: zstd (default), lz4, zlib,\n");
+  printf("                    zlibx, none, or auto\n");
   printf("  --zc <alg>          Alias for --compress-choice\n");
   printf("  -v, --verbose       Enable debug logging\n");
   printf("  -q, --quiet         Suppress non-error output\n");

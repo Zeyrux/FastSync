@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <limits.h>
 #include <errno.h>
 
@@ -67,6 +68,8 @@ static void config_set_defaults(Config* config) {
   config->human_readable = false;
   config->ignore_errors = false;
   config->ignore_missing_args = false;
+  config->checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
+  config->cli_exit_code = 0;
   config->filters = NULL;
   config->files_from = NULL;
   config->files_from_set = NULL;
@@ -196,12 +199,13 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          valid_wire_bool(config->dry_run) && checksum_algo_valid(config->checksum_algo) &&
-         identity_wire_valid(config) && valid_wire_bool(config->preserve_atimes) &&
-         valid_wire_bool(config->preserve_crtimes) && valid_wire_bool(config->omit_dir_times) &&
-         valid_wire_bool(config->omit_link_times) && valid_wire_bool(config->preserve_perms) &&
-         valid_wire_bool(config->preserve_times) && valid_wire_bool(config->preserve_owner) &&
-         valid_wire_bool(config->preserve_group) && valid_wire_bool(config->munge_links) &&
-         valid_wire_bool(config->keep_dirlinks) && valid_wire_bool(config->fake_super) &&
+         compression_algo_valid(config->compression_algo) && identity_wire_valid(config) &&
+         valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
+         valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
+         valid_wire_bool(config->preserve_perms) && valid_wire_bool(config->preserve_times) &&
+         valid_wire_bool(config->preserve_owner) && valid_wire_bool(config->preserve_group) &&
+         valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
+         valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
@@ -880,6 +884,14 @@ static bool config_receive_checksum_algo(int fd, int* value) {
   return true;
 }
 
+static bool config_receive_compression_algo(int fd, int* value) {
+  int algo;
+  if (!receive_int(fd, &algo) || !compression_algo_valid(algo))
+    return false;
+  *value = algo;
+  return true;
+}
+
 static bool config_receive_super_mode(int fd, SuperMode* value) {
   int mode;
   if (!receive_int(fd, &mode) || mode < SUPER_MODE_AUTO || mode > SUPER_MODE_OFF)
@@ -1081,6 +1093,9 @@ fail:
 #define CONFIG_SEND_INT_CHECKSUM_ALGO(name) send_int(fd, c->name)
 #define CONFIG_RECV_INT_CHECKSUM_ALGO(name) config_receive_checksum_algo(fd, &c->name)
 
+#define CONFIG_SEND_INT_COMPRESSION_ALGO(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_COMPRESSION_ALGO(name) config_receive_compression_algo(fd, &c->name)
+
 #define CONFIG_SEND_SUPERMODE(name) send_int(fd, (int)c->name)
 #define CONFIG_RECV_SUPERMODE(name) config_receive_super_mode(fd, &c->name)
 
@@ -1156,6 +1171,7 @@ CONFIG_DEFINE_SEND(send_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
 CONFIG_DEFINE_SEND(send_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_SEND(send_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
 CONFIG_DEFINE_SEND(send_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
+CONFIG_DEFINE_SEND(send_codec_options, CONFIG_WIRE_CODEC_FIELDS)
 
 CONFIG_DEFINE_RECV(receive_core_fields, CONFIG_WIRE_CORE_FIELDS)
 CONFIG_DEFINE_RECV(receive_delta_fields, CONFIG_WIRE_DELTA_FIELDS)
@@ -1175,6 +1191,7 @@ CONFIG_DEFINE_RECV(receive_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
 CONFIG_DEFINE_RECV(receive_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_RECV(receive_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
 CONFIG_DEFINE_RECV(receive_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
+CONFIG_DEFINE_RECV(receive_codec_options, CONFIG_WIRE_CODEC_FIELDS)
 
 #undef XSEND
 #undef XRECV
@@ -1292,7 +1309,8 @@ bool config_send_wire_block(int file_descriptor, const Config* config) {
          send_iconv_spec(file_descriptor, config) &&
          send_privilege_options(file_descriptor, config) &&
          send_copy_as_options(file_descriptor, config) &&
-         send_output_options(file_descriptor, config);
+         send_output_options(file_descriptor, config) &&
+         send_codec_options(file_descriptor, config);
 }
 
 bool config_send(int file_descriptor, const Config* config) {
@@ -1363,29 +1381,59 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_iconv_spec(file_descriptor, config, &budget) ||
       !receive_privilege_options(file_descriptor, config, &budget) ||
       !receive_copy_as_options(file_descriptor, config, &budget) ||
-      !receive_output_options(file_descriptor, config, &budget))
+      !receive_output_options(file_descriptor, config, &budget) ||
+      !receive_codec_options(file_descriptor, config, &budget))
     goto error;
-  if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
-      strcmp(config->compress_choice, "none") != 0 &&
-      strcmp(config->compress_choice, "auto") != 0) {
-    char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
-    log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
-                escaped_choice ? escaped_choice : "<allocation failed>");
-    char detail[128];
-    snprintf(detail, sizeof(detail), "unsupported compression choice: %s",
-             escaped_choice ? escaped_choice : "<allocation failed>");
-    send_error_detail(file_descriptor, detail);
-    free(escaped_choice);
+  /* Validate/normalize the negotiated codec.  compress_choice is the human
+   * spelling (NULL or "" when -z was not given); compression_algo is the
+   * concrete codec id the sender used.  They must agree, and "auto" is
+   * canonicalized to FastSync's negotiated default so the stored spelling is
+   * always concrete (a hostile/older client may still send "auto"). */
+  if (config->compress_choice && config->compress_choice[0] != '\0') {
+    int choice_algo = compression_algo_from_name(config->compress_choice);
+    if (choice_algo < 0 && strcasecmp(config->compress_choice, "auto") != 0) {
+      char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
+      log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
+                  escaped_choice ? escaped_choice : "<allocation failed>");
+      char detail[160];
+      snprintf(detail, sizeof(detail), "unsupported compression choice: %s",
+               escaped_choice ? escaped_choice : "<allocation failed>");
+      send_error_detail(file_descriptor, detail);
+      free(escaped_choice);
+      goto error;
+    }
+    if (choice_algo < 0)
+      choice_algo = (int)compression_negotiate_default();
+    if (strcasecmp(config->compress_choice, "auto") == 0 ||
+        choice_algo == (int)COMPRESSION_ALGO_NONE) {
+      const char* canonical = compression_algo_name((CompressionAlgo)choice_algo);
+      char* dup = str_dup(canonical);
+      if (!dup)
+        goto error;
+      free(config->compress_choice);
+      config->compress_choice = dup;
+    }
+    if (config->compression_algo != choice_algo) {
+      log_message(LOG_LEVEL_ERROR, "Compression choice '%s' does not match codec id %d",
+                  config->compress_choice, config->compression_algo);
+      send_error_detail(file_descriptor, "compression choice/codec mismatch");
+      goto error;
+    }
+  }
+  /* The concrete codec must exist only when compression is on.  A client that
+   * left -z off has no codec in effect, but the field keeps whatever id it
+   * carried (the receiver never dispatches on it without use_compression), so
+   * the wire value round-trips untouched. */
+  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Compression requested with the 'none' codec");
+    send_error_detail(file_descriptor, "compression requested with the none codec");
     goto error;
   }
-  /* Defensive: an older/hostile client may still send "auto"; canonicalize it
-     to zstd (its effective choice) so the stored value is always concrete. */
-  if (strcmp(config->compress_choice, "auto") == 0) {
-    char* canonical = str_dup("zstd");
-    if (!canonical)
-      goto error;
-    free(config->compress_choice);
-    config->compress_choice = canonical;
+  /* rsync: "none" as the pre-transfer checksum is invalid with --checksum. */
+  if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
+    send_error_detail(file_descriptor, "checksum-choice 'none' cannot be used with --checksum");
+    goto error;
   }
   if (!validate_received_config(config)) {
     log_message(LOG_LEVEL_ERROR, "Invalid configuration received from client");

@@ -741,6 +741,10 @@ void handler(int file_descriptor) {
    * received config. */
   if (gate_ctx.super_mode_override != -1)
     config->super_mode = (SuperMode)gate_ctx.super_mode_override;
+  /* Install the codec this connection negotiated before the receiver/writer
+   * threads start (the server forks per connection, so the process-global
+   * codec is private to this session). */
+  compression_set_algo((CompressionAlgo)config->compression_algo);
   /* If the client requested ownership but the effective super mode forbids it
    * (operator --no-super, a privileged standalone receiver's secure default, or
    * a daemon module without `client owner = yes`), say so ONCE per connection so
