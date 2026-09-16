@@ -725,6 +725,148 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
   return operation_ok;
 }
 
+/* Read-only mirror of delete_extras_fd: records the paths that WOULD be removed
+   without unlinking anything.  A child directory is reported after its own
+   reportable children (depth-first), matching the delete pass's ordering. */
+static bool list_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep,
+                           const PathIndex* dirs, ArrayList* out, size_t* recorded,
+                           const DeleteSkipEntry* skips, int skip_count, bool parent_deletable,
+                           bool* all_removed) {
+  int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (scanfd < 0)
+    return false;
+  DIR* dir = fdopendir(scanfd);
+  if (!dir) {
+    close(scanfd);
+    return false;
+  }
+  bool operation_ok = true;
+  bool local_survives = false;
+  bool deletable = parent_deletable || is_synced_dir(dirs, rel_path);
+  const struct dirent* entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entry->d_name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    if (path_under_skip_prefix(child_rel, rel_path[0] == '\0', skips, skip_count)) {
+      local_survives = true;
+      free(child_rel);
+      continue;
+    }
+    struct stat st;
+    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno != ENOENT)
+        operation_ok = false;
+      free(child_rel);
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      bool child_all_removed = false;
+      if (childfd >= 0) {
+        if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count,
+                            deletable, &child_all_removed))
+          operation_ok = false;
+        close(childfd);
+      } else if (errno != ENOENT) {
+        operation_ok = false;
+      }
+      bool child_synced = dirs && path_index_contains(dirs, child_rel);
+      if (child_synced || keep_is_dir(keep, child_rel)) {
+        local_survives = true;
+      } else if (child_all_removed && deletable) {
+        size_t len = strlen(child_rel);
+        char* copy = malloc(len + 2);
+        if (!copy) {
+          operation_ok = false;
+        } else {
+          memcpy(copy, child_rel, len);
+          copy[len] = '/';
+          copy[len + 1] = '\0';
+          if (!array_list_add(out, copy)) {
+            free(copy);
+            operation_ok = false;
+          } else {
+            (*recorded)++;
+          }
+        }
+      } else {
+        local_survives = true;
+      }
+    } else {
+      bool found = keep_is_file(keep, child_rel);
+      if (found || !deletable) {
+        local_survives = true;
+      } else {
+        char* copy = str_dup(child_rel);
+        if (!copy || !array_list_add(out, copy)) {
+          free(copy);
+          operation_ok = false;
+        } else {
+          (*recorded)++;
+        }
+      }
+    }
+    free(child_rel);
+  }
+  closedir(dir);
+  *all_removed = !local_survives;
+  return operation_ok;
+}
+
+bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
+                        const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
+                        ArrayList* out, size_t* count_out) {
+  if (count_out)
+    *count_out = 0;
+  if (!manifest || !out)
+    return false;
+  PathIndex keep;
+  if (!build_keep_index(manifest, &keep))
+    return false;
+  PathIndex dirs;
+  bool have_dirs = synced_dirs != NULL;
+  if (have_dirs &&
+      !path_index_build(&dirs, (const char* const*)synced_dirs->items, (size_t)synced_dirs->size)) {
+    path_index_free(&keep);
+    return false;
+  }
+  int rootfd;
+  int root_fd = utils_get_authorized_root_fd();
+  if (root_fd >= 0) {
+    if (utils_get_authorized_root_path())
+      rootfd = utils_open_authorized_destination(dest_root);
+    else if (dest_root == NULL)
+      rootfd = dup(root_fd);
+    else
+      rootfd = -1;
+  } else {
+    rootfd = open(dest_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  }
+  if (rootfd < 0) {
+    path_index_free(&keep);
+    if (have_dirs)
+      path_index_free(&dirs);
+    return false;
+  }
+  bool all_removed = false;
+  size_t recorded = 0;
+  bool ok = list_extras_fd(rootfd, "", &keep, have_dirs ? &dirs : NULL, out, &recorded, skips,
+                           skip_count, false, &all_removed);
+  if (close(rootfd) != 0)
+    ok = false;
+  path_index_free(&keep);
+  if (have_dirs)
+    path_index_free(&dirs);
+  if (count_out)
+    *count_out = recorded;
+  return ok;
+}
+
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,

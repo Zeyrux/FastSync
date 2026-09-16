@@ -1855,8 +1855,8 @@ class TestDelete:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert "Sent " in output and "MB" in output, "--progress produced no stable byte marker"
-        assert "Done." in output, "--progress did not report completion"
+        assert "sending incremental file list" in output, "--progress produced no rsync header"
+        assert "(xfr#" in output, "--progress produced no per-file xfr block"
 
     def test_human_readable_stats(self, shared_server):
         clean_dir(DEST_DIR)
@@ -1891,8 +1891,8 @@ class TestDelete:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert "Sent " in output
-        assert "Done." in output
+        assert "sending incremental file list" in output
+        assert "(xfr#" in output
 
 
 class TestInfo:

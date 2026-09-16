@@ -2775,14 +2775,14 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.24.0).  The values below are the only
+/* The pinned golden frame (protocol 2.25.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
- * per-directory delete-plan wave changes only the version string in the config
- * frame (the frame layout itself is unchanged from 2.23.0); the byte-exact hash
- * is recomputed for the new version bytes. */
-#define GOLDEN_WIRE_LEN 697
-#define GOLDEN_WIRE_HASH 13736055061412501670ULL
+ * per-directory delete-plan wave changed only the version string in the config
+ * frame; the 2.25.0 wire-stats wave appends one report_stats bool.  The
+ * byte-exact values are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 701
+#define GOLDEN_WIRE_HASH 16170466870400670271ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

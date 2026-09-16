@@ -12,6 +12,7 @@
 #include "protocol.h"
 #include "utils.h"
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -57,6 +58,29 @@ bool receiver_send_final_success(int fd, const Config* config, const ReceiverOut
       return false;
   }
   return send_status(fd, final_status);
+}
+
+bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats* stats,
+                               const struct ArrayList* would_delete) {
+  if (!config->report_stats)
+    return true;
+  ReceiverStats local;
+  memset(&local, 0, sizeof(local));
+  const ReceiverStats* out = stats ? stats : &local;
+  size_t count = would_delete ? (size_t)would_delete->size : 0;
+  if (count > (size_t)MAX_MANIFEST_ENTRIES)
+    count = MAX_MANIFEST_ENTRIES;
+  ReceiverStats record = *out;
+  record.would_delete_count = count;
+  if (!send_status(fd, STATUS_STATS) || !format_stats_send(fd, &record) ||
+      !send_int(fd, (int)count))
+    return false;
+  for (size_t i = 0; i < count; i++) {
+    const char* path = (const char*)would_delete->items[i];
+    if (!send_wire_str(fd, path ? path : ""))
+      return false;
+  }
+  return true;
 }
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
@@ -346,7 +370,14 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       if (config->dry_run) {
         /* Server-contacting --dry-run mutates nothing, so a keep-set manifest
            is consumed and discarded.  The early-delete mode still needs its ACK
-           so a sender blocked on the delete handshake is not left hanging. */
+           so a sender blocked on the delete handshake is not left hanging.
+           When would-delete reporting is armed, enumerate (read-only) the
+           destination extras so the terminal STATUS_STATS frame can list them. */
+        if (config->use_delete && sink->would_delete) {
+          size_t count = 0;
+          if (!manifest_would_delete_list(config, manifest, sink->would_delete, &count))
+            log_message(LOG_LEVEL_WARNING, "dry-run: could not enumerate would-delete paths");
+        }
         delete_manifest_free(manifest);
         if (early_delete && !send_status(file_descriptor, STATUS_OK))
           goto fail;
@@ -517,6 +548,10 @@ typedef struct {
   /* Set when a --max-delete commit was capped; the terminal frame then carries
      STATUS_DELETE_LIMIT so the sender exits 25 like rsync. */
   bool delete_limit_reached;
+  /* End-of-transfer wire counters (protocol 2.25.0) and the -n/--dry-run
+     --delete would-delete path list collected while processing the manifest. */
+  ReceiverStats stats;
+  ArrayList* would_delete;
 } ReceiverSaveContext;
 
 static bool receiver_save_file(File* file, void* context_pointer) {
@@ -565,6 +600,8 @@ static void receiver_note_delete_limit(void* context_pointer) {
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
   Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
+  if (!receiver_send_stats_frame(fd, context->config, &context->stats, context->would_delete))
+    return false;
   /* Server-contacting --dry-run: nothing was staged or written, so there is
      nothing to publish and no directory times to stamp. */
   if (context->config->dry_run)
@@ -592,12 +629,22 @@ static bool receiver_send_success_frame(int fd, void* context_pointer) {
 int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
   dir_time_list_init(&context.dir_times);
-  ReceiverSink sink = {receiver_save_file,        &context, true, true, receiver_send_success_frame,
-                       receiver_note_delete_limit};
+  context.would_delete = array_list_create(free);
+  if (!context.would_delete)
+    return -1;
+  ReceiverSink sink = {receiver_save_file,
+                       &context,
+                       true,
+                       true,
+                       receiver_send_success_frame,
+                       receiver_note_delete_limit,
+                       &context.stats,
+                       context.would_delete};
   int ret = receiver_process(config, file_descriptor, &sink);
   if (ret != 0 && config->delay_updates && config->delay_context)
     delay_updates_cleanup(config->delay_context);
   receiver_outcomes_destroy(&context.outcomes);
   dir_time_list_free(&context.dir_times);
+  array_list_delete(context.would_delete);
   return ret;
 }

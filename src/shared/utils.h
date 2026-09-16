@@ -138,6 +138,14 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,
                                        size_t* deleted_out, size_t* skipped_out);
+/* Read-only companion to delete_extras_limited: walk the destination exactly as
+   the delete pass would and APPEND (strdup'd) destination-relative paths that
+   WOULD be removed, without touching disk.  Used for -n/--dry-run --delete
+   would-delete reporting.  Returns true on a clean walk; the caller owns the
+   strings appended to `out` and receives their count in *count_out. */
+bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
+                        const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
+                        ArrayList* out, size_t* count_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
 /* Open the existing destination directory at `dest_root`, confined to the
    authorized root with an O_NOFOLLOW component walk (the same confinement the

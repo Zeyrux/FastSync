@@ -143,6 +143,14 @@ typedef enum {
    stopped part of the work, or DELETE_COMMIT_ERROR on a genuine failure. */
 DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest);
 
+/* -n/--dry-run --delete would-delete reporting: walk the destination exactly as
+   the delete pass would and append (strdup'd) destination-relative paths that
+   WOULD be removed to `out`, without touching disk.  Uses the same staging-dir,
+   basis-dir and protected-prefix skips as the real commit.  Returns true on a
+   clean walk; `*count_out` receives the number of paths appended. */
+bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, ArrayList* out,
+                                size_t* count_out);
+
 /* Outcome of a single file_save_to_disk operation.  The receiver needs to
    distinguish "written" from "skipped" so --remove-source-files can be told
    which sources were actually stored. */

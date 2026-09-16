@@ -195,13 +195,28 @@ enum NET_STATUS {
    * ("." for the receive root); then the child-directory count + names and the
    * child-file count + names that must be kept.  Appended after
    * STATUS_DEST_INFO so no existing status is renumbered. */
-  STATUS_DELETE_PLAN
+  STATUS_DELETE_PLAN,
+  /* End-of-transfer receiver counter report (protocol 2.25.0).  When the wire
+   * config carries report_stats=true, the receiver sends this status once,
+   * immediately before its terminal success status, followed by a fixed stats
+   * record (see format_stats_send/receive in format.h) and, when the run is a
+   * --dry-run with --delete, the would-delete path list.  Appended after
+   * STATUS_DELETE_PLAN so no existing status is renumbered. */
+  STATUS_STATS
 };
 
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
+
+/* Process-wide wire byte counters.  protocol_send_n_data/protocol_receive_n_data
+ * update them; the zero-copy sendfile path reports through
+ * protocol_note_bytes_written.  Used by the client to render rsync's
+ * --stats/--progress totals and the --out-format %b/%c tokens. */
+unsigned long long protocol_bytes_written(void);
+unsigned long long protocol_bytes_read(void);
+void protocol_note_bytes_written(unsigned long long bytes);
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
 /* Transitional bridge for helpers whose signatures still carry only an fd. */
