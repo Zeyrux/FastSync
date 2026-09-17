@@ -671,7 +671,7 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
     if (strcmp(component, ".") != 0) {
       int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (next < 0 && create_dirs && errno == ENOENT) {
-        bool created = mkdirat(fd, component, 0755) == 0;
+        bool created = mkdirat(fd, component, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0;
         if (created || errno == EEXIST) {
           /* P7 Wave E: --copy-as owns EVERY entry, including the intermediate
              directories this walk creates implicitly.  Its target ids are a
@@ -800,7 +800,7 @@ bool file_ensure_directory_secure(const char* path) {
   int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   bool created = false;
   if (dir_fd < 0 && errno == ENOENT) {
-    if (mkdirat(parent_fd, leaf, 0755) == 0) {
+    if (mkdirat(parent_fd, leaf, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0) {
       created = true;
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     } else if (errno == EEXIST) {
