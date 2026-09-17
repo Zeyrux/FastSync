@@ -534,22 +534,10 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
-    @pytest.mark.parametrize("mt", [
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                reason="known gap: the --threads dry-run delete path does not "
-                       "consume the receiver's STATUS_STATS delete list yet, so "
-                       "`-n --delete` emits no *deleting lines (tracked by the "
-                       "parity-blockers STATUS_STATS fix)",
-                strict=False,
-            ),
-        ),
-    ])
+    @pytest.mark.parametrize("mt", [False, True])
     def test_dry_run_delete_lines_match_rsync(self, mt):
         """-n --delete emits transfer-relative `*deleting` lines like rsync
-        (single-threaded; the --threads variant is a documented xfail)."""
+        (single-threaded and --threads)."""
         source = os.path.join(TEST_DATA_DIR, "wire_del_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_del_dst")
         rdst = os.path.join(TEST_DATA_DIR, "wire_del_rdst")

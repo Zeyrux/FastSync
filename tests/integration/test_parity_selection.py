@@ -101,8 +101,15 @@ class TestRelativeGeneral:
                 fs = os.stat(os.path.join(dest, rel))
                 assert (rs.st_mode & 0o7777) == (fs.st_mode & 0o7777), \
                     f"mode mismatch for {rel} with {extra}"
-                assert int(rs.st_mtime) == int(fs.st_mtime), \
-                    f"mtime mismatch for {rel} with {extra}"
+                if extra == ["--no-implied-dirs"]:
+                    # The implied parent directory is created at run time (no
+                    # metadata applied), so rsync's and FastSync's separate runs
+                    # can differ by a second; compare with a tolerance.
+                    assert abs(rs.st_mtime - fs.st_mtime) <= 2, \
+                        f"mtime mismatch for {rel} with {extra}"
+                else:
+                    assert int(rs.st_mtime) == int(fs.st_mtime), \
+                        f"mtime mismatch for {rel} with {extra}"
 
 
 class TestDirsOneLevel:

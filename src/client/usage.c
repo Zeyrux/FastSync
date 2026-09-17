@@ -282,8 +282,8 @@ void print_usage(void) {
   printf("  --partial           Keep partial files on interrupted transfer\n");
   printf("  --partial-dir <dir> Directory for partial files\n");
   printf("  -T, --temp-dir <dir>  Scratch dir for temp files before atomic install.\n");
-  printf("                      Relative dirs resolve below the destination root; absolute\n");
-  printf("                      dirs are used as-is (rsync semantics).  The dir must\n");
+  printf("                      Confined to the receive root: a relative dir resolves below\n");
+  printf("                      it and an absolute/traversal dir is rejected.  The dir must\n");
   printf("                      already exist; a different filesystem falls back to a\n");
   printf("                      non-atomic copy instead of aborting\n");
   printf("  --fastsync-server-path <path>\n");
