@@ -1,4 +1,4 @@
-# FastSync — Session Handoff (2026-09-14)
+# FastSync — Session Handoff (2026-09-17)
 
 ## Current status
 - **Release `v2.21.0`** tagged (`919a729`, "Release v2.21.0"); full CI green
@@ -8,8 +8,8 @@
 - **Release PR #284 (`dev` -> `main`)** open, CI green (run 553).
   `main` is protected: it needs review/approval to merge.
   https://gitea.tap-tap.win/TapTap/FastSync/pulls/284
-- **`PROTOCOL_VERSION` = `"2.23.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.23.0)`.
+- **`PROTOCOL_VERSION` = `"2.26.0"`** (`src/shared/config.h`); CMake
+  `project(FastFileTransfer VERSION 2.26.0)`.
 - Working tree clean; no wave worktrees remain.
 
 ## What landed this session
@@ -39,6 +39,7 @@
    docs state push-only / remote-source unsupported.
 5. **Preserve-attribute split (protocol 2.22.0)** landed on `feat/preserve-attr-split`: per-attribute `-p/-t/-o/-g` + `--no-*` negations, `-a` = `-rlptgoD`, and the 2.21.0 → 2.22.0 wire bump.
 6. **Rsync-parity wave (protocol 2.23.0)** on `feat/rsync-parity`: rsync short options/clustering/attached values (`-r`/`-b`/`-L`/`-B`, `-av`, `-aAX`, `-B1000`, `-essh`, `-MOPT`), `-c` checksum quick-check, `--checksum-choice`/`--compress-choice` validation and seed randomization, rsync timeout/max-alloc defaults, temp-dir confinement + `EXDEV` fallback, ownership/mapping parity (numeric-ids modifier, map ranges/`*`/empty-FROM, `--chown`+map conflicts, fake-super resolved-owner record), verbatim symlink storage with rsync `--safe-links`/`--munge-links`, socket recreation under `--specials`, `--chmod` 3.4.1 semantics, and delete scoping + `--max-delete` partial/exit-25. Wire: appended delete-manifest synchronized-directory section and `STATUS_DELETE_LIMIT`.
+7. **Parity-completion wave (protocol 2.24.0 → 2.26.0)** on `feat/parity-completion`: per-directory delete plans (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`; receiver `STATUS_STATS` counters feeding `--stats`/`--progress` and `--out-format %b/%c/%C`, plus `-n --delete` lines; `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/`none` checksums with `auto` negotiation (default `xxh128`/`zstd`); general `-R`/`--no-implied-dirs`/`-d`; the full filter grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` + modifiers) and corrected `-F`/`-FF`; receiver-side `--chown`/map TO-name resolution; absolute basis dirs + `--link-dest` relink; receiver-side `--ignore-existing` short-circuit; `--preallocate` over `--sparse` via `fallocate(2)`; `--iconv=.`/`-`/`--no-iconv`; lone `-h` help; aliases `--ignore-non-existing`/`--protect-args`/`--msgs2stderr`; and the full `--info`/`--debug` vocabulary. `RSYNC_COMPAT.md` reclassifies the matrix to 109 ✅ / 25 ⚠️ / 23 ❌.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).

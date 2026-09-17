@@ -55,6 +55,16 @@ if(NOT ZSTD_LIBRARY)
   message(FATAL_ERROR "zstd library not found. Ensure it is in your nix-shell!")
 endif()
 
+find_library(ZLIB_LIBRARY z)
+if(NOT ZLIB_LIBRARY)
+  message(FATAL_ERROR "zlib library not found. Ensure zlib1g-dev / nix zlib is available!")
+endif()
+
+find_library(LZ4_LIBRARY lz4)
+if(NOT LZ4_LIBRARY)
+  message(FATAL_ERROR "lz4 library not found. Ensure liblz4-dev / nix lz4 is available!")
+endif()
+
 find_package(OpenSSL REQUIRED)
 
 file(GLOB SHARED_SRCS "src/shared/*.c")
@@ -64,15 +74,15 @@ file(GLOB TEST_SRCS "tests/*.c")
 
 add_executable(server ${SERVER_SRCS} ${SHARED_SRCS})
 target_include_directories(server PRIVATE src/shared src/server src/client)
-target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY} ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
-target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY} ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
 target_include_directories(tests PRIVATE tests src/shared src/server src/client)
-target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY} ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 ```
 
 ### Source Layout
@@ -85,17 +95,23 @@ tests/integration/ — Python pytest integration tests
 ```
 
 ### Dependencies
-- **zstd** — found via `find_library(ZSTD_LIBRARY zstd)`
+- **zstd** — found via `find_library(ZSTD_LIBRARY zstd)` (default compression codec)
+- **zlib** — found via `find_library(ZLIB_LIBRARY z)` (the `zlib`/`zlibx` codecs)
+- **lz4** — found via `find_library(LZ4_LIBRARY lz4)` (the `lz4` codec)
 - **OpenSSL** — found via `find_package(OpenSSL REQUIRED)` (TLS 1.2+ transport)
 - **xxHash** — fetched via `FetchContent` from the upstream repository (delta transfer hashing, v0.8.3)
 - **pthreads** — found via `find_package(Threads REQUIRED)`
 - **C11 standard** — required
 - **CMake 3.22+** — minimum version
 
+The codec matrix (protocol 2.26.0) uses zstd/zlib/lz4 for compression and
+xxHash/OpenSSL for the `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1` checksums
+(`none` needs no library); both codec families are negotiated per transfer.
+
 ## Conventions
 
 - Use `file(GLOB ...)` for source collection (existing pattern).
-- All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
+- All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `${ZLIB_LIBRARY}`, `${LZ4_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
 - Sanitizer support: pass `-DSANITIZER=address`, `-DSANITIZER=thread`, or `-DSANITIZER=undefined` to cmake (live option in CMakeLists.txt).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.

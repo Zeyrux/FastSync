@@ -28,7 +28,7 @@ FastSync uses a producer-consumer transfer pipeline and can combine several
 optimizations for large or high-latency transfers:
 
 - Multithreaded scanning, loading, and sending.
-- Streaming zstd compression with levels 1 through 22.
+- Streaming compression (zstd by default, plus lz4/zlib/zlibx) with levels 1 through 22.
 - Configurable file chunking and compact chunk serialization.
 - `sendfile()` zero-copy transfers over TCP.
 - Batched incremental checks to reduce round trips.
@@ -54,7 +54,8 @@ replacement for every rsync feature or protocol mode.
 - Dry runs (server-contacting since protocol 2.21.0 for server-routed targets),
   excludes, includes, size filters, backups, statistics, and bandwidth
   limiting.
-- Incremental size/mtime checks and optional xxHash64 content checks.
+- Incremental size/mtime checks and optional content checks (`xxh128` by
+  default, selectable with `--checksum-choice`).
 - FastSync-native delta transfer for changed files.
 - Optional mode and timestamp preservation.
 - Delete manifests with server-side delete authorization.
@@ -111,9 +112,14 @@ matrix is classified as parity, caveat, or divergent in
 - Short-option clustering (`-av`, `-aAX`, `-rlpt`) and attached values
   (`-B1000`, `-essh`, `-MOPT`, `--opt=value`) are accepted, matching rsync.
 - `-r`, `-b`, `-L`, and `-B` are parsed with the rsync short names.
-- `--stats` prints the counters FastSync can observe locally; receiver-only
-  counters (matched data, file-list bytes, deleted count) are reported as 0, and
-  `--progress` is an aggregate line rather than a per-file block.
+- `--stats` prints the counters FastSync can observe plus the receiver-only
+  counters (`Matched data`, deleted files) reported over the wire; rsync's
+  per-type `Number of files` breakdown is not reproduced. `--progress` prints
+  rsync-style per-file blocks (without rsync's leading `./` line).
+- Codecs match rsync 3.4.1: `zstd`/`lz4`/`zlib`/`zlibx` compression and
+  `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1`/`none` checksums, negotiated with
+  `auto`; `zlibx` behaves as `zlib`, and the transfer checksum is not separately
+  selectable.
 
 The detailed flag matrix is maintained in
 [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md). It reports each row as **parity**,
@@ -137,16 +143,16 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 |----------|-------------|
 | Positional | `<source> <dest>` — automatic SSH detection if dest contains `:` |
 | `-c, --checksum` | Verify content by checksum instead of size+mtime (implies the incremental checksum quick-check) |
-| `--checksum-choice <alg>` | Whole-file checksum algorithm: `xxh64`/`xxhash` (default), `xxh3`, `xxh128`, `md5`, or `auto`; `md4`/`sha1`/`none` are rejected by name |
-| `-z, --compress [level]` | Enable streaming zstd compression (level 1–22, default 5) |
-| `--compress-choice <alg>` | Compression algorithm: `zstd` (default), `none`, or `auto`; `lz4`/`zlib`/`zlibx` are rejected by name |
+| `--checksum-choice <alg>` | Whole-file checksum algorithm: `xxh128` (default), `xxh3`, `xxh64`/`xxhash`, `md5`, `md4`, `sha1`, `none`, or `auto` (plus rsync's two-name `transfer,pre-transfer` form) |
+| `-z, --compress [level]` | Enable streaming compression (default `zstd`; level 1–22, default 5) |
+| `--compress-choice <alg>` | Compression algorithm: `zstd` (default), `lz4`, `zlib`, `zlibx`, `none`, or `auto` |
 | `--skip-compress <list>` | Skip compression for suffixes (`/`- or `,`-separated); defaults to rsync 3.4.1's built-in suffix list |
 | `-a, --archive` | rsync archive mode (`-rlptgoD`): links, perms, times, owner, group, devices and specials; ownership application stays privilege-gated (not compression/multithreading) |
 | `-j, --threads[=N]` | Multithreading mode; `N` (1–256) sets the parallel scanner worker count, bare `-j`/`--threads` uses the default |
 | `-m` | rsync `--prune-empty-dirs` (short form now rsync-parity) |
 | `-r, --recursive` | Recurse into directories (FastSync is always recursive; accepted for rsync compatibility) |
 | `-d, --dirs` | Transfer the named directory entries without recursing into their contents; aliases `--old-dirs`/`--old-d` |
-| `-R, --relative` | With `--files-from`, preserve each listed entry's relative path below the destination root |
+| `-R, --relative` | Use rsync's relative path semantics (including the `/./` cut); with `--files-from`, preserve each listed entry's relative path below the destination root |
 | `--chunk-serialization` | Chunk serialization (batch all files per chunk; long form only) |
 | `-s` | rsync `--secluded-args` compatibility no-op (remote SSH argv is already injection-safe) |
 | `--sendfile` | Sendfile zero-copy. Incompatible with compression / chunk serialization. TCP only. Long form only. |
@@ -208,9 +214,9 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `-n, --dry-run` | Report what would be transferred without mutating the destination. Since protocol 2.21.0 a server-routed target contacts the receiver and reports would-transfer based on receiver state; a plain local destination keeps the client-side scan. Never mutates or deletes. |
 | `-v, --verbose` | Enable debug logging |
 | `-q, --quiet` | Suppress non-error output |
-| `--progress` | Show a periodic aggregate transfer line (bytes sent, current rate); not rsync's per-file progress block |
+| `--progress` | Show rsync-style per-file progress blocks from the receiver's wire counters (FastSync does not print rsync's leading `./` line) |
 | `-P` | Enables partial-transfer mode + progress output; interrupted writes retain the already-written temp for resumption |
-| `--stats` | Print transfer statistics at end (bytes, files, timing). Receiver-only counters (matched data, file-list bytes, deleted count) are reported as 0 |
+| `--stats` | Print transfer statistics at end (bytes, files, timing), including the receiver-only counters reported over the wire; rsync's per-type `Number of files` breakdown is not reproduced |
 | `-i, --itemize-changes` | Print an rsync-style per-file change line |
 | `--out-format=FORMAT` | Output format for changed files (`%f %n %l %b %M %%`) |
 | `--list-only` | List source files instead of transferring |
@@ -315,10 +321,10 @@ transfer is never aborted.
 4. **Network protocol** — status-code-driven exchange with metadata packing,
    keep-alive, and abort support.
 5. **Incremental check** — the client sends `STATUS_CHECK` + path + size +
-   mtime and, with `--checksum`, a whole-file content checksum (xxHash64 by
-   default, or md5 via `--checksum-choice=md5`/`--cc`, seeded by
-   `--checksum-seed`); the server compares against the destination. Can be
-   batched via `STATUS_CHECK_BATCH` for reduced round-trips.
+    mtime and, with `--checksum`, a whole-file content checksum (`xxh128` by
+    default; selectable via `--checksum-choice`/`--cc`, seeded by
+    `--checksum-seed`); the server compares against the destination. Can be
+    batched via `STATUS_CHECK_BATCH` for reduced round-trips.
 6. **Bandwidth limiting** — token-bucket algorithm with sleep throttling on
    64 KiB write chunks.
 7. **Metadata restoration** — mode via `chmod()`/`fchmod()`, times via
@@ -498,9 +504,9 @@ features without changing the meaning of ordinary compatibility options.
 | Option | Purpose |
 |---|---|
 | `-j`, `--threads[=N]` | Enable the multithreaded scanner/loader/sender pipeline. `N` (1–256) sets the parallel scanner worker count; bare `-j`/`--threads` uses the default. |
-| `-z [level]`, `--compress [level]` | Enable streaming zstd compression, levels 1-22. |
-| `--compress-level <n>` | Set the zstd compression level. |
-| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd`, `none`, and `auto`; `lz4`/`zlib`/`zlibx` are rejected by name. |
+| `-z [level]`, `--compress [level]` | Enable streaming compression (default `zstd`), levels 1-22. |
+| `--compress-level <n>` | Set the compression level. |
+| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` (default), `lz4`, `zlib`, `zlibx`, `none`, and `auto`; `zlibx` behaves as `zlib`. |
 | `--zl <n>` | Alias for `--compress-level`. |
 | `--skip-compress <list>` | Skip compression for `/`- or `,`-separated suffixes; defaults to rsync 3.4.1's built-in list. Incompatible with `--chunk-serialization`. |
 | `--compress-threads <n>` | Use `n` zstd compression workers. Requires compression and a zstd build with threaded support; the setting affects sender CPU work only. |
@@ -514,8 +520,8 @@ features without changing the meaning of ordinary compatibility options.
 | `--server-port <port>` | Select the TCP server port (`--port <port>` and `--port=<port>` are rsync-friendly aliases). |
 | `--tls` | Enable TLS for TCP transport. |
 | `--bwlimit <KB/s>` | Apply token-bucket bandwidth limiting. |
-| `--progress` | Show a periodic aggregate transfer line (throughput; not a per-file block). |
-| `--stats` | Print transfer statistics (receiver-only counters are 0). |
+| `--progress` | Show rsync-style per-file progress blocks from the receiver's wire counters (FastSync omits rsync's leading `./` line). |
+| `--stats` | Print transfer statistics, including the receiver-only counters reported over the wire; rsync's per-type `Number of files` breakdown is not reproduced. |
 | `--timeout <seconds>` | Set the socket **and** per-message protocol I/O timeout. Default `0` = disabled (matching rsync); `0` disables it. |
 | `--contimeout <seconds>` | Connection timeout (default 60, matching rsync); `0` disables it. |
 
@@ -552,7 +558,7 @@ remote SSH argv is already built injection-safe.
 | `-W, --whole-file` | Transfer changed files without delta processing (`--no-whole-file` clears it). |
 | `-B <n>, --block-size <n>` | Delta block size in bytes (alias `--delta-block`). |
 | `-d, --dirs` | Transfer the named directory entries without recursing into their contents (aliases `--old-dirs`/`--old-d`). |
-| `-R, --relative` | With `--files-from`, preserve each listed entry's relative path below the destination root. |
+| `-R, --relative` | Use rsync's relative path semantics (including the `/./` cut); with `--files-from`, preserve each listed entry's relative path below the destination root. |
 | `--files-from <file>` | Read the source file list from FILE (paths relative to the source root). |
 | `--delay-updates` | Put updated files into place only at the end of the transfer. |
 | `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`). |
@@ -573,6 +579,7 @@ remote SSH argv is already built injection-safe.
 | `--include <pattern>` | Include matching paths. Repeatable. |
 | `--exclude-from <file>` | Read exclude patterns from a file. |
 | `--include-from <file>` | Read include patterns from a file. |
+| `-f, --filter=RULE` | Add an rsync-style filter rule (`+`/`-`, `include`/`exclude`, `merge`/`.`, `dir-merge`/`:`, `hide`/`H`, `show`/`S`, `protect`/`P`, `risk`/`R`, `clear`/`!`, and modifiers; repeatable). |
 | `--max-size <bytes>` | Skip files larger than the limit. |
 | `--min-size <bytes>` | Skip files smaller than the limit. |
 | `--max-alloc <SIZE>` | Maximum single allocation (binary units; default 1G; `0` = no local limit). |
@@ -616,7 +623,7 @@ remote SSH argv is already built injection-safe.
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes). |
 | `--no-super` | Forbid those super-user activities even when the receiver is root. |
 | `-l`, `--links` | Copy symlinks as symlinks; the target is stored verbatim (absolute and `..`-bearing targets included), matching rsync. |
-| `-L`, `--copy-links` | Copy symlink referents (a broken referent exits 0). |
+| `-L`, `--copy-links` | Copy symlink referents (a broken referent makes the run exit 23, matching rsync). |
 | `--safe-links` | Skip symlinks whose target points outside the transfer tree (applied on the sender). |
 | `--copy-unsafe-links` | Copy unsafe symlink referents. |
 | `--munge-links` | Rewrite stored symlink targets with rsync's `/rsyncd-munged/` marker. |
@@ -634,8 +641,8 @@ remote SSH argv is already built injection-safe.
 |---|---|
 | `-v`, `--verbose` | Enable debug logging. |
 | `-q`, `--quiet` | Suppress non-error output. |
-| `--progress` | Show a periodic aggregate transfer line (not a per-file block). |
-| `--stats` | Print transfer statistics (receiver-only counters are reported as 0). |
+| `--progress` | Show rsync-style per-file progress blocks (not rsync's leading `./` line). |
+| `--stats` | Print transfer statistics, including the receiver-only counters reported over the wire. |
 | `-i`, `--itemize-changes` | Print an rsync-style per-file change line. |
 | `--out-format=FORMAT` | Output format for changed files (`%f %n %l %b %M %%`). |
 | `--list-only` | List source files instead of transferring. |
@@ -782,7 +789,7 @@ before the module list, before authentication, and the connecting peer address
 
 ## Protocol and Security
 
-FastSync protocol version `2.23.0` is shared by the client and server. The
+FastSync protocol version `2.26.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
 manifests, keep-alives, abort handling, per-file remove-source results, and
@@ -851,14 +858,17 @@ The project will reach the drop-in replacement goal in stages:
    `-L`/`-B`, short-option clustering (`-av`, `-aAX`, `-rlpt`), and attached
    values (`-B1000`, `-essh`, `-MOPT`) all parse.
 2. Add differential tests that compare FastSync and rsync contents, metadata,
-   links, deletes, filters, dry runs, and exit codes.
+   links, deletes, filters, dry runs, and exit codes — **done** for the
+   completion wave's scope; the tests live in `tests/integration/` and skip
+   cleanly when rsync is unavailable.
 3. `-a` implements full rsync `-rlptgoD`; under `-p` the source mode is copied
    exactly (no masking). Ownership application stays privilege-gated, as in
    rsync.
 4. Symlink (verbatim storage), sparse-file, metadata, delete-policy (including
-   `--max-delete` partial + exit 25), and resumable-write semantics are
-   implemented; remaining work is the documented edge cases, which the
-   **Rsync-Parity Wave** section of `RSYNC_COMPAT.md` enumerates honestly.
+   `--max-delete` partial + exit 25, per-directory `--delete-during`/
+   `--delete-delay`), codecs, and resumable-write semantics are implemented;
+   remaining work is the documented edge cases, which the **Parity Completion
+   Wave** section of `RSYNC_COMPAT.md` enumerates honestly.
 5. Add rsync remote-shell and daemon protocol interoperability.
 6. Keep FastSync performance options as negotiated, optional extensions.
 

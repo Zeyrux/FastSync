@@ -4,6 +4,73 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [2.26.0] - 2026-09-17
+
+### Added
+
+- **Parity-completion wave.** Closed the remaining rsync-parity gaps against
+  rsync 3.4.1 and reclassified the inherently non-rsync rows. It moved the wire
+  protocol three times (`2.23.0 → 2.24.0 → 2.25.0 → 2.26.0`).
+  - **Delete timing (2.24.0):** per-directory delete plans
+    (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`. An interrupted
+    during-transfer has already removed the reached directories' extras, while a
+    delayed transfer commits per directory only after the whole transfer
+    succeeds (a late-created extra survives `--delete-delay` but not
+    `--delete-after`). `-R --delete` is scoped to the transferred prefix; empty
+    in-scope source directories survive; dry-run never deletes.
+  - **Wire stats (2.25.0):** `STATUS_STATS` carries the receiver counters
+    (matched data, deleted files) and the dry-run would-delete list. `--stats`
+    prints rsync's protocol-independent lines; `--progress`/`-P` print per-file
+    blocks; `--out-format` gains `%b` (wire bytes), `%c` (block-sum bytes) and
+    `%C` (whole-file digest); `-n --delete` prints escaped `*deleting` lines in
+    the sequential and `--threads` paths.
+  - **Codecs (2.26.0):** `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/
+    `none` checksums, with rsync-style `auto` negotiation (default `xxh128` +
+    `zstd`) and exit-4 rejection of unknown names; the resolved `compression_algo`
+    crosses the wire.
+  - General `-R`/`--relative` (including the `/./` cut) and `--no-implied-dirs`;
+    one-level `-d`/`--dirs` listing for `dir`, `dir/` and `.`; the full filter
+    grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` and
+    modifiers) with `-f` bound to `--filter`; a single `-F` transfers
+    `.rsync-filter` and `-FF` excludes it.
+  - Receiver-side `--chown`/`--usermap`/`--groupmap` TO-name resolution; absolute
+    basis directories and a `--link-dest` relink of an up-to-date destination;
+    a receiver-side `--ignore-existing` short-circuit before any payload;
+    `--preallocate` now wins over `--sparse` via `fallocate(2)`.
+  - Client quick wins: `--iconv=.`/`-`/`--no-iconv`, a lone `-h` prints help, an
+    empty `--files-from` succeeds (exit 0), a broken referent under
+    `-L`/`--copy-unsafe-links` exits 23, the full `--info`/`--debug`
+    vocabularies, and the aliases `--ignore-non-existing`, `--protect-args`,
+    `--msgs2stderr`.
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.23.0 → 2.24.0` (delete plans),
+  `2.24.0 → 2.25.0` (`STATUS_STATS` + `report_stats`), and
+  `2.25.0 → 2.26.0` (codec negotiation + `md4`/`sha1`/`none`).
+- `--checksum-choice`/`--cc` now accepts `md4`, `sha1`, `none` and the two-name
+  form; the negotiated whole-file default is `xxh128`.
+- `--compress-choice`/`--zc` now accepts `lz4`, `zlib`, `zlibx`.
+- `RSYNC_COMPAT.md` reclassifies the matrix: 9 already-parity rows to ✅, 17
+  inherently non-rsync rows to ❌ (native daemon config/auth, batch, privileged
+  xattr namespaces, and the safe-subset device/privilege flags), and the genuine
+  fixes to ✅; new rows cover `--bwlimit`, `--partial`, `--partial-dir`,
+  `--no-whole-file`, `--inc-recursive`/`--no-inc-recursive`, `--protect-args`
+  and `--msgs2stderr`.
+- The client `--help` `--max-delete` text now describes the implemented partial
+  semantics (delete up to N, skip the rest, exit 25).
+
+### Notes
+
+- Remaining documented divergences include the `--stats` per-type file-count
+  breakdown, `%b`/`%c` being FastSync wire counts, `-n --delete` line ordering,
+  the default `--delete` timing (delete-after, not rsync's delete-during),
+  destination-only exclude protection (still sender-derived), `--temp-dir`
+  absolute paths, basis-dir attribute re-application and the 256 MiB whole-file
+  cap, `--fuzzy` tie-breaking, `--bwlimit=0`/decimal rates, `zlibx`==`zlib`, and
+  recursive empty-directory creation.
+- Build: adds zlib and lz4 as link dependencies.
+
 ## [2.23.0] - 2026-09-16
 
 ### Added

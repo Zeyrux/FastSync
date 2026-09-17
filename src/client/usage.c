@@ -75,10 +75,10 @@ void print_usage(void) {
   printf("                      (the default --delete timing; implies --delete)\n");
   printf("  --delete-excluded   Also delete destination files that were excluded on\n");
   printf("                      the source (default protects them, matching rsync)\n");
-  printf("  --max-delete=NUM    Never delete more than NUM destination entries per run;\n");
-  printf("                      if the extras would exceed NUM, nothing is deleted and\n");
-  printf("                      the run fails with a clear error (implies --delete only\n");
-  printf("                      when used with it)\n");
+  printf("  --max-delete=NUM    Delete at most NUM destination entries per run; if the\n");
+  printf("                      extras exceed NUM, the rest are skipped and the run is\n");
+  printf("                      reported as partial (exit 25, matching rsync).  Only\n");
+  printf("                      applies together with --delete\n");
   printf("  --ignore-errors     Continue (and still delete) when a source directory is\n");
   printf("                      unreadable during the scan, instead of aborting with no\n");
   printf("                      deletion\n");
