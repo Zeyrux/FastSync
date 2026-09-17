@@ -144,14 +144,21 @@ static void test_client_delete_null() {
   client_delete(c);
 }
 
-/* Test tcp_set_timeouts with valid values */
+/* Test tcp_set_timeouts: a non-positive value disables the timeout (rsync's
+ * --timeout=0 / --contimeout=0), it is not a "leave unchanged" sentinel. */
 static void test_tcp_set_timeouts() {
-  /* Just verify the function doesn't crash with edge cases */
-  tcp_set_timeouts(0, 0);   /* zero means "don't change" */
-  tcp_set_timeouts(60, 20); /* normal values */
-  tcp_set_timeouts(-1, -1); /* negative means "don't change" */
-  /* If we got here without crashing, the test passes */
-  EXPECT_TRUE(true);
+  tcp_set_timeouts(0, 0);
+  EXPECT_EQ_INT(tcp_get_timeout_sec(), 0);
+  EXPECT_EQ_INT(tcp_get_contimeout_sec(), 0);
+  tcp_set_timeouts(60, 20);
+  EXPECT_EQ_INT(tcp_get_timeout_sec(), 60);
+  EXPECT_EQ_INT(tcp_get_contimeout_sec(), 20);
+  tcp_set_timeouts(-1, -1);
+  EXPECT_EQ_INT(tcp_get_timeout_sec(), 0);
+  EXPECT_EQ_INT(tcp_get_contimeout_sec(), 0);
+  /* Restore finite defaults so later tests that rely on a bounded connect/IO
+   * timeout (e.g. connecting to a non-routable address) cannot block forever. */
+  tcp_set_timeouts(30, 10);
 }
 
 /* Test client_connect with an invalid host (should fail gracefully) */

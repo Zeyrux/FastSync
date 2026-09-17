@@ -448,9 +448,9 @@ static void test_file_restore_executability_rsync_rule() {
 /* The shared metadata_mode_for_policy() helper is the single source of truth
  * used by both the normal metadata path and the --fake-super replay.  It must
  * reproduce the per-attribute split: no mode change when neither -p nor -E is
- * set; -p applies the sanitized source mode (group/other write cleared)
- * regardless of the destination; -E derives exec bits from the destination and
- * --perms wins when both are set. */
+ * set; -p applies the source mode exactly (including group/other write and the
+ * setuid/setgid/sticky bits) regardless of the destination; -E derives exec
+ * bits from the destination and --perms wins when both are set. */
 static void test_metadata_mode_for_policy() {
   mode_t out = 0xdead;
   EXPECT_FALSE(
@@ -459,7 +459,13 @@ static void test_metadata_mode_for_policy() {
 
   EXPECT_TRUE(
       metadata_mode_for_policy(0777, 0644, (FileAttrPolicy){true, false, false, false}, &out));
-  EXPECT_EQ_INT((int)(out & 0777), 0755); /* group/other write always cleared */
+  EXPECT_EQ_INT((int)(out & 0777), 0777); /* group/other write is preserved */
+
+  mode_t specials = (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0672);
+  EXPECT_TRUE(
+      metadata_mode_for_policy(specials, 0644, (FileAttrPolicy){true, false, false, false}, &out));
+  EXPECT_EQ_INT((int)(out & (S_ISUID | S_ISGID | S_ISVTX | 0777)),
+                (int)(S_ISUID | S_ISGID | S_ISVTX | 0672));
 
   /* -E: exec bits derive from the DESTINATION's read bits. */
   EXPECT_TRUE(
@@ -566,6 +572,27 @@ static void test_file_attr_policy_from_config() {
   config_delete(c);
 }
 
+/* Strict rsync parity: -p copies the source's setuid/setgid/sticky bits (they
+ * are attempted, not masked away).  On Linux these are settable on a file the
+ * receiving user owns; a mount that denies them would log a chmod failure. */
+static void test_perms_preserves_special_bits() {
+  const char* path = "temp_special_bits.txt";
+  unlink(path);
+  FileMetadata m = {
+      .mode = (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0755), .uid = getuid(), .gid = getgid()};
+
+  bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
+                                      (FileAttrPolicy){true, false, false, false}, false, false,
+                                      false, NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
+  EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)),
+                (int)(S_ISUID | S_ISGID | S_ISVTX));
+  unlink(path);
+}
+
 static void test_chmod_changes() {
   mode_t result;
   EXPECT_TRUE(chmod_apply(0777, "u=rw,go=r", &result));
@@ -583,8 +610,45 @@ static void test_chmod_changes() {
   EXPECT_EQ_INT(result, 0755);
   EXPECT_FALSE(chmod_apply(0777, "888", &result));
   EXPECT_FALSE(chmod_apply(0777, "10000", &result));
-  EXPECT_FALSE(chmod_apply(0777, "a+X", &result));
   EXPECT_FALSE(chmod_apply(0777, "a+r,", &result));
+
+  /* go+w is honored (rsync gives 0666 from a 0644 file). */
+  EXPECT_TRUE(chmod_apply(0644, "go+w", &result));
+  EXPECT_EQ_INT(result, 0666);
+
+  /* X only sets execute on directories or already-executable files. */
+  EXPECT_TRUE(chmod_apply(0644, "a+X", &result));
+  EXPECT_EQ_INT(result, 0644);
+  EXPECT_TRUE(chmod_apply(0755, "a+X", &result));
+  EXPECT_EQ_INT(result, 0755);
+  EXPECT_TRUE(chmod_apply((mode_t)(S_IFDIR | 0644), "a+X", &result));
+  EXPECT_EQ_INT((int)(result & 0777), 0755);
+  EXPECT_TRUE(S_ISDIR(result));
+
+  /* D/F selectors restrict a clause to directories/files. */
+  EXPECT_TRUE(chmod_apply((mode_t)(S_IFDIR | 0700), "Dg+s", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 02700);
+  EXPECT_TRUE(chmod_apply((mode_t)(S_IFREG | 0644), "Dg+s", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 0644);
+  EXPECT_TRUE(chmod_apply((mode_t)(S_IFREG | 0644), "Fo-w", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 0644);
+  EXPECT_TRUE(chmod_apply((mode_t)(S_IFREG | 0666), "Fo-w", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 0664);
+  EXPECT_TRUE(chmod_apply((mode_t)(S_IFDIR | 0666), "Fo-w", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 0666);
+  EXPECT_FALSE(chmod_apply(0644, "DFu+w", &result));
+
+  /* Special bits: s/t map to setuid/setgid/sticky like rsync. */
+  EXPECT_TRUE(chmod_apply(0755, "u+s", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 04755);
+  EXPECT_TRUE(chmod_apply(0755, "g+s", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 02755);
+  EXPECT_TRUE(chmod_apply(0755, "a+t", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 01755);
+
+  /* Comma-separated clauses accumulate (the CLI joins repeated options). */
+  EXPECT_TRUE(chmod_apply(0644, "g+w,u+x", &result));
+  EXPECT_EQ_INT((int)(result & 07777), 0764);
 }
 
 /* P7 Wave D: symlink metadata is applied with no-follow primitives, and -J
@@ -722,5 +786,6 @@ void test_metadata() {
   test_file_restore_metadata_fd_attribute_split();
   test_file_attr_policy_from_config();
   test_file_restore_symlink_metadata();
+  test_perms_preserves_special_bits();
   test_chmod_changes();
 }

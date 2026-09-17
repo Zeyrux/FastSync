@@ -3,5 +3,6 @@
 
 void print_usage(void);
 void print_debug_usage(void);
+void print_info_usage(void);
 
 #endif

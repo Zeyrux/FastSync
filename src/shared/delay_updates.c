@@ -264,6 +264,20 @@ static bool delay_publish_entry(DelayUpdatesContext* context, const Config* conf
                                 const StagedFileEntry* entry) {
   if (!delay_publish_backup(context, config, entry))
     return false;
+  /* --force: an incoming regular file/symlink may replace a destination
+     DIRECTORY (possibly non-empty).  The immediate-install path handles this in
+     file_receive; a --delay-updates run stages elsewhere and only discovers the
+     blocking directory here, so clear it before the rename (rsync's
+     "could not make way for new regular file" without --force). */
+  if (config && config->force_delete && file_directory_exists_secure(entry->final_path)) {
+    if (!file_remove_tree_secure(entry->final_path)) {
+      char* escaped = output_escape(entry->final_path, false);
+      log_message(LOG_LEVEL_ERROR, "could not remove destination directory blocking '%s': %s",
+                  escaped ? escaped : "<allocation failed>", strerror(errno));
+      free(escaped);
+      return false;
+    }
+  }
   if (!file_rename_secure(entry->staged_path, entry->final_path)) {
     if (errno == EXDEV) {
       char* escaped = output_escape(entry->final_path, false);

@@ -41,10 +41,26 @@ typedef struct PipelineContextReceiver {
      transfer truly succeeded.  NULL in the early delete modes (which delete at
      the manifest). */
   DeleteManifest* deferred_manifest;
+  /* Per-directory delete session for --delete-delay: receive_thread snapshots
+     each plan's extras as it arrives and hands the session here instead of
+     committing while the disk writer may still be draining; server.c commits it
+     after both threads joined.  NULL for every other timing. */
+  DeletePlanSession* deferred_plans;
+  /* Set by server.c when the deferred delete commit hit the --max-delete
+     budget; the terminal success frame then carries STATUS_DELETE_LIMIT
+     (rsync exit 25) while the transfer itself still succeeds. */
+  bool delete_limit_reached;
   /* P7 Wave D: directory metadata collected by write_thread from received
      directory entries.  Only write_thread mutates it (before it joins); the
      caller (server.c) applies it after the delete/delay-updates phase. */
   DirTimeList dir_times;
+  /* End-of-transfer wire counters (protocol 2.25.0).  receive_thread accumulates
+     matched_data under `mutex`; server.c adds the delete-commit tallies after
+     both threads join and emits the STATUS_STATS frame. */
+  ReceiverStats stats;
+  /* -n/--dry-run --delete would-delete path list, collected by receive_thread
+     and reported in the STATUS_STATS frame. */
+  struct ArrayList* would_delete;
 } PipelineContextReceiver;
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,

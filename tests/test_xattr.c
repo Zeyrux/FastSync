@@ -377,13 +377,12 @@ static void test_fake_super_restore() {
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 07777), 0751);
 
-  /* Mode sanitization: the normal metadata path never grants group/other write
-     bits, and fake-super replay must not re-add them (a recorded 0666 restores
-     as 0644, never as world-writable). */
+  /* Strict rsync parity: -p restores the recorded mode exactly, including
+     group/other write (a recorded 0666 restores as 0666). */
   fake_super_store_fd(fd, 1001, 1002, 0666, 1700000000, 0);
   EXPECT_TRUE(fake_super_restore_fd(fd, policy));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0666);
 
   /* Restore with a malformed record must skip without failing. */
   time_t before = st.st_mtime;
@@ -400,14 +399,12 @@ static void test_fake_super_restore() {
   unlink(path);
 }
 
-/* --fake-super owner replay must honor the super gate and copy-as authority:
-   --no-super suppresses the recorded-source-owner chown even for root, and an
-   active --copy-as keeps its forced owner (the recorded source owner must never
-   override it).  Root-gated: only root can observe a chown actually landing. */
-static void test_fake_super_owner_gate() {
-  if (geteuid() != 0)
-    return; /* non-root cannot observe ownership changes; skip silently */
-  const char* path = "test_fake_super_owner_gate.txt";
+/* --fake-super must NEVER perform a real chown: fake_super_restore_fd applies
+ * only mode/mtime and leaves the entry's uid/gid exactly as they were, even
+ * when an explicit ownership policy is active and super_mode permits it.  This
+ * is observable unprivileged (the file's owner is simply unchanged). */
+static void test_fake_super_no_real_chown() {
+  const char* path = "test_fake_super_nochown.txt";
   unlink(path);
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (fd < 0)
@@ -418,61 +415,32 @@ static void test_fake_super_owner_gate() {
   if (!has_xattr) {
     close(fd);
     unlink(path);
-    return; /* filesystem without xattr support */
-  }
-  if (fchown(fd, 0, 0) != 0) {
-    close(fd);
-    unlink(path);
     return;
   }
+  struct stat before;
+  EXPECT_EQ_INT(fstat(fd, &before), 0);
   fake_super_store_fd(fd, 12345, 12346, 0755, 1700000000, 0);
 
   Config* c = config_create();
   FileAttrPolicy policy = {true, true, false, false};
   EXPECT_NOT_NULL(c);
-
-  /* An explicit ownership policy is required before fake-super replay may
-     chown; --fake-super alone only records the source owner (A2). */
-  c->numeric_ids = true;
-
-  /* --no-super: the owner leg is skipped even as root. */
-  c->super_mode = SUPER_MODE_OFF;
-  EXPECT_TRUE(identity_set_active(c));
-  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
-  struct stat st;
-  EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)st.st_uid, 0);
-  EXPECT_EQ_INT((int)st.st_gid, 0);
-
-  /* AUTO with an identity policy: the recorded source owner is applied. */
-  c->super_mode = SUPER_MODE_AUTO;
-  EXPECT_TRUE(identity_set_active(c));
-  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
-  EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)st.st_uid, 12345);
-  EXPECT_EQ_INT((int)st.st_gid, 12346);
-
-  /* --super / --fake-super with NO explicit identity flag must NOT apply a
-     client-chosen owner: super_mode alone never enables ownership. */
-  EXPECT_EQ_INT(fchown(fd, 0, 0), 0);
-  c->numeric_ids = false;
+  /* The strongest ownership request available plus permitted super mode. */
+  c->preserve_owner = true;
+  c->preserve_group = true;
+  c->chown_uid_set = true;
+  c->chown_uid = 12345;
+  c->chown_gid_set = true;
+  c->chown_gid = 12346;
   c->super_mode = SUPER_MODE_ON;
+  c->fake_super = true;
   EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(fake_super_restore_fd(fd, policy));
-  EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)st.st_uid, 0);
-  EXPECT_EQ_INT((int)st.st_gid, 0);
-
-  /* Active --copy-as is authoritative: the recorded source owner must not
-     override it, even with AUTO/ON. */
-  c->copy_as_set = true;
-  c->copy_as_uid = 777;
-  c->copy_as_gid = 778;
-  EXPECT_TRUE(identity_set_active(c));
-  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
-  EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)st.st_uid, 0);
-  EXPECT_EQ_INT((int)st.st_gid, 0);
+  struct stat after;
+  EXPECT_EQ_INT(fstat(fd, &after), 0);
+  EXPECT_EQ_INT((int)after.st_uid, (int)before.st_uid);
+  EXPECT_EQ_INT((int)after.st_gid, (int)before.st_gid);
+  /* Mode is still replayed (policy-gated). */
+  EXPECT_EQ_INT((int)(after.st_mode & 0777), 0755);
 
   identity_clear_active();
   config_delete(c);
@@ -480,64 +448,99 @@ static void test_fake_super_owner_gate() {
   unlink(path);
 }
 
-/* MAJOR 1: the --fake-super owner replay must honor the per-side -o/-g split.
- * With only -o (preserve_owner) requested the recorded GROUP must be left
- * untouched, and with only -g (preserve_group) the recorded OWNER must be left
- * untouched.  Root-gated: only root can observe a chown actually landing. */
-static void test_fake_super_owner_group_split() {
-  if (geteuid() != 0)
-    return; /* non-root cannot observe ownership changes; skip silently */
-  const char* path = "test_fake_super_owner_group_split.txt";
-  unlink(path);
-  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0)
-    return;
-  bool has_xattr = setxattr(path, "user.fastsync.xprobe", "p", 1, 0) == 0;
-  if (has_xattr)
-    removexattr(path, "user.fastsync.xprobe");
-  if (!has_xattr) {
-    close(fd);
-    unlink(path);
-    return; /* filesystem without xattr support */
-  }
-  if (fchown(fd, 0, 0) != 0) {
-    close(fd);
-    unlink(path);
-    return;
-  }
-  fake_super_store_fd(fd, 12345, 12346, 0755, 1700000000, 0);
+/* identity_resolve_storage_ids() is what --fake-super RECORDS: the resolved
+ * mapping for a requested side, and the source's own id for a side never
+ * requested.  Also pins the #286 rule that --numeric-ids alone never activates
+ * ownership (it is only a mapping modifier). */
+static void test_fake_super_storage_resolution() {
+  uint32_t uid = 0, gid = 0;
 
+  /* --numeric-ids alone is INERT: no ownership request, storage unchanged. */
   Config* c = config_create();
-  FileAttrPolicy policy = {true, true, false, false};
   EXPECT_NOT_NULL(c);
-  struct stat st;
+  c->numeric_ids = true;
+  EXPECT_TRUE(identity_set_active(c));
+  EXPECT_FALSE(identity_active_enabled());
+  EXPECT_FALSE(identity_owner_requested());
+  EXPECT_FALSE(identity_group_requested());
+  identity_resolve_storage_ids(12345, 6789, &uid, &gid);
+  EXPECT_EQ_INT((int)uid, 12345);
+  EXPECT_EQ_INT((int)gid, 6789);
+  config_delete(c);
 
-  /* -o only: the owner is applied, the group stays at its current value (0). */
+  /* --fake-super with no ownership request records the raw source ids. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->fake_super = true;
+  EXPECT_TRUE(identity_set_active(c));
+  identity_resolve_storage_ids(12345, 6789, &uid, &gid);
+  EXPECT_EQ_INT((int)uid, 12345);
+  EXPECT_EQ_INT((int)gid, 6789);
+
+  /* -o + --numeric-ids: raw owner, un-requested group stays the source gid. */
   c->preserve_owner = true;
-  c->preserve_group = false;
+  c->numeric_ids = true;
   EXPECT_TRUE(identity_set_active(c));
-  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
-  EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)st.st_uid, 12345);
-  EXPECT_EQ_INT((int)st.st_gid, 0);
+  identity_resolve_storage_ids(12345, 6789, &uid, &gid);
+  EXPECT_EQ_INT((int)uid, 12345);
+  EXPECT_EQ_INT((int)gid, 6789);
 
-  /* -g only: the group is applied, the owner stays at its current value (0). */
-  EXPECT_EQ_INT(fchown(fd, 0, 0), 0);
-  c->preserve_owner = false;
-  c->preserve_group = true;
+  /* --chown overrides both sides. */
+  c->chown_uid_set = true;
+  c->chown_uid = 777;
+  c->chown_gid_set = true;
+  c->chown_gid = 778;
   EXPECT_TRUE(identity_set_active(c));
-  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
-  EXPECT_EQ_INT(fstat(fd, &st), 0);
-  EXPECT_EQ_INT((int)st.st_uid, 0);
-  EXPECT_EQ_INT((int)st.st_gid, 12346);
+  identity_resolve_storage_ids(12345, 6789, &uid, &gid);
+  EXPECT_EQ_INT((int)uid, 777);
+  EXPECT_EQ_INT((int)gid, 778);
+
+  /* A usermap match beats --chown on the owner side only. */
+  c->usermap_count = 1;
+  c->usermap = calloc(1, sizeof(IdentityMap));
+  EXPECT_NOT_NULL(c->usermap);
+  c->usermap[0].from = IDENTITY_MATCH_ANY;
+  c->usermap[0].to = 999;
+  EXPECT_TRUE(identity_set_active(c));
+  identity_resolve_storage_ids(12345, 6789, &uid, &gid);
+  EXPECT_EQ_INT((int)uid, 999);
+  EXPECT_EQ_INT((int)gid, 778);
+
+  /* --copy-as is authoritative for both sides. */
+  c->copy_as_set = true;
+  c->copy_as_uid = 111;
+  c->copy_as_gid = 222;
+  EXPECT_TRUE(identity_set_active(c));
+  identity_resolve_storage_ids(12345, 6789, &uid, &gid);
+  EXPECT_EQ_INT((int)uid, 111);
+  EXPECT_EQ_INT((int)gid, 222);
 
   identity_clear_active();
   config_delete(c);
-  close(fd);
-  unlink(path);
+}
+
+/* xattr_list_clone deep-copies names/values (used by the deferred directory
+ * metadata accumulator), so the clone stays valid after the original is freed. */
+static void test_xattr_list_clone() {
+  EXPECT_NULL(xattr_list_clone(NULL));
+  FileXattrList* list = xattr_list_new();
+  EXPECT_NOT_NULL(list);
+  EXPECT_TRUE(xattr_list_append(list, "user.a", "1", 1));
+  EXPECT_TRUE(xattr_list_append(list, "user.b", "22", 2));
+  FileXattrList* clone = xattr_list_clone(list);
+  EXPECT_NOT_NULL(clone);
+  EXPECT_EQ_INT(clone->count, 2);
+  EXPECT_EQ_STR(clone->items[0].name, "user.a");
+  EXPECT_EQ_INT((int)clone->items[1].value_len, 2);
+  EXPECT_TRUE(memcmp(clone->items[1].value, "22", 2) == 0);
+  EXPECT_TRUE(clone->items[0].name != list->items[0].name);
+  xattr_list_free(list);
+  EXPECT_EQ_STR(clone->items[0].name, "user.a");
+  xattr_list_free(clone);
 }
 
 void test_xattr() {
+  test_xattr_list_clone();
   test_xattr_wire_roundtrip();
   test_xattr_reject_privileged_namespace();
   test_xattr_reject_oversized_value();
@@ -547,6 +550,6 @@ void test_xattr() {
   test_xattr_receive_drops_acl_without_preserve_acls();
   test_link_copy_fallback_preserves_xattrs();
   test_fake_super_restore();
-  test_fake_super_owner_gate();
-  test_fake_super_owner_group_split();
+  test_fake_super_no_real_chown();
+  test_fake_super_storage_resolution();
 }

@@ -566,7 +566,7 @@ static Config* make_late_delete_config(const char* root) {
 
 static int run_pending_receiver(Config* cfg, int fd, DeleteManifest** pending) {
   ReceiverSink sink = {0};
-  return receiver_process_pending(cfg, fd, &sink, pending);
+  return receiver_process_pending(cfg, fd, &sink, pending, NULL);
 }
 
 static void test_late_manifest_abort_frees_keepset() {
@@ -582,6 +582,7 @@ static void test_late_manifest_abort_frees_keepset() {
   EXPECT_TRUE(send_str(p[1], "keep.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_ABORT));
 
   DeleteManifest* pending = NULL;
@@ -606,6 +607,7 @@ static void test_late_manifest_eof_frees_keepset() {
   EXPECT_TRUE(send_str(p[1], "keep.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
   shutdown(p[1], SHUT_WR);
 
   DeleteManifest* pending = NULL;
@@ -630,11 +632,13 @@ static void test_late_second_manifest_frees_both() {
   EXPECT_TRUE(send_str(p[1], "first.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
   EXPECT_TRUE(send_status(p[1], STATUS_MANIFEST));
   EXPECT_TRUE(send_int(p[1], 1));
   EXPECT_TRUE(send_str(p[1], "second.txt"));
   EXPECT_TRUE(send_int(p[1], 0)); /* protected-prefix section is empty */
   EXPECT_TRUE(send_int(p[1], 0)); /* missing-args section is empty */
+  EXPECT_TRUE(send_int(p[1], 0)); /* synchronized-directories section is empty */
 
   DeleteManifest* pending = NULL;
   EXPECT_EQ_INT(run_pending_receiver(cfg, p[0], &pending), -1);
@@ -645,9 +649,10 @@ static void test_late_second_manifest_frees_both() {
   config_delete(cfg);
 }
 
-/* A delete-manifest frame with a third (missing-args) section round-trips: the
-   receiver keeps all three sections and the missing paths are confined exactly
-   like the keep-set (a traversal entry in the missing section is rejected).
+/* A delete-manifest frame with all four sections round-trips: the receiver
+   keeps the keep-set, protected prefixes, missing-args paths and synchronized
+   directories, and every section is confined exactly like the keep-set (a
+   traversal entry in the missing section is rejected).
    receive_manifest_entries() reads the counts directly (the leading
    STATUS_MANIFEST code is consumed by the caller, so these frames do not send
    it). */
@@ -666,6 +671,9 @@ static void test_receive_manifest_three_sections() {
   EXPECT_TRUE(send_int(p[1], 2));
   EXPECT_TRUE(send_str(p[1], "gone.txt"));
   EXPECT_TRUE(send_str(p[1], "dir/gone.bin"));
+  EXPECT_TRUE(send_int(p[1], 2));
+  EXPECT_TRUE(send_str(p[1], "."));
+  EXPECT_TRUE(send_str(p[1], "dir"));
 
   DeleteManifest* manifest = receive_manifest_entries(p[0]);
   EXPECT_NOT_NULL(manifest);
@@ -676,9 +684,12 @@ static void test_receive_manifest_three_sections() {
   EXPECT_EQ_INT(manifest->missing->size, 2);
   EXPECT_EQ_STR((char*)manifest->missing->items[0], "gone.txt");
   EXPECT_EQ_STR((char*)manifest->missing->items[1], "dir/gone.bin");
+  EXPECT_EQ_INT(manifest->dirs->size, 2);
+  EXPECT_EQ_STR((char*)manifest->dirs->items[0], ".");
+  EXPECT_EQ_STR((char*)manifest->dirs->items[1], "dir");
   delete_manifest_free(manifest);
 
-  /* A traversal entry in the third section is rejected like every other. */
+  /* A traversal entry in the missing section is rejected like every other. */
   EXPECT_TRUE(send_int(p[1], 0));
   EXPECT_TRUE(send_int(p[1], 0));
   EXPECT_TRUE(send_int(p[1], 1));
@@ -780,12 +791,13 @@ static void test_receiver_pending_commits_missing_args() {
   EXPECT_TRUE(send_int(p[1], 2));
   EXPECT_TRUE(send_str(p[1], "gone.txt"));
   EXPECT_TRUE(send_str(p[1], "never_here.txt"));
+  EXPECT_TRUE(send_int(p[1], 0)); /* no synchronized directories */
   EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
 
   /* NULL pending: the single-threaded commit path deletes at FINISHED.  The
      sink sends the terminal STATUS_OK success frame. */
   ReceiverSink sink = {.send_success = true};
-  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL), 0);
+  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL, NULL), 0);
   Status ack;
   EXPECT_TRUE(receive_status(p[1], &ack));
   EXPECT_EQ_INT(ack, STATUS_OK);
@@ -818,9 +830,23 @@ static void test_special_socket_path_log_escaped() {
   set_log_level(LOG_LEVEL_WARNING);
   log_set_8_bit_output(false);
 
+  const char* root = "test_special_sock_escape_root";
+  const char* existing = "test_special_sock_escape_root/evil\npath";
+  unlink(existing);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  FILE* planted = fopen(existing, "wb");
+  EXPECT_NOT_NULL(planted);
+  fclose(planted);
+
   FILE* capture = tmpfile();
   EXPECT_NOT_NULL(capture);
   log_set_file(capture);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->preserve_specials = true;
+  cfg->use_metadata = true;
 
   File* file = file_create("evil\npath");
   EXPECT_NOT_NULL(file);
@@ -829,7 +855,9 @@ static void test_special_socket_path_log_escaped() {
   EXPECT_NOT_NULL(file->metadata);
   file->metadata->mode = S_IFSOCK | 0644;
 
-  FileSaveResult result = file_save_to_disk_full("/tmp/dst", file, NULL);
+  /* A non-matching entry already occupies the path: the socket creation is
+     refused and the warning must escape the path's control byte. */
+  FileSaveResult result = file_save_to_disk_full(root, file, cfg);
   EXPECT_EQ_INT(result, FILE_SAVE_SKIPPED);
 
   fflush(capture);
@@ -841,8 +869,11 @@ static void test_special_socket_path_log_escaped() {
   log_set_file(NULL);
   fclose(capture);
   file_destroy(file);
+  config_delete(cfg);
+  unlink(existing);
+  rmdir(root);
 
-  EXPECT_NOT_NULL(strstr(output, "socket not recreated: evil\\#012path"));
+  EXPECT_NOT_NULL(strstr(output, "refusing to replace existing entry with socket: evil\\#012path"));
 }
 
 /* B1: a client-planted FIFO at the destination must not block the receiver's
@@ -1041,10 +1072,10 @@ static void test_incremental_check_basis_fifo_does_not_hang() {
     EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
     EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
     /* config_has_basis() makes the request carry the source digest. */
-    uint8_t wire_len = 8;
-    uint8_t digest[8] = {0};
+    uint8_t wire_len = checksum_digest_len((ChecksumAlgo)cfg->checksum_algo);
+    uint8_t digest[CHECKSUM_MAX_DIGEST_LEN] = {0};
     EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
-    EXPECT_TRUE(send_n_data(p[1], digest, sizeof(digest)));
+    EXPECT_TRUE(send_n_data(p[1], digest, wire_len));
     Status s;
     EXPECT_TRUE(receive_status(p[1], &s));
     EXPECT_EQ_INT(s, STATUS_NEXT);
@@ -1097,6 +1128,56 @@ static void test_receive_manifest_total_entry_cap() {
   config_delete(cfg);
 }
 
+/* A server-contacting --dry-run must never delete, even on the per-directory
+   (--delete-during/--delete-delay) commit path.  The receive path already skips
+   plan application under -n, but a plan frame carrying --delete-missing-args
+   exact deletions used to be honored by delete_plan_session_commit().  Seed a
+   destination mirror, stream a plan naming it, and prove it survives. */
+static void test_dry_run_delete_plan_commit_does_not_delete() {
+  char* root = make_check_root("drydelplan");
+  EXPECT_NOT_NULL(root);
+  write_check_file(root, "victim.txt", "must survive");
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  cfg->delete_during = true;
+  cfg->delete_missing_args = true;
+  cfg->dry_run = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  EXPECT_TRUE(send_status(p[1], STATUS_DELETE_PLAN));
+  EXPECT_TRUE(send_int(p[1], 1)); /* first frame carries the config sections */
+  EXPECT_TRUE(send_int(p[1], 0)); /* protected prefixes */
+  EXPECT_TRUE(send_int(p[1], 0)); /* size-skipped prefixes */
+  EXPECT_TRUE(send_int(p[1], 1)); /* missing-args exact deletions */
+  EXPECT_TRUE(send_str(p[1], "victim.txt"));
+  EXPECT_TRUE(send_str(p[1], ".")); /* receive root plan */
+  EXPECT_TRUE(send_int(p[1], 0));   /* kept child directories */
+  EXPECT_TRUE(send_int(p[1], 0));   /* kept child files */
+  EXPECT_TRUE(send_status(p[1], STATUS_FINISHED));
+
+  ReceiverSink sink = {.send_success = true};
+  EXPECT_EQ_INT(receiver_process_pending(cfg, p[0], &sink, NULL, NULL), 0);
+
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/victim.txt", root);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
+  remove(path);
+  rmdir(root);
+  free(root);
+}
+
 void test_server() {
   test_special_socket_path_log_escaped();
   if (!is_running_under_valgrind()) {
@@ -1119,5 +1200,6 @@ void test_server() {
     test_receive_manifest_three_sections();
     test_manifest_delete_missing_args();
     test_receiver_pending_commits_missing_args();
+    test_dry_run_delete_plan_commit_does_not_delete();
   }
 }

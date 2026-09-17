@@ -20,7 +20,9 @@
 #include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <langinfo.h>
 #include <limits.h>
+#include <locale.h>
 #include <time.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -117,6 +119,27 @@ static int set_string_option(char** dest, const char* value, const char* option_
   return 0;
 }
 
+/* Append a --chmod clause list to the accumulated spec with a comma.  rsync
+ * 3.2.4+ makes repeated --chmod options cumulative, so they must not replace
+ * the previous ones.  Returns 0 on success, -1 on failure. */
+static int append_chmod_spec(char** dest, const char* value) {
+  if (!*dest)
+    return set_string_option(dest, value, "--chmod");
+  size_t old_len = strlen(*dest);
+  size_t add_len = strlen(value);
+  char* merged = malloc(old_len + add_len + 2);
+  if (!merged) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --chmod");
+    return -1;
+  }
+  memcpy(merged, *dest, old_len);
+  merged[old_len] = ',';
+  memcpy(merged + old_len + 1, value, add_len + 1);
+  free(*dest);
+  *dest = merged;
+  return 0;
+}
+
 /* Parse a string as a positive integer into *dest. Returns 0 on success, -1 on error. */
 static int set_positive_int_option(int* dest, const char* value, const char* option_name) {
   if (!parse_positive_int(value, dest)) {
@@ -126,30 +149,97 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
   return 0;
 }
 
-/* Set and validate the compression algorithm selected by the client. */
+/* Set and validate the compression algorithm selected by the client.  rsync
+ * 3.4.1 can be built with zstd, none, lz4, zlibx, zlib and auto; all of those
+ * names are accepted and mapped to a real codec here.  "auto" resolves through
+ * FastSync's compiled-in preference order (rsync 3.4.1's list).  An unknown
+ * name is a hard error with rsync's exit code 4, never a silent no-op. */
 static int set_compression_choice(Config* config, const char* value) {
-  if (strcmp(value, "zstd") != 0 && strcmp(value, "none") != 0) {
-    log_message(LOG_LEVEL_ERROR, "--compress-choice must be zstd or none");
+  if (!value) {
+    config->cli_exit_code = 4;
     return -1;
   }
-  if (set_string_option(&config->compress_choice, value, "--compress-choice") != 0)
+  int algo;
+  if (strcasecmp(value, "auto") == 0)
+    algo = (int)compression_negotiate_default();
+  else
+    algo = compression_algo_from_name(value);
+  if (algo < 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--compress-choice '%s' is not a supported algorithm; FastSync supports zstd, "
+                "lz4, zlib, zlibx, none or auto",
+                value);
+    config->cli_exit_code = 4;
     return -1;
-  config->use_compression = strcmp(value, "zstd") == 0;
+  }
+  const char* canonical = compression_algo_name((CompressionAlgo)algo);
+  if (set_string_option(&config->compress_choice, canonical, "--compress-choice") != 0)
+    return -1;
+  config->compression_algo = algo;
+  config->use_compression = (algo != (int)COMPRESSION_ALGO_NONE);
   return 0;
 }
 
-/* Validate and store the --checksum-choice/--cc algorithm.  Only the algorithms
- * the engine genuinely supports are accepted (xxHash64 and md5); anything else
- * is a clear error, never a silent no-op.  "xxhash" is accepted as rsync's
- * spelling of xxHash64. */
+/* Store one algorithm name into *out.  Returns 0 for a valid name, 1 for
+ * "auto" (caller resolves it), -1 for an unknown/too-long name. */
+static int resolve_checksum_name(const char* name, size_t len, int* out) {
+  char buf[64];
+  if (len == 0 || len >= sizeof(buf))
+    return -1;
+  memcpy(buf, name, len);
+  buf[len] = '\0';
+  if (strcasecmp(buf, "auto") == 0)
+    return 1;
+  int algo = checksum_algo_from_name(buf);
+  if (algo < 0)
+    return -1;
+  *out = algo;
+  return 0;
+}
+
+/* Validate and store the --checksum-choice/--cc algorithm.  rsync 3.4.1 accepts
+ * a single name (used for both the transfer and pre-transfer checksums) or the
+ * two-name "TRANSFER,PRE-TRANSFER" form (only one comma is significant).  The
+ * pre-transfer half is FastSync's whole-file digest; the transfer half is
+ * validated for parity and, when "none", forces --whole-file like rsync.  An
+ * unknown name (including an empty half or a second comma) is exit 4.  "auto"
+ * resolves to FastSync's negotiated default (xxh128). */
 static int set_checksum_choice(Config* config, const char* value) {
-  int algo = checksum_algo_from_name(value);
-  if (algo < 0) {
-    log_message(LOG_LEVEL_ERROR, "--checksum-choice must be xxh64 (or xxhash) or md5 (got '%s')",
-                value);
+  if (!value) {
+    config->cli_exit_code = 4;
     return -1;
   }
-  config->checksum_algo = algo;
+  const char* comma = strchr(value, ',');
+  const char* name1 = value;
+  size_t len1 = comma ? (size_t)(comma - value) : strlen(value);
+  const char* name2 = comma ? comma + 1 : NULL;
+  size_t len2 = name2 ? strlen(name2) : 0;
+
+  int transfer = -1;
+  int pre = -1;
+  int rc1 = resolve_checksum_name(name1, len1, &transfer);
+  int rc2 = name2 ? resolve_checksum_name(name2, len2, &pre) : 1;
+  if (rc1 < 0 || rc2 < 0) {
+    log_message(LOG_LEVEL_ERROR,
+                "--checksum-choice '%s' is invalid; FastSync supports xxh64 (or xxhash), xxh128, "
+                "xxh3, md5, md4, sha1, none or auto, optionally as 'transfer,pre-transfer'",
+                value);
+    config->cli_exit_code = 4;
+    return -1;
+  }
+  ChecksumAlgo negotiated = checksum_negotiate_default();
+  if (rc1 == 1)
+    transfer = (int)negotiated;
+  if (!name2)
+    pre = transfer;
+  else if (rc2 == 1)
+    pre = (int)negotiated;
+
+  config->checksum_algo = pre;
+  config->checksum_transfer_algo = transfer;
+  /* rsync: "none" for the transfer checksum forces --whole-file. */
+  if (transfer == (int)CHECKSUM_ALGO_NONE)
+    config->whole_file = true;
   return 0;
 }
 
@@ -234,6 +324,25 @@ static int set_nonneg_int_option(int* dest, const char* value, const char* optio
   return 0;
 }
 
+/* Parse a signed integer, clamping every negative value to -1.  rsync's
+   --max-delete treats a negative argument (the deprecated -1 spelling) as "no
+   client limit", so -2/-5 must behave identically rather than being rejected. */
+static int set_signed_clamped_int_option(int* dest, const char* value, const char* option_name) {
+  if (!value || *value == '\0') {
+    log_message(LOG_LEVEL_ERROR, "%s must be an integer", option_name);
+    return -1;
+  }
+  char* endptr;
+  errno = 0;
+  long parsed = strtol(value, &endptr, 10);
+  if (errno != 0 || *endptr != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+    log_message(LOG_LEVEL_ERROR, "%s must be an integer", option_name);
+    return -1;
+  }
+  *dest = parsed < 0 ? -1 : (int)parsed;
+  return 0;
+}
+
 /* Forward decl: config_add_pattern is defined below, but the --remote-option
  * helper above needs it. */
 static int config_add_pattern(char*** patterns, int* count, const char* value, const char* optname);
@@ -269,10 +378,10 @@ static int config_add_remote_option(Config* config, const char* value, const cha
 }
 
 /* Validate and append one --compare-dest/--copy-dest/--link-dest directory.
- * The path is interpreted on the receiver relative to the destination root,
- * so it must be a non-empty relative path with no "." / ".." components (an
- * absolute or escaping path is rejected up front instead of failing on the
- * server). Returns 0 on success, -1 on error. */
+ * A relative path is interpreted on the receiver below the destination root; an
+ * absolute path is used verbatim on the receiver (matching rsync), still subject
+ * to the receiver's authorized-root confinement. Either way the path must be
+ * non-empty and traversal-free (no ".."). Returns 0 on success, -1 on error. */
 static int set_basis_dest_option(Config* config, BasisDestType type, const char* value,
                                  const char* option_name) {
   if (!value || !value[0]) {
@@ -281,8 +390,9 @@ static int set_basis_dest_option(Config* config, BasisDestType type, const char*
   }
   if (config_basis_append(config, type, value) != 0) {
     log_message(LOG_LEVEL_ERROR,
-                "%s requires a non-empty relative directory name with no '.', '..', or absolute "
-                "path (resolved below the destination root)",
+                "%s requires a non-empty directory name with no '..' component "
+                "(relative paths resolve below the destination root; absolute paths are used "
+                "verbatim)",
                 option_name);
     return -1;
   }
@@ -334,7 +444,71 @@ static void apply_output_buffering(const Config* config) {
 }
 #endif
 
-static int read_patterns_from_file(const char* filepath, char*** patterns, int* count);
+static int read_patterns_from_file(const char* filepath, char*** patterns, int* count,
+                                   Config* config, char sign, const char* optname);
+
+/* Split one --debug/--info item into its category name and an optional rsync
+ * verbosity level suffix (e.g. "io2", "all4", "none0").  The output `name` is
+ * NUL-terminated and `level` is >= 0 (0 silences the item).  Returns false for
+ * an empty token or a token that is all digits. */
+static bool split_flag_level(const char* token, char* name, size_t name_size, int* level) {
+  size_t len = strlen(token);
+  if (len == 0 || name_size == 0)
+    return false;
+  size_t end = len;
+  while (end > 0 && token[end - 1] >= '0' && token[end - 1] <= '9')
+    end--;
+  if (end == 0)
+    return false; /* all digits: not a category name */
+  size_t name_len = end < name_size - 1 ? end : name_size - 1;
+  for (size_t i = 0; i < name_len; i++) {
+    char c = token[i];
+    name[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  }
+  name[name_len] = '\0';
+  int lvl = 1;
+  if (end < len) {
+    lvl = 0;
+    for (size_t i = end; i < len; i++) {
+      int digit = token[i] - '0';
+      if (lvl > (1000 - digit) / 10)
+        return false;
+      lvl = lvl * 10 + digit;
+    }
+  }
+  *level = lvl;
+  return true;
+}
+
+/* rsync --debug/--info categories that FastSync accepts for CLI parity but has
+ * no output wired to (yet).  They must parse successfully so a valid rsync
+ * invocation is not rejected up front; only categories with a FastSync
+ * counterpart set a log flag.  `pack`/`util` are FastSync-specific (packed
+ * metadata / general utility logging).  `syms`, `hl`, and `owner` are aliases
+ * of rsync's `symsafe`, `hlink`, and `own`. */
+static bool is_accepted_debug_category(const char* name) {
+  static const char* const categories[] = {
+      "acl",   "backup", "bind",   "chdir", "cmd",   "connect", "del",  "deltasum",
+      "dup",   "exit",   "filter", "flist", "fuzzy", "genr",    "hash", "hl",
+      "hlink", "iconv",  "nstr",   "own",   "owner", "recv",    "send", "time",
+  };
+  for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
+    if (strcmp(name, categories[i]) == 0)
+      return true;
+  }
+  return false;
+}
+
+static bool is_accepted_info_category(const char* name) {
+  static const char* const categories[] = {
+      "backup", "del", "flist", "mount", "nonreg", "progress", "remove", "syms", "symsafe",
+  };
+  for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
+    if (strcmp(name, categories[i]) == 0)
+      return true;
+  }
+  return false;
+}
 
 static int parse_debug_flags(const char* value, Config* config) {
   if (!value || value[0] == '\0' || value[0] == ',' || value[strlen(value) - 1] == ',' ||
@@ -353,30 +527,42 @@ static int parse_debug_flags(const char* value, Config* config) {
   for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
        token = strtok_r(NULL, ",", &saveptr)) {
     uint32_t flag = 0;
-    if (strcmp(token, "help") == 0) {
+    char name[32];
+    int level = 1;
+    if (!split_flag_level(token, name, sizeof(name), &level)) {
+      log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    if (strcmp(name, "help") == 0) {
       print_debug_usage();
       free(flags);
       return 1;
-    } else if (strcmp(token, "all") == 0) {
-      parsed = LOG_DEBUG_ALL;
+    } else if (strcmp(name, "all") == 0) {
+      parsed = level == 0 ? 0 : LOG_DEBUG_ALL;
       continue;
-    } else if (strcmp(token, "none") == 0) {
+    } else if (strcmp(name, "none") == 0) {
       parsed = 0;
       continue;
-    } else if (strcmp(token, "io") == 0) {
+    } else if (strcmp(name, "io") == 0) {
       flag = LOG_DEBUG_IO;
-    } else if (strcmp(token, "proto") == 0) {
+    } else if (strcmp(name, "proto") == 0) {
       flag = LOG_DEBUG_PROTO;
-    } else if (strcmp(token, "pack") == 0) {
+    } else if (strcmp(name, "pack") == 0) {
       flag = LOG_DEBUG_PACK;
-    } else if (strcmp(token, "util") == 0) {
+    } else if (strcmp(name, "util") == 0) {
       flag = LOG_DEBUG_UTIL;
+    } else if (is_accepted_debug_category(name)) {
+      continue;
     } else {
       log_message(LOG_LEVEL_ERROR, "unsupported --debug flag: %s", token);
       free(flags);
       return -1;
     }
-    parsed |= flag;
+    if (level == 0)
+      parsed &= ~flag;
+    else
+      parsed |= flag;
   }
   free(flags);
   config->debug_level = (int)parsed;
@@ -402,28 +588,45 @@ static int parse_info_flags(const char* value, Config* config) {
   for (char* token = strtok_r(flags, ",", &saveptr); token != NULL;
        token = strtok_r(NULL, ",", &saveptr)) {
     uint32_t flag = 0;
-    if (strcmp(token, "all") == 0) {
-      parsed = LOG_INFO_ALL;
+    char name[32];
+    int level = 1;
+    if (!split_flag_level(token, name, sizeof(name), &level)) {
+      log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
+      free(flags);
+      return -1;
+    }
+    if (strcmp(name, "all") == 0) {
+      parsed = level == 0 ? 0 : LOG_INFO_ALL;
       continue;
     }
-    if (strcmp(token, "none") == 0) {
+    if (strcmp(name, "none") == 0) {
       parsed = 0;
       continue;
     }
-    if (strcmp(token, "copy") == 0)
+    if (strcmp(name, "help") == 0) {
+      print_info_usage();
+      free(flags);
+      return 1;
+    }
+    if (strcmp(name, "copy") == 0 || strcmp(name, "name") == 0)
       flag = LOG_INFO_COPY;
-    else if (strcmp(token, "misc") == 0)
+    else if (strcmp(name, "misc") == 0)
       flag = LOG_INFO_MISC;
-    else if (strcmp(token, "skip") == 0)
+    else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;
-    else if (strcmp(token, "stats") == 0)
+    else if (strcmp(name, "stats") == 0)
       flag = LOG_INFO_STATS;
+    else if (is_accepted_info_category(name))
+      continue;
     else {
       log_message(LOG_LEVEL_ERROR, "unsupported --info flag: %s", token);
       free(flags);
       return -1;
     }
-    parsed |= flag;
+    if (level == 0)
+      parsed &= ~flag;
+    else
+      parsed |= flag;
   }
   free(flags);
   config->info_level = (int)parsed;
@@ -518,10 +721,6 @@ static int parse_size_arg_allow_zero(const char* value, unsigned long long* out,
   return 0;
 }
 
-static int parse_size_arg(const char* value, unsigned long long* out) {
-  return parse_size_arg_allow_zero(value, out, false);
-}
-
 /* Append a duplicated pattern to a growable pattern array. Returns 0 on success, -1 on error. */
 static int config_add_pattern(char*** patterns, int* count, const char* value,
                               const char* optname) {
@@ -542,16 +741,25 @@ static int config_add_pattern(char*** patterns, int* count, const char* value,
 
 /* Validate and append one --filter=RULE string. Returns 0 on success, -1 on error. */
 static int config_add_filter(Config* config, const char* rule) {
-  char err[160];
-  FilterRule* parsed = filter_rule_parse(rule, err, sizeof(err));
-  if (!parsed) {
+  char err[256];
+  /* Validate through the full list parser so clear/merge/dir-merge and the rule
+     modifiers are accepted (and a merge file is readable) at parse time. */
+  FilterParseOptions opts = {.delete_excluded = config->delete_excluded,
+                             .cvs_exclude = config->cvs_exclude};
+  FilterRuleList* probe = filter_rule_list_create();
+  if (!probe) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for --filter");
+    return -1;
+  }
+  bool ok = filter_rule_list_parse_append(probe, rule, &opts, NULL, err, sizeof(err));
+  filter_rule_list_free(probe);
+  if (!ok) {
     char* escaped = output_escape(rule, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "invalid --filter rule '%s': %s",
                 escaped ? escaped : "<allocation failed>", err);
     free(escaped);
     return -1;
   }
-  filter_rule_free(parsed);
   if (!config->filters) {
     config->filters = array_list_create(free);
     if (!config->filters) {
@@ -568,12 +776,36 @@ static int config_add_filter(Config* config, const char* rule) {
   return 0;
 }
 
+/* Compile one --exclude/--include pattern into the SAME ordered filter rule
+ * list used by --filter/-f: `--exclude P` becomes the rule "- P" and
+ * `--include P` becomes "+ P", appended in command-line order.  This is what
+ * makes rsync's first-match-wins semantics hold across a mixed sequence such as
+ * `--include='*.txt' --exclude='*'`.  Returns 0 on success, -1 on error. */
+static int config_add_selection_rule(Config* config, char sign, const char* pattern,
+                                     const char* optname) {
+  size_t len = strlen(pattern);
+  char* rule = malloc(len + 3);
+  if (!rule) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed for %s", optname);
+    return -1;
+  }
+  rule[0] = sign;
+  rule[1] = ' ';
+  memcpy(rule + 2, pattern, len + 1);
+  int rc = config_add_filter(config, rule);
+  free(rule);
+  return rc;
+}
+
 static int parse_skip_compress(Config* config, const char* value) {
   char* list = str_dup(value);
   if (!list)
     return -1;
   config->skip_compress_set = true;
-  for (char* token = strtok(list, ","); token; token = strtok(NULL, ",")) {
+  /* rsync documents the LIST as slash-separated; accept that along with the
+   * historical comma-separated spelling.  A leading dot is optional (rsync's
+   * suffixes have none, FastSync historically used them). */
+  for (char* token = strtok(list, ",/"); token; token = strtok(NULL, ",/")) {
     while (*token == ' ' || *token == '\t')
       token++;
     size_t len = strlen(token);
@@ -603,6 +835,9 @@ typedef enum {
   OPT_POS_INT,
   OPT_NONNEG_INT,
   OPT_ULL,
+  /* A signed integer whose negative values are clamped to -1 (rsync's
+     "no limit" spelling for --max-delete). */
+  OPT_SIGNED_INT,
 } OptKind;
 
 typedef struct {
@@ -647,17 +882,23 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--save-to-disk", NULL, OPT_FLAG, offsetof(Config, save_to_disk)},
     {"--progress", NULL, OPT_FLAG, offsetof(Config, show_progress)},
     {"--tls", NULL, OPT_FLAG, offsetof(Config, use_tls)},
-    {"--backup", NULL, OPT_FLAG, offsetof(Config, backup)},
+    {"--backup", "-b", OPT_FLAG, offsetof(Config, backup)},
     {"--stats", NULL, OPT_FLAG, offsetof(Config, stats)},
     {"--human-readable", "-h", OPT_FLAG, offsetof(Config, human_readable)},
     {"--partial", NULL, OPT_FLAG, offsetof(Config, partial)},
     {"--secluded-args", "-s", OPT_NOOP, 0},
+    /* rsync's pre-3.2.6 name for --secluded-args (--protect-args) is accepted
+     * as the same secure-argv no-op. */
+    {"--protect-args", NULL, OPT_NOOP, 0},
+    /* rsync -r/--recursive: FastSync is always recursive, so this is a
+     * faithful no-op (accepted silently, never consumes an argument). */
+    {"--recursive", "-r", OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
     {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
     {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
     {"--blocking-io", NULL, OPT_FLAG, offsetof(Config, blocking_io)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
-    {"--copy-links", NULL, OPT_FLAG, offsetof(Config, copy_links)},
+    {"--copy-links", "-L", OPT_FLAG, offsetof(Config, copy_links)},
     {"--safe-links", NULL, OPT_FLAG, offsetof(Config, safe_links)},
     {"--copy-unsafe-links", NULL, OPT_FLAG, offsetof(Config, copy_unsafe_links)},
     {"--copy-dirlinks", "-k", OPT_FLAG, offsetof(Config, copy_dirlinks)},
@@ -677,6 +918,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--out-format", NULL, OPT_STRING, offsetof(Config, out_format)},
     {"--log-file-format", NULL, OPT_STRING, offsetof(Config, log_file_format)},
     {"--existing", NULL, OPT_FLAG, offsetof(Config, existing)},
+    /* rsync's man-page alias for --existing (--ignore-non-existing). */
+    {"--ignore-non-existing", NULL, OPT_FLAG, offsetof(Config, existing)},
     {"--ignore-existing", NULL, OPT_FLAG, offsetof(Config, ignore_existing)},
     {"--delay-updates", NULL, OPT_FLAG, offsetof(Config, delay_updates)},
     {"--chmod", NULL, OPT_STRING, offsetof(Config, chmod_spec)},
@@ -714,7 +957,7 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
     {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
     {"--delete-excluded", NULL, OPT_FLAG, offsetof(Config, delete_excluded)},
-    {"--max-delete", NULL, OPT_NONNEG_INT, offsetof(Config, max_delete)},
+    {"--max-delete", NULL, OPT_SIGNED_INT, offsetof(Config, max_delete)},
     {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
     {"--force", NULL, OPT_FLAG, offsetof(Config, force_delete)},
     {"--prune-empty-dirs", "-m", OPT_FLAG, offsetof(Config, prune_empty_dirs)},
@@ -738,8 +981,8 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--compress-choice", "--zc", OPT_STRING, offsetof(Config, compress_choice)},
     {"--compress-level", "--zl", OPT_POS_INT, offsetof(Config, compression_level)},
 
-    {"--timeout", NULL, OPT_POS_INT, offsetof(Config, timeout)},
-    {"--contimeout", NULL, OPT_POS_INT, offsetof(Config, contimeout)},
+    {"--timeout", NULL, OPT_NONNEG_INT, offsetof(Config, timeout)},
+    {"--contimeout", NULL, OPT_NONNEG_INT, offsetof(Config, contimeout)},
     {"--max-depth", NULL, OPT_NONNEG_INT, offsetof(Config, max_depth)},
     {"--address", NULL, OPT_STRING, offsetof(Config, address)},
     {"--ipv4", "-4", OPT_FLAG, offsetof(Config, ipv4)},
@@ -778,6 +1021,7 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"delete", NULL, offsetof(Config, use_delete)},
     {"incremental", NULL, offsetof(Config, use_incremental)},
     {"delta", NULL, offsetof(Config, use_delta)},
+    {"whole-file", "W", offsetof(Config, whole_file)},
     {"fuzzy", NULL, offsetof(Config, fuzzy)},
     {"save-to-disk", NULL, offsetof(Config, save_to_disk)},
     {"progress", NULL, offsetof(Config, show_progress)},
@@ -837,7 +1081,8 @@ static const OptionEntry* find_table_option_with_equals(const char* arg, const c
         (entry->alias && strlen(entry->alias) == name_len &&
          strncmp(arg, entry->alias, name_len) == 0)) {
       if (entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
-          entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL) {
+          entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL ||
+          entry->kind == OPT_SIGNED_INT) {
         *value = equals + 1;
         return entry;
       }
@@ -889,6 +1134,26 @@ static int apply_negation(Config* config, const char* arg) {
   return 0;
 }
 
+/* rsync's --iconv accepted extra spellings beyond explicit charset pairs:
+ * "." selects the locale's default charset for both directions, and "-" (or
+ * --no-iconv) disables conversion entirely.  Normalize both here so the rest
+ * of the pipeline only ever sees a real charset spec or NULL. */
+static int set_iconv_option(char** field, const char* value) {
+  if (value && strcmp(value, "-") == 0) {
+    free(*field);
+    *field = NULL;
+    return 0;
+  }
+  if (value && strcmp(value, ".") == 0) {
+    setlocale(LC_ALL, "");
+    const char* codeset = nl_langinfo(CODESET);
+    if (!codeset || codeset[0] == '\0')
+      codeset = "UTF-8";
+    return set_string_option(field, codeset, "--iconv");
+  }
+  return set_string_option(field, value, "--iconv");
+}
+
 static int apply_table_option(Config* config, const OptionEntry* entry, const char* value) {
   if (entry->kind == OPT_NOOP)
     return 0;
@@ -900,11 +1165,17 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   case OPT_NOOP:
     return 0;
   case OPT_STRING:
+    if (entry->offset == offsetof(Config, chmod_spec))
+      return append_chmod_spec((char**)field, value);
+    if (entry->offset == offsetof(Config, iconv_spec))
+      return set_iconv_option((char**)field, value);
     return set_string_option((char**)field, value, entry->name);
   case OPT_POS_INT:
     return set_positive_int_option((int*)field, value, entry->name);
   case OPT_NONNEG_INT:
     return set_nonneg_int_option((int*)field, value, entry->name);
+  case OPT_SIGNED_INT:
+    return set_signed_clamped_int_option((int*)field, value, entry->name);
   case OPT_ULL: {
     unsigned long long v;
     /* Size-limit options accept rsync-style suffixes (e.g. --max-size=2G); a
@@ -936,17 +1207,22 @@ typedef struct {
 } CliParseCtx;
 
 /* Apply output controls before processing other options so their order is
- * irrelevant.  Returns 0 on success, -1 on error. */
+ * irrelevant.  Returns 0 on success, a positive code for a help request
+ * (parse_args returns it verbatim), or -1 on error. */
 static int cli_apply_output_controls(Config* config, int argc, char* argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
       set_log_level(LOG_LEVEL_DEBUG);
     } else if (strncmp(argv[i], "--info=", 7) == 0) {
-      if (parse_info_flags(argv[i] + 7, config) != 0)
-        return -1;
+      int ret = parse_info_flags(argv[i] + 7, config);
+      if (ret != 0)
+        return ret;
     } else if (strcmp(argv[i], "--info") == 0) {
-      if (i + 1 >= argc || parse_info_flags(argv[++i], config) != 0)
+      if (i + 1 >= argc)
         return -1;
+      int ret = parse_info_flags(argv[++i], config);
+      if (ret != 0)
+        return ret;
     }
   }
   return 0;
@@ -971,6 +1247,19 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
     config->no_implied_dirs = true;
     return true;
   }
+  /* "--no-iconv" is a real rsync option name that turns charset conversion off
+   * (the negation of the argument-taking --iconv), so it is handled before the
+   * generic --no-* negation branch. */
+  if (strcmp(arg, "--no-iconv") == 0) {
+    free(config->iconv_spec);
+    config->iconv_spec = NULL;
+    return true;
+  }
+  /* "--no-msgs2stderr" is the deprecated spelling of --stderr=client (rsync
+   * 3.4.1).  FastSync has no separate client message channel, so the closest
+   * supported mode is the errors-only default. */
+  if (strcmp(arg, "--no-msgs2stderr") == 0)
+    return set_stderr_mode("errors") == 0;
   /* "--no-motd" is a real rsync option name (client-side daemon MOTD display
    * suppression), not a negation of a "--motd" flag, so it is handled before
    * the generic --no-* negation branch. */
@@ -990,6 +1279,17 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
   }
   if (strcmp(arg, "--no-super") == 0) {
     config->super_mode = SUPER_MODE_OFF;
+    return true;
+  }
+  /* rsync's --no-timeout / --no-contimeout explicit spellings clear the
+   * corresponding (integer) deadline; handled before the generic --no-* branch
+   * because the negation table only models boolean fields. */
+  if (strcmp(arg, "--no-timeout") == 0) {
+    config->timeout = 0;
+    return true;
+  }
+  if (strcmp(arg, "--no-contimeout") == 0) {
+    config->contimeout = 0;
     return true;
   }
   if (strncmp(arg, "--no-", strlen("--no-")) == 0) {
@@ -1048,7 +1348,8 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
   }
   if (strncmp(arg, "--stop-at=", 10) == 0) {
     if (!stop_parse_at_time(arg + 10, time(NULL), &config->stop_at)) {
-      log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+      log_message(LOG_LEVEL_ERROR, "--stop-at must be a date/time such as 2000-12-31T23:59, 12-31, "
+                                   "14:00, :59, HH:MM[:SS] or now+N[smhd]");
       ctx->exit_code = -1;
       return true;
     }
@@ -1062,7 +1363,8 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       return true;
     }
     if (!stop_parse_at_time(ctx->argv[++ctx->i], time(NULL), &config->stop_at)) {
-      log_message(LOG_LEVEL_ERROR, "--stop-at must be HH:MM[:SS] or now+N[smhd]");
+      log_message(LOG_LEVEL_ERROR, "--stop-at must be a date/time such as 2000-12-31T23:59, 12-31, "
+                                   "14:00, :59, HH:MM[:SS] or now+N[smhd]");
       ctx->exit_code = -1;
       return true;
     }
@@ -1086,8 +1388,11 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       }
       value = ctx->argv[++ctx->i];
     }
-    if (parse_size_arg(value, &config->max_alloc) != 0) {
-      log_message(LOG_LEVEL_ERROR, "--max-alloc must be a positive size (B, K, M, G, T, P, or E)");
+    /* rsync: --max-alloc=0 means "no alloc limit" (it maps to SIZE_MAX).  A
+     * size with an optional binary suffix is also accepted. */
+    if (parse_size_arg_allow_zero(value, &config->max_alloc, true) != 0) {
+      log_message(LOG_LEVEL_ERROR, "--max-alloc must be a size (0 = no limit; B, K, M, G, T, P, E "
+                                   "suffixes allowed)");
       ctx->exit_code = -1;
     }
     return true;
@@ -1108,7 +1413,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
   if (!entry)
     return false;
   const char* value = NULL;
-  if (entry->kind != OPT_FLAG) {
+  if (entry->kind != OPT_FLAG && entry->kind != OPT_NOOP) {
     value = inline_value;
     if (!value && ctx->i + 1 < ctx->argc)
       value = ctx->argv[++ctx->i];
@@ -1140,7 +1445,6 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
           ctx->exit_code = -1;
           return true;
         }
-        config->preserve_perms = true;
       }
       /* Remember that --server-host was explicitly given (the field itself
          defaults to 127.0.0.1, so a value check cannot distinguish it).  Used
@@ -1154,6 +1458,11 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
   }
   if (entry->offset == offsetof(Config, eight_bit_output))
     protocol_set_8_bit_output(true);
+  /* -F is repeatable: rsync's single -F transfers .rsync-filter files, a
+     repeated -FF excludes them.  Count the occurrences so the scanner can
+     distinguish the two. */
+  if (entry->offset == offsetof(Config, per_dir_filter) && config->per_dir_filter_count < INT_MAX)
+    config->per_dir_filter_count++;
   /* A delete-timing flag selects when --delete removes extras, so it
      implies --delete exactly like the rsync options do. */
   if (entry->offset == offsetof(Config, delete_before) ||
@@ -1187,7 +1496,7 @@ static bool cli_handle_inline_chmod(CliParseCtx* ctx) {
   const char* arg = ctx->argv[ctx->i];
   if (strncmp(arg, "--chmod=", 8) != 0)
     return false;
-  if (set_string_option(&config->chmod_spec, arg + 8, "--chmod") != 0) {
+  if (append_chmod_spec(&config->chmod_spec, arg + 8) != 0) {
     ctx->exit_code = -1;
     return true;
   }
@@ -1197,7 +1506,6 @@ static bool cli_handle_inline_chmod(CliParseCtx* ctx) {
     ctx->exit_code = -1;
     return true;
   }
-  config->preserve_perms = true;
   return true;
 }
 
@@ -1266,6 +1574,26 @@ static bool cli_handle_meta_flags(CliParseCtx* ctx) {
   return false;
 }
 
+/* Apply a --delta-max value.  Values below the minimum warn and keep the
+ * default; values above the maximum are a hard error.  Returns 0 on success,
+ * -1 on error. */
+static int set_delta_max_option(Config* config, const char* value) {
+  unsigned long long val;
+  if (parse_ull_arg(value, &val, "--delta-max") != 0)
+    return -1;
+  if (val >= DELTA_MIN_FILE_SIZE && val <= DELTA_MAX_FILE_SIZE) {
+    config->delta_max_file_size = val;
+    return 0;
+  }
+  if (val < DELTA_MIN_FILE_SIZE) {
+    log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
+    return 0;
+  }
+  log_message(LOG_LEVEL_ERROR, "--delta-max must not exceed %llu bytes",
+              (unsigned long long)DELTA_MAX_FILE_SIZE);
+  return -1;
+}
+
 /* SSH port and pattern/block-size options.  Returns true when the argument was
  * consumed. */
 static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
@@ -1298,6 +1626,13 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
     }
     return true;
   }
+  if (strncmp(arg, "--exclude=", 10) == 0) {
+    if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, arg + 10,
+                           "--exclude") != 0 ||
+        config_add_selection_rule(config, '-', arg + 10, "--exclude") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--exclude", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
@@ -1305,7 +1640,15 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       return true;
     }
     if (config_add_pattern(&config->exclude_patterns, &config->exclude_count, ctx->argv[++ctx->i],
-                           "--exclude") != 0)
+                           "--exclude") != 0 ||
+        config_add_selection_rule(config, '-', ctx->argv[ctx->i], "--exclude") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
+  if (strncmp(arg, "--include=", 10) == 0) {
+    if (config_add_pattern(&config->include_patterns, &config->include_count, arg + 10,
+                           "--include") != 0 ||
+        config_add_selection_rule(config, '+', arg + 10, "--include") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1316,7 +1659,8 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       return true;
     }
     if (config_add_pattern(&config->include_patterns, &config->include_count, ctx->argv[++ctx->i],
-                           "--include") != 0)
+                           "--include") != 0 ||
+        config_add_selection_rule(config, '+', ctx->argv[ctx->i], "--include") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1330,7 +1674,8 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
-  if (opt_is(arg, "--delta-block", "--block-size")) {
+  if (strcmp(arg, "--delta-block") == 0 || strcmp(arg, "--block-size") == 0 ||
+      strcmp(arg, "-B") == 0) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
@@ -1340,26 +1685,19 @@ static bool cli_handle_ssh_and_pattern_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
+  if (strncmp(arg, "--delta-max=", 12) == 0) {
+    if (set_delta_max_option(config, arg + 12) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--delta-max", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
       return true;
     }
-    unsigned long long val;
-    if (parse_ull_arg(ctx->argv[++ctx->i], &val, "--delta-max") != 0) {
+    if (set_delta_max_option(config, ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (val >= DELTA_MIN_FILE_SIZE && val <= DELTA_MAX_FILE_SIZE) {
-      config->delta_max_file_size = val;
-    } else if (val < DELTA_MIN_FILE_SIZE) {
-      log_message(LOG_LEVEL_WARNING, "--delta-max value %llu too small, using default", val);
-    } else {
-      log_message(LOG_LEVEL_ERROR, "--delta-max must not exceed %llu bytes",
-                  (unsigned long long)DELTA_MAX_FILE_SIZE);
-      ctx->exit_code = -1;
-    }
     return true;
   }
   return false;
@@ -1372,7 +1710,7 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
   const char* arg = ctx->argv[ctx->i];
   if (opt_is(arg, "-z", "--compress")) {
     config->use_compression =
-        !config->compress_choice || strcmp(config->compress_choice, "zstd") == 0;
+        !config->compress_choice || strcmp(config->compress_choice, "none") != 0;
     log_info_message(LOG_INFO_MISC, "Enabled Compression");
     if (ctx->i + 1 < ctx->argc) {
       char* end_ptr;
@@ -1451,6 +1789,73 @@ static int set_server_port_option(Config* config, const char* value, const char*
   return 0;
 }
 
+/* Open (create/append) a --log-file target and install it in the logger.
+ * Refuses a symlinked target and never leaks the descriptor across exec: an
+ * attacker who can plant a symlink in the working directory must not be able to
+ * redirect (or truncate) an arbitrary file.  The log is created with owner-only
+ * permissions.  Returns 0 on success, -1 on error (already logged). */
+static int set_log_file_option(Config* config, const char* log_path) {
+  if (config->log_file) {
+    /* Detach the logger before closing: log I/O may be in flight and must
+       never touch a freed FILE*. */
+    log_set_file(NULL);
+    fclose(config->log_file);
+    config->log_file = NULL;
+  }
+  int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+  FILE* lf = log_fd >= 0 ? fdopen(log_fd, "a") : NULL;
+  if (!lf) {
+    int open_errno = errno;
+    if (log_fd >= 0)
+      close(log_fd);
+    char* escaped = output_escape(log_path, false);
+    log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
+                escaped ? escaped : "<allocation failed>", strerror(open_errno));
+    free(escaped);
+    return -1;
+  }
+  config->log_file = lf;
+  log_set_file(lf);
+  return 0;
+}
+
+/* Apply a --bwlimit value (kilobytes per second).  Returns 0 on success, -1 on
+ * error. */
+static int set_bwlimit_option(const char* value) {
+  unsigned long long kbps;
+  if (parse_ull_arg(value, &kbps, "--bwlimit") != 0)
+    return -1;
+  if (kbps == 0) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
+    return -1;
+  }
+  if (kbps > ULLONG_MAX / 1024) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
+    return -1;
+  }
+  io_set_bwlimit(kbps * 1024);
+  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
+  return 0;
+}
+
+/* Apply a --chunk-size value.  Returns 0 on success, -1 on error. */
+static int set_chunk_size_option(Config* config, const char* value) {
+  unsigned long long val;
+  if (parse_ull_arg(value, &val, "--chunk-size") != 0)
+    return -1;
+  if (val == 0) {
+    log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
+    return -1;
+  }
+  if (val > MAX_CHUNK_SIZE) {
+    log_message(LOG_LEVEL_ERROR, "--chunk-size must be between 1 and %llu",
+                (unsigned long long)MAX_CHUNK_SIZE);
+    return -1;
+  }
+  config->chunk_size = val;
+  return 0;
+}
+
 /* Network/IO options: --server-port/--port, --bwlimit, --chunk-size, --log-file
  * and --stderr.  Returns true when the argument was consumed. */
 static bool cli_handle_io_options(CliParseCtx* ctx) {
@@ -1475,29 +1880,24 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
+  if (strncmp(arg, "--bwlimit=", 10) == 0) {
+    if (set_bwlimit_option(arg + 10) != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--bwlimit", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
       ctx->exit_code = -1;
       return true;
     }
-    unsigned long long kbps;
-    if (parse_ull_arg(ctx->argv[++ctx->i], &kbps, "--bwlimit") != 0) {
+    if (set_bwlimit_option(ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (kbps == 0) {
-      log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
+    return true;
+  }
+  if (strncmp(arg, "--chunk-size=", 13) == 0) {
+    if (set_chunk_size_option(config, arg + 13) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (kbps > ULLONG_MAX / 1024) {
-      log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
-      ctx->exit_code = -1;
-      return true;
-    }
-    io_set_bwlimit(kbps * 1024);
-    log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
     return true;
   }
   if (opt_is(arg, "--chunk-size", NULL)) {
@@ -1506,23 +1906,13 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    unsigned long long val;
-    if (parse_ull_arg(ctx->argv[++ctx->i], &val, "--chunk-size") != 0) {
+    if (set_chunk_size_option(config, ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (val == 0) {
-      log_message(LOG_LEVEL_ERROR, "--chunk-size must be a positive integer");
+    return true;
+  }
+  if (strncmp(arg, "--log-file=", 11) == 0) {
+    if (set_log_file_option(config, arg + 11) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    if (val > MAX_CHUNK_SIZE) {
-      log_message(LOG_LEVEL_ERROR, "--chunk-size must be between 1 and %llu",
-                  (unsigned long long)MAX_CHUNK_SIZE);
-      ctx->exit_code = -1;
-      return true;
-    }
-    config->chunk_size = val;
     return true;
   }
   if (opt_is(arg, "--log-file", NULL)) {
@@ -1531,33 +1921,8 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    if (config->log_file) {
-      /* Detach the logger before closing: log I/O may be in flight and must
-         never touch a freed FILE*. */
-      log_set_file(NULL);
-      fclose(config->log_file);
-      config->log_file = NULL;
-    }
-    const char* log_path = ctx->argv[++ctx->i];
-    /* Refuse a symlinked target and never leak the descriptor across exec: an
-     * attacker who can plant a symlink in the working directory must not be
-     * able to redirect (or truncate) an arbitrary file via --log-file.  The log
-     * is created with owner-only permissions. */
-    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
-    FILE* lf = log_fd >= 0 ? fdopen(log_fd, "a") : NULL;
-    if (!lf) {
-      int open_errno = errno;
-      if (log_fd >= 0)
-        close(log_fd);
-      char* escaped = output_escape(log_path, false);
-      log_message(LOG_LEVEL_ERROR, "could not open log file '%s': %s",
-                  escaped ? escaped : "<allocation failed>", strerror(open_errno));
-      free(escaped);
+    if (set_log_file_option(config, ctx->argv[++ctx->i]) != 0)
       ctx->exit_code = -1;
-      return true;
-    }
-    config->log_file = lf;
-    log_set_file(lf);
     return true;
   }
   if (strncmp(arg, "--stderr=", 9) == 0) {
@@ -1570,6 +1935,12 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
     return true;
   }
+  /* rsync's deprecated spelling of --stderr=all. */
+  if (opt_is(arg, "--msgs2stderr", NULL)) {
+    if (set_stderr_mode("all") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   return false;
 }
 
@@ -1577,6 +1948,12 @@ static bool cli_handle_io_options(CliParseCtx* ctx) {
 static bool cli_handle_filter_options(CliParseCtx* ctx) {
   Config* config = ctx->config;
   const char* arg = ctx->argv[ctx->i];
+  if (strncmp(arg, "--exclude-from=", 15) == 0) {
+    if (read_patterns_from_file(arg + 15, &config->exclude_patterns, &config->exclude_count, config,
+                                '-', "--exclude-from") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
   if (opt_is(arg, "--exclude-from", NULL)) {
     if (ctx->i + 1 >= ctx->argc) {
       log_message(LOG_LEVEL_ERROR, "missing argument for %s", arg);
@@ -1584,7 +1961,13 @@ static bool cli_handle_filter_options(CliParseCtx* ctx) {
       return true;
     }
     if (read_patterns_from_file(ctx->argv[++ctx->i], &config->exclude_patterns,
-                                &config->exclude_count) != 0)
+                                &config->exclude_count, config, '-', "--exclude-from") != 0)
+      ctx->exit_code = -1;
+    return true;
+  }
+  if (strncmp(arg, "--include-from=", 15) == 0) {
+    if (read_patterns_from_file(arg + 15, &config->include_patterns, &config->include_count, config,
+                                '+', "--include-from") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1595,7 +1978,7 @@ static bool cli_handle_filter_options(CliParseCtx* ctx) {
       return true;
     }
     if (read_patterns_from_file(ctx->argv[++ctx->i], &config->include_patterns,
-                                &config->include_count) != 0)
+                                &config->include_count, config, '+', "--include-from") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1668,13 +2051,19 @@ static bool cli_handle_logging_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--info=", 7) == 0) {
-    if (parse_info_flags(arg + 7, config) != 0)
-      ctx->exit_code = -1;
+    int info_ret = parse_info_flags(arg + 7, config);
+    if (info_ret != 0)
+      ctx->exit_code = info_ret;
     return true;
   }
   if (opt_is(arg, "--info", NULL)) {
-    if (ctx->i + 1 >= ctx->argc || parse_info_flags(ctx->argv[++ctx->i], config) != 0)
+    if (ctx->i + 1 >= ctx->argc) {
       ctx->exit_code = -1;
+      return true;
+    }
+    int info_ret = parse_info_flags(ctx->argv[++ctx->i], config);
+    if (info_ret != 0)
+      ctx->exit_code = info_ret;
     return true;
   }
   if (strncmp(arg, "--skip-compress=", 16) == 0) {
@@ -1764,6 +2153,75 @@ static bool cli_handle_checksum_options(CliParseCtx* ctx) {
   return false;
 }
 
+/* Determine whether a --chown spec sets the owner and/or group side, honoring
+ * the same escape-aware splitting as identity_parse_chown(): a `\:` is a literal
+ * colon, not a field separator. */
+static void chown_spec_sides(const char* value, bool* has_owner, bool* has_group) {
+  *has_owner = false;
+  *has_group = false;
+  if (!value)
+    return;
+  bool split = false;
+  for (const char* p = value; *p; p++) {
+    if (*p == '\\' && p[1] == ':') {
+      p++;
+      continue;
+    }
+    if (*p == ':') {
+      split = true;
+      continue;
+    }
+    if (split)
+      *has_group = true;
+    else
+      *has_owner = true;
+  }
+}
+
+/* rsync refuses to mix --chown with --usermap/--groupmap on the SAME side
+ * ("--usermap conflicts with prior --chown").  `chown_value` is non-NULL only
+ * for the --chown option itself.  Returns true and records a parse error when
+ * the new option conflicts with one already seen. */
+static bool mapping_option_conflicts(CliParseCtx* ctx, const char* optname, bool is_group,
+                                     const char* chown_value) {
+  const Config* config = ctx->config;
+  if (chown_value) {
+    bool has_owner;
+    bool has_group;
+    chown_spec_sides(chown_value, &has_owner, &has_group);
+    if (has_owner && config->usermap_count > 0) {
+      log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --usermap", optname);
+      ctx->exit_code = -1;
+      return true;
+    }
+    if (has_group && config->groupmap_count > 0) {
+      log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --groupmap", optname);
+      ctx->exit_code = -1;
+      return true;
+    }
+    return false;
+  }
+  if (!is_group && config->chown_uid_set) {
+    log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --chown", optname);
+    ctx->exit_code = -1;
+    return true;
+  }
+  if (is_group && config->chown_gid_set) {
+    log_message(LOG_LEVEL_ERROR, "%s conflicts with prior --chown", optname);
+    ctx->exit_code = -1;
+    return true;
+  }
+  return false;
+}
+
+static bool usermap_conflicts_with_chown(CliParseCtx* ctx, const char* optname, bool is_group) {
+  return mapping_option_conflicts(ctx, optname, is_group, NULL);
+}
+
+static bool chown_conflicts_with_map(CliParseCtx* ctx, const char* optname, const char* value) {
+  return mapping_option_conflicts(ctx, optname, false, value);
+}
+
 /* Remote-option, basis-directory and identity-mapping options.  Returns true
  * when the argument was consumed. */
 static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
@@ -1771,11 +2229,6 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
   const char* arg = ctx->argv[ctx->i];
   if (strncmp(arg, "--remote-option=", 16) == 0) {
     if (config_add_remote_option(config, arg + 16, "--remote-option") != 0)
-      ctx->exit_code = -1;
-    return true;
-  }
-  if (strncmp(arg, "-M=", 3) == 0) {
-    if (config_add_remote_option(config, arg + 3, "-M") != 0)
       ctx->exit_code = -1;
     return true;
   }
@@ -1836,6 +2289,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--usermap=", 10) == 0) {
+    if (usermap_conflicts_with_chown(ctx, "--usermap", false))
+      return true;
     if (identity_parse_map(config, arg + 10, false) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1849,6 +2304,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (usermap_conflicts_with_chown(ctx, "--usermap", false))
+      return true;
     if (identity_parse_map(config, ctx->argv[++ctx->i], false) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1857,6 +2314,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--groupmap=", 11) == 0) {
+    if (usermap_conflicts_with_chown(ctx, "--groupmap", true))
+      return true;
     if (identity_parse_map(config, arg + 11, true) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1870,6 +2329,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (usermap_conflicts_with_chown(ctx, "--groupmap", true))
+      return true;
     if (identity_parse_map(config, ctx->argv[++ctx->i], true) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1878,6 +2339,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
     return true;
   }
   if (strncmp(arg, "--chown=", 8) == 0) {
+    if (chown_conflicts_with_map(ctx, "--chown", arg + 8))
+      return true;
     if (identity_parse_chown(config, arg + 8) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1894,6 +2357,8 @@ static bool cli_handle_remote_basis_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
+    if (chown_conflicts_with_map(ctx, "--chown", ctx->argv[ctx->i + 1]))
+      return true;
     if (identity_parse_chown(config, ctx->argv[++ctx->i]) != 0) {
       ctx->exit_code = -1;
       return true;
@@ -1944,8 +2409,32 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
  * -1 on error. */
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
   set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
-  if (config->compress_choice)
-    config->use_compression = strcmp(config->compress_choice, "zstd") == 0;
+  if (config->compress_choice) {
+    int algo = compression_algo_from_name(config->compress_choice);
+    if (algo >= 0) {
+      config->compression_algo = algo;
+      config->use_compression = (algo != (int)COMPRESSION_ALGO_NONE);
+    }
+  }
+  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE)
+    config->compression_algo = (int)compression_negotiate_default();
+  /* rsync parity: "none" as the pre-transfer checksum cannot be combined with
+   * --checksum (exit 4).  The check runs here because --checksum may appear on
+   * either side of --checksum-choice. */
+  if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
+    config->cli_exit_code = 4;
+    return -1;
+  }
+
+  /* rsync randomizes the checksum seed for every transfer when the user did not
+   * supply one (a seed of 0, including an explicit --checksum-seed=0), using
+   * time(NULL) ^ (getpid() << 6), and transmits it so both ends agree.  Mirror
+   * that: the wire config carries the value, so the receiver uses the exact
+   * seed this sender hashed with.  A non-zero --checksum-seed is honored
+   * verbatim (deterministic). */
+  if (config->checksum_seed == 0)
+    config->checksum_seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 6);
 
   /* --files-from is loaded after every argument is seen so that -0/--from0 may
    * appear anywhere on the command line. A missing or unreadable file, and
@@ -1997,6 +2486,16 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
     config->use_incremental = true;
   }
 
+  /* -c/--checksum switches the per-file quick-check from size+mtime to a
+   * content digest; FastSync expresses that comparison through the incremental
+   * handshake, so -c implies --incremental.  rsync's -c does NOT imply -t (the
+   * digest alone decides), so the incremental auto-preserve below must not be
+   * triggered by a checksum-only implication: capture the explicitly requested
+   * incremental/delta state first. */
+  bool preserve_implied = config->use_incremental || config->use_delta;
+  if (config->checksum)
+    config->use_incremental = true;
+
   /* --incremental/--delta historically auto-enabled the metadata path, which
    * applied mode+mtime (README: "--incremental Auto-enables --preserve").
    * Restore that behavior by turning on the two attributes unless the user
@@ -2004,12 +2503,21 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * BEFORE the derived use_metadata bit so the transport frame is still sent
    * for the incremental/delta handshake even when both attributes were negated
    * via --no-preserve (metadata_explicitly_disabled handles that opt-out). */
-  if ((config->use_incremental || config->use_delta) && !config->metadata_explicitly_disabled) {
+  if (preserve_implied && !config->metadata_explicitly_disabled) {
     if (!config->preserve_perms_explicit_off)
       config->preserve_perms = true;
     if (!config->preserve_times_explicit_off)
       config->preserve_times = true;
   }
+
+  /* --ignore-existing is a receiver-side existence policy: the receiver must
+   * answer "skip" BEFORE the sender transmits any payload, which only the
+   * per-file STATUS_CHECK handshake provides.  Imply --incremental here (after
+   * the auto-preserve capture above, so a bare --ignore-existing does not gain
+   * -p/-t, which rsync likewise does not imply) so an existing destination is
+   * skipped on the wire instead of being streamed and discarded. */
+  if (config->ignore_existing)
+    config->use_incremental = true;
 
   /* Derive the transport bit from the FINAL parsed flags.  Every
    * preservation/ownership option that needs the metadata frame (per-attribute
@@ -2022,7 +2530,150 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * --no-xattrs/--no-acls negation) so the sender's wire gate always matches
    * the flags the receiver will recompute from the received config. */
   config->use_xattrs = config->preserve_acls || config->preserve_xattrs;
+  /* Output parity: -i/--itemize-changes, --out-format and --log-file-format
+   * need the pre-transfer destination snapshot (new vs modified and which
+   * attributes differ), so ask the receiver to report it on every per-file
+   * check.  This is a wire field. */
+  config->report_dest_info = config->itemize_changes || config->out_format != NULL ||
+                             (config->log_file != NULL && config->log_file_format != NULL);
+  /* Wire-stats parity: --stats, --progress/-P, an --out-format token that needs
+   * a wire counter (%b/%c), or a dry-run --delete need the receiver's
+   * end-of-transfer STATUS_STATS report.  This is a wire field (protocol
+   * 2.25.0). */
+  bool format_needs_wire = false;
+  if (config->out_format != NULL) {
+    for (const char* p = config->out_format; *p != '\0'; p++) {
+      if (p[0] == '%' && (p[1] == 'b' || p[1] == 'c')) {
+        format_needs_wire = true;
+        break;
+      }
+    }
+  }
+  config->report_stats = config->stats || config->show_progress || format_needs_wire ||
+                         (config->dry_run && config->use_delete);
   return 0;
+}
+
+/* True for the rsync short options that take a value: the remainder of the
+ * cluster is the value (attached form), or the next argv entry when the option
+ * is written alone. */
+static bool short_takes_value(char c) {
+  return c == 'e' || c == 'B' || c == 'M' || c == 'f' || c == 'T' || c == '@';
+}
+
+/* True when the long option consumes the following argv entry as its value
+ * (i.e. a value-taking option written without an inline "=").  The cluster
+ * expander consults this so a value that happens to start with '-' (e.g.
+ * --filter "- *.tmp") is copied verbatim instead of being mistaken for a
+ * short-option cluster. */
+static bool cli_long_takes_separate_value(const char* arg) {
+  if (strchr(arg, '='))
+    return false;
+  const OptionEntry* entry = find_table_option(arg);
+  if (entry)
+    return entry->kind == OPT_STRING || entry->kind == OPT_POS_INT ||
+           entry->kind == OPT_NONNEG_INT || entry->kind == OPT_ULL || entry->kind == OPT_SIGNED_INT;
+  static const char* const extra[] = {
+      "--ssh-port",        "--exclude",      "--include",       "--exclude-from",
+      "--include-from",    "--files-from",   "--filter",        "--delta-block",
+      "--block-size",      "--delta-max",    "--server-port",   "--port",
+      "--bwlimit",         "--chunk-size",   "--log-file",      "--stderr",
+      "--stop-after",      "--stop-at",      "--max-alloc",     "--compress-threads",
+      "--checksum-choice", "--cc",           "--checksum-seed", "--sockopts",
+      "--remote-option",   "--compare-dest", "--copy-dest",     "--link-dest",
+      "--usermap",         "--groupmap",     "--chown",         "--copy-as",
+      "--outbuf",          "--debug",        "--info",          "--skip-compress",
+  };
+  for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++)
+    if (strcmp(arg, extra[i]) == 0)
+      return true;
+  return false;
+}
+
+/* Expand rsync-style short-option clusters into one option per token before
+ * parsing: -av -> -a -v, -rlpt -> -r -l -p -t, -B1048576 -> -B 1048576 and
+ * -essh -> -e ssh.  A value-taking short consumes the remainder of its token
+ * (an optional leading '=' is dropped) as its value; otherwise a value-taking
+ * option written alone takes the next argv entry, which is therefore copied
+ * verbatim.  Every expanded token is a copy; *out_orig maps each expanded
+ * token back to its source argv index so the positional-argument indices
+ * returned to main() stay valid for the caller's original argv.  Returns 0 on
+ * success, -1 on allocation failure. */
+static int expand_short_clusters(int argc, char* argv[], char*** out_argv, int** out_orig,
+                                 int* out_argc) {
+  size_t cap = 1;
+  for (int i = 0; i < argc; i++)
+    cap += strlen(argv[i]) + 2;
+  char** exp = calloc(cap, sizeof(char*));
+  int* orig = calloc(cap, sizeof(int));
+  if (!exp || !orig) {
+    free(exp);
+    free(orig);
+    return -1;
+  }
+  int n = 0;
+  bool expect_value = false;
+  for (int i = 0; i < argc; i++) {
+    const char* tok = argv[i];
+    if (i == 0 || expect_value || tok[0] != '-' || tok[1] == '\0') {
+      exp[n] = str_dup(tok);
+      if (!exp[n])
+        goto oom;
+      orig[n] = i;
+      n++;
+      expect_value = false;
+      continue;
+    }
+    if (tok[1] == '-') {
+      exp[n] = str_dup(tok);
+      if (!exp[n])
+        goto oom;
+      orig[n] = i;
+      n++;
+      expect_value = cli_long_takes_separate_value(tok);
+      continue;
+    }
+    size_t len = strlen(tok);
+    for (size_t j = 1; j < len; j++) {
+      char flag[3] = {'-', tok[j], '\0'};
+      exp[n] = str_dup(flag);
+      if (!exp[n])
+        goto oom;
+      orig[n] = i;
+      n++;
+      if (short_takes_value(tok[j])) {
+        const char* value = tok + j + 1;
+        if (*value == '=')
+          value++;
+        if (*value != '\0') {
+          exp[n] = str_dup(value);
+          if (!exp[n])
+            goto oom;
+          orig[n] = i;
+          n++;
+        } else {
+          expect_value = true;
+        }
+        break;
+      }
+    }
+  }
+  *out_argv = exp;
+  *out_orig = orig;
+  *out_argc = n;
+  return 0;
+oom:
+  for (int k = 0; k < n; k++)
+    free(exp[k]);
+  free(exp);
+  free(orig);
+  return -1;
+}
+
+static void free_expanded_args(char** exp, int exp_argc) {
+  for (int i = 0; i < exp_argc; i++)
+    free(exp[i]);
+  free(exp);
 }
 
 /* Parse CLI arguments into config. Returns 0 on success, -1 on error, 1 for help/clean-exit. */
@@ -2030,13 +2681,32 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                int* positional_count) {
   protocol_set_8_bit_output(config->eight_bit_output);
 
-  if (cli_apply_output_controls(config, argc, argv) != 0)
+  char** exp_argv = NULL;
+  int* exp_orig = NULL;
+  int exp_argc = 0;
+  if (expand_short_clusters(argc, argv, &exp_argv, &exp_orig, &exp_argc) != 0) {
+    log_message(LOG_LEVEL_ERROR, "memory allocation failed parsing arguments");
     return -1;
+  }
+
+  int result = -1;
+  /* rsync treats a lone -h as a help request (it only means human-readable
+   * when combined with a source/destination or other options). */
+  if (exp_argc == 2 && strcmp(exp_argv[1], "-h") == 0) {
+    print_usage();
+    result = 1;
+    goto done;
+  }
+  int output_ret = cli_apply_output_controls(config, exp_argc, exp_argv);
+  if (output_ret != 0) {
+    result = output_ret;
+    goto done;
+  }
 
   CliParseCtx ctx = {
       .config = config,
-      .argc = argc,
-      .argv = argv,
+      .argc = exp_argc,
+      .argv = exp_argv,
       .i = 1,
       .exit_code = 0,
       .verbose = false,
@@ -2044,7 +2714,7 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
       .no_incremental = false,
   };
 
-  for (ctx.i = 1; ctx.i < argc; ctx.i++) {
+  for (ctx.i = 1; ctx.i < exp_argc; ctx.i++) {
     ctx.exit_code = 0;
     bool handled = cli_handle_pre_negation(&ctx) || cli_handle_range_time_options(&ctx) ||
                    cli_handle_table_option(&ctx) || cli_handle_inline_chmod(&ctx) ||
@@ -2054,33 +2724,41 @@ int parse_args(Config* config, int argc, char* argv[], int* positional_args,
                    cli_handle_checksum_options(&ctx) || cli_handle_remote_basis_options(&ctx) ||
                    cli_handle_outbuf_option(&ctx);
     if (handled) {
-      if (ctx.exit_code != 0)
-        return ctx.exit_code;
+      if (ctx.exit_code != 0) {
+        result = ctx.exit_code;
+        goto done;
+      }
       continue;
     }
 
-    if (argv[ctx.i][0] == '-') {
-      char* escaped = output_escape(argv[ctx.i], false);
-      fprintf(stderr, "Unknown option: %s\n", escaped ? escaped : "<allocation failed>");
+    if (ctx.argv[ctx.i][0] == '-') {
+      char* escaped = output_escape(ctx.argv[ctx.i], false);
+      fprintf(stderr, "Unknown option: %s (FastSync does not support this option)\n",
+              escaped ? escaped : "<allocation failed>");
       free(escaped);
       print_usage();
-      return -1;
+      goto done;
     }
     if (*positional_count < 2)
-      positional_args[(*positional_count)++] = ctx.i;
+      positional_args[(*positional_count)++] = exp_orig[ctx.i];
     else {
-      char* escaped = output_escape(argv[ctx.i], false);
+      char* escaped = output_escape(ctx.argv[ctx.i], false);
       fprintf(stderr, "Unexpected argument: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);
       print_usage();
-      return -1;
+      goto done;
     }
   }
 
-  return cli_finalize_config(config, ctx.verbose, ctx.no_delta, ctx.no_incremental);
+  result = cli_finalize_config(config, ctx.verbose, ctx.no_delta, ctx.no_incremental);
+done:
+  free_expanded_args(exp_argv, exp_argc);
+  free(exp_orig);
+  return result;
 }
 
-static int read_patterns_from_file(const char* filepath, char*** patterns, int* count) {
+static int read_patterns_from_file(const char* filepath, char*** patterns, int* count,
+                                   Config* config, char sign, const char* optname) {
   FILE* fp = fopen(filepath, "r");
   if (!fp) {
     char* escaped = output_escape(filepath, false);
@@ -2122,7 +2800,8 @@ static int read_patterns_from_file(const char* filepath, char*** patterns, int* 
       p[--len] = '\0';
     if (len == 0)
       continue;
-    if (config_add_pattern(patterns, count, p, "pattern file") != 0) {
+    if (config_add_pattern(patterns, count, p, "pattern file") != 0 ||
+        config_add_selection_rule(config, sign, p, optname) != 0) {
       free(line);
       fclose(fp);
       return -1;
@@ -2205,7 +2884,7 @@ int main(int argc, char* argv[]) {
   int parse_ret = parse_args(config, argc, argv, positional_args, &positional_count);
   if (parse_ret != 0) {
     if (parse_ret < 0)
-      exit_code = 1;
+      exit_code = config->cli_exit_code ? config->cli_exit_code : 1;
     goto cleanup;
   }
 
@@ -2294,6 +2973,11 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto cleanup;
   }
+
+  /* Install the negotiated codec for this process before any transfer thread
+   * is spawned; the compressed frames are self-describing, so the receiver's
+   * decompressor does not need this, but the sender compressor does. */
+  compression_set_algo((CompressionAlgo)config->compression_algo);
 
   /* --iconv: install the sender-side local->wire conversion before any path is
      scanned or serialized (the scanner and the chunk/data path read windows are

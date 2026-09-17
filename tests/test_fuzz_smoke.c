@@ -18,6 +18,10 @@
 
 /* P8 config-frame tail: super_mode (4) + copy-as presence (4) + uid (4) + gid (4). */
 #define P8_TAIL_BYTES 16
+/* Bytes after the P8 tail: report_dest_info (4), report_stats (4, wire-stats
+ * wave) and compression_algo (4, codec wave).  The P8 fields sit this many
+ * bytes before the end of the frame. */
+#define POST_P8_TAIL_BYTES 12
 
 /* Smoke test for chunk_deserialize fuzz target */
 static void test_fuzz_chunk_deserialize() {
@@ -320,7 +324,7 @@ static void test_fuzz_config_receive_p8_tail() {
   size_t len = 0;
   bool captured = capture_config_frame(c, &frame, &len);
   config_delete(c);
-  if (!captured || len <= P8_TAIL_BYTES) {
+  if (!captured || len <= P8_TAIL_BYTES + POST_P8_TAIL_BYTES) {
     free(frame);
     EXPECT_TRUE(false);
     return;
@@ -334,31 +338,31 @@ static void test_fuzz_config_receive_p8_tail() {
 
   /* super_mode outside the 0..2 tri-state is refused. */
   memcpy(mut, frame, len);
-  put_i32(mut, len - P8_TAIL_BYTES, 99);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, 99);
   EXPECT_FALSE(receive_config_frame(mut, len));
-  put_i32(mut, len - P8_TAIL_BYTES, -1);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, -1);
   EXPECT_FALSE(receive_config_frame(mut, len));
 
   /* A negative (sentinel) and an extreme copy-as uid/gid are refused. */
   memcpy(mut, frame, len);
-  put_i32(mut, len - P8_TAIL_BYTES, SUPER_MODE_AUTO);
-  put_i32(mut, len - P8_TAIL_BYTES + 4, 1);
-  put_i32(mut, len - P8_TAIL_BYTES + 8, -1);
-  put_i32(mut, len - P8_TAIL_BYTES + 12, 0);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, SUPER_MODE_AUTO);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 4, 1);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 8, -1);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 12, 0);
   EXPECT_FALSE(receive_config_frame(mut, len));
-  put_i32(mut, len - P8_TAIL_BYTES + 8, 0);
-  put_i32(mut, len - P8_TAIL_BYTES + 12, INT32_MIN);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 8, 0);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 12, INT32_MIN);
   EXPECT_FALSE(receive_config_frame(mut, len));
 
   /* A presence int that is not a wire bool is refused. */
   memcpy(mut, frame, len);
-  put_i32(mut, len - P8_TAIL_BYTES, SUPER_MODE_AUTO);
-  put_i32(mut, len - P8_TAIL_BYTES + 4, 2);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES, SUPER_MODE_AUTO);
+  put_i32(mut, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES + 4, 2);
   EXPECT_FALSE(receive_config_frame(mut, len));
 
   /* Truncating anywhere inside the P8 tail is refused. */
   EXPECT_FALSE(receive_config_frame(frame, len - 2));
-  EXPECT_FALSE(receive_config_frame(frame, len - P8_TAIL_BYTES));
+  EXPECT_FALSE(receive_config_frame(frame, len - POST_P8_TAIL_BYTES - P8_TAIL_BYTES));
 
   free(mut);
   free(frame);
@@ -379,7 +383,9 @@ static void test_fuzz_config_receive_huge_map_count() {
   }
   c->usermap_count = 1;
   c->usermap[0].from = sentinel_from;
+  c->usermap[0].from_hi = sentinel_from;
   c->usermap[0].to = sentinel_to;
+  c->usermap[0].to_name = NULL;
 
   unsigned char* frame = NULL;
   size_t len = 0;
@@ -390,9 +396,12 @@ static void test_fuzz_config_receive_huge_map_count() {
     return;
   }
 
-  unsigned char pattern[8];
+  /* One wire entry is [from][from_hi][to][to_name]; search the fixed-width
+     prefix (the to_name length-prefixed string follows). */
+  unsigned char pattern[12];
   memcpy(pattern, &sentinel_from, sizeof(sentinel_from));
-  memcpy(pattern + sizeof(sentinel_from), &sentinel_to, sizeof(sentinel_to));
+  memcpy(pattern + sizeof(sentinel_from), &sentinel_from, sizeof(sentinel_from));
+  memcpy(pattern + 2 * sizeof(sentinel_from), &sentinel_to, sizeof(sentinel_to));
   size_t entry_off = find_bytes(frame, len, pattern, sizeof(pattern));
   if (entry_off == SIZE_MAX || entry_off < sizeof(int32_t)) {
     free(frame);

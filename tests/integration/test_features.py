@@ -92,54 +92,63 @@ class TestDeviceSpecial:
         assert stat.S_ISFIFO(os.stat(os.path.join(received, "pipe.fifo")).st_mode)
 
     @pytest.mark.ci
-    def test_specials_socket_source_skipped_safely(self):
-        """A socket cannot be recreated by any standard filesystem call, so
-        --specials must skip it with a note and still complete the run (the
-        adjacent regular file transfers normally; no socket node appears)."""
+    def test_specials_recreates_socket(self, shared_server):
+        """--specials recreates a unix-domain socket with mknod(S_IFSOCK), which
+        Linux permits unprivileged; the adjacent regular file still transfers."""
         self._setup()
         sock_path = os.path.join(DEVICE_SOURCE, "source.sock")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server, port = _start_captured_server()
         try:
             s.bind(sock_path)
             result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
-                                   flags=["--specials"], port=port)
+                                   flags=["--specials"], port=shared_server.port)
         finally:
             s.close()
-            out, err = _stop_captured_server(server)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
         with open(os.path.join(received, "plain.txt")) as f:
             assert f.read() == "regular content\n"
-        assert not os.path.lexists(os.path.join(received, "source.sock")), (
-            "socket source must be skipped, not materialized"
-        )
-        assert "socket not recreated" in (out + err), (
-            f"receiver did not log the documented socket skip: out={out!r} err={err!r}"
+        dest_sock = os.path.join(received, "source.sock")
+        assert os.path.lexists(dest_sock), "socket source was not recreated"
+        assert stat.S_ISSOCK(os.lstat(dest_sock).st_mode), (
+            "socket source must be recreated as a socket node"
         )
 
     @pytest.mark.ci
+    def test_special_default_skips_non_regular(self, shared_server):
+        """Without --specials, rsync skips a FIFO/socket as a non-regular file;
+        FastSync must skip it (never copy it as an empty regular file)."""
+        self._setup()
+        os.mkfifo(os.path.join(DEVICE_SOURCE, "skip.fifo"))
+        sock_path = os.path.join(DEVICE_SOURCE, "skip.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(sock_path)
+            result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST, flags=[], port=shared_server.port)
+        finally:
+            s.close()
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        assert not os.path.lexists(os.path.join(received, "skip.fifo"))
+        assert not os.path.lexists(os.path.join(received, "skip.sock"))
+        with open(os.path.join(received, "plain.txt")) as f:
+            assert f.read() == "regular content\n"
+
+    @pytest.mark.ci
     @pytest.mark.parametrize("flags", [["--copy-devices"], ["--copy-devices", "--sendfile"]])
-    def test_copy_devices_fifo_becomes_regular_file(self, shared_server, flags):
-        """--copy-devices treats a special source as an ordinary regular-file
-        copy: a FIFO (st_size 0) becomes a zero-length REGULAR file on the
-        destination (never a FIFO, never a hang), and the run succeeds.  The
-        --sendfile variant previously blocked forever in the sendfile open();
-        the non-regular source now falls back to the buffered read path, so it
-        must complete within the bounded-time assertion below."""
+    def test_copy_devices_skips_fifo_without_specials(self, shared_server, flags):
+        """rsync's --copy-devices applies to device nodes only; a FIFO/socket is
+        a non-regular entry and is skipped unless --specials is also given.  In
+        particular it must never hang in the sendfile open()."""
         self._setup()
         os.mkfifo(os.path.join(DEVICE_SOURCE, "device_copy.fifo"))
         result, dur = run_client(DEVICE_SOURCE, DEVICE_DEST,
                                  flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
         received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
-        copied = os.path.join(received, "device_copy.fifo")
-        assert os.path.lexists(copied), "copy-devices source was not transferred"
-        st = os.lstat(copied)
-        assert stat.S_ISREG(st.st_mode), (
-            f"copy-devices must produce a regular file, got mode {oct(st.st_mode)}"
+        assert not os.path.lexists(os.path.join(received, "device_copy.fifo")), (
+            "a FIFO under --copy-devices alone must be skipped, not materialized"
         )
-        assert st.st_size == 0, f"expected a size-bounded 0-byte copy, got {st.st_size}"
         assert dur < 60, f"{' '.join(flags)} hung on a FIFO source"
 
     def test_write_devices_non_crash(self, shared_server):
@@ -219,6 +228,24 @@ class TestDeviceSpecial:
         st = os.lstat(os.path.join(received, "realdev"))
         assert stat.S_ISCHR(st.st_mode)
         assert os.major(st.st_rdev) == 1 and os.minor(st.st_rdev) == 3
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create device nodes")
+    def test_copy_devices_copies_device_as_regular(self, shared_server):
+        """Root-only: --copy-devices copies a device's content into an ordinary
+        regular file instead of recreating the node.  /dev/null (1,3) has size 0,
+        so the result is a 0-byte REGULAR file."""
+        self._setup()
+        src_dev = os.path.join(DEVICE_SOURCE, "copieddev")
+        os.mknod(src_dev, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        result, _ = run_client(DEVICE_SOURCE, DEVICE_DEST,
+                               flags=["-a", "--copy-devices"], port=shared_server.port)
+        assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:200]}"
+        received = get_dest_received_dir(DEVICE_DEST, DEVICE_SOURCE)
+        st = os.lstat(os.path.join(received, "copieddev"))
+        assert stat.S_ISREG(st.st_mode), (
+            f"--copy-devices must produce a regular file, got mode {oct(st.st_mode)}"
+        )
+        assert st.st_size == 0
 
     def test_m_remove_source_files_keeps_recreated_fifo(self, shared_server):
         """--threads --remove-source-files --specials: a recreated FIFO must NOT be
@@ -325,7 +352,7 @@ class TestDryRun:
         result, dur = run_client(SOURCE_DIR, DEST_DIR, flags=["-h", "--dry-run"])
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         assert "Total:" in result.stdout
-        assert "KB" in result.stdout
+        assert any(unit in result.stdout for unit in ("K", "M", "G"))
 
     def test_dry_run(self):
         clean_dir(DEST_DIR)
@@ -909,6 +936,133 @@ class TestChmod:
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert (os.stat(os.path.join(received, "small.txt")).st_mode & 0o777) == 0o644
 
+    @pytest.mark.ci
+    def test_chmod_does_not_imply_perms(self, shared_server):
+        """rsync's --chmod only tweaks the mode used for a NEW destination; it
+        does not imply -p, so a pre-existing destination keeps its own mode."""
+        source = os.path.join(TEST_DATA_DIR, "chmod_nop_src")
+        dest = os.path.join(TEST_DATA_DIR, "chmod_nop_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"one\n")
+        os.chmod(src_file, 0o644)
+
+        result, _ = run_client(source, dest, flags=["-p"], port=shared_server.port)
+        assert result.returncode == 0, f"seed failed: {(result.stderr or '')[:200]}"
+        dst_file = os.path.join(get_dest_received_dir(dest, source), "f.txt")
+        os.chmod(dst_file, 0o600)
+        with open(src_file, "wb") as fh:
+            fh.write(b"two, changed content\n")
+
+        result, _ = run_client(source, dest, flags=["--chmod=go+w"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--chmod failed: {(result.stderr or result.stdout)[:300]}"
+        got = stat.S_IMODE(os.stat(dst_file).st_mode)
+        assert got == 0o600, \
+            f"--chmod must not imply -p; existing dest mode changed to {oct(got)}"
+
+    @pytest.mark.ci
+    def test_chmod_go_w_with_perms(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "chmod_gow_src")
+        dest = os.path.join(TEST_DATA_DIR, "chmod_gow_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"x\n")
+        os.chmod(src_file, 0o644)
+
+        result, _ = run_client(source, dest, flags=["-p", "--chmod=go+w"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-p --chmod=go+w failed: {(result.stderr or result.stdout)[:300]}"
+        got = stat.S_IMODE(os.stat(
+            os.path.join(get_dest_received_dir(dest, source), "f.txt")).st_mode)
+        assert got == 0o666, f"--chmod=go+w must grant group/other write, got {oct(got)}"
+
+    @pytest.mark.ci
+    def test_chmod_repeated_options_accumulate(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "chmod_append_src")
+        dest = os.path.join(TEST_DATA_DIR, "chmod_append_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "f.txt")
+        with open(src_file, "wb") as fh:
+            fh.write(b"x\n")
+        os.chmod(src_file, 0o644)
+
+        result, _ = run_client(source, dest,
+                               flags=["-p", "--chmod=a+r", "--chmod=a-w"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"append --chmod failed: {(result.stderr or result.stdout)[:300]}"
+        got = stat.S_IMODE(os.stat(
+            os.path.join(get_dest_received_dir(dest, source), "f.txt")).st_mode)
+        assert got == 0o444, f"repeated --chmod must accumulate, got {oct(got)}"
+
+    @pytest.mark.ci
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_chmod_matches_rsync(self, shared_server):
+        """Differential --chmod verification against rsync 3.4.1 for D/F/X
+        selectors, no-/with--p new files, special bits, and append semantics."""
+        cases = [
+            ("go_w_no_p", ["--chmod=go+w"], {}, {"f.txt": (b"x", 0o644)}, ["f.txt"]),
+            ("go_w_p", ["-p", "--chmod=go+w"], {}, {"f.txt": (b"x", 0o644)}, ["f.txt"]),
+            ("world_writable_p", ["-p"], {}, {"f.txt": (b"x", 0o666)}, ["f.txt"]),
+            ("setgid_sticky_dirs_p", ["-p"], {"sg": 0o2755, "st": 0o1777},
+             {"sg/a.txt": (b"x", 0o644), "st/b.txt": (b"x", 0o644)},
+             ["sg", "st"]),
+            ("special_file_p", ["-p"], {}, {"s": (b"x", 0o6755)}, ["s"]),
+            ("archive_special_file", ["-a"], {}, {"s": (b"x", 0o6755)}, ["s"]),
+            ("archive_setgid_dir", ["-a"], {"d": 0o2755},
+             {"d/a.txt": (b"x", 0o644)}, ["d"]),
+            ("dfx_p", ["-p", "--chmod=Dg+s,Fo-w,+X"], {"d": 0o700},
+             {"d/inner.txt": (b"x", 0o644), "f.txt": (b"x", 0o644)}, ["d", "f.txt"]),
+            ("x_selector_p", ["-p", "--chmod=a+X"], {"d": 0o600},
+             {"d/inner.txt": (b"x", 0o644), "exe": (b"x", 0o755), "noexe": (b"x", 0o644)},
+             ["d", "exe", "noexe"]),
+            ("append_p", ["-p", "--chmod=a+r", "--chmod=a-w"], {},
+             {"f.txt": (b"x", 0o644)}, ["f.txt"]),
+        ]
+        for name, flags, dirs, files, check in cases:
+            source = os.path.join(TEST_DATA_DIR, f"chmod_diff_{name}_src")
+            fdest = os.path.join(TEST_DATA_DIR, f"chmod_diff_{name}_fs")
+            rdest = os.path.join(TEST_DATA_DIR, f"chmod_diff_{name}_rsync")
+            clean_dir(source)
+            clean_dir(fdest)
+            clean_dir(rdest)
+            for rel, mode in dirs.items():
+                path = os.path.join(source, rel)
+                os.makedirs(path, exist_ok=True)
+                os.chmod(path, mode)
+            for rel, (content, mode) in files.items():
+                path = os.path.join(source, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(content)
+                os.chmod(path, mode)
+
+            rsync_result = subprocess.run(
+                ["rsync", "-r"] + flags + [source + "/", rdest + "/"],
+                text=True, capture_output=True)
+            assert rsync_result.returncode == 0, \
+                f"rsync {name} failed: {rsync_result.stderr[:300]}"
+
+            result, _ = run_client(source, fdest, flags=flags, port=shared_server.port)
+            assert result.returncode == 0, \
+                f"FastSync {name} failed: {(result.stderr or result.stdout)[:300]}"
+
+            fs_root = get_dest_received_dir(fdest, source)
+            for rel in check:
+                rsync_mode = stat.S_IMODE(os.lstat(os.path.join(rdest, rel)).st_mode)
+                fs_mode = stat.S_IMODE(os.lstat(os.path.join(fs_root, rel)).st_mode)
+                assert fs_mode == rsync_mode, (
+                    f"{name}: mode mismatch for {rel}: "
+                    f"FastSync {oct(fs_mode)} != rsync {oct(rsync_mode)}")
+
 
 class TestPreallocate:
     """--preallocate allocates the destination file space up front; the final
@@ -1070,10 +1224,12 @@ class TestExclude:
 
 class TestInclude:
     def test_include_single(self, shared_server):
+        # rsync first-match-wins: an --include alone is NOT a whitelist, so the
+        # selector must pair it with --exclude '*' (the common idiom).
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["--include", "binary.bin"],
+            flags=["--include", "binary.bin", "--exclude", "*"],
             port=shared_server.port,
         )
         if result.returncode != 0:
@@ -1086,13 +1242,14 @@ class TestInclude:
         clean_dir(DEST_DIR)
         result, dur = run_client(
             SOURCE_DIR, DEST_DIR,
-            flags=["--include", "*.bin"],
+            flags=["--include", "*.bin", "--exclude", "*"],
             port=shared_server.port,
         )
         if result.returncode != 0:
             pytest.fail(f"Exit {result.returncode}: {(result.stderr or result.stdout)[:200]}")
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert os.path.exists(os.path.join(received, "binary.bin")), "binary.bin should be included"
+        assert not os.path.exists(os.path.join(received, "small.txt")), "small.txt should not be included"
 
 
 class TestSizeFilters:
@@ -1300,7 +1457,151 @@ class TestChecksumChoice:
         )
         assert result.returncode != 0, "sha256 must be rejected, not silently ignored"
 
-    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    @pytest.mark.ci
+    def test_checksum_alone_skips_unchanged(self, shared_server):
+        """-c alone (no explicit --incremental) must switch the quick-check to a
+        content digest: an unchanged file whose mtime differs is skipped."""
+        source = os.path.join(TEST_DATA_DIR, "checksum_alone_src")
+        dest = os.path.join(TEST_DATA_DIR, "checksum_alone_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"same content\n")
+        result, _ = run_client(source, dest, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = os.path.join(get_dest_received_dir(dest, source), "f.txt")
+        assert os.path.exists(received)
+        # Make the destination mtime differ without changing the bytes.
+        bumped = os.stat(received).st_mtime + 100
+        os.utime(received, (bumped, bumped))
+
+        result, _ = run_client(source, dest, flags=["-c"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        # A skip leaves our bumped mtime in place; a transfer would rewrite it.
+        assert os.stat(received).st_mtime == pytest.approx(bumped), \
+            "-c did not skip an unchanged file"
+
+        # A same-size, same-mtime content change is still detected.
+        with open(received, "wb") as fh:
+            fh.write(b"DIFF content\n")
+        os.utime(received, (bumped, bumped))
+        result, _ = run_client(source, dest, flags=["-c"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        with open(received, "rb") as fh:
+            assert fh.read() == b"same content\n"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("algo", ["xxh128", "xxh3", "xxh64", "md5", "md4", "sha1"])
+    def test_checksum_choice_all_algorithms_transfer(self, shared_server, algo):
+        """Every rsync 3.4.1 checksum algorithm is accepted and transfers
+        byte-exactly.  'none' is covered separately (it needs no digest)."""
+        clean_dir(DEST_DIR)
+        flags = ["--preserve", "--incremental", "--checksum", f"--checksum-choice={algo}"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"checksum-choice={algo} failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_two_name_form(self, shared_server):
+        """The rsync 'TRANSFER,PRE-TRANSFER' form is accepted; FastSync uses the
+        second (pre-transfer) algorithm for its whole-file digest."""
+        clean_dir(DEST_DIR)
+        flags = ["--preserve", "--incremental", "--checksum", "--cc=md4,sha1"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"two-name --cc=md4,sha1 failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_none_accepted_without_checksum(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["--preserve", "--incremental", "--cc=none"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--cc=none failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_none_rejected_with_checksum(self, shared_server):
+        """rsync rejects 'none' as the pre-transfer checksum with --checksum and
+        exits 4; mirror both the rejection and the exit code."""
+        for choice in ("none", "md5,none"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=["--checksum", f"--cc={choice}"],
+                                   port=shared_server.port)
+            assert result.returncode == 4, \
+                f"--cc={choice} --checksum must exit 4, got {result.returncode}: " \
+                f"{(result.stderr or result.stdout)[:200]}"
+
+    @pytest.mark.ci
+    def test_checksum_choice_unknown_rejected_exit_4(self, shared_server):
+        for bad in ("sha256", "bogus", "md5,", "md4,md5,sha1"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=[f"--checksum-choice={bad}"],
+                                   port=shared_server.port)
+            assert result.returncode == 4, \
+                f"--checksum-choice={bad} must exit 4, got {result.returncode}"
+
+    @pytest.mark.ci
+    @pytest.mark.parametrize("algo", ["zstd", "lz4", "zlib", "zlibx"])
+    def test_compress_choice_all_algorithms_transfer(self, shared_server, algo):
+        """Every rsync 3.4.1 compression codec is accepted and transfers
+        byte-exactly through its own codec."""
+        clean_dir(DEST_DIR)
+        flags = ["-z", f"--compress-choice={algo}"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--compress-choice={algo} failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    @pytest.mark.ci
+    def test_compress_choice_unknown_rejected_exit_4(self, shared_server):
+        for bad in ("bogus", "zstd,lz4", ""):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                                   flags=[f"--compress-choice={bad}"],
+                                   port=shared_server.port)
+            assert result.returncode == 4, \
+                f"--compress-choice={bad} must exit 4, got {result.returncode}"
+
+    @pytest.mark.ci
+    def test_compress_choice_none_disables_compression(self, shared_server):
+        clean_dir(DEST_DIR)
+        result, _ = run_client(SOURCE_DIR, DEST_DIR,
+                               flags=["-z", "--compress-choice=none"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--compress-choice=none failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing and not mismatches, f"missing={missing} mismatches={mismatches}"
+
+    @pytest.mark.ci
+    def test_compress_choice_auto_transfers(self, shared_server):
+        """--compress-choice=auto is normalized to zstd client-side, so the
+        receiver never rejects the transfer (#4)."""
+        clean_dir(DEST_DIR)
+        flags = ["-z", "--compress-choice=auto"]
+        result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--compress-choice=auto sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
+        mismatches, missing = verify_transfer(SOURCE_DIR, received)
+        assert not missing, f"Missing: {missing}"
+        assert not mismatches, f"Mismatch: {mismatches}"
+
+    @pytest.mark.parametrize("algo", ["xxh64", "xxh3", "xxh128", "md5"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_unchanged_skipped_and_bytes_preserved(self, shared_server, algo, mt):
         clean_dir(DEST_DIR)
@@ -1321,7 +1622,7 @@ class TestChecksumChoice:
     # detected (and re-transferred byte-exactly) because the whole-file digest
     # differs -- the explicit reason --checksum exists.  This exercises the
     # sender/receiver digest agreement for a non-default algorithm.
-    @pytest.mark.parametrize("algo", ["xxh64", "md5"])
+    @pytest.mark.parametrize("algo", ["xxh64", "xxh3", "xxh128", "md5"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_changed_same_size_mtime_redetected(self, shared_server, algo, mt):
         clean_dir(DEST_DIR)
@@ -1635,8 +1936,8 @@ class TestDelete:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert "Sent " in output and "MB" in output, "--progress produced no stable byte marker"
-        assert "Done." in output, "--progress did not report completion"
+        assert "sending incremental file list" in output, "--progress produced no rsync header"
+        assert "(xfr#" in output, "--progress produced no per-file xfr block"
 
     def test_human_readable_stats(self, shared_server):
         clean_dir(DEST_DIR)
@@ -1646,8 +1947,8 @@ class TestDelete:
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
-        assert "Stats:" in result.stderr
-        assert "KB" in result.stderr
+        assert "Number of files:" in result.stdout
+        assert "Total file size:" in result.stdout
 
     def test_human_readable_stats_multithreaded(self, shared_server):
         # The multithreaded sender shares the single-threaded --stats format,
@@ -1659,9 +1960,8 @@ class TestDelete:
             port=shared_server.port,
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
-        assert "Stats:" in result.stderr
-        assert "KB" in result.stderr
-        assert "/s" in result.stderr
+        assert "Number of files:" in result.stdout
+        assert "bytes/sec" in result.stdout
 
     def test_human_readable_progress_multithreaded(self, shared_server):
         clean_dir(DEST_DIR)
@@ -1672,9 +1972,8 @@ class TestDelete:
         )
         assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr[:100]}"
         output = result.stdout + result.stderr
-        assert "Sent " in output
-        assert "KB" in output
-        assert "Done." in output
+        assert "sending incremental file list" in output
+        assert "(xfr#" in output
 
 
 class TestInfo:
@@ -2066,6 +2365,8 @@ class TestTempDir:
         source = self._make_source("tempdir_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_dst")
         clean_dir(dest)
+        # rsync requires the temp dir to already exist (it is not created).
+        os.makedirs(os.path.join(dest, "scratch"), exist_ok=True)
         flags = ["--temp-dir=scratch"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
         assert result.returncode == 0, f"temp-dir sync failed: {result.stderr[:200]}"
@@ -2125,26 +2426,172 @@ class TestTempDir:
         assert not os.path.exists(os.path.join(dest, "scratch")), \
             "--partial-dir wrote through the scratch dir"
 
-    def test_temp_dir_escape_rejected(self, shared_server):
-        source = self._make_source("tempdir_escape_src")
-        dest = os.path.join(TEST_DATA_DIR, "tempdir_escape_dst")
+    def test_temp_dir_must_exist(self, shared_server):
+        """rsync does not create the temp dir; a missing one is a clear error."""
+        source = self._make_source("tempdir_missing_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_missing_dst")
         clean_dir(dest)
-        # "../escape" would resolve one level above the destination root.
-        outside = os.path.join(TEST_DATA_DIR, "escape")
-        assert not os.path.lexists(outside)
-
-        result, _ = run_client(source, dest, flags=["--temp-dir=../escape"],
+        missing_rel = os.path.join(dest, "no_such_scratch")
+        assert not os.path.lexists(missing_rel)
+        result, _ = run_client(source, dest, flags=["--temp-dir=no_such_scratch"],
                                port=shared_server.port)
-        assert result.returncode != 0, "relative escaping --temp-dir was not rejected"
-        assert not os.path.lexists(outside), "file created outside the destination root"
+        assert result.returncode != 0, "a missing relative --temp-dir must fail"
 
+    def test_temp_dir_absolute_rejected(self, shared_server):
+        """The receiver confines --temp-dir to the destination root: an absolute
+        (or `..`-escaping) value is rejected before any write, so a client can
+        never make the receiver create scratch files in an arbitrary directory."""
+        source = self._make_source("tempdir_abs_src")
+        dest = os.path.join(TEST_DATA_DIR, "tempdir_abs_dst")
         clean_dir(dest)
-        abs_escape = os.path.join(TEST_DATA_DIR, "abs_escape_probe")
-        assert not os.path.lexists(abs_escape)
-        result, _ = run_client(source, dest, flags=["--temp-dir", abs_escape],
+        scratch = os.path.join(TEST_DATA_DIR, "tempdir_abs_scratch")
+        shutil.rmtree(scratch, ignore_errors=True)
+        os.makedirs(scratch)
+
+        result, _ = run_client(source, dest, flags=["--temp-dir", scratch],
                                port=shared_server.port)
-        assert result.returncode != 0, "absolute --temp-dir was not rejected"
-        assert not os.path.lexists(abs_escape), "file created outside the destination root"
+        assert result.returncode != 0, "an absolute --temp-dir must be rejected"
+        assert os.listdir(scratch) == [], "receiver wrote into an unconfined temp dir"
+        # A relative traversal is rejected for the same reason.
+        result, _ = run_client(source, dest, flags=["--temp-dir=../escape_scratch"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "a `..` --temp-dir must be rejected"
+        shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(os.path.join(TEST_DATA_DIR, "escape_scratch"), ignore_errors=True)
+
+
+class TestTimeoutAndAllocLimits:
+    """#295: rsync defaults --timeout=0 (disabled), --contimeout=60, and
+    --max-alloc=0 (no limit); 0 must be accepted for all three."""
+
+    def _seed(self, name):
+        source = os.path.join(TEST_DATA_DIR, name)
+        dest = os.path.join(TEST_DATA_DIR, name + "_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"payload\n" * 100)
+        return source, dest
+
+    @pytest.mark.ci
+    def test_timeout_zero_disables_and_transfers(self, shared_server):
+        source, dest = self._seed("timeout_zero_src")
+        result, _ = run_client(source, dest, flags=["--timeout=0", "--contimeout=0"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing and not mismatches
+
+    @pytest.mark.ci
+    def test_no_timeout_forms(self, shared_server):
+        source, dest = self._seed("timeout_no_src")
+        result, _ = run_client(source, dest, flags=["--timeout=30", "--no-timeout",
+                                                    "--no-contimeout"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+
+    @pytest.mark.ci
+    def test_max_alloc_zero_means_no_limit(self, shared_server):
+        source, dest = self._seed("max_alloc_zero_src")
+        result, _ = run_client(source, dest, flags=["--max-alloc=0"], port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:200]
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not missing and not mismatches
+
+    def test_temp_dir_cross_filesystem_fallback(self, shared_server):
+        """A confined relative --temp-dir that resolves (via a symlink under the
+        destination root) to another filesystem must fall back to a non-atomic
+        copy instead of aborting (rsync parity).  Skipped when no second
+        filesystem is available."""
+        shm = "/dev/shm"
+        if not os.path.isdir(shm):
+            pytest.skip("/dev/shm not available")
+        if os.stat(shm).st_dev == os.stat(TEST_DATA_DIR).st_dev:
+            pytest.skip("/dev/shm is on the same filesystem as the test data")
+        scratch = os.path.join(shm, f"fastsync_tmp_{os.getpid()}")
+        shutil.rmtree(scratch, ignore_errors=True)
+        os.makedirs(scratch)
+        try:
+            source, dest = self._seed("tempdir_xdev_src")
+            # The receiver resolves a relative temp dir under the destination
+            # root; a symlink there points the scratch at the second filesystem.
+            link = os.path.join(dest, "xdev_scratch")
+            os.symlink(scratch, link)
+            result, _ = run_client(source, dest, flags=["--temp-dir", "xdev_scratch"],
+                                   port=shared_server.port)
+            assert result.returncode == 0, f"cross-fs temp-dir failed: {result.stderr[:300]}"
+            received = get_dest_received_dir(dest, source)
+            mismatches, missing = verify_transfer(source, received)
+            assert not missing, f"Missing: {missing}"
+            assert not mismatches, f"Mismatch: {mismatches}"
+            assert os.listdir(scratch) == [], "temp files left behind in the cross-fs scratch"
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+class TestRemoteOptionTransport:
+    """#296: -M/--remote-option is SSH-only; a daemon/TCP destination rejects it
+    instead of silently ignoring it."""
+
+    @pytest.mark.ci
+    def test_remote_option_rejected_for_tcp(self, shared_server):
+        for flag in ("--remote-option=--allow-delete", "-M--allow-delete", "-M=--allow-delete"):
+            result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=[flag],
+                                   port=shared_server.port)
+            assert result.returncode != 0, f"{flag} must be rejected for a TCP destination"
+            assert "remote-option" in (result.stderr + result.stdout), \
+                f"{flag}: error must name --remote-option"
+
+
+class TestTrustSenderServerPath:
+    """--trust-sender is a receiver-local file-list validation policy.  Symlink
+    targets are stored verbatim like rsync (an absolute/`..` target is copied as
+    a symlink by default); the sender-side --safe-links is what suppresses
+    unsafe links.  A client --trust-sender is never sent to the peer, so it
+    cannot change how the receiving server stores links."""
+
+    def _make_source(self, name):
+        source = os.path.join(TEST_DATA_DIR, name)
+        clean_dir(source)
+        with open(os.path.join(source, "file.txt"), "wb") as fh:
+            fh.write(b"content\n")
+        os.symlink("/etc/passwd", os.path.join(source, "escape_link"))
+        return source
+
+    def _run_with_server(self, extra_args, flags, tag):
+        server = ServerManager()
+        server.start(extra_args=extra_args)
+        try:
+            source = self._make_source(f"trust_sender_src_{tag}")
+            dest = os.path.join(TEST_DATA_DIR, f"trust_sender_dst_{tag}")
+            clean_dir(dest)
+            result, _ = run_client(source, dest, flags=["-l"] + flags, port=server.port)
+            link = os.path.join(get_dest_received_dir(dest, source), "escape_link")
+            return result, link
+        finally:
+            server.stop()
+
+    @pytest.mark.ci
+    def test_escaping_symlink_stored_verbatim_by_default(self):
+        result, link = self._run_with_server([], [], "default")
+        assert result.returncode == 0, result.stderr[:200]
+        assert os.path.islink(link), "rsync parity: -l stores the link verbatim"
+        assert os.readlink(link) == "/etc/passwd"
+
+    @pytest.mark.ci
+    def test_client_trust_sender_does_not_change_server_storage(self):
+        result, link = self._run_with_server([], ["--trust-sender"], "client")
+        assert result.returncode == 0, result.stderr[:200]
+        assert os.path.islink(link) and os.readlink(link) == "/etc/passwd", \
+            "a client --trust-sender must not change how the server stores links"
+
+    @pytest.mark.ci
+    def test_safe_links_skips_escaping_symlink(self):
+        result, link = self._run_with_server([], ["--safe-links"], "safe")
+        assert result.returncode == 0, result.stderr[:200]
+        assert not os.path.lexists(link), "--safe-links must skip an unsafe target"
 
 
 def _source_files():
@@ -2164,7 +2611,8 @@ class TestListOnly:
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only"])
         assert result.returncode == 0, f"list-only failed: {result.stderr[:200]}"
         for full_path in _source_files():
-            assert full_path in result.stdout, f"list-only omitted {full_path}"
+            rel = os.path.relpath(full_path, SOURCE_DIR)
+            assert rel in result.stdout, f"list-only omitted {rel}"
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert not os.path.exists(received), "list-only wrote to the destination"
 
@@ -2180,7 +2628,8 @@ class TestListOnly:
         result, _ = run_client(SOURCE_DIR, DEST_DIR, flags=["--list-only", "--threads"])
         assert result.returncode == 0, f"list-only -m failed: {result.stderr[:200]}"
         for full_path in _source_files():
-            assert full_path in result.stdout, f"list-only -m omitted {full_path}"
+            rel = os.path.relpath(full_path, SOURCE_DIR)
+            assert rel in result.stdout, f"list-only -m omitted {rel}"
         received = get_dest_received_dir(DEST_DIR, SOURCE_DIR)
         assert not os.path.exists(received), "list-only -m wrote to the destination"
 
@@ -2193,7 +2642,7 @@ class TestItemizeChanges:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--preserve", "-i"], port=shared_server.port)
         assert result.returncode == 0, f"itemize sync failed: {result.stderr[:200]}"
-        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        sent_lines = {">f+++++++++ " + os.path.relpath(p, SOURCE_DIR) for p in _source_files()}
         assert sent_lines <= set(result.stdout.splitlines()), (
             f"missing itemize lines; got {result.stdout[:500]}"
         )
@@ -2214,7 +2663,7 @@ class TestItemizeChanges:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--preserve", "-i", "--threads"], port=shared_server.port)
         assert result.returncode == 0, f"itemize -m sync failed: {result.stderr[:200]}"
-        sent_lines = {">f+++++++++ " + p for p in _source_files()}
+        sent_lines = {">f+++++++++ " + os.path.relpath(p, SOURCE_DIR) for p in _source_files()}
         assert sent_lines <= set(result.stdout.splitlines()), (
             f"missing itemize lines in -m mode; got {result.stdout[:500]}"
         )
@@ -2249,7 +2698,9 @@ class TestItemizeChanges:
                                port=shared_server.port)
         assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
         itemized = [line for line in result.stdout.splitlines() if line.startswith(">f")]
-        assert itemized == [">f+++++++++ " + changed], (
+        # The content and mtime both changed, so the itemize compares the
+        # destination snapshot: size and time columns are set.
+        assert itemized == [">f.st...... changed.txt"], (
             f"expected exactly one itemize line for {changed}, got {itemized}"
         )
         received = get_dest_received_dir(dest, source)
@@ -2265,7 +2716,11 @@ class TestOutFormat:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--out-format=%f %l"], port=shared_server.port)
         assert result.returncode == 0, f"out-format sync failed: {result.stderr[:200]}"
-        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        # %f is rsync's long display path: the source argument normalized
+        # (leading '/' stripped) joined to the transfer-relative name.
+        prefix = SOURCE_DIR.lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, os.path.relpath(p, SOURCE_DIR))} {os.path.getsize(p)}"
+                    for p in _source_files()}
         got = set(result.stdout.splitlines())
         assert expected <= got, f"out-format lines missing: expected {len(expected)} got {len(got)}"
 
@@ -2274,7 +2729,9 @@ class TestOutFormat:
         result, _ = run_client(SOURCE_DIR, DEST_DIR,
                                flags=["--out-format=%f %l", "--threads"], port=shared_server.port)
         assert result.returncode == 0, f"out-format -m sync failed: {result.stderr[:200]}"
-        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        prefix = SOURCE_DIR.lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, os.path.relpath(p, SOURCE_DIR))} {os.path.getsize(p)}"
+                    for p in _source_files()}
         got = set(result.stdout.splitlines())
         assert expected <= got, f"out-format -m lines missing: {result.stdout[:500]}"
 
@@ -2296,7 +2753,9 @@ class TestLogFileFormat:
         assert os.path.exists(log_path), "--log-file created no log"
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-        expected = {f"{p} {os.path.getsize(p)}" for p in _source_files()}
+        prefix = SOURCE_DIR.lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, os.path.relpath(p, SOURCE_DIR))} {os.path.getsize(p)}"
+                    for p in _source_files()}
         for line in expected:
             assert line in content, f"log file missing {line!r}"
 
@@ -2322,7 +2781,8 @@ class TestLogFileFormat:
         assert os.path.exists(log_path), "--log-file created no log"
         with open(log_path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-        expected = {f"{os.path.join(source, rel)} {len(data)}" for rel, data in files.items()}
+        prefix = os.path.abspath(source).lstrip(os.sep)
+        expected = {f"{os.path.join(prefix, rel)} {len(data)}" for rel, data in files.items()}
         for line in expected:
             assert line in content, f"log file (--threads) missing {line!r}"
 
@@ -2635,8 +3095,9 @@ class TestRelativeFilesFrom:
             "bare relative layout must not appear without -R"
 
     def test_relative_delete_manifest_stays_consistent(self):
-        """--delete derives from the sent (-R) relative paths, so a later
-        subset run removes unlisted relative entries but keeps listed ones."""
+        """--delete with --files-from is confined to the synchronized directories
+        (rsync parity): listing a FILE does not make its parent a delete scope,
+        but listing the DIRECTORY does."""
         source = _make_relative_source("rel_del_src")
         dest = os.path.join(TEST_DATA_DIR, "rel_del_dst")
         clean_dir(dest)
@@ -2648,14 +3109,64 @@ class TestRelativeFilesFrom:
             assert result.returncode == 0, f"seed -R sync failed: {result.stderr[:200]}"
             assert os.path.isfile(os.path.join(dest, "sub", "y.txt"))
 
+            # A file-only listing leaves sub/ unsynchronized: y.txt survives.
             subset = _write_rel_list(b"sub/x.txt\n")
             result, _ = run_client(source, dest,
                                    flags=["--files-from", subset, "-R", "--delete"],
                                    port=server.port)
             assert result.returncode == 0, f"-R delete sync failed: {result.stderr[:200]}"
             assert os.path.isfile(os.path.join(dest, "sub", "x.txt")), "listed file was deleted"
+            assert os.path.exists(os.path.join(dest, "sub", "y.txt")), \
+                "file-only --files-from made the parent a delete scope (rsync keeps it)"
+
+            # Listing the directory synchronizes it: a source-removed y.txt is now
+            # an in-scope extra and is deleted.
+            os.unlink(os.path.join(source, "sub", "y.txt"))
+            listed_dir = _write_rel_list(b"sub/\n")
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", listed_dir, "-R", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, f"-R dir delete sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(dest, "sub", "x.txt"))
             assert not os.path.exists(os.path.join(dest, "sub", "y.txt")), \
-                "unlisted relative file was not deleted"
+                "directory-listed --delete did not remove the in-scope extra"
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_relative_root_size_prune_protects_mirror_from_delete(self, mt):
+        """#12: a root-level --max-size prune under -R + --files-from must record
+        the bare relative wire path as its delete-protected prefix, so the
+        size-pruned entry's destination mirror survives --delete (rsync parity)."""
+        source = _make_relative_source("rel_rootsize_src")
+        # Big enough that a 100-byte cap prunes only this entry.
+        with open(os.path.join(source, "big.txt"), "wb") as fh:
+            fh.write(b"b" * 1000)
+        dest = os.path.join(TEST_DATA_DIR, "rel_rootsize_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            # "." lists the whole tree, so the receive root is a delete scope
+            # (a file-only list would leave the root out of scope, masking the
+            # protected-prefix mismatch this test targets).
+            lst = _write_rel_list(b".\n")
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", lst, "-R"] + (["--threads"] if mt else []),
+                                   port=server.port)
+            assert result.returncode == 0, f"seed -R sync failed: {result.stderr[:200]}"
+            assert os.path.isfile(os.path.join(dest, "big.txt"))
+            with open(os.path.join(dest, "unrelated.txt"), "w") as fh:
+                fh.write("x")
+
+            # --max-size=100 prunes only big.txt; its dest mirror is always protected.
+            result, _ = run_client(source, dest,
+                                   flags=["--files-from", lst, "-R", "--delete", "--max-size=100"] +
+                                         (["--threads"] if mt else []),
+                                   port=server.port)
+            assert result.returncode == 0, f"-R size+delete sync failed: {result.stderr[:300]}"
+            assert not os.path.exists(os.path.join(dest, "unrelated.txt")), "delete not active"
+            assert os.path.isfile(os.path.join(dest, "big.txt")), \
+                "the size-pruned entry's mirror was wrongly deleted (protected prefix mismatch)"
+            assert os.path.isfile(os.path.join(dest, "sub", "x.txt"))
+            assert os.path.isfile(os.path.join(dest, "top.txt"))
 
 
 class TestMissingArgs:
@@ -2727,15 +3238,21 @@ class TestMissingArgs:
         assert not os.path.exists(os.path.join(received, "gone1.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
-    def test_empty_list_stays_a_hard_error(self, shared_server, mt):
+    def test_empty_list_succeeds_transferring_nothing(self, shared_server, mt):
+        """rsync 3.4.1 treats an empty --files-from list as "nothing to
+        transfer" and exits 0 (verified with the real binary), so fastsync must
+        too rather than reporting a hard error."""
         source = self._make_source("mg_empty_src")
         dest = os.path.join(TEST_DATA_DIR, "mg_empty_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"")
         flags = ["--files-from", lst, "--ignore-missing-args"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
-        assert result.returncode != 0, "an empty --files-from list must stay a hard error"
-        assert "contains no entries" in (result.stderr or result.stdout)
+        assert result.returncode == 0, \
+            f"an empty --files-from list must succeed like rsync: {result.stderr[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert not os.path.exists(os.path.join(received, "a.txt")), \
+            "an empty --files-from list must transfer nothing"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_delete_missing_removes_mirror_not_unrelated(self, mt):
@@ -2772,14 +3289,15 @@ class TestMissingArgs:
             assert os.path.isfile(os.path.join(dest, "a.txt"))
             assert os.path.isfile(os.path.join(dest, "sub", "b.txt"))
 
-            # Now with --delete the unrelated extra is an ordinary extra and must go.
+            # --delete is confined to synchronized directories: no listed
+            # directory, so the root-level unrelated extra survives (rsync parity).
             lst2 = _write_rel_list(b"a.txt\ngone.txt\nsub/b.txt\n")
             flags2 = ["--files-from", lst2, "-R", "--delete-missing-args", "--delete"] + \
                      (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags2, port=server.port)
             assert result.returncode == 0, f"delete-missing + delete sync failed: {result.stderr[:300]}"
-            assert not os.path.exists(os.path.join(dest, "unrelated.txt")), \
-                "--delete did not remove the unrelated extra"
+            assert os.path.isfile(os.path.join(dest, "unrelated.txt")), \
+                "--delete under --files-from removed an extra outside a listed directory"
             assert not os.path.exists(os.path.join(dest, "gone.txt"))
             assert os.path.isfile(os.path.join(dest, "a.txt"))
 
@@ -2808,6 +3326,64 @@ class TestMissingArgs:
             assert result.returncode == 0, f"delete-missing no-R sync failed: {result.stderr[:300]}"
             assert not os.path.exists(os.path.join(received, "gone.txt")), \
                 "the full-source-mirror path of the missing entry was not deleted"
+            assert os.path.isfile(os.path.join(received, "a.txt"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_missing_args_respects_max_delete_budget(self, mt):
+        """#290 (5): --delete-missing-args deletions draw from the same
+        --max-delete budget as the ordinary extras walk: only the first N happen
+        and the run exits 25 like rsync."""
+        source = self._make_source("mg_budget_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_budget_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            for name in ("gone1.txt", "gone2.txt", "gone3.txt"):
+                with open(os.path.join(received, name), "w") as fh:
+                    fh.write("stale")
+            lst = _write_rel_list(b"a.txt\ngone1.txt\ngone2.txt\ngone3.txt\n")
+            flags = ["--files-from", lst, "--delete-missing-args", "--max-delete=2"] + \
+                    (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, \
+                f"--delete-missing-args --max-delete=2 should exit 25: {result.stderr[:300]}"
+            remaining = [n for n in ("gone1.txt", "gone2.txt", "gone3.txt")
+                         if os.path.exists(os.path.join(received, n))]
+            assert len(remaining) == 1, \
+                f"missing-args deletions ignored the --max-delete budget: {remaining}"
+            assert os.path.isfile(os.path.join(received, "a.txt"))
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_missing_nonempty_dir_counts_each_entry_against_budget(self, mt):
+        """A non-empty missing-arg directory with --force/--delete is removed
+        entry-by-entry, each counting toward --max-delete (rsync parity): with a
+        small cap the run stops after N files and leaves the rest in place."""
+        source = self._make_source("mg_dirbudget_src")
+        dest = os.path.join(TEST_DATA_DIR, "mg_dirbudget_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            gone = os.path.join(received, "gone")
+            os.makedirs(gone)
+            for i in range(4):
+                with open(os.path.join(gone, f"f{i}"), "w") as fh:
+                    fh.write("stale")
+            lst = _write_rel_list(b"a.txt\ngone\n")
+            flags = ["--files-from", lst, "--delete-missing-args", "--force",
+                     "--max-delete=2"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, \
+                f"non-empty missing-arg dir should cap at 2 and exit 25: {result.stderr[:300]}"
+            assert os.path.isdir(gone), \
+                "the non-empty missing-arg directory should survive a capped run"
+            remaining = len(os.listdir(gone))
+            assert remaining == 2, f"expected 2 entries left, found {remaining}"
             assert os.path.isfile(os.path.join(received, "a.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
@@ -2842,8 +3418,10 @@ class TestMissingArgs:
                 "the explicit missing-arg deletion was blocked by exclusion protection"
             assert os.path.isfile(os.path.join(received, "prot", "kept.txt")), \
                 "the excluded-but-present destination file must stay (default protection)"
-            assert not os.path.exists(os.path.join(received, "extra.txt")), \
-                "--delete did not remove the unrelated extra"
+            # A file-only --files-from listing synchronizes no directory, so the
+            # root-level extra is outside the delete scope (rsync parity).
+            assert os.path.isfile(os.path.join(received, "extra.txt")), \
+                "--delete under --files-from removed an extra outside a listed directory"
             assert os.path.isfile(os.path.join(received, "a.txt"))
 
     @pytest.mark.parametrize("mt", [False, True])
@@ -2868,8 +3446,10 @@ class TestMissingArgs:
             assert not os.path.exists(os.path.join(dest, "gone.txt")), \
                 "early timing did not remove the missing-arg mirror"
             assert os.path.isfile(os.path.join(dest, "a.txt")), "a.txt was not transferred"
-            assert not os.path.exists(os.path.join(dest, "extra.txt")), \
-                "--delete-before implies --delete: unrelated extras must go"
+            # --delete-before implies --delete, but the extras walk is still
+            # confined to synchronized directories: no listed directory here.
+            assert os.path.isfile(os.path.join(dest, "extra.txt")), \
+                "--delete-before under --files-from removed an extra outside a listed directory"
 
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("relative", [False, True])
@@ -2879,6 +3459,12 @@ class TestMissingArgs:
         exact-path deletions must not abort the --delete extras walk.  Covers
         the -R bare-relative layout and the full source-mirror layout."""
         source = self._make_source("mg_deep_src")
+        # A listed directory gives the extras walk a synchronized scope to work
+        # in, so the test can prove the absent-parent missing entry did not abort
+        # it.
+        os.makedirs(os.path.join(source, "scope"))
+        with open(os.path.join(source, "scope", "keep.txt"), "w") as fh:
+            fh.write("kept\n")
         dest = os.path.join(TEST_DATA_DIR, "mg_deep_dst")
         clean_dir(dest)
         rel_flags = ["-R"] if relative else []
@@ -2898,16 +3484,22 @@ class TestMissingArgs:
                 assert os.path.isfile(os.path.join(target_root, "a.txt"))
             with open(os.path.join(target_root, "extra.txt"), "w") as fh:
                 fh.write("extra")
+            os.makedirs(os.path.join(target_root, "scope"), exist_ok=True)
+            with open(os.path.join(target_root, "scope", "extra.txt"), "w") as fh:
+                fh.write("extra")
 
-            lst = _write_rel_list(b"a.txt\nsub/gone.txt\n")
+            lst = _write_rel_list(b"a.txt\nscope/\nsub/gone.txt\n")
             flags = ["--files-from", lst, "--delete-missing-args", "--delete"] + rel_flags + \
                     (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
             assert result.returncode == 0, \
                 f"deep missing-entry sync failed: {result.stderr[:300]}"
             assert _read_file(os.path.join(target_root, "a.txt")) == b"a\n"
-            assert not os.path.exists(os.path.join(target_root, "extra.txt")), \
+            assert _read_file(os.path.join(target_root, "scope", "keep.txt")) == b"kept\n"
+            assert not os.path.exists(os.path.join(target_root, "scope", "extra.txt")), \
                 "--delete extras walk was aborted by the absent-parent missing entry"
+            # The root-level extra is outside every listed directory: it survives.
+            assert os.path.exists(os.path.join(target_root, "extra.txt"))
             assert not os.path.exists(os.path.join(target_root, "sub")), \
                 "the absent parent directory of the missing entry was created"
 
@@ -3244,15 +3836,15 @@ class TestDeleteTiming:
             assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n", \
                 f"{flag}: nested file was not written after the early deletion"
 
-    @pytest.mark.parametrize("flag", ["--delete", "--delete-after", "--delete-delay"])
+    @pytest.mark.parametrize("flag", ["--delete", "--delete-after"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_flags_commit_only_after_success(self, flag, mt):
-        """Plain --delete/--delete-after/--delete-delay defer deletion until the
-        whole transfer succeeds: a mid-transfer write failure must leave every
-        extra in place (commit-style safety).  The -m receiver must also keep
-        the extras: the deferred keep-set is committed by the server only after
-        the disk-writer thread has finished, and a failing writer means the
-        manifest is freed, never applied."""
+        """Plain --delete/--delete-after defer deletion until the whole transfer
+        succeeds: a mid-transfer write failure must leave every extra in place
+        (commit-style safety).  The -m receiver must also keep the extras: the
+        deferred keep-set is committed by the server only after the disk-writer
+        thread has finished, and a failing writer means the manifest is freed,
+        never applied."""
         source = self._seed("late")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_late_dst")
         clean_dir(dest)
@@ -3278,10 +3870,42 @@ class TestDeleteTiming:
             assert os.path.isfile(blocker), \
                 f"{flag} (mt={mt}) deleted the blocker although the transfer failed"
 
-    def test_early_flag_respected_when_server_refuses_delete(self, shared_server):
-        """With an --allow-delete-less server the client's early timing still
-        completes (no deadlock on the pre-delete ack) and simply never deletes,
-        exactly like the plain server policy."""
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_delete_delay_clears_type_conflict_like_rsync(self, mt):
+        """rsync clears a destination file that blocks a source directory even
+        when the deletion itself is deferred (--delete-delay); the type conflict
+        is resolved immediately so the nested write succeeds.  The transfer must
+        therefore succeed and the unrelated extra must still be removed."""
+        source = self._seed("delayconflict")
+        dest = os.path.join(TEST_DATA_DIR, "deltiming_delayconflict_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            extra = os.path.join(received, "extra.txt")
+            with open(extra, "wb") as fh:
+                fh.write(b"extra file")
+            blocker = os.path.join(received, "sub")
+            shutil.rmtree(blocker)
+            with open(blocker, "wb") as fh:
+                fh.write(b"blocks the nested destination directory")
+
+            flags = ["--delete-delay"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"--delete-delay (mt={mt}) did not clear the type conflict: " \
+                f"{(result.stderr or result.stdout)[:300]}"
+            assert os.path.isdir(blocker), "blocker file was not replaced by the source directory"
+            assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n"
+            assert not os.path.exists(extra), "--delete-delay did not remove the extra"
+
+    @pytest.mark.parametrize("flag", ["--delete-before", "--delete-during", "--delete-delay"])
+    def test_early_flag_respected_when_server_refuses_delete(self, flag, shared_server):
+        """With an --allow-delete-less server the client's timing still completes
+        (no deadlock on the pre-delete ack, no per-directory deletion) and simply
+        never deletes, exactly like the plain server policy."""
         source = self._seed("refused")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_refused_dst")
         clean_dir(dest)
@@ -3291,9 +3915,9 @@ class TestDeleteTiming:
         extra = os.path.join(received, "extra.txt")
         with open(extra, "wb") as fh:
             fh.write(b"extra file")
-        result, _ = run_client(source, dest, flags=["--delete-before"], port=shared_server.port)
+        result, _ = run_client(source, dest, flags=[flag], port=shared_server.port)
         assert result.returncode == 0, \
-            f"--delete-before against a refuse-delete server failed: {result.stderr[:300]}"
+            f"{flag} against a refuse-delete server failed: {result.stderr[:300]}"
         assert os.path.exists(extra), "unauthorized delete removed an extra file"
 
 
@@ -3316,6 +3940,179 @@ def _seed_delete_tree(tag, entries, dest):
     return source, received
 
 
+class TestDeleteScope:
+    """#290 (1): --delete with --files-from is confined to the directories the
+    transfer synchronized (rsync parity), so untransmitted paths outside a
+    listed directory subtree are never deleted.  Data-loss capable."""
+
+    def _write(self, path, content):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(content)
+
+    def _seed(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"dscope_{tag}_src")
+        clean_dir(source)
+        for rel, content in {
+            "listed.txt": b"listed\n",
+            "unlisted.txt": b"unlisted\n",
+            "other/c.txt": b"c\n",
+            "sub/x.txt": b"x\n",
+            "sub/y.txt": b"y\n",
+        }.items():
+            self._write(os.path.join(source, rel), content)
+        dest = os.path.join(TEST_DATA_DIR, f"dscope_{tag}_dst")
+        clean_dir(dest)
+        server = ServerManager()
+        server.start(extra_args=["--allow-delete"])
+        result, _ = run_client(source, dest, port=server.port)
+        assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+        received = get_dest_received_dir(dest, source)
+        self._write(os.path.join(received, "sub", "extra.txt"), b"in-scope extra\n")
+        self._write(os.path.join(received, "rootextra.txt"), b"root extra\n")
+        self._write(os.path.join(received, "other", "extra.txt"), b"other extra\n")
+        return source, dest, received, server
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
+    def test_files_from_delete_confined_to_listed_dirs(self, mt):
+        source, dest, received, server = self._seed(f"dir_{mt}")
+        try:
+            listed = _write_rel_list(b"listed.txt\nsub/\n")
+            flags = ["--files-from", listed, "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"delete failed: {result.stderr[:300]}"
+            assert not os.path.exists(os.path.join(received, "sub", "extra.txt")), \
+                "in-scope extra under a listed directory was not deleted"
+            assert os.path.isfile(os.path.join(received, "sub", "x.txt"))
+            assert os.path.exists(os.path.join(received, "unlisted.txt")), \
+                "unlisted path outside a listed directory was deleted (data loss)"
+            assert os.path.exists(os.path.join(received, "other", "c.txt")), \
+                "unlisted sibling directory was deleted (data loss)"
+            assert os.path.exists(os.path.join(received, "rootextra.txt")), \
+                "receive-root extra outside a listed directory was deleted (data loss)"
+        finally:
+            server.stop()
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
+    def test_files_from_delete_file_listing_keeps_parent_extras(self, mt):
+        source, dest, received, server = self._seed(f"file_{mt}")
+        try:
+            # Listing a FILE does not synchronize its parent directory, so the
+            # parent's extras survive exactly like rsync.
+            listed = _write_rel_list(b"listed.txt\nsub/x.txt\n")
+            flags = ["--files-from", listed, "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"delete failed: {result.stderr[:300]}"
+            assert os.path.exists(os.path.join(received, "sub", "extra.txt")), \
+                "a file-only --files-from made its parent a delete scope"
+            assert os.path.exists(os.path.join(received, "rootextra.txt"))
+            assert os.path.exists(os.path.join(received, "unlisted.txt"))
+        finally:
+            server.stop()
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
+    @pytest.mark.ci
+    def test_files_from_per_dir_timing_confined_to_listed_dirs(self, mt, timing):
+        """The per-directory timings honor the same --files-from scope: an extra
+        inside a listed directory is removed, while unlisted siblings and the
+        receive-root extra survive."""
+        source, dest, received, server = self._seed(f"pd_{timing.strip('-')}_{mt}")
+        try:
+            listed = _write_rel_list(b"listed.txt\nsub/\n")
+            flags = ["--files-from", listed, timing] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"{timing} delete failed: {result.stderr[:300]}"
+            assert not os.path.exists(os.path.join(received, "sub", "extra.txt")), \
+                f"{timing} did not delete the in-scope extra"
+            assert os.path.isfile(os.path.join(received, "sub", "x.txt"))
+            assert os.path.exists(os.path.join(received, "unlisted.txt")), \
+                f"{timing} deleted an unlisted path (data loss)"
+            assert os.path.exists(os.path.join(received, "other", "c.txt")), \
+                f"{timing} deleted an unlisted sibling directory (data loss)"
+            assert os.path.exists(os.path.join(received, "rootextra.txt")), \
+                f"{timing} deleted the receive-root extra (data loss)"
+        finally:
+            server.stop()
+
+
+class TestDeleteExtraneousSymlinks:
+    """#290 (3): --delete unlinks extraneous destination symlinks (never follows
+    them), matching rsync, and leaves their targets intact."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.ci
+    def test_delete_unlinks_extraneous_symlinks(self, mt):
+        source = os.path.join(TEST_DATA_DIR, f"dsym_{mt}_src")
+        clean_dir(source)
+        with open(os.path.join(source, "keep.txt"), "wb") as fh:
+            fh.write(b"kept\n")
+        dest = os.path.join(TEST_DATA_DIR, f"dsym_{mt}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            outside = os.path.join(TEST_DATA_DIR, f"dsym_{mt}_outside")
+            clean_dir(outside)
+            with open(os.path.join(outside, "secret.txt"), "wb") as fh:
+                fh.write(b"secret\n")
+            os.symlink("keep.txt", os.path.join(received, "link_file"))
+            os.symlink(outside, os.path.join(received, "link_dir"))
+            os.symlink("/nonexistent-target", os.path.join(received, "link_broken"))
+            os.makedirs(os.path.join(received, "realdir"), exist_ok=True)
+            os.symlink("../realdir", os.path.join(received, "realdir", "self"))
+
+            flags = ["--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"delete failed: {result.stderr[:300]}"
+            assert not os.path.lexists(os.path.join(received, "link_file")), \
+                "extraneous symlink to a file was not unlinked"
+            assert not os.path.lexists(os.path.join(received, "link_dir")), \
+                "extraneous symlink to a directory was not unlinked"
+            assert not os.path.lexists(os.path.join(received, "link_broken")), \
+                "extraneous dangling symlink was not unlinked"
+            assert not os.path.lexists(os.path.join(received, "realdir", "self")), \
+                "extraneous self-referential symlink was not unlinked"
+            assert os.path.isfile(os.path.join(received, "keep.txt"))
+            assert os.path.isfile(os.path.join(outside, "secret.txt")), \
+                "an extraneous symlink was followed and its target deleted"
+
+
+class TestSizePruneProtection:
+    """#290 (2): --max-size/--min-size pruned source mirrors survive --delete
+    even with --delete-excluded (rsync keeps them)."""
+
+    @pytest.mark.parametrize("mt", [False, True])
+    @pytest.mark.parametrize("flag", ["--max-size=1000", "--min-size=1000"])
+    @pytest.mark.ci
+    def test_size_pruned_mirror_survives_delete_excluded(self, mt, flag):
+        source = os.path.join(TEST_DATA_DIR, f"dsize_{mt}_{flag.strip('-=')}_src")
+        clean_dir(source)
+        with open(os.path.join(source, "small.txt"), "wb") as fh:
+            fh.write(b"small\n")
+        with open(os.path.join(source, "big.bin"), "wb") as fh:
+            fh.write(b"0" * 5000)
+        dest = os.path.join(TEST_DATA_DIR, f"dsize_{mt}_{flag.strip('-=')}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+
+            flags = [flag, "--delete", "--delete-excluded"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, f"size delete failed: {result.stderr[:300]}"
+            assert os.path.isfile(os.path.join(received, "small.txt")), \
+                "size-pruned small mirror was deleted under --delete-excluded"
+            assert os.path.isfile(os.path.join(received, "big.bin")), \
+                "size-pruned big mirror was deleted under --delete-excluded"
+
+
 class TestDeletePolicy:
     """Deletion-policy family: --delete-excluded, --max-delete, --force,
     --ignore-errors and --prune-empty-dirs."""
@@ -3327,7 +4124,8 @@ class TestDeletePolicy:
 
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.parametrize("timing",
-                             ["--delete", "--delete-before", "--delete-after", "--delete-delay"])
+                             ["--delete", "--delete-before", "--delete-after", "--delete-delay",
+                              "--delete-during"])
     def test_delete_protects_excluded_by_default_and_delete_excluded_removes(self, mt, timing):
         """rsync parity: with a --delete timing the destination mirror path whose
         source was excluded survives (protected by default); --delete-excluded
@@ -3411,9 +4209,10 @@ class TestDeletePolicy:
                 "--delete-excluded did not remove the excluded dir subtree"
 
     @pytest.mark.parametrize("mt", [False, True])
-    @pytest.mark.parametrize("timing", ["--delete", "--delete-before"])
-    def test_max_delete_exceeded_fails_without_deleting(self, mt, timing):
-        """A run that would exceed --max-delete deletes nothing and fails."""
+    @pytest.mark.parametrize("timing", ["--delete", "--delete-before", "--delete-during"])
+    def test_max_delete_exceeded_deletes_up_to_cap_and_exits_25(self, mt, timing):
+        """rsync parity: --max-delete=N deletes up to N extras, skips the rest and
+        still succeeds as a transfer, exiting 25 with a diagnostic."""
         source = os.path.join(TEST_DATA_DIR, f"maxdel_{timing.strip('-')}_{mt}_src")
         clean_dir(source)
         self._write(os.path.join(source, "keep.txt"), b"kept\n")
@@ -3424,19 +4223,51 @@ class TestDeletePolicy:
             result, _ = run_client(source, dest, port=server.port)
             assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
             received = get_dest_received_dir(dest, source)
-            extras = []
             for i in range(4):
-                name = f"e{i}.txt"
-                self._write(os.path.join(received, name), b"extra\n")
-                extras.append(os.path.join(received, name))
+                self._write(os.path.join(received, f"e{i}.txt"), b"extra\n")
 
             flags = ["--max-delete=2", timing] + (["--threads"] if mt else [])
             result, _ = run_client(source, dest, flags=flags, port=server.port)
-            assert result.returncode != 0, \
-                f"--max-delete=2 with 4 extras unexpectedly succeeded: {result.stderr[:300]}"
-            for path in extras:
-                assert os.path.exists(path), \
-                    "--max-delete overrun deleted files (must be all-or-nothing)"
+            assert result.returncode == 25, \
+                f"--max-delete=2 with 4 extras should exit 25: {result.stderr[:300]}"
+            remaining = [i for i in range(4)
+                         if os.path.exists(os.path.join(received, f"e{i}.txt"))]
+            assert len(remaining) == 2, \
+                f"--max-delete=2 deleted {4 - len(remaining)} extras, expected 2"
+            assert os.path.isfile(os.path.join(received, "keep.txt"))
+            assert "--max-delete" in (result.stderr or result.stdout)
+
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_max_delete_zero_and_negative(self, mt):
+        """--max-delete=0 warns about every extra without deleting (exit 25);
+        a negative value is rsync's deprecated unlimited spelling (exit 0)."""
+        source = os.path.join(TEST_DATA_DIR, f"maxdelzn_{mt}_src")
+        clean_dir(source)
+        self._write(os.path.join(source, "keep.txt"), b"kept\n")
+        dest = os.path.join(TEST_DATA_DIR, f"maxdelzn_{mt}_dst")
+        clean_dir(dest)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, port=server.port)
+            assert result.returncode == 0, f"seed sync failed: {result.stderr[:200]}"
+            received = get_dest_received_dir(dest, source)
+            for i in range(3):
+                self._write(os.path.join(received, f"e{i}.txt"), b"extra\n")
+            flags = ["--max-delete=0", "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 25, f"--max-delete=0 should exit 25: {result.stderr[:300]}"
+            for i in range(3):
+                assert os.path.exists(os.path.join(received, f"e{i}.txt")), \
+                    "--max-delete=0 deleted an extra"
+
+            # -1 (and any negative) means no client limit: every extra goes.
+            flags = ["--max-delete=-1", "--delete"] + (["--threads"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=server.port)
+            assert result.returncode == 0, \
+                f"--max-delete=-1 should be unlimited: {result.stderr[:300]}"
+            for i in range(3):
+                assert not os.path.exists(os.path.join(received, f"e{i}.txt")), \
+                    "--max-delete=-1 did not remove every extra"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_max_delete_not_exceeded_deletes_exactly(self, mt):
@@ -3499,16 +4330,16 @@ class TestDeletePolicy:
                 "--force did not replace the directory with the file"
             assert _read_file(os.path.join(received, "sub")) == b"now a file\n"
 
-    def test_force_inert_under_delay_updates(self):
-        """Documented divergence: --force acts on the immediate-install path; a
-        --delay-updates run stages into its own tree and its publication renames
-        over regular files only, so a blocking directory is not cleared and the
-        run fails."""
-        source = os.path.join(TEST_DATA_DIR, "force_delay_src")
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_force_replaces_dir_under_delay_updates(self, mt):
+        """rsync parity: --force also acts during a --delay-updates publication,
+        clearing a non-empty destination directory that blocks an incoming file
+        (without --force the run fails and the directory survives)."""
+        source = os.path.join(TEST_DATA_DIR, f"force_delay_{mt}_src")
         clean_dir(source)
         self._write(os.path.join(source, "sub", "old.txt"), b"old\n")
         self._write(os.path.join(source, "keep.txt"), b"kept\n")
-        dest = os.path.join(TEST_DATA_DIR, "force_delay_dst")
+        dest = os.path.join(TEST_DATA_DIR, f"force_delay_{mt}_dst")
         clean_dir(dest)
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
@@ -3518,14 +4349,24 @@ class TestDeletePolicy:
             os.unlink(os.path.join(source, "sub", "old.txt"))
             os.rmdir(os.path.join(source, "sub"))
             self._write(os.path.join(source, "sub"), b"now a file\n")
-            result, _ = run_client(source, dest, flags=["--force", "--delay-updates"],
+
+            # Without --force the blocking directory is untouched and the run fails.
+            result, _ = run_client(source, dest, flags=["--delay-updates"] + (["--threads"] if mt else []),
                                    port=server.port)
             assert result.returncode != 0, \
-                "--force --delay-updates unexpectedly replaced the blocking directory"
-            assert os.path.isdir(os.path.join(received, "sub")), \
-                "blocking directory was cleared although --delay-updates should keep --force inert"
-            assert os.path.exists(os.path.join(received, "sub", "old.txt")), \
-                "blocking directory content was lost"
+                "--delay-updates replaced a non-empty directory without --force"
+            assert os.path.isdir(os.path.join(received, "sub"))
+            assert os.path.exists(os.path.join(received, "sub", "old.txt"))
+
+            # With --force the publication clears it and installs the file.
+            result, _ = run_client(source, dest,
+                                   flags=["--force", "--delay-updates"] + (["--threads"] if mt else []),
+                                   port=server.port)
+            assert result.returncode == 0, \
+                f"--force --delay-updates failed: {result.stderr[:300]}"
+            assert os.path.isfile(os.path.join(received, "sub")), \
+                "--force under --delay-updates did not replace the blocking directory"
+            assert _read_file(os.path.join(received, "sub")) == b"now a file\n"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_prune_empty_dirs_dirs_mode(self, mt):
@@ -4261,15 +5102,20 @@ class TestFuzzy:
             "no-candidate fuzzy run should have sent the whole file"
 
     def test_dissimilar_sibling_is_not_used(self, shared_server):
-        # The destination holds a large sibling whose basename is too different
-        # from the incoming name; the name gate must reject it and fall back to
-        # a whole-file transfer.
+        # A sibling whose basename is too different from the incoming name is
+        # rejected by rsync's fuzzy distance window (the length gap exceeds
+        # 25), so the run falls back to a whole-file transfer.  A distinct
+        # mtime keeps rsync's exact size+mtime first pass from accepting it.
         source, dest = self._prepare("dissim")
         old_bytes, new_bytes = _random_payloads()
-        self._seed_dest(source, dest, {"totally-unrelated-notes.bin": old_bytes},
+        long_name = "totally-unrelated-notes-with-a-very-long-name.bin"
+        self._seed_dest(source, dest, {long_name: old_bytes},
                            shared_server.port)
         with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
             fh.write(new_bytes)
+        received_dir = get_dest_received_dir(dest, source)
+        os.utime(os.path.join(received_dir, long_name), (self.TS, self.TS))
+        os.utime(os.path.join(source, self.NEW_NAME), (self.TS + 100000, self.TS + 100000))
         result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
         assert result.returncode == 0, \
             f"--fuzzy dissimilar-sibling run failed: {(result.stderr or result.stdout)[:300]}"
@@ -4277,6 +5123,28 @@ class TestFuzzy:
         assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
         assert proxy.client_to_server > len(new_bytes) // 2, \
             "a dissimilar-named sibling must not be used as a fuzzy basis"
+
+    def test_exact_size_mtime_sibling_is_used(self, shared_server):
+        # rsync's fuzzy first pass accepts a sibling with an exact size+mtime
+        # match regardless of how unrelated its name is (its content is almost
+        # certainly the same).
+        source, dest = self._prepare("exact")
+        old_bytes, new_bytes = _random_payloads()
+        self._seed_dest(source, dest, {"unrelated-blob.bin": old_bytes},
+                           shared_server.port)
+        with open(os.path.join(source, self.NEW_NAME), "wb") as fh:
+            fh.write(new_bytes)
+        received_dir = get_dest_received_dir(dest, source)
+        ts = 1600000000
+        os.utime(os.path.join(received_dir, "unrelated-blob.bin"), (ts, ts))
+        os.utime(os.path.join(source, self.NEW_NAME), (ts, ts))
+        result, proxy = self._run_measured(source, dest, ["--fuzzy"], shared_server.port)
+        assert result.returncode == 0, \
+            f"--fuzzy exact size+mtime run failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert _read_file(os.path.join(received, self.NEW_NAME)) == new_bytes
+        assert proxy.client_to_server < len(new_bytes) // 4, \
+            "an exact size+mtime sibling should be used as a fuzzy basis"
 
     def test_fuzzy_helps_when_dest_holds_an_unsuitable_file(self, shared_server):
         # The destination DOES hold the exact new name, but it is a tiny stale
@@ -4510,9 +5378,11 @@ class TestIdentityMapping:
         clean_dir(dest)
         with open(os.path.join(source, "f.txt"), "wb") as f:
             f.write(b"mapped")
+        # #294: --chown cannot be mixed with --usermap/--groupmap on the same
+        # side, so the maps travel together and --chown is exercised separately.
         result, _ = run_client(
             source, dest,
-            flags=["--preserve", "--usermap=@1000:@1001", "--groupmap=@100:@101", "--chown=@2000:@2001"],
+            flags=["--preserve", "--usermap=@1000:@1001", "--groupmap=@100:@101"],
             port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:200]}"
@@ -4520,8 +5390,14 @@ class TestIdentityMapping:
         with open(os.path.join(received, "f.txt"), "rb") as f:
             assert f.read() == b"mapped"
 
+        result, _ = run_client(source, dest, flags=["--preserve", "--chown=@2000:@2001"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"chown exit {result.returncode}: {(result.stderr or '')[:200]}"
+
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
-    def test_numeric_ids_applies_ownership_as_root(self, shared_server):
+    def test_numeric_ids_alone_does_not_apply_ownership_as_root(self, shared_server):
+        # #286.1: --numeric-ids is a mapping modifier, not an ownership request.
         source = os.path.join(TEST_DATA_DIR, "identity_root_source")
         dest = os.path.join(TEST_DATA_DIR, "identity_root_dest")
         clean_dir(source)
@@ -4539,8 +5415,8 @@ class TestIdentityMapping:
         dst_file = os.path.join(received, "f.txt")
         assert os.path.exists(dst_file)
         st = os.stat(dst_file)
-        assert st.st_uid == 12345 and st.st_gid == 12346, \
-            f"owner not applied: uid={st.st_uid} gid={st.st_gid}"
+        assert st.st_uid != 12345, \
+            f"--numeric-ids alone must not chown: uid={st.st_uid} gid={st.st_gid}"
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
     def test_chown_overrides_ownership_as_root(self, shared_server):
@@ -4627,21 +5503,21 @@ class TestSuperPrivilege:
             f"--super alone must not apply ownership (uid={st.st_uid} gid={st.st_gid})"
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
-    def test_super_with_numeric_ids_applies_ownership_as_root(self, shared_server):
-        """Control: an explicit identity policy is what enables ownership, so
-        --numeric-ids --super still applies the raw ids as root (the very
-        ownership --no-super suppresses)."""
+    def test_super_with_owner_numeric_ids_applies_ownership_as_root(self, shared_server):
+        """Control: an explicit ownership request is what enables ownership, so
+        -a --numeric-ids --super applies the raw ids as root (the very ownership
+        --no-super suppresses).  --numeric-ids itself is only the modifier."""
         source, dest = self._seed("supernumeric")
         os.chown(os.path.join(source, "f.txt"), 12345, 12346)
         result, _ = run_client(source, dest,
-                               flags=["--preserve", "--numeric-ids", "--super"],
+                               flags=["-a", "--numeric-ids", "--super"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"exit {result.returncode}: {(result.stderr or '')[:300]}"
         received = get_dest_received_dir(dest, source)
         st = os.stat(os.path.join(received, "f.txt"))
         assert (st.st_uid, st.st_gid) == (12345, 12346), \
-            f"--numeric-ids --super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
+            f"-a --numeric-ids --super should apply raw ids: uid={st.st_uid} gid={st.st_gid}"
 
     @pytest.mark.ci
     @pytest.mark.skipif(os.geteuid() != 0, reason="only root can change ownership")
@@ -5150,8 +6026,10 @@ class TestSymlinkTrust:
         os.symlink("realfile.txt", os.path.join(source, "link_file"))
         os.symlink("realdir", os.path.join(source, "link_dir"))
 
-        result, _ = run_client(source, dest, flags=["-k"], port=shared_server.port)
-        assert result.returncode == 0, f"-k failed: {(result.stderr or result.stdout)[:300]}"
+        # -k only dereferences directory symlinks; file symlinks need -l to be
+        # carried as symlinks (rsync skips them otherwise).
+        result, _ = run_client(source, dest, flags=["-l", "-k"], port=shared_server.port)
+        assert result.returncode == 0, f"-l -k failed: {(result.stderr or result.stdout)[:300]}"
 
         received = get_dest_received_dir(dest, source)
         # link -> realdir dereferences into a real directory tree...
@@ -5191,9 +6069,13 @@ class TestSymlinkTrust:
         # ... and the file is written beneath it, through to the referent dir.
         assert os.path.isfile(os.path.join(parent, "realdir", "file.txt"))
 
-    def test_munge_links_unmunged_target_and_containment(self, shared_server):
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_munge")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_munge_dst")
+    @pytest.mark.ci
+    def test_munge_links_prefixes_targets(self, shared_server):
+        # rsync's --munge-links is a RECEIVER-side rewrite: every stored target
+        # gets the /rsyncd-munged/ prefix, making the link unusable while that
+        # directory does not exist.
+        source = os.path.join(TEST_DATA_DIR, "symlink_munge")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_munge_dst")
         clean_dir(source)
         clean_dir(dest)
         with open(os.path.join(source, "a.txt"), "wb") as f:
@@ -5207,19 +6089,15 @@ class TestSymlinkTrust:
         assert result.returncode == 0, f"--munge-links failed: {(result.stderr or result.stdout)[:300]}"
 
         received = get_dest_received_dir(dest, source)
-        # The safe symlink is created with its correct (unmunged) target.
-        good = os.path.join(received, "good")
-        assert os.path.islink(good)
-        assert os.readlink(good) == "a.txt"
-        # A target that would escape the receive root is contained (skip: never
-        # transmitted, so nothing is created at the destination).
-        assert not os.path.lexists(os.path.join(received, "abs_escape"))
-        assert not os.path.lexists(os.path.join(received, "dotdot_escape"))
+        assert os.readlink(os.path.join(received, "good")) == "/rsyncd-munged/a.txt"
+        assert os.readlink(os.path.join(received, "abs_escape")) == "/rsyncd-munged//etc/passwd"
+        assert os.readlink(os.path.join(received, "dotdot_escape")) == "/rsyncd-munged/../../escape"
         assert os.path.isfile(os.path.join(received, "a.txt"))
 
+    @pytest.mark.ci
     def test_links_copies_symlinks_as_symlinks(self, shared_server):
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_links")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_links_dst")
+        source = os.path.join(TEST_DATA_DIR, "symlink_links")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_links_dst")
         clean_dir(source)
         clean_dir(dest)
         os.makedirs(os.path.join(source, "realdir"))
@@ -5238,48 +6116,157 @@ class TestSymlinkTrust:
         assert os.path.islink(os.path.join(received, "ld"))
         assert os.readlink(os.path.join(received, "ld")) == "realdir"
 
-    def test_receiver_contains_absolute_target_even_without_munge(self, shared_server):
-        # The trust boundary is symmetric and enforced receiver-side: a plain -l
-        # (no --munge-links) run must refuse to materialize an out-of-root
-        # absolute symlink target, while still copying a legitimate in-root one.
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_abs")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_abs_dst")
+    @pytest.mark.ci
+    def test_links_preserves_absolute_and_dotdot_targets(self, shared_server):
+        # rsync -l parity: -l stores a symlink target verbatim, including an
+        # absolute target and an in-tree ".." target (no silent drop).
+        source = os.path.join(TEST_DATA_DIR, "symlink_links_verbatim")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_links_verbatim_dst")
         clean_dir(source)
         clean_dir(dest)
         with open(os.path.join(source, "a.txt"), "wb") as f:
             f.write(b"a\n")
+        os.makedirs(os.path.join(source, "sub"))
         os.symlink("a.txt", os.path.join(source, "good"))
         os.symlink("/etc/passwd", os.path.join(source, "unsafe_abs"))
+        os.symlink("../a.txt", os.path.join(source, "sub", "up"))
 
         result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
         assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
-
         received = get_dest_received_dir(dest, source)
-        good = os.path.join(received, "good")
-        assert os.path.islink(good)
-        assert os.readlink(good) == "a.txt"
-        # The absolute (non-contained) target was not materialized at the dest.
-        assert not os.path.lexists(os.path.join(received, "unsafe_abs"))
+        assert os.readlink(os.path.join(received, "good")) == "a.txt"
+        assert os.readlink(os.path.join(received, "unsafe_abs")) == "/etc/passwd"
+        assert os.readlink(os.path.join(received, "sub", "up")) == "../a.txt"
 
-    def test_links_does_not_strip_munge_prefix_without_munge(self, shared_server):
-        # A source symlink whose target genuinely begins with the #SYMLINK/ marker
-        # must round-trip verbatim under plain -l: the receiver only unmunges when
-        # the negotiated --munge-links policy is on, never unconditionally.
-        source = os.path.join(TEST_DATA_DIR, "symlink_trust_prefix")
-        dest = os.path.join(TEST_DATA_DIR, "symlink_trust_prefix_dst")
+    @pytest.mark.ci
+    def test_safe_links_keeps_safe_skips_unsafe(self, shared_server):
+        # --safe-links keeps symlinks that stay inside the transfer tree (even
+        # with a ".." that does not climb out) and drops absolute / escaping /
+        # internally-".."-bearing targets.
+        source = os.path.join(TEST_DATA_DIR, "symlink_safe")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_safe_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        os.makedirs(os.path.join(source, "sub"))
+        os.symlink("a.txt", os.path.join(source, "safe_rel"))
+        os.symlink("../a.txt", os.path.join(source, "sub", "up"))
+        os.symlink("/etc/passwd", os.path.join(source, "abs"))
+        os.symlink("../outside.txt", os.path.join(source, "esc"))
+        os.symlink("sub/../a.txt", os.path.join(source, "internal"))
+
+        result, _ = run_client(source, dest, flags=["-l", "--safe-links"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"--safe-links failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.readlink(os.path.join(received, "safe_rel")) == "a.txt"
+        assert os.readlink(os.path.join(received, "sub", "up")) == "../a.txt"
+        for unsafe in ("abs", "esc", "internal"):
+            assert not os.path.lexists(os.path.join(received, unsafe)), (
+                f"{unsafe} must be skipped by --safe-links"
+            )
+
+    @pytest.mark.ci
+    def test_safe_links_protects_dest_from_delete(self):
+        # rsync counts an unsafe link ignored by --safe-links as present in the
+        # transfer, so its destination mirror survives --delete.  FastSync must
+        # not delete it (no silent data loss).  Own server: deletion needs
+        # --allow-delete, which the shared session server does not grant.
+        source = os.path.join(TEST_DATA_DIR, "symlink_safe_delete")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_safe_delete_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "keep.txt"), "wb") as f:
+            f.write(b"keep\n")
+        os.symlink("/etc/passwd", os.path.join(source, "unsafe_abs"))
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            received = get_dest_received_dir(dest, source)
+            os.makedirs(received, exist_ok=True)
+            mirror = os.path.join(received, "unsafe_abs")
+            with open(mirror, "wb") as f:
+                f.write(b"existing destination data\n")
+            extra = os.path.join(received, "extra.txt")
+            with open(extra, "wb") as f:
+                f.write(b"extra\n")
+
+            result, _ = run_client(source, dest, flags=["-l", "--safe-links", "--delete"],
+                                   port=server.port)
+            assert result.returncode == 0, (
+                f"--delete --safe-links failed: {(result.stderr or result.stdout)[:300]}"
+            )
+            assert os.path.exists(mirror), (
+                "a destination mirror of a --safe-links-skipped link must survive --delete"
+            )
+            assert not os.path.exists(extra), "a genuine extra must still be deleted"
+
+    @pytest.mark.ci
+    def test_copy_unsafe_links_derefs_only_unsafe(self, shared_server):
+        # --copy-unsafe-links keeps safe symlinks and dereferences unsafe ones
+        # (absolute or escaping) into regular files.
+        source = os.path.join(TEST_DATA_DIR, "symlink_copy_unsafe")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_copy_unsafe_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        with open(os.path.join(source, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        with open(os.path.join(source, "refer.txt"), "wb") as f:
+            f.write(b"refer\n")
+        external = os.path.join(TEST_DATA_DIR, "symlink_copy_unsafe_external.txt")
+        with open(external, "wb") as f:
+            f.write(b"external\n")
+        os.symlink("a.txt", os.path.join(source, "safe_rel"))
+        os.symlink("refer.txt", os.path.join(source, "from_rel"))
+        os.symlink("../symlink_copy_unsafe_external.txt", os.path.join(source, "esc"))
+        os.symlink("/etc/hostname", os.path.join(source, "abs"))
+
+        result, _ = run_client(source, dest, flags=["-l", "--copy-unsafe-links"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (
+            f"--copy-unsafe-links failed: {(result.stderr or result.stdout)[:300]}"
+        )
+        received = get_dest_received_dir(dest, source)
+        assert os.path.islink(os.path.join(received, "safe_rel"))
+        assert os.readlink(os.path.join(received, "safe_rel")) == "a.txt"
+        assert os.path.islink(os.path.join(received, "from_rel")), (
+            "a safe symlink must be preserved, not dereferenced"
+        )
+        assert os.readlink(os.path.join(received, "from_rel")) == "refer.txt"
+        # An escaping (..) symlink and an absolute symlink are both dereferenced
+        # into regular files holding the referent's content.
+        assert not os.path.islink(os.path.join(received, "esc"))
+        with open(os.path.join(received, "esc"), "rb") as f:
+            assert f.read() == b"external\n"
+        assert not os.path.islink(os.path.join(received, "abs"))
+        assert os.path.isfile(os.path.join(received, "abs"))
+
+    def test_munge_prefix_roundtrip(self, shared_server):
+        # A source target that already begins with /rsyncd-munged/ round-trips:
+        # plain -l stores it verbatim, and --munge-links strips on the sender
+        # then re-munges on the receiver, yielding the same stored value.
+        source = os.path.join(TEST_DATA_DIR, "symlink_munge_roundtrip")
+        dest = os.path.join(TEST_DATA_DIR, "symlink_munge_roundtrip_dst")
         clean_dir(source)
         clean_dir(dest)
         with open(os.path.join(source, "realfile.txt"), "wb") as f:
             f.write(b"real\n")
-        os.symlink("#SYMLINK/realfile.txt", os.path.join(source, "prefixed"))
+        os.symlink("/rsyncd-munged/realfile.txt", os.path.join(source, "prefixed"))
+        os.symlink("#SYMLINK/realfile.txt", os.path.join(source, "oldmarker"))
 
-        result, _ = run_client(source, dest, flags=["-l"], port=shared_server.port)
-        assert result.returncode == 0, f"-l failed: {(result.stderr or result.stdout)[:300]}"
-
-        received = get_dest_received_dir(dest, source)
-        prefixed = os.path.join(received, "prefixed")
-        assert os.path.islink(prefixed)
-        assert os.readlink(prefixed) == "#SYMLINK/realfile.txt"
+        for flags, oldmarker_target in (
+            (["-l"], "#SYMLINK/realfile.txt"),
+            (["-l", "--munge-links"], "/rsyncd-munged/#SYMLINK/realfile.txt"),
+        ):
+            clean_dir(dest)
+            result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+            assert result.returncode == 0, (
+                f"{' '.join(flags)} failed: {(result.stderr or result.stdout)[:300]}"
+            )
+            received = get_dest_received_dir(dest, source)
+            assert os.readlink(os.path.join(received, "prefixed")) == "/rsyncd-munged/realfile.txt"
+            assert os.readlink(os.path.join(received, "oldmarker")) == oldmarker_target
 def _xattr_supported(path):
     """True when the filesystem hosting `path` supports user xattrs."""
     try:
@@ -5452,6 +6439,79 @@ class TestExtendedAttributes:
         fields = record.split(":")
         assert len(fields) == 5
         assert fields[0] == str(uid), f"reserved uid field {fields[0]} != source uid {uid}"
+
+    @pytest.mark.ci
+    def test_fake_super_records_resolved_chown_without_real_chown(self, shared_server):
+        """#294: --fake-super must NOT real-chown the recorded owner; it records
+        the RESOLVED ownership (here a --chown mapping) in the reserved xattr."""
+        source, dest = self._source_and_dest("fakesuper_chown")
+        f = os.path.join(source, "data.txt")
+        with open(f, "wb") as fh:
+            fh.write(b"fake-super chown\n")
+        if not _xattr_supported(f):
+            pytest.skip("filesystem does not support xattrs")
+
+        result, _ = run_client(source, dest,
+                               flags=["--fake-super", "--chown=@33333:@44444"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--fake-super --chown sync failed: {(result.stderr or result.stdout)[:300]}"
+        dst = os.path.join(get_dest_received_dir(dest, source), "data.txt")
+        record = os.getxattr(dst, "user.fastsync.stat").decode().split(":")
+        assert record[0] == "33333", f"recorded owner {record[0]} != resolved 33333"
+        assert record[1] == "44444", f"recorded group {record[1]} != resolved 44444"
+        st = os.stat(dst)
+        assert st.st_uid != 33333, "--fake-super must not real-chown the recorded owner"
+
+    @pytest.mark.ci
+    def test_directory_xattrs_preserved(self, shared_server):
+        """#286.3: -aX must preserve user.* xattrs on DIRECTORIES, not just files."""
+        source, dest = self._source_and_dest("dirxattr")
+        os.makedirs(os.path.join(source, "sub"))
+        if not _xattr_supported(source):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(source, "user.rootdir", b"r")
+        os.setxattr(os.path.join(source, "sub"), "user.subdir", b"s")
+        with open(os.path.join(source, "sub", "f.txt"), "wb") as fh:
+            fh.write(b"x\n")
+
+        result, _ = run_client(source, dest, flags=["-aX"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-aX dir sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(received, "user.rootdir") == b"r"
+        assert os.getxattr(os.path.join(received, "sub"), "user.subdir") == b"s"
+
+    @pytest.mark.ci
+    def test_directory_default_acl_preserved(self, shared_server):
+        """#286.3: -aA must preserve a directory's default POSIX ACL (the
+        system.posix_acl_default xattr), which regular-file ACLs do not cover."""
+        source, dest = self._source_and_dest("diracl")
+        sub = os.path.join(source, "sub")
+        os.makedirs(sub)
+        # A child is needed because FastSync deliberately does not materialize
+        # empty directories; the implicit parent is created by the child write.
+        with open(os.path.join(sub, "f.txt"), "wb") as fh:
+            fh.write(b"acl dir\n")
+        if not _xattr_supported(sub):
+            pytest.skip("filesystem does not support xattrs")
+        if shutil.which("setfacl") is None:
+            pytest.skip("setfacl is not available")
+        acl = subprocess.run(["setfacl", "-m", "d:u::rwx,d:g::rx,d:o::---", sub],
+                             capture_output=True, text=True)
+        if acl.returncode != 0:
+            pytest.skip(f"cannot set a default ACL: {acl.stderr.strip()}")
+        try:
+            before = os.getxattr(sub, "system.posix_acl_default")
+        except OSError as e:
+            pytest.skip(f"no default ACL xattr: {e}")
+
+        result, _ = run_client(source, dest, flags=["-aA"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-aA dir sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        assert os.getxattr(os.path.join(received, "sub"),
+                           "system.posix_acl_default") == before
 
 
 class TestConnectivityClientOptions:
@@ -5878,8 +6938,8 @@ class TestCopyAs:
     @pytest.mark.ci
     @pytest.mark.skipif(os.geteuid() != 0, reason="requires a root receiver to chown")
     def test_root_copy_as_with_fake_super_keeps_target_owner(self, shared_server):
-        """--fake-super must not let the recorded source owner override the
-        --copy-as forced owner (copy-as is authoritative)."""
+        """#294: --fake-super records the RESOLVED copy-as ownership without
+        real-chowning; the recorded source owner can never override copy-as."""
         source = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_src")
         dest = os.path.join(TEST_DATA_DIR, "copyas_fakesuper_dst")
         clean_dir(source)
@@ -5887,6 +6947,8 @@ class TestCopyAs:
         src_file = os.path.join(source, "mixed.txt")
         with open(src_file, "wb") as fh:
             fh.write(b"copy-as wins over fake-super\n")
+        if not _xattr_supported(src_file):
+            pytest.skip("filesystem does not support user xattrs")
         os.chown(src_file, 12345, 12346)
 
         result, _ = run_client(source, dest,
@@ -5897,7 +6959,13 @@ class TestCopyAs:
             f"{(result.stderr or result.stdout)[:400]}"
         )
         received = get_dest_received_dir(dest, source)
-        st = os.lstat(os.path.join(received, "mixed.txt"))
-        assert (st.st_uid, st.st_gid) == (65534, 65534), (
-            f"--fake-super overrode --copy-as: uid={st.st_uid} gid={st.st_gid}"
+        dst = os.path.join(received, "mixed.txt")
+        record = os.getxattr(dst, "user.fastsync.stat").decode().split(":")
+        assert (record[0], record[1]) == ("65534", "65534"), (
+            f"fake-super must record the resolved copy-as ownership: {record[:2]}"
+        )
+        st = os.lstat(dst)
+        assert (st.st_uid, st.st_gid) != (12345, 12346), (
+            f"--fake-super must not real-chown the recorded source owner: "
+            f"uid={st.st_uid} gid={st.st_gid}"
         )

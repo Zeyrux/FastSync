@@ -40,4 +40,14 @@ void file_list_destroy(FileListSet* set);
  * this returns true, files are transferred only when it returns true. */
 bool file_list_affects(const FileListSet* set, const char* rel);
 
+/* True when the DIRECTORY `rel` (path relative to the source root) is inside a
+ * listed directory subtree: `rel` itself is a listed entry, or one of `rel`'s
+ * ancestor directory prefixes is an exact listed entry.  Unlike
+ * file_list_affects this does NOT treat an ancestor of a listed entry as
+ * affected, so an implied parent directory of a listed file is not synchronized
+ * (rsync deletes nothing in it).  With no set or a whole-tree set every
+ * directory is in scope.  This is the delete-walker's "synchronized directory"
+ * predicate. */
+bool file_list_dir_in_scope(const FileListSet* set, const char* rel);
+
 #endif

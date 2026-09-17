@@ -116,7 +116,7 @@ The project uses Gitea Actions. Key jobs:
 jobs:
   new-job:
     runs-on: ubuntu-latest
-    container: gitea.tap-tap.win/taptap/fastsync-ci:v10
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v11
     steps:
       - uses: actions/checkout@v4
       - name: Configure

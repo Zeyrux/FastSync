@@ -36,7 +36,7 @@ from common import (  # noqa: E402
     verify_transfer,
 )
 
-PROTOCOL_VERSION = b"2.22.0"
+PROTOCOL_VERSION = b"2.26.0"
 STATUS_MANIFEST = 5
 STATUS_OK = 0
 

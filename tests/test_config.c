@@ -552,6 +552,83 @@ static void test_config_send_receive() {
   }
 }
 
+/* #5: a received --max-alloc=0 (rsync's "no limit") is floored to the server
+ * ceiling on the receive path, so a client cannot disable it. */
+static void test_config_receive_max_alloc_zero_floored() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  send_cfg->max_alloc = 0;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && recv_cfg->max_alloc == MAX_SERVER_ALLOC;
+    config_delete(recv_cfg);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[0]);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
+/* #4: a hostile/older client that still sends compress_choice=auto must be
+ * accepted (as zstd) rather than failing the whole transfer. */
+static void test_config_receive_compress_choice_auto_canonicalized() {
+  Config* send_cfg = config_create();
+  EXPECT_NOT_NULL(send_cfg);
+  send_cfg->send_directory = str_dup("/send/src");
+  send_cfg->receive_root_directory = str_dup("/send/dst");
+  free(send_cfg->compress_choice);
+  send_cfg->compress_choice = str_dup("auto");
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    Config* recv_cfg = config_receive(p[0]);
+    bool ok = recv_cfg != NULL && strcmp(recv_cfg->compress_choice, "zstd") == 0;
+    config_delete(recv_cfg);
+    close(p[0]);
+    close(p[1]);
+    _exit(ok ? 0 : 1);
+  } else {
+    close(p[0]);
+    io_set_fds(p[1], p[1]);
+    bool sent = config_send(p[1], send_cfg);
+    int status;
+    waitpid(pid, &status, 0);
+    close(p[0]);
+    close(p[1]);
+    config_delete(send_cfg);
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
+}
+
 static void test_config_send_receive_version_mismatch() {
   /* A peer using the previous wire format must be rejected. */
   Config* cfg = config_create();
@@ -775,13 +852,15 @@ static void test_config_delete_timing_early_helper() {
   cfg->use_delete = true;
   cfg->delete_before = true;
   EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
   cfg = config_create();
   cfg->use_delete = true;
   cfg->delete_during = true;
-  EXPECT_TRUE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
@@ -789,6 +868,7 @@ static void test_config_delete_timing_early_helper() {
   cfg->use_delete = true;
   cfg->delete_delay = true;
   EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_TRUE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
@@ -796,6 +876,7 @@ static void test_config_delete_timing_early_helper() {
   cfg->use_delete = true;
   cfg->delete_after = true;
   EXPECT_FALSE(config_delete_timing_early(cfg));
+  EXPECT_FALSE(config_delete_timing_per_dir(cfg));
   EXPECT_TRUE(config_has_valid_delete_timing(cfg));
   config_delete(cfg);
 
@@ -1115,7 +1196,10 @@ static void test_config_basis_wire_rejects_escaping() {
   c->basis_dirs = calloc(1, sizeof(BasisDest));
   c->basis_dirs[0].type = BASIS_DEST_LINK;
   c->basis_dirs[0].path = str_dup("/abs");
-  EXPECT_FALSE(roundtrip_config_ok(c));
+  /* An absolute basis dir is accepted (rsync parity); it is only usable when it
+     lies within the receiver's authorized root, which file_open_secure_parent
+     enforces at lookup time. */
+  EXPECT_TRUE(roundtrip_config_ok(c));
   config_delete(c);
 
   /* A well-formed list still round-trips even with a manually built struct. */
@@ -1148,8 +1232,13 @@ static void test_config_basis_normalization() {
   /* Degenerate values that normalize away to nothing stay rejected. */
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "."), -1);
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ".."), -1);
-  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/abs"), -1);
+  /* An absolute path is canonicalized (leading '/' preserved) and accepted. */
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/abs"), 0);
+  EXPECT_EQ_STR(c->basis_dirs[c->basis_count - 1].path, "/abs");
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/a//b/"), 0);
+  EXPECT_EQ_STR(c->basis_dirs[c->basis_count - 1].path, "/a/b");
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "a/../b"), -1);
+  EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "/"), -1);
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, ""), -1);
   config_delete(c);
 }
@@ -1279,6 +1368,61 @@ static void test_config_receive_rejects_invalid_checksum_algo() {
   EXPECT_FALSE(roundtrip_config_ok(c));
   config_delete(c);
 }
+
+/* The negotiated codec id and the human --compress-choice spelling must agree,
+ * and the id itself must be a known codec. */
+static void test_config_receive_rejects_invalid_compression_algo() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->compression_algo = 99;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+static void test_config_receive_rejects_codec_mismatch() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  free(c->compress_choice);
+  c->compress_choice = str_dup("lz4");
+  c->use_compression = true;
+  c->compression_algo = (int)COMPRESSION_ALGO_ZSTD; /* does not match lz4 */
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+static void test_config_receive_rejects_none_codec_with_compression() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->use_compression = true;
+  c->compression_algo = (int)COMPRESSION_ALGO_NONE;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
+
+static void test_config_receive_rejects_checksum_none_with_checksum() {
+  if (is_running_under_valgrind())
+    return;
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->checksum = true;
+  c->checksum_algo = (int)CHECKSUM_ALGO_NONE;
+  EXPECT_FALSE(roundtrip_config_ok(c));
+  config_delete(c);
+}
 /* The identity-mapping fields (--numeric-ids / --usermap / --groupmap /
    --chown) cross the config wire unchanged: the receiver needs them to apply
    ownership with the same policy the client requested. */
@@ -1345,13 +1489,19 @@ static void test_config_identity_wire_roundtrip() {
   send_cfg->usermap_count = 2;
   send_cfg->usermap = calloc(2, sizeof(IdentityMap));
   send_cfg->usermap[0].from = IDENTITY_MATCH_ANY;
+  send_cfg->usermap[0].from_hi = IDENTITY_MATCH_ANY;
   send_cfg->usermap[0].to = 65534;
+  send_cfg->usermap[0].to_name = NULL;
   send_cfg->usermap[1].from = 1000;
+  send_cfg->usermap[1].from_hi = 1000;
   send_cfg->usermap[1].to = 1000;
+  send_cfg->usermap[1].to_name = NULL;
   send_cfg->groupmap_count = 1;
   send_cfg->groupmap = calloc(1, sizeof(IdentityMap));
   send_cfg->groupmap[0].from = 0;
+  send_cfg->groupmap[0].from_hi = 0;
   send_cfg->groupmap[0].to = IDENTITY_CURRENT;
+  send_cfg->groupmap[0].to_name = str_dup("root");
 
   int p[2];
   EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
@@ -1367,9 +1517,12 @@ static void test_config_identity_wire_roundtrip() {
       ok = recv->numeric_ids && recv->chown_uid_set && recv->chown_uid == 1001 &&
            recv->chown_gid_set && recv->chown_gid == IDENTITY_CURRENT && recv->usermap_count == 2 &&
            recv->groupmap_count == 1 && recv->usermap[0].from == IDENTITY_MATCH_ANY &&
-           recv->usermap[0].to == 65534 && recv->usermap[1].from == 1000 &&
-           recv->usermap[1].to == 1000 && recv->groupmap[0].from == 0 &&
-           recv->groupmap[0].to == IDENTITY_CURRENT;
+           recv->usermap[0].from_hi == IDENTITY_MATCH_ANY && recv->usermap[0].to == 65534 &&
+           recv->usermap[0].to_name == NULL && recv->usermap[1].from == 1000 &&
+           recv->usermap[1].from_hi == 1000 && recv->usermap[1].to == 1000 &&
+           recv->groupmap[0].from == 0 && recv->groupmap[0].from_hi == 0 &&
+           recv->groupmap[0].to == IDENTITY_CURRENT && recv->groupmap[0].to_name != NULL &&
+           strcmp(recv->groupmap[0].to_name, "root") == 0;
     }
     config_delete(recv);
     close(p[0]);
@@ -1399,7 +1552,8 @@ static void test_config_receive_rejects_invalid_identity() {
   c->receive_root_directory = str_dup("/dst");
   c->usermap_count = 1;
   c->usermap = calloc(1, sizeof(IdentityMap));
-  c->usermap[0].from = -2; /* below IDENTITY_MATCH_ANY */
+  c->usermap[0].from = -3; /* below IDENTITY_MATCH_UNNAMED */
+  c->usermap[0].from_hi = -3;
   c->usermap[0].to = 0;
   EXPECT_FALSE(roundtrip_config_ok(c));
   config_delete(c);
@@ -2101,8 +2255,10 @@ static void test_identity_explicit_ownership_requested() {
 }
 
 /* P7 Wave E hardening (A3): --super no longer implies raw numeric-id
-   preservation, so it must never enable ownership application on its own; an
-   explicit identity flag is required. */
+   preservation, so it must never enable ownership application on its own.
+   #286: --numeric-ids is a mapping MODIFIER only and is likewise inert on its
+   own; a real ownership request (-o/-g or an explicit identity flag) is
+   required to activate chown. */
 static void test_super_does_not_imply_numeric() {
   Config* c = config_create();
   EXPECT_NOT_NULL(c);
@@ -2111,6 +2267,9 @@ static void test_super_does_not_imply_numeric() {
   EXPECT_TRUE(identity_set_active(c));
   EXPECT_FALSE(identity_active_enabled());
   c->numeric_ids = true;
+  EXPECT_TRUE(identity_set_active(c));
+  EXPECT_FALSE(identity_active_enabled()); /* mapping modifier only */
+  c->preserve_owner = true;
   EXPECT_TRUE(identity_set_active(c));
   EXPECT_TRUE(identity_active_enabled());
   identity_clear_active();
@@ -2445,6 +2604,7 @@ static bool basis_equal(const Config* a, const Config* b) {
 #define CONFIG_CMP_STR_MODULE(a, b, name) str_opt_equal((a)->name, (b)->name)
 #define CONFIG_CMP_STR_REDACTED_AUTH(a, b, name) str_opt_equal((a)->name, (b)->name)
 #define CONFIG_CMP_INT_CHECKSUM_ALGO(a, b, name) ((a)->name == (b)->name)
+#define CONFIG_CMP_INT_COMPRESSION_ALGO(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_SUPERMODE(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_INT_IDENTITY(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_INT_SKIPCOUNT(a, b, name) ((a)->name == (b)->name)
@@ -2635,13 +2795,19 @@ static void golden_config_populate(Config* c) {
   c->usermap_count = 2;
   c->usermap = calloc(2, sizeof(IdentityMap));
   c->usermap[0].from = IDENTITY_MATCH_ANY;
+  c->usermap[0].from_hi = IDENTITY_MATCH_ANY;
   c->usermap[0].to = 1000;
+  c->usermap[0].to_name = NULL;
   c->usermap[1].from = 5;
+  c->usermap[1].from_hi = 9;
   c->usermap[1].to = 6;
+  c->usermap[1].to_name = NULL;
   c->groupmap_count = 1;
   c->groupmap = calloc(1, sizeof(IdentityMap));
   c->groupmap[0].from = 7;
+  c->groupmap[0].from_hi = 7;
   c->groupmap[0].to = 8;
+  c->groupmap[0].to_name = str_dup("root");
   c->preserve_atimes = true;
   c->preserve_crtimes = false;
   c->omit_dir_times = true;
@@ -2665,14 +2831,14 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.22.0).  The values below are the only
+/* The pinned golden frame (protocol 2.26.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
- * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.22.0
- * preserve-attribute split appends four serialized bools
- * (preserve_perms/times/owner/group) to CONFIG_WIRE_METADATA_TIMES_FIELDS after
- * omit_link_times. */
-#define GOLDEN_WIRE_LEN 653
-#define GOLDEN_WIRE_HASH 95530566005420798ULL
+ * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
+ * delete-plan wave changed only the version string; 2.25.0 appended the
+ * report_stats bool and 2.26.0 appended the compression_algo int.  The
+ * byte-exact values are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 705
+#define GOLDEN_WIRE_HASH 4673424031554175633ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2754,7 +2920,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.22.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.26.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())
@@ -2815,7 +2981,10 @@ static void test_config_wire_golden_receive() {
       ok = ok && recv->super_mode == SUPER_MODE_ON;
       ok = ok && recv->chown_uid == 1234 && recv->chown_gid == 5678;
       ok = ok && recv->usermap_count == 2 && recv->usermap[0].from == IDENTITY_MATCH_ANY &&
-           recv->usermap[0].to == 1000 && recv->usermap[1].from == 5 && recv->usermap[1].to == 6;
+           recv->usermap[0].from_hi == IDENTITY_MATCH_ANY && recv->usermap[0].to == 1000 &&
+           recv->usermap[1].from == 5 && recv->usermap[1].from_hi == 9 && recv->usermap[1].to == 6;
+      ok = ok && recv->groupmap_count == 1 && recv->groupmap[0].from == 7 &&
+           recv->groupmap[0].to_name != NULL && strcmp(recv->groupmap[0].to_name, "root") == 0;
       ok = ok && recv->basis_count == 2 && recv->basis_dirs[0].type == BASIS_DEST_COMPARE &&
            recv->basis_dirs[1].type == BASIS_DEST_LINK;
       ok = ok && recv->module != NULL && strcmp(recv->module, "goldenmod") == 0;
@@ -2899,13 +3068,14 @@ static void test_config_wire_receive_bounds() {
   /* BOOL: only 0/1 is a legal wire value. */
   EXPECT_TRUE(receive_hand_built_frame_rejected(write_frame_with_invalid_bool));
 
-  /* RAW_MAXALLOC: zero is rejected before it can become the session ceiling. */
+  /* RAW_MAXALLOC: zero is rsync's --max-alloc=0 "no limit" and round-trips;
+   * only the over-ceiling clamp is applied server-side. */
   Config* c = config_create();
   EXPECT_NOT_NULL(c);
   c->send_directory = str_dup("/src");
   c->receive_root_directory = str_dup("/dst");
   c->max_alloc = 0;
-  EXPECT_TRUE(roundtrip_config_rejected(c));
+  EXPECT_FALSE(roundtrip_config_rejected(c));
   config_delete(c);
 
   /* STR_MODULE: a name outside [A-Za-z0-9._-] is refused. */
@@ -3026,6 +3196,8 @@ void test_config() {
   test_pipeline_receiver_lifecycle();
   if (!is_running_under_valgrind()) {
     test_config_send_receive();
+    test_config_receive_max_alloc_zero_floored();
+    test_config_receive_compress_choice_auto_canonicalized();
     test_config_local_only_fields_not_serialized();
     test_config_send_receive_version_mismatch();
     test_config_receive_truncated();
@@ -3043,6 +3215,10 @@ void test_config() {
     test_config_basis_normalization();
     test_config_checksum_options_wire_roundtrip();
     test_config_receive_rejects_invalid_checksum_algo();
+    test_config_receive_rejects_invalid_compression_algo();
+    test_config_receive_rejects_codec_mismatch();
+    test_config_receive_rejects_none_codec_with_compression();
+    test_config_receive_rejects_checksum_none_with_checksum();
     test_config_identity_wire_roundtrip();
     test_config_receive_rejects_invalid_identity();
     test_config_metadata_times_wire_roundtrip();

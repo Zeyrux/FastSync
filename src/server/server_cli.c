@@ -192,14 +192,20 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
         inline_value = argv[++i];
       }
       opts->iconv_spec = inline_value;
-    } else if (arg_is(argv[i], "-p")) {
-      if (i + 1 >= argc) {
-        set_error(err, err_size, "missing argument for -p");
-        return -1;
+    } else if (arg_is(argv[i], "-p") || arg_has_value(argv[i], "--port", &inline_value)) {
+      if (inline_value) {
+        opts->port_set = true;
+        if (parse_port_arg(inline_value, &opts->port, err, err_size) != 0)
+          return -1;
+      } else {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for %s", argv[i]);
+          return -1;
+        }
+        opts->port_set = true;
+        if (parse_port_arg(argv[++i], &opts->port, err, err_size) != 0)
+          return -1;
       }
-      opts->port_set = true;
-      if (parse_port_arg(argv[++i], &opts->port, err, err_size) != 0)
-        return -1;
     } else {
       if (arg_has_value(argv[i], "--config", &inline_value)) {
         if (!inline_value) {

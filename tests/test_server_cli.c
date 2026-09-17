@@ -234,6 +234,31 @@ static void test_server_cli_password_requires_daemon() {
   server_cli_options_free(&opts);
 }
 
+/* --port is the rsync-style alias for -p, in both the separate and =value
+ * spellings; an invalid value is still validated. */
+static void test_server_cli_port_alias() {
+  const char* a1[] = {"fastsync-server", "--port", "9000"};
+  ServerCliOptions opts;
+  EXPECT_EQ_INT(parse_ok(a1, 3, &opts), 0);
+  EXPECT_EQ_INT(opts.port, 9000);
+  EXPECT_TRUE(opts.port_set);
+  server_cli_options_free(&opts);
+
+  const char* a2[] = {"fastsync-server", "--port=9001"};
+  ServerCliOptions opts2;
+  EXPECT_EQ_INT(parse_ok(a2, 2, &opts2), 0);
+  EXPECT_EQ_INT(opts2.port, 9001);
+  EXPECT_TRUE(opts2.port_set);
+  server_cli_options_free(&opts2);
+
+  char err[128];
+  ServerCliOptions opts3;
+  const char* a3[] = {"fastsync-server", "--port", "notaport"};
+  EXPECT_EQ_INT(server_cli_parse(3, (char**)a3, &opts3, err, sizeof(err)), -1);
+  EXPECT_TRUE(strstr(err, "invalid port") != NULL);
+  server_cli_options_free(&opts3);
+}
+
 static void test_server_cli_help() {
   char err[256];
   const char* a1[] = {"s", "--help"};
@@ -254,5 +279,6 @@ void test_server_cli() {
   test_server_cli_password_requires_daemon();
   test_server_cli_no_super();
   test_server_cli_allow_super();
+  test_server_cli_port_alias();
   test_server_cli_help();
 }

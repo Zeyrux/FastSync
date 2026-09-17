@@ -3,6 +3,7 @@
 
 #include "array_list.h"
 #include "checksum.h"
+#include "compression.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,15 +40,20 @@ typedef struct BasisDest {
   char* path; /* relative to the destination root (receiver-confined) */
 } BasisDest;
 
-/* One resolved FROM:TO identity-mapping rule (--usermap / --groupmap).  Both
- * fields are numeric ids.  IDENTITY_MATCH_ANY (-1) in `from` is rsync's '*'
- * wildcard (matches any transmitted id); IDENTITY_CURRENT (-1) in `to` makes
- * the receiver resolve the receiving process's own current euid/egid at apply
- * time.  Names are resolved to numbers at parse time on the client (see
- * identity.h for the exact subset). */
+/* One FROM:TO identity-mapping rule (--usermap / --groupmap).  `from`/`from_hi`
+ * describe the sender-side FROM matcher (a single id when from_hi == from, an
+ * inclusive LOW-HIGH range, IDENTITY_MATCH_ANY for rsync's '*', or
+ * IDENTITY_MATCH_UNNAMED for rsync's empty FROM).  `to` is the receiver-side TO
+ * numeric id (IDENTITY_CURRENT = the receiving process's own euid/egid) UNLESS
+ * `to_name` is non-NULL, in which case the receiver resolves the name against
+ * its own account database at apply time (rsync resolves TO names on the
+ * receiver) and `to` is ignored.  FROM names/ranges/globs are resolved on the
+ * client (the sender) exactly as rsync matches them against sender names. */
 typedef struct {
   int32_t from;
+  int32_t from_hi;
   int32_t to;
+  char* to_name;
 } IdentityMap;
 
 /* --sockopts=OPTIONS allowlist.  Only these option names are accepted; anything
@@ -76,7 +82,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.22.0).
+ * Config wire-field table (single source of truth for protocol 2.26.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -198,7 +204,7 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
 #define CONFIG_WIRE_FUZZY_FIELDS(X) X(fuzzy, bool, false, BOOL)
 
 #define CONFIG_WIRE_CHECKSUM_FIELDS(X)                                                             \
-  X(checksum_algo, int, CHECKSUM_ALGO_XXH64, INT_CHECKSUM_ALGO)                                    \
+  X(checksum_algo, int, CHECKSUM_ALGO_DEFAULT, INT_CHECKSUM_ALGO)                                  \
   X(checksum_seed, uint64_t, 0, RAW)
 
 #define CONFIG_WIRE_IDENTITY_FIELDS(X)                                                             \
@@ -241,6 +247,43 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   X(copy_as_uid, int32_t, 0, COPY_AS_ID)                                                           \
   X(copy_as_gid, int32_t, 0, COPY_AS_ID)
 
+/* Output-parity wave (protocol 2.23.0).  report_dest_info tells the receiver to
+ * answer every per-file STATUS_CHECK with a STATUS_DEST_INFO snapshot of the
+ * pre-transfer destination entry (see protocol.h).  It is set by the client
+ * only when -i/--itemize-changes or --out-format asks for per-file change
+ * output; the transfer decision itself is unchanged.
+ *
+ * Wire-stats wave (protocol 2.25.0).  report_stats tells the receiver to send a
+ * STATUS_STATS frame immediately before its terminal success status carrying
+ * the receiver-only counters (matched data, deleted-file count) and,
+ * for -n/--dry-run --delete, the destination-relative paths it WOULD have
+ * deleted.  It is set by the client only when --stats, --progress/-P, an
+ * --out-format token needs a wire counter (%b/%c), or a dry-run carries
+ * --delete; the transfer decision itself is unchanged. */
+#define CONFIG_WIRE_OUTPUT_FIELDS(X)                                                               \
+  X(report_dest_info, bool, false, BOOL) X(report_stats, bool, false, BOOL)
+
+/* Codec-negotiation wave (protocol 2.26.0).  compression_algo is the concrete
+ * codec the client selected for this transfer (a CompressionAlgo id) and is the
+ * value the receiver validates and installs.  It is the resolved result of
+ * --compress-choice / the "auto" negotiation so both peers agree exactly.
+ *
+ * Negotiation model: FastSync enforces a strict same-version handshake, so both
+ * peers carry the identical compiled-in codec set.  The client resolves the
+ * effective algorithm deterministically and serializes it here; "auto" picks
+ * the first entry of the rsync 3.4.1 preference order
+ * (compression: zstd lz4 zlibx zlib none; checksum: xxh128 xxh3 xxh64 md5 md4
+ * sha1 none), and an explicit request wins.  The receiver rejects (before
+ * STATUS_OK) any algorithm outside its own supported set, which is rsync's
+ * "no common choice is an error" behavior.  The same resolver runs on both
+ * sides (compression_negotiate_default / checksum_negotiate_default), so the
+ * fallback is consistent.
+ *
+ * The field is appended after the output block so every pre-2.26 field keeps
+ * its wire position. */
+#define CONFIG_WIRE_CODEC_FIELDS(X)                                                                \
+  X(compression_algo, int, COMPRESSION_ALGO_ZSTD, INT_COMPRESSION_ALGO)
+
 /* All serialized fields, in exact wire order.  Concatenating the per-segment
  * lists here is what keeps the declaration order = the wire order. */
 #define CONFIG_WIRE_FIELDS(X)                                                                      \
@@ -261,7 +304,9 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   CONFIG_WIRE_DAEMON_AUTH_FIELDS(X)                                                                \
   CONFIG_WIRE_ICONV_FIELDS(X)                                                                      \
   CONFIG_WIRE_PRIVILEGE_FIELDS(X)                                                                  \
-  CONFIG_WIRE_COPY_AS_FIELDS(X)
+  CONFIG_WIRE_COPY_AS_FIELDS(X)                                                                    \
+  CONFIG_WIRE_OUTPUT_FIELDS(X)                                                                     \
+  CONFIG_WIRE_CODEC_FIELDS(X)
 
 typedef struct Config {
   /* -j/--threads=N: number of parallel scanner worker threads for the -m
@@ -314,12 +359,14 @@ typedef struct Config {
   char* tls_cert;
   char* tls_key;
   char* tls_ca;
-  /* --timeout: per-message I/O deadline in seconds.  0 (the default/unset
-   * sentinel) leaves the transport's built-in 30 s socket timeout and the
-   * protocol's built-in 60 s per-message deadline in place; a positive value
-   * overrides both.  See protocol_session_set_io_timeout. */
+  /* --timeout: per-message I/O deadline in seconds.  0 (rsync's default)
+   * disables the deadline entirely on the client's own socket and protocol
+   * layers; a positive value sets it.  A server session never inherits the
+   * disabled value: it applies the SERVER_IO_TIMEOUT_SEC floor (see
+   * protocol_server_io_timeout_sec and tcp_set_timeouts). */
   int timeout;
-  /* --contimeout: connect()/accept timeout, transport layer only. */
+  /* --contimeout: connect()/accept timeout in seconds (rsync's default 60);
+   * 0 disables it.  Transport layer only. */
   int contimeout;
   bool quiet;
   bool stats;
@@ -354,6 +401,16 @@ typedef struct Config {
    * enters the keep-set.  Implied by --delete-missing-args. */
   bool ignore_missing_args;
 
+  /* Codec-negotiation CLI state (all client-only, never serialized).  The
+   * effective pre-transfer checksum is Config->checksum_algo (serialized);
+   * checksum_transfer_algo is the rsync "transfer" half of a two-name
+   * --checksum-choice form (validated and used only to mirror rsync's
+   * whole-file forcing, since FastSync's per-block strong hash is fixed).
+   * cli_exit_code carries a parser-requested process exit status (rsync uses 4
+   * for an unsupported checksum/compress algorithm) so main() can mirror it. */
+  int checksum_transfer_algo;
+  int cli_exit_code;
+
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).
   ArrayList* filters;   /* --filter=RULE rule strings, in order */
@@ -362,6 +419,10 @@ typedef struct Config {
   bool from0;           /* -0/--from0: NUL-delimited *-from files */
   bool cvs_exclude;     /* -C/--cvs-exclude: standard CVS ignore set */
   bool per_dir_filter;  /* -F: apply per-directory .rsync-filter files */
+  /* -F click count.  rsync's single -F means --filter='dir-merge
+   * /.rsync-filter' (the .rsync-filter files themselves are transferred); a
+   * repeated -F adds --filter='- .rsync-filter' so they are excluded too. */
+  int per_dir_filter_count;
   bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
   /* --no-implied-dirs: client-only.  With -R + --files-from, refuse to place a
    * listed file whose ancestor directory is not itself explicitly listed. */
@@ -532,13 +593,17 @@ typedef struct Config {
   /* rsync deletion-timing family (real from Phase 3).  At most one of
      delete_before / delete_during / delete_delay / delete_after may be set, and
      only together with use_delete (the CLI implies --delete for each of them).
-     delete_before and delete_during select the EARLY engine mode: the keep-set
+     delete_before selects the EARLY engine mode: the whole-tree keep-set
      manifest is transmitted before any file data and extras are removed then,
-     acknowledged, before the first data byte.  delete_delay and delete_after
-     select the LATE commit mode: extras are removed only after the whole
-     transfer has succeeded (plain --delete keeps this mode).  The exact
-     semantics and the divergences from rsync are documented in RSYNC_COMPAT.md
-     and in config_delete_timing_early() below. */
+     acknowledged, before the first data byte.  delete_during and delete_delay
+     select the per-directory delete-plan mode (protocol 2.24.0): one plan per
+     source directory is streamed in directory order, and the receiver removes
+     each directory's extras when its plan arrives (during) or snapshots them
+     and removes them only after a successful transfer (delay).  delete_after
+     (and plain --delete) keep the whole-tree commit mode: extras are removed
+     from a fresh end-of-transfer destination scan only after the whole transfer
+     succeeded.  See config_delete_timing_early()/config_delete_timing_per_dir()
+     below. */
   /* partial_dir */
   // PR #174: Partial transfer resumption
   /* suffix */
@@ -576,13 +641,17 @@ typedef struct Config {
    * targets and, with -K, follows an in-root destination symlink-to-directory);
    * -k/--copy-dirlinks is sender-only and is never serialized. */
   /* numeric_ids */
-  /* --numeric-ids: no name lookup, use the transmitted numeric ids raw. */
+  /* --numeric-ids: a mapping MODIFIER only -- no name lookup, use the
+   * transmitted numeric ids raw.  It does NOT by itself request ownership. */
   /* chown_uid_set */
   /* --chown USER (owner) override; IDENTITY_CURRENT = the receiver's euid. */
   /* chown_gid_set */
   /* --chown :GROUP (group) override; IDENTITY_CURRENT = the receiver's egid. */
   /* usermap */
-  /* --usermap / --groupmap entries, in order (first match wins). */
+  /* --usermap / --groupmap entries, in order (first match wins).  Each entry's
+   * from/from_hi are a single id, an inclusive range, IDENTITY_MATCH_ANY ('*'),
+   * or IDENTITY_MATCH_UNNAMED (empty FROM); to_name carries a receiver-resolved
+   * TO name (rsync resolves TO names on the receiving side). */
   /* preserve_atimes */
   /* -U/--atimes: preserve source access times on the destination. */
   /* preserve_crtimes */
@@ -610,8 +679,11 @@ typedef struct Config {
    * --copy-as) imply it. */
   /* fake_super */
   /* --fake-super: receiver-only.  When set, each written file additionally gets
-   * a reserved user.fastsync.stat xattr recording the source uid/gid/mode/mtime
-   * so a later privileged restore could re-apply them.  Crosses the wire. */
+   * a reserved user.fastsync.stat xattr recording the RESOLVED uid/gid (the
+   * source's own when no ownership request is active, else the --chown/--usermap
+   * result) plus mode/mtime so a later privileged restore could re-apply them.
+   * It NEVER real-chowns: the point is to record the source ownership on an
+   * unprivileged receiver.  Crosses the wire. */
   /* module */
   /* Daemon module selection (Wave A, protocol 2.15.0).  Client-composed from a
    * host::module/path destination; NULL or "" means "no module" (the ordinary
@@ -849,8 +921,74 @@ typedef struct Config {
  * version before parsing anything else) is what keeps a 2.22 client and a 2.21
  * server from ever reaching that state.  The fixed-width FileMetadata layout is
  * UNCHANGED: the receiver still gates attribute application on use_metadata,
- * which is now DERIVED from these attributes by config_derived_use_metadata(). */
-#define PROTOCOL_VERSION "2.22.0"
+ * which is now DERIVED from these attributes by config_derived_use_metadata().
+ *
+ * Rsync-Parity Wave: 2.22.0 -> 2.23.0.
+ *
+ * WHY the bump, grounded in the wire.  Several independent changes land in this
+ * protocol version:
+ *
+ * (1) Ownership parity (#286/#294): each --usermap/--groupmap wire entry grows
+ * from two int32s to [from][from_hi][to][to_name]; `from_hi` carries an
+ * inclusive LOW-HIGH range (== from for a single/any/unnamed matcher) and the
+ * trailing string carries a TO NAME for the receiver to resolve (rsync resolves
+ * TO names on the receiving side).  The STATUS_MKDIR and STATUS_DIR_TIMES frames
+ * also gain a bounded per-entry xattr block when -X/-A is negotiated, so
+ * directory xattrs/ACLs (including default ACLs) are preserved like regular-file
+ * xattrs.
+ *
+ * (2) Delete semantics (#290): the delete-manifest frame gains a fourth trailing
+ * section -- a synchronized-directory count followed by that many
+ * destination-relative directory paths (the receive root is ".").  The receiver
+ * confines its extras walk to these directories, so `--files-from` with
+ * `--delete` only removes inside listed directory subtrees (rsync parity)
+ * instead of deleting every untransmitted path under the receive root.  The
+ * frame stream also gains STATUS_DELETE_LIMIT, the terminal success status sent
+ * instead of STATUS_OK when a --max-delete commit removes up to the bound and
+ * skips the rest (the sender then exits 25 like rsync).
+ *
+ * Any config-frame layout or frame-sequence change must bump the protocol
+ * version: a 2.22 peer would desynchronize on the new entry bytes, the extra
+ * trailing section or the unknown status, and the strict same-version handshake
+ * (config_receive rejects a mismatched version before parsing anything else) is
+ * what keeps a 2.23 client and a 2.22 server from ever reaching that state.
+ *
+ * (3) Output parity (#291/#292): -i/--itemize-changes and --out-format must
+ * compare the source against the PRE-TRANSFER destination entry (new vs
+ * modified, and which of size/time/perms/owner/group differ), but FastSync's
+ * push sender never sees the destination.  The receiver therefore answers a
+ * per-file STATUS_CHECK with a new STATUS_DEST_INFO frame (a fixed-width
+ * snapshot of the old entry) before its ordinary verdict when the config frame
+ * carries the new report_dest_info bool appended after the --copy-as block.
+ * This is both a config-frame layout change (one trailing bool) and a frame
+ * sequence change (the new status).
+ *
+ * (4) Delete timing (protocol 2.24.0): the sender streams one delete plan per
+ * source directory so --delete-during/--delete-delay reproduce rsync's deletion
+ * timing (the plan fields and STATUS_DELETE_PLAN are documented at the keep-set
+ * / delete-plan definitions below).
+ *
+ * (5) Wire-stats parity (protocol 2.25.0): --stats, --progress/-P and the
+ * --out-format %b/%c tokens need receiver-only and wire counters that the push
+ * sender cannot observe, and -n/--dry-run --delete must report the extras it
+ * would have removed without deleting anything.  The config frame gains one
+ * trailing report_stats bool and the receiver emits a new STATUS_STATS frame
+ * (carrying matched data, the deleted-file count and the would-delete path
+ * list) immediately before its terminal success status.
+ *
+ * (6) Codec breadth + negotiation (protocol 2.26.0): the config frame gains one
+ * trailing int, compression_algo (a CompressionAlgo id), appended after the
+ * output block.  It is the negotiated/effective compression codec and is what
+ * the receiver's self-describing decompressor validates against its own
+ * supported set.  The checksum_algo wire value now also accepts md4/sha1/none,
+ * and its default changes to the rsync 3.4.1 auto-negotiated xxh128.
+ *
+ * Any config-frame layout change must bump the protocol version: a peer that
+ * does not parse the new trailing bytes would desynchronize on the frame
+ * boundary, and the strict same-version handshake (config_receive rejects a
+ * mismatched version before parsing anything else) keeps mixed deployments from
+ * ever reaching that state. */
+#define PROTOCOL_VERSION "2.26.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
@@ -875,9 +1013,11 @@ typedef struct Config {
 
 /* Identity-mapping sentinels and bounds (see identity.h for semantics).
  * IDENTITY_MATCH_ANY is a usermap/groupmap FROM '*' (matches any id);
- * IDENTITY_CURRENT is a chown / map TO '*' (resolve to the receiver's current
- * euid/egid at apply time). */
+ * IDENTITY_MATCH_UNNAMED is a FROM with an empty token (rsync's "ids with no
+ * name on the sender"); IDENTITY_CURRENT is a chown / map TO '*' (resolve to
+ * the receiver's current euid/egid at apply time). */
 #define IDENTITY_MATCH_ANY (-1)
+#define IDENTITY_MATCH_UNNAMED (-2)
 #define IDENTITY_CURRENT (-1)
 #define MAX_IDENTITY_MAP 128
 
@@ -942,13 +1082,17 @@ int config_parse_daemon_dest(Config* config);
  * 0. */
 int config_parse_transport_dest(Config* config);
 
-/* True when the negotiated delete timing performs the extra-file deletion
- * BEFORE the transfer data (--delete-before / --delete-during).  The flag is
- * a pure function of the config and is used identically on the sender (to pick
+/* True for the whole-tree delete-before timing: a complete keep-set manifest is
+ * transmitted before any data and committed (with an ack) before the first data
+ * byte.  Pure function of the config, used identically on the sender (to pick
  * the manifest-first frame order) and the receiver (to delete when the early
- * manifest arrives).  When false the deletion is committed only after the whole
- * transfer succeeded (--delete / --delete-after / --delete-delay). */
+ * manifest arrives). */
 bool config_delete_timing_early(const Config* config);
+/* True for the per-directory timings (--delete-during / --delete-delay).  The
+ * sender streams a delete plan per source directory in directory order; the
+ * receiver applies each plan on arrival (during) or snapshots its extras and
+ * commits them only after a fully-successful transfer (delay). */
+bool config_delete_timing_per_dir(const Config* config);
 /* Delete-timing sanity: with deletion enabled at most one timing flag may be
  * set (none = the default delete-after commit timing); without deletion no
  * timing flag may be set (each timing flag implies --delete). */

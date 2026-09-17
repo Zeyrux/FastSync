@@ -143,20 +143,28 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
   }
 
   off_t offset = 0;
+  /* A non-positive --timeout disables the deadline: poll blocks until the
+   * socket is writable (rsync's --timeout=0 default). */
+  int io_timeout_sec = protocol_get_io_timeout_sec();
   struct timespec deadline;
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += protocol_get_io_timeout_sec();
+  if (io_timeout_sec > 0) {
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += io_timeout_sec;
+  }
   while ((unsigned long long)offset < file_size) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long long remaining = (long long)(deadline.tv_sec - now.tv_sec) * 1000LL +
-                          (deadline.tv_nsec - now.tv_nsec) / 1000000LL;
-    if (remaining <= 0) {
-      close(fd);
-      return false;
+    int timeout = -1;
+    if (io_timeout_sec > 0) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      long long remaining = (long long)(deadline.tv_sec - now.tv_sec) * 1000LL +
+                            (deadline.tv_nsec - now.tv_nsec) / 1000000LL;
+      if (remaining <= 0) {
+        close(fd);
+        return false;
+      }
+      timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
     }
     struct pollfd pfd = {.fd = file_descriptor, .events = POLLOUT};
-    int timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
     int polled = poll(&pfd, 1, timeout);
     if (polled <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
       close(fd);
@@ -174,6 +182,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
       close(fd);
       return false;
     }
+    protocol_note_bytes_written((unsigned long long)sent);
   }
 
   close(fd);

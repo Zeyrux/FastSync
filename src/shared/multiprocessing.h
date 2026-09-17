@@ -7,6 +7,7 @@
 #include "array_list.h"
 #include "chunk.h"
 #include "config.h"
+#include "delete_plan.h"
 #include "file.h"
 #include "protocol.h"
 #include "queue.h"
@@ -42,6 +43,23 @@ typedef struct {
      scanner's exclusion sink) or, in the early modes, by the path-only pre-scan
      on the calling thread before the pipeline starts. */
   ArrayList* excluded_paths;
+  /* --max-size/--min-size pruned source paths.  These are ALWAYS sent as
+     protected prefixes (even with --delete-excluded), so the destination
+     mirrors of size-skipped files survive --delete like rsync.  Populated by
+     the scanner thread (workers append under mutex_scanner) or, in the early
+     modes, by the path-only pre-scan on the calling thread. */
+  ArrayList* size_skipped_paths;
+  /* Destination-relative paths of the directories the source scan synchronized
+     for this run (the receive root is the "." sentinel).  Sent with the
+     manifest so the receiver confines its extras walk to them, matching rsync's
+     "delete only in synchronized directories" (notably for --files-from).
+     Populated by the scanner thread or the early pre-scan. */
+  ArrayList* synced_dirs;
+  /* Destination-relative paths of every traversed source directory, for the
+     per-directory delete plan keep set (so an empty source directory survives
+     --delete rather than being removed as an extra).  Prebuilt by the path-only
+     pre-scan on the calling thread. */
+  ArrayList* plan_dirs;
   /* --delete-missing-args: the destination-relative mirrors of the --files-from
      entries that are missing under the source.  Computed by the preflight on
      the calling thread before the pipeline starts; the sender thread transmits
@@ -54,11 +72,16 @@ typedef struct {
      --ignore-errors kept the run going. */
   bool scan_had_io_error;
   ArrayList* remove_source_files;
-  /* True when --delete-before/--delete-during require the keep-set manifest to
-     be transmitted before any file data: context->manifest is then prebuilt by
-     a path-only pre-scan on the calling thread and the pipeline scanner must
-     not append to it.  Set once before the worker threads start. */
+  /* True when --delete-before requires the whole-tree keep-set manifest to be
+     transmitted before any file data: context->manifest is then prebuilt by a
+     path-only pre-scan on the calling thread and the pipeline scanner must not
+     append to it.  Set once before the worker threads start. */
   bool early_delete;
+  /* Non-NULL for --delete-during/--delete-delay: the per-directory plan set
+     prebuilt by the path-only pre-scan on the calling thread.  The sender
+     thread transmits the root plan before any data and the remaining plans
+     alongside the chunks.  Set once before the worker threads start. */
+  DeletePlanSender* delete_plans;
   mtx_t mutex_progress;
   int total_files;
   unsigned long long progress_bytes;
@@ -83,6 +106,10 @@ typedef struct {
   ArrayList* dir_entries;
   mtx_t dir_entries_mutex;
   bool dir_entries_mutex_init;
+  /* Set by the sender thread when the receiver reported a --max-delete-capped
+     deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
+     exit 25 like rsync.  Read by the caller after the sender thread is joined. */
+  bool delete_limit;
 } PipelineContextSender;
 
 /* `config` is borrowed and must outlive the context: destroy does NOT free it,

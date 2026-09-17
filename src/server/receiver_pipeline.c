@@ -27,6 +27,10 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->queued_bytes = 0;
   context->max_queue_bytes = 0;
   context->deferred_manifest = NULL;
+  context->deferred_plans = NULL;
+  context->delete_limit_reached = false;
+  memset(&context->stats, 0, sizeof(context->stats));
+  context->would_delete = NULL;
   atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
@@ -39,6 +43,9 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
     goto fail;
   // cppcheck-suppress unreadVariable
   init++;
+  context->would_delete = array_list_create(free);
+  if (!context->would_delete)
+    goto fail;
   return context;
 
 fail:
@@ -57,9 +64,13 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   config_delete(context->config);
   if (context->deferred_manifest)
     delete_manifest_free(context->deferred_manifest);
+  if (context->deferred_plans)
+    delete_plan_session_destroy(context->deferred_plans);
   queue_destroy(context->queue);
   receiver_outcomes_destroy(&context->outcomes);
   dir_time_list_free(&context->dir_times);
+  if (context->would_delete)
+    array_list_delete(context->would_delete);
   mtx_destroy(&context->mutex);
   cnd_destroy(&context->condition_not_full);
   cnd_destroy(&context->condition_not_empty);
@@ -132,7 +143,21 @@ bool pipeline_context_receiver_enqueue_file(PipelineContextReceiver* context, Fi
 
 static bool receiver_enqueue_file(File* file, void* context_pointer) {
   PipelineContextReceiver* context = (PipelineContextReceiver*)context_pointer;
+  if (file && file->matched_bytes > 0) {
+    mtx_lock(&context->mutex);
+    context->stats.matched_data += file->matched_bytes;
+    mtx_unlock(&context->mutex);
+  }
   return pipeline_context_receiver_enqueue_file(context, file);
+}
+
+/* Early delete modes (--delete-before/--delete-during) commit the manifest
+   inside receiver_process_pending on this thread; record a capped commit so
+   server.c's terminal frame can report STATUS_DELETE_LIMIT.  The plain bool is
+   safe: receive_thread writes it before the main thread joins the thread. */
+static void receiver_pipeline_note_delete_limit(void* context_pointer) {
+  PipelineContextReceiver* context = (PipelineContextReceiver*)context_pointer;
+  context->delete_limit_reached = true;
 }
 
 static void receiver_thread_fail(PipelineContextReceiver* context) {
@@ -152,9 +177,16 @@ int receive_thread(void* pipeline_context) {
   const Config* config = context->config;
   mtx_unlock(&context->mutex);
 
-  ReceiverSink sink = {receiver_enqueue_file, context, false, false, NULL};
-  if (receiver_process_pending((Config*)config, file_descriptor, &sink,
-                               &context->deferred_manifest) != 0) {
+  ReceiverSink sink = {receiver_enqueue_file,
+                       context,
+                       false,
+                       false,
+                       NULL,
+                       receiver_pipeline_note_delete_limit,
+                       &context->stats,
+                       context->would_delete};
+  if (receiver_process_pending((Config*)config, file_descriptor, &sink, &context->deferred_manifest,
+                               &context->deferred_plans) != 0) {
     receiver_thread_fail(context);
     protocol_session_unbind();
     return thrd_error;
@@ -221,7 +253,7 @@ int write_thread(void* pipeline_context) {
        caller apply it once every writer has drained. */
     if (!dry_run && result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
         dir_metadata_should_capture(context->config) &&
-        !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+        !dir_time_list_add(&context->dir_times, file->path, file->metadata, file->xattrs)) {
       file_destroy(file);
       pipeline_context_receiver_note_bytes_released(context, file_bytes);
       mtx_lock(&context->mutex);

@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -19,6 +20,7 @@
 #include "delay_updates.h"
 #include "delta.h"
 #include "file.h"
+#include "format.h"
 #include "identity.h"
 #include "log.h"
 #include "metadata.h"
@@ -294,13 +296,31 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     free(destination_path);
     return absent_result;
   }
-  const char* temp_dir = (cfg && cfg->temp_dir) ? cfg->temp_dir : NULL;
+  /* Resolve a relative --temp-dir under the destination root, exactly as the
+   * primary save path does; an absolute or `..`-escaping value is rejected. */
+  char* resolved_temp = NULL;
+  if (cfg->temp_dir) {
+    if (cfg->temp_dir[0] == '/' || has_path_traversal(cfg->temp_dir)) {
+      free(content);
+      free(first_disk);
+      free(destination_path);
+      return FILE_SAVE_ERROR;
+    }
+    resolved_temp = path_cat(root_directory, cfg->temp_dir);
+    if (!resolved_temp) {
+      free(content);
+      free(first_disk);
+      free(destination_path);
+      return FILE_SAVE_ERROR;
+    }
+  }
   FileXattrList* sibling_xattrs =
       cfg->use_xattrs ? xattr_capture_path(first_disk, cfg->preserve_acls) : NULL;
-  bool ok = file_to_disk_secure_link_attrs(destination_path, first_disk, content, content_size,
-                                           preallocate, file->metadata, policy, use_fsync,
-                                           sibling_xattrs, cfg ? cfg->fake_super : false, temp_dir);
+  bool ok = file_to_disk_secure_link_attrs(
+      destination_path, first_disk, content, content_size, preallocate, file->metadata, policy,
+      use_fsync, sibling_xattrs, cfg ? cfg->fake_super : false, resolved_temp);
   xattr_list_free(sibling_xattrs);
+  free(resolved_temp);
   free(content);
   free(first_disk);
   free(destination_path);
@@ -358,14 +378,6 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
     log_message(LOG_LEVEL_ERROR, "Special node has no device/FIFO/socket mode");
     return FILE_SAVE_ERROR;
   }
-  if (is_sock) {
-    /* No standard filesystem call recreates a socket; best-effort unsupported. */
-    char* escaped_path = output_escape(file->path, log_get_8_bit_output());
-    log_message(LOG_LEVEL_WARNING, "socket not recreated: %s (unsupported; skipped)",
-                escaped_path ? escaped_path : "<allocation failed>");
-    free(escaped_path);
-    return FILE_SAVE_SKIPPED;
-  }
   if (is_char || is_blk) {
     if (!config || !config->preserve_devices)
       return FILE_SAVE_SKIPPED;
@@ -383,7 +395,10 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       free(escaped_path);
       return FILE_SAVE_SKIPPED;
     }
-  } else if (is_fifo) {
+  } else if (is_fifo || is_sock) {
+    /* FIFOs and unix sockets are recreated by --specials.  mknod(S_IFSOCK)
+       works unprivileged on Linux (the node carries no live socket), so unlike
+       a socket bound to a live fd it can be materialized. */
     if (!config || !config->preserve_specials)
       return FILE_SAVE_SKIPPED;
   }
@@ -433,13 +448,18 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   } else if (is_blk) {
     create_mode = S_IFBLK;
     rdev = makedev((unsigned)file->rdev_major, (unsigned)file->rdev_minor);
+  } else if (is_sock) {
+    create_mode = S_IFSOCK;
   } else {
     create_mode = S_IFIFO;
   }
-  /* The creation permission bits come from the source only under -p/--perms;
-   * otherwise a safe default (0644, group/other write never granted) keeps an
-   * unprivileged no--p run from materializing a world-writable node. */
-  mode_t perms = config->preserve_perms ? (mode & 0777 & ~(S_IWGRP | S_IWOTH)) : 0644;
+  const char* node_kind = (is_char || is_blk) ? "device" : (is_fifo ? "FIFO" : "socket");
+  /* Under -p/--perms rsync copies the source's permission and special bits; a
+   * kernel that denies setuid/setgid/sticky reports the failure rather than
+   * having them masked here.  Without -p the node is created like any other new
+   * entry: source_mode & 0777 & ~umask. */
+  mode_t perms = config->preserve_perms ? (mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777))
+                                        : (mode & 0777 & ~(mode_t)file_process_umask());
 
   int rc = is_fifo ? mkfifoat(parent_fd, leaf, perms)
                    : mknodat(parent_fd, leaf, create_mode | perms, rdev);
@@ -450,7 +470,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       struct stat st;
       if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
           ((is_char && S_ISCHR(st.st_mode)) || (is_blk && S_ISBLK(st.st_mode)) ||
-           (is_fifo && S_ISFIFO(st.st_mode)))) {
+           (is_fifo && S_ISFIFO(st.st_mode)) || (is_sock && S_ISSOCK(st.st_mode)))) {
         close(parent_fd);
         free(leaf);
         free(destination);
@@ -458,7 +478,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       }
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING, "refusing to replace existing entry with %s: %s (skipped)",
-                  is_fifo ? "FIFO" : "device", escaped_path ? escaped_path : "<allocation failed>");
+                  node_kind, escaped_path ? escaped_path : "<allocation failed>");
       free(escaped_path);
     } else if (errno == EPERM || errno == EACCES) {
       /* Missing CAP_MKNOD / parent write permission: the environment cannot
@@ -467,14 +487,12 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: cannot create %s node (%s)\n"
                   "  --devices/--specials node creation needs privilege (CAP_MKNOD)",
-                  escaped_path ? escaped_path : "<allocation failed>", is_fifo ? "FIFO" : "device",
-                  strerror(errno));
+                  escaped_path ? escaped_path : "<allocation failed>", node_kind, strerror(errno));
       free(escaped_path);
     } else {
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
-      log_message(LOG_LEVEL_WARNING, "failed to create %s %s: %s (skipped)",
-                  is_fifo ? "FIFO" : "device", escaped_path ? escaped_path : "<allocation failed>",
-                  strerror(errno));
+      log_message(LOG_LEVEL_WARNING, "failed to create %s %s: %s (skipped)", node_kind,
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
       free(escaped_path);
     }
     close(parent_fd);
@@ -710,26 +728,23 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     char* link_path = path_cat(root_directory, file->path);
     if (!link_path)
       return FILE_SAVE_ERROR;
-    /* Restore the real target by stripping the sender's --munge-links marker.
-       Only unmunge when the policy was negotiated: a plain -l run must preserve
-       a source symlink whose target genuinely begins with the marker verbatim. */
+    /* The link value is stored verbatim (rsync -l parity: absolute and
+       ".."-bearing targets are preserved; the scanner's --safe-links /
+       --copy-unsafe-links decide which links are sent at all).  --munge-links
+       is a RECEIVER-side rewrite: the stored target is prefixed with
+       /rsyncd-munged/, making the link unusable while the referenced directory
+       does not exist -- exactly as rsync's receiver munges.  Only the link's
+       own placement path is confined below the receive root. */
+    bool munge = config && config->munge_links;
     char* target = str_dup(file->symlink_target);
     bool ok = target != NULL;
-    if (ok && config && config->munge_links)
-      file_symlink_unmunge(target);
-    /* Receiver-side trust boundary (independent of the sender): a target that
-       could escape the receive root (absolute, or relative-with-"..") is never
-       materialized.  It is contained (the entry is skipped) rather than failing
-       the whole transfer, so a hostile sender can inject a broken symlink but
-       can never redirect it outside the root.  --trust-sender deliberately
-       relaxes this receiver-side re-validation: a trusted sender's escaping
-       symlink target is copied verbatim (rsync -l parity).  The low-level
-       leaf/destination confinement in file_symlink_at_secure still ensures the
-       link itself is placed inside the authorized root. */
-    if (ok && !file_get_trust_sender() && !file_symlink_target_contained(target))
-      ok = false;
+    if (ok && munge) {
+      char* munged = file_symlink_munge(target);
+      free(target);
+      target = munged;
+      ok = target != NULL;
+    }
     if (!ok) {
-      /* Skip the escaping/empty target (contained) rather than abort. */
       free(target);
       free(link_path);
       return FILE_SAVE_SKIPPED;
@@ -765,11 +780,13 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     return file_save_hardlink_sibling(root_directory, file, config);
   }
 
-  /* These options arrive from the client.  They are names below the server
-     root, never independent filesystem roots.  --temp-dir is confined exactly
-     like --backup-dir/--partial-dir: an absolute or `..`-escaping scratch
-     directory is rejected outright so nothing is ever created outside the
-     authorized destination root. */
+  /* These options arrive from the client.  --backup-dir, --partial-dir and
+     --temp-dir are names below the server root, never independent filesystem
+     roots: an absolute or `..`-escaping value is rejected outright (rsync's
+     daemon confines temp-dir to the module the same way).  A relative temp dir
+     is resolved under the receive root below; if that resolution still lands on
+     a different filesystem than the destination the install falls back to a
+     non-atomic copy (see file_to_disk_secure_impl), never an abort. */
   if ((backup_dir && (backup_dir[0] == '/' || has_path_traversal(backup_dir))) ||
       (partial_dir && (partial_dir[0] == '/' || has_path_traversal(partial_dir))) ||
       (temp_dir && (temp_dir[0] == '/' || has_path_traversal(temp_dir))))
@@ -897,11 +914,13 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   }
 
   /* A configured --temp-dir sends the temporary working copy to a scratch
-     directory resolved below the receive root; the engine then atomically
-     renames the completed file into the final destination directory.  The
-     partial-dir flow already keeps its working copy in a separate directory
-     and --inplace writes directly, so neither diverts through the scratch
-     dir (matching rsync, where --inplace/--partial-dir supersede --temp-dir). */
+     directory; the engine then atomically renames the completed file into the
+     final destination directory.  A relative temp dir is resolved under the
+     receive root and must already exist (an absolute or `..`-escaping value was
+     rejected above); the engine falls back to a non-atomic copy on EXDEV.  The
+     partial-dir flow already keeps its working copy in a separate directory and
+     --inplace writes directly, so neither diverts through the scratch dir
+     (matching rsync, where --inplace/--partial-dir supersede --temp-dir). */
   char* confined_temp = NULL;
   bool use_temp_dir = temp_dir != NULL && !inplace && !use_partial_root;
   if (use_temp_dir) {
@@ -1074,6 +1093,13 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       *failed = true;
       return NULL;
     }
+    /* Wire-stats tally: bytes taken straight from the basis file (matched
+       delta blocks).  Computed before the delta is destroyed. */
+    unsigned long long matched = 0;
+    for (uint32_t k = 0; k < delta->instruction_count; k++) {
+      if (delta->instructions[k].type == DELTA_INSTR_BLOCK_MATCH)
+        matched += delta->instructions[k].match.length;
+    }
     void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
     delta_destroy(delta);
 
@@ -1092,6 +1118,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       *failed = true;
       return NULL;
     }
+    file->matched_bytes = matched;
 
     if (config->use_metadata) {
       int meta_ok = 1;
@@ -1317,7 +1344,11 @@ static bool basis_match_find(const Config* config, const char* check_path,
     return false;
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
-    char* basis_dir = path_cat(config->receive_root_directory, entry->path);
+    /* An absolute basis path is used verbatim (rsync semantics); a relative one
+       is resolved below the receive root.  Both remain subject to the receiver's
+       authorized-root confinement inside file_open_secure_parent. */
+    char* basis_dir = entry->path[0] == '/' ? str_dup(entry->path)
+                                            : path_cat(config->receive_root_directory, entry->path);
     if (!basis_dir)
       continue;
     char* candidate = path_cat(basis_dir, check_path);
@@ -1379,7 +1410,8 @@ static bool basis_match_find(const Config* config, const char* check_path,
  * transfer).  A fuzzy basis can therefore waste bandwidth but never corrupt a
  * file.
  *
- * Similarity heuristic (deterministic, deliberately simpler than rsync's):
+ * Similarity heuristic (rsync 3.4.1 parity, util1.c fuzzy_distance /
+ * find_filename_suffix + generator.c find_fuzzy):
  *   * candidates are the target's sibling entries in its destination
  *     directory, opened through the confined root (file_open_secure_parent +
  *     openat O_NOFOLLOW, fstatat AT_SYMLINK_NOFOLLOW) -- symlinks are never
@@ -1388,12 +1420,15 @@ static bool basis_match_find(const Config* config, const char* check_path,
  *     temp scratch names are never candidates;
  *   * size gate = the delta engine's own bounds (delta_should_attempt: both
  *     files >= DELTA_MIN_FILE_SIZE, <= delta_max_file_size, ratio <= 10x),
- *     NOT rsync's ~1.5x size window;
- *   * name gate = Levenshtein edit distance between the basenames, accepted
- *     only when distance <= half the length of the longer basename;
- *   * the single best candidate (smallest distance; tie-break: size closest
- *     to the incoming file, then lexicographically smaller basename) is read
- *     and returned as the basis.
+ *     because FastSync's delta engine cannot use a basis outside them;
+ *   * first pass = an exact size+mtime match wins regardless of name (rsync's
+ *     "fuzzy size/modtime match");
+ *   * otherwise the winner minimizes rsync's weighted Levenshtein distance
+ *     (substitution ± byte difference, insertion UNIT+byte, 16.16 fixed point)
+ *     plus ten times the suffix distance, accepted only when <= 25*UNIT; the
+ *     tie-break (smallest size gap, then lexical name) keeps the result
+ *     deterministic across filesystem readdir order (rsync leaves equal
+ *     distances to its file-list order).
  * ------------------------------------------------------------------------- */
 
 /* A directory scan is linear in the number of entries; the fuzzy search stops
@@ -1411,107 +1446,108 @@ static bool basis_match_find(const Config* config, const char* check_path,
 typedef struct {
   char name[FUZZY_NAME_LIMIT + 1];
   unsigned long long size;
-  size_t distance;
+  uint32_t distance;
   unsigned long long size_gap;
 } FuzzyCandidate;
 
-/* Two-row DP scratch, allocated once per directory scan (not per candidate) so
- * a 4096-entry directory never performs 4096 malloc/free pairs. */
-typedef struct {
-  size_t* prev;
-  size_t* cur;
-} FuzzyEditBuffer;
+/* rsync's fuzzy distance is a weighted Levenshtein variant in 16.16 fixed point
+ * (util1.c fuzzy_distance): a substitution costs UNIT +/- the byte difference
+ * and an insertion costs UNIT + the inserted byte, so similar names score low.
+ * The search keeps only distances <= 25*UNIT.  Ported verbatim for parity. */
+#define FUZZY_DIST_UNIT (1u << 16)
+#define FUZZY_DIST_REJECT (0xFFFFu * FUZZY_DIST_UNIT + 1)
+#define FUZZY_DIST_LIMIT (25u * FUZZY_DIST_UNIT)
 
-static bool fuzzy_edit_buffer_init(FuzzyEditBuffer* buf) {
-  buf->prev = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
-  buf->cur = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(size_t));
-  if (!buf->prev || !buf->cur) {
-    free(buf->prev);
-    free(buf->cur);
-    buf->prev = NULL;
-    buf->cur = NULL;
-    return false;
-  }
-  return true;
-}
-
-static void fuzzy_edit_buffer_destroy(FuzzyEditBuffer* buf) {
-  free(buf->prev);
-  free(buf->cur);
-  buf->prev = NULL;
-  buf->cur = NULL;
-}
-
-/* Cheap lower bounds used to reject a candidate BEFORE the DP:
- *  - any edit script must at least absorb the length gap: d >= |la - lb|;
- *  - any character of `a` that does not occur in `b` at all must be deleted or
- *    substituted at its own position: d >= (count of such characters).
- * The acceptance gate is d*2 <= longer, so a candidate whose max of these two
- * bounds already violates it can be skipped without computing the distance. */
-static size_t fuzzy_absent_char_bound(const char* a, size_t la, const char* b, size_t lb) {
-  if (lb == 0)
-    return la;
-  bool present[256] = {false};
-  for (size_t i = 0; i < lb; i++)
-    present[(uint8_t)b[i]] = true;
-  size_t absent = 0;
-  for (size_t i = 0; i < la; i++)
-    if (!present[(uint8_t)a[i]])
-      absent++;
-  return absent;
-}
-
-/* Levenshtein edit distance between the two basenames.  A shared prefix and a
- * (non-overlapping) shared suffix can always be aligned at no cost, so the DP
- * only runs over the differing middles; its two rows come from `buf` (allocated
- * once by the caller).  Callers enforce la, lb <= FUZZY_NAME_LIMIT. */
-static size_t fuzzy_edit_distance(FuzzyEditBuffer* buf, const char* a, size_t la, const char* b,
-                                  size_t lb) {
-  size_t p = 0;
-  while (p < la && p < lb && a[p] == b[p])
-    p++;
-  /* Trim the common suffix (never overlapping the prefix).  Working with two
-     moving end indices keeps the region arithmetic explicit and safe. */
-  size_t ae = la;
-  size_t be = lb;
-  while (ae > p && be > p && a[ae - 1] == b[be - 1]) {
-    ae--;
-    be--;
-  }
-  size_t ma = ae - p;
-  size_t mb = be - p;
-  /* cppcheck-suppress knownConditionTrueFalse -- the prefix/suffix trims above
-     only run while the corresponding ends match, so a middle can remain; the
-     analysis unsoundly concludes the trims always consume everything. */
-  if (ma == 0)
-    return mb;
-  if (mb == 0)
-    return ma;
-  const char* A = a + p;
-  const char* B = b + p;
-  size_t* prev = buf->prev;
-  size_t* cur = buf->cur;
-  for (size_t j = 0; j <= mb; j++)
-    prev[j] = j;
-  for (size_t i = 1; i <= ma; i++) {
-    cur[0] = i;
-    for (size_t j = 1; j <= mb; j++) {
-      size_t cost = A[i - 1] == B[j - 1] ? 0 : 1;
-      size_t del = prev[j] + 1;
-      size_t ins = cur[j - 1] + 1;
-      size_t sub = prev[j - 1] + cost;
-      size_t m = del < ins ? del : ins;
-      cur[j] = m < sub ? m : sub;
+static uint32_t fuzzy_distance(const char* s1, unsigned len1, const char* s2, unsigned len2,
+                               uint32_t upperlimit, uint32_t* scratch) {
+  if ((len1 > len2 ? len1 - len2 : len2 - len1) * FUZZY_DIST_UNIT > upperlimit)
+    return FUZZY_DIST_REJECT;
+  if (!len1 || !len2) {
+    if (!len1) {
+      s1 = s2;
+      len1 = len2;
     }
-    size_t* tmp = prev;
-    prev = cur;
-    cur = tmp;
+    uint32_t cost = 0;
+    for (unsigned i = 0; i < len1; i++)
+      cost += (uint8_t)s1[i];
+    return (uint32_t)len1 * FUZZY_DIST_UNIT + cost;
   }
-  return prev[mb];
+  uint32_t* a = scratch;
+  for (unsigned i2 = 0; i2 < len2; i2++)
+    a[i2] = (i2 + 1) * FUZZY_DIST_UNIT;
+  for (unsigned i1 = 0; i1 < len1; i1++) {
+    uint32_t diag = i1 * FUZZY_DIST_UNIT;
+    uint32_t above = (i1 + 1) * FUZZY_DIST_UNIT;
+    for (unsigned i2 = 0; i2 < len2; i2++) {
+      uint32_t left = a[i2];
+      int32_t cost = (int32_t)(uint8_t)s1[i1] - (int32_t)(uint8_t)s2[i2];
+      if (cost != 0)
+        cost = cost < 0 ? (int32_t)(FUZZY_DIST_UNIT - (uint32_t)(-cost))
+                        : (int32_t)(FUZZY_DIST_UNIT + (uint32_t)cost);
+      uint32_t diag_inc = diag + (uint32_t)cost;
+      uint32_t left_inc = left + FUZZY_DIST_UNIT + (uint8_t)s1[i1];
+      uint32_t above_inc = above + FUZZY_DIST_UNIT + (uint8_t)s2[i2];
+      a[i2] = above = left < above ? (left_inc < diag_inc ? left_inc : diag_inc)
+                                   : (above_inc < diag_inc ? above_inc : diag_inc);
+      diag = left;
+    }
+  }
+  return a[len2 - 1];
 }
 
-/* Deterministic ordering of two fuzzy candidates: smallest edit distance,
- * then the size closest to the incoming file, then the lexical basename. */
+/* rsync's find_filename_suffix (util1.c): return the last significant filename
+ * suffix (its dot included).  Leading dots are not a suffix; a trailing "~" is
+ * ignored; .bak/.old/.orig and a "~/<num>" backup marker are skipped. */
+static const char* fuzzy_find_suffix(const char* fn, int fn_len, int* len_ptr) {
+  const char* suf;
+  const char* s;
+  bool had_tilde;
+
+  while (fn_len && *fn == '.') {
+    fn++;
+    fn_len--;
+  }
+  if (fn_len > 1 && fn[fn_len - 1] == '~') {
+    fn_len--;
+    had_tilde = true;
+  } else {
+    had_tilde = false;
+  }
+  suf = "";
+  *len_ptr = 0;
+  for (s = fn + fn_len; fn_len > 1;) {
+    int s_len;
+    while (--s != fn && *s != '.') {
+    }
+    if (s == fn)
+      break;
+    s_len = fn_len - (int)(s - fn);
+    fn_len = (int)(s - fn);
+    if (s_len == 4) {
+      if (strcmp(s + 1, "bak") == 0 || strcmp(s + 1, "old") == 0)
+        continue;
+    } else if (s_len == 5) {
+      if (strcmp(s + 1, "orig") == 0)
+        continue;
+    } else if (s_len > 2 && had_tilde && s[1] == '~' && isdigit((unsigned char)s[2])) {
+      continue;
+    }
+    *len_ptr = s_len;
+    suf = s;
+    if (s_len == 1)
+      break;
+    for (s++, s_len--; s_len > 0; s++, s_len--) {
+      if (!isdigit((unsigned char)*s))
+        return suf;
+    }
+    s = suf;
+  }
+  return suf;
+}
+
+/* Deterministic ordering of two fuzzy candidates with equal rsync distance:
+ * smallest size gap, then the lexical basename (rsync itself takes the last
+ * equal-distance candidate in file-list order). */
 static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandidate* best) {
   if (!best->name[0])
     return true;
@@ -1528,8 +1564,8 @@ static bool fuzzy_candidate_better(const FuzzyCandidate* cand, const FuzzyCandid
  * = 0) when no candidate qualifies, which means the caller performs the normal
  * whole-file transfer. */
 static void* fuzzy_basis_find_and_load(const Config* config, const char* check_path,
-                                       unsigned long long check_size,
-                                       unsigned long long* out_size) {
+                                       unsigned long long check_size, time_t check_mtime,
+                                       long check_mtime_nsec, unsigned long long* out_size) {
   *out_size = 0;
   if (!config || !config->receive_root_directory || !config->fuzzy || !config->use_delta ||
       !check_path || check_size < DELTA_MIN_FILE_SIZE || check_size > config->delta_max_file_size ||
@@ -1572,18 +1608,28 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     return NULL;
   }
 
-  /* The DP scratch rows are allocated once per scan (not once per candidate). */
-  FuzzyEditBuffer ebuf;
-  if (!fuzzy_edit_buffer_init(&ebuf)) {
+  /* The weighted-distance scratch row is allocated once per scan (not once per
+     candidate). */
+  uint32_t* dist_scratch = malloc((FUZZY_NAME_LIMIT + 1) * sizeof(uint32_t));
+  if (!dist_scratch) {
     closedir(dir);
     close(dir_fd);
     free(leaf);
     free(full_path);
     return NULL;
   }
+  int fname_suf_len = 0;
+  const char* fname_suf = fuzzy_find_suffix(leaf, (int)target_len, &fname_suf_len);
 
   FuzzyCandidate best;
   memset(&best, 0, sizeof(best));
+  uint32_t lowest_dist = FUZZY_DIST_LIMIT;
+  /* rsync's fuzzy search runs an exact size+mtime pass before the name-distance
+     pass; such a candidate is almost certainly the same content and wins
+     regardless of how dissimilar its name is.  The first one (directory order,
+     deterministic) is kept. */
+  FuzzyCandidate exact;
+  memset(&exact, 0, sizeof(exact));
   const struct dirent* entry;
   size_t scanned = 0;
   /* readdir() yields entries in filesystem-dependent order, so the SET of
@@ -1603,22 +1649,32 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE ||
         !delta_should_attempt(cand_size, check_size, config->delta_max_file_size))
       continue;
-    /* Cheap pre-name gates run BEFORE the edit-distance DP.  The edit distance
-       is bounded below by the length gap |la-lb| and by the number of
-       characters of one basename that are absent from the other (each such
-       position costs at least one op), so a candidate whose acceptance gate
-       (distance*2 <= longer) already fails on the max of those bounds is
-       skipped without running the DP. */
-    size_t longer = target_len > name_len ? target_len : name_len;
-    size_t bound = longer - (target_len < name_len ? target_len : name_len);
-    size_t absent = fuzzy_absent_char_bound(leaf, target_len, name, name_len);
-    if (absent > bound)
-      bound = absent;
-    if (bound * 2 > longer)
+    long cand_nsec = 0;
+#ifdef __linux__
+    cand_nsec = st.st_mtim.tv_nsec;
+#endif
+    if (!exact.name[0] && cand_size == check_size &&
+        metadata_mtime_matches(st.st_mtime, cand_nsec, check_mtime, check_mtime_nsec,
+                               config->modify_window)) {
+      memcpy(exact.name, name, name_len + 1);
+      exact.size = cand_size;
+      exact.size_gap = 0;
       continue;
-    size_t distance = fuzzy_edit_distance(&ebuf, leaf, target_len, name, name_len);
-    if (distance * 2 > longer)
+    }
+    /* rsync's name-distance pass: a weighted Levenshtein distance over the full
+       basenames, plus ten times the same distance over the filename suffixes,
+       accepted only when it does not exceed the running lowest distance. */
+    int name_suf_len = 0;
+    const char* name_suf = fuzzy_find_suffix(name, (int)name_len, &name_suf_len);
+    uint32_t distance = fuzzy_distance(name, (unsigned)name_len, leaf, (unsigned)target_len,
+                                       lowest_dist, dist_scratch);
+    if (distance < 0xFFFF0000U)
+      distance += fuzzy_distance(name_suf, (unsigned)name_suf_len, fname_suf,
+                                 (unsigned)fname_suf_len, 0xFFFF0000U, dist_scratch) *
+                  10;
+    if (distance > lowest_dist)
       continue;
+    lowest_dist = distance;
     FuzzyCandidate cand;
     memcpy(cand.name, name, name_len + 1);
     cand.size = cand_size;
@@ -1629,7 +1685,11 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
   }
   closedir(dir);
   free(leaf);
-  fuzzy_edit_buffer_destroy(&ebuf);
+  free(dist_scratch);
+
+  /* Prefer the exact size+mtime candidate over any name-distance winner. */
+  if (exact.name[0])
+    best = exact;
 
   void* basis = NULL;
   if (best.name[0]) {
@@ -1746,6 +1806,7 @@ typedef struct {
   long long check_mtime_nsec;
   uint8_t check_digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t check_digest_len;
+  bool dest_exists; /* any destination entry exists (lstat succeeded) */
   bool has_old_file;
   int old_fd;
   struct stat old_st;
@@ -1842,6 +1903,9 @@ static IncrementalCheckOutcome incremental_check_open_destination(IncrementalChe
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full_path, &leaf, false);
   if (parent_fd >= 0) {
+    struct stat dest_st;
+    if (fstatat(parent_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
+      state->dest_exists = true;
     /* O_NONBLOCK: an existing FIFO at the destination must not block this
        openat(); the S_ISREG gate below rejects the non-regular entry. */
     state->old_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -1855,6 +1919,109 @@ static IncrementalCheckOutcome incremental_check_open_destination(IncrementalChe
     state->old_fd = -1;
   }
   state->old_size = state->has_old_file ? (unsigned long long)state->old_st.st_size : 0;
+  return INCREMENTAL_CONTINUE;
+}
+
+/* Output parity (protocol 2.23.0): when the wire config asked for it, report a
+   snapshot of the pre-transfer destination entry BEFORE the ordinary verdict so
+   the sender can render rsync-accurate -i/--out-format columns.  A missing
+   destination is reported explicitly (existed=false) rather than omitted, so
+   the sender can distinguish "new" from "unknown". */
+static IncrementalCheckOutcome incremental_check_report_dest_info(IncrementalCheckState* state) {
+  if (!state->config->report_dest_info)
+    return INCREMENTAL_CONTINUE;
+  OutputDestState info;
+  memset(&info, 0, sizeof(info));
+  info.known = true;
+  info.existed = state->has_old_file;
+  if (state->has_old_file) {
+    info.size = (unsigned long long)state->old_st.st_size;
+    info.mtime_sec = (long long)state->old_st.st_mtime;
+#ifdef __linux__
+    info.mtime_nsec = state->old_st.st_mtim.tv_nsec;
+#endif
+    info.mode = (uint32_t)state->old_st.st_mode;
+    info.uid = (int32_t)state->old_st.st_uid;
+    info.gid = (int32_t)state->old_st.st_gid;
+  }
+  if (!send_status(state->fd, STATUS_DEST_INFO) || !format_dest_state_send(state->fd, &info))
+    return INCREMENTAL_ERROR;
+  return INCREMENTAL_CONTINUE;
+}
+
+/* --ignore-existing short-circuit.  The receiver must answer "skip" (STATUS_OK)
+   BEFORE the sender transmits any payload, otherwise the whole file crosses the
+   wire only to be discarded at write time.  rsync skips an existing destination
+   entry regardless of its content or type, so the reply depends only on the
+   lstat existence probe; the ordinary --ignore-existing checks inside
+   file_receive remain as defense-in-depth for the frame types that have no
+   per-file check (directories/symlinks/specials/hard-links). */
+static IncrementalCheckOutcome
+incremental_check_ignore_existing(const IncrementalCheckState* state) {
+  if (!state->config->ignore_existing || !state->dest_exists)
+    return INCREMENTAL_CONTINUE;
+  if (!send_status(state->fd, STATUS_OK))
+    return INCREMENTAL_ERROR;
+  return INCREMENTAL_SKIP;
+}
+
+/* --link-dest relink of an already up-to-date destination.  rsync hard-links a
+   destination entry to a matching basis even when the entry is already correct,
+   so a run over an existing tree still maximizes sharing with the basis.  Only a
+   link-dest basis triggers this (copy-dest/compare-dest leave an up-to-date
+   destination untouched, matching rsync).  The ordinary basis path further down
+   handles every not-up-to-date case, so this helper only adds the relink that
+   the quick-skip would otherwise short-circuit. */
+static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalCheckState* state,
+                                                                  File** out_file) {
+  const Config* config = state->config;
+  if (!config_has_basis(config) || config->ignore_times || config->dry_run)
+    return INCREMENTAL_CONTINUE;
+  if (!state->has_old_file)
+    return INCREMENTAL_CONTINUE;
+  BasisMatch basis;
+  basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
+                   (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
+                   true, true, &basis);
+  /* Only a link-dest hit relinks; a copy-dest/compare-dest hit (or a miss) lets
+     the up-to-date check below keep the existing destination. */
+  if (!basis.hit || basis.type != BASIS_DEST_LINK) {
+    basis_match_free(&basis);
+    return INCREMENTAL_CONTINUE;
+  }
+  /* Already the basis inode: nothing to do, leave the destination alone. */
+  if (basis.st.st_dev == state->old_st.st_dev && basis.st.st_ino == state->old_st.st_ino) {
+    basis_match_free(&basis);
+    return INCREMENTAL_CONTINUE;
+  }
+  File* materialized = file_create(state->check_path);
+  if (materialized && basis.content) {
+    data_destroy(materialized->data);
+    materialized->data = basis.content;
+    basis.content = NULL;
+    materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
+    materialized->skip = true;
+    materialized->basis_link = basis.basis_path;
+    basis.basis_path = NULL;
+    if (!materialized->metadata) {
+      file_destroy(materialized);
+      materialized = NULL;
+    }
+  } else {
+    file_destroy(materialized);
+    materialized = NULL;
+  }
+  if (materialized) {
+    if (!send_status(state->fd, STATUS_OK)) {
+      basis_match_free(&basis);
+      file_destroy(materialized);
+      return INCREMENTAL_ERROR;
+    }
+    basis_match_free(&basis);
+    *out_file = materialized;
+    return INCREMENTAL_FILE;
+  }
+  basis_match_free(&basis);
   return INCREMENTAL_CONTINUE;
 }
 
@@ -2244,8 +2411,9 @@ static IncrementalCheckOutcome incremental_check_try_fuzzy(IncrementalCheckState
   if (!config->fuzzy || !config->use_delta)
     return INCREMENTAL_CONTINUE;
   unsigned long long fuzzy_size = 0;
-  void* fuzzy_basis =
-      fuzzy_basis_find_and_load(config, state->check_path, state->check_size, &fuzzy_size);
+  void* fuzzy_basis = fuzzy_basis_find_and_load(config, state->check_path, state->check_size,
+                                                (time_t)state->check_mtime,
+                                                (long)state->check_mtime_nsec, &fuzzy_size);
   if (fuzzy_basis != NULL) {
     bool fuzzy_failed = false;
     File* fuzzy_file = receive_delta_file(state->fd, config, state->check_path, fuzzy_basis,
@@ -2300,6 +2468,28 @@ File* receive_incremental_check_ex(int fd, const Config* config, bool* skipped,
 
   outcome = incremental_check_open_destination(&state);
   if (outcome == INCREMENTAL_ERROR)
+    goto done;
+
+  outcome = incremental_check_report_dest_info(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+
+  /* --ignore-existing must answer before any data is requested; it takes
+     precedence over the metadata up-to-date check below. */
+  outcome = incremental_check_ignore_existing(&state);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_SKIP) {
+    *skipped = true;
+    goto done;
+  }
+
+  /* A --link-dest hit relinks even an already up-to-date destination before the
+     quick-skip can suppress it (rsync parity). */
+  outcome = incremental_check_link_dest_relink(&state, &result);
+  if (outcome == INCREMENTAL_ERROR)
+    goto done;
+  if (outcome == INCREMENTAL_FILE)
     goto done;
 
   outcome = incremental_check_quick_skip(&state, &try_delta);
@@ -2421,11 +2611,14 @@ File* file_receive(const Config* config, int file_descriptor) {
 
 bool dir_metadata_should_capture(const Config* config) {
   /* Directory metadata is captured when a directory attribute is actually
-   * requested: -p/--perms (directory modes) or -t/--times (directory mtimes,
-   * unless -O/--omit-dir-times suppresses them).  --atimes/-U alone does not
-   * pull directory metadata (matching the original dir-time bundle). */
+   * requested: -p/--perms (directory modes), -t/--times (directory mtimes,
+   * unless -O/--omit-dir-times suppresses them), -o/-g (directory ownership),
+   * or -X/-A (directory xattrs/ACLs).  --atimes/-U alone does not pull
+   * directory metadata (matching the original dir-time bundle). */
   return config && config->use_metadata &&
-         (config->preserve_perms || (config->preserve_times && !config->omit_dir_times));
+         (config->preserve_perms || (config->preserve_times && !config->omit_dir_times) ||
+          config->preserve_owner || config->preserve_group || config->preserve_xattrs ||
+          config->preserve_acls);
 }
 
 void dir_time_list_init(DirTimeList* list) {
@@ -2433,6 +2626,7 @@ void dir_time_list_init(DirTimeList* list) {
     return;
   list->paths = NULL;
   list->entries = NULL;
+  list->xattrs = NULL;
   list->count = 0;
   list->capacity = 0;
   list->bytes = 0;
@@ -2441,18 +2635,23 @@ void dir_time_list_init(DirTimeList* list) {
 void dir_time_list_free(DirTimeList* list) {
   if (!list)
     return;
-  for (size_t i = 0; i < list->count; i++)
+  for (size_t i = 0; i < list->count; i++) {
     free(list->paths[i]);
+    xattr_list_free(list->xattrs ? list->xattrs[i] : NULL);
+  }
   free(list->paths);
   free(list->entries);
+  free(list->xattrs);
   list->paths = NULL;
   list->entries = NULL;
+  list->xattrs = NULL;
   list->count = 0;
   list->capacity = 0;
   list->bytes = 0;
 }
 
-bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata) {
+bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetadata* metadata,
+                       const FileXattrList* xattrs) {
   if (!list || !wire_path || !metadata)
     return true; /* nothing to remember; never a hard error */
   /* Cumulative, not per-frame: the sender may stream a tree across unbounded
@@ -2461,9 +2660,14 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
      transfer, which becomes a clean protocol error). */
   size_t path_len = strlen(wire_path);
   /* Charge the whole per-entry cost (path copy + pointer slot + metadata
-     struct), not just the path, so the array growth is bounded by the same
-     cumulative budget. */
-  size_t entry_cost = path_len + sizeof(FileMetadata) + sizeof(char*);
+     struct + captured xattrs), not just the path, so the array growth is
+     bounded by the same cumulative budget. */
+  size_t xattr_cost = 0;
+  if (xattrs) {
+    for (int i = 0; i < xattrs->count; i++)
+      xattr_cost += strlen(xattrs->items[i].name) + xattrs->items[i].value_len + sizeof(FileXattr);
+  }
+  size_t entry_cost = path_len + sizeof(FileMetadata) + 2 * sizeof(char*) + xattr_cost;
   if (list->count >= MAX_DIR_TIME_ENTRIES || entry_cost > MAX_DIR_TIME_BYTES - list->bytes)
     return false;
   if (list->count == list->capacity) {
@@ -2472,10 +2676,9 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
       return false;
     /* Assign each grown array as soon as its realloc succeeds: the old block is
        already freed by then, so discarding the pointer would dangle.  capacity
-       is advanced only after BOTH reallocs succeed, so a partial failure leaves
-       capacity no larger than the entries allocation (the paths array may be
-       over-allocated, which is harmless) -- never a mismatched list the next
-       add could write past. */
+       is advanced only after ALL reallocs succeed, so a partial failure leaves
+       capacity no larger than the smallest allocation -- never a mismatched
+       list the next add could write past. */
     char** grown_paths = realloc(list->paths, new_capacity * sizeof(char*));
     if (!grown_paths)
       return false;
@@ -2484,13 +2687,23 @@ bool dir_time_list_add(DirTimeList* list, const char* wire_path, const FileMetad
     if (!grown_entries)
       return false;
     list->entries = grown_entries;
+    FileXattrList** grown_xattrs = realloc(list->xattrs, new_capacity * sizeof(FileXattrList*));
+    if (!grown_xattrs)
+      return false;
+    list->xattrs = grown_xattrs;
     list->capacity = new_capacity;
   }
   char* copy = str_dup(wire_path);
   if (!copy)
     return false;
+  FileXattrList* xattr_copy = xattr_list_clone(xattrs);
+  if (xattrs && !xattr_copy) {
+    free(copy);
+    return false;
+  }
   list->paths[list->count] = copy;
   list->entries[list->count] = *metadata;
+  list->xattrs[list->count] = xattr_copy;
   list->count++;
   list->bytes += entry_cost;
   return true;
@@ -2502,7 +2715,12 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
     return;
   bool apply_times = config->preserve_times && !config->omit_dir_times;
   bool apply_mode = config->preserve_perms;
-  if (!apply_times && !apply_mode)
+  bool apply_xattrs = config->use_xattrs;
+  /* Ownership is applied through the active identity snapshot (which no-ops
+   * unless an ownership request is active), and xattrs only when -X/-A was
+   * negotiated.  Times/mode keep their own per-attribute gates. */
+  bool have_any = apply_times || apply_mode || apply_xattrs || identity_active_enabled();
+  if (!have_any)
     return;
   for (size_t i = 0; i < list->count; i++) {
     char* dir_path = path_cat(root_directory, list->paths[i]);
@@ -2531,6 +2749,13 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
       free(dir_path);
       continue;
     }
+    /* One O_DIRECTORY|O_NOFOLLOW fd drives ownership/mode/xattr application so
+       none of them can follow a same-named symlink planted after the fstatat. */
+    int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    /* Ownership first: a chown clears setuid/setgid, so it must precede mode. */
+    if (dir_fd >= 0)
+      identity_apply_ownership(dir_fd, (int32_t)list->entries[i].uid,
+                               (int32_t)list->entries[i].gid);
     if (apply_times) {
       struct timespec times[2] = {
           {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
@@ -2558,30 +2783,28 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
         mode_ready = false;
       }
       if (mode_ready) {
-        /* Route the directory mode through the SAME sanitization as the
-         * regular-file policy: a client-supplied mode never grants group/other
-         * write.  Open the directory with O_DIRECTORY|O_NOFOLLOW (never
-         * following a same-named symlink) and fchmod the fd, avoiding the
-         * fchmodat(..., 0) TOCTOU/symlink-follow hole. */
-        mode_t safe_mode =
-            (dir_mode & 0777 & ~(S_IWGRP | S_IWOTH)) | (dir_mode & (S_ISGID | S_ISVTX));
-        int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        /* rsync -p copies the source directory mode exactly, including
+         * group/other write and the setgid/sticky bits. */
+        mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
         if (dir_fd < 0) {
           char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
                       escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
           free(escaped_path);
-        } else {
-          if (fchmod(dir_fd, safe_mode) != 0) {
-            char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-            log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
-                        escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-            free(escaped_path);
-          }
-          close(dir_fd);
+        } else if (fchmod(dir_fd, safe_mode) != 0) {
+          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+          log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
+                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+          free(escaped_path);
         }
       }
     }
+    /* xattrs/ACLs last: a mode change can rewrite the ACL mask, so the ACL
+       xattrs must be (re)applied after fchmod. */
+    if (apply_xattrs && dir_fd >= 0 && list->xattrs)
+      xattr_apply_fd(dir_fd, list->xattrs[i]);
+    if (dir_fd >= 0)
+      close(dir_fd);
     close(parent_fd);
     free(leaf);
     free(dir_path);
@@ -2621,6 +2844,11 @@ File* file_receive_directory(int file_descriptor, const Config* config) {
       return NULL;
     }
   }
+  /* Directory xattrs/ACLs (-X/-A) ride after the metadata when negotiated. */
+  if (config && !receive_file_xattrs(file, file_descriptor, config)) {
+    file_destroy(file);
+    return NULL;
+  }
   return file;
 }
 
@@ -2656,6 +2884,12 @@ File* file_receive_dir_time(int file_descriptor, const Config* config) {
       file_destroy(file);
       return NULL;
     }
+  }
+  /* Directory xattrs/ACLs (-X/-A) ride after the metadata, mirroring the
+     sender's send_dir_times(). */
+  if (config && !receive_file_xattrs(file, file_descriptor, config)) {
+    file_destroy(file);
+    return NULL;
   }
   return file;
 }
@@ -2832,8 +3066,10 @@ File* file_receive_special(int file_descriptor) {
 /* Read a delete-manifest frame (the STATUS_MANIFEST leading code has already
    been consumed): a keep-set entry count followed by that many
    destination-relative paths, then a protected-prefix count followed by that
-   many destination-relative prefixes, then (protocol 2.10.0+) a missing-args
-   count followed by that many destination-relative delete paths.  The frame is
+   many destination-relative prefixes, then a missing-args count followed by that
+   many destination-relative delete paths, then (protocol 2.23.0) a
+   synchronized-directory count followed by that many destination-relative
+   directory paths (the receive root is the "." sentinel).  The frame is
    self-delimiting (the counts are authoritative), so the caller decides what to
    do next and continues reading the following STATUS_* frame.  Every section is
    validated identically: an entry must be non-empty, relative and traversal-free
@@ -2878,7 +3114,8 @@ DeleteManifest* receive_manifest_entries(int fd) {
   manifest->keeps = array_list_create(free);
   manifest->protected = array_list_create(free);
   manifest->missing = array_list_create(free);
-  if (!manifest->keeps || !manifest->protected || !manifest->missing) {
+  manifest->dirs = array_list_create(free);
+  if (!manifest->keeps || !manifest->protected || !manifest->missing || !manifest->dirs) {
     delete_manifest_free(manifest);
     send_status(fd, STATUS_ERROR);
     return NULL;
@@ -2887,7 +3124,8 @@ DeleteManifest* receive_manifest_entries(int fd) {
   size_t manifest_entries = 0;
   if (!receive_manifest_section(fd, manifest->keeps, &manifest_bytes, &manifest_entries) ||
       !receive_manifest_section(fd, manifest->protected, &manifest_bytes, &manifest_entries) ||
-      !receive_manifest_section(fd, manifest->missing, &manifest_bytes, &manifest_entries)) {
+      !receive_manifest_section(fd, manifest->missing, &manifest_bytes, &manifest_entries) ||
+      !receive_manifest_section(fd, manifest->dirs, &manifest_bytes, &manifest_entries)) {
     delete_manifest_free(manifest);
     return NULL;
   }
@@ -2900,18 +3138,65 @@ void delete_manifest_free(DeleteManifest* manifest) {
   array_list_delete(manifest->keeps);
   array_list_delete(manifest->protected);
   array_list_delete(manifest->missing);
+  array_list_delete(manifest->dirs);
   free(manifest);
 }
 
+/* Shared --max-delete budget for one receiver-side deletion commit.  Both the
+   --delete-missing-args exact-path removals and the ordinary extras walk draw
+   from the same tally, matching rsync (whose --max-delete counts every deleted
+   file or directory).  `max_delete` is SIZE_MAX for an unlimited budget. */
+typedef struct {
+  size_t max_delete;
+  size_t deleted;
+  size_t skipped;
+  bool limit_hit;
+} DeleteBudgetState;
+
+/* Build the delete-walk protection prefix for one basis directory.  The walker
+   compares paths relative to the receive root, so a relative entry is already
+   in the right form; an absolute entry that lies below the root is converted to
+   its root-relative form, and one outside the root returns NULL (the walk
+   cannot reach it, and it is not protected data beneath the root).  Exposed so
+   tests can exercise the root-of-"/" child mapping directly. */
+char* file_receive_basis_delete_relative(const Config* config, const char* path) {
+  if (!path)
+    return NULL;
+  if (path[0] != '/')
+    return str_dup(path);
+  const char* root = config->receive_root_directory;
+  if (!root || root[0] != '/')
+    return NULL;
+  size_t root_len = strlen(root);
+  while (root_len > 1 && root[root_len - 1] == '/')
+    root_len--;
+  if (strncmp(path, root, root_len) != 0)
+    return NULL;
+  if (root_len == 1) {
+    /* `root` is "/" (the only single-character absolute root): every absolute
+       path is below it, and the child relative form is everything after the
+       leading '/'. */
+    if (path[1] == '\0')
+      return NULL; /* identical to the root, not a child */
+    return str_dup(path + 1);
+  }
+  if (path[root_len] != '/')
+    return NULL; /* identical or a sibling sharing a name prefix */
+  return str_dup(path + root_len + 1);
+}
+
 /* Remove every destination entry under the receive root that is not in the
-   keep-set, bounded by MAX_SERVER_DELETE_COUNT (or a smaller client
-   --max-delete=NUM, which is all-or-nothing), using the symlink-safe delete
-   walker.  With --delay-updates the not-yet-published staging directory is a
+   keep-set, bounded by the shared budget (a smaller client --max-delete=NUM
+   replaces the server hard bound; rsync deletes up to the bound and skips the
+   rest).  With --delay-updates the not-yet-published staging directory is a
    direct child of the receive root and must not be treated as a set of extras;
-   the manifest's protected prefixes (paths excluded on the source) and the
+   the manifest's protected prefixes (paths excluded on the source), the
+   size-pruned prefixes (--max-size/--min-size, always protected) and the
    alternate basis directories are never destination content and are skipped at
-   any depth.  Prints a notice and returns true on success. */
-bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
+   any depth.  Returns true unless a traversal/unlink error aborted the walk;
+   the budget's limit_hit/skipped fields report a cap-stopped run. */
+static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifest,
+                                   DeleteBudgetState* budget) {
   if (!config || !manifest || !manifest->keeps)
     return false;
   fprintf(stderr, "Deleting files not in manifest...\n");
@@ -2923,16 +3208,23 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
        at any depth: they are extra comparison snapshots the user pointed at,
        not destination content, and deleting them would destroy the very files a
        --link-dest run just linked into place;
-     - the sender-side protected prefixes (source paths excluded by filters), at
-       any depth, so an excluded destination mirror survives --delete unless
-       --delete-excluded opts back into removing it. */
+     - the sender-side protected prefixes (source paths excluded by filters and
+       paths pruned by --max-size/--min-size), at any depth, so their destination
+       mirror survives --delete unless --delete-excluded opts back into removing
+       the filter-excluded ones (size-pruned entries are always protected). */
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
                    (manifest->protected ? manifest->protected->size : 0);
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -2940,7 +3232,13 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      /* An absolute basis outside the receive root is unreachable by this walk,
+         so it contributes no protection prefix (and no slot). */
+      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
@@ -2949,31 +3247,33 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
-  /* A client --max-delete=NUM smaller than the server's hard bound replaces it
-     for this run; both still bound the walk.  The walker is all-or-nothing, so
-     a run that would delete more than the bound removes nothing and fails with
-     an error that names the bound that was hit. */
-  bool user_limited =
-      config->max_delete >= 0 && (size_t)config->max_delete < MAX_SERVER_DELETE_COUNT;
-  size_t cap = user_limited ? (size_t)config->max_delete : MAX_SERVER_DELETE_COUNT;
-  size_t deleted_count = 0;
-  DeleteWalkResult result = delete_extras_limited(config->receive_root_directory, manifest->keeps,
-                                                  cap, skips, skip_count, &deleted_count);
+  /* Clamp rather than subtract: an accounting bug where deleted already exceeds
+     max_delete must never underflow into an effectively unlimited budget. */
+  size_t remaining;
+  if (budget->max_delete == SIZE_MAX)
+    remaining = SIZE_MAX;
+  else if (budget->deleted >= budget->max_delete)
+    remaining = 0;
+  else
+    remaining = budget->max_delete - budget->deleted;
+  size_t deleted = 0;
+  size_t skipped = 0;
+  DeleteWalkResult result =
+      delete_extras_limited(config->receive_root_directory, manifest->keeps, manifest->dirs,
+                            remaining, skips, used, &deleted, &skipped);
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
-  if (result == DELETE_WALK_LIMIT_EXCEEDED) {
-    if (user_limited) {
-      log_message(LOG_LEVEL_ERROR,
-                  "deletion stopped: the destination holds more than --max-delete=%d extraneous "
-                  "entries; no files were deleted",
-                  config->max_delete);
-    } else {
-      log_message(LOG_LEVEL_ERROR,
-                  "deletion stopped: the destination holds more than %u extraneous entries "
-                  "(server deletion limit); no files were deleted",
-                  (unsigned)MAX_SERVER_DELETE_COUNT);
-    }
-    return false;
+  budget->deleted += deleted;
+  budget->skipped += skipped;
+  if (result == DELETE_WALK_LIMIT_REACHED) {
+    budget->limit_hit = true;
+    return true;
   }
   if (result != DELETE_WALK_OK) {
     log_message(LOG_LEVEL_ERROR, "deletion failed while removing extraneous files");
@@ -2991,10 +3291,12 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
    removed recursively only when --delete or --force is in effect (rsync parity:
    the man page says a non-empty directory mirror is only deleted with --force
    or --delete); otherwise it is left with a warning and the run continues.  A
-   mirror that does not exist is a no-op.  Returns false only on a genuine error
-   (a confinement failure on a validated path or an I/O error), which fails the
-   run. */
-bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
+   mirror that does not exist is a no-op.  Each removal draws from the shared
+   --max-delete budget: once it is exhausted the remaining requests are skipped
+   and counted.  Returns false only on a genuine error (a confinement failure on
+   a validated path or an I/O error), which fails the run. */
+static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* manifest,
+                                         DeleteBudgetState* budget) {
   if (!config || !manifest)
     return false;
   if (!manifest->missing || manifest->missing->size == 0)
@@ -3002,10 +3304,16 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
   fprintf(stderr, "Deleting destination mirrors of missing source arguments...\n");
   int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
   DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
   if (skip_count > 0) {
     skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    if (!skips)
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
       return false;
+    }
     int idx = 0;
     if (config->delay_updates) {
       skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
@@ -3013,10 +3321,15 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       idx++;
     }
     for (int i = 0; i < config->basis_count; i++) {
-      skips[idx].prefix = config->basis_dirs[i].path;
+      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
       skips[idx].top_level_only = false;
       idx++;
     }
+    used = idx;
   }
   bool ok = true;
   for (int i = 0; i < manifest->missing->size; i++) {
@@ -3029,7 +3342,7 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       continue;
     }
     bool at_root = strchr(rel, '/') == NULL;
-    if (path_under_skip_prefix(rel, at_root, skips, skip_count)) {
+    if (path_under_skip_prefix(rel, at_root, skips, used)) {
       char* escaped = output_escape(rel, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "missing-args path '%s' is protected (staging directory or basis snapshot); "
@@ -3068,6 +3381,16 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       free(full);
       continue;
     }
+    /* An entry that exists is one deletion: skip it (and count it) when the
+       shared --max-delete budget is already exhausted. */
+    if (budget->deleted >= budget->max_delete) {
+      budget->limit_hit = true;
+      budget->skipped++;
+      close(parent_fd);
+      free(leaf);
+      free(full);
+      continue;
+    }
     bool removed = false;
     if (S_ISDIR(st.st_mode)) {
       if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0) {
@@ -3078,10 +3401,40 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
         free(leaf);
         leaf = NULL;
         if (config->use_delete || config->force_delete) {
-          if (!file_remove_tree_secure(full))
+          /* Remove the contents entry-by-entry through the budgeted extras
+             walker so every deleted file/dir counts toward --max-delete (rsync
+             parity); the now-empty directory itself costs one more.  A run that
+             hits the cap leaves the remaining entries in place. */
+          ArrayList* no_keeps = array_list_create(free);
+          /* Never let an accounting slip (deleted > max_delete) underflow the
+             remaining budget into SIZE_MAX, which would grant unlimited
+             deletions. */
+          size_t remaining =
+              budget->deleted >= budget->max_delete ? 0 : budget->max_delete - budget->deleted;
+          size_t contents_deleted = 0;
+          size_t contents_skipped = 0;
+          DeleteWalkResult walk =
+              no_keeps ? delete_extras_limited(full, no_keeps, NULL, remaining, NULL, 0,
+                                               &contents_deleted, &contents_skipped)
+                       : DELETE_WALK_ERROR;
+          if (no_keeps)
+            array_list_delete(no_keeps);
+          budget->deleted += contents_deleted;
+          budget->skipped += contents_skipped;
+          if (walk == DELETE_WALK_LIMIT_REACHED) {
+            budget->limit_hit = true;
+          } else if (walk != DELETE_WALK_OK) {
             ok = false;
-          else
+          } else if (budget->deleted >= budget->max_delete) {
+            budget->limit_hit = true;
+            budget->skipped++;
+          } else if (file_remove_tree_secure(full)) {
+            /* The shared `if (removed)` tail charges this directory exactly
+               once; counting it here too would consume two budget units. */
             removed = true;
+          } else {
+            ok = false;
+          }
         } else {
           char* escaped = output_escape(rel, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING,
@@ -3101,6 +3454,7 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
       }
     }
     if (removed) {
+      budget->deleted++;
       char* escaped = output_escape(rel, log_get_8_bit_output());
       fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);
@@ -3112,7 +3466,96 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
     if (!ok)
       break;
   }
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
   free(skips);
+  return ok;
+}
+
+/* Public wrappers used outside the commit path (and by unit tests): no
+   --max-delete budget. */
+bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, ArrayList* out,
+                                size_t* count_out) {
+  if (count_out)
+    *count_out = 0;
+  if (!config || !manifest || !manifest->keeps || !out)
+    return false;
+  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
+                   (manifest->protected ? manifest->protected->size : 0);
+  DeleteSkipEntry* skips = NULL;
+  char** owned_prefixes = NULL;
+  int used = 0;
+  if (skip_count > 0) {
+    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
+    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
+    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
+      free(skips);
+      free(owned_prefixes);
+      return false;
+    }
+    int idx = 0;
+    if (config->delay_updates) {
+      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
+      skips[idx].top_level_only = true;
+      idx++;
+    }
+    for (int i = 0; i < config->basis_count; i++) {
+      /* Normalize exactly like the real commit path: a relative entry is
+         already root-relative, an absolute one inside the receive root is
+         converted, and one outside contributes no protection prefix. */
+      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
+      if (!prefix)
+        continue;
+      owned_prefixes[i] = prefix;
+      skips[idx].prefix = prefix;
+      skips[idx].top_level_only = false;
+      idx++;
+    }
+    for (int i = 0; i < manifest->protected->size; i++) {
+      skips[idx].prefix = (const char*)manifest->protected->items[i];
+      skips[idx].top_level_only = false;
+      idx++;
+    }
+    used = idx;
+  }
+  bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
+                               skips, used, out, count_out);
+  if (owned_prefixes) {
+    for (int i = 0; i < config->basis_count; i++)
+      free(owned_prefixes[i]);
+  }
+  free(owned_prefixes);
+  free(skips);
+  return ok;
+}
+
+bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
+  DeleteBudgetState budget = {
+      .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
+  return delete_extras_budgeted(config, manifest, &budget);
+}
+
+bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
+  DeleteBudgetState budget = {
+      .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
+  return delete_missing_args_budgeted(config, manifest, &budget);
+}
+
+bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
+                                          size_t max_delete, size_t* deleted, size_t* skipped,
+                                          bool* limit_hit) {
+  DeleteBudgetState budget = {
+      .max_delete = max_delete, .deleted = 0, .skipped = 0, .limit_hit = false};
+  bool ok = delete_missing_args_budgeted(config, manifest, &budget);
+  if (deleted)
+    *deleted = budget.deleted;
+  if (skipped)
+    *skipped = budget.skipped;
+  if (limit_hit)
+    *limit_hit = budget.limit_hit;
   return ok;
 }
 
@@ -3121,19 +3564,48 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
    be blocked by the extras walker's filter-exclusion protection (a protected
    leftover inside a missing-argument directory must not make that user-requested
    removal fail).  The ordinary extras walk then runs when --delete is active.
-   Returns true when there was nothing to do or every requested deletion
-   committed. */
-bool manifest_delete_all(const Config* config, DeleteManifest* manifest) {
+   Both draw from one --max-delete budget; the result reports a cap-stopped
+   (partial) commit distinctly so the client can exit 25 like rsync. */
+DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest) {
+  return manifest_delete_all_counted(config, manifest, NULL);
+}
+
+DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
+                                               size_t* deleted) {
+  if (deleted)
+    *deleted = 0;
   if (!config || !manifest)
-    return false;
+    return DELETE_COMMIT_ERROR;
   /* Central no-mutation guard: a dry-run never deletes.  No manifest is sent on
      the dry-run path, but a hostile/buggy peer could; treat it as a no-op so
      the receiver can never remove anything. */
   if (config->dry_run)
-    return true;
-  if (config->delete_missing_args && !manifest_delete_missing_args(config, manifest))
-    return false;
-  if (config->use_delete && !manifest_delete_extras(config, manifest))
-    return false;
-  return true;
+    return DELETE_COMMIT_OK;
+  /* A client --max-delete=NUM smaller than the server's hard bound replaces it
+     for this run; both still bound the commit. */
+  bool user_limited =
+      config->max_delete >= 0 && (size_t)config->max_delete < MAX_SERVER_DELETE_COUNT;
+  DeleteBudgetState budget = {.max_delete = user_limited ? (size_t)config->max_delete
+                                                         : MAX_SERVER_DELETE_COUNT,
+                              .deleted = 0,
+                              .skipped = 0,
+                              .limit_hit = false};
+  if (config->delete_missing_args && !delete_missing_args_budgeted(config, manifest, &budget))
+    return DELETE_COMMIT_ERROR;
+  if (config->use_delete && !delete_extras_budgeted(config, manifest, &budget))
+    return DELETE_COMMIT_ERROR;
+  if (deleted)
+    *deleted = budget.deleted;
+  if (budget.limit_hit) {
+    if (user_limited) {
+      log_message(LOG_LEVEL_ERROR, "Deletions stopped due to --max-delete limit (%zu skipped)",
+                  budget.skipped);
+    } else {
+      log_message(LOG_LEVEL_ERROR,
+                  "Deletions stopped due to the server deletion limit of %u (%zu skipped)",
+                  (unsigned)MAX_SERVER_DELETE_COUNT, budget.skipped);
+    }
+    return DELETE_COMMIT_LIMIT_REACHED;
+  }
+  return DELETE_COMMIT_OK;
 }

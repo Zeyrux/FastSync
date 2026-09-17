@@ -289,14 +289,14 @@ void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* chil
   accept_loop(server, child_fn, child_ctx, log_fmt);
 }
 
-static int g_timeout_sec = 30;
-static int g_contimeout_sec = 10;
+/* rsync defaults: --timeout=0 (disabled) and --contimeout=60.  A non-positive
+ * value means "no timeout" rather than "leave the built-in value in place". */
+static int g_timeout_sec = 0;
+static int g_contimeout_sec = 60;
 
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec) {
-  if (timeout_sec > 0)
-    g_timeout_sec = timeout_sec;
-  if (contimeout_sec > 0)
-    g_contimeout_sec = contimeout_sec;
+  g_timeout_sec = timeout_sec > 0 ? timeout_sec : 0;
+  g_contimeout_sec = contimeout_sec > 0 ? contimeout_sec : 0;
 }
 
 int tcp_get_contimeout_sec(void) {
@@ -308,6 +308,10 @@ int tcp_get_timeout_sec(void) {
 }
 
 static void tcp_apply_socket_timeout(int fd) {
+  /* timeout 0 means no timeout: leave the socket in its default (blocking)
+   * mode instead of installing a zero SO_RCVTIMEO/SO_SNDTIMEO. */
+  if (g_timeout_sec <= 0)
+    return;
   struct timeval tv;
   tv.tv_sec = g_timeout_sec;
   tv.tv_usec = 0;
@@ -483,11 +487,15 @@ bool tcp_connect_socket_ex(Client* client, const char* host, int port,
       break;
     }
 
-    struct timeval ct;
-    ct.tv_sec = g_contimeout_sec;
-    ct.tv_usec = 0;
-    setsockopt(client->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &ct, sizeof(ct));
-    setsockopt(client->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &ct, sizeof(ct));
+    /* --contimeout=0 disables the connect timeout: skip the pre-connect socket
+     * timeouts entirely. */
+    if (g_contimeout_sec > 0) {
+      struct timeval ct;
+      ct.tv_sec = g_contimeout_sec;
+      ct.tv_usec = 0;
+      setsockopt(client->file_descriptor, SOL_SOCKET, SO_RCVTIMEO, &ct, sizeof(ct));
+      setsockopt(client->file_descriptor, SOL_SOCKET, SO_SNDTIMEO, &ct, sizeof(ct));
+    }
 
     if (bind_addr_family != 0) {
       if (rp->ai_family != bind_addr_family) {

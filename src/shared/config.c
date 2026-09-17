@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <limits.h>
 #include <errno.h>
 
@@ -45,12 +46,14 @@ static void config_set_defaults(Config* config) {
   config->server_port = 8080;
   config->server_port_set = false;
   config->server_host_set = false;
-  /* 0 means "--timeout not given": the transport keeps its own built-in 30 s
-   * socket timeout (tcp_set_timeouts ignores non-positive values) and the
-   * protocol layer keeps its built-in 60 s per-message deadline.  A positive
-   * value overrides BOTH (see protocol_session_set_io_timeout). */
+  /* rsync defaults: --timeout=0 (I/O timeouts disabled) and --contimeout=60.
+   * A value of 0 disables the client's own deadline on both the socket layer
+   * (tcp_set_timeouts) and the protocol layer
+   * (protocol_session_set_io_timeout); a positive value sets it.  A server
+   * session floors the deadline at SERVER_IO_TIMEOUT_SEC so 0 can never hold a
+   * connection open forever. */
   config->timeout = 0;
-  config->contimeout = 10;
+  config->contimeout = 60;
   config->quiet = false;
   config->stats = false;
   config->max_depth = 0;
@@ -65,6 +68,8 @@ static void config_set_defaults(Config* config) {
   config->human_readable = false;
   config->ignore_errors = false;
   config->ignore_missing_args = false;
+  config->checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
+  config->cli_exit_code = 0;
   config->filters = NULL;
   config->files_from = NULL;
   config->files_from_set = NULL;
@@ -194,12 +199,13 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
          valid_wire_bool(config->dry_run) && checksum_algo_valid(config->checksum_algo) &&
-         identity_wire_valid(config) && valid_wire_bool(config->preserve_atimes) &&
-         valid_wire_bool(config->preserve_crtimes) && valid_wire_bool(config->omit_dir_times) &&
-         valid_wire_bool(config->omit_link_times) && valid_wire_bool(config->preserve_perms) &&
-         valid_wire_bool(config->preserve_times) && valid_wire_bool(config->preserve_owner) &&
-         valid_wire_bool(config->preserve_group) && valid_wire_bool(config->munge_links) &&
-         valid_wire_bool(config->keep_dirlinks) && valid_wire_bool(config->fake_super) &&
+         compression_algo_valid(config->compression_algo) && identity_wire_valid(config) &&
+         valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
+         valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
+         valid_wire_bool(config->preserve_perms) && valid_wire_bool(config->preserve_times) &&
+         valid_wire_bool(config->preserve_owner) && valid_wire_bool(config->preserve_group) &&
+         valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
+         valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
@@ -207,8 +213,9 @@ static bool validate_received_config(const Config* config) {
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
-         config->max_delete >= -1 && config->skip_compress_count >= 0 &&
-         config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES && config->max_alloc > 0 &&
+         config->max_delete >= -1 && config->max_alloc <= MAX_SERVER_ALLOC &&
+         config->skip_compress_count >= 0 &&
+         config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
          config->super_mode >= SUPER_MODE_AUTO && config->super_mode <= SUPER_MODE_OFF;
@@ -225,7 +232,13 @@ Config* config_create(void) {
 bool config_delete_timing_early(const Config* config) {
   if (!config)
     return false;
-  return config->delete_before || config->delete_during;
+  return config->delete_before;
+}
+
+bool config_delete_timing_per_dir(const Config* config) {
+  if (!config)
+    return false;
+  return config->delete_during || config->delete_delay;
 }
 
 /* A delete-timing flag is only meaningful together with --delete.  At most one
@@ -326,30 +339,38 @@ bool config_has_basis(const Config* config) {
 }
 
 /* A basis-dir path travels from the client to the receiver and is resolved
- * below the destination root, so it must be a non-empty relative path with no
- * "." or ".." component and no traversal: an absolute or escaping path would
- * make the receiver read or link files outside its authorized root.
+ * below the destination root when relative, or used verbatim when absolute
+ * (matching rsync).  Either form must be non-empty, traversal-free (no "..")
+ * and free of "." components: an escaping path would make the receiver read or
+ * link files outside its authorized root.  An absolute path is still subject to
+ * the receiver's root confinement at open time (file_open_secure_parent), so a
+ * basis outside the authorized root is simply not found rather than an escape.
  *
  * Returns a malloc'd CANONICAL copy of an accepted path, or NULL when the path
  * is rejected.  Canonicalization collapses interior empty components ("a//b" ->
- * "a/b"), drops "." components and trailing "/"s, so validation, the delete
- * walker prefix match and the receiver's basis lookup all agree on one form.
- * The normalizer is the single source of truth for both config_basis_path_valid
- * and config_basis_append. */
+ * "a/b"), drops "." components and trailing "/"s, and preserves a leading '/'
+ * for absolute paths, so validation, the delete walker prefix match and the
+ * receiver's basis lookup all agree on one form.  The normalizer is the single
+ * source of truth for both config_basis_path_valid and config_basis_append. */
 static char* basis_path_normalize(const char* path) {
-  if (!path || path[0] == '\0' || path[0] == '/' || has_path_traversal(path))
+  if (!path || path[0] == '\0' || has_path_traversal(path))
     return NULL;
-  if (strcmp(path, ".") == 0)
+  bool absolute = path[0] == '/';
+  if (!absolute && strcmp(path, ".") == 0)
+    return NULL;
+  if (absolute && strcmp(path, "/") == 0)
     return NULL;
   char* dup = str_dup(path);
   if (!dup)
     return NULL;
   size_t out_len = 0;
-  char* out = malloc(strlen(path) + 1);
+  char* out = malloc(strlen(path) + 2);
   if (!out) {
     free(dup);
     return NULL;
   }
+  if (absolute)
+    out[out_len++] = '/';
   char* saveptr = NULL;
   bool ok = true;
   for (char* part = strtok_r(dup, "/", &saveptr); part; part = strtok_r(NULL, "/", &saveptr)) {
@@ -359,14 +380,14 @@ static char* basis_path_normalize(const char* path) {
     }
     if (strcmp(part, ".") == 0)
       continue;
-    if (out_len > 0)
+    if (out_len > 0 && out[out_len - 1] != '/')
       out[out_len++] = '/';
     size_t len = strlen(part);
     memcpy(out + out_len, part, len);
     out_len += len;
   }
   free(dup);
-  if (!ok || out_len == 0) {
+  if (!ok || out_len == 0 || (absolute && out_len == 1)) {
     free(out);
     return NULL;
   }
@@ -749,10 +770,18 @@ void config_delete(Config* config) {
       free(config->skip_compress_suffixes[i]);
     free(config->skip_compress_suffixes);
   }
-  free(config->usermap);
+  if (config->usermap) {
+    for (int i = 0; i < config->usermap_count; i++)
+      free(config->usermap[i].to_name);
+    free(config->usermap);
+  }
   config->usermap = NULL;
   config->usermap_count = 0;
-  free(config->groupmap);
+  if (config->groupmap) {
+    for (int i = 0; i < config->groupmap_count; i++)
+      free(config->groupmap[i].to_name);
+    free(config->groupmap);
+  }
   config->groupmap = NULL;
   config->groupmap_count = 0;
   if (config->filters) {
@@ -780,11 +809,14 @@ void config_delete(Config* config) {
  * ------------------------------------------------------------------------- */
 
 /* --max-alloc: raw 64-bit value, clamped server-side and installed as the
- * session allocation ceiling.  A zero value is rejected. */
+ * session allocation ceiling.  A received 0 is rsync's "no alloc limit"; on the
+ * receive path it is mapped to the server ceiling so a client can never disable
+ * it (client-side 0 remains unlimited).  Any value above the ceiling is clamped
+ * to it. */
 static bool config_receive_max_alloc(int fd, unsigned long long* value) {
-  if (!receive_n_data(fd, value, sizeof(*value)) || *value == 0)
+  if (!receive_n_data(fd, value, sizeof(*value)))
     return false;
-  if (*value > MAX_SERVER_ALLOC)
+  if (*value == 0 || *value > MAX_SERVER_ALLOC)
     *value = MAX_SERVER_ALLOC;
   protocol_session_set_max_alloc(NULL, *value);
   return true;
@@ -861,6 +893,14 @@ static bool config_send_auth_user(int fd, const Config* c) {
 static bool config_receive_checksum_algo(int fd, int* value) {
   int algo;
   if (!receive_int(fd, &algo) || !checksum_algo_valid(algo))
+    return false;
+  *value = algo;
+  return true;
+}
+
+static bool config_receive_compression_algo(int fd, int* value) {
+  int algo;
+  if (!receive_int(fd, &algo) || !compression_algo_valid(algo))
     return false;
   *value = algo;
   return true;
@@ -984,7 +1024,8 @@ static bool receive_basis_entries(int fd, Config* c, ConfigStringBudget* budget)
 
 static bool send_identity_entries(int fd, const IdentityMap* map, int count) {
   for (int i = 0; i < count; i++) {
-    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].to))
+    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].from_hi) || !send_int(fd, map[i].to) ||
+        !send_str(fd, map[i].to_name ? map[i].to_name : ""))
       return false;
   }
   return true;
@@ -992,20 +1033,32 @@ static bool send_identity_entries(int fd, const IdentityMap* map, int count) {
 
 static bool receive_identity_entries(int fd, ConfigStringBudget* budget, int count,
                                      IdentityMap** out) {
-  (void)budget;
   if (count <= 0)
     return true;
   IdentityMap* map = calloc((size_t)count, sizeof(IdentityMap));
   if (!map)
     return false;
   for (int i = 0; i < count; i++) {
-    if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].to)) {
-      free(map);
-      return false;
+    if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].from_hi) ||
+        !receive_int(fd, &map[i].to))
+      goto fail;
+    char* name = config_receive_str(fd, budget);
+    if (!name)
+      goto fail;
+    if (name[0] == '\0') {
+      free(name);
+      map[i].to_name = NULL;
+    } else {
+      map[i].to_name = name;
     }
   }
   *out = map;
   return true;
+fail:
+  for (int i = 0; i < count; i++)
+    free(map[i].to_name);
+  free(map);
+  return false;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1053,6 +1106,9 @@ static bool receive_identity_entries(int fd, ConfigStringBudget* budget, int cou
 
 #define CONFIG_SEND_INT_CHECKSUM_ALGO(name) send_int(fd, c->name)
 #define CONFIG_RECV_INT_CHECKSUM_ALGO(name) config_receive_checksum_algo(fd, &c->name)
+
+#define CONFIG_SEND_INT_COMPRESSION_ALGO(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_COMPRESSION_ALGO(name) config_receive_compression_algo(fd, &c->name)
 
 #define CONFIG_SEND_SUPERMODE(name) send_int(fd, (int)c->name)
 #define CONFIG_RECV_SUPERMODE(name) config_receive_super_mode(fd, &c->name)
@@ -1128,6 +1184,8 @@ CONFIG_DEFINE_SEND(send_daemon_auth, CONFIG_WIRE_DAEMON_AUTH_FIELDS)
 CONFIG_DEFINE_SEND(send_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
 CONFIG_DEFINE_SEND(send_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_SEND(send_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
+CONFIG_DEFINE_SEND(send_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
+CONFIG_DEFINE_SEND(send_codec_options, CONFIG_WIRE_CODEC_FIELDS)
 
 CONFIG_DEFINE_RECV(receive_core_fields, CONFIG_WIRE_CORE_FIELDS)
 CONFIG_DEFINE_RECV(receive_delta_fields, CONFIG_WIRE_DELTA_FIELDS)
@@ -1146,6 +1204,8 @@ CONFIG_DEFINE_RECV(receive_daemon_auth, CONFIG_WIRE_DAEMON_AUTH_FIELDS)
 CONFIG_DEFINE_RECV(receive_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
 CONFIG_DEFINE_RECV(receive_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_RECV(receive_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
+CONFIG_DEFINE_RECV(receive_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
+CONFIG_DEFINE_RECV(receive_codec_options, CONFIG_WIRE_CODEC_FIELDS)
 
 #undef XSEND
 #undef XRECV
@@ -1262,7 +1322,9 @@ bool config_send_wire_block(int file_descriptor, const Config* config) {
          send_daemon_module(file_descriptor, config) && send_daemon_auth(file_descriptor, config) &&
          send_iconv_spec(file_descriptor, config) &&
          send_privilege_options(file_descriptor, config) &&
-         send_copy_as_options(file_descriptor, config);
+         send_copy_as_options(file_descriptor, config) &&
+         send_output_options(file_descriptor, config) &&
+         send_codec_options(file_descriptor, config);
 }
 
 bool config_send(int file_descriptor, const Config* config) {
@@ -1332,18 +1394,59 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_daemon_auth(file_descriptor, config, &budget) ||
       !receive_iconv_spec(file_descriptor, config, &budget) ||
       !receive_privilege_options(file_descriptor, config, &budget) ||
-      !receive_copy_as_options(file_descriptor, config, &budget))
+      !receive_copy_as_options(file_descriptor, config, &budget) ||
+      !receive_output_options(file_descriptor, config, &budget) ||
+      !receive_codec_options(file_descriptor, config, &budget))
     goto error;
-  if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
-      strcmp(config->compress_choice, "none") != 0) {
-    char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
-    log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
-                escaped_choice ? escaped_choice : "<allocation failed>");
-    char detail[128];
-    snprintf(detail, sizeof(detail), "unsupported compression choice: %s",
-             escaped_choice ? escaped_choice : "<allocation failed>");
-    send_error_detail(file_descriptor, detail);
-    free(escaped_choice);
+  /* Validate/normalize the negotiated codec.  compress_choice is the human
+   * spelling (NULL or "" when -z was not given); compression_algo is the
+   * concrete codec id the sender used.  They must agree, and "auto" is
+   * canonicalized to FastSync's negotiated default so the stored spelling is
+   * always concrete (a hostile/older client may still send "auto"). */
+  if (config->compress_choice && config->compress_choice[0] != '\0') {
+    int choice_algo = compression_algo_from_name(config->compress_choice);
+    if (choice_algo < 0 && strcasecmp(config->compress_choice, "auto") != 0) {
+      char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
+      log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
+                  escaped_choice ? escaped_choice : "<allocation failed>");
+      char detail[160];
+      snprintf(detail, sizeof(detail), "unsupported compression choice: %s",
+               escaped_choice ? escaped_choice : "<allocation failed>");
+      send_error_detail(file_descriptor, detail);
+      free(escaped_choice);
+      goto error;
+    }
+    if (choice_algo < 0)
+      choice_algo = (int)compression_negotiate_default();
+    if (strcasecmp(config->compress_choice, "auto") == 0 ||
+        choice_algo == (int)COMPRESSION_ALGO_NONE) {
+      const char* canonical = compression_algo_name((CompressionAlgo)choice_algo);
+      char* dup = str_dup(canonical);
+      if (!dup)
+        goto error;
+      free(config->compress_choice);
+      config->compress_choice = dup;
+    }
+    if (config->compression_algo != choice_algo) {
+      log_message(LOG_LEVEL_ERROR, "Compression choice '%s' does not match codec id %d",
+                  config->compress_choice, config->compression_algo);
+      send_error_detail(file_descriptor, "compression choice/codec mismatch");
+      goto error;
+    }
+  }
+  /* The concrete codec must exist only when compression is on.  A client that
+   * left -z off has no codec in effect, but the field keeps whatever id it
+   * carried (the receiver never dispatches on it without use_compression), so
+   * the wire value round-trips untouched. */
+  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Compression requested with the 'none' codec");
+    send_error_detail(file_descriptor, "compression requested with the none codec");
+    goto error;
+  }
+  /* rsync: "none" as the pre-transfer checksum is invalid with --checksum. */
+  if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
+    send_error_detail(file_descriptor, "checksum-choice 'none' cannot be used with --checksum");
     goto error;
   }
   if (!validate_received_config(config)) {

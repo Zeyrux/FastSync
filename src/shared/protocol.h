@@ -34,6 +34,11 @@
 #define DEFAULT_MAX_ALLOC (1ULL * 1024 * 1024 * 1024)
 /* Server policy ceiling for a client-provided allocation limit. */
 #define MAX_SERVER_ALLOC (256ULL * 1024 * 1024)
+/* Server-owned floor for the per-message I/O deadline.  A client --timeout=0
+   (rsync's default) disables the client's own deadlines, but a server session
+   must never be held open forever by a silent peer (slow-loris), so the server
+   floors the effective deadline at this value. */
+#define SERVER_IO_TIMEOUT_SEC 60
 /* Bounded cumulative per-connection receive budget.  In-flight wire buffers,
    decompression buffers and queued (not yet written) file payloads for a
    connection must stay within this ceiling. */
@@ -59,10 +64,12 @@ typedef struct ProtocolSession {
   bool eight_bit_output;
   unsigned long long max_alloc;
   /* Per-session deadline (seconds) applied to every protocol send/receive by
-   * protocol_send_n_data / protocol_receive_n_data.  Defaults to the built-in
-   * 60 s window; a value <= 0 falls back to that default.  Set from the
-   * negotiated Config->timeout so --timeout is honored by the poll()-driven
-   * protocol I/O, not just the socket SO_RCVTIMEO/SO_SNDTIMEO. */
+   * protocol_send_n_data / protocol_receive_n_data.  The initialized default is
+   * the built-in 60 s window; a value <= 0 disables the deadline (rsync's
+   * --timeout=0).  Set from the negotiated Config->timeout so --timeout is
+   * honored by the poll()-driven protocol I/O, not just the socket
+   * SO_RCVTIMEO/SO_SNDTIMEO.  The server does not propagate a client 0 here: it
+   * installs protocol_server_io_timeout_sec() so its sessions keep a floor. */
   int io_timeout_sec;
 } ProtocolSession;
 
@@ -155,13 +162,61 @@ enum NET_STATUS {
    * (the receiver reads none in dry-run).  STATUS_OK keeps its meaning in this
    * path ("already up to date / nothing to do").  Appended after
    * STATUS_ERROR_DETAIL so no existing status is renumbered. */
-  STATUS_DRY_RUN_TRANSFER
+  STATUS_DRY_RUN_TRANSFER,
+  /* --max-delete budget exhausted (protocol 2.23.0).  Sent by the receiver as
+   * the terminal success status INSTEAD of STATUS_OK when a --delete/
+   * --delete-missing-args commit removed up to the --max-delete bound but had
+   * to skip further extras.  The transfer itself succeeded and all file data is
+   * stored; the sender maps this to rsync's exit code 25 ("the --max-delete
+   * limit stopped deletions").  Appended after STATUS_DRY_RUN_TRANSFER so no
+   * existing status is renumbered. */
+  STATUS_DELETE_LIMIT,
+  /* Destination-state report for output parity (protocol 2.23.0).  When the
+   * wire config carries report_dest_info=true, the receiver answers every
+   * per-file STATUS_CHECK request with STATUS_DEST_INFO FIRST, followed by a
+   * fixed record describing the pre-transfer destination entry
+   * (int32 has_old; uint64 size; int64 mtime; int64 mtime_nsec; uint32 mode;
+   * int32 uid; int32 gid).  The ordinary STATUS_OK/STATUS_NEXT/... verdict
+   * follows, so the sender can render rsync-accurate -i/--out-format columns
+   * (new vs modified, and which of size/time/perms/owner/group differ) without
+   * changing the transfer decision itself.  Appended after
+   * STATUS_DELETE_LIMIT so no existing status is renumbered. */
+  STATUS_DEST_INFO,
+  /* Per-directory delete plan (protocol 2.24.0).  The sender of a
+   * --delete-during/--delete-delay transfer streams one frame per source
+   * directory in directory order instead of a single whole-tree keep-set
+   * manifest.  The receiver applies the plan when it arrives
+   * (--delete-during removes that directory's extras immediately) or records
+   * the extras and applies them only after the whole transfer succeeded
+   * (--delete-delay).  Payload: an int32 has_config flag (1 on the first plan
+   * of the run, 0 afterwards); when set, the three global config sections
+   * (protected-prefix count+paths, size-skipped count+paths, missing-args
+   * count+paths); then the destination-relative directory path wire string
+   * ("." for the receive root); then the child-directory count + names and the
+   * child-file count + names that must be kept.  Appended after
+   * STATUS_DEST_INFO so no existing status is renumbered. */
+  STATUS_DELETE_PLAN,
+  /* End-of-transfer receiver counter report (protocol 2.25.0).  When the wire
+   * config carries report_stats=true, the receiver sends this status once,
+   * immediately before its terminal success status, followed by a fixed stats
+   * record (see format_stats_send/receive in format.h) and, when the run is a
+   * --dry-run with --delete, the would-delete path list.  Appended after
+   * STATUS_DELETE_PLAN so no existing status is renumbered. */
+  STATUS_STATS
 };
 
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
+
+/* Process-wide wire byte counters.  protocol_send_n_data/protocol_receive_n_data
+ * update them; the zero-copy sendfile path reports through
+ * protocol_note_bytes_written.  Used by the client to render rsync's
+ * --stats/--progress totals and the --out-format %b/%c tokens. */
+unsigned long long protocol_bytes_written(void);
+unsigned long long protocol_bytes_read(void);
+void protocol_note_bytes_written(unsigned long long bytes);
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
 /* Transitional bridge for helpers whose signatures still carry only an fd. */
@@ -170,15 +225,20 @@ void protocol_session_unbind(void);
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl);
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec);
 void protocol_session_set_max_alloc(ProtocolSession* session, unsigned long long max_alloc);
-/* Override the per-message send/receive deadline for this session.
- * `sec` <= 0 restores the built-in 60 s default (used for --timeout=0/unset).
- * An explicit long deadline (e.g. the delete-ack wait) is applied per-call by
- * protocol_receive_status_timed and is unaffected by this setter. */
+/* Override the per-message send/receive deadline for this session.  The value
+ * is stored verbatim: a positive value sets the deadline, `sec` <= 0 disables
+ * it (rsync's --timeout=0).  An explicit long deadline (e.g. the delete-ack
+ * wait) is applied per-call by protocol_receive_status_timed and is unaffected
+ * by this setter. */
 void protocol_session_set_io_timeout(ProtocolSession* session, int sec);
-/* Effective per-message I/O deadline (seconds) for the currently-bound session,
- * falling back to the built-in default.  Used by the plaintext sendfile path
- * which bypasses the protocol send primitive. */
+/* Effective per-message I/O deadline (seconds) for the currently-bound session.
+ * Zero means the deadline is disabled (rsync's --timeout=0).  Used by the
+ * plaintext sendfile path which bypasses the protocol send primitive. */
 int protocol_get_io_timeout_sec(void);
+/* The server-side effective deadline for a client-requested timeout: a positive
+ * client value is honored, otherwise the SERVER_IO_TIMEOUT_SEC floor applies so
+ * a silent peer can never hold a session open forever. */
+int protocol_server_io_timeout_sec(int client_timeout);
 void* protocol_alloc(size_t size);
 void* protocol_realloc(void* ptr, size_t size);
 void protocol_session_set_8_bit_output(ProtocolSession* session, bool enabled);

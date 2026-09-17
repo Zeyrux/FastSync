@@ -38,6 +38,8 @@ pkgs.mkShell {
 
   buildInputs = with pkgs; [
     zstd
+    zlib
+    lz4
     openssl
   ];
 
@@ -54,6 +56,6 @@ pkgs.mkShell {
     echo "FastSync dev shell ready."
     echo "  Build:      cmake -B build -S . && cmake --build build -j\$(nproc)"
     echo "  Unit:       ./build/tests"
-    echo "  CI parity:  docker run --rm --user \"\$(id -u):\$(id -g)\" -v \"\$PWD:/workspace\" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v10 ..."
+    echo "  CI parity:  docker run --rm --user \"\$(id -u):\$(id -g)\" -v \"\$PWD:/workspace\" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v11 ..."
   '';
 }

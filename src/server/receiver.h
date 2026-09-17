@@ -2,8 +2,10 @@
 #define RECEIVER_H
 
 #include "config.h"
+#include "delete_plan.h"
 #include "file.h"
 #include "file_receive.h"
+#include "protocol.h"
 #include <stdbool.h>
 #include <time.h>
 
@@ -21,6 +23,12 @@ typedef struct {
 
 typedef bool (*ReceiverSuccessFrame)(int fd, void* context);
 
+/* Records that a --max-delete commit stopped with extras left over, so the
+   caller's terminal success frame can carry STATUS_DELETE_LIMIT instead of
+   STATUS_OK.  The commit runs on the receiver thread, so the flag is stored in
+   the sink's own context rather than in a shared global. */
+typedef void (*ReceiverNoteDeleteLimit)(void* context);
+
 typedef struct {
   ReceiverFileSink store_file;
   void* context;
@@ -28,23 +36,43 @@ typedef struct {
   bool send_success;
   /* Emits the end-of-transfer success frame.  When the sender requested
      --remove-source-files this includes one per-file status per processed
-     data file followed by the final STATUS_OK; otherwise just STATUS_OK. */
+     data file followed by the final status; otherwise just the final status. */
   ReceiverSuccessFrame send_success_frame;
+  /* Optional; may be NULL when the sink has no --max-delete handling. */
+  ReceiverNoteDeleteLimit note_delete_limit;
+  /* Optional end-of-transfer wire counters (protocol 2.25.0).  When non-NULL
+     and the wire config carries report_stats, the success frame is preceded by
+     a STATUS_STATS record; `would_delete` (optional, receiver-owned strings)
+     carries the -n/--dry-run --delete path list. */
+  ReceiverStats* stats;
+  struct ArrayList* would_delete;
 } ReceiverSink;
 
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code);
 void receiver_outcomes_destroy(ReceiverOutcomes* outcomes);
-bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes);
+
+/* Send the terminal success frame.  `final_status` is usually STATUS_OK, or
+   STATUS_DELETE_LIMIT when a --max-delete commit was capped. */
+bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes,
+                                 Status final_status);
+
+/* Emit STATUS_STATS (a fixed ReceiverStats record plus, when `would_delete` is
+   non-NULL, a count and that many wire strings) when the wire config requested
+   report_stats.  A no-op otherwise. */
+bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats* stats,
+                               const struct ArrayList* would_delete);
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink);
 /* receiver_process with an escape hatch for the commit-style (late) deletion:
    when `pending_manifest` is non-NULL the receiver does NOT delete at
    STATUS_FINISHED itself; instead it stores the owned keep-set manifest there
    (leaving *pending_manifest untouched on early modes/errors) so the caller can
-   commit the deletion only after its disk writer has fully drained.  Pass NULL
-   to keep the default behaviour (delete before the success frame). */
+   commit the deletion only after its disk writer has fully drained.  Likewise,
+   when `pending_plans` is non-NULL the --delete-delay per-directory session is
+   handed to the caller instead of being committed at STATUS_FINISHED.  Pass NULL
+   for either to keep the default behaviour (delete before the success frame). */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             DeleteManifest** pending_manifest);
+                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans);
 int receiver_receive_files(Config* config, int file_descriptor);
 
 /* ---- Connection time bounds (anti-slowloris) ----

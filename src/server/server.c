@@ -741,6 +741,10 @@ void handler(int file_descriptor) {
    * received config. */
   if (gate_ctx.super_mode_override != -1)
     config->super_mode = (SuperMode)gate_ctx.super_mode_override;
+  /* Install the codec this connection negotiated before the receiver/writer
+   * threads start (the server forks per connection, so the process-global
+   * codec is private to this session). */
+  compression_set_algo((CompressionAlgo)config->compression_algo);
   /* If the client requested ownership but the effective super mode forbids it
    * (operator --no-super, a privileged standalone receiver's secure default, or
    * a daemon module without `client owner = yes`), say so ONCE per connection so
@@ -752,10 +756,11 @@ void handler(int file_descriptor) {
   protocol_set_8_bit_output(config->eight_bit_output);
   /* Server-side per-message protocol deadline for every frame from here on.
    * `timeout` is not serialized, so this is the server's own config (the server
-   * has no --timeout CLI and defaults it to 0): the built-in 60 s window stays
-   * in effect.  A client's --timeout tightens only that client's own protocol
-   * I/O and the server's socket read/write timeout is the transport default. */
-  protocol_session_set_io_timeout(&session, config->timeout);
+   * has no --timeout CLI and defaults it to 0).  A client's --timeout tightens
+   * only that client's own protocol I/O; the server floors its own deadline at
+   * SERVER_IO_TIMEOUT_SEC so a silent peer can never hold a session slot
+   * forever (the socket layer gets the same floor at startup). */
+  protocol_session_set_io_timeout(&session, protocol_server_io_timeout_sec(config->timeout));
   const char* authorized_root = utils_get_authorized_root_path();
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
@@ -904,7 +909,8 @@ void handler(int file_descriptor) {
       goto done;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
-    protocol_session_set_io_timeout(&context->session, config->timeout);
+    protocol_session_set_io_timeout(&context->session,
+                                    protocol_server_io_timeout_sec(config->timeout));
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
     pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);
@@ -949,11 +955,37 @@ void handler(int file_descriptor) {
          --delay-updates run; the walker skips the staging directory.  A
          server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
-        if (!manifest_delete_all(config, context->deferred_manifest)) {
+        size_t deleted = 0;
+        DeleteCommitResult deletion =
+            manifest_delete_all_counted(config, context->deferred_manifest, &deleted);
+        context->stats.deleted_files += deleted;
+        if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
+        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+          /* The transfer still succeeds; the terminal frame reports the capped
+             deletion so the sender exits 25 like rsync. */
+          context->delete_limit_reached = true;
         }
         delete_manifest_free(context->deferred_manifest);
         context->deferred_manifest = NULL;
+      }
+      /* --delete-delay: receive_thread snapshotted each plan's extras as it
+         arrived; with the disk writer drained, commit the deferred removals.
+         --delete-during already applied its plans on the receive thread. */
+      if (context->deferred_plans) {
+        /* Defence in depth (the enclosing block already excludes dry-run): a
+           -n run never commits a deletion. */
+        DeleteCommitResult deletion =
+            config->dry_run ? DELETE_COMMIT_OK
+                            : delete_plan_session_commit(context->deferred_plans, config);
+        context->stats.deleted_files += delete_plan_session_deleted(context->deferred_plans);
+        if (deletion == DELETE_COMMIT_ERROR) {
+          transfer_ok = false;
+        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+          context->delete_limit_reached = true;
+        }
+        delete_plan_session_destroy(context->deferred_plans);
+        context->deferred_plans = NULL;
       }
     }
     if (transfer_ok && !config->dry_run) {
@@ -974,7 +1006,12 @@ void handler(int file_descriptor) {
         dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
     }
     if (transfer_ok) {
-      if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
+      Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
+      /* Emit the optional wire-stats record first (protocol 2.25.0), then the
+         success/outcome frame, exactly like the single-threaded receiver. */
+      if (!receiver_send_stats_frame(file_descriptor, config, &context->stats,
+                                     context->would_delete) ||
+          !receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
         transfer_ok = false;
     } else {
       send_error_detail(file_descriptor, "transfer failed on receiver");
@@ -1041,8 +1078,9 @@ static void print_server_usage(void) {
   printf("                      hosts allow, hosts deny)\n");
   printf("  --no-detach         Stay in the foreground (default detaches to\n");
   printf("                      background when running --daemon)\n");
-  printf("  --password-file=FILE  Credential store for modules that declare\n");
-  printf("                      'auth users' (line format:\n");
+  printf("  --password-file=FILE  FastSync-native SCRAM/PBKDF2 credential store (NOT\n");
+  printf("                      rsync's auth scheme) for modules that declare 'auth\n");
+  printf("                      users' (line format:\n");
   printf("                      user:$fastsync$1$pbkdf2-sha256$iters$salt$stored$server,\n");
   printf("                      generated by --hash-credentials).  Legacy\n");
   printf("                      user:SHA256HEX lines are rejected.  Requires\n");
@@ -1051,7 +1089,7 @@ static void print_server_usage(void) {
   printf("  --early-input=FILE  Second credential store layered over\n");
   printf("                      --password-file (same format); usually a secrets-\n");
   printf("                      manager/process-substitution file.  Requires --daemon\n");
-  printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
+  printf("  -p, --port <port>   TCP port (default: 8080, range: 1-65535)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
@@ -1062,7 +1100,9 @@ static void print_server_usage(void) {
   printf("  -4, --ipv4          Bind an IPv4 socket (default)\n");
   printf("  -6, --ipv6          Bind an IPv6 socket\n");
   printf("  --allow-delete      Permit manifest deletion\n");
-  printf("  --trust-sender      Trust the remote sender's file list\n");
+  printf("  --trust-sender      Trust the remote sender's file list (receiver-local;\n");
+  printf("                      this server-side flag is the only one that matters -- a\n");
+  printf("                      client --trust-sender is never sent to the server)\n");
   printf("  --no-super          Operator veto: never attempt super-user activities\n");
   printf("                      (ownership, device nodes) even as root, and refuse\n");
   printf("                      any client --copy-as/--super request\n");
@@ -1211,6 +1251,10 @@ int main(int argc, char* argv[]) {
   server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
+  /* Server-owned socket deadline floor: the client default --timeout=0 would
+   * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
+   * silent peer hold a connection (and its process slot) forever. */
+  tcp_set_timeouts(SERVER_IO_TIMEOUT_SEC, SERVER_IO_TIMEOUT_SEC);
 
   if (opts.stdio_mode) {
     /* SSH authenticates the stdio transport outside of FastSync. */

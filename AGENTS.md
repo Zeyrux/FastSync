@@ -4,18 +4,19 @@ FastSync is a high-performance file synchronization system written in C11. It su
 
 ## Dependency installation
 
-**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v10`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest + pytest-xdist, openssh-client, and Node.js.
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v11`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest + pytest-xdist, openssh-client, Node.js, plus `rsync` 3.4.1 (with zstd/xxhash/lz4), `acl` and `attr` (setfacl/getfacl, setfattr/getfattr) for drop-in parity tests.
 
 **Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. The Docker image can also be used locally for CI parity.
 
 ```bash
 # Use the prebuilt CI image directly (faster, guaranteed CI parity)
-docker pull gitea.tap-tap.win/taptap/fastsync-ci:v10
-docker tag gitea.tap-tap.win/taptap/fastsync-ci:v10 fastsync-ci:local
+docker pull gitea.tap-tap.win/taptap/fastsync-ci:v11
+docker tag gitea.tap-tap.win/taptap/fastsync-ci:v11 fastsync-ci:local
 
 # Or build the image from the repo-root Dockerfile
-# (Note: the prebuilt :v10 image reflects the previous Dockerfile state;
-#  rebuild from source to pick up any newly added packages like lcov/valgrind.)
+# (Note: the prebuilt :v11 image is built from the current Dockerfile and
+#  includes rsync 3.4.1 plus acl/attr; rebuild from source after changing
+#  the Dockerfile.)
 docker build -t fastsync-ci:local .
 
 # Build, run unit tests, and run integration tests inside the container
@@ -66,14 +67,14 @@ When running the CI workflow via `tea` (the task execution agent), always set a 
 ### If lint (clang-format) fails
 Run clang-format in the CI Docker image to match the exact CI version:
 ```bash
-docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v10 \
+docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v11 \
   sh -c 'find src/ tests/ -name "*.c" -o -name "*.h" | xargs clang-format -i'
 ```
 
 ### If cppcheck fails
 Fix reported issues locally, then verify with:
 ```bash
-docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v10 \
+docker run --rm -v "$PWD:/workspace" -w /workspace gitea.tap-tap.win/taptap/fastsync-ci:v11 \
   sh -c 'cppcheck --enable=warning,style,performance,portability --suppress=missingIncludeSystem --error-exitcode=1 --inline-suppr src/ tests/'
 ```
 

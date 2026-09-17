@@ -148,6 +148,50 @@ static void test_ancestor_and_descendant_queries() {
   remove(path);
 }
 
+/* The delete-walker's synchronized-directory predicate: a directory is in scope
+   only when it is a listed directory or lies below one, NOT when it is merely an
+   implied parent of a listed file. */
+static void test_dir_in_scope() {
+  char err[160];
+
+  /* NULL set / empty list semantics. */
+  EXPECT_TRUE(file_list_dir_in_scope(NULL, "anything"));
+
+  const char* path = "test_file_list_dirscope.txt";
+  write_list(path, "d1/leaf.txt\n");
+  FileListSet* set = file_list_load(path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+  /* d1 is only an implied parent of a listed FILE: not synchronized. */
+  EXPECT_FALSE(file_list_dir_in_scope(set, "d1"));
+  EXPECT_FALSE(file_list_dir_in_scope(set, "d1/sub"));
+  EXPECT_FALSE(file_list_dir_in_scope(set, "other"));
+  file_list_destroy(set);
+  remove(path);
+
+  /* A listed DIRECTORY synchronizes itself and its whole subtree. */
+  write_list(path, "d1/\nother\n");
+  set = file_list_load(path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+  EXPECT_TRUE(file_list_dir_in_scope(set, "d1"));
+  EXPECT_TRUE(file_list_dir_in_scope(set, "d1/sub/deep"));
+  EXPECT_TRUE(file_list_dir_in_scope(set, "other"));
+  EXPECT_TRUE(file_list_dir_in_scope(set, "other/x"));
+  EXPECT_FALSE(file_list_dir_in_scope(set, "d2"));
+  EXPECT_FALSE(file_list_dir_in_scope(set, "d1x")); /* component boundary */
+  EXPECT_FALSE(file_list_dir_in_scope(set, ""));
+  file_list_destroy(set);
+  remove(path);
+
+  /* "." lists the whole tree. */
+  write_list(path, ".\n");
+  set = file_list_load(path, false, err, sizeof(err));
+  EXPECT_NOT_NULL(set);
+  EXPECT_TRUE(file_list_dir_in_scope(set, ""));
+  EXPECT_TRUE(file_list_dir_in_scope(set, "anything/at/all"));
+  file_list_destroy(set);
+  remove(path);
+}
+
 /* Regression for the remote OOM: an adversarial --files-from entry made of a
    very deep chain of repeated components must be indexed with memory
    proportional to the entry count.  The old implementation stored one copied
@@ -219,6 +263,7 @@ static void test_oversized_entry_rejected() {
 void test_file_list() {
   test_membership_matches_reference();
   test_ancestor_and_descendant_queries();
+  test_dir_in_scope();
   test_deep_paths_are_bounded();
   test_oversized_entry_rejected();
 }

@@ -291,6 +291,35 @@ static void test_max_alloc_allows_configured_buffer() {
   protocol_session_unbind();
 }
 
+/* max_alloc == 0 is rsync's --max-alloc=0 "no limit": allocations of any size
+ * are permitted. */
+static void test_max_alloc_zero_means_unlimited() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_set_max_alloc(&session, 0);
+  protocol_session_bind(&session);
+  void* first = protocol_alloc(1024 * 1024);
+  void* second = protocol_alloc(8 * 1024 * 1024);
+  EXPECT_NOT_NULL(first);
+  EXPECT_NOT_NULL(second);
+  free(first);
+  free(second);
+  protocol_session_unbind();
+}
+
+/* A non-positive session io timeout disables the deadline: the getter reports 0
+ * (not the built-in 60 s fallback) so callers know to wait indefinitely. */
+static void test_protocol_get_io_timeout_zero_disables() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_bind(&session);
+  protocol_session_set_io_timeout(&session, 0);
+  EXPECT_EQ_INT(protocol_get_io_timeout_sec(), 0);
+  protocol_session_set_io_timeout(&session, 45);
+  EXPECT_EQ_INT(protocol_get_io_timeout_sec(), 45);
+  protocol_session_unbind();
+}
+
 static void test_max_alloc_is_bound_in_worker_threads() {
   enum { WORKER_COUNT = 4 };
   ProtocolSession sessions[WORKER_COUNT];
@@ -493,10 +522,19 @@ static void test_data_create_starts_uncharged_and_unowned() {
   data_destroy(reserved);
 }
 
+/* The server floors a client --timeout=0 at SERVER_IO_TIMEOUT_SEC so a silent
+ * peer can never hold a session slot forever (slow-loris). */
+static void test_protocol_server_io_timeout_floor() {
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(0), SERVER_IO_TIMEOUT_SEC);
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(-7), SERVER_IO_TIMEOUT_SEC);
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(30), 30);
+  EXPECT_TRUE(SERVER_IO_TIMEOUT_SEC > 0);
+}
+
 static void test_protocol_session_io_timeout() {
-  /* Default is the built-in 60 s window; the setter stores exactly what it is
-   * given (<= 0 means "fall back to the default") so callers can propagate
-   * --timeout without special-casing 0. */
+  /* The default is the built-in 60 s window; the setter stores exactly what it
+   * is given (<= 0 disables the deadline, matching rsync's --timeout=0) so
+   * callers can propagate --timeout without special-casing 0. */
   ProtocolSession session;
   protocol_session_init(&session, -1, -1);
   EXPECT_EQ_INT(session.io_timeout_sec, 60);
@@ -641,6 +679,7 @@ void test_protocol() {
   test_send_receive_int();
   test_send_receive_status();
   test_protocol_session_io_timeout();
+  test_protocol_server_io_timeout_floor();
   test_send_receive_status_timed();
   test_receive_status_keepalive_skips_reply();
   test_receive_status_keepalive_aborts();
@@ -650,6 +689,8 @@ void test_protocol() {
   test_max_alloc_rejects_single_buffer();
   test_explicit_session_max_alloc_cannot_be_bypassed();
   test_max_alloc_allows_configured_buffer();
+  test_max_alloc_zero_means_unlimited();
+  test_protocol_get_io_timeout_zero_disables();
   test_max_alloc_is_bound_in_worker_threads();
   test_protocol_accounting_is_released_in_worker_threads();
   test_protocol_accounting_reservation_is_atomic();

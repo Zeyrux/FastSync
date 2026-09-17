@@ -7,10 +7,12 @@
 #include "compression.h"
 #include "config.h"
 #include "data.h"
+#include "delete_plan.h"
 #include "delta.h"
 #include "file.h"
 #include "file_list.h"
 #include "filter.h"
+#include "format.h"
 #include "hardlink.h"
 #include "metadata.h"
 #include "motd.h"
@@ -64,37 +66,163 @@ static void log_server_rejection(const char* context) {
   }
 }
 
-/* Forward declaration for progress-reporting thread used in multithreaded send. */
-static int progress_thread_fn(void* arg);
-
 static const char* display_bytes(unsigned long long bytes, bool human_readable, char* buffer,
                                  size_t buffer_size) {
-  if (human_readable && format_human_bytes(bytes, buffer, buffer_size))
+  if (human_readable && format_human_size_decimal(bytes, buffer, buffer_size))
     return buffer;
   snprintf(buffer, buffer_size, "%.1f MB", (double)bytes / (double)BYTES_PER_MIB);
   return buffer;
 }
 
-/* Print the canonical `--stats` line.  Shared by the single-threaded and
-   multithreaded send paths so both honor --stats, --human-readable and --quiet
-   identically; `start` marks the beginning of the transfer for the rate. */
+/* rsync byte count: human-readable decimal when -h was given, otherwise a
+ * comma-grouped integer (rsync's big_num in the C locale). */
+static const char* stats_bytes(const Config* config, unsigned long long bytes, char* buffer,
+                               size_t buffer_size) {
+  if (!format_big_num(bytes, config->human_readable, buffer, buffer_size))
+    snprintf(buffer, buffer_size, "%llu", bytes);
+  return buffer;
+}
+
+/* Print the rsync `--stats` block on stdout.  Byte totals use the process-wide
+   wire counters and the receiver-only counters come from the STATUS_STATS frame;
+   the labels, layout and rate/speedup formulas match rsync 3.4.1.  Shared by the
+   single-threaded and multithreaded send paths. */
 static void report_transfer_stats(const Config* config, int total_files,
-                                  unsigned long long total_bytes, time_t start) {
+                                  unsigned long long total_bytes, time_t start,
+                                  const ReceiverStats* recv) {
   if (!config->stats || config->quiet)
     return;
+  ReceiverStats none = {0};
+  if (recv == NULL)
+    recv = &none;
+  unsigned long long sent = protocol_bytes_written();
+  unsigned long long received = protocol_bytes_read();
+  /* rsync: bytes_per_sec = (written + read) / (0.5 + (end - start)). */
   double elapsed = difftime(time(NULL), start);
-  double rate = elapsed > 0.0 ? (double)total_bytes / ((double)BYTES_PER_MIB * elapsed) : 0.0;
+  double rate = (double)(sent + received) / (0.5 + elapsed);
+  char total_buffer[32];
+  char sent_buffer[32];
+  char recv_buffer[32];
+  char rate_buffer[32] = {0};
+  char human_rate[32] = {0};
+  const char* total = stats_bytes(config, total_bytes, total_buffer, sizeof(total_buffer));
+  const char* sent_s = stats_bytes(config, sent, sent_buffer, sizeof(sent_buffer));
+  const char* recv_s = stats_bytes(config, received, recv_buffer, sizeof(recv_buffer));
+  const char* rate_str = rate_buffer;
   if (config->human_readable) {
-    char total_buffer[32];
-    char rate_buffer[32];
-    fprintf(stderr, "Stats: %d files, %s, %s/s\n", total_files,
-            display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
-            display_bytes((unsigned long long)(rate * (double)BYTES_PER_MIB), true, rate_buffer,
-                          sizeof(rate_buffer)));
+    if (!format_human_size_decimal((unsigned long long)rate, human_rate, sizeof(human_rate)))
+      snprintf(human_rate, sizeof(human_rate), "0");
+    rate_str = human_rate;
   } else {
-    fprintf(stderr, "Stats: %d files, %.1f MB, %.1f MB/s\n", total_files,
-            (double)total_bytes / (double)BYTES_PER_MIB, rate);
+    snprintf(rate_buffer, sizeof(rate_buffer), "%.2f", rate);
   }
+  double speedup = (sent + received) > 0 ? (double)total_bytes / (double)(sent + received) : 0.0;
+  printf("\n");
+  printf("Number of files: %d\n", total_files);
+  printf("Number of created files: %d\n", total_files);
+  printf("Number of deleted files: %llu\n", recv->deleted_files);
+  printf("Number of regular files transferred: %d\n", total_files);
+  printf("Total file size: %s bytes\n", total);
+  printf("Total transferred file size: %s bytes\n", total);
+  printf("Literal data: %s bytes\n", total);
+  printf("Matched data: %llu bytes\n", recv->matched_data);
+  printf("File list size: 0\n");
+  printf("File list generation time: 0.000 seconds\n");
+  printf("File list transfer time: 0.000 seconds\n");
+  printf("Total bytes sent: %s\n", sent_s);
+  printf("Total bytes received: %s\n", recv_s);
+  printf("\n");
+  printf("sent %s bytes  received %s bytes  %s bytes/sec\n", sent_s, recv_s, rate_str);
+  printf("total size is %s  speedup is %.2f%s\n", total, speedup,
+         config->dry_run ? " (DRY RUN)" : "");
+  fflush(stdout);
+}
+
+/* ---- rsync-style per-file --progress ------------------------------------
+ * rsync prints, for each transferred regular file, the file name followed by a
+ * two-frame progress line: the first at the initial 32 KiB read window (always
+ * 0.00 kB/s / 0:00:00 on a sub-second transfer) and a final 100% frame carrying
+ * `(xfr#N, to-chk=X/Y)`.  Rates are wall-clock dependent, so only the final
+ * rate is measured here; the layout matches rsync 3.4.1's progress.c. */
+#define RSYNC_PROGRESS_IO_WINDOW (32ULL * 1024ULL)
+
+static const char* delete_display_path(const Config* config, const char* path);
+
+static bool g_progress_active;
+static unsigned long long g_progress_xferred;
+static unsigned long long g_progress_seen;
+static struct timespec g_progress_file_start;
+
+static void progress_first_frame(unsigned long long size, char* out, size_t out_size) {
+  char ofs_buf[32];
+  unsigned long long ofs = size < RSYNC_PROGRESS_IO_WINDOW ? size : RSYNC_PROGRESS_IO_WINDOW;
+  if (!format_big_num(ofs, false, ofs_buf, sizeof(ofs_buf)))
+    snprintf(ofs_buf, sizeof(ofs_buf), "%llu", ofs);
+  int pct = size == 0 ? 100 : (ofs == size ? 100 : (int)(100.0 * (double)ofs / (double)size));
+  snprintf(out, out_size, "\r%15s %3d%% %7.2f%s %s%s", ofs_buf, pct, 0.0, "kB/s", "   0:00:00",
+           "  ");
+}
+
+static void progress_final_frame(unsigned long long size, char* out, size_t out_size) {
+  char ofs_buf[32];
+  char rembuf[32];
+  unsigned long long last_ofs = size < RSYNC_PROGRESS_IO_WINDOW ? size : RSYNC_PROGRESS_IO_WINDOW;
+  if (!format_big_num(size, false, ofs_buf, sizeof(ofs_buf)))
+    snprintf(ofs_buf, sizeof(ofs_buf), "%llu", size);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long diff_ms = (long long)(now.tv_sec - g_progress_file_start.tv_sec) * 1000 +
+                      (now.tv_nsec - g_progress_file_start.tv_nsec) / 1000000;
+  if (diff_ms <= 0)
+    diff_ms = 1;
+  double rate =
+      size > last_ofs ? (double)(size - last_ofs) * 1000.0 / (double)diff_ms / 1024.0 : 0.0;
+  const char* units = "kB/s";
+  if (rate > 1024.0 * 1024.0) {
+    rate /= 1024.0 * 1024.0;
+    units = "GB/s";
+  } else if (rate > 1024.0) {
+    rate /= 1024.0;
+    units = "MB/s";
+  }
+  unsigned long long remain = (unsigned long long)(diff_ms / 1000);
+  snprintf(rembuf, sizeof(rembuf), "%4u:%02u:%02u", (unsigned)(remain / 3600),
+           (unsigned)((remain / 60) % 60), (unsigned)(remain % 60));
+  unsigned long long to_chk =
+      g_progress_seen > g_progress_xferred ? g_progress_seen - g_progress_xferred : 0;
+  snprintf(out, out_size, "\r%15s %3d%% %7.2f%s %s (xfr#%llu, to-chk=%llu/%llu)\n", ofs_buf, 100,
+           rate, units, rembuf, g_progress_xferred, to_chk, g_progress_seen);
+}
+
+static void client_progress_begin(const Config* config) {
+  g_progress_active = config->show_progress && !config->quiet;
+  g_progress_xferred = 0;
+  g_progress_seen = 0;
+  if (!g_progress_active)
+    return;
+  printf("sending incremental file list\n");
+  fflush(stdout);
+}
+
+/* Emit the name (unless itemize/out-format already did) and the two progress
+ * frames for one transferred regular file. */
+static void client_progress_file(const Config* config, const File* file) {
+  if (!g_progress_active || file == NULL || !file->data)
+    return;
+  g_progress_seen++;
+  g_progress_xferred++;
+  unsigned long long size = file->data->size;
+  if (!config->itemize_changes && config->out_format == NULL) {
+    const char* name = delete_display_path(config, file_wire_path(file));
+    printf("%s\n", name ? name : "");
+  }
+  clock_gettime(CLOCK_MONOTONIC, &g_progress_file_start);
+  char frame[160];
+  progress_first_frame(size, frame, sizeof(frame));
+  fputs(frame, stdout);
+  progress_final_frame(size, frame, sizeof(frame));
+  fputs(frame, stdout);
+  fflush(stdout);
 }
 
 /* Compiled scanner inputs that are shared read-only across scanner instances
@@ -106,6 +234,7 @@ typedef struct {
   ScannerOptions options;
   FilterRuleList* base_filters; /* owned; may be NULL */
   HardLinkTable* hardlinks;     /* owned; may be NULL */
+  char* relative_prefix;        /* owned -R prefix; may be NULL */
 } PreparedScanner;
 
 /* Build the scanner options for one scan. Returns false and logs on failure. */
@@ -114,6 +243,7 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
     return false;
   out->base_filters = NULL;
   out->hardlinks = NULL;
+  out->relative_prefix = NULL;
   memset(&out->options, 0, sizeof(out->options));
 
   int rule_count = config->filters ? config->filters->size : 0;
@@ -129,7 +259,8 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   }
   if (rule_count > 0 || config->cvs_exclude) {
     char err[160];
-    out->base_filters = filter_base_build(texts, rule_count, config->cvs_exclude, err, sizeof(err));
+    out->base_filters = filter_base_build(texts, rule_count, config->cvs_exclude,
+                                          config->delete_excluded, err, sizeof(err));
     free(texts);
     if (!out->base_filters) {
       log_message(LOG_LEVEL_ERROR, "invalid filter rule: %s", err);
@@ -146,10 +277,16 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->preserve_xattrs = config->preserve_xattrs;
   options->preserve_acls = config->preserve_acls;
   options->chunk_size = config->chunk_size;
-  options->exclude_patterns = config->exclude_patterns;
-  options->exclude_count = config->exclude_count;
-  options->include_patterns = config->include_patterns;
-  options->include_count = config->include_count;
+  /* --exclude/--include are compiled, in command-line order, into the SAME
+   * ordered filter rule list as --filter/-f (see config_add_selection_rule), so
+   * the legacy per-kind arrays are deliberately NOT passed to the scanner:
+   * doing so would re-apply them with the old "excludes first, then includes as
+   * a mandatory whitelist" precedence and defeat rsync's first-match-wins
+   * ordering.  The arrays remain populated purely for the Config API surface. */
+  options->exclude_patterns = NULL;
+  options->exclude_count = 0;
+  options->include_patterns = NULL;
+  options->include_count = 0;
   options->max_size = config->max_size;
   options->min_size = config->min_size;
   options->max_depth = config->max_depth;
@@ -168,13 +305,30 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->file_list = (const FileListSet*)config->files_from_set;
   options->base_filters = out->base_filters;
   options->per_dir_filters = config->per_dir_filter;
+  options->delete_excluded = config->delete_excluded;
+  options->exclude_per_dir_filter_files = config->per_dir_filter_count >= 2;
   options->dirs = config->dirs;
   options->relative = config->relative;
+  /* -R/--relative outside --files-from reconstructs every destination path from
+   * the source spec (rsync's '/./' cut point).  With --files-from the listed
+   * entry already supplies the bare relative path, so no prefix is built. */
+  if (config->relative && config->files_from_set == NULL && config->send_directory) {
+    out->relative_prefix = scanner_relative_prefix(config->send_directory);
+    if (!out->relative_prefix) {
+      log_message(LOG_LEVEL_ERROR, "memory allocation failed building --relative path prefix");
+      filter_rule_list_free(out->base_filters);
+      out->base_filters = NULL;
+      return false;
+    }
+    options->relative_prefix = out->relative_prefix;
+  }
   options->prune_empty_dirs = config->prune_empty_dirs;
   options->ignore_io_errors = config->ignore_errors;
   options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
+  options->size_skipped_paths = NULL;
+  options->synced_dirs = NULL;
   options->hardlinks = NULL;
   /* P7 Wave D: capture source directory metadata when a directory attribute is
      requested (-p for modes, -t for times unless -O omits them).  Whether they
@@ -201,6 +355,118 @@ static void prepared_scanner_destroy(PreparedScanner* prepared) {
   prepared->base_filters = NULL;
   hardlink_table_destroy(prepared->hardlinks);
   prepared->hardlinks = NULL;
+  free(prepared->relative_prefix);
+  prepared->relative_prefix = NULL;
+}
+
+/* -R/--relative implied directories: rsync transmits the metadata of the
+ * parent directories implied by the source path (every prefix component above
+ * the source root) so the receiver applies their attributes to the created
+ * parents.  FastSync's scan only covers the source root and below, so append
+ * one metadata-only directory entry per implied ancestor.  --no-implied-dirs
+ * suppresses this exactly like rsync.  A missing ancestor is never fatal. */
+static bool append_implied_dir_times(const Config* config, ArrayList* dir_entries) {
+  if (!dir_entries || !config->relative || config->files_from_set != NULL ||
+      config->no_implied_dirs || !config->send_directory)
+    return true;
+  char* prefix = scanner_relative_prefix(config->send_directory);
+  if (!prefix)
+    return true;
+  int ncomp = 0;
+  for (const char* s = prefix; *s;) {
+    while (*s == '/')
+      s++;
+    if (!*s)
+      break;
+    while (*s && *s != '/')
+      s++;
+    ncomp++;
+  }
+  if (ncomp <= 1) {
+    free(prefix);
+    return true;
+  }
+  char* fs = str_dup(config->send_directory);
+  if (!fs) {
+    free(prefix);
+    return true;
+  }
+  size_t flen = strlen(fs);
+  while (flen > 1 && fs[flen - 1] == '/')
+    fs[--flen] = '\0';
+  bool ok = true;
+  /* Walk the source path upwards one component at a time (fs is truncated in
+     place, so each step targets the next implied ancestor). */
+  for (int depth = ncomp - 2; depth >= 0 && ok; depth--) {
+    char* slash = strrchr(fs, '/');
+    if (!slash || slash == fs)
+      break;
+    *slash = '\0';
+    char* p = prefix;
+    int c = 0;
+    while (c <= depth) {
+      while (*p == '/')
+        p++;
+      while (*p && *p != '/')
+        p++;
+      c++;
+    }
+    char saved = *p;
+    *p = '\0';
+    struct stat st;
+    if (stat(fs, &st) == 0 && S_ISDIR(st.st_mode)) {
+      File* file = file_create(fs);
+      if (!file) {
+        ok = false;
+      } else {
+        file->is_dir = true;
+        file->metadata =
+            file_metadata_create(fs, &st, config->preserve_atimes, config->preserve_crtimes);
+        file->send_path = str_dup(prefix);
+        if (!file->metadata || !file->send_path || !array_list_add(dir_entries, file)) {
+          file_destroy(file);
+          ok = false;
+        }
+      }
+    }
+    *p = saved;
+  }
+  free(fs);
+  free(prefix);
+  return ok;
+}
+
+/* The delete-walk root scope for a full (non---files-from) transfer: rsync
+ * confines --delete to the directories it actually transferred.  A plain
+ * recursive run mirrors the source under the receive root, so "." (the whole
+ * tree) is correct; an -R run transfers only the reconstructed prefix subtree,
+ * so the walk is scoped to that prefix instead.  Returns a malloc'd wire path
+ * (or "."), or NULL on allocation failure. */
+static char* delete_scope_root_marker(const Config* config) {
+  if (config->relative && config->files_from_set == NULL && config->send_directory) {
+    char* prefix = scanner_relative_prefix(config->send_directory);
+    if (!prefix)
+      return NULL;
+    if (prefix[0] != '\0')
+      return prefix;
+    free(prefix);
+  }
+  return str_dup(".");
+}
+
+/* The -R destination prefix that confines a per-directory delete walk, or NULL
+ * when the whole receive root is in scope.  The marker was installed into
+ * `synced_dirs` by delete_scope_root_marker(); for a plain recursive transfer
+ * it is "." (whole root) and for --files-from the list is not a single prefix. */
+static const char* delete_plan_walk_root(const Config* config, const ArrayList* synced_dirs) {
+  if (!config || config->files_from_set != NULL || !config->relative || !config->send_directory)
+    return NULL;
+  if (!synced_dirs || synced_dirs->size != 1)
+    return NULL;
+  const char* marker = (const char*)synced_dirs->items[0];
+  if (marker[0] == '\0' || strcmp(marker, ".") == 0)
+    return NULL;
+  return marker;
 }
 
 /* True when some --files-from entry is an ancestor-or-equal directory of
@@ -290,15 +556,15 @@ static char* files_from_missing_dest_path(const Config* config, const char* entr
 
 /* --files-from semantics: every listed entry must resolve under the source
  * root, otherwise rsync reports a hard error instead of silently transferring
- * nothing. An empty list is also an error. An entry of "." (the whole tree)
- * and listed-but-empty directories are valid.  With --ignore-missing-args
+ * nothing. An entry of "." (the whole tree) and listed-but-empty directories
+ * are valid.  An empty list is valid too: rsync transfers nothing and exits 0.
+ * With --ignore-missing-args
  * (implied by --delete-missing-args) a listed-but-missing entry is instead
  * skipped: nothing is transferred for it, it never enters the keep-set and the
  * run succeeds for the rest (an all-missing non-empty list succeeds
  * transferring nothing, matching rsync).  With --delete-missing-args
  * `missing_dest` (when non-NULL) collects the entry's destination-relative
- * mirror for the receiver's exact-deletion request.  An empty list stays a
- * hard error in every mode (nothing was requested at all).  Runs before any
+ * mirror for the receiver's exact-deletion request.  Runs before any
  * transfer so the failure/skip is surfaced uniformly in the single-threaded,
  * -m, dry-run and --list-only paths. */
 static bool files_from_list_check(const Config* config, ArrayList* missing_dest, int* skipped_out) {
@@ -311,12 +577,11 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
     return false;
   }
   if (set->count == 0) {
-    char* escaped_list =
-        output_escape(config->files_from ? config->files_from : "", log_get_8_bit_output());
-    log_message(LOG_LEVEL_ERROR, "--files-from file '%s' contains no entries; nothing to transfer",
-                escaped_list ? escaped_list : "<allocation failed>");
-    free(escaped_list);
-    return false;
+    /* rsync treats an empty --files-from list as "nothing to transfer" and
+       exits 0 (the source directory is still a valid source arg), so this is
+       not an error.  Nothing passes the (empty) allow-set, so no file is sent
+       and no keep-set entry is produced. */
+    return true;
   }
   bool ignore = config->ignore_missing_args || config->delete_missing_args;
   for (int i = 0; i < set->count; i++) {
@@ -467,7 +732,7 @@ static void receive_daemon_motd(Client* client, const Config* config) {
 static Client* connect_transfer_client(const Config* config) {
   if (config->transport == TRANSPORT_SSH) {
     if (config->use_sendfile) {
-      log_message(LOG_LEVEL_ERROR, "-f/--sendfile is not supported with SSH transport");
+      log_message(LOG_LEVEL_ERROR, "--sendfile is not supported with SSH transport");
       return NULL;
     }
     return client_connect_ssh(config->ssh_destination, config->ssh_port,
@@ -649,34 +914,117 @@ static void mark_sender_done(PipelineContextSender* context) {
   mtx_unlock(&context->mutex_progress);
 }
 
+/* Read the optional STATUS_STATS record (protocol 2.25.0) that the receiver
+ * sends just before its terminal status when report_stats was negotiated.
+ * Consumes the would-delete path list into `would_delete` (optional). */
+static bool receive_stats_record(int fd, ReceiverStats* stats, ArrayList* would_delete) {
+  if (!format_stats_receive(fd, stats))
+    return false;
+  int count = 0;
+  if (!receive_int(fd, &count) || count < 0 || count > MAX_MANIFEST_ENTRIES)
+    return false;
+  /* Mirror the delete-plan parser: every retained path must be a valid
+     destination-relative path, and the whole list shares one MAX_MANIFEST_BYTES
+     budget so a hostile peer cannot make the client retain unbounded memory. */
+  size_t bytes = 0;
+  for (int i = 0; i < count; i++) {
+    char* path = receive_wire_str(fd);
+    if (!path)
+      return false;
+    if (path[0] == '\0' || path[0] == '/' || has_path_traversal(path)) {
+      free(path);
+      return false;
+    }
+    if (would_delete) {
+      size_t entry_size = strlen(path) + sizeof(char*) + 16;
+      if (entry_size > MAX_MANIFEST_BYTES - bytes) {
+        free(path);
+        return false;
+      }
+      bytes += entry_size;
+      if (!array_list_add(would_delete, path)) {
+        free(path);
+        return false;
+      }
+    } else {
+      free(path);
+    }
+  }
+  return true;
+}
+
+/* Strip the transfer-root prefix from a receiver-reported destination-relative
+ * delete path so a `*deleting` line matches rsync's transfer-relative name
+ * (FastSync's destination mirror includes the source's absolute path). */
+static const char* delete_display_path(const Config* config, const char* path) {
+  if (!config || !path || !config->send_directory)
+    return path;
+  const char* root = config->send_directory;
+  while (*root == '/')
+    root++;
+  const char* rel = path;
+  while (*rel == '/')
+    rel++;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  if (root_len == 0)
+    return rel;
+  if (strncmp(rel, root, root_len) == 0 && (rel[root_len] == '/' || rel[root_len] == '\0'))
+    return rel + root_len + (rel[root_len] == '/' ? 1 : 0);
+  return rel;
+}
+
 /* Send the final STATUS_FINISHED frame and await the receiver's verdict.
    When --remove-source-files is active the receiver acknowledges each data
    file it processed, in send order: STATUS_NEXT means the file was written,
    STATUS_OK means the file was skipped/unchanged.  Skipped sources are marked
    so the later removal pass keeps them. */
-static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources) {
+static bool finalize_transfer(Client* client, const Config* config, ArrayList* remove_sources,
+                              bool* delete_limit_out, ReceiverStats* stats_out) {
+  if (delete_limit_out)
+    *delete_limit_out = false;
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     return false;
-  if (config->remove_source_files && remove_sources) {
+  /* The receiver emits its optional wire-stats frame (protocol 2.25.0) FIRST,
+     then any per-file --remove-source-files acks, then the terminal status. */
+  Status status;
+  if (!receive_status(client->file_descriptor, &status))
+    return false;
+  if (status == STATUS_STATS) {
+    ReceiverStats scratch;
+    if (!receive_stats_record(client->file_descriptor, stats_out ? stats_out : &scratch, NULL))
+      return false;
+    if (!receive_status(client->file_descriptor, &status))
+      return false;
+  }
+  if (config->remove_source_files && remove_sources && remove_sources->size > 0) {
     for (int i = 0; i < remove_sources->size; i++) {
-      Status per_file;
-      if (!receive_status(client->file_descriptor, &per_file))
+      if (i > 0 && !receive_status(client->file_descriptor, &status))
         return false;
-      if (per_file == STATUS_ERROR) {
+      if (status == STATUS_ERROR) {
         log_server_rejection("Receiver reported a per-file error");
         return false;
       }
-      if (per_file == STATUS_OK) {
+      if (status == STATUS_OK) {
         ((SourceFile*)remove_sources->items[i])->skipped = true;
-      } else if (per_file != STATUS_NEXT) {
+      } else if (status != STATUS_NEXT) {
         log_message(LOG_LEVEL_ERROR, "Unexpected per-file status from receiver");
         return false;
       }
     }
+    if (!receive_status(client->file_descriptor, &status))
+      return false;
   }
-  Status status;
-  if (!receive_status(client->file_descriptor, &status))
-    return false;
+  /* A capped --max-delete commit is a successful transfer that the client must
+     report with rsync's exit code 25 (not an error). */
+  if (status == STATUS_DELETE_LIMIT) {
+    log_message(LOG_LEVEL_ERROR,
+                "Deletions stopped due to --max-delete limit; some deletions were skipped");
+    if (delete_limit_out)
+      *delete_limit_out = true;
+    return true;
+  }
   if (status != STATUS_OK) {
     log_server_rejection("Receiver reported transfer failure");
     return false;
@@ -782,30 +1130,53 @@ static int send_dry_run_manifest(const Config* config) {
 }
 
 typedef struct {
-  char* path;
+  char* name; /* transfer-relative name ("" == the source root) */
   mode_t mode;
   unsigned long long size;
   time_t mtime;
+  long mtime_nsec;
+  bool is_dir;
+  bool is_symlink;
+  char* link_target;
 } ListEntry;
 
 static void list_entries_destroy(ListEntry* entries, size_t count) {
   if (entries == NULL)
     return;
-  for (size_t i = 0; i < count; i++)
-    free(entries[i].path);
+  for (size_t i = 0; i < count; i++) {
+    free(entries[i].name);
+    free(entries[i].link_target);
+  }
   free(entries);
 }
 
 static int compare_list_entries(const void* left, const void* right) {
   const ListEntry* a = (const ListEntry*)left;
   const ListEntry* b = (const ListEntry*)right;
-  return strcmp(a->path, b->path);
+  return strcmp(a->name, b->name);
 }
 
-/* --list-only: print an ls-style listing of the files that WOULD be
+/* Relative path of an entry below `root` ("" for the root itself).  Mirrors
+ * change_list's relative_name for list-only rendering. */
+static char* list_relative_name(const char* root, const char* full) {
+  if (root == NULL || full == NULL)
+    return str_dup(full != NULL ? full : "");
+  size_t root_len = strlen(root);
+  while (root_len > 1 && root[root_len - 1] == '/')
+    root_len--;
+  if (strncmp(root, full, root_len) == 0) {
+    if (full[root_len] == '\0')
+      return str_dup("");
+    if (full[root_len] == '/')
+      return str_dup(full + root_len + 1);
+  }
+  return str_dup(full);
+}
+
+/* --list-only: print an ls-style listing of the entries that WOULD be
  * transferred and exit without contacting the server or writing anything.
- * Directory lines are not printed because the scanner only yields regular
- * transfer candidates. Returns 0 on success, 1 on error. */
+ * Names are transfer-relative (rsync prints `a.txt`, `sub/b.txt`, `.`) and
+ * directory entries are included.  Returns 0 on success, 1 on error. */
 static int send_list_only(const Config* config) {
   int skipped = 0;
   if (!files_from_list_check(config, NULL, &skipped))
@@ -814,6 +1185,7 @@ static int send_list_only(const Config* config) {
   if (!prepare_scanner(config, 0, &prepared))
     return 1;
   prepared.options.use_metadata = true; /* capture mode + mtime for the listing */
+  prepared.options.list_dirs = true;
   DirectoryScanner* scanner =
       directory_scanner_create_with_options(config->send_directory, &prepared.options);
   if (!scanner) {
@@ -823,9 +1195,33 @@ static int send_list_only(const Config* config) {
   ListEntry* entries = NULL;
   size_t count = 0;
   size_t capacity = 0;
-  Chunk* chunk;
   bool oom = false;
-  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+
+  /* rsync lists the source root itself (as ".").  Only when the source is a
+   * directory and no --files-from subset is in effect. */
+  if (config->files_from_set == NULL && config->send_directory != NULL) {
+    struct stat st;
+    if (stat(config->send_directory, &st) == 0 && S_ISDIR(st.st_mode)) {
+      capacity = 64;
+      entries = calloc(capacity, sizeof(ListEntry));
+      if (entries == NULL) {
+        oom = true;
+      } else if ((entries[0].name = str_dup("")) == NULL) {
+        /* A NULL name would be dereferenced by qsort/render: fail the listing. */
+        oom = true;
+      } else {
+        entries[0].mode = st.st_mode;
+        entries[0].mtime = st.st_mtime;
+        entries[0].mtime_nsec = st.st_mtim.tv_nsec;
+        entries[0].size = (unsigned long long)st.st_size;
+        entries[0].is_dir = true;
+        count = 1;
+      }
+    }
+  }
+
+  Chunk* chunk;
+  while (!oom && (chunk = directory_scanner_next(scanner)) != NULL) {
     for (int i = 0; i < chunk->element_count; i++) {
       File* f = chunk->items[i];
       if (f == NULL)
@@ -842,34 +1238,47 @@ static int send_list_only(const Config* config) {
           break;
         }
         entries = grown;
+        memset(entries + capacity, 0, (new_capacity - capacity) * sizeof(ListEntry));
         capacity = new_capacity;
       }
-      char* path = str_dup(file_wire_path(f));
-      if (!path) {
+      char* name = list_relative_name(config->send_directory, file_wire_path(f));
+      if (!name) {
         oom = true;
         break;
       }
       mode_t mode = 0;
       time_t mtime = 0;
+      long mtime_nsec = 0;
       if (f->metadata != NULL) {
         mode = f->metadata->mode;
         mtime = f->metadata->mtime_sec;
+        mtime_nsec = f->metadata->mtime_nsec;
       } else {
         struct stat st;
-        if (stat(f->path, &st) == 0) {
+        if (lstat(f->path, &st) == 0) {
           mode = st.st_mode;
           mtime = st.st_mtime;
+          mtime_nsec = st.st_mtim.tv_nsec;
         }
       }
-      entries[count].path = path;
+      entries[count].name = name;
       entries[count].mode = mode;
       entries[count].mtime = mtime;
-      entries[count].size = f->data != NULL ? f->data->size : 0;
+      entries[count].mtime_nsec = mtime_nsec;
+      if (f->is_symlink)
+        entries[count].size = f->symlink_target != NULL ? strlen(f->symlink_target) : 0;
+      else if (f->is_dir) {
+        struct stat dir_st;
+        entries[count].size = stat(f->path, &dir_st) == 0 ? (unsigned long long)dir_st.st_size : 0;
+      } else
+        entries[count].size = f->data != NULL ? f->data->size : 0;
+      entries[count].is_dir = f->is_dir;
+      entries[count].is_symlink = f->is_symlink;
+      entries[count].link_target =
+          f->is_symlink && f->symlink_target ? str_dup(f->symlink_target) : NULL;
       count++;
     }
     chunk_destroy(chunk);
-    if (oom)
-      break;
   }
   bool failed = oom || directory_scanner_failed(scanner) || directory_scanner_had_io_error(scanner);
   directory_scanner_destroy(scanner);
@@ -883,8 +1292,18 @@ static int send_list_only(const Config* config) {
   if (count > 1)
     qsort(entries, count, sizeof(ListEntry), compare_list_entries);
   for (size_t i = 0; i < count; i++) {
-    char* line = change_render_list_line(entries[i].mode, entries[i].size, entries[i].mtime,
-                                         entries[i].path);
+    ChangeEvent event;
+    memset(&event, 0, sizeof(event));
+    event.name = entries[i].name;
+    event.path = entries[i].name;
+    event.mode = entries[i].mode;
+    event.size = entries[i].size;
+    event.mtime_sec = entries[i].mtime;
+    event.mtime_nsec = entries[i].mtime_nsec;
+    event.is_directory = entries[i].is_dir;
+    event.is_symlink = entries[i].is_symlink;
+    event.symlink_target = entries[i].link_target;
+    char* line = change_render_list_line(config, &event);
     if (line != NULL) {
       char* escaped = output_escape(line, config->eight_bit_output);
       printf("%s\n", escaped != NULL ? escaped : line);
@@ -896,21 +1315,25 @@ static int send_list_only(const Config* config) {
   return 0;
 }
 
-/* Send the delete manifest (keep-set paths plus the protected excluded
-   prefixes and the --delete-missing-args exact-delete paths) to the server.
-   Returns 0 on success, -1 on failure.  When --delete-excluded is given
-   `protected` is empty: excluded destination mirrors are then ordinary extras
-   and are removed.  When --delete-missing-args is active `missing_args` holds
-   the destination mirrors of missing --files-from entries: each is an explicit
-   receiver-side deletion request, independent of the extras walk.  A NULL
-   keep-set / protected / missing list transmits an empty section.  All three
-   sections are unbounded on the sender; the receiver enforces
+/* Send the delete manifest to the server.  Returns 0 on success, -1 on
+   failure.  It carries FOUR sections: the keep-set paths, the protected
+   excluded prefixes, the --delete-missing-args exact-delete paths, and the
+   destination-relative directories the sender synchronized this run.
+   When --delete-excluded is given `protected` is empty: excluded destination
+   mirrors are then ordinary extras and are removed.  When
+   --delete-missing-args is active `missing_args` holds the destination mirrors
+   of missing --files-from entries: each is an explicit receiver-side deletion
+   request, independent of the extras walk.  `synced_dirs` confines the extras
+   walk to entries directly inside a synchronized directory.  A NULL
+   keep-set / protected / missing / dirs list transmits an empty section.  All
+   four sections are unbounded on the sender; the receiver enforces
    MAX_MANIFEST_ENTRIES per section and a single MAX_MANIFEST_BYTES budget
    shared across the sections, rejecting (with STATUS_ERROR) an over-budget
    frame.  A heavily filtered source whose exclusion list is large therefore
    fails the run cleanly on the receiver rather than being truncated. */
 static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protected_prefixes,
-                                ArrayList* missing_args) {
+                                ArrayList* size_skipped, ArrayList* missing_args,
+                                ArrayList* synced_dirs) {
   if (!send_status(fd, STATUS_MANIFEST))
     return -1;
   int keep_count = manifest ? manifest->size : 0;
@@ -920,18 +1343,37 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
     if (!send_wire_str(fd, (char*)manifest->items[i]))
       return -1;
   }
-  int protected_count = protected_prefixes ? protected_prefixes->size : 0;
+  /* The receiver has ONE protected-prefix section; filter-excluded prefixes
+     (dropped under --delete-excluded) and size-pruned prefixes (always
+     protected) are concatenated into it. */
+  int protected_count =
+      (protected_prefixes ? protected_prefixes->size : 0) + (size_skipped ? size_skipped->size : 0);
   if (!send_int(fd, protected_count))
     return -1;
-  for (int i = 0; i < protected_count; i++) {
-    if (!send_wire_str(fd, (char*)protected_prefixes->items[i]))
-      return -1;
+  if (protected_prefixes) {
+    for (int i = 0; i < protected_prefixes->size; i++) {
+      if (!send_wire_str(fd, (char*)protected_prefixes->items[i]))
+        return -1;
+    }
+  }
+  if (size_skipped) {
+    for (int i = 0; i < size_skipped->size; i++) {
+      if (!send_wire_str(fd, (char*)size_skipped->items[i]))
+        return -1;
+    }
   }
   int missing_count = missing_args ? missing_args->size : 0;
   if (!send_int(fd, missing_count))
     return -1;
   for (int i = 0; i < missing_count; i++) {
     if (!send_wire_str(fd, (char*)missing_args->items[i]))
+      return -1;
+  }
+  int dirs_count = synced_dirs ? synced_dirs->size : 0;
+  if (!send_int(fd, dirs_count))
+    return -1;
+  for (int i = 0; i < dirs_count; i++) {
+    if (!send_wire_str(fd, (char*)synced_dirs->items[i]))
       return -1;
   }
   return 0;
@@ -953,11 +1395,12 @@ static int send_delete_manifest(int fd, ArrayList* manifest, ArrayList* protecte
 #define DELETE_ACK_KEEPALIVE_SEC 10
 
 static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
-                                       ArrayList* protected_prefixes, ArrayList* missing_args) {
+                                       ArrayList* protected_prefixes, ArrayList* size_skipped,
+                                       ArrayList* missing_args, ArrayList* synced_dirs) {
   if (!client || !manifest)
     return false;
-  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes, missing_args) !=
-      0)
+  if (send_delete_manifest(client->file_descriptor, manifest, protected_prefixes, size_skipped,
+                           missing_args, synced_dirs) != 0)
     return false;
   Status ack;
   /* The wait is long (up to an hour) and runs inline on this thread: a helper
@@ -991,7 +1434,7 @@ static bool send_delete_manifest_early(Client* client, ArrayList* manifest,
    directory and *io_error_out reports it (the caller still performs the
    deletion but reports the run as errored). */
 static bool scan_paths_only(const Config* config, const ScannerOptions* options,
-                            ArrayList* manifest, bool* io_error_out) {
+                            ArrayList* manifest, DeletePlanSender* plans, bool* io_error_out) {
   if (io_error_out)
     *io_error_out = false;
   DirectoryScanner* scanner =
@@ -1001,12 +1444,41 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
   bool ok = true;
   Chunk* chunk;
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
-    if (!add_chunk_to_manifest(manifest, chunk)) {
+    if (manifest && !add_chunk_to_manifest(manifest, chunk)) {
       ok = false;
       chunk_destroy(chunk);
       break;
     }
+    if (plans) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        File* f = chunk->items[i];
+        if (!f)
+          continue;
+        const char* path = file_wire_path(f);
+        if (!delete_plan_sender_add(plans, path, f->is_dir)) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) {
+        chunk_destroy(chunk);
+        break;
+      }
+    }
     chunk_destroy(chunk);
+  }
+  if (ok) {
+    /* Keep every traversed source directory, including empty ones, so a plan
+       no longer removes the destination directory itself.  Their own plans are
+       emitted after the data stream (no file frame triggers them). */
+    if (plans && options->plan_dirs) {
+      for (int i = 0; i < options->plan_dirs->size; i++) {
+        if (!delete_plan_sender_add(plans, (const char*)options->plan_dirs->items[i], true)) {
+          ok = false;
+          break;
+        }
+      }
+    }
   }
   if (ok && directory_scanner_failed(scanner))
     ok = false;
@@ -1014,6 +1486,25 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
     *io_error_out = directory_scanner_had_io_error(scanner);
   directory_scanner_destroy(scanner);
   return ok;
+}
+
+/* Transmit any not-yet-sent per-directory delete plan needed by the entries in
+ * `chunk` (ancestors root-first, then the entry's own directory for --dirs
+ * entries) before its data frames go out, so --delete-during/--delete-delay
+ * clear a directory's extras (and any type conflict) before the directory's
+ * first write. */
+static int send_chunk_delete_plans(Client* client, DeletePlanSender* plans, const Chunk* chunk) {
+  if (!plans)
+    return 0;
+  for (int i = 0; i < chunk->element_count; i++) {
+    File* f = chunk->items[i];
+    if (!f)
+      continue;
+    if (delete_plan_send_for_path(client->file_descriptor, plans, file_wire_path(f), f->is_dir) !=
+        0)
+      return -1;
+  }
+  return 0;
 }
 
 static int incremental_check(Client* client, File* file, const Config* config,
@@ -1052,6 +1543,19 @@ static int incremental_check(Client* client, File* file, const Config* config,
   Status s;
   if (!receive_status(client->file_descriptor, &s))
     return -1;
+  /* Output parity: when dest-info reporting is negotiated the receiver sends
+   * the pre-transfer destination snapshot BEFORE its ordinary verdict.  Consume
+   * it here so the following status read stays in sync. */
+  if (config->report_dest_info) {
+    if (s != STATUS_DEST_INFO ||
+        !format_dest_state_receive(client->file_descriptor, &file->dest_state)) {
+      log_message(LOG_LEVEL_ERROR, "Unexpected reply to the destination-state report");
+      send_status(client->file_descriptor, STATUS_ERROR);
+      return -1;
+    }
+    if (!receive_status(client->file_descriptor, &s))
+      return -1;
+  }
   if (s == STATUS_ERROR) {
     log_server_rejection("Server reported error for file");
     return -1;
@@ -1162,6 +1666,10 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
 static int send_append(const Client* client, File* file, Config* config,
                        unsigned long long offset) {
   int fd = client->file_descriptor;
+  if (file->data->data == NULL && !file_load_data(file)) {
+    send_status(fd, STATUS_ERROR);
+    return -1;
+  }
   const unsigned long long fsize = file->data->size;
   if (offset >= fsize) {
     send_status(fd, STATUS_ERROR);
@@ -1276,13 +1784,6 @@ static int send_dry_run_remote(Config* config) {
      dry-run reports the same clear diagnostic instead of aborting mid-stream. */
   if (config_has_basis(config) && !basis_oversize_preflight(config))
     return 1;
-  /* Would-delete reporting requires a receiver-side read-only extras walk that
-     is not implemented yet; be explicit that --delete is a no-op in dry-run
-     rather than silently ignoring it. */
-  if ((config->use_delete || config->delete_missing_args) && !config->quiet)
-    log_message(LOG_LEVEL_WARNING,
-                "--dry-run: would-delete reporting is not available in this release; nothing is "
-                "deleted");
 
   /* A live session may follow, so arm graceful abort handling. */
   client_set_abort_armed(true);
@@ -1301,9 +1802,14 @@ static int send_dry_run_remote(Config* config) {
   protocol_session_bind(&session);
 
   int ret = 1;
+  time_t dry_start = time(NULL);
+  ReceiverStats dry_stats;
+  memset(&dry_stats, 0, sizeof(dry_stats));
   PreparedScanner prepared;
   memset(&prepared, 0, sizeof(prepared));
   DirectoryScanner* scanner = NULL;
+  ArrayList* dry_manifest = NULL;
+  ArrayList* dry_dirs = NULL;
   if (!config_send(client->file_descriptor, config))
     goto dry_fail;
   receive_daemon_motd(client, config);
@@ -1316,10 +1822,34 @@ static int send_dry_run_remote(Config* config) {
   int file_count = 0;
   unsigned long long total_bytes = 0;
   char size_buffer[32];
+  /* -n --delete: build the same keep-set manifest a real run would send so the
+     receiver can enumerate (read-only) the destination extras.  Filter-excluded
+     and size-pruned protections are not propagated here, so a filtered dry-run
+     may over-report; the no-filter case is exact. */
+  dry_manifest = config->use_delete ? array_list_create(free) : NULL;
+  if (config->use_delete && !dry_manifest)
+    goto dry_fail;
+  /* Scope the receiver-side extras walk to the receive root (the "." sentinel),
+     exactly as the recursive transfer path does. */
+  if (config->use_delete) {
+    dry_dirs = array_list_create(free);
+    char* root_marker = dry_dirs ? str_dup(".") : NULL;
+    if (!dry_dirs || !root_marker || !array_list_add(dry_dirs, root_marker)) {
+      free(root_marker);
+      if (dry_dirs)
+        array_list_delete(dry_dirs);
+      dry_dirs = NULL;
+      goto dry_fail;
+    }
+  }
   if (!config->quiet)
     printf("Dry run: files to be transferred\n");
   Chunk* chunk;
   while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    if (dry_manifest && !add_chunk_to_manifest(dry_manifest, chunk)) {
+      chunk_destroy(chunk);
+      goto dry_fail;
+    }
     for (int i = 0; i < chunk->element_count; i++) {
       File* f = chunk->items[i];
       if (!f)
@@ -1381,12 +1911,73 @@ static int send_dry_run_remote(Config* config) {
     goto dry_fail;
   if (io_error)
     log_message(LOG_LEVEL_WARNING, "source scan hit an unreadable directory");
-  /* Terminate the stream so the receiver emits its success frame; no data
-     frame and no delete manifest are ever sent in dry-run. */
+  /* Send the keep-set manifest (no data frames) so the receiver can enumerate
+     the destination extras; an early-timing delete ACKs before it will accept
+     the terminal FINISHED. */
+  bool early_delete = config->use_delete && config_delete_timing_early(config);
+  if (dry_manifest) {
+    if (send_delete_manifest(client->file_descriptor, dry_manifest, NULL, NULL, NULL, dry_dirs) !=
+        0)
+      goto dry_fail;
+    if (early_delete) {
+      Status ack;
+      if (!receive_status_keepalive(client->file_descriptor, &ack, DELETE_ACK_TIMEOUT_SEC,
+                                    DELETE_ACK_KEEPALIVE_SEC, client_abort_pending) ||
+          ack != STATUS_OK)
+        goto dry_fail;
+    }
+  }
+  /* Terminate the stream so the receiver emits its success frame; no data frame
+     is ever sent in dry-run. */
   if (!send_status(client->file_descriptor, STATUS_FINISHED))
     goto dry_fail;
   Status status;
-  if (!receive_status(client->file_descriptor, &status) || status != STATUS_OK)
+  if (!receive_status(client->file_descriptor, &status))
+    goto dry_fail;
+  if (status == STATUS_STATS) {
+    ArrayList* would_delete = array_list_create(free);
+    if (!would_delete)
+      goto dry_fail;
+    if (!receive_stats_record(client->file_descriptor, &dry_stats, would_delete)) {
+      array_list_delete(would_delete);
+      goto dry_fail;
+    }
+    /* rsync prints `*deleting   PATH` when itemizing (or `deleting PATH` with
+       --out-format / -v); the plain-total output used here has no delete
+       counterpart, so only the itemize/out-format cases are rendered. */
+    if (!config->quiet && (config->itemize_changes || config->out_format != NULL)) {
+      for (int i = 0; i < would_delete->size; i++) {
+        const char* raw = (const char*)would_delete->items[i];
+        const char* path = delete_display_path(config, raw);
+        if (config->out_format != NULL) {
+          ChangeEvent event;
+          memset(&event, 0, sizeof(event));
+          event.decision = CHANGE_SENT;
+          event.deleted = true;
+          event.name = path;
+          event.path = path;
+          char* line = change_render_format(config->out_format, config, &event);
+          if (line) {
+            /* Escape the whole rendered line, exactly like change_emit() does
+               for a real transfer, so a control byte in the peer-supplied path
+               cannot forge output. */
+            char* escaped = output_escape(line, config->eight_bit_output);
+            printf("%s\n", escaped ? escaped : line);
+            free(escaped);
+            free(line);
+          }
+        } else {
+          char* escaped = output_escape(path, config->eight_bit_output);
+          printf("*deleting   %s\n", escaped ? escaped : path);
+          free(escaped);
+        }
+      }
+    }
+    array_list_delete(would_delete);
+    if (!receive_status(client->file_descriptor, &status))
+      goto dry_fail;
+  }
+  if (status != STATUS_OK)
     goto dry_fail;
   if (!config->quiet) {
     if (config->human_readable)
@@ -1395,9 +1986,14 @@ static int send_dry_run_remote(Config* config) {
     else
       printf("Total: %d files, %.1f MB\n", file_count, (double)total_bytes / (double)BYTES_PER_MIB);
   }
+  report_transfer_stats(config, file_count, total_bytes, dry_start, &dry_stats);
   ret = io_error ? 1 : 0;
 
 dry_fail:
+  if (dry_manifest)
+    array_list_delete(dry_manifest);
+  if (dry_dirs)
+    array_list_delete(dry_dirs);
   if (scanner)
     directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);
@@ -1429,7 +2025,11 @@ static bool send_directory_entry(const Client* client, File* file, const Config*
   if (!send_status(client->file_descriptor, STATUS_MKDIR) ||
       !send_wire_str(client->file_descriptor, file_wire_path(file)))
     return false;
-  return !config->use_metadata || metadata_send(client->file_descriptor, file->metadata);
+  if (config->use_metadata && !metadata_send(client->file_descriptor, file->metadata))
+    return false;
+  /* Directory xattrs/ACLs (-X/-A) ride the same trailing block as regular files
+     when the xattr transport was negotiated. */
+  return !config->use_xattrs || xattr_send(client->file_descriptor, file->xattrs);
 }
 
 /* P7 Wave D: transmit every captured source directory's metadata in terminal
@@ -1460,6 +2060,9 @@ static bool send_dir_times(const Client* client, const Config* config, ArrayList
       if (!file || !file_wire_path(file))
         return false;
       if (!send_wire_str(fd, file_wire_path(file)) || !metadata_send(fd, file->metadata))
+        return false;
+      /* Directory xattrs/ACLs travel with the deferred directory metadata. */
+      if (config->use_xattrs && !xattr_send(fd, file->xattrs))
         return false;
     }
     index += chunk;
@@ -1714,6 +2317,8 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
                          (stream && !config->use_compression)) &&
                         source_is_regular_file(f);
     SourceFile* source = remove_sources ? source_file_create(f) : NULL;
+    unsigned long long bytes_before = protocol_bytes_written();
+    unsigned long long read_before = protocol_bytes_read();
     int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
     if (rc == 1) {
       source_file_destroy(source);
@@ -1723,7 +2328,9 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       source_file_destroy(source);
       return -1;
     }
-    change_emit_file_sent(config, f);
+    change_emit_file_sent_bytes(config, f, protocol_bytes_written() - bytes_before,
+                                protocol_bytes_read() - read_before);
+    client_progress_file(config, f);
     if (source && !array_list_add(remove_sources, source)) {
       source_file_destroy(source);
       return -1;
@@ -1761,7 +2368,18 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     /* The keep-set manifest was prebuilt by a path-only pre-scan.  Transmit it
        and wait for the receiver to delete extras before streaming any data. */
     if (!send_delete_manifest_early(client, context->manifest, context->excluded_paths,
-                                    context->missing_args)) {
+                                    context->size_skipped_paths, context->missing_args,
+                                    context->synced_dirs)) {
+      pipeline_cancel(context);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
+      return thrd_error;
+    }
+  } else if (context->delete_plans) {
+    /* --delete-during/--delete-delay: transmit the receive root's plan before
+       any data, exactly like rsync's first generator directory. */
+    if (delete_plan_send_root(client->file_descriptor, context->delete_plans) != 0) {
       pipeline_cancel(context);
       disconnect_transfer_client(client);
       mark_sender_done(context);
@@ -1770,6 +2388,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
     }
   }
 
+  client_progress_begin(context->config);
   while (true) {
     /* Graceful abort (Ctrl-C/SIGTERM): tell the receiver to clean up instead of
        dying abruptly.  Best-effort: a failed send just means the peer is gone.
@@ -1806,6 +2425,15 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         return thrd_error;
       }
       break;
+    }
+    if (send_chunk_delete_plans(client, context->delete_plans, current_chunk) != 0) {
+      log_message(LOG_LEVEL_ERROR, "unexpected error while sending delete plan");
+      chunk_destroy(current_chunk);
+      pipeline_cancel(context);
+      disconnect_transfer_client(client);
+      mark_sender_done(context);
+      protocol_session_unbind();
+      return thrd_error;
     }
     if (send_chunk_with_removal(client, current_chunk, context->config,
                                 context->remove_source_files) != 0) {
@@ -1854,7 +2482,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                   "unscanned source mirrors are not deleted");
     else
       log_message(LOG_LEVEL_WARNING, "transfer stopped early (stop deadline)");
-  } else if (context->config->use_delete && !context->early_delete) {
+  } else if (context->config->use_delete && !context->early_delete && !context->delete_plans) {
     /* Empty keep-set + scan I/O error must not delete the whole destination
        (the source may not be genuinely empty -- see send_files). */
     bool empty_io;
@@ -1868,15 +2496,25 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       goto send_fail;
     }
     if (send_delete_manifest(client->file_descriptor, context->manifest, context->excluded_paths,
-                             context->missing_args) != 0)
+                             context->size_skipped_paths, context->missing_args,
+                             context->synced_dirs) != 0)
       goto send_fail;
-  } else if (context->config->delete_missing_args && !context->early_delete) {
+  } else if (context->config->delete_missing_args && !context->early_delete &&
+             !context->delete_plans) {
     /* --delete-missing-args without --delete: no keep-set is built, but the
        exact-delete paths still ride the same manifest frame (commit once the
        transfer succeeded). */
-    if (send_delete_manifest(client->file_descriptor, NULL, NULL, context->missing_args) != 0)
+    if (send_delete_manifest(client->file_descriptor, NULL, NULL, NULL, context->missing_args,
+                             NULL) != 0)
       goto send_fail;
   }
+  /* Emit the plans for source directories the data stream never triggered
+     (empty directories): their extras are still cleared while the directory
+     itself is kept. */
+  if (!context->scan_stopped_early && context->delete_plans && context->plan_dirs &&
+      delete_plan_send_remaining(client->file_descriptor, context->delete_plans,
+                                 context->plan_dirs) != 0)
+    goto send_fail;
   /* P7 Wave D: transmit the captured directory times last.  The scanner thread
      (and all parallel workers) has been joined before scanner_done was set, so
      the list is complete and race-free; on an early stop the list may be
@@ -1884,18 +2522,22 @@ static int send_chunks_multithreaded(void* pipeline_context) {
   if (!context->scan_stopped_early &&
       !send_dir_times(client, context->config, context->dir_entries))
     goto send_fail;
-  bool ok = finalize_transfer(client, context->config, context->remove_source_files);
+  bool delete_limit = false;
+  ReceiverStats recv_stats;
+  memset(&recv_stats, 0, sizeof(recv_stats));
+  bool ok = finalize_transfer(client, context->config, context->remove_source_files, &delete_limit,
+                              &recv_stats);
+  context->delete_limit = delete_limit;
   if (!ok && context->config->use_delete)
     log_message(LOG_LEVEL_ERROR,
-                "server reported a deletion failure (--delete); see the server log for the "
-                "reason (a --max-delete limit that the run would exceed deletes nothing)");
+                "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(context->config, context->remove_source_files);
   mtx_lock(&context->mutex_progress);
   int total_files = context->total_files;
   unsigned long long total_bytes = context->total_bytes;
   mtx_unlock(&context->mutex_progress);
-  report_transfer_stats(context->config, total_files, total_bytes, start);
+  report_transfer_stats(context->config, total_files, total_bytes, start, &recv_stats);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    (double)total_bytes / (double)BYTES_PER_MIB);
   disconnect_transfer_client(client);
@@ -1930,12 +2572,25 @@ static int scan_directory_multithreaded(void* pipeline_context) {
      parallel workers append under the context's dedicated mutex. */
   prepared.options.dir_entries = context->dir_entries;
   prepared.options.dir_entries_mutex = &context->dir_entries_mutex;
+  if (!append_implied_dir_times(context->config, context->dir_entries)) {
+    pipeline_cancel(context);
+    protocol_session_unbind();
+    return thrd_error;
+  }
   /* The keep-set manifest for the late modes is built from this data pass, so
-     the parallel scanner records the protected excluded prefixes here.  The
-     early modes already transmitted the pre-scan keep-set and its protected
-     list, so the data pass must not append to it again. */
-  if (!context->early_delete)
+     the parallel scanner records the protected excluded prefixes and the
+     synchronized directories here (the size-prune protection is collected in
+     every mode).  The early modes already transmitted the pre-scan keep-set and
+     its protected lists, so the data pass must not append to them again. */
+  if (!context->early_delete && !context->delete_plans) {
     prepared.options.excluded_paths = context->excluded_paths;
+    /* The root marker for a full recursive transfer is already in the list; do
+       not let the scanner append every directory to it. */
+    if (context->config->files_from_set != NULL)
+      prepared.options.synced_dirs = context->synced_dirs;
+  }
+  if (!context->delete_plans)
+    prepared.options.size_skipped_paths = context->size_skipped_paths;
   bool dirs_mode = prepared.options.dirs;
   /* -H also selects the sequential scanner (see the comment at the branch),
    * so the loop below must choose the scanner by which object exists, not by
@@ -1973,7 +2628,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       failed = use_dscanner ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
       break;
     }
-    if (context->config->use_delete && !context->early_delete) {
+    if (context->config->use_delete && !context->early_delete && !context->delete_plans) {
       mtx_lock(&context->mutex_scanner);
       bool manifest_ok = add_chunk_to_manifest(context->manifest, current_chunk);
       mtx_unlock(&context->mutex_scanner);
@@ -2064,58 +2719,6 @@ static int load_files_multithreaded(void* pipeline_context) {
       return thrd_error;
     }
   }
-}
-
-/* Print a one-line transfer progress report to stderr. `suffix` ends the
-   line (e.g. "Done.\n") or is "" for in-place refresh. Shared by the
-   single-threaded loop and the multithreaded progress thread. */
-static void print_transfer_progress(unsigned long long total_bytes, time_t start,
-                                    const char* suffix, bool human_readable) {
-  double elapsed = difftime(time(NULL), start);
-  double rate = elapsed > 0.0 ? (double)total_bytes / ((double)BYTES_PER_MIB * elapsed) : 0.0;
-  if (human_readable) {
-    char total_buffer[32];
-    char rate_buffer[32];
-    fprintf(stderr, "\rSent %s  (%s/s)  %s",
-            display_bytes(total_bytes, true, total_buffer, sizeof(total_buffer)),
-            display_bytes((unsigned long long)(rate * (double)BYTES_PER_MIB), true, rate_buffer,
-                          sizeof(rate_buffer)),
-            suffix);
-  } else {
-    fprintf(stderr, "\rSent %.1f MB  (%.1f MB/s)  %s", (double)total_bytes / (double)BYTES_PER_MIB,
-            rate, suffix);
-  }
-  fflush(stderr);
-}
-
-/* Progress-reporting thread for multithreaded send. Runs in parallel with
-   the scanner/loader/sender threads and prints periodic progress to stderr. */
-static int progress_thread_fn(void* arg) {
-  PipelineContextSender* context = (PipelineContextSender*)arg;
-  time_t last_progress = 0;
-  time_t start = time(NULL);
-
-  while (true) {
-    mtx_lock(&context->mutex_progress);
-    bool done = context->sender_done;
-    unsigned long long total = context->progress_bytes;
-    mtx_unlock(&context->mutex_progress);
-
-    if (done) {
-      print_transfer_progress(total, start, "Done.\n", context->config->human_readable);
-      break;
-    }
-
-    time_t now = time(NULL);
-    if (now - last_progress >= 1) {
-      last_progress = now;
-      print_transfer_progress(total, start, "", context->config->human_readable);
-    }
-
-    struct timespec ts = {0, 100 * 1000000L}; /* 100 ms */
-    thrd_sleep(&ts, NULL);
-  }
-  return thrd_success;
 }
 
 /* Phase 6 residual-batch (client-only).  --write-batch=FILE / --only-write-batch
@@ -2236,13 +2839,23 @@ int send_files(Config* config) {
   int ret = 1;
   DirectoryScanner* scanner = NULL;
   ArrayList* manifest = NULL;
+  DeletePlanSender* plan_sender = NULL;
   ArrayList* remove_sources = NULL;
   /* P7 Wave D: captured source directory times, transmitted in trailing
      STATUS_DIR_TIMES frame(s) (only when metadata rides the wire). */
   ArrayList* dir_entries = NULL;
   /* Protected excluded prefixes (delete-excluded default protection). */
   ArrayList* excluded = NULL;
+  /* Size-pruned prefixes (always protected) and synchronized directories. */
+  ArrayList* size_skipped = NULL;
+  ArrayList* synced_dirs = NULL;
+  /* Traversed source directories for the per-directory delete keep set. */
+  ArrayList* plan_dirs = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
+  /* -d/--dirs does not recurse, so a per-directory plan would carry no child
+     information and could delete the contents of an untraversed directory;
+     fall back to the whole-tree end-of-transfer commit for that mode. */
+  bool delete_per_dir = config->use_delete && config_delete_timing_per_dir(config) && !config->dirs;
   bool send_failed = false;
   bool had_scan_io = false;
   PreparedScanner prepared;
@@ -2256,6 +2869,8 @@ int send_files(Config* config) {
     dir_entries = array_list_create(file_destroy);
     if (!dir_entries)
       goto send_fail;
+    if (!append_implied_dir_times(config, dir_entries))
+      goto send_fail;
   }
   if (config->remove_source_files)
     remove_sources = array_list_create(source_file_destroy);
@@ -2265,16 +2880,37 @@ int send_files(Config* config) {
      by user-selection rules so the receiver protects their destination mirrors
      from --delete (rsync's default).  Only scans that build the keep-set get the
      sink attached (prescan for early timing, the streaming data pass otherwise). */
-  if (config->use_delete && !config->delete_excluded) {
-    excluded = array_list_create(free);
-    if (!excluded)
+  if (config->use_delete) {
+    if (!config->delete_excluded) {
+      excluded = array_list_create(free);
+      if (!excluded)
+        goto send_fail;
+      prepared.options.excluded_paths = excluded;
+    }
+    size_skipped = array_list_create(free);
+    synced_dirs = array_list_create(free);
+    if (!size_skipped || !synced_dirs)
       goto send_fail;
-    prepared.options.excluded_paths = excluded;
+    prepared.options.size_skipped_paths = size_skipped;
+    /* Only a --files-from subset confines the extras walk to the directories
+       the scan synchronized; a full recursive transfer deletes throughout the
+       receive root, so mark the root itself (the "." sentinel) and let the
+       scanner record nothing extra. */
+    if (config->files_from_set == NULL) {
+      char* root_marker = delete_scope_root_marker(config);
+      if (!root_marker || !array_list_add(synced_dirs, root_marker)) {
+        free(root_marker);
+        goto send_fail;
+      }
+    } else {
+      prepared.options.synced_dirs = synced_dirs;
+    }
   }
-  /* The late-timing modes (plain --delete / --delete-after / --delete-delay)
-     build the manifest while streaming and send it after the last data frame.
-     The early modes (--delete-before/--delete-during) send it up front from a
-     dedicated path-only pre-scan, so no manifest is kept during the data pass. */
+  /* The late-timing modes (plain --delete / --delete-after) build the manifest
+     while streaming and send it after the last data frame.  --delete-before
+     sends a whole-tree keep-set up front; --delete-during/--delete-delay build a
+     per-directory plan set up front (paths only) and stream the plans alongside
+     the data, so no manifest is kept during the data pass. */
   if (delete_early) {
     /* Pass 1: collect the complete keep-set (paths only, no data loaded) and
        transmit it now, before any file data.  The receiver removes extras and
@@ -2282,7 +2918,8 @@ int send_files(Config* config) {
     ArrayList* early_manifest = array_list_create(free);
     if (!early_manifest)
       goto send_fail;
-    bool prescan_ok = scan_paths_only(config, &prepared.options, early_manifest, &had_scan_io);
+    bool prescan_ok =
+        scan_paths_only(config, &prepared.options, early_manifest, NULL, &had_scan_io);
     bool early_ok = false;
     if (prescan_ok) {
       /* A scan that hit an I/O error and produced NO keep entries is ambiguous
@@ -2296,14 +2933,50 @@ int send_files(Config* config) {
                     "with an empty keep-set (--delete)");
         prescan_ok = false;
       } else {
-        early_ok = send_delete_manifest_early(client, early_manifest, excluded, missing_args);
+        early_ok = send_delete_manifest_early(client, early_manifest, excluded, size_skipped,
+                                              missing_args, synced_dirs);
       }
     }
     array_list_delete(early_manifest);
-    /* The keep-set (and its protected prefixes) are already on the wire; the
-       data pass must not append to the exclusion list again. */
+    /* The keep-set (and its protected prefixes and synchronized directories) are
+       already on the wire; the data pass must not append to those lists again. */
     prepared.options.excluded_paths = NULL;
+    prepared.options.size_skipped_paths = NULL;
+    prepared.options.synced_dirs = NULL;
     if (!prescan_ok || !early_ok)
+      goto send_fail;
+  } else if (delete_per_dir) {
+    /* --delete-during/--delete-delay: build one plan per source directory from a
+       path-only pre-scan and transmit the root plan now, before any data, so the
+       receive root's extras are handled exactly like rsync's first generator
+       directory.  The remaining plans are streamed with the data below. */
+    plan_sender = delete_plan_sender_create();
+    plan_dirs = array_list_create(free);
+    if (!plan_sender || !plan_dirs)
+      goto send_fail;
+    prepared.options.plan_dirs = plan_dirs;
+    bool prescan_ok = scan_paths_only(config, &prepared.options, NULL, plan_sender, &had_scan_io);
+    bool plans_ok = false;
+    if (prescan_ok) {
+      const char* walk_root = delete_plan_walk_root(config, synced_dirs);
+      const ArrayList* scope =
+          config->files_from_set ? synced_dirs : (walk_root ? synced_dirs : NULL);
+      delete_plan_sender_finalize(plan_sender, scope, walk_root);
+      delete_plan_sender_set_config(plan_sender, excluded, size_skipped, missing_args);
+      if (had_scan_io && delete_plan_sender_empty(plan_sender)) {
+        log_message(LOG_LEVEL_ERROR,
+                    "source scan hit an I/O error before finding any file; refusing to delete "
+                    "with an empty keep-set (--delete)");
+        prescan_ok = false;
+      } else {
+        plans_ok = delete_plan_send_root(client->file_descriptor, plan_sender) == 0;
+      }
+    }
+    prepared.options.excluded_paths = NULL;
+    prepared.options.size_skipped_paths = NULL;
+    prepared.options.synced_dirs = NULL;
+    prepared.options.plan_dirs = NULL;
+    if (!prescan_ok || !plans_ok)
       goto send_fail;
   } else if (config->use_delete) {
     manifest = array_list_create(free);
@@ -2332,8 +3005,8 @@ int send_files(Config* config) {
   Chunk* current_chunk;
   unsigned long long total_bytes = 0;
   int total_files = 0;
-  time_t last_progress = 0;
   time_t start = time(NULL);
+  client_progress_begin(config);
   /* True when the stop deadline cut the scan short so the keep-set manifest is
      only a prefix of the source. */
   bool scan_stopped_early = false;
@@ -2383,6 +3056,11 @@ int send_files(Config* config) {
         goto send_fail;
       }
     }
+    if (send_chunk_delete_plans(client, plan_sender, current_chunk) != 0) {
+      chunk_destroy(current_chunk);
+      send_failed = true;
+      break;
+    }
     if (send_chunk_with_removal(client, current_chunk, config, remove_sources) != 0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
       chunk_destroy(current_chunk);
@@ -2390,13 +3068,6 @@ int send_files(Config* config) {
       break;
     }
     total_bytes += chunk_bytes;
-    if (config->show_progress && !config->quiet) {
-      time_t now = time(NULL);
-      if (now - last_progress >= 1) {
-        last_progress = now;
-        print_transfer_progress(total_bytes, start, "", config->human_readable);
-      }
-    }
     chunk_destroy(current_chunk);
   }
   if (send_failed) {
@@ -2440,13 +3111,15 @@ int send_files(Config* config) {
                   "an empty keep-set (--delete)");
       goto send_fail;
     }
-    if ((manifest || config->delete_missing_args) && !delete_early) {
+    if ((manifest || config->delete_missing_args) && !delete_early && !delete_per_dir) {
       /* Late (commit) ordering: all file data is out; transmit the manifest so
          the receiver commits the extras walk (--delete) and/or the
          --delete-missing-args exact-path deletions only after the transfer
-         succeeds.  In the early modes (--delete-before/--delete-during) the
-         manifest already went out up front, so nothing is re-sent here. */
-      if (send_delete_manifest(client->file_descriptor, manifest, excluded, missing_args) != 0) {
+         succeeds.  In the early modes (--delete-before) and the per-directory
+         modes the deletion already went out with the data, so nothing is
+         re-sent here. */
+      if (send_delete_manifest(client->file_descriptor, manifest, excluded, size_skipped,
+                               missing_args, synced_dirs) != 0) {
         if (manifest) {
           array_list_delete(manifest);
           manifest = NULL;
@@ -2459,34 +3132,56 @@ int send_files(Config* config) {
       }
     }
   }
+  /* Emit the plans for any source directories the data stream never triggered
+     (an empty directory has no file frame).  Sending them now still clears that
+     directory's destination extras while keeping the directory itself. */
+  if (!scan_stopped_early && plan_sender && plan_dirs &&
+      delete_plan_send_remaining(client->file_descriptor, plan_sender, plan_dirs) != 0)
+    goto send_fail;
   /* P7 Wave D: every directory has now been traversed (or the scan stopped
      early), so transmit the captured directory times last.  The receiver defers
      applying them until after its own deletion/publication phase. */
   if (!send_dir_times(client, config, dir_entries))
     goto send_fail;
-  bool ok = finalize_transfer(client, config, remove_sources);
+  bool delete_limit = false;
+  ReceiverStats recv_stats;
+  memset(&recv_stats, 0, sizeof(recv_stats));
+  bool ok = finalize_transfer(client, config, remove_sources, &delete_limit, &recv_stats);
   if (!ok && config->use_delete)
     log_message(LOG_LEVEL_ERROR,
-                "server reported a deletion failure (--delete); see the server log for the "
-                "reason (a --max-delete limit that the run would exceed deletes nothing)");
+                "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(config, remove_sources);
-  if (config->show_progress && !config->quiet)
-    print_transfer_progress(total_bytes, start, "Done.\n", config->human_readable);
-  report_transfer_stats(config, total_files, total_bytes, start);
+  report_transfer_stats(config, total_files, total_bytes, start, &recv_stats);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
                    (double)total_bytes / (double)BYTES_PER_MIB);
-  /* --ignore-errors: an unreadable source directory was skipped but the run
-     still completed (and deleted); report the run as errored like rsync does. */
-  ret = (ok && !had_scan_io) ? 0 : 1;
+  /* A skipped source entry (--ignore-errors past an unreadable directory, or a
+     dereferenced symlink with no referent) makes rsync report a partial
+     transfer (exit 23) even though the rest of the run succeeded.  A
+     --max-delete-capped commit is a successful transfer that rsync reports
+     with exit code 25. */
+  if (!ok)
+    ret = 1;
+  else if (had_scan_io)
+    ret = 23;
+  else
+    ret = delete_limit ? 25 : 0;
 
 send_fail:
   /* Single cleanup path for all exits. The manifest is intentionally deleted
      here even on success without --delete, fixing a pre-existing leak. */
   if (manifest)
     array_list_delete(manifest);
+  if (plan_sender)
+    delete_plan_sender_destroy(plan_sender);
   if (excluded)
     array_list_delete(excluded);
+  if (size_skipped)
+    array_list_delete(size_skipped);
+  if (synced_dirs)
+    array_list_delete(synced_dirs);
+  if (plan_dirs)
+    array_list_delete(plan_dirs);
   if (missing_args)
     array_list_delete(missing_args);
   if (remove_sources)
@@ -2580,11 +3275,6 @@ int send_files_multithreaded(Config** config_ptr) {
                           config->stop_at, now_mono);
   bool collect_excluded = config->use_delete && !config->delete_excluded;
   if (config->use_delete) {
-    context->manifest = array_list_create(free);
-    if (!context->manifest) {
-      pipeline_context_sender_destroy(context);
-      return 1;
-    }
     if (collect_excluded) {
       context->excluded_paths = array_list_create(free);
       if (!context->excluded_paths) {
@@ -2592,22 +3282,73 @@ int send_files_multithreaded(Config** config_ptr) {
         return 1;
       }
     }
-    if (config_delete_timing_early(config)) {
-      /* --delete-before/--delete-during: build the complete keep-set manifest
+    /* Size-pruned mirrors stay protected under every mode (even
+       --delete-excluded); synchronized directories confine the walk.  A full
+       recursive transfer marks the receive root itself (".") so the walk is not
+       confined; only a --files-from subset records concrete directories. */
+    context->size_skipped_paths = array_list_create(free);
+    context->synced_dirs = array_list_create(free);
+    if (!context->size_skipped_paths || !context->synced_dirs) {
+      pipeline_context_sender_destroy(context);
+      return 1;
+    }
+    if (config->files_from_set == NULL) {
+      char* root_marker = delete_scope_root_marker(config);
+      if (!root_marker || !array_list_add(context->synced_dirs, root_marker)) {
+        free(root_marker);
+        pipeline_context_sender_destroy(context);
+        return 1;
+      }
+    }
+    /* -d/--dirs does not recurse, so a per-directory plan would carry no child
+       information and could delete the contents of an untraversed directory;
+       fall back to the whole-tree end-of-transfer commit for that mode. */
+    bool per_dir = config_delete_timing_per_dir(config) && !config->dirs;
+    if (config_delete_timing_early(config) || per_dir) {
+      /* --delete-before / --delete-during / --delete-delay: build the keep-set
          (paths only, nothing loaded or sent) up front so the sender thread can
-         transmit it before the first data byte.  The path-only pre-scan also
-         fills the protected excluded prefixes. */
+         transmit it before/with the data.  The path-only pre-scan also fills the
+         protected excluded prefixes and synchronized directories. */
       PreparedScanner prepared;
       memset(&prepared, 0, sizeof(prepared));
       bool prepared_ok = prepare_scanner(config, config->scanner_threads, &prepared);
-      if (prepared_ok && context->excluded_paths)
-        prepared.options.excluded_paths = context->excluded_paths;
-      bool prebuilt = prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
-                                                     &context->scan_had_io_error);
+      if (prepared_ok) {
+        if (context->excluded_paths)
+          prepared.options.excluded_paths = context->excluded_paths;
+        prepared.options.size_skipped_paths = context->size_skipped_paths;
+        /* The root marker for a full recursive transfer is already in the list;
+           only a --files-from subset needs the scanner to record directories. */
+        if (config->files_from_set != NULL)
+          prepared.options.synced_dirs = context->synced_dirs;
+      }
+      if (per_dir) {
+        context->delete_plans = delete_plan_sender_create();
+        context->plan_dirs = array_list_create(free);
+        prepared_ok = prepared_ok && context->delete_plans != NULL && context->plan_dirs != NULL;
+        if (prepared_ok)
+          prepared.options.plan_dirs = context->plan_dirs;
+      } else {
+        context->manifest = array_list_create(free);
+        prepared_ok = prepared_ok && context->manifest != NULL;
+      }
+      bool prebuilt =
+          prepared_ok && scan_paths_only(config, &prepared.options, context->manifest,
+                                         context->delete_plans, &context->scan_had_io_error);
       prepared_scanner_destroy(&prepared);
-      if (prebuilt && context->scan_had_io_error && context->manifest->size == 0) {
-        /* Empty keep-set + scan I/O error: refusing an empty keep-set manifest
-           would have deleted the whole destination (see send_files). */
+      if (per_dir && prebuilt) {
+        const char* walk_root = delete_plan_walk_root(config, context->synced_dirs);
+        const ArrayList* scope = config->files_from_set ? context->synced_dirs
+                                                        : (walk_root ? context->synced_dirs : NULL);
+        delete_plan_sender_finalize(context->delete_plans, scope, walk_root);
+        delete_plan_sender_set_config(context->delete_plans, context->excluded_paths,
+                                      context->size_skipped_paths, context->missing_args);
+      }
+      bool empty = per_dir
+                       ? (context->delete_plans && delete_plan_sender_empty(context->delete_plans))
+                       : (context->manifest && context->manifest->size == 0);
+      if (prebuilt && context->scan_had_io_error && empty) {
+        /* Empty keep-set + scan I/O error: refusing an empty keep-set would
+           have deleted the whole destination (see send_files). */
         log_message(LOG_LEVEL_ERROR,
                     "source scan hit an I/O error before finding any file; refusing to delete "
                     "with an empty keep-set (--delete)");
@@ -2617,12 +3358,19 @@ int send_files_multithreaded(Config** config_ptr) {
         pipeline_context_sender_destroy(context);
         return 1;
       }
-      context->early_delete = true;
+      if (!per_dir)
+        context->early_delete = true;
+    } else {
+      context->manifest = array_list_create(free);
+      if (!context->manifest) {
+        pipeline_context_sender_destroy(context);
+        return 1;
+      }
     }
   }
   if (config->remove_source_files)
     context->remove_source_files = array_list_create(source_file_destroy);
-  if ((config->use_delete && !context->manifest) ||
+  if ((config->use_delete && !context->manifest && !context->delete_plans) ||
       (config->remove_source_files && !context->remove_source_files)) {
     pipeline_context_sender_destroy(context);
     return 1;
@@ -2655,37 +3403,26 @@ int send_files_multithreaded(Config** config_ptr) {
     return 1;
   }
 
-  thrd_t progress;
-  bool progress_created = false;
-  if (config->show_progress && !config->quiet) {
-    progress_created = (thrd_create(&progress, progress_thread_fn, context) == thrd_success);
-    if (!progress_created) {
-      log_perror("Error creating progress thread");
-      /* Non-fatal; continue without progress reporting */
-    }
-  }
-
   int sender_result;
   thrd_join(scanner, NULL);
   thrd_join(loader, NULL);
   thrd_join(sender, &sender_result);
-
-  if (progress_created) {
-    /* Signal progress thread to exit if it hasn't already */
-    mtx_lock(&context->mutex_progress);
-    context->sender_done = true;
-    mtx_unlock(&context->mutex_progress);
-    thrd_join(progress, NULL);
-  }
 
   bool scan_io;
   mtx_lock(&context->mutex_scanner);
   scan_io = context->scan_had_io_error;
   mtx_unlock(&context->mutex_scanner);
   bool sender_ok = sender_result == thrd_success;
-  /* --ignore-errors: the run completed (and deleted) past an unreadable source
-     directory; report it as errored like rsync does. */
+  bool delete_limit = context->delete_limit;
+  /* A skipped source entry (--ignore-errors past an unreadable directory, or a
+     dereferenced symlink with no referent) makes rsync report a partial
+     transfer (exit 23).  A --max-delete-capped commit is a successful transfer
+     that rsync reports with exit code 25. */
   pipeline_context_sender_destroy(context);
   client_set_abort_armed(false);
-  return sender_ok && !scan_io ? 0 : 1;
+  if (!sender_ok)
+    return 1;
+  if (scan_io)
+    return 23;
+  return delete_limit ? 25 : 0;
 }

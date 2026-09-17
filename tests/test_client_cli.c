@@ -317,7 +317,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.22.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.26.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -327,7 +327,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.22.0"};
+                        "/dst",     "--protocol",   "2.26.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -338,8 +338,8 @@ static void test_parse_args_protocol_accept_current() {
  * failure (parse_args simply stores it; validate_config rejects it up front). */
 static void test_parse_args_protocol_rejects_other_versions() {
   static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
-                                             "2.18.0", "2.19.0", "2.20.0", "2.21.0", "216",
-                                             "31",     "abc",    ""};
+                                             "2.18.0", "2.19.0", "2.20.0", "2.21.0", "2.22.0",
+                                             "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
     EXPECT_NOT_NULL(cfg);
@@ -530,7 +530,9 @@ static void test_parse_args_chmod() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->chmod_spec, "u=rw,go=r");
-  EXPECT_TRUE(cfg->preserve_perms);
+  /* rsync's --chmod does NOT imply --perms: it only tweaks the mode used for a
+   * new destination unless -p is also given. */
+  EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
   mode_t result;
   EXPECT_TRUE(chmod_apply(0777, cfg->chmod_spec, &result));
@@ -545,14 +547,39 @@ static void test_parse_args_numeric_chmod() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->chmod_spec, "7777");
-  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_TRUE(cfg->use_metadata);
+  config_delete(cfg);
+}
+
+static void test_parse_args_accepts_selector_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod=Dg+s,Fo-w,+X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->chmod_spec, "Dg+s,Fo-w,+X");
+  EXPECT_FALSE(cfg->preserve_perms);
+  config_delete(cfg);
+}
+
+static void test_parse_args_appends_repeated_chmod() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--chmod=a+r", "--chmod=a-w", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  /* Repeated --chmod options accumulate (rsync >= 3.2.4) instead of replacing. */
+  EXPECT_EQ_STR(cfg->chmod_spec, "a+r,a-w");
+  mode_t result;
+  EXPECT_TRUE(chmod_apply(0644, cfg->chmod_spec, &result));
+  EXPECT_EQ_INT(result, 0444);
   config_delete(cfg);
 }
 
 static void test_parse_args_rejects_invalid_chmod() {
   Config* cfg = config_create();
-  char* argv[] = {"fastsync", "--chmod=a+X", "/src", "/dst"};
+  char* argv[] = {"fastsync", "--chmod=a+r,", "/src", "/dst"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
@@ -749,7 +776,7 @@ static void test_parse_args_debug_help() {
 }
 
 static void test_parse_args_debug_flags_validation() {
-  static const char* const values[] = {"", "io,", ",io", "io,,proto", "acl", "tls", "unknown"};
+  static const char* const values[] = {"", "io,", ",io", "io,,proto", "tls", "unknown"};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     Config* cfg = config_create();
     char option[64];
@@ -801,8 +828,11 @@ static void test_parse_args_rejects_invalid_modify_window() {
 }
 
 static void test_parse_args_max_alloc_sizes() {
-  const char* values[] = {"1", "4K", "2m", "3G", "1T", "1P", "1E", "512B"};
-  const unsigned long long expected[] = {1,
+  /* "0" is rsync's "no alloc limit" sentinel: it must parse to 0, not be
+   * rejected. */
+  const char* values[] = {"0", "1", "4K", "2m", "3G", "1T", "1P", "1E", "512B"};
+  const unsigned long long expected[] = {0,
+                                         1,
                                          4ULL * 1024,
                                          2ULL * 1024 * 1024,
                                          3ULL * 1024 * 1024 * 1024,
@@ -830,8 +860,8 @@ static void test_parse_args_max_alloc_sizes() {
 }
 
 static void test_parse_args_rejects_invalid_max_alloc() {
-  const char* values[] = {"0",  "-1",  "+1",  " 1",   "1 ",
-                          "1Z", "1K2", "1 K", "1\tK", "18446744073709551615K"};
+  const char* values[] = {
+      "-1", "+1", " 1", "1 ", "1Z", "1K2", "1 K", "1\tK", "18446744073709551615K"};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--max-alloc", (char*)values[i], "/src", "/dst"};
@@ -1014,10 +1044,11 @@ static void test_parse_args_basis_dirs() {
   config_delete(cfg);
 }
 
-/* Absolute, escaping, or degenerate basis-dir values must be rejected up
-   front: they would resolve outside the destination root on the receiver. */
+/* Escaping or degenerate basis-dir values must be rejected up front (they would
+   resolve outside the destination root on the receiver); an absolute path is
+   accepted (rsync parity) and canonicalized with its leading '/' preserved. */
 static void test_parse_args_basis_invalid_paths() {
-  static const char* const invalid[] = {"/abs", "..", "a/../b", "."};
+  static const char* const invalid[] = {"..", "a/../b", ".", "/", ""};
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--link-dest", (char*)invalid[i], "/src", "/dst"};
@@ -1026,6 +1057,15 @@ static void test_parse_args_basis_invalid_paths() {
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--link-dest=/abs/dir", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->basis_count, 1);
+  EXPECT_EQ_STR(cfg->basis_dirs[0].path, "/abs/dir");
+  config_delete(cfg);
 }
 
 /* Basis dirs require the per-file incremental handshake, which -s disables. */
@@ -1287,7 +1327,84 @@ static void test_parse_args_rejects_invalid_info_flag() {
   config_delete(cfg);
 }
 
+/* rsync's info "name" category maps to fastsync's per-file name logging, and
+ * --info=help prints the flag list and exits without error. */
+static void test_parse_args_info_name_and_help() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=name", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_COPY);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* help_argv[] = {"fastsync", "--info=help"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 2, help_argv, positional_args, &positional_count), 1);
+  config_delete(cfg);
+}
+
+/* rsync 3.4.1's remaining --info/--debug categories parse successfully but
+ * have no FastSync output wired to them, so they must not set any log flag. */
+static void test_parse_args_rsync_flag_vocabulary_accepted() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--info=backup,del,flist,mount,nonreg,progress,remove,symsafe,syms",
+                  "--debug=acl,backup,bind,chdir,cmd,connect,del,deltasum,dup,exit,"
+                  "filter,flist,fuzzy,genr,hash,hlink,iconv,nstr,own,recv,send,time,"
+                  "hl,owner",
+                  "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, 0);
+  EXPECT_EQ_INT(cfg->debug_level, 0);
+  config_delete(cfg);
+}
+
 /* Test parse_args with --archive flag */
+/* rsync accepts a trailing level digit on --debug/--info items (e.g. io2,
+ * all4); level 0 silences the item. */
+static void test_parse_args_debug_info_levels() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--debug=io2,proto0,all", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* io0_argv[] = {"fastsync", "--debug=all,io0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, io0_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL & ~LOG_DEBUG_IO);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* info_argv[] = {"fastsync", "--info=stats2", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, info_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_STATS);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* bad_argv[] = {"fastsync", "--debug=123", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, bad_argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+
+  /* rsync accepts category names case-insensitively. */
+  cfg = config_create();
+  char* upper_argv[] = {"fastsync", "--info=STATS2", "--debug=IO", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, upper_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_STATS);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_IO);
+  config_delete(cfg);
+}
+
 static void test_parse_args_archive() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--archive", "/src", "/dst"};
@@ -1410,18 +1527,216 @@ static void test_parse_args_checksum_choice_equals_forms() {
   config_delete(cfg);
 }
 
-/* An algorithm FastSync does not support must be rejected, never a silent
-   no-op. */
+/* An algorithm FastSync does not support, an empty half, a lone/extra comma or
+   a malformed separator must be rejected, never a silent no-op.  A single
+   md4/sha1/none name and the two-name transfer,pre-transfer form are valid. */
 static void test_parse_args_checksum_choice_rejects_unsupported() {
-  static const char* const bad[] = {"md4", "sha256", "crc32", "none", "bogus"};
+  static const char* const bad[] = {"sha256", "crc32", "bogus",       "xxhash:md5",
+                                    "md5,",   ",md5",  "md5,md4,sha1"};
   for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--checksum-choice", (char*)bad[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
     config_delete(cfg);
   }
+}
+
+/* xxh3/xxh128/md4/sha1/none and the two-name form are accepted; "auto"
+   resolves to FastSync's negotiated default xxh128. */
+static void test_parse_args_checksum_choice_new_algos() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum-choice=xxh3", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH3);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--cc=xxh128", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH128);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--checksum-choice=auto", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_XXH128);
+  config_delete(cfg);
+
+  /* A single md4/sha1 name selects it for both transfer and pre-transfer. */
+  static const int single[] = {(int)CHECKSUM_ALGO_MD4, (int)CHECKSUM_ALGO_SHA1};
+  static const char* const single_names[] = {"md4", "sha1"};
+  for (size_t i = 0; i < 2; i++) {
+    cfg = config_create();
+    char* arg = (char*)single_names[i];
+    char* argv4[] = {"fastsync", "--cc", arg, "/src", "/dst"};
+    positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->checksum_algo, single[i]);
+    EXPECT_EQ_INT(cfg->checksum_transfer_algo, single[i]);
+    config_delete(cfg);
+  }
+
+  /* Two-name form: first is the transfer checksum, second the pre-transfer one
+     that FastSync actually uses. */
+  cfg = config_create();
+  char* argv5[] = {"fastsync", "--cc=sha1,md4", "/checksum/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_SHA1);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD4);
+  config_delete(cfg);
+
+  /* "none" is accepted without --checksum but forces --whole-file like rsync. */
+  cfg = config_create();
+  char* argv6[] = {"fastsync", "--cc=none", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv6, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_NONE);
+  EXPECT_TRUE(cfg->whole_file);
+  config_delete(cfg);
+}
+
+/* rsync rejects "none" as the pre-transfer checksum with --checksum (exit 4),
+   regardless of option order. */
+static void test_parse_args_checksum_none_with_checksum_rejected() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum", "--cc=none", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--checksum", "--cc=md5,none", "/checksum/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+
+  /* "none" as the TRANSFER checksum with a real pre-transfer checksum is
+     accepted (rsync allows none,md5 with -c). */
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--checksum", "--cc=none,md5", "/checksum/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
+  EXPECT_TRUE(cfg->whole_file);
+  config_delete(cfg);
+}
+
+/* -c/--checksum must run the per-file content-check handshake (FastSync's
+ * --incremental), but unlike --incremental it must NOT auto-preserve -t/-p. */
+static void test_parse_args_checksum_implies_incremental_only() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-c", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->checksum);
+  EXPECT_TRUE(cfg->use_incremental);
+  EXPECT_FALSE(cfg->preserve_times);
+  EXPECT_FALSE(cfg->preserve_perms);
+  config_delete(cfg);
+}
+
+/* rsync's --no-whole-file spelling clears -W. */
+static void test_parse_args_no_whole_file() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-W", "--no-whole-file", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->whole_file);
+  config_delete(cfg);
+}
+
+/* --timeout/--contimeout accept 0 (rsync default: disabled) and the
+ * --no-timeout/--no-contimeout spellings clear them. */
+static void test_parse_args_timeout_zero_and_no_forms() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--timeout=0", "--contimeout=0", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->timeout, 0);
+  EXPECT_EQ_INT(cfg->contimeout, 0);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv2[] = {"fastsync", "--timeout", "45", "--contimeout", "90", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->timeout, 45);
+  EXPECT_EQ_INT(cfg->contimeout, 90);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* argv3[] = {"fastsync", "--timeout=30", "--no-timeout", "--no-contimeout", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->timeout, 0);
+  EXPECT_EQ_INT(cfg->contimeout, 0);
+  config_delete(cfg);
+}
+
+/* Every rsync 3.4.1 --compress-choice name is accepted and mapped to a real
+ * codec; "auto" resolves to the negotiated default (zstd).  An unknown name is
+ * rejected with rsync's exit code 4. */
+static void test_parse_args_compress_choice_parity() {
+  struct {
+    const char* name;
+    CompressionAlgo algo;
+    bool enabled;
+  } good[] = {
+      {"zstd", COMPRESSION_ALGO_ZSTD, true},  {"lz4", COMPRESSION_ALGO_LZ4, true},
+      {"zlib", COMPRESSION_ALGO_ZLIB, true},  {"zlibx", COMPRESSION_ALGO_ZLIBX, true},
+      {"none", COMPRESSION_ALGO_NONE, false}, {"auto", COMPRESSION_ALGO_ZSTD, true},
+      {"ZSTD", COMPRESSION_ALGO_ZSTD, true},
+  };
+  for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--compress-choice", (char*)good[i].name, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    /* "auto" is normalized to the canonical "zstd" the receiver accepts. */
+    EXPECT_EQ_STR(cfg->compress_choice, compression_algo_name(good[i].algo));
+    EXPECT_EQ_INT(cfg->compression_algo, (int)good[i].algo);
+    EXPECT_EQ_INT(cfg->use_compression, good[i].enabled ? 1 : 0);
+    config_delete(cfg);
+  }
+  static const char* const bad[] = {"bogus", "", "zstd,lz4"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--compress-choice", (char*)bad[i], "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+    config_delete(cfg);
+  }
+}
+
+/* -M/--remote-option is SSH-only: a daemon or local TCP destination must reject
+ * it instead of silently ignoring it. */
+static void test_validate_config_remote_option_requires_ssh() {
+  Config* cfg = valid_client_config();
+  cfg->remote_options = malloc(sizeof(char*));
+  cfg->remote_options[0] = str_dup("--allow-delete");
+  cfg->remote_option_count = 1;
+  cfg->transport = TRANSPORT_TCP;
+  EXPECT_FALSE(validate_config(cfg));
+  cfg->transport = TRANSPORT_SSH;
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
 }
 
 /* --checksum-seed parses as a 64-bit non-negative integer (space and = forms);
@@ -1442,12 +1757,13 @@ static void test_parse_args_checksum_seed() {
   EXPECT_TRUE(cfg->checksum_seed == 12345ULL);
   config_delete(cfg);
 
-  /* 0 is a valid (and default) seed. */
+  /* An explicit seed of 0 is randomized per transfer (rsync behavior), so the
+   * parsed config must come back non-zero. */
   cfg = config_create();
   char* argv3[] = {"fastsync", "--checksum-seed=0", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->checksum_seed == 0ULL);
+  EXPECT_TRUE(cfg->checksum_seed != 0ULL);
   config_delete(cfg);
 
   /* Non-numeric and negative seeds are rejected. */
@@ -1469,7 +1785,7 @@ static void test_parse_args_checksum_seed() {
 }
 
 static void test_parse_args_rejects_unsafe_negation() {
-  static const char* const options[] = {"--no-archive", "--no-timeout", "--no-unknown"};
+  static const char* const options[] = {"--no-archive", "--no-unknown"};
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
     char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
@@ -2204,6 +2520,8 @@ static void test_parse_args_log_file_format() {
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->log_file_format, "%n %M");
+  /* The format alone is inert (no --log-file): no destination report needed. */
+  EXPECT_FALSE(cfg->report_dest_info);
   config_delete(cfg);
 
   cfg = config_create();
@@ -2211,6 +2529,61 @@ static void test_parse_args_log_file_format() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, separate_argv, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->log_file_format, "%n %M");
+  config_delete(cfg);
+
+  /* With --log-file the log-format is a real output mode whose %i/%n columns
+     need the receiver's destination snapshot (same as -i/--out-format). */
+  const char* log_path = "cli_log_fmt_test.txt";
+  cfg = config_create();
+  char log_arg[64];
+  snprintf(log_arg, sizeof(log_arg), "--log-file=%s", log_path);
+  char* both_argv[] = {"fastsync", log_arg, "--log-file-format=%i %n", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, both_argv, positional_args, &positional_count), 0);
+  EXPECT_NOT_NULL(cfg->log_file);
+  EXPECT_TRUE(cfg->report_dest_info);
+  config_delete(cfg);
+  remove(log_path);
+}
+
+/* --skip-compress takes a separate value even when it starts with '-' (e.g. a
+ * suffix typed as "-foo"); the cluster expander must copy it verbatim rather
+ * than treat it as a short-option cluster. */
+static void test_parse_args_skip_compress_dash_value() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--skip-compress", "-foo/bar", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->skip_compress_set);
+  EXPECT_EQ_INT(cfg->skip_compress_count, 2);
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[0], "-foo");
+  EXPECT_EQ_STR(cfg->skip_compress_suffixes[1], "bar");
+  config_delete(cfg);
+}
+
+/* -i and --out-format also request the destination snapshot. */
+static void test_parse_args_report_dest_info_modes() {
+  Config* cfg = config_create();
+  char* itemize_argv[] = {"fastsync", "-i", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, itemize_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->report_dest_info);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* out_argv[] = {"fastsync", "--out-format=%n", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, out_argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->report_dest_info);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* plain_argv[] = {"fastsync", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 3, plain_argv, positional_args, &positional_count), 0);
+  EXPECT_FALSE(cfg->report_dest_info);
   config_delete(cfg);
 }
 
@@ -2283,15 +2656,35 @@ static void test_parse_args_filter_rules() {
   EXPECT_EQ_INT(parse_args(cfg, 4, missing_argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 
-  /* rsync shorthands/modifiers we do not support are rejected instead of being
-   * silently parsed as literal patterns. */
-  static const char* const unsupported[] = {
-      ": .rsync-filter", ". /tmp/rules", "-s foo", "-p bar", "-C", "-! *.o", "!",
+  /* Full rsync grammar (rule words, modifiers, clear) is supported. */
+  cfg = config_create();
+  positional_count = 0;
+  char* grammar_argv[] = {"fastsync",
+                          "--filter=hide *.tmp",
+                          "--filter=show *.txt",
+                          "--filter=protect *.bak",
+                          "--filter=risk *.o",
+                          "--filter=-s foo",
+                          "--filter=-p bar",
+                          "--filter=-! *.o",
+                          "--filter=dir-merge .rules",
+                          "--filter=!",
+                          "/src",
+                          "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 11, grammar_argv, positional_args, &positional_count), 0);
+  config_delete(cfg);
+
+  /* Genuinely malformed rules are still rejected. */
+  static const char* const malformed[] = {
+      "merge",          /* merge requires a filename */
+      "dir-merge",      /* dir-merge requires a filename */
+      "clear extra",    /* clear takes no pattern */
+      "no-such-rule x", /* unknown rule word */
   };
-  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
     cfg = config_create();
     positional_count = 0;
-    char* rule_argv[] = {"fastsync", "--filter", (char*)unsupported[i], "/src", "/dst"};
+    char* rule_argv[] = {"fastsync", "--filter", (char*)malformed[i], "/src", "/dst"};
     EXPECT_EQ_INT(parse_args(cfg, 5, rule_argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
@@ -2480,10 +2873,13 @@ static void test_parse_args_delete_policy_invalid_values() {
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
   config_delete(cfg);
 
+  /* A negative --max-delete is rsync's deprecated "no client limit" spelling:
+     parse succeeds and every negative value clamps to -1. */
   cfg = config_create();
   char* argv2[] = {"fastsync", "--max-delete=-3", "/src", "/dst"};
   positional_count = 0;
-  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->max_delete, -1);
   config_delete(cfg);
 }
 
@@ -2739,6 +3135,92 @@ static void test_parse_args_usermap_name_resolution() {
   config_delete(cfg);
 }
 
+/* #294: rsync map FROM forms -- inclusive numeric ranges, '*' (any), and the
+ * empty token (ids with no name on the sender).  A TO name is transmitted as a
+ * NAME for the receiver to resolve (rsync resolves TO names on the receiving
+ * side), not resolved against the client's database. */
+static void test_parse_args_usermap_rsync_forms() {
+  int positional_args[2];
+
+  Config* cfg = config_create();
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--usermap=0-99:nobody", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].from, 0);
+  EXPECT_EQ_INT(cfg->usermap[0].from_hi, 99);
+  EXPECT_TRUE(cfg->preserve_owner);
+  config_delete(cfg);
+
+  /* Empty FROM => IDENTITY_MATCH_UNNAMED. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--usermap=:@0", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_EQ_INT(cfg->usermap[0].from, IDENTITY_MATCH_UNNAMED);
+  EXPECT_EQ_INT(cfg->usermap[0].from_hi, IDENTITY_MATCH_UNNAMED);
+  config_delete(cfg);
+
+  /* '*' FROM => IDENTITY_MATCH_ANY. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--groupmap=*:@0", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->groupmap[0].from, IDENTITY_MATCH_ANY);
+  EXPECT_EQ_INT(cfg->groupmap[0].from_hi, IDENTITY_MATCH_ANY);
+  config_delete(cfg);
+
+  /* A TO name is kept as a receiver-resolved name, NOT resolved locally. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--usermap=0:nobody", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_NOT_NULL(cfg->usermap[0].to_name);
+  if (cfg->usermap[0].to_name)
+    EXPECT_EQ_STR(cfg->usermap[0].to_name, "nobody");
+  config_delete(cfg);
+}
+
+/* #294: rsync refuses to mix --chown with --usermap/--groupmap on the same
+ * side (either order).  --chown=USER conflicts with a prior --usermap;
+ * --chown=:GROUP conflicts with a prior --groupmap; the opposite side is fine. */
+static void test_parse_args_identity_map_chown_conflict() {
+  int positional_args[2];
+  struct {
+    const char* a;
+    const char* b;
+  } bad[] = {
+      {"--usermap=0:1", "--chown=2:3"},  {"--chown=2:3", "--usermap=0:1"},
+      {"--chown=2", "--usermap=0:1"},    {"--chown=2:3", "--groupmap=0:1"},
+      {"--groupmap=0:1", "--chown=2:3"}, {"--chown=:3", "--groupmap=0:1"},
+  };
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)bad[i].a, (char*)bad[i].b, "/src", "/dst"};
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+
+  /* The opposite-side combinations rsync allows must still parse. */
+  struct {
+    const char* a;
+    const char* b;
+  } ok[] = {
+      {"--chown=2", "--groupmap=0:1"},
+      {"--chown=:3", "--usermap=0:1"},
+  };
+  for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", (char*)ok[i].a, (char*)ok[i].b, "/src", "/dst"};
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    config_delete(cfg);
+  }
+}
+
 /* --chown parses USER:GROUP / USER / :GROUP, numeric ids, and '*'. */
 static void test_parse_args_chown() {
   Config* cfg = config_create();
@@ -2788,6 +3270,27 @@ static void test_parse_args_chown() {
   EXPECT_EQ_INT(cfg->chown_uid, IDENTITY_CURRENT);
   EXPECT_TRUE(cfg->chown_gid_set);
   EXPECT_EQ_INT(cfg->chown_gid, IDENTITY_CURRENT);
+  config_delete(cfg);
+
+  /* A --chown NAME is converted to the equivalent receiver-resolved map rule
+   * (rsync implements --chown as --usermap=*:USER --groupmap=*:GROUP), so the
+   * name is carried on the wire as to_name instead of being resolved on the
+   * sender.  A name that does not exist on the sender is accepted and left for
+   * the receiver to resolve (or warn about), matching rsync. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv5[] = {"fastsync", "--chown=no_such_user_zzz:no_such_group_zzz", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->usermap_count, 1);
+  EXPECT_NOT_NULL(cfg->usermap[0].to_name);
+  if (cfg->usermap[0].to_name)
+    EXPECT_EQ_STR(cfg->usermap[0].to_name, "no_such_user_zzz");
+  EXPECT_FALSE(cfg->chown_uid_set);
+  EXPECT_EQ_INT(cfg->groupmap_count, 1);
+  EXPECT_NOT_NULL(cfg->groupmap[0].to_name);
+  if (cfg->groupmap[0].to_name)
+    EXPECT_EQ_STR(cfg->groupmap[0].to_name, "no_such_group_zzz");
+  EXPECT_FALSE(cfg->chown_gid_set);
   config_delete(cfg);
 }
 
@@ -2856,12 +3359,13 @@ static void test_parse_args_rejects_malformed_identity() {
     const char* val;
   } bad[] = {
       {"--usermap", "@1000"},
-      {"--usermap", ":1000"},
       {"--usermap", "definitely_not_a_real_user_zzz:@1"},
+      {"--usermap", "0-"},
+      {"--usermap", "5-2:@1"},
+      {"--usermap", "roo*:@1"},
       {"--groupmap", "@1"},
       {"--groupmap", "no_such_group_qqq:x"},
       {"--chown", "a:b:c"},
-      {"--chown", "no_such_user_zzz:"},
       {"--copy-as", ""},
       {"--copy-as", ":"},
       {"--copy-as", "a:b:c"},
@@ -3129,6 +3633,24 @@ static void test_parse_args_remote_option_multiple() {
   EXPECT_EQ_STR(cfg->remote_options[0], "--allow-delete");
   EXPECT_EQ_STR(cfg->remote_options[1], "--verbose");
   config_delete(cfg);
+}
+
+/* The -M=value and -Mvalue short forms are expanded by the cluster expander to
+ * "-M value" before parsing; both must still collect the remote option (there
+ * is no dedicated -M= branch). */
+static void test_parse_args_remote_option_short_forms() {
+  static const char* const forms[] = {"-M=--allow-delete", "-M--allow-delete"};
+  for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+    Config* cfg = valid_client_config();
+    EXPECT_NOT_NULL(cfg);
+    char* argv[] = {"fastsync", "--source-dir", "/src", "--dest-dir", "/dst", (char*)forms[i]};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(cfg->remote_option_count, 1);
+    EXPECT_EQ_STR(cfg->remote_options[0], "--allow-delete");
+    config_delete(cfg);
+  }
 }
 
 /* Space-separated form "--remote-option OPT" also parses. */
@@ -3632,12 +4154,254 @@ static void test_parse_args_acls_implies_perms_xattrs_does_not() {
   config_delete(cfg);
 }
 
+/* rsync short-option clustering: boolean shorts bundle after one dash
+ * (-av == -a -v, -aAX, -rlpt), including the -r recursive no-op. */
+static void test_parse_args_short_clustering() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "-av", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_TRUE(cfg->preserve_owner);
+  EXPECT_TRUE(cfg->preserve_group);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_ax[] = {"fastsync", "-aAX", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_ax, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->preserve_acls);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_rlpt[] = {"fastsync", "-rlpt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_rlpt, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->follow_symlinks);
+  EXPECT_TRUE(cfg->preserve_perms);
+  EXPECT_TRUE(cfg->preserve_times);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+/* Attached short-option values: a value-taking short consumes the remainder of
+ * its token as the value (-B32768, -essh, -Mfoo, -B=... also tolerated). */
+static void test_parse_args_attached_short_values() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+
+  char* argv_b[] = {"fastsync", "-B32768", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_b, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 32768);
+  config_delete(cfg);
+
+  /* An oversized block size parses (and warns) but keeps the default, exactly
+   * like the long --block-size form. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_big[] = {"fastsync", "-B1048576", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_big, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, (int)DELTA_BLOCK_SIZE_DEFAULT);
+  config_delete(cfg);
+
+  /* A separate value still works for a short written alone. */
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_sep[] = {"fastsync", "-B", "8192", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_sep, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT((int)cfg->delta_block_size, 8192);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_e[] = {"fastsync", "-essh", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_e, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->rsh_command, "ssh");
+  config_delete(cfg);
+
+  cfg = valid_client_config();
+  positional_count = 0;
+  char* argv_m[] = {"fastsync", "-Mfoo=bar", "--source-dir", "/src", "--dest-dir", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 6, argv_m, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->remote_option_count, 1);
+  EXPECT_EQ_STR(cfg->remote_options[0], "foo=bar");
+  config_delete(cfg);
+}
+
+/* Inline --opt=value forms for options that previously only accepted a
+ * separate argument. */
+static void test_parse_args_inline_equals_forms() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--exclude=*.log", "--include=*.txt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->exclude_count, 1);
+  EXPECT_EQ_STR(cfg->exclude_patterns[0], "*.log");
+  EXPECT_EQ_INT(cfg->include_count, 1);
+  EXPECT_EQ_STR(cfg->include_patterns[0], "*.txt");
+  /* The same patterns are compiled, in command-line order, into the shared
+   * ordered --filter rule list (rsync first-match-wins). */
+  EXPECT_NOT_NULL(cfg->filters);
+  EXPECT_EQ_INT(cfg->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg->filters->items[0], "- *.log");
+  EXPECT_EQ_STR((char*)cfg->filters->items[1], "+ *.txt");
+  config_delete(cfg);
+
+  const char* list_path = "cli_inline_patterns.txt";
+  write_file_bytes(list_path, "*.o\nbuild/\n", 11);
+  cfg = config_create();
+  positional_count = 0;
+  char arg_excl[64];
+  snprintf(arg_excl, sizeof(arg_excl), "--exclude-from=%s", list_path);
+  char arg_incl[64];
+  snprintf(arg_incl, sizeof(arg_incl), "--include-from=%s", list_path);
+  char* argv2[] = {"fastsync", arg_excl, arg_incl, "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->exclude_count, 2);
+  EXPECT_EQ_STR(cfg->exclude_patterns[0], "*.o");
+  EXPECT_EQ_STR(cfg->exclude_patterns[1], "build/");
+  EXPECT_EQ_INT(cfg->include_count, 2);
+  remove(list_path);
+  config_delete(cfg);
+
+  const char* log_path = "cli_inline_log.txt";
+  cfg = config_create();
+  positional_count = 0;
+  char arg_log[64];
+  snprintf(arg_log, sizeof(arg_log), "--log-file=%s", log_path);
+  char* argv3[] = {"fastsync", arg_log, "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv3, positional_args, &positional_count), 0);
+  EXPECT_NOT_NULL(cfg->log_file);
+  config_delete(cfg);
+  remove(log_path);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv4[] = {"fastsync", "--chmod=u=rw,go=r", "--out-format=%f %l", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
+  EXPECT_EQ_STR(cfg->chmod_spec, "u=rw,go=r");
+  EXPECT_EQ_STR(cfg->out_format, "%f %l");
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv5[] = {"fastsync", "--chunk-size=4096", "--delta-max=1048576", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv5, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->chunk_size == 4096ULL);
+  EXPECT_TRUE(cfg->delta_max_file_size == 1048576ULL);
+  config_delete(cfg);
+}
+
+/* --exclude/--include compile into the SAME ordered filter list as --filter, so
+ * rsync's first-match-wins semantics hold: the common `--include='*.txt'
+ * --exclude='*'` idiom keeps the .txt files and drops the rest, and an
+ * --include rule with no matching exclude is not a mandatory whitelist. */
+static void test_parse_args_include_exclude_order() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--include=*.txt", "--exclude=*", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_NOT_NULL(cfg->filters);
+  EXPECT_EQ_INT(cfg->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg->filters->items[0], "+ *.txt");
+  EXPECT_EQ_STR((char*)cfg->filters->items[1], "- *");
+  /* The order is reversible on the command line and the list follows it. */
+  Config* cfg2 = config_create();
+  positional_count = 0;
+  char* argv2[] = {"fastsync", "--exclude=*", "--include=*.txt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg2, 5, argv2, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg2->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg2->filters->items[0], "- *");
+  EXPECT_EQ_STR((char*)cfg2->filters->items[1], "+ *.txt");
+  /* --filter and --exclude/--include interleave in command-line order. */
+  Config* cfg3 = config_create();
+  positional_count = 0;
+  char* argv3[] = {"fastsync", "--filter=- *.tmp", "--include=*.txt", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg3, 5, argv3, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg3->filters->size, 2);
+  EXPECT_EQ_STR((char*)cfg3->filters->items[0], "- *.tmp");
+  EXPECT_EQ_STR((char*)cfg3->filters->items[1], "+ *.txt");
+  config_delete(cfg);
+  config_delete(cfg2);
+  config_delete(cfg3);
+}
+
+/* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive) must never
+ * swallow the next argv: `fastsync -s SRC DST` keeps both positionals. */
+static void test_parse_args_noop_does_not_consume_argv() {
+  static const char* const noops[] = {"-s", "--secluded-args", "-r", "--recursive"};
+  for (size_t i = 0; i < sizeof(noops) / sizeof(noops[0]); i++) {
+    Config* cfg = config_create();
+    int positional_args[2];
+    int positional_count = 0;
+    char* argv[] = {"fastsync", (char*)noops[i], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_EQ_INT(positional_count, 2);
+    config_delete(cfg);
+  }
+
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "-sv", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(positional_count, 2);
+  config_delete(cfg);
+}
+
+/* -b/--backup and -L/--copy-links short aliases behave like their long forms. */
+static void test_parse_args_backup_copy_links_shorts() {
+  Config* cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv_b[] = {"fastsync", "-b", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_b, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->backup);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_l[] = {"fastsync", "-L", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_l, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->copy_links);
+  config_delete(cfg);
+}
+
+/* An unknown short option (alone or inside a cluster) is rejected, never
+ * silently ignored. */
+static void test_parse_args_rejects_unsupported_short() {
+  static const char* const bad[] = {"-Q", "-aQ", "-rZ", "-9"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    Config* cfg = config_create();
+    int positional_args[2];
+    int positional_count = 0;
+    char* argv[] = {"fastsync", (char*)bad[i], "/src", "/dst"};
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+    config_delete(cfg);
+  }
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
   test_parse_args_usermap();
   test_parse_args_groupmap();
   test_parse_args_usermap_name_resolution();
+  test_parse_args_usermap_rsync_forms();
+  test_parse_args_identity_map_chown_conflict();
   test_parse_args_chown();
   test_parse_args_copy_as();
   test_parse_args_rejects_malformed_identity();
@@ -3680,6 +4444,8 @@ void test_client_cli() {
   test_parse_args_executability();
   test_parse_args_chmod();
   test_parse_args_numeric_chmod();
+  test_parse_args_accepts_selector_chmod();
+  test_parse_args_appends_repeated_chmod();
   test_parse_args_rejects_invalid_chmod();
   test_parse_args_invalid_port();
   test_parse_args_non_numeric_port();
@@ -3693,6 +4459,8 @@ void test_client_cli() {
   test_parse_args_debug_flags();
   test_parse_args_debug_help();
   test_parse_args_debug_flags_validation();
+  test_parse_args_rsync_flag_vocabulary_accepted();
+  test_parse_args_debug_info_levels();
   test_parse_args_modify_window();
   test_parse_args_rejects_invalid_modify_window();
   test_parse_args_skip_compress();
@@ -3716,6 +4484,7 @@ void test_client_cli() {
   test_parse_args_info_flags();
   test_parse_args_info_verbose_order();
   test_parse_args_rejects_invalid_info_flag();
+  test_parse_args_info_name_and_help();
   test_parse_args_archive();
   test_parse_args_preserve_attributes_are_independent();
   test_parse_args_preserve_long_form();
@@ -3770,10 +4539,19 @@ void test_client_cli() {
   test_parse_args_list_only();
   test_parse_args_out_format();
   test_parse_args_log_file_format();
+  test_parse_args_report_dest_info_modes();
+  test_parse_args_skip_compress_dash_value();
   test_parse_args_checksum_choice_aliases();
   test_parse_args_checksum_choice_requires_value();
   test_parse_args_checksum_choice_equals_forms();
   test_parse_args_checksum_choice_rejects_unsupported();
+  test_parse_args_checksum_choice_new_algos();
+  test_parse_args_checksum_none_with_checksum_rejected();
+  test_parse_args_checksum_implies_incremental_only();
+  test_parse_args_no_whole_file();
+  test_parse_args_timeout_zero_and_no_forms();
+  test_parse_args_compress_choice_parity();
+  test_validate_config_remote_option_requires_ssh();
   test_parse_args_checksum_seed();
   test_parse_args_temp_dir();
   test_parse_args_delay_updates();
@@ -3792,6 +4570,7 @@ void test_client_cli() {
   test_parse_args_trust_sender_default_false();
   test_parse_args_trust_sender();
   test_parse_args_remote_option_multiple();
+  test_parse_args_remote_option_short_forms();
   test_parse_args_remote_option_space_form();
   test_parse_args_remote_option_missing_value();
   test_parse_args_remote_option_rejects_bad_values();
@@ -3801,4 +4580,11 @@ void test_client_cli() {
   test_parse_args_pattern_file_oversized_rejected();
   test_parse_args_unsigned_options_reject_sign();
   test_validate_config_dry_run_rejects_write_batch();
+  test_parse_args_short_clustering();
+  test_parse_args_attached_short_values();
+  test_parse_args_inline_equals_forms();
+  test_parse_args_include_exclude_order();
+  test_parse_args_noop_does_not_consume_argv();
+  test_parse_args_backup_copy_links_shorts();
+  test_parse_args_rejects_unsupported_short();
 }

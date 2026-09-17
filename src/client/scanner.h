@@ -63,8 +63,23 @@ typedef struct {
   const FileListSet* file_list;       /* --files-from allow-set, or NULL */
   const FilterRuleList* base_filters; /* command-line + -C rules, or NULL */
   bool per_dir_filters;               /* -F: read .rsync-filter per directory */
-  bool dirs;                          /* -d/--dirs: transfer dir entries, no recursion */
-  bool relative;                      /* -R/--relative (dest rel paths, with --files-from) */
+  /* --delete-excluded: per-directory plain rules become sender-only, so they no
+     longer protect the receiver from deletion. */
+  bool delete_excluded;
+  /* -FF: also exclude the per-directory filter files themselves from the
+     transfer (single -F transfers them). */
+  bool exclude_per_dir_filter_files;
+  bool dirs;     /* -d/--dirs: transfer dir entries, no recursion */
+  bool relative; /* -R/--relative (dest rel paths, with --files-from) */
+  /* -R/--relative outside --files-from: the destination-relative path prefix
+   * reconstructed from the source spec (rsync's '/./' cut point), or NULL when
+   * -R is off or --files-from is in use (the bare-relative path then comes from
+   * the listed entry).  Borrowed read-only; owned by client_send. */
+  const char* relative_prefix;
+  /* --list-only: emit an is_dir File for every traversed directory (the listing
+   * includes directory entries, matching rsync).  Client-only; never set on a
+   * real transfer, which relies on implicit parent creation. */
+  bool list_dirs;
   /* --prune-empty-dirs (long only): in --dirs mode an empty source directory's
      explicit entry is omitted from the transfer file list (so nothing is
      created at the destination and it can be pruned by --delete); explicitly
@@ -73,17 +88,39 @@ typedef struct {
   bool prune_empty_dirs;
   /* Delete-excluded protection sink (optional): when non-NULL the scanner
    * appends the destination-relative path of every entry it prunes because a
-   * USER SELECTION rule excluded it (--filter/-C/per-dir rules, the legacy
-   * --exclude/--include layer, and --max-size/--min-size).  The sender turns
-   * this list into the manifest's protected prefixes so `--delete` leaves the
-   * destination mirror of excluded source paths alone (rsync's default), and
-   * empties it when --delete-excluded opts back into deleting them.  NOT
-   * recorded for --files-from subset pruning (whose delete semantics stay
-   * keep-set-only) or for -R/--files-from relative wire paths.  When
-   * `excluded_mutex` is non-NULL it is taken around every append (the parallel
-   * scanner shares one list across its worker threads). */
+   * USER SELECTION rule excluded it (--filter/-C/per-dir rules and the legacy
+   * --exclude/--include layer).  The sender turns this list into the manifest's
+   * protected prefixes so `--delete` leaves the destination mirror of excluded
+   * source paths alone (rsync's default), and drops it when --delete-excluded
+   * opts back into deleting them.  NOT recorded for --files-from subset pruning
+   * (whose delete semantics derive from the synchronized-directory set) or for
+   * -R/--files-from relative wire paths.  When `excluded_mutex` is non-NULL it
+   * is taken around every append (the parallel scanner shares one list across
+   * its worker threads). */
   ArrayList* excluded_paths;
   mtx_t* excluded_mutex;
+  /* Size-prune protection sink (optional): when non-NULL the scanner appends
+   * the destination-relative path of every entry it skipped because of
+   * --max-size/--min-size.  rsync never deletes a size-skipped source mirror,
+   * even under --delete-excluded, so the sender always transmits this list as
+   * protected prefixes (unlike excluded_paths, which --delete-excluded drops).
+   * Guarded by `excluded_mutex` like excluded_paths. */
+  ArrayList* size_skipped_paths;
+  /* Synchronized-directory sink (optional): when non-NULL the scanner appends
+   * the destination-relative path of every directory it is about to traverse
+   * that lies inside a --files-from listed directory (or of every traversed
+   * directory when there is no list).  The sender sends this set with the delete
+   * manifest so the receiver confines its extras walk to synchronized
+   * directories, exactly like rsync; the receive root is the "." sentinel.
+   * Guarded by `excluded_mutex`. */
+  ArrayList* synced_dirs;
+  /* Delete-plan directory sink (optional): when non-NULL the scanner appends
+   * the destination-relative path of every directory it traverses (except the
+   * receive root).  The per-directory --delete-during/--delete-delay plan
+   * builder uses this to keep an empty in-scope source directory (rsync keeps
+   * it) and to emit its plan after the data stream, when no file frame would
+   * otherwise trigger it.  Guarded by `excluded_mutex`. */
+  ArrayList* plan_dirs;
   /* --ignore-errors: an unreadable directory during the scan is recorded as an
    * I/O error and skipped instead of aborting the scan.  Client-only. */
   bool ignore_io_errors;
@@ -193,6 +230,13 @@ bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entr
  * when `fs_path` is not under `root`). Handles trailing slashes and a root of
  * "/". Exposed so tests can exercise the mapping directly. */
 char* scanner_path_relative(const char* root, const char* fs_path);
+
+/* -R/--relative destination-relative prefix reconstructed from a source spec:
+ * the path after rsync's first '.' path component (the '/./' cut point), with
+ * leading/trailing slashes removed, or the whole spec (normalized) when there
+ * is no cut.  Returns "" for the receive root, or NULL when `spec` is NULL or
+ * allocation fails.  Exposed so tests can exercise the mapping directly. */
+char* scanner_relative_prefix(const char* spec);
 
 ParallelScanner* parallel_scanner_create_with_options(const char* root_directory,
                                                       const ScannerOptions* options,

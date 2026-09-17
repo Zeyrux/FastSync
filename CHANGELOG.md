@@ -4,6 +4,147 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [2.26.0] - 2026-09-17
+
+### Added
+
+- **Parity-completion wave.** Closed the remaining rsync-parity gaps against
+  rsync 3.4.1 and reclassified the inherently non-rsync rows. It moved the wire
+  protocol three times (`2.23.0 → 2.24.0 → 2.25.0 → 2.26.0`).
+  - **Delete timing (2.24.0):** per-directory delete plans
+    (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`. An interrupted
+    during-transfer has already removed the reached directories' extras, while a
+    delayed transfer commits per directory only after the whole transfer
+    succeeds (a late-created extra survives `--delete-delay` but not
+    `--delete-after`). `-R --delete` is scoped to the transferred prefix; empty
+    in-scope source directories survive; dry-run never deletes.
+  - **Wire stats (2.25.0):** `STATUS_STATS` carries the receiver counters
+    (matched data, deleted files) and the dry-run would-delete list. `--stats`
+    prints rsync's protocol-independent lines; `--progress`/`-P` print per-file
+    blocks; `--out-format` gains `%b` (wire bytes), `%c` (block-sum bytes) and
+    `%C` (whole-file digest); `-n --delete` prints escaped `*deleting` lines in
+    the sequential and `--threads` paths.
+  - **Codecs (2.26.0):** `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/
+    `none` checksums, with rsync-style `auto` negotiation (default `xxh128` +
+    `zstd`) and exit-4 rejection of unknown names; the resolved `compression_algo`
+    crosses the wire.
+  - General `-R`/`--relative` (including the `/./` cut) and `--no-implied-dirs`;
+    one-level `-d`/`--dirs` listing for `dir`, `dir/` and `.`; the full filter
+    grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` and
+    modifiers) with `-f` bound to `--filter`; a single `-F` transfers
+    `.rsync-filter` and `-FF` excludes it.
+  - Receiver-side `--chown`/`--usermap`/`--groupmap` TO-name resolution; absolute
+    basis directories and a `--link-dest` relink of an up-to-date destination;
+    a receiver-side `--ignore-existing` short-circuit before any payload;
+    `--preallocate` now wins over `--sparse` via `fallocate(2)`.
+  - Client quick wins: `--iconv=.`/`-`/`--no-iconv`, a lone `-h` prints help, an
+    empty `--files-from` succeeds (exit 0), a broken referent under
+    `-L`/`--copy-unsafe-links` exits 23, the full `--info`/`--debug`
+    vocabularies, and the aliases `--ignore-non-existing`, `--protect-args`,
+    `--msgs2stderr`.
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.23.0 → 2.24.0` (delete plans),
+  `2.24.0 → 2.25.0` (`STATUS_STATS` + `report_stats`), and
+  `2.25.0 → 2.26.0` (codec negotiation + `md4`/`sha1`/`none`).
+- `--checksum-choice`/`--cc` now accepts `md4`, `sha1`, `none` and the two-name
+  form; the negotiated whole-file default is `xxh128`.
+- `--compress-choice`/`--zc` now accepts `lz4`, `zlib`, `zlibx`.
+- `RSYNC_COMPAT.md` reclassifies the matrix: 9 already-parity rows to ✅, 17
+  inherently non-rsync rows to ❌ (native daemon config/auth, batch, privileged
+  xattr namespaces, and the safe-subset device/privilege flags), and the genuine
+  fixes to ✅; new rows cover `--bwlimit`, `--partial`, `--partial-dir`,
+  `--no-whole-file`, `--inc-recursive`/`--no-inc-recursive`, `--protect-args`
+  and `--msgs2stderr`.
+- The client `--help` `--max-delete` text now describes the implemented partial
+  semantics (delete up to N, skip the rest, exit 25).
+
+### Notes
+
+- Remaining documented divergences include the `--stats` per-type file-count
+  breakdown, `%b`/`%c` being FastSync wire counts, `-n --delete` line ordering,
+  the default `--delete` timing (delete-after, not rsync's delete-during),
+  destination-only exclude protection (still sender-derived), `--temp-dir`
+  absolute paths, basis-dir attribute re-application and the 256 MiB whole-file
+  cap, `--fuzzy` tie-breaking, `--bwlimit=0`/decimal rates, `zlibx`==`zlib`, and
+  recursive empty-directory creation.
+- Build: adds zlib and lz4 as link dependencies.
+
+## [2.23.0] - 2026-09-16
+
+### Added
+
+- **Rsync-parity wave.** Closed the remaining CLI, filesystem, ownership,
+  deletion, and output gaps against rsync 3.4.1.
+  - Short options `-r` (`--recursive`), `-b` (`--backup`), `-L`
+    (`--copy-links`), and `-B` (`--block-size`/`--delta-block`); rsync
+    short-option clustering (`-av`, `-aAX`, `-rlpt`) and attached/inline values
+    (`--opt=value`, `-B1000`, `-essh`, `-MOPT`). A value that starts with `-`
+    is not mistaken for a cluster.
+  - `-c`/`--checksum` now implies the incremental checksum quick-check (and,
+    like rsync, does not imply `-t`).
+  - `--checksum-choice`/`--cc` accepts `xxh64`/`xxhash`/`xxh3`/`xxh128`/`md5`/
+    `auto` and rejects `md4`/`sha1`/`none` and the two-name form by name;
+    `--checksum-seed=0` (the default) is randomized per transfer and the chosen
+    seed is sent to the receiver.
+  - `--compress-choice`/`--zc` accepts `zstd`/`none`/`auto` and rejects
+    `lz4`/`zlib`/`zlibx` by name; `--skip-compress` defaults to rsync 3.4.1's
+    built-in suffix list; `--no-whole-file` is accepted.
+  - `--timeout` defaults to 0 (disabled) and `--contimeout` to 60 s (both `0`
+    disables), matching rsync; `--max-alloc=0` means no local limit.
+  - `--temp-dir` is confined to the receive root (absolute/`..` rejected by the
+    receiver) and an `EXDEV` install falls back to a non-atomic copy.
+  - `--numeric-ids` is documented as a mapping modifier only;
+    `--usermap`/`--groupmap` support inclusive `LOW-HIGH` ranges, `*`,
+    empty-`FROM` (unnamed ids), and receiver-resolved `TO` names; `--chown`
+    conflicts with a map on the same side are rejected.
+  - `--fake-super` records the *resolved* owner (never a real chown) and replays
+    mode/time; directory ownership and directory xattrs/ACLs are preserved.
+  - `-l`/`--links` stores symlink targets verbatim (absolute and `..`-bearing
+    included), matching rsync; `--safe-links`/`--copy-unsafe-links` are applied
+    sender-side and `--munge-links` uses rsync's `/rsyncd-munged/` marker;
+    `--trust-sender` no longer affects symlink targets.
+  - `--specials` recreates unix sockets with `mknod(S_IFSOCK)` (so `-D` covers
+    the full rsync node set).
+  - Deletion: the manifest carries a synchronized-directory section so
+    `--files-from` subsets no longer delete untransmitted paths;
+    `--delete-excluded` leaves size-pruned mirrors protected; extraneous
+    destination symlinks are unlinked (never followed); `--max-delete=N` is
+    partial (delete up to N, skip the rest, exit 25) and `--delete-missing-args`
+    removals draw from the same budget; `--force` is honored during
+    `--delay-updates` publication.
+  - `-x`/`--one-file-system` emits the mount-point directory entry; the
+    `--include`/`--exclude` layers are an ordered first-match rule list.
+  - `--chmod` is a faithful port of rsync 3.4.1 (numeric/symbolic, `D`/`F`/`X`,
+    `s`/`t`, append semantics, no `-p` implication, no sanitization).
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.22.0 → 2.23.0`: the delete manifest gains a
+  synchronized-directory section and the terminal status gains
+  `STATUS_DELETE_LIMIT` (client exit 25 on a `--max-delete`-capped commit).
+- **The 2.22.0 mode-masking divergence is removed.** Under `-p` the source mode
+  is copied exactly, including `S_IWGRP`/`S_IWOTH` and setuid/setgid/sticky;
+  `--chmod` no longer implies `-p`. New files without `-p` still use
+  `source_mode & ~umask` when metadata is present (else `0644`), and new
+  directories without `-p` still use the `0755` creation default.
+- `--protocol=NUM` accepts only the current `2.23.0` version string.
+
+### Notes
+
+- The rsync-compatibility matrix (`RSYNC_COMPAT.md`) now classifies every row
+  as **parity**, **caveat** (works with a documented divergence), or
+  **divergent** (not supported/no-op/impossible), replacing the previous
+  misleading "N implemented / 0 divergence" summary. Durable documented
+  divergences remain: receiver-side symlink target containment is not enforced
+  by default (verbatim storage is rsync parity; use `--safe-links`),
+  `--temp-dir` rejects absolute/foreign-filesystem paths, `--copy-devices`
+  reads a bounded `st_size`, a broken referent under `--copy-links` exits 0,
+  new directories without `-p` use `0755`, `--stats` receiver-only counters are
+  0, and `--password-file`/`--early-input`/`--hash-credentials`/`--iterations`
+  and the batch format are FastSync-native.
+
 ## [2.22.0] - 2026-09-15
 
 ### Added

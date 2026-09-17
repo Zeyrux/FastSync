@@ -30,10 +30,14 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->max_queue_bytes = 0;
   context->manifest = NULL;
   context->excluded_paths = NULL;
+  context->size_skipped_paths = NULL;
+  context->synced_dirs = NULL;
+  context->plan_dirs = NULL;
   context->missing_args = NULL;
   context->scan_had_io_error = false;
   context->remove_source_files = NULL;
   context->early_delete = false;
+  context->delete_plans = NULL;
   context->scan_stopped_early = false;
   context->total_files = 0;
   context->progress_bytes = 0;
@@ -44,6 +48,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   protocol_session_set_max_alloc(&context->allocation_session, config->max_alloc);
   context->dir_entries = NULL;
   context->dir_entries_mutex_init = false;
+  context->delete_limit = false;
   int init = 0;
   if (config->use_metadata) {
     context->dir_entries = array_list_create(file_destroy);
@@ -184,8 +189,16 @@ void pipeline_context_sender_destroy(PipelineContextSender* context) {
   if (context->manifest) {
     array_list_delete(context->manifest);
   }
+  if (context->delete_plans)
+    delete_plan_sender_destroy(context->delete_plans);
   if (context->excluded_paths)
     array_list_delete(context->excluded_paths);
+  if (context->size_skipped_paths)
+    array_list_delete(context->size_skipped_paths);
+  if (context->synced_dirs)
+    array_list_delete(context->synced_dirs);
+  if (context->plan_dirs)
+    array_list_delete(context->plan_dirs);
   if (context->missing_args)
     array_list_delete(context->missing_args);
   if (context->remove_source_files)

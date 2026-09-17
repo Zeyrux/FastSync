@@ -56,6 +56,8 @@ typedef struct {
 
 FileXattrList* xattr_list_new(void);
 void xattr_list_free(FileXattrList* list);
+/* Deep-copy `list` (NULL in, NULL out).  Returns NULL on allocation failure. */
+FileXattrList* xattr_list_clone(const FileXattrList* list);
 /* Append one entry (deep copy).  Returns false on allocation failure. */
 bool xattr_list_append(FileXattrList* list, const char* name, const void* value, size_t value_len);
 
@@ -96,17 +98,17 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
                          int64_t mtime_nsec);
 
 /* --fake-super replay: parse the FAKESUPER_XATTR record previously written on
- * `fd` by fake_super_store_fd and re-apply uid/gid/mode/mtime fd-relative.
- * Best-effort: absence of the xattr or a malformed record is a silent no-op
- * that never fails the transfer.  The OWNER leg is applied only when an explicit
- * ownership identity policy is active (numeric-ids/chown/usermap/groupmap/
- * copy-as/-o/-g), when super-user activities are permitted, and when --copy-as
- * is not authoritative; a non-root EPERM/EACCES is skipped silently, matching
- * FastSync's identity philosophy.  The MODE leg is applied only when
- * policy.perms||policy.executability and the MTIME leg only when policy.times,
- * so the fake-super replay cannot bypass the per-attribute split; the mode is
- * sanitized exactly like the normal metadata path (group/other write bits never
- * granted).  Returns true when the xattr was present and parsed. */
+ * `fd` by fake_super_store_fd and re-apply mode/mtime fd-relative.  The
+ * recorded uid/gid are deliberately NOT chowned for real: --fake-super only
+ * RECORDS ownership (the caller stores the resolved mapping via
+ * identity_resolve_storage_ids), it never performs a real chown.  Best-effort:
+ * absence of the xattr or a malformed record is a silent no-op that never fails
+ * the transfer.  The MODE leg is applied only when policy.perms||policy.
+ * executability and the MTIME leg only when policy.times, so the fake-super
+ * replay cannot bypass the per-attribute split; the mode follows the normal
+ * metadata path exactly (under --perms the source mode is copied verbatim,
+ * special and group/other write bits included).
+ * Returns true when the xattr was present and parsed. */
 bool fake_super_restore_fd(int fd, FileAttrPolicy policy);
 
 #endif

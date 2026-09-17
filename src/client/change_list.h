@@ -2,7 +2,9 @@
 #define CHANGE_LIST_H
 
 #include "config.h"
+#include "checksum.h"
 #include "file_types.h"
+#include "format.h"
 #include <stdbool.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -26,42 +28,59 @@ typedef enum {
 } ChangeDecision;
 
 typedef struct {
-  const char* path; /* full source path */
+  const char* path; /* long-form display path (rsync %f) */
+  const char* name; /* transfer-relative path (rsync %n), no trailing slash */
   ChangeDecision decision;
   bool is_directory;
-  unsigned long long size; /* source file length in bytes */
-  /* The number of bytes reported for a sent file. FastSync has no wire-byte
-   * counter, so this is always the source length (== size / %l); actual
-   * post-compression/delta bytes on the wire are not counted. */
-  unsigned long long bytes_sent;
-  time_t mtime_sec; /* 0 when unknown */
+  bool is_symlink;
+  bool is_special;
+  bool is_hardlink; /* a hard-link sibling (linked, no data sent) */
+  bool deleted;     /* a would-delete report (-n --delete); no source file */
+  const char* symlink_target;
+  const char* hardlink_target;
+  unsigned long long size;       /* source file length in bytes */
+  unsigned long long bytes_sent; /* wire bytes actually transferred (rsync %b) */
+  unsigned long long bytes_read; /* wire bytes read back for this file (rsync %c) */
+  /* rsync %C: whole-file checksum hex for a transferred regular file.  Only
+   * filled when the active format uses %C (checksum_known == false otherwise,
+   * which renders as spaces like rsync for non-regular entries). */
+  bool checksum_known;
+  char checksum[CHECKSUM_MAX_DIGEST_LEN * 2 + 1];
+  time_t mtime_sec;
+  long mtime_nsec;
+  mode_t mode;
+  uid_t uid;
+  gid_t gid;
+  /* Receiver-reported pre-transfer destination state (OutputDestState.known is
+   * false when no report was requested/received). */
+  OutputDestState dest;
 } ChangeEvent;
 
 /* True when any output mode is active and per-file events matter. */
 bool change_list_enabled(const Config* config);
 
-/* Render the rsync-style itemize line for a transferred file:
- *   `>f+++++++++ <path>`
- * The 11-char code is `>f` (regular file transferred to the remote host)
- * followed by c/s/t/p/o/g/u/a/x markers that are all `+` (value will be set
- * / differs) because FastSync does not separately compare checksums, size,
- * mtime, perms, owner, group, uid, acl, or xattr on the receiving side, so a
- * sent file is reported as fully updated.  Up-to-date files print no line
- * (rsync single `-i` only shows changes).  Caller frees the result. */
-char* change_render_itemize(const ChangeEvent* event);
+/* Render the rsync-style itemize line for a transferred item
+ * (`%i %n%L`): `>f+++++++++ sub/b.txt`.  Caller frees the result. */
+char* change_render_itemize(const Config* config, const ChangeEvent* event);
 
-/* Expand an --out-format/--log-file-format template.  Tokens:
- *   %f  full source path        %b  "bytes sent" == the source length (%l);
- *   %n  leaf (base) name            actual post-compression/delta wire bytes
- *   %l  file length in bytes        are not counted
- *   %M  mtime in whole seconds      %%  a literal percent sign
+/* Expand an --out-format/--log-file-format template.  Supported tokens:
+ *   %i  itemize code            %n  transfer-relative name (dir: trailing /)
+ *   %f  long display path       %l  file length in bytes
+ *   %b  wire bytes transferred  %c  block-checksum bytes received (rsync: 16
+ *                                   for a whole-file transfer, 0 for a dry run)
+ *   %C  whole-file checksum hex (xxh128 by default; spaces for non-regular)
+ *   %M  mtime (YYYY/MM/DD-HH:MM:SS)
+ *   %t  current time            %o  operation ("send"/"del.")
+ *   %p  pid                     %B  permission bits without the type char
+ *   %U  uid                     %G  gid
+ *   %L  " -> target" / " => target"    %%  a literal percent sign
  * Unknown %X sequences are preserved verbatim.  Caller frees the result. */
-char* change_render_format(const char* format, const ChangeEvent* event);
+char* change_render_format(const char* format, const Config* config, const ChangeEvent* event);
 
 /* Render one --list-only long-listing entry:
- *   `-rw-r--r--           12 2026/09/06 10:00:00 <path>`
+ *   `-rw-r--r--           12 2026/09/06 10:00:00 sub/b.txt`
  * (ls -l style columns; mtime in the local time zone).  Caller frees it. */
-char* change_render_list_line(mode_t mode, unsigned long long size, time_t mtime, const char* path);
+char* change_render_list_line(const Config* config, const ChangeEvent* event);
 
 /* Emit an event to every active destination:
  *   stdout: --itemize-changes line, or the --out-format expansion when set;
@@ -69,7 +88,15 @@ char* change_render_list_line(mode_t mode, unsigned long long size, time_t mtime
  * CHANGE_UP_TO_DATE events produce no output. */
 void change_emit(const Config* config, const ChangeEvent* event);
 
-/* Build and emit a CHANGE_SENT event for a file the client just sent. */
+/* Build and emit a CHANGE_SENT event for a file the client just sent.  `bytes_sent`
+ * is the process-wide wire-byte delta for this file (rsync's %b) and `bytes_read`
+ * the received bytes used for the delta handshake; pass 0 when unknown.  For a
+ * whole-file transfer %c is pinned to rsync's 16-byte sum header regardless. */
+void change_emit_file_sent_bytes(const Config* config, const File* file,
+                                 unsigned long long bytes_sent, unsigned long long bytes_read);
+
+/* Build and emit a CHANGE_SENT event for a file the client just sent, deriving
+ * the wire byte counts from the source payload length. */
 void change_emit_file_sent(const Config* config, const File* file);
 
 /* Build and emit a CHANGE_SENT event for an explicit directory entry (-d). */
