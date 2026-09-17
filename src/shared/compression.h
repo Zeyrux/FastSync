@@ -22,8 +22,6 @@ typedef enum {
   COMPRESSION_ALGO_ZLIBX = 4
 } CompressionAlgo;
 
-CompressionAlgo compression_default_algo(void);
-
 /* Resolve a --compress-choice string (case-insensitive) to an algorithm id.
  * Accepts "zstd", "lz4", "zlib", "zlibx", "none".  "auto" is not an algorithm
  * here; the caller resolves it to the negotiated default.  Returns -1 for any

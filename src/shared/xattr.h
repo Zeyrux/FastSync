@@ -105,8 +105,9 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
  * absence of the xattr or a malformed record is a silent no-op that never fails
  * the transfer.  The MODE leg is applied only when policy.perms||policy.
  * executability and the MTIME leg only when policy.times, so the fake-super
- * replay cannot bypass the per-attribute split; the mode is sanitized exactly
- * like the normal metadata path (group/other write bits never granted).
+ * replay cannot bypass the per-attribute split; the mode follows the normal
+ * metadata path exactly (under --perms the source mode is copied verbatim,
+ * special and group/other write bits included).
  * Returns true when the xattr was present and parsed. */
 bool fake_super_restore_fd(int fd, FileAttrPolicy policy);
 

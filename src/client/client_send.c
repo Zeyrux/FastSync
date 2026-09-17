@@ -1666,6 +1666,10 @@ static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* c
 static int send_append(const Client* client, File* file, Config* config,
                        unsigned long long offset) {
   int fd = client->file_descriptor;
+  if (file->data->data == NULL && !file_load_data(file)) {
+    send_status(fd, STATUS_ERROR);
+    return -1;
+  }
   const unsigned long long fsize = file->data->size;
   if (offset >= fsize) {
     send_status(fd, STATUS_ERROR);

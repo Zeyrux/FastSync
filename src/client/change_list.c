@@ -158,14 +158,6 @@ static void itemize_code(const Config* config, const ChangeEvent* event, char co
   code[11] = '\0';
 }
 
-char* change_render_itemize_code(const Config* config, const ChangeEvent* event) {
-  if (event == NULL || event->decision != CHANGE_SENT)
-    return str_dup("");
-  char code[12];
-  itemize_code(config, event, code);
-  return str_dup(code);
-}
-
 /* rsync %n: the transfer-relative name, with a trailing slash for directories. */
 static bool append_name(StrBuf* buf, const ChangeEvent* event) {
   if (!strbuf_append(buf, event->name != NULL ? event->name : ""))

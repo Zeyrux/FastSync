@@ -186,6 +186,7 @@ File* file_create(const char* path) {
   file->rdev_minor = 0;
   file->xattrs = NULL;
   file->dest_state = (OutputDestState){0};
+  file->matched_bytes = 0;
   return file;
 }
 

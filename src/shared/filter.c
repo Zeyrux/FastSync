@@ -301,6 +301,10 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
     filter_set_error(err, err_size, "the C modifier is handled by the rule-list parser");
     return NULL;
   }
+  if (xattr) {
+    filter_set_error(err, err_size, "xattr-name filter rules (the x modifier) are not supported");
+    return NULL;
+  }
   if (kind == RULE_KIND_MERGE || kind == RULE_KIND_DIR_MERGE) {
     filter_set_error(err, err_size, "merge/dir-merge rules are handled by the rule-list parser");
     return NULL;
@@ -637,6 +641,20 @@ FilterRuleList* filter_base_build(const char* const* rule_texts, int rule_count,
 
 /* ---- Per-directory merge files ---- */
 
+/* Undo the rules and dir-merge registrations that one merge file appended,
+ * leaving the caller's earlier content intact.  A "clear" rule inside the file
+ * frees every rule, including the caller's; clamp to the surviving count so
+ * those already-freed rules are never resurrected and freed a second time. */
+static void filter_file_rollback(FilterRuleList* list, int rules_before, int dir_merges_before) {
+  int first = rules_before < list->count ? rules_before : list->count;
+  for (int i = first; i < list->count; i++)
+    filter_rule_free(list->items[i]);
+  list->count = first;
+  for (int i = dir_merges_before; i < list->dir_merge_count; i++)
+    free(list->dir_merge_names[i]);
+  list->dir_merge_count = dir_merges_before;
+}
+
 bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* name,
                         const char* owner_rel, const FilterParseOptions* opts, bool* exists,
                         char* err, size_t err_size) {
@@ -698,19 +716,13 @@ bool filter_file_append(FilterRuleList* list, const char* dir_path, const char* 
   free(line);
   fclose(fp);
   if (!ok) {
-    /* Drop only the rules and dir-merge registrations this file appended,
-       leaving the caller's earlier content untouched. */
-    for (int i = rules_before; i < list->count; i++)
-      filter_rule_free(list->items[i]);
-    list->count = rules_before;
-    for (int i = dir_merges_before; i < list->dir_merge_count; i++)
-      free(list->dir_merge_names[i]);
-    list->dir_merge_count = dir_merges_before;
+    filter_file_rollback(list, rules_before, dir_merges_before);
     return false;
   }
   for (int i = rules_before; i < list->count; i++) {
     if (!set_rule_owner(list->items[i], owner_rel)) {
       filter_set_error(err, err_size, "memory allocation failed");
+      filter_file_rollback(list, rules_before, dir_merges_before);
       return false;
     }
   }

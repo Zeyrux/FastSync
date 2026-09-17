@@ -63,9 +63,6 @@ bool change_list_enabled(const Config* config);
  * (`%i %n%L`): `>f+++++++++ sub/b.txt`.  Caller frees the result. */
 char* change_render_itemize(const Config* config, const ChangeEvent* event);
 
-/* Render only the 11-character itemize code (rsync %i).  Caller frees. */
-char* change_render_itemize_code(const Config* config, const ChangeEvent* event);
-
 /* Expand an --out-format/--log-file-format template.  Supported tokens:
  *   %i  itemize code            %n  transfer-relative name (dir: trailing /)
  *   %f  long display path       %l  file length in bytes

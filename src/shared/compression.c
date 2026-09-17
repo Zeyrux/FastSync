@@ -77,10 +77,6 @@ bool compression_should_skip_with_suffixes(const char* path, char* const* suffix
   return false;
 }
 
-CompressionAlgo compression_default_algo(void) {
-  return COMPRESSION_ALGO_ZSTD;
-}
-
 int compression_algo_from_name(const char* name) {
   if (!name)
     return -1;

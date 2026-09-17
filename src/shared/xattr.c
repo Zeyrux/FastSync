@@ -409,10 +409,10 @@ bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
   (void)ul_gid;
   /* Mode is applied only when the per-attribute policy asks for it, through the
      SAME shared helper the normal metadata path uses (metadata_mode_for_policy):
-     group/other write bits are never granted, so a recorded source mode of 0666
-     restores as 0644 — identical to a non-fake-super --preserve run, never a
-     privilege-granting regression — and the -E rule derives exec bits from the
-     destination's read bits exactly like file_restore_metadata_fd. */
+     under --perms the recorded source mode is copied exactly, including
+     group/other write and setuid/setgid/sticky bits (rsync parity), and the -E
+     rule derives exec bits from the destination's read bits exactly like
+     file_restore_metadata_fd. */
   if (policy.perms || policy.executability) {
     struct stat cur;
     mode_t want = 0;
