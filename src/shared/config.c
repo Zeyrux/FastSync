@@ -76,6 +76,7 @@ static void config_set_defaults(Config* config) {
   config->from0 = false;
   config->cvs_exclude = false;
   config->per_dir_filter = false;
+  config->per_dir_filter_count = 0;
   config->one_file_system = false;
   config->no_implied_dirs = false;
   config->dirs = false;
