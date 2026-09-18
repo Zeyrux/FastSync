@@ -441,3 +441,24 @@ class TestDeleteDelayVsAfterSnapshot:
                     f"{timing} (mt={mt}): new_extra present="
                     f"{os.path.exists(new_extra)}, expected survives={new_survives}"
                 )
+
+
+class TestDeleteAfterThreadsKeepSet:
+    """Regression: -m/--threads with the default delete-after timing (plain
+    --delete) must still transmit the keep-set manifest and remove destination
+    extras.  PipelineContextSender.delete_suppressed was left uninitialized, so a
+    garbage true silently skipped the manifest under --threads."""
+
+    @pytest.mark.parametrize("delete_flag", ["--delete", "--delete-after"])
+    def test_threads_delete_after_sends_keep_set(self, delete_flag):
+        source, dest, received = _seed_pair("mtkeep")
+        extra = os.path.join(received, "d", "old_extra")
+        assert os.path.exists(extra)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["--threads", delete_flag],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert not os.path.exists(extra), (
+            f"{delete_flag} --threads did not remove an extra: keep-set manifest was suppressed"
+        )

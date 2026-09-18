@@ -77,8 +77,10 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config);
 /* True once the shared --max-delete budget stopped part of a deletion. */
 bool delete_plan_session_limit_reached(const DeletePlanSession* session);
-/* Number of destination entries the session's plans removed (or, for
-   --delete-delay, snapshotted for removal), for the end-of-transfer stats. */
+/* Number of destination entries the session's plans ACTUALLY removed, for the
+   end-of-transfer stats.  A --delete-delay entry only snapshotted for removal
+   that survives the commit (e.g. a directory refilled before it is removed, so
+   unlink/rmdir fails with ENOTEMPTY) is not counted. */
 size_t delete_plan_session_deleted(const DeletePlanSession* session);
 /* Install an observer invoked for every destination-relative path the session
    truly removes (including the deferred --delete-delay commit), so the receiver

@@ -104,6 +104,11 @@ void receiver_record_deleted_path(void* context, const char* rel_path) {
   ArrayList* paths = context;
   if (!paths || !rel_path)
     return;
+  /* Bound the retained list like the keep-set manifest: only MAX_MANIFEST_ENTRIES
+     paths are ever transmitted in the terminal STATUS_STATS frame, so recording
+     more only grows memory.  A hostile/huge deletion set is therefore capped. */
+  if ((size_t)paths->size >= (size_t)MAX_MANIFEST_ENTRIES)
+    return;
   char* copy = str_dup(rel_path);
   if (copy && !array_list_add(paths, copy))
     free(copy);
@@ -417,7 +422,8 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            --max-delete-capped commit still succeeds and the transfer proceeds;
            the terminal success frame reports the cap. */
         size_t deleted = 0;
-        DeletePathObserver observer = sink->deleted_paths ? receiver_record_deleted_path : NULL;
+        DeletePathObserver observer =
+            (config->report_deletes && sink->deleted_paths) ? receiver_record_deleted_path : NULL;
         DeleteCommitResult deletion =
             (config->use_delete || config->delete_missing_args)
                 ? manifest_delete_all_observed(config, manifest, &deleted, observer,
@@ -459,7 +465,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       }
       if (!plan_session) {
         plan_session = delete_plan_session_create(config);
-        if (plan_session && sink->deleted_paths)
+        if (plan_session && config->report_deletes && sink->deleted_paths)
           delete_plan_session_set_delete_observer(plan_session, receiver_record_deleted_path,
                                                   (void*)sink->deleted_paths);
       }
@@ -505,7 +511,8 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       deferred_manifest = NULL;
     } else {
       size_t deleted = 0;
-      DeletePathObserver observer = sink->deleted_paths ? receiver_record_deleted_path : NULL;
+      DeletePathObserver observer =
+          (config->report_deletes && sink->deleted_paths) ? receiver_record_deleted_path : NULL;
       DeleteCommitResult deletion = manifest_delete_all_observed(
           config, deferred_manifest, &deleted, observer, (void*)sink->deleted_paths);
       receiver_tally_deleted(sink, deleted);
@@ -525,7 +532,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
      hands the session to its caller instead, which commits after the disk
      writer drained. */
   if (plan_session) {
-    if (sink->deleted_paths)
+    if (config->report_deletes && sink->deleted_paths)
       delete_plan_session_set_delete_observer(plan_session, receiver_record_deleted_path,
                                               (void*)sink->deleted_paths);
     if (pending_plans) {
@@ -684,8 +691,11 @@ int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
   dir_time_list_init(&context.dir_times);
   context.would_delete = array_list_create(free);
-  context.deleted_paths = array_list_create(free);
-  if (!context.would_delete || !context.deleted_paths) {
+  /* report_deletes (--info=del / -i / --out-format under --delete) is the only
+     reason to retain the actually-removed paths; a plain --delete must not
+     str_dup every removal.  NULL is handled by every consumer. */
+  context.deleted_paths = config->report_deletes ? array_list_create(free) : NULL;
+  if (!context.would_delete || (config->report_deletes && !context.deleted_paths)) {
     array_list_delete(context.would_delete);
     array_list_delete(context.deleted_paths);
     return -1;

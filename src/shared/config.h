@@ -265,8 +265,9 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  * the destination-relative paths it ACTUALLY removed in its terminal
  * STATUS_STATS record (the same path-list field the dry-run would-delete report
  * uses), so the sender can print rsync's `deleting PATH`/`*deleting` lines for a
- * real (non-dry-run) deletion.  It is set only when --info=del is requested with
- * --delete; the transfer decision itself is unchanged. */
+ * real (non-dry-run) deletion.  It is set when --delete is active and any of
+ * --info=del, -i/--itemize-changes or --out-format requests per-file change
+ * output; the transfer decision itself is unchanged. */
 #define CONFIG_WIRE_OUTPUT_FIELDS(X)                                                               \
   X(report_dest_info, bool, false, BOOL)                                                           \
   X(report_stats, bool, false, BOOL) X(report_deletes, bool, false, BOOL)

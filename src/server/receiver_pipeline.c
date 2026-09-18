@@ -47,9 +47,15 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->would_delete = array_list_create(free);
   if (!context->would_delete)
     goto fail;
-  context->deleted_paths = array_list_create(free);
-  if (!context->deleted_paths)
-    goto fail;
+  /* The actually-removed path list is only needed to render rsync's
+     `deleting PATH` lines, which the client requests via report_deletes
+     (--info=del / -i / --out-format under --delete).  A plain --delete run must
+     not allocate it or observe every removal. */
+  if (config->report_deletes) {
+    context->deleted_paths = array_list_create(free);
+    if (!context->deleted_paths)
+      goto fail;
+  }
   return context;
 
 fail:
@@ -60,6 +66,12 @@ fail:
     cnd_destroy(&context->condition_not_full);
   if (init >= 1)
     mtx_destroy(&context->mutex);
+  /* Free every list that was already created before the failing allocation:
+     `context` itself is freed below, so they would otherwise leak. */
+  if (context->would_delete)
+    array_list_delete(context->would_delete);
+  if (context->deleted_paths)
+    array_list_delete(context->deleted_paths);
   free(context);
   return NULL;
 }

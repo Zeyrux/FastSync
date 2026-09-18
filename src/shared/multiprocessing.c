@@ -38,6 +38,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->remove_source_files = NULL;
   context->early_delete = false;
   context->delete_plans = NULL;
+  context->delete_suppressed = false;
   context->scan_stopped_early = false;
   context->total_files = 0;
   context->progress_bytes = 0;

@@ -93,7 +93,11 @@ typedef struct {
   unsigned long long progress_bytes;
   unsigned long long total_bytes;
   /* Per-type flist / transferred accounting for the rsync --stats breakdown and
-     the progress `to-chk` denominator.  Guarded by mutex_progress. */
+     the progress `to-chk` denominator.  Owned by the sender thread: it is the
+     only writer (the entry/transfer notes in send_chunks_multithreaded) and it
+     reads the totals in its completion tail, so no lock is needed.  This is NOT
+     guarded by mutex_progress (which covers total_files/progress_bytes/
+     total_bytes/sender_done). */
   TransferStats stats;
   bool sender_done;
   atomic_bool cancelled;

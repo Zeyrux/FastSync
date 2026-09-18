@@ -103,6 +103,62 @@ static void test_sender_zero_capacity() {
   config_delete(cfg);
 }
 
+/* Regression (blocker): PipelineContextSender.delete_suppressed must be
+   initialized false.  A garbage true silently suppresses the --delete keep-set
+   manifest under -m/--threads, so destination extras would never be removed. */
+static void test_sender_delete_suppressed_initialized() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+
+  Queue* q1 = queue_create(5, NULL);
+  Queue* q2 = queue_create(5, NULL);
+  EXPECT_NOT_NULL(q1);
+  EXPECT_NOT_NULL(q2);
+  PipelineContextSender* ctx = pipeline_context_sender_create(cfg, q1, q2);
+  EXPECT_NOT_NULL(ctx);
+  EXPECT_FALSE(ctx->delete_suppressed);
+  pipeline_context_sender_destroy(ctx);
+  config_delete(cfg);
+}
+
+/* --info=del (report_deletes) is the only reason the receiver retains the
+   actually-removed paths: a plain --delete receiver must not allocate the list,
+   and with report_deletes armed the observer records into it. */
+static void test_receiver_deleted_paths_gated_by_report_deletes() {
+  Config* plain = config_create();
+  EXPECT_NOT_NULL(plain);
+  free(plain->version);
+  plain->version = str_dup(PROTOCOL_VERSION);
+  plain->receive_root_directory = str_dup("/dst");
+  plain->report_deletes = false;
+  Queue* q_plain = queue_create(5, file_destroy);
+  EXPECT_NOT_NULL(q_plain);
+  PipelineContextReceiver* ctx_plain = pipeline_context_receiver_create(plain, q_plain, -1, NULL);
+  EXPECT_NOT_NULL(ctx_plain);
+  EXPECT_NULL(ctx_plain->deleted_paths);
+  pipeline_context_receiver_destroy(ctx_plain);
+
+  Config* info = config_create();
+  EXPECT_NOT_NULL(info);
+  free(info->version);
+  info->version = str_dup(PROTOCOL_VERSION);
+  info->receive_root_directory = str_dup("/dst");
+  info->report_deletes = true;
+  Queue* q_info = queue_create(5, file_destroy);
+  EXPECT_NOT_NULL(q_info);
+  PipelineContextReceiver* ctx_info = pipeline_context_receiver_create(info, q_info, -1, NULL);
+  EXPECT_NOT_NULL(ctx_info);
+  EXPECT_NOT_NULL(ctx_info->deleted_paths);
+  receiver_record_deleted_path(ctx_info->deleted_paths, "d/old_extra");
+  EXPECT_EQ_INT(ctx_info->deleted_paths->size, 1);
+  EXPECT_EQ_STR((const char*)ctx_info->deleted_paths->items[0], "d/old_extra");
+  pipeline_context_receiver_destroy(ctx_info);
+}
+
 /* Test receiver with zero file_descriptor */
 static void test_receiver_fd_zero() {
   Config* cfg = config_create();
@@ -462,6 +518,8 @@ void test_multiprocessing() {
   test_receiver_create_destroy();
   test_sender_queue_capacities();
   test_sender_zero_capacity();
+  test_sender_delete_suppressed_initialized();
+  test_receiver_deleted_paths_gated_by_report_deletes();
   test_receiver_fd_zero();
   if (!is_running_under_valgrind()) {
     test_receive_thread_finished();
