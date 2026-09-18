@@ -53,10 +53,27 @@
    over daemon/TCP (no argv channel in FastSync's binary config handshake;
    rsync-daemon differential pins the rsync behavior) and receiver-side
    `protect`/`risk` re-derivation for destination-only entries (would need a
-   receiver filter engine; differential pins the divergence). Matrix now
-   **109 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
+   receiver filter engine; differential pins the divergence). The options pass
+   stands at **110 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
    holds the rsync differentials (bwlimit parse+rate, info lines, real-setpriv
    `--ignore-errors`, rsync-daemon `-M`, filter-protect pin).
+
+9. **rsync-parity-fs pass** on `fix/parity-fs` (no wire change of its own; integrated
+   on top of the 2.27.0 options wave): recursive transfers now recreate empty source directories (and
+   `-m/--prune-empty-dirs` still suppresses them), a directory entry replaces a
+   blocking destination regular file, and `-R --no-implied-dirs --files-from`
+   places a listed file under a missing implied parent with default attributes
+   instead of refusing (real rsync 3.4.1 parity, differential-tested). `--iconv`
+   now reproduces rsync's push direction (destination charset = the spec's REMOTE
+   half; a server `--iconv` overrides), and `-T/--temp-dir` relative semantics are
+   confirmed identical while the absolute-path confinement is a deliberate
+   divergence. The basis-dir options, `--delay-updates`, `--fuzzy` and `--dry-run`
+   were reclassified to ❌ after a differential test reproduced each exact residual
+   (basis content verification, fixed staging-name collision, heuristic size
+   window, and dry-run would-delete over-report). Differential-gate allowlist
+   entries `min_size`/`empty_dirs_recursive`/`dirs_plain` were removed. The
+   integrated stats+options+fs branch stands at **112 ✅ / 12 ⚠️ / 33 ❌ = 157**;
+   full suite + ASan + clang-format + cppcheck clean.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).

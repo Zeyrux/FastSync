@@ -160,6 +160,17 @@ typedef struct {
   bool capture_dir_times;
   ArrayList* dir_entries;
   mtx_t* dir_entries_mutex;
+  /* Recreate empty source directories on a recursive transfer: emit a
+   * payload-less directory entry for every traversed directory that produced
+   * no transferred/descended child.  Off by default so low-level scanner users
+   * (unit helpers, --list-only) see only the historical file list; the real
+   * sender sets it in prepare_scanner. */
+  bool emit_empty_dirs;
+  /* --no-implied-dirs with -R + --files-from: a directory that is only an
+   * implied parent of a listed entry (not itself listed, nor below a listed
+   * directory) must not carry source metadata; it is created with default
+   * attributes at the destination, matching rsync. */
+  bool no_implied_dirs;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -177,6 +188,11 @@ typedef struct {
   int current_depth;
   dev_t root_dev;
   bool failed;
+  /* Recursive scan: whether the open directory yielded any transferred or
+     descended entry.  When it did not, closing it emits a directory entry so
+     the empty source directory is recreated at the destination (rsync
+     parity). */
+  bool current_dir_produced;
   /* Phase 2 (files-from / filter layer). */
   char* root_path;          /* transfer root (fs path) for rel computation */
   char* current_rel;        /* rel path of the open directory ("" == root) */

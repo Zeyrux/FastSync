@@ -472,6 +472,13 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->exclude_per_dir_filter_files = config->per_dir_filter_count >= 2;
   options->dirs = config->dirs;
   options->relative = config->relative;
+  /* A real recursive transfer recreates empty source directories (rsync
+     parity); low-level scanner users leave this off. */
+  options->emit_empty_dirs = true;
+  /* --no-implied-dirs only has meaning with -R (rsync): without it the option
+     is a documented no-op, so the scanner must not suppress directory
+     metadata. */
+  options->no_implied_dirs = config->no_implied_dirs && config->relative;
   /* -R/--relative outside --files-from reconstructs every destination path from
    * the source spec (rsync's '/./' cut point).  With --files-from the listed
    * entry already supplies the bare relative path, so no prefix is built. */
@@ -635,72 +642,6 @@ static const char* delete_plan_walk_root(const Config* config, const ArrayList* 
   return marker;
 }
 
-/* True when some --files-from entry is an ancestor-or-equal directory of
- * `rel` (an empty entry -- the whole tree "." -- counts as the root). */
-static bool file_list_ancestor_listed(const FileListSet* set, const char* rel) {
-  if (!set)
-    return true;
-  for (int i = 0; i < set->count; i++) {
-    const char* listed = set->entries[i];
-    if (listed[0] == '\0')
-      return true;
-    size_t n = strlen(listed);
-    if (strncmp(rel, listed, n) == 0 && (rel[n] == '/' || rel[n] == '\0'))
-      return true;
-  }
-  return false;
-}
-
-/* --no-implied-dirs (meaningful only with -R + --files-from): a listed file
- * may only be placed when its parent directory (or one of its ancestors) is
- * itself an explicitly listed entry.  rsync omits a file whose implied parent
- * directory is suppressed, and an explicitly listed file that cannot be placed
- * fails the transfer; FastSync fails the whole run up front with a clear error
- * (it has no per-entry skip channel).  Without -R or --files-from the option
- * has no effect. */
-static bool no_implied_dirs_files_from_valid(const Config* config) {
-  if (!config->no_implied_dirs || !config->relative)
-    return true;
-  const FileListSet* set = (const FileListSet*)config->files_from_set;
-  if (!set)
-    return true;
-  for (int i = 0; i < set->count; i++) {
-    const char* entry = set->entries[i];
-    if (entry[0] == '\0')
-      continue;
-    char* full = path_cat(config->send_directory, entry);
-    if (!full)
-      return false;
-    struct stat st;
-    bool is_file = lstat(full, &st) == 0 && S_ISREG(st.st_mode);
-    free(full);
-    if (!is_file)
-      continue;
-    const char* slash = strrchr(entry, '/');
-    if (!slash)
-      continue; /* top-level file: its parent is the receive root */
-    size_t parent_len = (size_t)(slash - entry);
-    if (parent_len == 0)
-      continue;
-    char* parent = malloc(parent_len + 1);
-    if (!parent)
-      return false;
-    memcpy(parent, entry, parent_len);
-    parent[parent_len] = '\0';
-    bool listed = file_list_ancestor_listed(set, parent);
-    if (!listed) {
-      log_message(LOG_LEVEL_ERROR,
-                  "--no-implied-dirs: cannot place file '%s': parent directory '%s' is not "
-                  "explicitly listed (list the directory or drop --no-implied-dirs)",
-                  entry, parent);
-    }
-    free(parent);
-    if (!listed)
-      return false;
-  }
-  return true;
-}
-
 /* The destination-relative mirror path for a missing --files-from entry: where
    a PRESENT entry with the same name would have been written.  With -R that is
    the entry's bare relative path (the bare wire path the receiver uses);
@@ -814,7 +755,7 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
                   "--ignore-missing-args: ignored %d missing --files-from entr%s", *skipped_out,
                   *skipped_out == 1 ? "y" : "ies");
   }
-  return no_implied_dirs_files_from_valid(config);
+  return true;
 }
 
 /* Basis directories are honored by the receiver's per-file incremental check,

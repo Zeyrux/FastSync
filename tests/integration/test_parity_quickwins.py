@@ -769,6 +769,47 @@ class TestVerifyAndFlip:
         assert os.stat(dest_file).st_ino == os.stat(basis_file).st_ino, \
             "--link-dest must hard-link to the basis file"
 
+    @requires_rsync
+    def test_basis_dir_size_only_content_residual(self, shared_server):
+        """Documented residual (RSYNC_COMPAT.md basis-dir rows): FastSync
+        xxHash-verifies a basis hit, while rsync's `--size-only` quick check
+        trusts the size alone.  With a same-size, different-content basis,
+        rsync links/copies the wrong basis content while FastSync transfers the
+        source.  This test pins both observed behaviors (FastSync is stricter,
+        so the rows are reclassified Divergent)."""
+        source = self._src("basissz")
+        rdest = self._dst("basissz_r")
+        fdest = self._dst("basissz_f")
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"AAAA\n")
+        OLD = 1_400_000_000
+        # rsync basis at the transfer-relative path (relative to the dest dir).
+        os.makedirs(os.path.join(rdest, "basis"), exist_ok=True)
+        with open(os.path.join(rdest, "basis", "f.txt"), "wb") as fh:
+            fh.write(b"BBBB\n")
+        os.utime(os.path.join(rdest, "basis", "f.txt"), (OLD, OLD))
+        rs = _rsync(["-a", "--size-only", "--link-dest=basis", source + "/", rdest + "/"])
+        assert rs.returncode == 0, rs.stderr
+        with open(os.path.join(rdest, "f.txt"), "rb") as fh:
+            assert fh.read() == b"BBBB\n", "rsync --size-only did not trust the basis size"
+
+        # FastSync basis is relative to the receive root; the file mirrors the
+        # source path.
+        rel = os.path.abspath(source).lstrip(os.sep)
+        basis = os.path.join(fdest, "basis", rel)
+        os.makedirs(basis, exist_ok=True)
+        with open(os.path.join(basis, "f.txt"), "wb") as fh:
+            fh.write(b"BBBB\n")
+        os.utime(os.path.join(basis, "f.txt"), (OLD, OLD))
+        received = get_dest_received_dir(fdest, source)
+        result, _ = run_client(source, fdest,
+                               flags=["-a", "--size-only", "--link-dest=basis", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        with open(os.path.join(received, "f.txt"), "rb") as fh:
+            assert fh.read() == b"AAAA\n", \
+                "FastSync must verify the basis content and transfer the source"
+
 
 class TestIgnoreExistingShortCircuit:
     """#9: --ignore-existing is decided by the receiver during the per-file

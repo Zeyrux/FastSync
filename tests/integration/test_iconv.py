@@ -1,10 +1,12 @@
 """--iconv=CONVERT_SPEC file-NAME charset conversion integration tests.
 
-The client converts every source file name from LOCAL to REMOTE before it goes
-on the wire, and the receiver converts it back from REMOTE to LOCAL, so a
-source tree using one charset can be written into a destination tree using
-another (rsync compatibility; content bytes are never touched).
+rsync's spec is ``--iconv=LOCAL,REMOTE`` (the order is the same push or pull).
+The sender converts each source name from LOCAL to REMOTE for the wire, and on
+a PUSH the receiver's charset is the spec's REMOTE half, so it writes the wire
+bytes verbatim (only a server with its own ``--iconv`` declares a different
+destination charset and re-converts).  Content bytes are never touched.
 """
+import codecs
 import os
 import shutil
 
@@ -14,6 +16,11 @@ from common import TEST_DATA_DIR, run_client, clean_dir, ServerManager
 
 LATIN1_NAME = b"caf\xe9.txt"
 UTF8_NAME = "caf\u00e9.txt".encode("utf-8")
+
+
+def _to_utf8(name_bytes):
+    """The UTF-8 encoding of a name that is stored as ISO-8859-1 bytes."""
+    return codecs.encode(codecs.decode(name_bytes, "iso-8859-1"), "utf-8")
 
 
 def _make(tag):
@@ -41,10 +48,10 @@ def _dest_file(source, dest, name):
 
 
 @pytest.mark.ci
-def test_iconv_latin1_roundtrip(shared_server):
-    """A source file whose name is ISO-8859-1 bytes is transferred with
-    --iconv=iso-8859-1,utf-8 and lands on the destination with the ORIGINAL
-    latin1 name (the wire carried it as UTF-8)."""
+def test_iconv_latin1_to_utf8_dest(shared_server):
+    """rsync push parity: --iconv=iso-8859-1,utf-8 converts a latin1 source name
+    to the spec's REMOTE (UTF-8) on the wire and the default receiver writes it
+    verbatim, so the destination name is UTF-8 (not the source's latin1)."""
     source, dest = _make("latin1")
     _place_bytes(source, LATIN1_NAME)
 
@@ -53,8 +60,10 @@ def test_iconv_latin1_roundtrip(shared_server):
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[:400]
 
-    dst = _dest_file(source, dest, LATIN1_NAME)
-    assert os.path.exists(dst), f"dest latin1-named file not found under {dest}"
+    dst = _dest_file(source, dest, UTF8_NAME)
+    assert os.path.exists(dst), f"dest UTF-8-named file not found under {dest}"
+    assert not os.path.exists(_dest_file(source, dest, LATIN1_NAME)), \
+        "destination kept the latin1 name instead of the wire (UTF-8) charset"
 
 
 @pytest.mark.ci
@@ -153,7 +162,7 @@ def test_iconv_expanding_name_growth(shared_server):
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[:400]
 
-    assert os.path.exists(_dest_file(source, dest, name_bytes))
+    assert os.path.exists(_dest_file(source, dest, _to_utf8(name_bytes)))
 
 
 def test_iconv_symlink_path_and_target(shared_server):
@@ -170,11 +179,13 @@ def test_iconv_symlink_path_and_target(shared_server):
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[:400]
 
-    dst_target = _dest_file(source, dest, target)
-    dst_link = _dest_file(source, dest, b"link\xe9")
-    assert os.path.exists(dst_target), "dest latin1 target file missing"
-    assert os.path.islink(dst_link), "dest latin1 symlink missing"
-    assert os.readlink(dst_link) == target, "symlink target not preserved/decoded"
+    utf8_target = _to_utf8(target)
+    utf8_link = _to_utf8(b"link\xe9")
+    dst_target = _dest_file(source, dest, utf8_target)
+    dst_link = _dest_file(source, dest, utf8_link)
+    assert os.path.exists(dst_target), "dest UTF-8 target file missing"
+    assert os.path.islink(dst_link), "dest UTF-8 symlink missing"
+    assert os.readlink(dst_link) == utf8_target, "symlink target not wire-converted"
     with open(dst_link, "rb") as fh:
         assert fh.read() == b"t\n"
 
@@ -198,8 +209,8 @@ def test_iconv_hardlink_path_and_target(shared_server):
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[:400]
 
-    dst_a = _dest_file(source, dest, a)
-    dst_b = _dest_file(source, dest, b)
+    dst_a = _dest_file(source, dest, _to_utf8(a))
+    dst_b = _dest_file(source, dest, _to_utf8(b))
     assert os.path.exists(dst_a) and os.path.exists(dst_b)
     assert os.stat(dst_a).st_ino == os.stat(dst_b).st_ino, \
         "hard-link relationship not preserved across the transfer"
@@ -221,16 +232,16 @@ def test_iconv_delete_manifest_consistent(shared_server):
         flags = ["--iconv=iso-8859-1,utf-8"]
         result, _ = run_client(source, dest, flags=flags, port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:400]
-        assert os.path.exists(_dest_file(source, dest, keep))
-        assert os.path.exists(_dest_file(source, dest, gone))
+        assert os.path.exists(_dest_file(source, dest, _to_utf8(keep)))
+        assert os.path.exists(_dest_file(source, dest, _to_utf8(gone)))
 
         os.remove(os.path.join(os.fsencode(source), gone))
         result, _ = run_client(
             source, dest, flags=flags + ["--delete"], port=server.port
         )
         assert result.returncode == 0, (result.stderr or result.stdout)[:400]
-        assert os.path.exists(_dest_file(source, dest, keep)), "kept file deleted"
-        assert not os.path.exists(_dest_file(source, dest, gone)), \
+        assert os.path.exists(_dest_file(source, dest, _to_utf8(keep))), "kept file deleted"
+        assert not os.path.exists(_dest_file(source, dest, _to_utf8(gone))), \
             "missing file was not deleted"
 
 
@@ -247,4 +258,4 @@ def test_iconv_chunk_serialization_blob(shared_server):
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[:400]
 
-    assert os.path.exists(_dest_file(source, dest, name))
+    assert os.path.exists(_dest_file(source, dest, _to_utf8(name)))
