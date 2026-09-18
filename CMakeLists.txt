@@ -221,6 +221,7 @@ set(TEST_SRCS
 	tests/test_daemon_limits.c
 	tests/test_data.c
 	tests/test_delay_updates.c
+	tests/test_delete_plan.c
 	tests/test_delta.c
 	tests/test_file.c
 	tests/test_file_list.c

@@ -9,6 +9,7 @@
 #include "config.h"
 #include "delete_plan.h"
 #include "file.h"
+#include "format.h"
 #include "protocol.h"
 #include "queue.h"
 #include "stop_condition.h"
@@ -86,6 +87,9 @@ typedef struct {
   int total_files;
   unsigned long long progress_bytes;
   unsigned long long total_bytes;
+  /* Per-type flist / transferred accounting for the rsync --stats breakdown and
+     the progress `to-chk` denominator.  Guarded by mutex_progress. */
+  TransferStats stats;
   bool sender_done;
   atomic_bool cancelled;
   ProtocolSession allocation_session;

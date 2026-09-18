@@ -42,6 +42,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->total_files = 0;
   context->progress_bytes = 0;
   context->total_bytes = 0;
+  memset(&context->stats, 0, sizeof(context->stats));
   context->sender_done = false;
   atomic_init(&context->cancelled, false);
   protocol_session_init(&context->allocation_session, -1, -1);

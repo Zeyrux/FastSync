@@ -223,17 +223,25 @@ bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, ui
   if (fd < 0)
     return false;
 
+  if (algo == CHECKSUM_ALGO_NONE) {
+    /* No checksum requested: nothing to read; an empty digest succeeds. */
+    close(fd);
+    *out_len = 0;
+    return true;
+  }
+
   uint8_t buffer[64 * 1024];
   bool ok = false;
 
-  if (algo == CHECKSUM_ALGO_MD5) {
+  if (algo == CHECKSUM_ALGO_MD5 || algo == CHECKSUM_ALGO_SHA1) {
+    const EVP_MD* md = algo == CHECKSUM_ALGO_MD5 ? EVP_md5() : EVP_sha1();
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) {
       close(fd);
       return false;
     }
     unsigned int digest_len = 0;
-    if (EVP_DigestInit_ex(ctx, EVP_md5(), NULL) == 1) {
+    if (EVP_DigestInit_ex(ctx, md, NULL) == 1) {
       ok = true;
       ssize_t got;
       while ((got = read(fd, buffer, sizeof(buffer))) > 0) {
@@ -250,6 +258,23 @@ bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, ui
         ok = false;
     }
     EVP_MD_CTX_free(ctx);
+    close(fd);
+    return ok;
+  }
+
+  if (algo == CHECKSUM_ALGO_MD4) {
+    Md4Ctx ctx;
+    md4_init(&ctx);
+    ok = true;
+    ssize_t got;
+    while ((got = read(fd, buffer, sizeof(buffer))) > 0)
+      md4_update(&ctx, buffer, (size_t)got);
+    if (got < 0)
+      ok = false;
+    if (ok) {
+      md4_final(&ctx, out);
+      *out_len = 16;
+    }
     close(fd);
     return ok;
   }

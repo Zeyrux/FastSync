@@ -313,6 +313,91 @@ class TestDeleteTimingFailure:
                 )
 
 
+class TestDeleteDelayDeletedCount:
+    """The reported deleted count must reflect entries actually removed."""
+
+    def test_refilled_deferred_dir_is_not_counted(self):
+        """A directory snapshotted into a --delete-delay plan that is refilled
+        before the commit survives ENOTEMPTY and must NOT inflate "Number of
+        deleted files" (regression for delete_plan.c counting at snapshot)."""
+        source = os.path.join(TEST_DATA_DIR, "ddc_src")
+        dest = os.path.join(TEST_DATA_DIR, "ddc_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        _write(os.path.join(source, "d", "keep.txt"), b"kept payload\n")
+        _write(os.path.join(source, "d", "big.bin"), b"B" * BIG_BYTES)
+        received = get_dest_received_dir(dest, source)
+        extra_dir = os.path.join(received, "d", "extradir")
+        os.makedirs(extra_dir, exist_ok=True)
+
+        def hook():
+            # Runs while big.bin is in flight, after d's delete plan was processed.
+            _write(os.path.join(extra_dir, "new.txt"), b"created mid-transfer\n")
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            proxy = _SlicingProxy(server.port, hook=hook, hook_after=MID_TRANSFER_BYTES,
+                                  throttle=PROXY_THROTTLE, wait_for_reply=True)
+            flags = ["--delete-delay", "--incremental", "--ignore-times", "--stats"]
+            result, _ = run_client(source, dest, flags=flags, port=proxy.port)
+            proxy.finish()
+        assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+        assert proxy.hook_called.is_set(), "hook never fired"
+        assert os.path.exists(os.path.join(extra_dir, "new.txt")), "late file vanished"
+        deleted = None
+        for line in result.stdout.splitlines():
+            if line.startswith("Number of deleted files:"):
+                deleted = int(line.split(":", 1)[1].split()[0])
+        assert deleted == 0, (deleted, result.stdout)
+
+
+class TestDeleteDelayMaxDeleteParity:
+    """--max-delete with --delete-delay: a partial deletion still reports the
+    number of entries actually removed, matching rsync (the exact surviving set
+    can differ; only the count is compared)."""
+
+    @requires_rsync
+    def test_max_delete_count_matches_rsync(self):
+        source = os.path.join(TEST_DATA_DIR, "ddm_src")
+        rsync_dst = os.path.join(TEST_DATA_DIR, "ddm_rsync_dst")
+        clean_dir(source)
+        clean_dir(rsync_dst)
+        _write(os.path.join(source, "d", "keep.txt"), b"keep\n")
+        for i in range(1, 6):
+            _write(os.path.join(rsync_dst, "d", f"e{i}.txt"), f"extra{i}\n".encode())
+
+        rsync_result = _rsync(["-a", "--delete-delay", "--max-delete=2", "--stats",
+                               source + "/", rsync_dst + "/"])
+        # rsync exits 25 ("the --max-delete limit stopped deletions").
+        assert rsync_result.returncode == 25, rsync_result.stderr
+        rsync_count = _deleted_count(rsync_result.stdout)
+        assert rsync_count == 2, rsync_result.stdout
+
+        dest = os.path.join(TEST_DATA_DIR, "ddm_dst")
+        clean_dir(dest)
+        received = get_dest_received_dir(dest, source)
+        for i in range(1, 6):
+            _write(os.path.join(received, "d", f"e{i}.txt"), f"extra{i}\n".encode())
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(
+                source, dest,
+                flags=["--delete-delay", "--max-delete=2", "--stats"],
+                port=server.port,
+            )
+        # A capped --max-delete commit is a successful transfer that both tools
+        # report with exit 25.
+        assert result.returncode == 25, (result.stderr or result.stdout)[:300]
+        assert _deleted_count(result.stdout) == rsync_count, result.stdout
+
+
+def _deleted_count(text):
+    for line in text.splitlines():
+        if line.startswith("Number of deleted files:"):
+            return int(line.split(":", 1)[1].split()[0])
+    return None
+
+
 class TestDeleteDelayVsAfterSnapshot:
     """A destination entry created after its directory's scan survives under
     --delete-delay but is removed by --delete-after's fresh end scan."""

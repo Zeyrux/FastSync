@@ -1,7 +1,9 @@
 #include "test_checksum.h"
 #include "checksum.h"
 #include "test_utils.h"
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Known xxHash64 vector (seed 0) for the empty string and a literal.
  * The md5 vectors are the standard NIST/RFC1321 test strings.  These pin the
@@ -230,6 +232,39 @@ static void test_checksum_null_empty_digest() {
   EXPECT_TRUE(memcmp(a, b, alen) == 0);
 }
 
+/* Every algorithm checksum_digest_file() claims to support must produce the
+ * SAME digest as the in-memory one-shot, including the newly added md4/sha1/
+ * none.  A 200000-byte payload forces several 64 KiB streaming reads. */
+static void test_checksum_digest_file_matches_oneshot(void) {
+  static const ChecksumAlgo algos[] = {
+      CHECKSUM_ALGO_XXH64, CHECKSUM_ALGO_XXH3, CHECKSUM_ALGO_XXH128, CHECKSUM_ALGO_MD5,
+      CHECKSUM_ALGO_MD4,   CHECKSUM_ALGO_SHA1, CHECKSUM_ALGO_NONE,
+  };
+  enum { SIZE = 200000 };
+  uint8_t* data = malloc(SIZE);
+  EXPECT_NOT_NULL(data);
+  for (int i = 0; i < SIZE; i++)
+    data[i] = (uint8_t)((i * 7 + 3) & 0xff);
+  char path[] = "/tmp/fastsync_ck_XXXXXX";
+  int fd = mkstemp(path);
+  EXPECT_TRUE(fd >= 0);
+  ssize_t written = write(fd, data, SIZE);
+  close(fd);
+  EXPECT_EQ_INT((int)written, SIZE);
+  for (size_t a = 0; a < sizeof(algos) / sizeof(algos[0]); a++) {
+    ChecksumAlgo algo = algos[a];
+    uint8_t one[CHECKSUM_MAX_DIGEST_LEN];
+    uint8_t file[CHECKSUM_MAX_DIGEST_LEN];
+    size_t one_len = 0, file_len = 0;
+    EXPECT_TRUE(checksum_digest(algo, 0, data, SIZE, one, sizeof(one), &one_len));
+    EXPECT_TRUE(checksum_digest_file(algo, 0, path, file, sizeof(file), &file_len));
+    EXPECT_EQ_INT((int)file_len, (int)one_len);
+    EXPECT_TRUE(memcmp(one, file, one_len) == 0);
+  }
+  unlink(path);
+  free(data);
+}
+
 void test_checksum(void) {
   test_checksum_xxh64_seed0();
   test_checksum_xxh64_empty();
@@ -245,4 +280,5 @@ void test_checksum(void) {
   test_checksum_xxh3_xxh128();
   test_checksum_truncated_buffer_rejected();
   test_checksum_null_empty_digest();
+  test_checksum_digest_file_matches_oneshot();
 }

@@ -83,15 +83,53 @@ static const char* stats_bytes(const Config* config, unsigned long long bytes, c
   return buffer;
 }
 
-/* Print the rsync `--stats` block on stdout.  Byte totals use the process-wide
-   wire counters and the receiver-only counters come from the STATUS_STATS frame;
-   the labels, layout and rate/speedup formulas match rsync 3.4.1.  Shared by the
-   single-threaded and multithreaded send paths. */
-static void report_transfer_stats(const Config* config, int total_files,
-                                  unsigned long long total_bytes, time_t start,
+/* Build rsync's `Number of files` parenthetical: each non-zero category, in
+   reg/dir/link/special order.  Empty when the flist counted nothing. */
+static void stats_type_breakdown(const TransferStats* stats, char* out, size_t out_size) {
+  unsigned long long total =
+      stats->flist_reg + stats->flist_dir + stats->flist_link + stats->flist_special;
+  if (total == 0) {
+    out[0] = '\0';
+    return;
+  }
+  out[0] = '\0';
+  size_t used = 0;
+  const struct {
+    const char* name;
+    unsigned long long count;
+  } parts[4] = {{"reg", stats->flist_reg},
+                {"dir", stats->flist_dir},
+                {"link", stats->flist_link},
+                {"special", stats->flist_special}};
+  bool first = true;
+  for (size_t i = 0; i < 4; i++) {
+    if (parts[i].count == 0)
+      continue;
+    int written = snprintf(out + used, out_size - used, "%s%s: %llu", first ? "(" : ", ",
+                           parts[i].name, parts[i].count);
+    if (written < 0 || (size_t)written >= out_size - used)
+      break;
+    used += (size_t)written;
+    first = false;
+  }
+  if (!first && used + 1 < out_size)
+    out[used++] = ')';
+  out[used] = '\0';
+}
+
+/* Print the rsync `--stats` block on stdout.  The source-side flist and
+   transferred counters come from `stats` (filled while scanning/sending), the
+   receiver-only counters from the STATUS_STATS frame, and the wire byte totals
+   from the process-wide protocol counters.  The labels, layout and
+   rate/speedup formulas match rsync 3.4.1.  Shared by the single-threaded and
+   multithreaded send paths. */
+static void report_transfer_stats(const Config* config, const TransferStats* stats, time_t start,
                                   const ReceiverStats* recv) {
   if (!config->stats || config->quiet)
     return;
+  TransferStats empty = {0};
+  if (stats == NULL)
+    stats = &empty;
   ReceiverStats none = {0};
   if (recv == NULL)
     recv = &none;
@@ -101,11 +139,18 @@ static void report_transfer_stats(const Config* config, int total_files,
   double elapsed = difftime(time(NULL), start);
   double rate = (double)(sent + received) / (0.5 + elapsed);
   char total_buffer[32];
+  char transferred_buffer[32];
+  char literal_buffer[32];
   char sent_buffer[32];
   char recv_buffer[32];
   char rate_buffer[32] = {0};
   char human_rate[32] = {0};
-  const char* total = stats_bytes(config, total_bytes, total_buffer, sizeof(total_buffer));
+  const char* total =
+      stats_bytes(config, stats->total_file_size, total_buffer, sizeof(total_buffer));
+  const char* transferred = stats_bytes(config, stats->transferred_file_size, transferred_buffer,
+                                        sizeof(transferred_buffer));
+  const char* literal =
+      stats_bytes(config, stats->literal_data, literal_buffer, sizeof(literal_buffer));
   const char* sent_s = stats_bytes(config, sent, sent_buffer, sizeof(sent_buffer));
   const char* recv_s = stats_bytes(config, received, recv_buffer, sizeof(recv_buffer));
   const char* rate_str = rate_buffer;
@@ -116,15 +161,26 @@ static void report_transfer_stats(const Config* config, int total_files,
   } else {
     snprintf(rate_buffer, sizeof(rate_buffer), "%.2f", rate);
   }
-  double speedup = (sent + received) > 0 ? (double)total_bytes / (double)(sent + received) : 0.0;
+  double speedup =
+      (sent + received) > 0 ? (double)stats->total_file_size / (double)(sent + received) : 0.0;
+  char breakdown[128];
+  stats_type_breakdown(stats, breakdown, sizeof(breakdown));
+  unsigned long long flist_total =
+      stats->flist_reg + stats->flist_dir + stats->flist_link + stats->flist_special;
   printf("\n");
-  printf("Number of files: %d\n", total_files);
-  printf("Number of created files: %d\n", total_files);
+  if (breakdown[0] != '\0')
+    printf("Number of files: %llu %s\n", flist_total, breakdown);
+  else
+    printf("Number of files: %llu\n", flist_total);
+  /* FastSync cannot tell which entries the receiver newly created, so it
+     reports the transferred regular files (which are created on a fresh
+     destination).  See RSYNC_COMPAT.md for the documented residual. */
+  printf("Number of created files: %llu\n", stats->transferred_regular);
   printf("Number of deleted files: %llu\n", recv->deleted_files);
-  printf("Number of regular files transferred: %d\n", total_files);
+  printf("Number of regular files transferred: %llu\n", stats->transferred_regular);
   printf("Total file size: %s bytes\n", total);
-  printf("Total transferred file size: %s bytes\n", total);
-  printf("Literal data: %s bytes\n", total);
+  printf("Total transferred file size: %s bytes\n", transferred);
+  printf("Literal data: %s bytes\n", literal);
   printf("Matched data: %llu bytes\n", recv->matched_data);
   printf("File list size: 0\n");
   printf("File list generation time: 0.000 seconds\n");
@@ -136,6 +192,45 @@ static void report_transfer_stats(const Config* config, int total_files,
   printf("total size is %s  speedup is %.2f%s\n", total, speedup,
          config->dry_run ? " (DRY RUN)" : "");
   fflush(stdout);
+}
+
+/* Classify one scanned source entry into the rsync flist counters.  Called for
+   every entry the sender walks, transferred or skipped.  Directory entries are
+   counted here only for the explicit -d/--dirs generator; a recursive scan's
+   directories are accounted from the scanner's dir_entries list at report time. */
+static void transfer_stats_note_entry(TransferStats* stats, const File* file) {
+  if (stats == NULL || file == NULL)
+    return;
+  if (file->is_dir) {
+    stats->flist_dir++;
+    return;
+  }
+  if (file->is_symlink) {
+    stats->flist_link++;
+    stats->total_file_size += file->symlink_target ? strlen(file->symlink_target) : 0;
+    return;
+  }
+  if (file->is_special) {
+    stats->flist_special++;
+    return;
+  }
+  stats->flist_reg++;
+  stats->total_file_size += file->data ? file->data->size : 0;
+}
+
+/* Account for a regular file (or a whole-file append) the receiver actually
+   stored: rsync's transferred-file count and transferred/literal byte totals. */
+static void transfer_stats_note_transferred(TransferStats* stats, const File* file) {
+  if (stats == NULL || file == NULL)
+    return;
+  if (file->is_dir || file->is_symlink || file->is_special)
+    return;
+  if (file->link_group != 0 && !file->link_first)
+    return;
+  unsigned long long size = file->data ? file->data->size : 0;
+  stats->transferred_regular++;
+  stats->transferred_file_size += size;
+  stats->literal_data += size;
 }
 
 /* ---- rsync-style per-file --progress ------------------------------------
@@ -188,10 +283,14 @@ static void progress_final_frame(unsigned long long size, char* out, size_t out_
   unsigned long long remain = (unsigned long long)(diff_ms / 1000);
   snprintf(rembuf, sizeof(rembuf), "%4u:%02u:%02u", (unsigned)(remain / 3600),
            (unsigned)((remain / 60) % 60), (unsigned)(remain % 60));
+  /* rsync's `to-chk` denominator is the whole file list, which includes the
+     transfer-root directory FastSync never emits as a transfer entry.  Count
+     that root entry so a single-file transfer matches rsync exactly. */
+  unsigned long long total = g_progress_seen + 1;
   unsigned long long to_chk =
       g_progress_seen > g_progress_xferred ? g_progress_seen - g_progress_xferred : 0;
   snprintf(out, out_size, "\r%15s %3d%% %7.2f%s %s (xfr#%llu, to-chk=%llu/%llu)\n", ofs_buf, 100,
-           rate, units, rembuf, g_progress_xferred, to_chk, g_progress_seen);
+           rate, units, rembuf, g_progress_xferred, to_chk, total);
 }
 
 static void client_progress_begin(const Config* config) {
@@ -201,6 +300,10 @@ static void client_progress_begin(const Config* config) {
   if (!g_progress_active)
     return;
   printf("sending incremental file list\n");
+  /* rsync prints the transfer-root directory's name before the first file when
+     that directory is created; FastSync mirrors the source root below the
+     receive root and creates it on a fresh destination, so emit it here. */
+  printf("./\n");
   fflush(stdout);
 }
 
@@ -1986,7 +2089,16 @@ static int send_dry_run_remote(Config* config) {
     else
       printf("Total: %d files, %.1f MB\n", file_count, (double)total_bytes / (double)BYTES_PER_MIB);
   }
-  report_transfer_stats(config, file_count, total_bytes, dry_start, &dry_stats);
+  {
+    TransferStats dry_transfer;
+    memset(&dry_transfer, 0, sizeof(dry_transfer));
+    dry_transfer.flist_reg = (unsigned long long)file_count;
+    dry_transfer.total_file_size = total_bytes;
+    dry_transfer.transferred_regular = (unsigned long long)file_count;
+    dry_transfer.transferred_file_size = total_bytes;
+    dry_transfer.literal_data = total_bytes;
+    report_transfer_stats(config, &dry_transfer, dry_start, &dry_stats);
+  }
   ret = io_error ? 1 : 0;
 
 dry_fail:
@@ -2236,7 +2348,7 @@ static bool source_is_regular_file(const File* file) {
 }
 
 static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
-                                   ArrayList* remove_sources) {
+                                   ArrayList* remove_sources, TransferStats* stats) {
   if (config->use_chunk_serialization) {
     if (remove_sources) {
       for (int i = 0; i < chunk->element_count; i++) {
@@ -2263,10 +2375,13 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     for (int i = 0; i < chunk->element_count; i++) {
       if (chunk->items[i] == NULL)
         continue;
+      transfer_stats_note_entry(stats, chunk->items[i]);
       if (chunk->items[i]->is_dir)
         change_emit_dir_sent(config, chunk->items[i]);
       else
         change_emit_file_sent(config, chunk->items[i]);
+      if (!chunk->items[i]->is_dir)
+        transfer_stats_note_transferred(stats, chunk->items[i]);
     }
     return 0;
   }
@@ -2275,6 +2390,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     File* f = chunk->items[i];
     if (f == NULL)
       continue;
+    transfer_stats_note_entry(stats, f);
     if (f->is_dir) {
       /* Explicit directory entry (--dirs): a MKDIR frame carrying the
          destination path (and metadata when negotiated).  Directories have no
@@ -2328,6 +2444,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       source_file_destroy(source);
       return -1;
     }
+    transfer_stats_note_transferred(stats, f);
     change_emit_file_sent_bytes(config, f, protocol_bytes_written() - bytes_before,
                                 protocol_bytes_read() - read_before);
     client_progress_file(config, f);
@@ -2436,7 +2553,7 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       return thrd_error;
     }
     if (send_chunk_with_removal(client, current_chunk, context->config,
-                                context->remove_source_files) != 0) {
+                                context->remove_source_files, &context->stats) != 0) {
       log_message(LOG_LEVEL_ERROR, "unexpected error while sending chunk");
       chunk_destroy(current_chunk);
       pipeline_cancel(context);
@@ -2533,13 +2650,12 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                 "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(context->config, context->remove_source_files);
-  mtx_lock(&context->mutex_progress);
-  int total_files = context->total_files;
-  unsigned long long total_bytes = context->total_bytes;
-  mtx_unlock(&context->mutex_progress);
-  report_transfer_stats(context->config, total_files, total_bytes, start, &recv_stats);
-  log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
-                   (double)total_bytes / (double)BYTES_PER_MIB);
+  if (context->dir_entries)
+    context->stats.flist_dir += (unsigned long long)context->dir_entries->size;
+  report_transfer_stats(context->config, &context->stats, start, &recv_stats);
+  log_info_message(LOG_INFO_STATS, "Transfer summary: %llu files, %.1f MB",
+                   context->stats.transferred_regular,
+                   (double)context->stats.transferred_file_size / (double)BYTES_PER_MIB);
   disconnect_transfer_client(client);
   mark_sender_done(context);
   protocol_session_unbind();
@@ -3003,8 +3119,8 @@ int send_files(Config* config) {
     goto send_fail;
 
   Chunk* current_chunk;
-  unsigned long long total_bytes = 0;
-  int total_files = 0;
+  TransferStats transfer_stats;
+  memset(&transfer_stats, 0, sizeof(transfer_stats));
   time_t start = time(NULL);
   client_progress_begin(config);
   /* True when the stop deadline cut the scan short so the keep-set manifest is
@@ -3029,11 +3145,6 @@ int send_files(Config* config) {
                        "Stop deadline reached; stopping transfer at the next chunk boundary");
       scan_stopped_early = true;
       break;
-    }
-    unsigned long long chunk_bytes = 0;
-    for (int i = 0; i < current_chunk->element_count; i++) {
-      chunk_bytes += current_chunk->items[i]->data->size;
-      total_files++;
     }
     if (manifest && !add_chunk_to_manifest(manifest, current_chunk)) {
       chunk_destroy(current_chunk);
@@ -3061,13 +3172,13 @@ int send_files(Config* config) {
       send_failed = true;
       break;
     }
-    if (send_chunk_with_removal(client, current_chunk, config, remove_sources) != 0) {
+    if (send_chunk_with_removal(client, current_chunk, config, remove_sources, &transfer_stats) !=
+        0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
       chunk_destroy(current_chunk);
       send_failed = true;
       break;
     }
-    total_bytes += chunk_bytes;
     chunk_destroy(current_chunk);
   }
   if (send_failed) {
@@ -3152,9 +3263,16 @@ int send_files(Config* config) {
                 "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(config, remove_sources);
-  report_transfer_stats(config, total_files, total_bytes, start, &recv_stats);
-  log_info_message(LOG_INFO_STATS, "Transfer summary: %d files, %.1f MB", total_files,
-                   (double)total_bytes / (double)BYTES_PER_MIB);
+  /* A recursive -a scan has no directory entries in its chunks; account them
+     from the scanner's captured directory list (present whenever a directory
+     attribute is preserved, e.g. -a/-t/-p).  The -d generator counts its
+     explicit directory entries inline instead. */
+  if (dir_entries)
+    transfer_stats.flist_dir += (unsigned long long)dir_entries->size;
+  report_transfer_stats(config, &transfer_stats, start, &recv_stats);
+  log_info_message(LOG_INFO_STATS, "Transfer summary: %llu files, %.1f MB",
+                   transfer_stats.transferred_regular,
+                   (double)transfer_stats.transferred_file_size / (double)BYTES_PER_MIB);
   /* A skipped source entry (--ignore-errors past an unreadable directory, or a
      dereferenced symlink with no referent) makes rsync report a partial
      transfer (exit 23) even though the rest of the run succeeded.  A
