@@ -65,6 +65,14 @@ python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load
 See `tests/integration/README.md` for the differential parity gate and its
 `parity_caveats.py` allowlist (the residual burn-down mechanism).
 
+Unit tests under valgrind must set `FASTSYNC_UNDER_VALGRIND=1` (CI does): the
+tests use it to skip fork-based tests, because valgrind 3.22 does not expose
+`vgpreload` in the guest's `/proc/self/maps`.
+
+```bash
+FASTSYNC_UNDER_VALGRIND=1 valgrind --leak-check=full --show-leak-kinds=definite --error-exitcode=1 ./build/tests
+```
+
 ## CI Workflow — Waiting for Results
 
 When running the CI workflow via `tea` (the task execution agent), always set a sufficient timeout (e.g., 600000ms) to allow CI to finish. After CI completes, check the results yourself — do not assume success. Monitor CI status via the Gitea API (see below) or `tea actions`, then inspect logs on failure.
