@@ -3523,23 +3523,25 @@ class TestMissingArgs:
 
 
 class TestNoImpliedDirs:
-    """--no-implied-dirs (only meaningful with -R + --files-from) refuses to
-    place a listed file whose parent directory is not itself listed."""
+    """--no-implied-dirs (meaningful with -R) omits the source metadata of a
+    listed path's implied parent directories but still creates those parents
+    with default attributes, matching rsync 3.4.1."""
 
     def _make(self):
         return _make_relative_source("noimplied_src")
 
     @pytest.mark.parametrize("mt", [False, True])
-    def test_implied_dir_only_fails_entry(self, shared_server, mt):
+    def test_implied_dir_created_with_default_attrs(self, shared_server, mt):
         source = self._make()
         dest = os.path.join(TEST_DATA_DIR, "noimplied_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a/b.txt\n")  # "a" itself is not listed
         flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
-        assert result.returncode != 0, "implied parent directory was not rejected"
-        assert "--no-implied-dirs" in (result.stderr or result.stdout)
-        assert not os.path.exists(os.path.join(dest, "a", "b.txt"))
+        assert result.returncode == 0, \
+            f"implied parent directory was not created: {result.stderr[:200]}"
+        assert os.path.isdir(os.path.join(dest, "a")), "implied parent 'a' was not created"
+        assert _read_file(os.path.join(dest, "a", "b.txt")) == b"nested\n"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_listed_dir_allows_file(self, shared_server, mt):
@@ -3666,9 +3668,10 @@ class TestDirs:
                 files.extend(os.path.relpath(os.path.join(root, n), mirror) for n in names)
             assert files == [], f"--dirs descended into contents: {files}"
 
-    def test_dirs_listed_dir_colliding_with_file_fails(self, shared_server):
-        """A listed directory that already exists as a regular file at the
-        destination fails the transfer cleanly instead of clobbering the file."""
+    def test_dirs_listed_dir_replaces_blocking_file(self, shared_server):
+        """rsync parity: a listed directory replaces a regular file already at
+        its destination path (rsync removes the non-directory and creates the
+        directory)."""
         source = self._make()
         dest = os.path.join(TEST_DATA_DIR, "dirs_coll_dst")
         clean_dir(dest)
@@ -3678,8 +3681,10 @@ class TestDirs:
         lst = _write_rel_list(b"dir1\n")
         result, _ = run_client(source, dest, flags=["--files-from", lst, "--dirs", "-R"],
                                port=shared_server.port)
-        assert result.returncode != 0, "dir entry over an existing file did not fail"
-        assert os.path.isfile(blocker), "blocking regular file was clobbered"
+        assert result.returncode == 0, \
+            f"dir entry over an existing file failed: {(result.stderr or result.stdout)[:300]}"
+        assert os.path.isdir(blocker) and not os.path.islink(blocker), \
+            "blocking regular file was not replaced by the incoming directory"
 
 
 class TestMkpath:
@@ -6690,11 +6695,10 @@ class TestDirectoryAndSymlinkTimes:
 
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
-    def test_preserve_does_not_create_empty_source_dir(self, shared_server, mt):
-        """P7 Wave D #1: a captured-but-EMPTY source directory is never created
-        at the destination.  The scanner records its time (it is transmitted via
-        STATUS_DIR_TIMES), but the receiver treats that entry as record-only, so
-        `-a` keeps the documented "empty dirs are never transferred" behavior."""
+    def test_preserve_creates_empty_source_dir(self, shared_server, mt):
+        """rsync parity: a recursive `-a` transfer recreates an empty source
+        directory at the destination (the scanner emits it as an explicit
+        directory entry)."""
         source = os.path.join(TEST_DATA_DIR, f"empty_dir_{'m' if mt else 's'}_src")
         dest = os.path.join(TEST_DATA_DIR, f"empty_dir_{'m' if mt else 's'}_dst")
         clean_dir(source)
@@ -6705,8 +6709,8 @@ class TestDirectoryAndSymlinkTimes:
         flags = ["-a"] + (["--threads"] if mt else [])
         received = self._run(source, dest, flags, shared_server)
         assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
-        assert not os.path.lexists(os.path.join(received, "empty_sub")), \
-            f"-a created an empty source directory at {received}/empty_sub"
+        assert os.path.isdir(os.path.join(received, "empty_sub")), \
+            f"-a did not recreate the empty source directory at {received}/empty_sub"
 
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
@@ -6729,10 +6733,10 @@ class TestDirectoryAndSymlinkTimes:
 
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
-    def test_collision_at_dir_time_path_does_not_abort(self, shared_server, mt):
-        """P7 Wave D #1: a pre-existing regular file at a source-empty-dir's
-        mirror path must not abort the transfer (the old mkdir failed and failed
-        the run) and must not be clobbered."""
+    def test_collision_at_empty_dir_path_replaces_blocker(self, shared_server, mt):
+        """rsync parity: a pre-existing regular file at a source empty-dir's
+        mirror path is replaced by the incoming directory (rsync removes the
+        non-directory and creates the directory); the run succeeds."""
         source = os.path.join(TEST_DATA_DIR, f"dirtime_collide_{'m' if mt else 's'}_src")
         dest = os.path.join(TEST_DATA_DIR, f"dirtime_collide_{'m' if mt else 's'}_dst")
         clean_dir(source)
@@ -6751,10 +6755,8 @@ class TestDirectoryAndSymlinkTimes:
         assert result.returncode == 0, \
             f"-a aborted on a pre-existing file at an empty-dir path: " \
             f"{(result.stderr or result.stdout)[:400]}"
-        assert os.path.isfile(blocker) and not os.path.islink(blocker), \
-            "the pre-existing blocker was replaced by a directory"
-        with open(blocker, "rb") as fh:
-            assert fh.read() == b"pre-existing blocker\n", "the blocker file was clobbered"
+        assert os.path.isdir(blocker) and not os.path.islink(blocker), \
+            "the pre-existing blocker was not replaced by the incoming directory"
         assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
 
 

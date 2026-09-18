@@ -424,8 +424,10 @@ typedef struct Config {
    * repeated -F adds --filter='- .rsync-filter' so they are excluded too. */
   int per_dir_filter_count;
   bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
-  /* --no-implied-dirs: client-only.  With -R + --files-from, refuse to place a
-   * listed file whose ancestor directory is not itself explicitly listed. */
+  /* --no-implied-dirs: client-only.  With -R, do not transfer the source
+   * metadata of the parent directories implied by a listed path; an unlisted
+   * implied parent is still created (with default attributes) so the listed
+   * file can be placed, matching rsync. */
   bool no_implied_dirs;
   /* -d/--dirs: client-only.  Transfer the directory entries named by the
    * source argument / --files-from list without recursing into contents. */

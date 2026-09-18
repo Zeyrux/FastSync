@@ -151,6 +151,11 @@ typedef struct {
   bool capture_dir_times;
   ArrayList* dir_entries;
   mtx_t* dir_entries_mutex;
+  /* --no-implied-dirs with -R + --files-from: a directory that is only an
+   * implied parent of a listed entry (not itself listed, nor below a listed
+   * directory) must not carry source metadata; it is created with default
+   * attributes at the destination, matching rsync. */
+  bool no_implied_dirs;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -168,6 +173,11 @@ typedef struct {
   int current_depth;
   dev_t root_dev;
   bool failed;
+  /* Recursive scan: whether the open directory yielded any transferred or
+     descended entry.  When it did not, closing it emits a directory entry so
+     the empty source directory is recreated at the destination (rsync
+     parity). */
+  bool current_dir_produced;
   /* Phase 2 (files-from / filter layer). */
   char* root_path;          /* transfer root (fs path) for rel computation */
   char* current_rel;        /* rel path of the open directory ("" == root) */

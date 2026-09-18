@@ -830,7 +830,8 @@ static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const
                                      const char* fs_path, bool relative_mode,
                                      const char* relative_prefix, bool preserve_atimes,
                                      bool preserve_crtimes, bool preserve_xattrs,
-                                     bool preserve_acls) {
+                                     bool preserve_acls, bool no_implied_dirs,
+                                     const FileListSet* file_list) {
   if (!dir_entries || !root_path || !fs_path)
     return true;
   struct stat st;
@@ -839,6 +840,13 @@ static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const
   char* rel = scanner_path_relative(root_path, fs_path);
   if (!rel)
     return true;
+  /* --no-implied-dirs: an implied parent directory (not listed, and not under
+     a listed directory) keeps the destination's own/default attributes, so its
+     source metadata is not transmitted. */
+  if (no_implied_dirs && file_list && !file_list_dir_in_scope(file_list, rel)) {
+    free(rel);
+    return true;
+  }
   if (relative_mode && rel[0] == '\0') {
     /* -R + --files-from: the transfer root itself has no bare relative wire
        path (matches the -R scan, which never emits the root). */
@@ -902,6 +910,43 @@ static bool scanner_capture_dir_time(ArrayList* dir_entries, mtx_t* mutex, const
   return true;
 }
 
+/* Recursive scan: emit a payload-less directory entry for the directory that
+ * just finished scanning.  rsync creates every source directory at the
+ * destination; FastSync otherwise creates one only implicitly through a
+ * transferred child, so a directory emptied on the transfer side (physically
+ * empty, or all of its entries filtered out) would never appear.  The transfer
+ * root is skipped (it maps to the receive root, which already exists), as are
+ * --files-from (only listed items and their implied parents transfer),
+ * --list-only (directory lines are emitted by the caller) and
+ * -m/--prune-empty-dirs.  Returns false on allocation failure. */
+static bool scanner_emit_empty_dir(DirectoryScanner* scanner, ArrayList* chunk_data) {
+  if (!scanner->current_path || !scanner->current_rel || scanner->current_rel[0] == '\0')
+    return true;
+  struct stat st;
+  if (stat(scanner->current_path, &st) != 0 || !S_ISDIR(st.st_mode))
+    return true;
+  File* dir = scanner_build_dir_file(scanner->current_path, &st, &scanner->options);
+  if (!dir)
+    return false;
+  if (scanner->relative_mode) {
+    dir->send_path = str_dup(scanner->current_rel);
+  } else if (scanner->options.relative_prefix) {
+    dir->send_path =
+        scanner_prefix_send_path(scanner->options.relative_prefix, scanner->current_rel);
+  }
+  if ((scanner->relative_mode || scanner->options.relative_prefix) && !dir->send_path) {
+    file_destroy(dir);
+    return false;
+  }
+  if (scanner->options.preserve_xattrs || scanner->options.preserve_acls)
+    dir->xattrs = xattr_capture_path(scanner->current_path, scanner->options.preserve_acls);
+  if (!array_list_add(chunk_data, dir)) {
+    file_destroy(dir);
+    return false;
+  }
+  return true;
+}
+
 /* Open the next queued directory and set up its filter context.  Returns 1 when
    a directory is open, 0 when the queue is exhausted, and -1 on a fatal error.
    A directory that cannot be opened is an I/O error: it is recorded on the
@@ -925,6 +970,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
      * the directory that enqueued them. */
     const FilterNode* inherited = scanner->at_seed_dir ? scanner->seed_node : de->context;
     scanner->at_seed_dir = false;
+    scanner->current_dir_produced = false;
     free(de);
 
     free(scanner->current_rel);
@@ -985,7 +1031,8 @@ static int open_next_directory(DirectoryScanner* scanner) {
             scanner->options.dir_entries, scanner->options.dir_entries_mutex, scanner->root_path,
             scanner->current_path, scanner->relative_mode, scanner->options.relative_prefix,
             scanner->options.preserve_atimes, scanner->options.preserve_crtimes,
-            scanner->options.preserve_xattrs, scanner->options.preserve_acls)) {
+            scanner->options.preserve_xattrs, scanner->options.preserve_acls,
+            scanner->options.no_implied_dirs, scanner->options.file_list)) {
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
       free(scanner->current_path);
@@ -1350,10 +1397,21 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
 
     const struct dirent* entry = readdir(scanner->current_dir);
     if (entry == NULL) {
+      /* The directory is exhausted: if nothing was transferred or descended
+         from it, recreate it at the destination as an explicit entry. */
+      if (!scanner->current_dir_produced && !scanner->options.prune_empty_dirs &&
+          !scanner->options.list_dirs && scanner->options.file_list == NULL) {
+        if (!scanner_emit_empty_dir(scanner, chunk_data))
+          scanner->failed = true;
+      }
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
       free(scanner->current_path);
       scanner->current_path = NULL;
+      if (scanner->failed) {
+        array_list_delete(chunk_data);
+        return NULL;
+      }
       continue;
     }
 
@@ -1488,6 +1546,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
           scanner->failed = true;
           break;
         }
+        scanner->current_dir_produced = true;
         free(cur_path);
         continue;
       }
@@ -1502,6 +1561,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
           break;
         }
       }
+      scanner->current_dir_produced = true;
       int next_depth = scanner->current_depth + 1;
       if (scanner->options.max_depth <= 0 || next_depth < scanner->options.max_depth) {
         DirEntry* de = dir_entry_create(cur_path, next_depth, scanner->current_node);
@@ -1577,6 +1637,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         scanner->failed = true;
         break;
       }
+      scanner->current_dir_produced = true;
       chunk_data_size += file->data->size;
       if (chunk_data_size > scanner->options.chunk_size) {
         free(rel_copy);
@@ -2206,7 +2267,8 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
                                 root_directory, options->relative && options->file_list != NULL,
                                 options->relative_prefix, options->preserve_atimes,
                                 options->preserve_crtimes, options->preserve_xattrs,
-                                options->preserve_acls)) {
+                                options->preserve_acls, options->no_implied_dirs,
+                                options->file_list)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);

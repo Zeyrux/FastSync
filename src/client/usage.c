@@ -103,8 +103,9 @@ void print_usage(void) {
   printf("  -R, --relative    With --files-from, preserve each listed entry's relative path\n");
   printf("                    below the destination root instead of mirroring the full\n");
   printf("                    source path (no effect without --files-from)\n");
-  printf("  --no-implied-dirs  With -R --files-from, refuse to place a listed file whose\n");
-  printf("                    parent directory is not itself listed\n");
+  printf("  --no-implied-dirs  With -R, do not apply the source metadata of a listed file's\n");
+  printf("                    implied parent directories (they are still created with\n");
+  printf("                    default attributes)\n");
   printf("  --mkpath          Create the destination root directory on the server when it\n");
   printf("                    does not exist yet\n");
   printf("  --exclude <pattern>, --exclude=<pattern>  Exclude files matching pattern\n");
