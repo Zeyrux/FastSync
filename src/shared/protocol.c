@@ -187,12 +187,24 @@ unsigned long long io_get_bwlimit(void) {
   return global_bwlimit();
 }
 
+/* rsync's throttle (io.c sleep_for_bwlimit) sleeps once its unslept debt
+ * reaches ~100 ms of bandwidth, so its effective initial burst is about 0.1 s
+ * worth of bytes, not a full second.  FastSync models the same with a token
+ * bucket whose capacity is bwlimit/10, so a throttled run paces like rsync
+ * instead of sending a full second's worth up front. */
+static long long bw_burst_capacity(unsigned long long bwlimit) {
+  if (bwlimit == 0)
+    return 0;
+  long long burst = (long long)(bwlimit / 10);
+  return burst > 0 ? burst : 1;
+}
+
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec) {
   if (!session)
     return;
   session->bwlimit =
       bytes_per_sec > (unsigned long long)LLONG_MAX ? (unsigned long long)LLONG_MAX : bytes_per_sec;
-  session->bw_tokens = (long long)session->bwlimit;
+  session->bw_tokens = bw_burst_capacity(session->bwlimit);
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   session->bw_last_refill_sec = now.tv_sec;
@@ -226,8 +238,9 @@ static void bw_throttle_session(ProtocolSession* session, size_t bytes_written) 
 
   long long tokens_to_add = (long long)((double)session->bwlimit * elapsed_ns / 1000000000.0);
   session->bw_tokens += tokens_to_add;
-  if (session->bw_tokens > (long long)session->bwlimit)
-    session->bw_tokens = (long long)session->bwlimit;
+  long long burst = bw_burst_capacity(session->bwlimit);
+  if (session->bw_tokens > burst)
+    session->bw_tokens = burst;
 
   session->bw_tokens -= bytes_written;
 
@@ -238,7 +251,11 @@ static void bw_throttle_session(ProtocolSession* session, size_t bytes_written) 
       poll(NULL, 0, (int)(deficit_us / 1000));
     else
       usleep((useconds_t)deficit_us);
+    /* Reset the bucket AFTER the sleep: crediting the sleep duration as elapsed
+       refill time would cancel half the throttle (the next call would see the
+       whole sleep as refill and immediately grant a fresh burst). */
     session->bw_tokens = 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
     session->bw_last_refill_sec = now.tv_sec;
     session->bw_last_refill_nsec = now.tv_nsec;
   }

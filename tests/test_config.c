@@ -2831,14 +2831,15 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.26.0).  The values below are the only
+/* The pinned golden frame (protocol 2.27.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
  * delete-plan wave changed only the version string; 2.25.0 appended the
- * report_stats bool and 2.26.0 appended the compression_algo int.  The
- * byte-exact values are recomputed for the merged layout. */
-#define GOLDEN_WIRE_LEN 705
-#define GOLDEN_WIRE_HASH 4673424031554175633ULL
+ * report_stats bool, 2.26.0 appended the compression_algo int, and 2.27.0
+ * appended the report_deletes bool.  The byte-exact values are recomputed for
+ * the merged layout. */
+#define GOLDEN_WIRE_LEN 709
+#define GOLDEN_WIRE_HASH 14423869696887880000ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

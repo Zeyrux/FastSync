@@ -31,6 +31,7 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   context->delete_limit_reached = false;
   memset(&context->stats, 0, sizeof(context->stats));
   context->would_delete = NULL;
+  context->deleted_paths = NULL;
   atomic_init(&context->cancelled, false);
   int init = 0;
   if (mtx_init(&context->mutex, mtx_plain) != thrd_success)
@@ -45,6 +46,9 @@ PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue*
   init++;
   context->would_delete = array_list_create(free);
   if (!context->would_delete)
+    goto fail;
+  context->deleted_paths = array_list_create(free);
+  if (!context->deleted_paths)
     goto fail;
   return context;
 
@@ -71,6 +75,8 @@ void pipeline_context_receiver_destroy(PipelineContextReceiver* context) {
   dir_time_list_free(&context->dir_times);
   if (context->would_delete)
     array_list_delete(context->would_delete);
+  if (context->deleted_paths)
+    array_list_delete(context->deleted_paths);
   mtx_destroy(&context->mutex);
   cnd_destroy(&context->condition_not_full);
   cnd_destroy(&context->condition_not_empty);
@@ -184,7 +190,8 @@ int receive_thread(void* pipeline_context) {
                        NULL,
                        receiver_pipeline_note_delete_limit,
                        &context->stats,
-                       context->would_delete};
+                       context->would_delete,
+                       context->deleted_paths};
   if (receiver_process_pending((Config*)config, file_descriptor, &sink, &context->deferred_manifest,
                                &context->deferred_plans) != 0) {
     receiver_thread_fail(context);

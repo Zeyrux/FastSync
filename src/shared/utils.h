@@ -134,6 +134,19 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
    cap and returns DELETE_WALK_LIMIT_REACHED when more extras remained.
    `deleted_out`/`skipped_out` optionally receive the number of entries removed
    and the number skipped because of the cap. */
+/* Optional per-deletion observer: called for each destination-relative path
+   actually removed (a file, symlink, or directory), in removal order, so the
+   receiver can stream rsync's `--info=del`/`--info=remove` lines. */
+typedef void (*DeletePathObserver)(void* context, const char* rel_path);
+
+/* `delete_extras_limited_observed` is delete_extras_limited with an optional
+   observer; the observer is invoked only for entries truly removed. */
+DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
+                                                const ArrayList* synced_dirs, size_t max_delete,
+                                                const DeleteSkipEntry* skips, int skip_count,
+                                                size_t* deleted_out, size_t* skipped_out,
+                                                DeletePathObserver observer, void* observer_context);
+
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,

@@ -426,7 +426,15 @@ struct DeletePlanSession {
   ArrayList* size_skipped;
   ArrayList* missing;
   ArrayList* deferred;
+  DeletePathObserver observer;
+  void* observer_context;
 };
+
+/* Report one path the session truly removed (no-op without an observer). */
+static void notify_deleted(DeletePlanSession* session, const char* rel) {
+  if (session && session->observer && rel)
+    session->observer(session->observer_context, rel);
+}
 
 DeletePlanSession* delete_plan_session_create(const Config* config) {
   if (!config)
@@ -642,6 +650,7 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
     session->deleted++;
     session->planned++;
     log_deleted(child_rel);
+    notify_deleted(session, child_rel);
     *removed = true;
     return true;
   }
@@ -667,6 +676,7 @@ static bool process_extra_file(int dirfd, const char* name, const char* child_re
     session->deleted++;
     session->planned++;
     log_deleted(child_rel);
+    notify_deleted(session, child_rel);
   } else if (errno != ENOENT) {
     return false;
   }
@@ -781,8 +791,9 @@ static bool apply_missing(DeletePlanSession* session, const Config* config) {
   size_t deleted = 0;
   size_t skipped = 0;
   bool limit = false;
-  bool ok = manifest_delete_missing_args_limited(config, &manifest, remaining, &deleted, &skipped,
-                                                 &limit);
+  bool ok = manifest_delete_missing_args_limited_observed(
+      config, &manifest, remaining, &deleted, &skipped, &limit, session->observer,
+      session->observer_context);
   session->deleted += deleted;
   session->planned += deleted;
   session->skipped += skipped;
@@ -875,10 +886,19 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
   if (rc == 0) {
     session->deleted++;
     log_deleted(rel);
+    notify_deleted(session, rel);
   }
   close(parent_fd);
   free(leaf);
   return ok;
+}
+
+void delete_plan_session_set_delete_observer(DeletePlanSession* session, DeletePathObserver observer,
+                                             void* context) {
+  if (!session)
+    return;
+  session->observer = observer;
+  session->observer_context = context;
 }
 
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config) {

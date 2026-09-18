@@ -2648,9 +2648,16 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
       }
     }
   }
+  /* --info=del on a real --delete run asks the receiver to report the paths it
+     actually removed; the report rides the STATUS_STATS path list, so the wire
+     stats frame must be negotiated too. */
+  config->report_deletes =
+      config->use_delete && !config->dry_run &&
+      ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
+       config->out_format != NULL);
   config->report_stats = config->stats || config->show_progress ||
                          (config->info_level & LOG_INFO_PROGRESS) || format_needs_wire ||
-                         (config->dry_run && config->use_delete);
+                         config->report_deletes || (config->dry_run && config->use_delete);
   return 0;
 }
 

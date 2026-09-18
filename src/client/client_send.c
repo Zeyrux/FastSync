@@ -307,6 +307,45 @@ static bool info_flag_enabled(const Config* config, LogInfoFlag flag) {
   return config != NULL && (config->info_level & flag) != 0;
 }
 
+/* Print rsync's deletion lines for a received list of destination-relative
+ * paths: `*deleting   PATH` when itemizing, the --out-format expansion when a
+ * format is set, else `deleting PATH` for --info=del.  Used by both the dry-run
+ * would-delete report and the real --info=del report. */
+static void print_delete_reports(const Config* config, const ArrayList* paths) {
+  if (!config || !paths || config->quiet)
+    return;
+  if (!(config->itemize_changes || config->out_format != NULL ||
+        info_flag_enabled(config, LOG_INFO_DEL)))
+    return;
+  for (int i = 0; i < paths->size; i++) {
+    const char* raw = (const char*)paths->items[i];
+    const char* path = delete_display_path(config, raw);
+    if (config->out_format != NULL) {
+      ChangeEvent event;
+      memset(&event, 0, sizeof(event));
+      event.decision = CHANGE_SENT;
+      event.deleted = true;
+      event.name = path;
+      event.path = path;
+      char* line = change_render_format(config->out_format, config, &event);
+      if (line) {
+        char* escaped = output_escape(line, config->eight_bit_output);
+        printf("%s\n", escaped ? escaped : line);
+        free(escaped);
+        free(line);
+      }
+    } else {
+      char* escaped = output_escape(path, config->eight_bit_output);
+      if (config->itemize_changes)
+        printf("*deleting   %s\n", escaped ? escaped : path);
+      else
+        printf("deleting %s\n", escaped ? escaped : path);
+      free(escaped);
+    }
+  }
+  fflush(stdout);
+}
+
 static void client_progress_begin(const Config* config) {
   g_progress_active = (config->show_progress || info_flag_enabled(config, LOG_INFO_PROGRESS)) &&
                       !config->quiet;
@@ -1129,8 +1168,19 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
     return false;
   if (status == STATUS_STATS) {
     ReceiverStats scratch;
-    if (!receive_stats_record(client->file_descriptor, stats_out ? stats_out : &scratch, NULL))
+    /* A real --info=del run carries the actually-removed paths in the stats
+       frame's path list; collect and print them in rsync's format. */
+    ArrayList* deleted = config->report_deletes ? array_list_create(free) : NULL;
+    if (config->report_deletes && !deleted)
       return false;
+    if (!receive_stats_record(client->file_descriptor, stats_out ? stats_out : &scratch, deleted)) {
+      array_list_delete(deleted);
+      return false;
+    }
+    if (deleted) {
+      print_delete_reports(config, deleted);
+      array_list_delete(deleted);
+    }
     if (!receive_status(client->file_descriptor, &status))
       return false;
   }
@@ -2081,40 +2131,7 @@ static int send_dry_run_remote(Config* config) {
       array_list_delete(would_delete);
       goto dry_fail;
     }
-    /* rsync prints `*deleting   PATH` when itemizing, `deleting PATH` under
-       --info=del/--info=remove, and the --out-format expansion when set. */
-    if (!config->quiet && (config->itemize_changes || config->out_format != NULL ||
-                           info_flag_enabled(config, LOG_INFO_DEL))) {
-      for (int i = 0; i < would_delete->size; i++) {
-        const char* raw = (const char*)would_delete->items[i];
-        const char* path = delete_display_path(config, raw);
-        if (config->out_format != NULL) {
-          ChangeEvent event;
-          memset(&event, 0, sizeof(event));
-          event.decision = CHANGE_SENT;
-          event.deleted = true;
-          event.name = path;
-          event.path = path;
-          char* line = change_render_format(config->out_format, config, &event);
-          if (line) {
-            /* Escape the whole rendered line, exactly like change_emit() does
-               for a real transfer, so a control byte in the peer-supplied path
-               cannot forge output. */
-            char* escaped = output_escape(line, config->eight_bit_output);
-            printf("%s\n", escaped ? escaped : line);
-            free(escaped);
-            free(line);
-          }
-        } else {
-          char* escaped = output_escape(path, config->eight_bit_output);
-          if (config->itemize_changes)
-            printf("*deleting   %s\n", escaped ? escaped : path);
-          else
-            printf("deleting %s\n", escaped ? escaped : path);
-          free(escaped);
-        }
-      }
-    }
+    print_delete_reports(config, would_delete);
     array_list_delete(would_delete);
     if (!receive_status(client->file_descriptor, &status))
       goto dry_fail;

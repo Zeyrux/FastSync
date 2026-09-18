@@ -61,6 +61,9 @@ typedef struct PipelineContextReceiver {
   /* -n/--dry-run --delete would-delete path list, collected by receive_thread
      and reported in the STATUS_STATS frame. */
   struct ArrayList* would_delete;
+  /* --info=del actually-removed path list, collected by the deferred delete
+     commit in server.c and reported in the STATUS_STATS frame. */
+  struct ArrayList* deleted_paths;
 } PipelineContextReceiver;
 
 PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,
