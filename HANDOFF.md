@@ -42,6 +42,23 @@
 7. **Parity-completion wave (protocol 2.24.0 → 2.26.0)** on `feat/parity-completion`: per-directory delete plans (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`; receiver `STATUS_STATS` counters feeding `--stats`/`--progress` and `--out-format %b/%c/%C`, plus `-n --delete` lines; `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/`none` checksums with `auto` negotiation (default `xxh128`/`zstd`); general `-R`/`--no-implied-dirs`/`-d`; the full filter grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` + modifiers) and corrected `-F`/`-FF`; receiver-side `--chown`/map TO-name resolution; absolute basis dirs + `--link-dest` relink; receiver-side `--ignore-existing` short-circuit; `--preallocate` over `--sparse` via `fallocate(2)`; `--iconv=.`/`-`/`--no-iconv`; lone `-h` help; aliases `--ignore-non-existing`/`--protect-args`/`--msgs2stderr`; and the full `--info`/`--debug` vocabulary. `RSYNC_COMPAT.md` reclassifies the matrix to 106 ✅ / 27 ⚠️ / 23 ❌; the later rsync-parity-stats pass (`fix/parity-stats`) moves it to 107 ✅ / 25 ⚠️ / 24 ❌ (see item 8).
 8. **rsync-parity-stats pass** on `fix/parity-stats` (no wire change, `PROTOCOL_VERSION` stays `2.26.0`): `--delete-delay` now counts/budgets only entries actually removed (a refilled deferred directory that survives `ENOTEMPTY` is not counted; `--max-delete` partial-delete count matches rsync); `--stats` gained the `(reg/dir/link/special)` `Number of files` breakdown and now counts only regular files actually stored for `Number of regular files transferred`/transferred size/literal data (up-to-date re-runs report 0); `Total file size` includes symlink target lengths; `--progress` prints the leading `./` root line and counts it in `to-chk` so a single-file transfer matches rsync; and `%C` uses the selected transfer checksum with `checksum_digest_file` supporting md4/sha1/none, byte-identical to rsync for every algorithm. `--out-format` reclassified ❌ (`%b`/delta-`%c` are protocol-specific). Differential + regression tests added; full suite + ASan + clang-format + cppcheck clean.
 
+9. **rsync-parity-fs pass** on `fix/parity-fs` (no wire change, `PROTOCOL_VERSION`
+   stays `2.26.0`): recursive transfers now recreate empty source directories (and
+   `-m/--prune-empty-dirs` still suppresses them), a directory entry replaces a
+   blocking destination regular file, and `-R --no-implied-dirs --files-from`
+   places a listed file under a missing implied parent with default attributes
+   instead of refusing (real rsync 3.4.1 parity, differential-tested). `--iconv`
+   now reproduces rsync's push direction (destination charset = the spec's REMOTE
+   half; a server `--iconv` overrides), and `-T/--temp-dir` relative semantics are
+   confirmed identical while the absolute-path confinement is a deliberate
+   divergence. The basis-dir options, `--delay-updates`, `--fuzzy` and `--dry-run`
+   were reclassified to ❌ after a differential test reproduced each exact residual
+   (basis content verification, fixed staging-name collision, heuristic size
+   window, and dry-run would-delete over-report). Differential-gate allowlist
+   entries `min_size`/`empty_dirs_recursive`/`dirs_plain` were removed. The
+   `RSYNC_COMPAT.md` tally is now **109 ✅ / 16 ⚠️ / 31 ❌ = 156**; full suite +
+   ASan + clang-format + cppcheck clean.
+
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
 2. **Deferred security items** (documented, not implemented):

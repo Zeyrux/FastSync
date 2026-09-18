@@ -816,8 +816,8 @@ bool file_ensure_directory_secure(const char* path) {
        replacing it is not required for FastSync's transferred directories and
        keeps --keep-dirlinks semantics untouched. */
     struct stat leaf_st;
-    if (fstatat(parent_fd, leaf, &leaf_st, AT_SYMLINK_NOFOLLOW) == 0 &&
-        !S_ISDIR(leaf_st.st_mode) && !S_ISLNK(leaf_st.st_mode)) {
+    if (fstatat(parent_fd, leaf, &leaf_st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(leaf_st.st_mode) &&
+        !S_ISLNK(leaf_st.st_mode)) {
       if (unlinkat(parent_fd, leaf, 0) == 0) {
         if (mkdirat(parent_fd, leaf, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0) {
           created = true;

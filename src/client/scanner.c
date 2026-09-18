@@ -2264,12 +2264,11 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
      transfer root itself (it hands the root's immediate subdirectories to
      workers), so capture the root's directory time here. */
   if (options->capture_dir_times &&
-      !scanner_capture_dir_time(options->dir_entries, options->dir_entries_mutex, root_directory,
-                                root_directory, options->relative && options->file_list != NULL,
-                                options->relative_prefix, options->preserve_atimes,
-                                options->preserve_crtimes, options->preserve_xattrs,
-                                options->preserve_acls, options->no_implied_dirs,
-                                options->file_list)) {
+      !scanner_capture_dir_time(
+          options->dir_entries, options->dir_entries_mutex, root_directory, root_directory,
+          options->relative && options->file_list != NULL, options->relative_prefix,
+          options->preserve_atimes, options->preserve_crtimes, options->preserve_xattrs,
+          options->preserve_acls, options->no_implied_dirs, options->file_list)) {
     array_list_delete(root_files);
     array_list_delete(subdirs);
     parallel_scanner_destroy(ps);

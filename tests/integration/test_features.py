@@ -583,6 +583,55 @@ class TestRemoteDryRun:
             assert os.path.exists(extra), f"{flags} deleted an extra in dry-run"
             assert _snapshot_tree(received) == before, f"{flags} mutated the destination"
 
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_dry_run_delete_lines_over_report_residual(self):
+        """Documented residual (RSYNC_COMPAT.md `-n/--dry-run` row): FastSync's
+        dry-run would-delete report includes the file that is merely being
+        updated (derived from the receiver's STATUS_STATS extras) and, unlike
+        rsync, also reports an excluded-but-protected extra.  rsync `-n -i
+        --delete` lists only genuine extras.  Pins the residual that keeps the
+        row Divergent."""
+        source = os.path.join(TEST_DATA_DIR, "dryrep_src")
+        rdst = os.path.join(TEST_DATA_DIR, "dryrep_rdst")
+        fdst = os.path.join(TEST_DATA_DIR, "dryrep_fdst")
+        clean_dir(source)
+        clean_dir(rdst)
+        clean_dir(fdst)
+        with open(os.path.join(source, "a.txt"), "wb") as fh:
+            fh.write(b"new content\n")
+        os.utime(os.path.join(source, "a.txt"), (1_700_000_000, 1_700_000_000))
+        for root in (rdst, fdst):
+            with open(os.path.join(root, "a.txt"), "wb") as fh:
+                fh.write(b"old\n")
+            for name, data in (("extra.log", b"log\n"), ("extra.txt", b"extra\n")):
+                with open(os.path.join(root, name), "wb") as fh:
+                    fh.write(data)
+            for p in (os.path.join(root, "a.txt"), os.path.join(root, "extra.log"),
+                      os.path.join(root, "extra.txt")):
+                os.utime(p, (1_500_000_000, 1_500_000_000))
+
+        r = subprocess.run(["rsync", "-an", "-i", "--delete", "--exclude=*.log",
+                            source + "/", rdst + "/"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"))
+        assert r.returncode == 0, r.stderr
+        rsync_del = {l.split(None, 1)[1] for l in r.stdout.splitlines()
+                     if l.startswith("*deleting")}
+        assert rsync_del == {"extra.txt"}, f"unexpected rsync deleting set: {rsync_del}"
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, fdst,
+                                   flags=["-a", "-n", "-i", "--delete", "--exclude=*.log"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        fs_del = {l.split(None, 1)[1] for l in (result.stdout or "").splitlines()
+                  if l.startswith("*deleting")}
+        # Documented over-report: the transferred/updated file and the excluded
+        # extra appear in FastSync's would-delete set.
+        assert "a.txt" in fs_del, "residual changed: FastSync no longer over-reports the update"
+        assert "extra.log" in fs_del, "residual changed: FastSync no longer reports excluded extra"
+
     @pytest.mark.ci
     def test_remote_dry_run_quiet_is_silent(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "remote_dry_quiet_src")
@@ -2891,6 +2940,41 @@ class TestDelayUpdates:
                                    os.path.join(delay_received, rel), shallow=False), rel
         assert not os.path.isdir(os.path.join(delay_dest, self.STAGING)), \
             "staging directory left behind after a successful delayed transfer"
+
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_delay_updates_staging_name_collision_residual(self):
+        """Documented residual (RSYNC_COMPAT.md `--delay-updates` row): FastSync
+        uses a fixed `.fastsync-stage` staging name and wipes a pre-existing tree
+        of that name at the start of a delayed run (crash-leftover cleanup),
+        even without `--delete`; rsync leaves a genuine destination entry of that
+        name untouched.  Pins the divergence that keeps the row Divergent."""
+        source = self._make_source("delay_collide_src")
+        rdst = os.path.join(TEST_DATA_DIR, "delay_collide_rdst")
+        fdst = os.path.join(TEST_DATA_DIR, "delay_collide_fdst")
+        clean_dir(rdst)
+        clean_dir(fdst)
+        for root in (rdst, fdst):
+            with open(os.path.join(root, "top.txt"), "wb") as fh:
+                fh.write(b"old\n")
+            stage = os.path.join(root, self.STAGING)
+            os.makedirs(stage, exist_ok=True)
+            with open(os.path.join(stage, "keepme.txt"), "wb") as fh:
+                fh.write(b"genuine user data\n")
+
+        r = subprocess.run(["rsync", "-a", "--delay-updates", source + "/", rdst + "/"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"))
+        assert r.returncode == 0, r.stderr
+        assert os.path.exists(os.path.join(rdst, self.STAGING, "keepme.txt")), \
+            "rsync removed an unrelated destination entry named like the staging dir"
+
+        with ServerManager() as server:
+            server.start()
+            result, _ = run_client(source, fdst, flags=["--delay-updates"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert not os.path.exists(os.path.join(fdst, self.STAGING)), \
+            "FastSync did not wipe the reserved staging name (residual changed)"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_delay_updates_incremental_rerun_no_leftovers(self, shared_server, mt):
