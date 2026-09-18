@@ -438,18 +438,7 @@ static void scanner_record_protected(DirectoryScanner* scanner, const char* fs_p
 static void scanner_note_nonreg(const ScannerOptions* options, const char* fs_path) {
   if (!options || !options->note_nonreg || !fs_path)
     return;
-  const char* rel = *fs_path == '/' ? fs_path + 1 : fs_path;
-  const char* root = options->send_directory;
-  if (root != NULL) {
-    while (*root == '/')
-      root++;
-    size_t root_len = strlen(root);
-    while (root_len > 0 && root[root_len - 1] == '/')
-      root_len--;
-    if (root_len > 0 && strncmp(root, rel, root_len) == 0 &&
-        (rel[root_len] == '/' || rel[root_len] == '\0'))
-      rel += root_len + (rel[root_len] == '/' ? 1 : 0);
-  }
+  const char* rel = utils_strip_transfer_root(fs_path, options->send_directory);
   char* escaped = output_escape(rel, options->eight_bit_output);
   printf("skipping non-regular file \"%s\"\n", escaped ? escaped : rel);
   free(escaped);
@@ -947,7 +936,7 @@ static bool scanner_emit_empty_dir(DirectoryScanner* scanner, ArrayList* chunk_d
   if (!scanner->current_path || !scanner->current_rel || scanner->current_rel[0] == '\0')
     return true;
   struct stat st;
-  if (stat(scanner->current_path, &st) != 0 || !S_ISDIR(st.st_mode))
+  if (lstat(scanner->current_path, &st) != 0 || !S_ISDIR(st.st_mode))
     return true;
   File* dir = scanner_build_dir_file(scanner->current_path, &st, &scanner->options);
   if (!dir)

@@ -24,17 +24,18 @@ typedef enum {
   /* rsync categories that map to a FastSync event (emitted in rsync's line
    * format): del (deletions), remove (sender-side source removal), name
    * (transferred entry names), flist (file-list header), nonreg (skipped
-   * non-regular files), backup (backed-up files), progress (per-file progress). */
+   * non-regular files), progress (per-file progress).  rsync's `backup`
+   * category is accepted for CLI parity but stays silent: the receiver does the
+   * backing-up and FastSync has no backup event to report from the sender. */
   LOG_INFO_DEL = 1u << 4,
   LOG_INFO_REMOVE = 1u << 5,
   LOG_INFO_NAME = 1u << 6,
   LOG_INFO_FLIST = 1u << 7,
   LOG_INFO_NONREG = 1u << 8,
-  LOG_INFO_BACKUP = 1u << 9,
-  LOG_INFO_PROGRESS = 1u << 10,
+  LOG_INFO_PROGRESS = 1u << 9,
   LOG_INFO_ALL = LOG_INFO_COPY | LOG_INFO_MISC | LOG_INFO_SKIP | LOG_INFO_STATS | LOG_INFO_DEL |
                  LOG_INFO_REMOVE | LOG_INFO_NAME | LOG_INFO_FLIST | LOG_INFO_NONREG |
-                 LOG_INFO_BACKUP | LOG_INFO_PROGRESS,
+                 LOG_INFO_PROGRESS,
 } LogInfoFlag;
 
 void log_message(LogLevel log_level, const char* message, ...);

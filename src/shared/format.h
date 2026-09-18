@@ -88,7 +88,12 @@ typedef struct {
   unsigned long long total_file_size;       /* sum of entry sizes (link target len) */
   unsigned long long transferred_regular;   /* regular files actually stored */
   unsigned long long transferred_file_size; /* source size of those files */
-  unsigned long long literal_data;          /* literal bytes sent for them */
+  /* Whole-file accuracy: the `--stats` "Literal data" row.  The sender counts
+   * the source size of every stored file, so a whole-file transfer matches
+   * rsync.  A delta run actually ships only the literal fragments of the diff
+   * (the rest is matched/copied), so here the value is an upper bound, not
+   * rsync's literal-byte total; see RSYNC_COMPAT.md's `--stats` row. */
+  unsigned long long literal_data;
 } TransferStats;
 
 #endif

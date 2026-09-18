@@ -229,7 +229,10 @@ static void transfer_stats_note_entry(TransferStats* stats, const File* file) {
 }
 
 /* Account for a regular file (or a whole-file append) the receiver actually
-   stored: rsync's transferred-file count and transferred/literal byte totals. */
+   stored: rsync's transferred-file count and transferred/literal byte totals.
+   `literal_data` counts the whole source size, which is exact for a whole-file
+   send but an upper bound for a delta send (the receiver reuses basis blocks
+   the sender never ships); see TransferStats.literal_data in format.h. */
 static void transfer_stats_note_transferred(TransferStats* stats, const File* file) {
   if (stats == NULL || file == NULL)
     return;
@@ -940,8 +943,6 @@ static void source_file_destroy(void* item) {
   }
 }
 
-static const char* delete_display_path(const Config* config, const char* path);
-
 /* Remove only the same regular source file that was sent. */
 static void remove_transferred_sources(const Config* config, ArrayList* paths) {
   if (!config->remove_source_files || !paths)
@@ -1075,20 +1076,7 @@ static bool receive_stats_record(int fd, ReceiverStats* stats, ArrayList* would_
 static const char* delete_display_path(const Config* config, const char* path) {
   if (!config || !path || !config->send_directory)
     return path;
-  const char* root = config->send_directory;
-  while (*root == '/')
-    root++;
-  const char* rel = path;
-  while (*rel == '/')
-    rel++;
-  size_t root_len = strlen(root);
-  while (root_len > 0 && root[root_len - 1] == '/')
-    root_len--;
-  if (root_len == 0)
-    return rel;
-  if (strncmp(rel, root, root_len) == 0 && (rel[root_len] == '/' || rel[root_len] == '\0'))
-    return rel + root_len + (rel[root_len] == '/' ? 1 : 0);
-  return rel;
+  return utils_strip_transfer_root(path, config->send_directory);
 }
 
 /* Send the final STATUS_FINISHED frame and await the receiver's verdict.

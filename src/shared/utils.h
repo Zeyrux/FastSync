@@ -191,6 +191,11 @@ const char* utils_get_authorized_root_path(void);
  * callers guarantee this); this is containment by string, not by resolved
  * symlinks.  Shared by the utils and file secure-walk root confinement. */
 bool path_is_within_root(const char* root, const char* path);
+/* Non-allocating transfer-relative view of `path`: strip any leading '/' and
+ * then a `root` prefix (leading/trailing slashes tolerated), returning a
+ * borrowed pointer into `path`.  A NULL/empty root, or a path not under
+ * `root`, yields just the leading-slash strip.  `path`/`root` must stay alive. */
+const char* utils_strip_transfer_root(const char* path, const char* root);
 /* True when `path` contains a ".." component.  This is a purely lexical
  * dot-dot check: an absolute path is NOT rejected here, because default
  * (non-relative) transfers legitimately put the sender's absolute source path
