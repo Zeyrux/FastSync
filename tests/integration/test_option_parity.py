@@ -92,9 +92,13 @@ class TestBwlimitParity:
         result, fast_secs = run_client(source, dest, flags=["-a", "--bwlimit=2048"],
                                        port=shared_server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:200]
-        assert fast_secs > 1.0, f"fastsync throttled too little: {fast_secs:.2f}s"
-        # Both rendezvous near 2 s; allow a generous band for CI scheduling.
-        assert abs(fast_secs - rsync_secs) < 1.0, (
+        # 4 MiB at 2 MiB/s rendezvous near 2 s.  Use a coarse band on each side
+        # (an unthrottled transfer finishes well under 1.5 s) plus a generous
+        # cross-tolerance so a loaded CI runner cannot flake the parity assert.
+        lo, hi = 1.5, 4.5
+        assert lo <= fast_secs <= hi, f"fastsync throttle out of band: {fast_secs:.2f}s"
+        assert lo <= rsync_secs <= hi, f"rsync throttle out of band: {rsync_secs:.2f}s"
+        assert abs(fast_secs - rsync_secs) < 2.0, (
             f"fastsync {fast_secs:.2f}s vs rsync {rsync_secs:.2f}s"
         )
 

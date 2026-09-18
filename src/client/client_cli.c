@@ -23,6 +23,7 @@
 #include <langinfo.h>
 #include <limits.h>
 #include <locale.h>
+#include <math.h>
 #include <time.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -501,6 +502,7 @@ static bool is_accepted_debug_category(const char* name) {
 
 static bool is_accepted_info_category(const char* name) {
   static const char* const categories[] = {
+      "backup",
       "mount",
       "syms",
       "symsafe",
@@ -628,8 +630,6 @@ static int parse_info_flags(const char* value, Config* config) {
       flag = LOG_INFO_FLIST;
     else if (strcmp(name, "nonreg") == 0)
       flag = LOG_INFO_NONREG;
-    else if (strcmp(name, "backup") == 0)
-      flag = LOG_INFO_BACKUP;
     else if (strcmp(name, "progress") == 0)
       flag = LOG_INFO_PROGRESS;
     else if (is_accepted_info_category(name))
@@ -1897,17 +1897,41 @@ static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_
     return -1;
   }
 
-  long long size = 1;
+  long long base = 1;
   for (int i = 0; i < reps; i++) {
-    if (size > LLONG_MAX / mult) {
+    if (base > LLONG_MAX / mult) {
       log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
       return -1;
     }
-    size *= mult;
+    base *= mult;
   }
-  size = (long long)((double)size * atof(value));
+  /* rsync multiplies the numeric prefix (atof) by mult^reps in a signed
+   * ssize_t, which is undefined on overflow.  Scale in double and range-check
+   * before converting, so a huge value is rejected as "too large" (where
+   * rsync's overflow happens to land on a negative result) without invoking
+   * signed-overflow UB. */
+  double scaled = (double)base * strtod(value, NULL);
+  /* (double)LLONG_MAX rounds up to 2^63, which is itself out of range for the
+   * cast, so reject at >= that bound; LLONG_MIN == -2^63 is exactly
+   * representable and thus castable, so the lower bound stays strict. */
+  if (!isfinite(scaled) || scaled >= (double)LLONG_MAX || scaled < (double)LLONG_MIN) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
+    return -1;
+  }
+  long long size = (long long)scaled;
   if ((*arg == '+' || *arg == '-') && arg[1] == '1' && arg != value) {
-    size += atoi(arg);
+    /* The only form accepted here is "+1"/"-1" (a longer number leaves a
+       trailing byte and is rejected below), so apply the delta directly and
+       guard the one overflow direction. */
+    if (*arg == '+') {
+      if (size == LLONG_MAX) {
+        log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
+        return -1;
+      }
+      size += 1;
+    } else {
+      size -= 1;
+    }
     arg += 2;
   }
   if (*arg != '\0' || size < 0) {

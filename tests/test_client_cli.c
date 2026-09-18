@@ -1348,8 +1348,8 @@ static void test_parse_args_info_name_and_help() {
 
 /* rsync 3.4.1's full --info/--debug vocabulary parses.  The info categories
  * with a FastSync event set their flag; the remaining rsync-only categories
- * (mount/symsafe/syms) parse but stay silent.  Every --debug category listed
- * here is FastSync-silent, so debug_level stays 0. */
+ * (backup/mount/symsafe/syms) parse but stay silent.  Every --debug category
+ * listed here is FastSync-silent, so debug_level stays 0. */
 static void test_parse_args_rsync_flag_vocabulary_accepted() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--info=backup,del,flist,mount,nonreg,progress,remove,symsafe,syms",
@@ -1361,7 +1361,7 @@ static void test_parse_args_rsync_flag_vocabulary_accepted() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_BACKUP | LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_NONREG |
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_NONREG |
                                      LOG_INFO_PROGRESS | LOG_INFO_REMOVE);
   EXPECT_EQ_INT(cfg->debug_level, 0);
   config_delete(cfg);
@@ -3932,6 +3932,55 @@ static void test_parse_args_bwlimit_rsync_units() {
   io_set_bwlimit(0);
 }
 
+/* Huge/malformed --bwlimit values must be rejected (not accepted or UB) and
+ * oversized-but-representable ones must still be accepted: the scaling used to
+ * be done with an unchecked signed double->long long cast, which is undefined
+ * when the product leaves long long's range. */
+static void test_parse_args_bwlimit_huge_and_boundary() {
+  struct {
+    const char* value;
+    unsigned long long expected; /* bytes/sec, ignored when !ok */
+    int ok;
+  } cases[] = {
+      /* Malformed / non-numeric prefixes. */
+      {"1e300", 0, 0},
+      {"99999999999999999999999999e3", 0, 0},
+      /* Products that exceed LLONG_MAX at every suffix. */
+      {"99999999999999999999999999", 0, 0},
+      {"99999999999999999999999999K", 0, 0},
+      {"100000000000000000000P", 0, 0},
+      {"99999999999999999999999999999999999999999999999999B", 0, 0},
+      /* `strtod` overflow to +inf must be caught by the isfinite() guard. */
+      {"9999999999999999999999999999999999999999999999999999999999999999999999"
+       "9999999999999999999999999999999999999999999999999999999999999999999999"
+       "99999999999999999999999999999999999999999999999999999999999999999999999",
+       0, 0},
+      /* 2^52 KiB/s: the largest power-of-two scaling that still fits. */
+      {"4503599627370496", 4611686018427387904ULL, 1},
+      /* The +/-1 suffix forms accepted by rsync. */
+      {"1+1", 1024ULL, 1},
+      {"1-1", 1024ULL, 1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    int positional_args[2];
+    int positional_count = 0;
+    char option[1024];
+    snprintf(option, sizeof(option), "--bwlimit=%s", cases[i].value);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int rc = parse_args(cfg, 4, argv, positional_args, &positional_count);
+    if (cases[i].ok) {
+      EXPECT_EQ_INT(rc, 0);
+      EXPECT_TRUE(io_get_bwlimit() == cases[i].expected);
+    } else {
+      EXPECT_EQ_INT(rc, -1);
+    }
+    config_delete(cfg);
+    io_set_bwlimit(0);
+  }
+}
+
 /* --dry-run must not emit a batch file, so it is rejected alongside
  * --read-batch/--only-write-batch. */
 static void test_validate_config_dry_run_rejects_write_batch() {
@@ -4662,6 +4711,7 @@ void test_client_cli() {
   test_parse_args_pattern_file_oversized_rejected();
   test_parse_args_unsigned_options_reject_sign();
   test_parse_args_bwlimit_rsync_units();
+  test_parse_args_bwlimit_huge_and_boundary();
   test_validate_config_dry_run_rejects_write_batch();
   test_parse_args_short_clustering();
   test_parse_args_attached_short_values();

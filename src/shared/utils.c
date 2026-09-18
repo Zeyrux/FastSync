@@ -52,6 +52,31 @@ bool path_is_within_root(const char* root, const char* path) {
   return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
 }
 
+/* Borrowed transfer-relative view of `path`: strip any leading '/' and then a
+ * `root` prefix (its own leading/trailing slashes tolerated), returning a
+ * pointer into `path`.  Non-allocating, so it is safe on the hot scan/print
+ * paths.  A NULL/empty root, or a path not under `root`, leaves only the
+ * leading-slash strip.  `path` must be NUL-terminated and live in the caller. */
+const char* utils_strip_transfer_root(const char* path, const char* root) {
+  if (path == NULL)
+    return NULL;
+  const char* rel = path;
+  while (*rel == '/')
+    rel++;
+  if (root == NULL)
+    return rel;
+  while (*root == '/')
+    root++;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  if (root_len == 0)
+    return rel;
+  if (strncmp(rel, root, root_len) == 0 && (rel[root_len] == '/' || rel[root_len] == '\0'))
+    return rel + root_len + (rel[root_len] == '/' ? 1 : 0);
+  return rel;
+}
+
 /* Open the destination root directory itself, confined to the authorized root.
  * NOTE (do not merge with file_open_secure_parent): this walk opens dest_root
  * (a directory that must already exist) and returns its fd, whereas

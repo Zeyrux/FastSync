@@ -2921,7 +2921,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.26.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.27.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())
