@@ -56,7 +56,14 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 ./build/tests                # unit tests
 python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"   # full integration suite (CI excludes env-dependent privilege tests)
 python3 -m pytest tests/integration/ -n 4 --dist=load -m ci   # PR-gate subset only
+
+# Differential rsync-parity gate (real rsync 3.4.1 vs FastSync)
+python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity_ci  # fast PR subset
+python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity     # full set
 ```
+
+See `tests/integration/README.md` for the differential parity gate and its
+`parity_caveats.py` allowlist (the residual burn-down mechanism).
 
 ## CI Workflow — Waiting for Results
 
