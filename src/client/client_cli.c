@@ -1843,6 +1843,8 @@ static int set_log_file_option(Config* config, const char* log_path) {
  * parsed byte count is then quantized to whole KiB exactly like rsync's
  * `bwlimit = (size + 512) / 1024`.  Returns 0 on success, -1 on a parse error. */
 static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_sec_out) {
+  if (!value || !bytes_per_sec_out)
+    return -1;
   const char* arg = value;
   int reps;
   long long mult;
@@ -1879,7 +1881,7 @@ static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_
     reps = 5;
     break;
   default:
-    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value ? value : "");
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value);
     return -1;
   }
   if (*arg == 'b' || *arg == 'B') {
@@ -1891,14 +1893,14 @@ static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_
     mult = 1024;
     arg += 2;
   } else {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value ? value : "");
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value);
     return -1;
   }
 
   long long size = 1;
   for (int i = 0; i < reps; i++) {
     if (size > LLONG_MAX / mult) {
-      log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value ? value : "");
+      log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
       return -1;
     }
     size *= mult;
@@ -1909,18 +1911,16 @@ static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_
     arg += 2;
   }
   if (*arg != '\0' || size < 0) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is %s", value ? value : "",
-                size < 0 ? "too large" : "invalid");
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is %s", value, size < 0 ? "too large" : "invalid");
     return -1;
   }
   if (size != 0 && size < 512) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too small (min: 512 or 0 for unlimited)",
-                value ? value : "");
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too small (min: 512 or 0 for unlimited)", value);
     return -1;
   }
   long long kib = size == 0 ? 0 : (size + 512) / 1024;
   if (kib > (long long)(ULLONG_MAX / 1024)) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value ? value : "");
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
     return -1;
   }
   *bytes_per_sec_out = (unsigned long long)kib * 1024;
