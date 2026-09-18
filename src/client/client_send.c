@@ -72,7 +72,7 @@ static void log_server_rejection(const char* context) {
  * continues past an unreadable subdirectory so the readable tree transfers, and
  * always reports the partial transfer (exit 23); this only decides whether the
  * deletion phase is skipped.  Returns true when deletion may proceed. */
-static bool ignore_errors_allows_delete(const Config* config, bool had_io_error) {
+bool ignore_errors_allows_delete(const Config* config, bool had_io_error) {
   return !had_io_error || (config && config->ignore_errors);
 }
 
