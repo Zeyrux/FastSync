@@ -291,6 +291,35 @@ static void test_max_alloc_allows_configured_buffer() {
   protocol_session_unbind();
 }
 
+/* max_alloc == 0 is rsync's --max-alloc=0 "no limit": allocations of any size
+ * are permitted. */
+static void test_max_alloc_zero_means_unlimited() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_set_max_alloc(&session, 0);
+  protocol_session_bind(&session);
+  void* first = protocol_alloc(1024 * 1024);
+  void* second = protocol_alloc(8 * 1024 * 1024);
+  EXPECT_NOT_NULL(first);
+  EXPECT_NOT_NULL(second);
+  free(first);
+  free(second);
+  protocol_session_unbind();
+}
+
+/* A non-positive session io timeout disables the deadline: the getter reports 0
+ * (not the built-in 60 s fallback) so callers know to wait indefinitely. */
+static void test_protocol_get_io_timeout_zero_disables() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_bind(&session);
+  protocol_session_set_io_timeout(&session, 0);
+  EXPECT_EQ_INT(protocol_get_io_timeout_sec(), 0);
+  protocol_session_set_io_timeout(&session, 45);
+  EXPECT_EQ_INT(protocol_get_io_timeout_sec(), 45);
+  protocol_session_unbind();
+}
+
 static void test_max_alloc_is_bound_in_worker_threads() {
   enum { WORKER_COUNT = 4 };
   ProtocolSession sessions[WORKER_COUNT];
@@ -412,6 +441,125 @@ static void test_protocol_accounting_release_does_not_underflow() {
   protocol_session_unbind();
 }
 
+/* A Data acquired on session A must return its connection-memory charge to A
+   regardless of what (if anything) is bound at destroy time.  The original bug
+   had two halves: destroying A's Data while a different session is bound leaks
+   A and drains the bound session, and destroying it with nothing bound leaks A
+   and drains the legacy fallback session. */
+static void test_receive_data_charge_follows_owning_session() {
+  int pipe_a[2];
+  int pipe_b[2];
+  EXPECT_EQ_INT(pipe(pipe_a), 0);
+  EXPECT_EQ_INT(pipe(pipe_b), 0);
+
+  ProtocolSession session_a;
+  ProtocolSession session_b;
+  protocol_session_init(&session_a, pipe_a[0], pipe_a[1]);
+  protocol_session_init(&session_b, pipe_b[0], pipe_b[1]);
+  protocol_session_set_max_alloc(&session_a, 64);
+  protocol_session_set_max_alloc(&session_b, 64);
+
+  unsigned long long size = 8;
+  EXPECT_EQ_INT((int)write(pipe_a[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(pipe_a[1], "12345678", 8), 8);
+  EXPECT_EQ_INT((int)write(pipe_a[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(pipe_a[1], "ABCDEFGH", 8), 8);
+  EXPECT_EQ_INT((int)write(pipe_b[1], &size, sizeof(size)), (int)sizeof(size));
+  EXPECT_EQ_INT((int)write(pipe_b[1], "abcdefgh", 8), 8);
+
+  Data* data_a1 = protocol_receive_data_limited(&session_a, 8);
+  Data* data_a2 = protocol_receive_data_limited(&session_a, 8);
+  Data* data_b = protocol_receive_data_limited(&session_b, 8);
+  EXPECT_NOT_NULL(data_a1);
+  EXPECT_NOT_NULL(data_a2);
+  EXPECT_NOT_NULL(data_b);
+  EXPECT_TRUE(data_a1->owner == &session_a);
+  EXPECT_TRUE(data_a2->owner == &session_a);
+  EXPECT_TRUE(data_b->owner == &session_b);
+  EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 16);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
+
+  /* Half 1: destroy A's Data while the unrelated session B is bound.  The
+     charge must go to A, not to the bound B. */
+  protocol_session_bind(&session_b);
+  data_destroy(data_a1);
+  protocol_session_unbind();
+
+  EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 8);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
+
+  /* Half 2: destroy A's remaining Data with NO session bound.  The charge must
+     still go to A, not to the legacy fallback session. */
+  protocol_session_unbind();
+  data_destroy(data_a2);
+  EXPECT_EQ_INT((int)atomic_load(&session_a.total_allocated_bytes), 0);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 8);
+
+  data_destroy(data_b);
+  EXPECT_EQ_INT((int)atomic_load(&session_b.total_allocated_bytes), 0);
+
+  close(pipe_a[0]);
+  close(pipe_a[1]);
+  close(pipe_b[0]);
+  close(pipe_b[1]);
+}
+
+/* Freshest Data holds no connection charge; only a bounded receive binds an
+   owner and a charge, so creation helpers must start uncharged and unowned. */
+static void test_data_create_starts_uncharged_and_unowned() {
+  void* buf = malloc(8);
+  EXPECT_NOT_NULL(buf);
+  Data* created = data_create(buf, 8);
+  EXPECT_NOT_NULL(created);
+  EXPECT_TRUE(created->owner == NULL);
+  EXPECT_EQ_INT((int)created->protocol_charge, 0);
+  data_destroy(created);
+
+  Data* reserved = data_create_reserve(64);
+  EXPECT_NOT_NULL(reserved);
+  EXPECT_TRUE(reserved->owner == NULL);
+  EXPECT_EQ_INT((int)reserved->protocol_charge, 0);
+  data_destroy(reserved);
+}
+
+/* The server floors a client --timeout=0 at SERVER_IO_TIMEOUT_SEC so a silent
+ * peer can never hold a session slot forever (slow-loris). */
+static void test_protocol_server_io_timeout_floor() {
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(0), SERVER_IO_TIMEOUT_SEC);
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(-7), SERVER_IO_TIMEOUT_SEC);
+  EXPECT_EQ_INT(protocol_server_io_timeout_sec(30), 30);
+  EXPECT_TRUE(SERVER_IO_TIMEOUT_SEC > 0);
+}
+
+static void test_protocol_session_io_timeout() {
+  /* The default is the built-in 60 s window; the setter stores exactly what it
+   * is given (<= 0 disables the deadline, matching rsync's --timeout=0) so
+   * callers can propagate --timeout without special-casing 0. */
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  EXPECT_EQ_INT(session.io_timeout_sec, 60);
+
+  protocol_session_set_io_timeout(&session, 120);
+  EXPECT_EQ_INT(session.io_timeout_sec, 120);
+  protocol_session_set_io_timeout(&session, 0);
+  EXPECT_EQ_INT(session.io_timeout_sec, 0);
+  /* A NULL session is a no-op, not a crash. */
+  protocol_session_set_io_timeout(NULL, 5);
+
+  /* A short per-session deadline must actually bound a non-responsive read:
+   * with no writer the poll waits for the configured 1 s and then fails,
+   * rather than the built-in 60 s. */
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession timed;
+  protocol_session_init(&timed, p[0], p[1]);
+  protocol_session_set_io_timeout(&timed, 1);
+  char buf[4];
+  EXPECT_FALSE(protocol_receive_n_data(&timed, buf, sizeof(buf)));
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_send_receive_status_timed() {
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -431,6 +579,96 @@ static void test_send_receive_status_timed() {
   close(p[0]);
 }
 
+static bool keepalive_always_abort(void) {
+  return true;
+}
+
+/* A pre-buffered KEEPALIVE reply from the peer must be consumed transparently,
+   leaving the first real status visible to the caller. */
+static void test_receive_status_keepalive_skips_reply() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+
+  EXPECT_TRUE(protocol_send_status(&session, STATUS_KEEPALIVE));
+  EXPECT_TRUE(protocol_send_status(&session, STATUS_OK));
+
+  Status received = STATUS_ERROR;
+  EXPECT_TRUE(protocol_receive_status_keepalive(&session, &received, 5, 1, NULL));
+  EXPECT_EQ_INT((int)received, (int)STATUS_OK);
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* The abort callback ends the wait immediately, before any keepalive traffic. */
+static void test_receive_status_keepalive_aborts() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+
+  Status received = STATUS_ERROR;
+  EXPECT_FALSE(
+      protocol_receive_status_keepalive(&session, &received, 5, 1, keepalive_always_abort));
+
+  close(p[0]);
+  close(p[1]);
+}
+
+typedef struct {
+  int peer_read_fd;
+  int peer_write_fd;
+  bool replied;
+} KeepalivePeerArg;
+
+static int keepalive_peer(void* arg) {
+  KeepalivePeerArg* peer = arg;
+  ProtocolSession session;
+  protocol_session_init(&session, peer->peer_read_fd, peer->peer_write_fd);
+  Status status = STATUS_ERROR;
+  if (protocol_receive_status(&session, &status) && status == STATUS_KEEPALIVE) {
+    /* Model the busy receiver: it sends the real ack first, then the keepalive
+       reply it owes for the queued keepalive (which the client must drain so it
+       does not desynchronize the stream). */
+    peer->replied = protocol_send_status(&session, STATUS_OK) &&
+                    protocol_send_status(&session, STATUS_KEEPALIVE);
+  }
+  return thrd_success;
+}
+
+/* While the peer is silent the helper must emit STATUS_KEEPALIVE, then consume
+   the peer's ack and drain the keepalive reply that follows it -- proving the
+   inline keepalive loop works without a second writer racing the send path. */
+static void test_receive_status_keepalive_emits() {
+  int to_client[2];
+  int to_peer[2];
+  EXPECT_EQ_INT(pipe(to_client), 0);
+  EXPECT_EQ_INT(pipe(to_peer), 0);
+
+  ProtocolSession session;
+  protocol_session_init(&session, to_client[0], to_peer[1]);
+
+  KeepalivePeerArg peer = {.peer_read_fd = to_peer[0], .peer_write_fd = to_client[1]};
+  thrd_t thread;
+  EXPECT_EQ_INT(thrd_create(&thread, keepalive_peer, &peer), thrd_success);
+
+  Status received = STATUS_ERROR;
+  EXPECT_TRUE(protocol_receive_status_keepalive(&session, &received, 10, 1, NULL));
+  EXPECT_EQ_INT((int)received, (int)STATUS_OK);
+
+  int result = 0;
+  EXPECT_EQ_INT(thrd_join(thread, &result), thrd_success);
+  EXPECT_EQ_INT(result, thrd_success);
+  EXPECT_TRUE(peer.replied);
+
+  close(to_client[0]);
+  close(to_client[1]);
+  close(to_peer[0]);
+  close(to_peer[1]);
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -440,15 +678,24 @@ void test_protocol() {
   test_send_receive_data();
   test_send_receive_int();
   test_send_receive_status();
+  test_protocol_session_io_timeout();
+  test_protocol_server_io_timeout_floor();
   test_send_receive_status_timed();
+  test_receive_status_keepalive_skips_reply();
+  test_receive_status_keepalive_aborts();
+  test_receive_status_keepalive_emits();
   test_receive_n_data_truncated();
   test_receive_str_truncated();
   test_max_alloc_rejects_single_buffer();
   test_explicit_session_max_alloc_cannot_be_bypassed();
   test_max_alloc_allows_configured_buffer();
+  test_max_alloc_zero_means_unlimited();
+  test_protocol_get_io_timeout_zero_disables();
   test_max_alloc_is_bound_in_worker_threads();
   test_protocol_accounting_is_released_in_worker_threads();
   test_protocol_accounting_reservation_is_atomic();
   test_protocol_string_accounting_is_transient();
   test_protocol_accounting_release_does_not_underflow();
+  test_receive_data_charge_follows_owning_session();
+  test_data_create_starts_uncharged_and_unowned();
 }

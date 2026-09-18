@@ -1,6 +1,7 @@
 #ifndef FILE_LIST_H
 #define FILE_LIST_H
 
+#include "utils.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -12,11 +13,18 @@
  * of "." means the whole tree, absolute entries and ".." traversal are
  * rejected at parse time. The set is immutable and shared read-only across
  * scanner worker threads.
- */
-
+ *
+ * Membership is answered from `index`, built once at load time over the exact
+ * entries only: `index.exact` matches a listed path, the sorted view detects an
+ * ancestor directory of a listed entry, and `rel`'s own directory prefixes are
+ * matched against the exact set while descending.  No ancestor prefix is stored
+ * as a separate string, so the index is O(entry count) memory however deep the
+ * paths are, and each query is O(path length) comparisons. */
 typedef struct {
   char** entries; /* normalized rel paths; "" means the whole tree */
   int count;
+  PathIndex index;
+  bool whole_tree; /* an entry of "" lists the source root */
 } FileListSet;
 
 /* Load and validate a --files-from file. When `null_separated` (-0/--from0)
@@ -31,5 +39,15 @@ void file_list_destroy(FileListSet* set);
  * listed entry. Used to prune scanning: directories are descended only when
  * this returns true, files are transferred only when it returns true. */
 bool file_list_affects(const FileListSet* set, const char* rel);
+
+/* True when the DIRECTORY `rel` (path relative to the source root) is inside a
+ * listed directory subtree: `rel` itself is a listed entry, or one of `rel`'s
+ * ancestor directory prefixes is an exact listed entry.  Unlike
+ * file_list_affects this does NOT treat an ancestor of a listed entry as
+ * affected, so an implied parent directory of a listed file is not synchronized
+ * (rsync deletes nothing in it).  With no set or a whole-tree set every
+ * directory is in scope.  This is the delete-walker's "synchronized directory"
+ * predicate. */
+bool file_list_dir_in_scope(const FileListSet* set, const char* rel);
 
 #endif

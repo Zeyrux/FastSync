@@ -644,17 +644,19 @@ static void test_scanner_one_file_system_cross_device() {
   EXPECT_EQ_INT(seq_off_rc, 0);
   EXPECT_TRUE(seq_off_found);
   EXPECT_EQ_INT(seq_off_total, 2);
-  /* Sequential: with -x the cross-device subtree is dropped, keep.txt remains. */
+  /* Sequential: with -x the cross-device subtree is not descended into, but
+   * rsync-compatible behavior still emits the mount-point directory entry as an
+   * empty directory File, so keep.txt plus that entry are present. */
   EXPECT_EQ_INT(seq_on_rc, 0);
   EXPECT_FALSE(seq_on_found);
-  EXPECT_EQ_INT(seq_on_total, 1);
+  EXPECT_EQ_INT(seq_on_total, 2);
   /* Parallel: same behavior, worker path (depth > 1). */
   EXPECT_EQ_INT(par_off_rc, 0);
   EXPECT_TRUE(par_off_found);
   EXPECT_EQ_INT(par_off_total, 2);
   EXPECT_EQ_INT(par_on_rc, 0);
   EXPECT_FALSE(par_on_found);
-  EXPECT_EQ_INT(par_on_total, 1);
+  EXPECT_EQ_INT(par_on_total, 2);
 }
 
 /* Collect emitted file paths (relative to `root`) from a sequential scan.
@@ -853,7 +855,7 @@ static void test_filter_rules(bool parallel) {
   /* - *.tmp excludes only the tmp file; other files remain (default include). */
   const char* exclude_only[] = {"- *.tmp"};
   char err[160];
-  FilterRuleList* base = filter_base_build(exclude_only, 1, false, err, sizeof(err));
+  FilterRuleList* base = filter_base_build(exclude_only, 1, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   ScannerOptions options = {0};
   options.base_filters = base;
@@ -873,7 +875,7 @@ static void test_filter_rules(bool parallel) {
 
   /* Anchored include then exclude-all: only root-level keep* survives. */
   const char* anchored[] = {"+ /a.txt", "- *"};
-  base = filter_base_build(anchored, 2, false, err, sizeof(err));
+  base = filter_base_build(anchored, 2, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   options.base_filters = base;
   rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
@@ -881,6 +883,35 @@ static void test_filter_rules(bool parallel) {
   EXPECT_EQ_INT(rc, 0);
   EXPECT_EQ_INT(count, 1);
   EXPECT_TRUE(has_path(paths, count, "a.txt"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  /* The common include idiom (the exact rule order the CLI compiles from
+   * --include='*.txt' --exclude='*'): only .txt files survive. */
+  const char* idiom[] = {"+ *.txt", "- *"};
+  base = filter_base_build(idiom, 2, false, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  options.base_filters = base;
+  rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 2);
+  EXPECT_TRUE(has_path(paths, count, "a.txt"));
+  EXPECT_TRUE(has_path(paths, count, "c.txt"));
+  EXPECT_FALSE(has_path(paths, count, "b.tmp"));
+  free_paths(paths, count);
+  filter_rule_list_free(base);
+
+  /* An include rule alone is NOT a mandatory whitelist (rsync semantics): only
+   * the matching file is affected, everything else is still transferred. */
+  const char* include_alone[] = {"+ *.txt"};
+  base = filter_base_build(include_alone, 1, false, false, err, sizeof(err));
+  EXPECT_NOT_NULL(base);
+  options.base_filters = base;
+  rc = parallel ? collect_files_parallel(root, &options, &paths, &count)
+                : collect_files(root, &options, &paths, &count);
+  EXPECT_EQ_INT(rc, 0);
+  EXPECT_EQ_INT(count, 3);
   free_paths(paths, count);
   filter_rule_list_free(base);
 
@@ -901,7 +932,7 @@ static void test_filter_dir_only_and_anchored(bool parallel) {
 
   const char* rules[] = {"- /sub/"};
   char err[160];
-  FilterRuleList* base = filter_base_build(rules, 1, false, err, sizeof(err));
+  FilterRuleList* base = filter_base_build(rules, 1, false, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   ScannerOptions options = {0};
   options.base_filters = base;
@@ -935,7 +966,7 @@ static void test_cvs_defaults(bool parallel) {
   create_test_file("test_scan_cvs/keep.txt", "keep");
 
   char err[160];
-  FilterRuleList* base = filter_base_build(NULL, 0, true, err, sizeof(err));
+  FilterRuleList* base = filter_base_build(NULL, 0, true, false, err, sizeof(err));
   EXPECT_NOT_NULL(base);
   ScannerOptions options = {0};
   options.base_filters = base;
@@ -974,6 +1005,7 @@ static void test_per_dir_filter(bool parallel) {
 
   ScannerOptions options = {0};
   options.per_dir_filters = true;
+  options.exclude_per_dir_filter_files = true; /* -FF */
   if (parallel)
     options.num_threads = 2;
   char** paths = NULL;
@@ -1038,6 +1070,59 @@ static void test_scanner_path_relative() {
   EXPECT_NULL(scanner_path_relative("/tmp/foo", "/tmp/foobar"));
 }
 
+/* -R/--relative destination prefix: the '/./' cut point and normalization. */
+static void test_scanner_relative_prefix() {
+  char* p = NULL;
+
+  /* No cut: the whole spec with leading/trailing slashes removed. */
+  p = scanner_relative_prefix("/tmp/src/foo/");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "tmp/src/foo");
+  free(p);
+
+  p = scanner_relative_prefix("src/foo");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "src/foo");
+  free(p);
+
+  /* Trailing "/." is the directory itself, not a cut. */
+  p = scanner_relative_prefix("src/foo/.");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "src/foo");
+  free(p);
+
+  /* The first "/./" cuts everything before it. */
+  p = scanner_relative_prefix("/a/./b/c");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "b/c");
+  free(p);
+
+  p = scanner_relative_prefix("src/./");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "");
+  free(p);
+
+  /* A later "." component is normalized away. */
+  p = scanner_relative_prefix("a/./b/./c");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "b/c");
+  free(p);
+
+  /* A leading "./" is the cut at the start. */
+  p = scanner_relative_prefix("./s2");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "s2");
+  free(p);
+
+  p = scanner_relative_prefix(".");
+  EXPECT_NOT_NULL(p);
+  EXPECT_EQ_STR(p, "");
+  free(p);
+
+  EXPECT_NULL(scanner_relative_prefix(NULL));
+  EXPECT_NULL(scanner_relative_prefix(""));
+}
+
 /* rsync precedence: a deeper .rsync-filter overrides a shallower one, so an
  * inner "+ *.tmp" re-includes what the outer "- *.tmp" excluded. */
 static void test_per_dir_filter_override(bool parallel) {
@@ -1053,6 +1138,7 @@ static void test_per_dir_filter_override(bool parallel) {
 
   ScannerOptions options = {0};
   options.per_dir_filters = true;
+  options.exclude_per_dir_filter_files = true; /* -FF */
   if (parallel)
     options.num_threads = 2;
   char** paths = NULL;
@@ -1317,6 +1403,234 @@ static void test_scanner_captures_directory_times() {
   rmdir(root);
 }
 
+/* Ownership guard for chunk_data_to_chunk(): a returned Chunk owns its File
+ * objects, so destroying the chunk must free them exactly once and the scanner
+ * must never free them again.  chunk_size = 1 forces the mid-directory
+ * conversion branch (chunk_data_size > chunk_size) for every file, and the
+ * chunk is destroyed immediately, catching a double free / use-after-free under
+ * ASan if ownership transfer regressed.
+ *
+ * The failure path (array_list_to_array() or chunk_create() returning NULL) is
+ * not reachable from a unit test: both allocate through protocol_alloc(), and
+ * each allocation they perform is no larger than the array_list allocations
+ * that already succeeded while building the list (array_list_to_array() copies
+ * exactly `size` pointers, which never exceeds the capacity just grown, and
+ * sizeof(Chunk) is far below the initial 100-entry item array).  Binding a
+ * small --max-alloc session therefore always fails *before* this function, not
+ * inside it, so fault injection cannot isolate these paths. */
+static void test_scanner_chunk_ownership() {
+  const char* dir = "test_scan_ownership";
+  const char* file1 = "test_scan_ownership/a.txt";
+  const char* file2 = "test_scan_ownership/b.txt";
+  const char* file3 = "test_scan_ownership/c.txt";
+
+  EXPECT_EQ_INT(mkdir(dir, 0755), 0);
+  create_test_file(file1, "aaaa");
+  create_test_file(file2, "bbbb");
+  create_test_file(file3, "cccc");
+
+  ScannerOptions options = {0};
+  options.chunk_size = 1;
+  DirectoryScanner* scanner = directory_scanner_create_with_options(dir, &options);
+  EXPECT_NOT_NULL(scanner);
+
+  int chunks = 0;
+  int files = 0;
+  Chunk* chunk;
+  while ((chunk = directory_scanner_next(scanner)) != NULL) {
+    chunks++;
+    files += chunk->element_count;
+    EXPECT_EQ_INT(chunk->element_count, 1);
+    chunk_destroy(chunk);
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+  }
+  EXPECT_EQ_INT(files, 3);
+  EXPECT_EQ_INT(chunks, 3);
+  EXPECT_FALSE(directory_scanner_failed(scanner));
+
+  directory_scanner_destroy(scanner);
+  unlink(file1);
+  unlink(file2);
+  unlink(file3);
+  rmdir(dir);
+}
+
+/* The scanner derives entry type from a single lstat() for non-symlinks
+ * (regular files and directories) and only calls stat() to dereference real
+ * symlinks.  Guard the regular-file/directory/symlink distinction across the
+ * default (symlinks skipped), --copy-links (dereferenced) and -l (carried)
+ * modes so the lstat/stat reuse cannot misclassify entries. */
+static void test_scanner_entry_classification() {
+  const char* root = "test_scan_classify";
+  const char* sub = "test_scan_classify/sub";
+  const char* file = "test_scan_classify/file.txt";
+  const char* nested = "test_scan_classify/sub/nested.txt";
+  const char* link_file = "test_scan_classify/link_file";
+  const char* link_dir = "test_scan_classify/link_dir";
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(sub, 0755), 0);
+  create_test_file(file, "hello");    /* 5 bytes */
+  create_test_file(nested, "nested"); /* 6 bytes */
+  EXPECT_EQ_INT(symlink("file.txt", link_file), 0);
+  EXPECT_EQ_INT(symlink("sub", link_dir), 0);
+
+  /* Default: no link option -> symlinks are skipped entirely; regular files and
+     directories (descended, not emitted) are classified as before. */
+  {
+    ScannerOptions options = {0};
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    size_t root_len = strlen(root);
+    bool file_ok = false, nested_ok = false, link_seen = false;
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        const File* f = chunk->items[i];
+        const char* rel = f->path + root_len;
+        if (*rel == '/')
+          rel++;
+        if (strcmp(rel, "file.txt") == 0) {
+          file_ok = !f->is_dir && !f->is_symlink && f->data->size == 5;
+        } else if (strcmp(rel, "sub/nested.txt") == 0) {
+          nested_ok = !f->is_dir && !f->is_symlink && f->data->size == 6;
+        } else {
+          link_seen = true;
+        }
+      }
+      chunk_destroy(chunk);
+    }
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(file_ok);
+    EXPECT_TRUE(nested_ok);
+    EXPECT_FALSE(link_seen);
+    directory_scanner_destroy(scanner);
+  }
+
+  /* --copy-links: symlinks are dereferenced.  A link to a file becomes a
+     regular file with the referent's size; a link to a directory is traversed. */
+  {
+    ScannerOptions options = {0};
+    options.copy_links = true;
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    size_t root_len = strlen(root);
+    bool file_ok = false, nested_ok = false, link_file_ok = false;
+    bool link_dir_nested_ok = false, symlink_leaked = false;
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        const File* f = chunk->items[i];
+        const char* rel = f->path + root_len;
+        if (*rel == '/')
+          rel++;
+        if (f->is_symlink)
+          symlink_leaked = true;
+        if (strcmp(rel, "file.txt") == 0)
+          file_ok = !f->is_dir && f->data->size == 5;
+        else if (strcmp(rel, "sub/nested.txt") == 0)
+          nested_ok = !f->is_dir && f->data->size == 6;
+        else if (strcmp(rel, "link_file") == 0)
+          link_file_ok = !f->is_dir && f->data->size == 5;
+        else if (strcmp(rel, "link_dir/nested.txt") == 0)
+          link_dir_nested_ok = !f->is_dir && f->data->size == 6;
+      }
+      chunk_destroy(chunk);
+    }
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(file_ok);
+    EXPECT_TRUE(nested_ok);
+    EXPECT_TRUE(link_file_ok);
+    EXPECT_TRUE(link_dir_nested_ok);
+    EXPECT_FALSE(symlink_leaked);
+    directory_scanner_destroy(scanner);
+  }
+
+  /* -l (--links): symlinks are carried through as symlinks, not dereferenced. */
+  {
+    ScannerOptions options = {0};
+    options.follow_symlinks = true;
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    size_t root_len = strlen(root);
+    bool file_ok = false, link_file_ok = false, link_dir_ok = false, leaked_dir = false;
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL) {
+      for (int i = 0; i < chunk->element_count; i++) {
+        const File* f = chunk->items[i];
+        const char* rel = f->path + root_len;
+        if (*rel == '/')
+          rel++;
+        if (strcmp(rel, "file.txt") == 0)
+          file_ok = !f->is_dir && !f->is_symlink && f->data->size == 5;
+        else if (strcmp(rel, "link_file") == 0)
+          link_file_ok = f->is_symlink && !f->is_dir;
+        else if (strcmp(rel, "link_dir") == 0)
+          link_dir_ok = f->is_symlink && !f->is_dir;
+        else if (strcmp(rel, "link_dir/nested.txt") == 0)
+          leaked_dir = true;
+      }
+      chunk_destroy(chunk);
+    }
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(file_ok);
+    EXPECT_TRUE(link_file_ok);
+    EXPECT_TRUE(link_dir_ok);
+    EXPECT_FALSE(leaked_dir);
+    directory_scanner_destroy(scanner);
+  }
+
+  unlink(link_file);
+  unlink(link_dir);
+  unlink(nested);
+  unlink(file);
+  rmdir(sub);
+  rmdir(root);
+}
+
+/* A dereferenced symlink with no referent (broken/unreadable) must record a
+ * non-fatal I/O error so the run can exit 23 like rsync, without aborting the
+ * scan or treating the condition as a fatal failure. */
+static void test_scanner_broken_referent_io_error(void) {
+  const char* root = "test_scan_broken_ref";
+  const char* good = "test_scan_broken_ref/good.txt";
+  const char* broken = "test_scan_broken_ref/broken";
+
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  create_test_file(good, "hello");
+  EXPECT_EQ_INT(symlink("/nonexistent/quickwins/target", broken), 0);
+
+  {
+    ScannerOptions options = {0};
+    options.copy_links = true;
+    DirectoryScanner* scanner = directory_scanner_create_with_options(root, &options);
+    EXPECT_NOT_NULL(scanner);
+    Chunk* chunk;
+    while ((chunk = directory_scanner_next(scanner)) != NULL)
+      chunk_destroy(chunk);
+    EXPECT_FALSE(directory_scanner_failed(scanner));
+    EXPECT_TRUE(directory_scanner_had_io_error(scanner));
+    directory_scanner_destroy(scanner);
+  }
+
+  {
+    ScannerOptions options = {0};
+    options.copy_links = true;
+    ParallelScanner* scanner = parallel_scanner_create_with_options(root, &options, NULL);
+    EXPECT_NOT_NULL(scanner);
+    Chunk* chunk;
+    while ((chunk = parallel_scanner_next(scanner)) != NULL)
+      chunk_destroy(chunk);
+    EXPECT_FALSE(parallel_scanner_failed(scanner));
+    EXPECT_TRUE(parallel_scanner_had_io_error(scanner));
+    parallel_scanner_destroy(scanner);
+  }
+
+  unlink(broken);
+  unlink(good);
+  rmdir(root);
+}
+
 void test_scanner() {
   test_scanner_single_file();
   test_scanner_multiple_files();
@@ -1335,6 +1649,7 @@ void test_scanner() {
   test_scanner_one_file_system_decision();
   test_scanner_one_file_system_same_device();
   test_parallel_scanner_one_file_system_same_device();
+  test_scanner_broken_referent_io_error();
   test_scanner_one_file_system_cross_device();
   test_files_from_subset(false);
   test_files_from_subset(true);
@@ -1347,10 +1662,13 @@ void test_scanner() {
   test_per_dir_filter(false);
   test_per_dir_filter(true);
   test_scanner_path_relative();
+  test_scanner_relative_prefix();
   test_per_dir_filter_override(false);
   test_per_dir_filter_override(true);
   test_dirs_no_descent();
   test_dirs_files_from();
   test_files_from_relative_send_path();
   test_scanner_captures_directory_times();
+  test_scanner_chunk_ownership();
+  test_scanner_entry_classification();
 }

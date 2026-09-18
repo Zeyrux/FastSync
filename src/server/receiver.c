@@ -3,6 +3,7 @@
 #include "charset.h"
 #include "chunk.h"
 #include "config.h"
+#include "delete_plan.h"
 #include "delay_updates.h"
 #include "file.h"
 #include "file_receive.h"
@@ -11,7 +12,9 @@
 #include "protocol.h"
 #include "utils.h"
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code) {
   if (!outcomes)
@@ -42,17 +45,49 @@ void receiver_outcomes_destroy(ReceiverOutcomes* outcomes) {
 /* End-of-transfer success frame.  When --remove-source-files was negotiated
    each processed data file is acknowledged first (STATUS_NEXT = written,
    STATUS_OK = skipped) so the sender never removes a source the receiver did
-   not actually store.  The frame always ends with a plain STATUS_OK. */
-bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes) {
+   not actually store.  The frame ends with `final_status` (STATUS_OK, or
+   STATUS_DELETE_LIMIT when a --max-delete commit was capped). */
+bool receiver_send_final_success(int fd, const Config* config, const ReceiverOutcomes* outcomes,
+                                 Status final_status) {
   if (!config->remove_source_files)
-    return send_status(fd, STATUS_OK);
+    return send_status(fd, final_status);
   size_t count = outcomes ? outcomes->count : 0;
   for (size_t i = 0; i < count; i++) {
     Status per_file = outcomes->entries[i] == FILE_SAVE_WRITTEN ? STATUS_NEXT : STATUS_OK;
     if (!send_status(fd, per_file))
       return false;
   }
-  return send_status(fd, STATUS_OK);
+  return send_status(fd, final_status);
+}
+
+bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats* stats,
+                               const struct ArrayList* would_delete) {
+  if (!config->report_stats)
+    return true;
+  ReceiverStats local;
+  memset(&local, 0, sizeof(local));
+  const ReceiverStats* out = stats ? stats : &local;
+  size_t count = would_delete ? (size_t)would_delete->size : 0;
+  if (count > (size_t)MAX_MANIFEST_ENTRIES)
+    count = MAX_MANIFEST_ENTRIES;
+  ReceiverStats record = *out;
+  record.would_delete_count = count;
+  if (!send_status(fd, STATUS_STATS) || !format_stats_send(fd, &record) ||
+      !send_int(fd, (int)count))
+    return false;
+  for (size_t i = 0; i < count; i++) {
+    const char* path = (const char*)would_delete->items[i];
+    if (!send_wire_str(fd, path ? path : ""))
+      return false;
+  }
+  return true;
+}
+
+/* Add a delete commit's tally to the sink's end-of-transfer wire counters (when
+   the sink reports them).  Runs on the receiving thread, so no locking. */
+static void receiver_tally_deleted(const ReceiverSink* sink, size_t deleted) {
+  if (sink && sink->stats && deleted > 0)
+    sink->stats->deleted_files += deleted;
 }
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
@@ -153,8 +188,95 @@ static bool receiver_process_batch(Config* config, int file_descriptor) {
   return true;
 }
 
+/* ---- Anti-slowloris connection bounds ----
+ * A legitimate transfer either streams data frames continuously or, when it
+ * must pause, sends STATUS_KEEPALIVE so the peer sees the connection is alive.
+ * An attacker can therefore squat on a connection slot indefinitely by sending
+ * only keepalives under the per-message timeout.  Two CLOCK_MONOTONIC bounds
+ * defeat that without ever punishing a real transfer:
+ *
+ *   MAX_SESSION_IDLE_SEC (1 h): the longest a stream may make no forward
+ *     progress.  Data/status frames count as progress and refresh the timer;
+ *     keepalives do not.  One hour is far longer than any real pause between
+ *     data frames, yet small enough to reap a slowloris well before the 24 h
+ *     session cap.
+ *
+ *   MAX_SESSION_WALL_SEC (24 h): an absolute ceiling on one connection's
+ *     lifetime as defense-in-depth against a trickle of progress frames that
+ *     resets the idle timer just below its limit.  Larger than any plausible
+ *     single transfer while still bounding resource occupancy.
+ *
+ * Both are wall-clock deltas, so the per-message poll timeout (60 s by default,
+ * or --timeout) can never fool them, and both the single-threaded and the -m
+ * receiver paths (receiver_process_pending) share the same logic. */
+#define MAX_SESSION_IDLE_SEC 3600u
+#define MAX_SESSION_WALL_SEC 86400u
+
+static unsigned int g_max_session_idle_sec = MAX_SESSION_IDLE_SEC;
+static unsigned int g_max_session_wall_sec = MAX_SESSION_WALL_SEC;
+
+void receiver_set_time_limits(unsigned int idle_sec, unsigned int wall_sec) {
+  g_max_session_idle_sec = idle_sec;
+  g_max_session_wall_sec = wall_sec;
+}
+
+void receiver_reset_time_limits(void) {
+  g_max_session_idle_sec = MAX_SESSION_IDLE_SEC;
+  g_max_session_wall_sec = MAX_SESSION_WALL_SEC;
+}
+
+bool receiver_time_limit_exceeded(const struct timespec* session_start,
+                                  const struct timespec* last_progress,
+                                  const struct timespec* now) {
+  if (!session_start || !last_progress || !now)
+    return false;
+  if (now->tv_sec - session_start->tv_sec >= (time_t)g_max_session_wall_sec)
+    return true;
+  if (now->tv_sec - last_progress->tv_sec >= (time_t)g_max_session_idle_sec)
+    return true;
+  return false;
+}
+
+/* A frame proves forward progress only when it cannot be fabricated for free.
+ * KEEPALIVE/ABORT are pure liveness, and CHECK_BATCH/DIR_TIMES may carry zero
+ * entries, so a peer must not be able to hold a connection slot forever by
+ * merely emitting empty frames. */
+static bool status_counts_as_progress(Status status) {
+  switch (status) {
+  case STATUS_KEEPALIVE:
+  case STATUS_ABORT:
+  case STATUS_CHECK_BATCH:
+  case STATUS_DIR_TIMES:
+    return false;
+  default:
+    return true;
+  }
+}
+
+/* Refresh the progress timestamp for a forward-moving frame and enforce the
+ * bounds above.  Returns false when the connection must be dropped; the
+ * terminal STATUS_ERROR is sent only when the sink owns error reporting (the
+ * -m sink sets send_error=false so the main thread emits exactly one). */
+static bool receiver_note_status(const struct timespec* session_start,
+                                 struct timespec* last_progress, Status status, int file_descriptor,
+                                 const ReceiverSink* sink) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    now = *last_progress;
+  if (status_counts_as_progress(status))
+    *last_progress = now;
+  if (!receiver_time_limit_exceeded(session_start, last_progress, &now))
+    return true;
+  log_message(LOG_LEVEL_ERROR,
+              "Receive session exceeded its time bound (idle %us / total %us); aborting connection",
+              g_max_session_idle_sec, g_max_session_wall_sec);
+  if (!sink || sink->send_error)
+    send_status(file_descriptor, STATUS_ERROR);
+  return false;
+}
+
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink) {
-  return receiver_process_pending(config, file_descriptor, sink, NULL);
+  return receiver_process_pending(config, file_descriptor, sink, NULL, NULL);
 }
 
 /* Runs the whole receive loop.  The delete manifest may legitimately arrive
@@ -168,19 +290,36 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
    the whole transfer succeeded.  See receiver_process_pending() for how the -m
    receiver defers that commit until its disk writer has drained. */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
-                             DeleteManifest** pending_manifest) {
+                             DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
   Status status;
   if (!receive_status(file_descriptor, &status))
     return -1;
+  /* Wall-clock (=CLOCK_MONOTONIC) anti-slowloris bookkeeping.  session_start is
+   * fixed for the whole connection; last_progress is refreshed by every frame
+   * that is not a keepalive/abort. */
+  struct timespec session_start;
+  struct timespec last_progress;
+  clock_gettime(CLOCK_MONOTONIC, &session_start);
+  last_progress = session_start;
+  if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor, sink))
+    return -1;
   bool early_delete = config_delete_timing_early(config);
+  bool per_dir_delete = config_delete_timing_per_dir(config);
   /* Parked keep-set for the late/commit timing.  Every exit path below frees it
      exactly once; the only exception is the successful FINISHED handoff, which
      transfers ownership to *pending_manifest (used by the -m receiver). */
   DeleteManifest* deferred_manifest = NULL;
+  /* Per-directory delete session for --delete-during/--delete-delay.  During the
+     loop it applies plans inline (during) or snapshots their extras (delay); on
+     a successful FINISHED it is either committed here or handed to
+     *pending_plans so the -m caller commits after its disk writer drained. */
+  DeletePlanSession* plan_session = NULL;
+  bool delete_limit_noted = false;
   while (status == STATUS_NEXT || status == STATUS_CHUNK || status == STATUS_CHECK ||
          status == STATUS_KEEPALIVE || status == STATUS_ABORT || status == STATUS_CHECK_BATCH ||
          status == STATUS_MKDIR || status == STATUS_MANIFEST || status == STATUS_HARDLINK ||
-         status == STATUS_SYMLINK || status == STATUS_SPECIAL || status == STATUS_DIR_TIMES) {
+         status == STATUS_SYMLINK || status == STATUS_SPECIAL || status == STATUS_DIR_TIMES ||
+         status == STATUS_DELETE_PLAN) {
     if (status == STATUS_KEEPALIVE) {
       if (!send_status(file_descriptor, STATUS_KEEPALIVE))
         goto fail;
@@ -191,10 +330,19 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       goto fail;
     }
     if (status == STATUS_CHECK) {
-      bool skipped;
-      File* file = receive_incremental_check(file_descriptor, config, &skipped);
-      if (!skipped && (!file || !sink->store_file(file, sink->context)))
+      bool skipped = false;
+      bool would_transfer = false;
+      File* file = receive_incremental_check_ex(file_descriptor, config, &skipped, &would_transfer);
+      if (config->dry_run) {
+        /* Server-contacting --dry-run: the reply has already been sent
+           (STATUS_OK = up to date, STATUS_DRY_RUN_TRANSFER = would transfer) and
+           nothing may be stored.  Both flags false means a genuine protocol
+           error (STATUS_ERROR already sent or sent by receive_error below). */
+        if (!skipped && !would_transfer)
+          goto receive_error;
+      } else if (!skipped && (!file || !sink->store_file(file, sink->context))) {
         goto receive_error;
+      }
     } else if (status == STATUS_CHUNK) {
       Chunk* chunk = receive_chunk_data(file_descriptor, config);
       if (!chunk || !receiver_process_chunk(chunk, sink))
@@ -226,26 +374,47 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       DeleteManifest* manifest = receive_manifest_entries(file_descriptor);
       if (!manifest)
         goto fail; /* receive_manifest_entries already sent STATUS_ERROR */
-      if (early_delete) {
-        /* --delete-before / --delete-during: the manifest is authoritative the
-           moment it arrives, before any file data.  Delete now and acknowledge
-           so the sender only starts streaming once the deletion committed (or
-           failed).  This is the rsync delete-before/delete-during window: a
-           later transfer failure does not restore these deletions. */
-        bool deletion_ok = (config->use_delete || config->delete_missing_args)
-                               ? manifest_delete_all(config, manifest)
-                               : true;
+      if (config->dry_run) {
+        /* Server-contacting --dry-run mutates nothing, so a keep-set manifest
+           is consumed and discarded.  The early-delete mode still needs its ACK
+           so a sender blocked on the delete handshake is not left hanging.
+           When would-delete reporting is armed, enumerate (read-only) the
+           destination extras so the terminal STATUS_STATS frame can list them. */
+        if (config->use_delete && sink->would_delete) {
+          size_t count = 0;
+          if (!manifest_would_delete_list(config, manifest, sink->would_delete, &count))
+            log_message(LOG_LEVEL_WARNING, "dry-run: could not enumerate would-delete paths");
+        }
         delete_manifest_free(manifest);
-        if (!deletion_ok) {
+        if (early_delete && !send_status(file_descriptor, STATUS_OK))
+          goto fail;
+        goto next_status;
+      }
+      if (early_delete) {
+        /* --delete-before: the whole-tree manifest is authoritative the moment
+           it arrives, before any file data.  Delete now and acknowledge so the
+           sender only starts streaming once the deletion committed (or failed).
+           A later transfer failure does not restore these deletions.  A
+           --max-delete-capped commit still succeeds and the transfer proceeds;
+           the terminal success frame reports the cap. */
+        size_t deleted = 0;
+        DeleteCommitResult deletion = (config->use_delete || config->delete_missing_args)
+                                          ? manifest_delete_all_counted(config, manifest, &deleted)
+                                          : DELETE_COMMIT_OK;
+        receiver_tally_deleted(sink, deleted);
+        delete_manifest_free(manifest);
+        if (deletion == DELETE_COMMIT_ERROR) {
           send_status(file_descriptor, STATUS_ERROR);
           goto fail;
         }
+        if (deletion == DELETE_COMMIT_LIMIT_REACHED && sink->note_delete_limit)
+          sink->note_delete_limit(sink->context);
         if (!send_status(file_descriptor, STATUS_OK))
           goto fail;
       } else if (config->use_delete || config->delete_missing_args) {
-        /* Plain --delete / --delete-after / --delete-delay and the
-           --delete-missing-args exact-path deletions: hold the manifest and
-           commit it only after STATUS_FINISHED. */
+        /* Plain --delete / --delete-after and the --delete-missing-args
+           exact-path deletions: hold the manifest and commit it only after
+           STATUS_FINISHED.  The per-directory modes never send this frame. */
         if (deferred_manifest) {
           log_message(LOG_LEVEL_ERROR, "Received a second delete manifest");
           delete_manifest_free(deferred_manifest);
@@ -257,6 +426,23 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         deferred_manifest = manifest;
       } else {
         delete_manifest_free(manifest);
+      }
+      goto next_status;
+    } else if (status == STATUS_DELETE_PLAN) {
+      if (!per_dir_delete) {
+        log_message(LOG_LEVEL_ERROR, "Received a per-directory delete plan without a per-dir "
+                                     "delete timing");
+        send_status(file_descriptor, STATUS_ERROR);
+        goto fail;
+      }
+      if (!plan_session)
+        plan_session = delete_plan_session_create(config);
+      if (!plan_session || delete_plan_session_receive(plan_session, config, file_descriptor) != 0)
+        goto fail;
+      if (delete_plan_session_limit_reached(plan_session) && !delete_limit_noted &&
+          sink->note_delete_limit) {
+        sink->note_delete_limit(sink->context);
+        delete_limit_noted = true;
       }
       goto next_status;
     } else {
@@ -271,6 +457,8 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
   next_status:
     if (!receive_status(file_descriptor, &status))
       goto receive_error;
+    if (!receiver_note_status(&session_start, &last_progress, status, file_descriptor, sink))
+      goto fail;
   }
   if (status != STATUS_FINISHED) {
     log_message(LOG_LEVEL_ERROR, "Did not receive FINISHED Status");
@@ -290,13 +478,45 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       *pending_manifest = deferred_manifest;
       deferred_manifest = NULL;
     } else {
-      bool deletion_ok = manifest_delete_all(config, deferred_manifest);
+      size_t deleted = 0;
+      DeleteCommitResult deletion =
+          manifest_delete_all_counted(config, deferred_manifest, &deleted);
+      receiver_tally_deleted(sink, deleted);
       delete_manifest_free(deferred_manifest);
       deferred_manifest = NULL;
-      if (!deletion_ok) {
+      if (deletion == DELETE_COMMIT_ERROR) {
         send_status(file_descriptor, STATUS_ERROR);
         goto fail;
       }
+      if (deletion == DELETE_COMMIT_LIMIT_REACHED && sink->note_delete_limit)
+        sink->note_delete_limit(sink->context);
+    }
+  }
+  /* Per-directory deletion: --delete-during already applied each plan inline, so
+     this only finishes the missing-args deletions; --delete-delay committed
+     nothing yet and applies its decompressed snapshot here.  The -m receiver
+     hands the session to its caller instead, which commits after the disk
+     writer drained. */
+  if (plan_session) {
+    if (pending_plans) {
+      *pending_plans = plan_session;
+      plan_session = NULL;
+    } else if (config->dry_run) {
+      /* Central dry-run no-op: never commit a deletion for a -n run. */
+      delete_plan_session_destroy(plan_session);
+      plan_session = NULL;
+    } else {
+      DeleteCommitResult deletion = delete_plan_session_commit(plan_session, config);
+      bool limit = delete_plan_session_limit_reached(plan_session);
+      receiver_tally_deleted(sink, delete_plan_session_deleted(plan_session));
+      delete_plan_session_destroy(plan_session);
+      plan_session = NULL;
+      if (deletion == DELETE_COMMIT_ERROR) {
+        send_status(file_descriptor, STATUS_ERROR);
+        goto fail;
+      }
+      if (limit && !delete_limit_noted && sink->note_delete_limit)
+        sink->note_delete_limit(sink->context);
     }
   }
   if (sink->send_success) {
@@ -311,11 +531,14 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
 
 fail:
   /* Failure exits that must not (or already did) report a STATUS_ERROR.  The
-     parked keep-set is dropped: never commit a deletion for a failed stream. */
+     parked keep-set/session is dropped: never commit a deletion for a failed
+     stream. */
   if (deferred_manifest) {
     delete_manifest_free(deferred_manifest);
     deferred_manifest = NULL;
   }
+  if (plan_session)
+    delete_plan_session_destroy(plan_session);
   return -1;
 
 receive_error:
@@ -323,6 +546,8 @@ receive_error:
     delete_manifest_free(deferred_manifest);
     deferred_manifest = NULL;
   }
+  if (plan_session)
+    delete_plan_session_destroy(plan_session);
   if (sink->send_error)
     send_status(file_descriptor, STATUS_ERROR);
   return -1;
@@ -337,29 +562,49 @@ typedef struct {
      after the whole transfer (and its delete/publication phases) has run so a
      child write never clobbers a directory mtime. */
   DirTimeList dir_times;
+  /* Set when a --max-delete commit was capped; the terminal frame then carries
+     STATUS_DELETE_LIMIT so the sender exits 25 like rsync. */
+  bool delete_limit_reached;
+  /* End-of-transfer wire counters (protocol 2.25.0) and the -n/--dry-run
+     --delete would-delete path list collected while processing the manifest. */
+  ReceiverStats stats;
+  ArrayList* would_delete;
 } ReceiverSaveContext;
 
 static bool receiver_save_file(File* file, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
   FileSaveResult result = FILE_SAVE_ERROR;
-  if (!context->config->save_to_disk) {
+  if (context->config->dry_run) {
+    /* Defense in depth: a dry-run receiver mutates nothing even if a data
+       frame reaches the sink (the sender is not supposed to send one). */
+    result = FILE_SAVE_SKIPPED;
+  } else if (!context->config->save_to_disk) {
     /* Nothing is stored; report the file as not-written so a
        --remove-source-files sender keeps its source. */
     result = FILE_SAVE_SKIPPED;
   } else {
     result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
   }
-  /* A directory's times are deferred, never applied inline: collect the
-     metadata now and apply it at the end.  -O/--omit-dir-times is honored by
-     dir_time_list_apply's caller (see receiver_send_success_frame). */
+  /* Wire-stats tally: bytes reconstructed from the basis file (delta matches)
+     count as matched data in the end-of-transfer report. */
+  if (result != FILE_SAVE_ERROR && file->matched_bytes > 0)
+    context->stats.matched_data += file->matched_bytes;
+  /* A directory's metadata is deferred, never applied inline: collect it now
+     and apply it at the end.  -O/--omit-dir-times and --preserve_perms/-times
+     are honored by dir_metadata_list_apply's caller (see
+     receiver_send_success_frame). */
   if (result != FILE_SAVE_ERROR && file->is_dir && file->metadata &&
-      context->config->use_metadata && !context->config->omit_dir_times &&
-      !dir_time_list_add(&context->dir_times, file->path, file->metadata)) {
+      dir_metadata_should_capture(context->config) &&
+      !dir_time_list_add(&context->dir_times, file->path, file->metadata, file->xattrs)) {
     file_destroy(file);
     return false;
   }
-  if (result != FILE_SAVE_ERROR && context->config->remove_source_files && !file->is_dir &&
-      !file->is_special && !file->skip &&
+  /* A dry-run receiver mutates nothing AND records no per-file outcomes: a
+     hostile dry-run client that streamed data frames anyway must not be able to
+     grow `outcomes` without bound (receiver_outcomes_append reallocs uncharged)
+     or force a per-frame ack. */
+  if (!context->config->dry_run && result != FILE_SAVE_ERROR &&
+      context->config->remove_source_files && !file->is_dir && !file->is_special && !file->skip &&
       !receiver_outcomes_append(&context->outcomes, (unsigned char)result)) {
     file_destroy(file);
     return false;
@@ -368,8 +613,20 @@ static bool receiver_save_file(File* file, void* context_pointer) {
   return result != FILE_SAVE_ERROR;
 }
 
+static void receiver_note_delete_limit(void* context_pointer) {
+  ReceiverSaveContext* context = context_pointer;
+  context->delete_limit_reached = true;
+}
+
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
+  Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
+  if (!receiver_send_stats_frame(fd, context->config, &context->stats, context->would_delete))
+    return false;
+  /* Server-contacting --dry-run: nothing was staged or written, so there is
+     nothing to publish and no directory times to stamp. */
+  if (context->config->dry_run)
+    return receiver_send_final_success(fd, context->config, &context->outcomes, final_status);
   /* --delay-updates: the whole protocol stream (including manifest/delete
      handling, which ran inside receiver_process) has succeeded and every
      staged file was fully written.  Publish them atomically now, before the
@@ -385,18 +642,30 @@ static bool receiver_send_success_frame(int fd, void* context_pointer) {
      phases have committed, so it is finally safe to stamp directory times.
      This runs after the deferred deletion because receiver_process commits it
      before calling this success frame. */
-  dir_time_list_apply(&context->dir_times, context->config->receive_root_directory);
-  return receiver_send_final_success(fd, context->config, &context->outcomes);
+  dir_metadata_list_apply(&context->dir_times, context->config->receive_root_directory,
+                          context->config);
+  return receiver_send_final_success(fd, context->config, &context->outcomes, final_status);
 }
 
 int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
   dir_time_list_init(&context.dir_times);
-  ReceiverSink sink = {receiver_save_file, &context, true, true, receiver_send_success_frame};
+  context.would_delete = array_list_create(free);
+  if (!context.would_delete)
+    return -1;
+  ReceiverSink sink = {receiver_save_file,
+                       &context,
+                       true,
+                       true,
+                       receiver_send_success_frame,
+                       receiver_note_delete_limit,
+                       &context.stats,
+                       context.would_delete};
   int ret = receiver_process(config, file_descriptor, &sink);
   if (ret != 0 && config->delay_updates && config->delay_context)
     delay_updates_cleanup(config->delay_context);
   receiver_outcomes_destroy(&context.outcomes);
   dir_time_list_free(&context.dir_times);
+  array_list_delete(context.would_delete);
   return ret;
 }

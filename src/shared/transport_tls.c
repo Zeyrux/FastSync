@@ -4,7 +4,9 @@
 #include "transport_tcp.h"
 #include "utils.h"
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -34,6 +36,59 @@ static void log_ssl_errors(void) {
   }
 }
 
+/* Load the TLS private key through an already-opened, no-follow descriptor so
+ * the owner/mode policy is checked on the SAME file object that is loaded: an
+ * attacker cannot swap the path between a stat() and a later open() (TOCTOU).
+ * The exact-owner / 0600 policy is preserved and group/other execute bits are
+ * rejected as well.  Ownership of the descriptor passes to the BIO and is
+ * released exactly once by BIO_free() (BIO_CLOSE). */
+static bool load_private_key_secure(SSL_CTX* ctx, const char* key) {
+  int fd = open(key, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    char* escaped = output_escape(key, false);
+    log_message(LOG_LEVEL_ERROR, "Failed to open private key: %s",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    return false;
+  }
+  struct stat key_stat;
+  if (fstat(fd, &key_stat) != 0 || !S_ISREG(key_stat.st_mode) || key_stat.st_uid != geteuid() ||
+      (key_stat.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH | S_IXGRP | S_IXOTH))) {
+    log_message(LOG_LEVEL_ERROR,
+                "TLS private key must be a regular file owned by the current user and private "
+                "(mode 0600)");
+    close(fd);
+    return false;
+  }
+  BIO* bio = BIO_new_fd(fd, BIO_CLOSE);
+  if (!bio) {
+    close(fd);
+    log_message(LOG_LEVEL_ERROR, "Failed to read private key");
+    return false;
+  }
+  EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+  BIO_free(bio); /* releases fd via BIO_CLOSE */
+  if (!pkey) {
+    char* escaped = output_escape(key, false);
+    log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    log_ssl_errors();
+    return false;
+  }
+  int use_ok = SSL_CTX_use_PrivateKey(ctx, pkey);
+  EVP_PKEY_free(pkey);
+  if (use_ok != 1) {
+    char* escaped = output_escape(key, false);
+    log_message(LOG_LEVEL_ERROR, "Failed to use private key: %s",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    log_ssl_errors();
+    return false;
+  }
+  return true;
+}
+
 static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key,
                                const char* ca_path) {
   if (!is_server && !ca_path) {
@@ -56,24 +111,38 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
 #ifdef SSL_OP_NO_RENEGOTIATION
   SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
 #endif
+  /* Let the server's own preference order decide the negotiated cipher rather
+   * than the client's, so a client cannot steer both peers into a weaker (but
+   * still offered) suite. */
+  SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
   if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
     SSL_CTX_free(ctx);
     return NULL;
   }
-  if (SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES") != 1) {
+  /* TLS 1.2 and below: an AEAD-only suite list.  "HIGH" still includes CBC
+   * suites (Lucky13/POODLE-adjacent MAC-then-encrypt constructions), so restrict
+   * the list to ECDHE key agreement with an AEAD record cipher (AES-GCM or
+   * ChaCha20-Poly1305).  A NULL/weak/3DES cipher is never selectable. */
+  if (SSL_CTX_set_cipher_list(ctx, "ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL:!MD5:!RC4:!3DES") !=
+      1) {
     SSL_CTX_free(ctx);
     return NULL;
   }
+  /* TLS 1.3 ciphersuites are configured separately from the TLS 1.2 and below
+   * cipher list above.  Pin the three AEAD suites OpenSSL offers, dropping
+   * TLS_AES_128_CCM_SHA256 and the CCM_8 variant, and fail closed if the
+   * library rejects the policy.  SSL_CTX_set_ciphersuites needs OpenSSL 1.1.1;
+   * earlier versions have no TLS 1.3, so the call is compile-guarded. */
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+  if (SSL_CTX_set_ciphersuites(
+          ctx, "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256") != 1) {
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
+#endif
 
   if (cert && key) {
-    struct stat key_stat;
-    if (stat(key, &key_stat) != 0 || !S_ISREG(key_stat.st_mode) || key_stat.st_uid != geteuid() ||
-        (key_stat.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH))) {
-      log_message(LOG_LEVEL_ERROR, "TLS private key must be owned by the current user and private");
-      SSL_CTX_free(ctx);
-      return NULL;
-    }
     if (SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) <= 0) {
       char* escaped = output_escape(cert, false);
       log_message(LOG_LEVEL_ERROR, "Failed to load certificate: %s",
@@ -83,12 +152,7 @@ static SSL_CTX* create_ssl_ctx(bool is_server, const char* cert, const char* key
       SSL_CTX_free(ctx);
       return NULL;
     }
-    if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) <= 0) {
-      char* escaped = output_escape(key, false);
-      log_message(LOG_LEVEL_ERROR, "Failed to load private key: %s",
-                  escaped ? escaped : "<allocation failed>");
-      free(escaped);
-      log_ssl_errors();
+    if (!load_private_key_secure(ctx, key)) {
       SSL_CTX_free(ctx);
       return NULL;
     }
@@ -132,7 +196,16 @@ static SSL* wrap_fd_with_ssl(int fd, SSL_CTX* ctx, bool is_server, const char* h
   // Enable hostname verification for client connections when a hostname is provided.
   // Must be done before SSL_connect to take effect during the handshake.
   if (!is_server && hostname) {
-    if (SSL_set1_host(ssl, hostname) != 1) {
+    /* An IP-literal host must be verified against the certificate's IP SAN
+     * (X509_check_ip_asc), not as a DNS name: SSL_set1_host would look for a
+     * DNS SAN that a legitimate IP-SAN certificate never carries. */
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+    bool is_ip_literal =
+        inet_pton(AF_INET, hostname, &ipv4) == 1 || inet_pton(AF_INET6, hostname, &ipv6) == 1;
+    int set_ok = is_ip_literal ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), hostname)
+                               : SSL_set1_host(ssl, hostname);
+    if (set_ok != 1) {
       SSL_free(ssl);
       return NULL;
     }
@@ -180,13 +253,18 @@ static void tls_child_fn(int fd, void* arg) {
   SSL* ssl = wrap_fd_with_ssl(fd, ctx->ssl_ctx, true, NULL);
   if (!ssl) {
     io_set_ssl(NULL);
+    close(fd);
     return;
   }
   io_set_ssl(ssl);
   ctx->handler(fd);
+  /* Shut the TLS layer down before releasing the fd: handler() no longer
+   * closes it, so SSL_shutdown still has a valid socket.  The child owns the
+   * single fd close, performed last. */
   SSL_shutdown(ssl);
   SSL_free(ssl);
   io_set_ssl(NULL);
+  close(fd);
 }
 
 bool server_listen_tls(Server* server, void (*handler)(int file_descriptor)) {

@@ -101,9 +101,15 @@ class CountingProxy:
                 return
             counter[0] += len(data)
 
-    def run(self, cmd):
+    def run(self, cmd, join_timeout=20):
         """Forward one client run (the full command list) to the real server and
-        return the CompletedProcess after the counts have settled."""
+        return the CompletedProcess after the counts have settled.
+
+        ``join_timeout`` bounds how long to wait for the forwarding threads.  The
+        client->server count is published as soon as the client side reaches EOF
+        (i.e. once the client process has exited), so callers that only need that
+        count can pass a small value instead of waiting for the server to close
+        its idle socket."""
 
         def serve():
             try:
@@ -119,15 +125,15 @@ class CountingProxy:
             a.start()
             b.start()
             a.join()
-            b.join()
             self.client_to_server = c2s[0]
+            b.join()
             self.server_to_client = s2c[0]
             self._listener.close()
 
-        thread = threading.Thread(target=serve)
+        thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        thread.join(20)
+        thread.join(join_timeout)
         return result
 
 
@@ -254,6 +260,13 @@ def _wait_for_port(port, timeout=5):
 
 
 def _wait_proc(proc, timeout=5):
+    """Stop a long-lived subprocess promptly.  The server installs a SIGTERM
+    handler, so signal first and only escalate to SIGKILL if it does not exit;
+    waiting without signalling would burn the full timeout on every stop."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    proc.terminate()
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:

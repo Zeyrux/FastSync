@@ -2,15 +2,16 @@
 #include "charset.h"
 #include "credentials.h"
 #include "daemon_conf.h"
+#include "daemon_limits.h"
 #include "delay_updates.h"
 #include "file.h"
 #include "identity.h"
 #include "log.h"
 #include "motd.h"
-#include "multiprocessing.h"
 #include "protocol.h"
 #include "queue.h"
 #include "receiver.h"
+#include "receiver_pipeline.h"
 #include "server_cli.h"
 #include "transport_tcp.h"
 #include "transport_tls.h"
@@ -23,11 +24,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <openssl/x509.h>
 
-static char* authorized_root;
-static int authorized_root_fd = -1;
 static bool allow_delete;
 static bool trust_sender;
 static bool allow_unauthenticated;
@@ -35,6 +37,15 @@ static bool allow_unauthenticated;
  * root), so no super-user activity is attempted and any client --copy-as is
  * refused.  Set once in main before the accept loop / stdio handler. */
 static bool server_no_super;
+/* --allow-super: locally-launched standalone TCP opt-in that preserves the
+ * historical permissive super mode for a root receiver.  When false, a
+ * privileged standalone receiver forces SUPER_MODE_OFF for every connection
+ * (C3), so a client cannot make it create device nodes / write raw devices /
+ * apply client-chosen ownership.  It is REJECTED for --stdio (the SSH remote
+ * argv is composed by the client, so it must never be able to opt a root
+ * receiver back into super mode); the --stdio path always keeps the secure
+ * default. */
+static bool server_allow_super;
 static const char* required_client_cn;
 /* --iconv CONVERT_SPEC the server was itself started with (borrowed argv
  * pointer).  Its LOCAL half may override the local charset the client assumed;
@@ -53,6 +64,12 @@ static DaemonConf* g_daemon_conf = NULL;
  * such a module exists. */
 static CredentialStore* g_credentials = NULL;
 
+/* Cross-process connection registry (per-module and per-source caps plus the
+ * shared auth lockout), created once in main BEFORE the accept loop forks and
+ * shared read-only-by-pointer with every connection child.  NULL outside daemon
+ * mode or when the mapping could not be allocated (global cap + ACLs remain). */
+static DaemonLimitRegistry* g_daemon_limits = NULL;
+
 /* Opaque context threaded through to the config-frame gate: the connection's
  * SSL object (NULL over plaintext) so the gate can warn when a credential
  * exchange is not encrypted, plus the super-mode override the gate decides on.
@@ -67,6 +84,18 @@ typedef struct ModuleGateContext {
      activity (operator --no-super, or a daemon module without the
      `client owner = yes` opt-in); -1 when the config's own mode stands. */
   int super_mode_override;
+  /* Numeric peer address (INET6_ADDRSTRLEN is always enough), filled once by
+   * server_module_gate.  has_peer_ip is false when getpeername/inet_ntop could
+   * not classify the peer; an ACL-configured module then fails closed. */
+  bool has_peer_ip;
+  char peer_ip[INET6_ADDRSTRLEN];
+  /* True when the peer is provably loopback (utils_fd_peer_is_local, fail
+   * closed).  A trusted local/SSH peer is exempt from the per-host cap and the
+   * cross-process auth lockout: every loopback client shares the 127.0.0.1
+   * identity, so counting/locking them out would let one local client deny
+   * service to (or leak lockout state about) all the others.  The per-module and
+   * global caps still apply. */
+  bool is_local;
 } ModuleGateContext;
 
 /* Server half of the SCRAM challenge/response (A7 remediation, protocol
@@ -167,25 +196,34 @@ static bool tls_client_identity_allowed(SSL* ssl) {
   X509* certificate = SSL_get1_peer_certificate(ssl);
   if (!certificate)
     return false;
-  char common_name[256];
-  int length = X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName,
-                                         common_name, sizeof(common_name));
   size_t required_length = strlen(required_client_cn);
-  bool allowed = length >= 0 && (size_t)length == required_length &&
-                 required_length < sizeof(common_name) &&
-                 credentials_secure_equal(common_name, required_client_cn, required_length);
+  bool allowed = false;
+  X509_NAME* subject = X509_get_subject_name(certificate);
+  int index = subject ? X509_NAME_get_index_by_NID(subject, NID_commonName, -1) : -1;
+  if (index >= 0) {
+    X509_NAME_ENTRY* entry = X509_NAME_get_entry(subject, index);
+    ASN1_STRING* data = entry ? X509_NAME_ENTRY_get_data(entry) : NULL;
+    /* Convert the CN to UTF-8 to get its FULL byte length: unlike
+     * X509_NAME_get_text_by_NID (which truncates an over-long CN to the buffer
+     * and reports the truncated length), ASN1_STRING_to_UTF8 never truncates, so
+     * an exactly-required-length CN is accepted while an over-long one cannot be
+     * prefix-matched by a shorter required name. */
+    unsigned char* utf8 = NULL;
+    int cn_length = data ? ASN1_STRING_to_UTF8(&utf8, data) : -1;
+    if (cn_length >= 0 && (size_t)cn_length == required_length)
+      allowed = credentials_secure_equal((const char*)utf8, required_client_cn, required_length);
+    if (utf8)
+      OPENSSL_free(utf8);
+  }
   X509_free(certificate);
   return allowed;
 }
 
 static void release_authorization(void) {
-  file_set_authorized_root(-1, NULL);
-  utils_set_authorized_root_fd(-1);
-  if (authorized_root_fd >= 0)
-    close(authorized_root_fd);
-  authorized_root_fd = -1;
-  free(authorized_root);
-  authorized_root = NULL;
+  int root_fd = utils_get_authorized_root_fd();
+  utils_set_authorized_root(-1, NULL);
+  if (root_fd >= 0)
+    close(root_fd);
 }
 
 static bool path_is_within(const char* root, const char* path) {
@@ -200,24 +238,34 @@ static bool path_is_within(const char* root, const char* path) {
    root is rejected up front instead of being silently invented by a later
    write.  Both paths are confined to the authorized root by the secure file
    helpers. */
+/* Existence-only half of the precondition: the destination root must already
+   resolve to a directory below the authorized root.  Never creates anything, so
+   a server-contacting --dry-run can apply the exact same fail-closed check a
+   real run would without mutating the tree. */
+static bool receive_root_exists(const Config* config) {
+  if (!config || !config->receive_root_directory)
+    return false;
+  return file_directory_exists_secure(config->receive_root_directory);
+}
+
+/* Full precondition for a real run: --mkpath creates the root (and missing
+   leading components), otherwise it must already exist as a directory. */
 static bool ensure_receive_root(const Config* config) {
   if (!config || !config->receive_root_directory)
     return false;
   if (config->mkpath)
     return file_ensure_directory_secure(config->receive_root_directory);
-  return file_directory_exists_secure(config->receive_root_directory);
+  return receive_root_exists(config);
 }
 
 static bool configure_authorization(const char* root) {
   char resolved[PATH_MAX];
   if (!root) {
-    file_set_authorized_root(-1, NULL);
     utils_set_authorized_root(-1, NULL);
     return false;
   }
   int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (root_fd < 0) {
-    file_set_authorized_root(-1, NULL);
     utils_set_authorized_root(-1, NULL);
     return false;
   }
@@ -226,29 +274,312 @@ static bool configure_authorization(const char* root) {
   if (fd_path_length < 0 || (size_t)fd_path_length >= sizeof(fd_path) ||
       !realpath(fd_path, resolved)) {
     close(root_fd);
-    file_set_authorized_root(-1, NULL);
     utils_set_authorized_root(-1, NULL);
     return false;
   }
-  authorized_root = str_dup(resolved);
-  if (!authorized_root) {
+  if (!utils_set_authorized_root(root_fd, resolved)) {
+    /* The setter already cleared the fd/path state on allocation failure. */
     close(root_fd);
-    file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root(-1, NULL);
-    return false;
-  }
-  authorized_root_fd = root_fd;
-  if (!file_set_authorized_root(authorized_root_fd, authorized_root) ||
-      !utils_set_authorized_root(authorized_root_fd, authorized_root)) {
-    file_set_authorized_root(-1, NULL);
-    utils_set_authorized_root(-1, NULL);
-    close(authorized_root_fd);
-    authorized_root_fd = -1;
-    free(authorized_root);
-    authorized_root = NULL;
     return false;
   }
   return true;
+}
+
+/* Discriminates the outcome of the A7 auth gate so the dispatcher can map it
+ * back to the config_receive_with_validate contract: accepted (including
+ * "module needs no auth"), a config-level refusal carrying an error string, or
+ * a handshake that already wrote its own terminal status frame. */
+typedef enum {
+  MODULE_AUTH_ACCEPTED = 0,
+  MODULE_AUTH_REFUSED,
+  MODULE_AUTH_TERMINATED,
+} ModuleAuthResult;
+
+/* Looks up the daemon module selected by the client's config frame and rejects
+ * a `read only` one for a real write transfer.  A server-contacting --dry-run
+ * IS a read-only wire operation (it reports what would transfer/skip and
+ * mutates nothing), so a `read only` module is the safest possible dry-run
+ * target and is accepted.  Returns the module, or NULL with *error set to the
+ * caller-facing rejection message. */
+static const DaemonModule* module_gate_lookup_module(const Config* config, const char** error) {
+  const DaemonModule* module = daemon_conf_find_module(g_daemon_conf, config->module);
+  if (module == NULL) {
+    char* escaped_module = output_escape(config->module, config->eight_bit_output);
+    log_message(LOG_LEVEL_ERROR, "unknown daemon module '%s' requested",
+                escaped_module ? escaped_module : "<allocation failed>");
+    free(escaped_module);
+    *error = "requested daemon module does not exist";
+    return NULL;
+  }
+  if (module->read_only && !config->dry_run) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
+                config->module);
+    *error = "requested daemon module is read only";
+    return NULL;
+  }
+  return module;
+}
+
+/* Index of `module` within the loaded config's module array (the registry's
+ * per-module counter key).  Returns -1 when it cannot be resolved. */
+static int daemon_module_index(const DaemonModule* module) {
+  if (!g_daemon_conf || !module || module < g_daemon_conf->modules ||
+      module >= g_daemon_conf->modules + g_daemon_conf->module_count)
+    return -1;
+  return (int)(module - g_daemon_conf->modules);
+}
+
+/* Shared-registry admission: reserve this connection's slot for the selected
+ * module and the peer source IP.  Enforces the per-module `max connections` and
+ * the global `max connections per host` across every forked child.  Runs before
+ * auth/ownership so a client that is over a cap is refused before any work.
+ * The per-source cap is skipped when the peer cannot be classified (host ACLs
+ * fail closed separately); the module cap still applies.  A missing registry
+ * (allocation failure / non-fork path) fails open -- the global cap and ACLs
+ * still bound the listener. */
+static const char* module_gate_check_limits(const Config* config, const DaemonModule* module,
+                                            ModuleGateContext* gate_ctx) {
+  if (!g_daemon_limits)
+    return NULL;
+  int slot = transport_tcp_current_slot();
+  if (slot < 0)
+    return NULL; /* not on the forked accept-loop path (e.g. --stdio) */
+  int module_index = daemon_module_index(module);
+  if (module_index < 0)
+    return NULL;
+  /* A trusted loopback peer is exempt from the per-source cap: pass an
+   * unparseable peer so the registry skips per-source tracking, while the
+   * per-module cap below is still enforced.  Remote peers are tracked normally. */
+  const char* peer =
+      (!gate_ctx || gate_ctx->is_local || !gate_ctx->has_peer_ip) ? "" : gate_ctx->peer_ip;
+  DaemonLimitResult result =
+      daemon_limits_register(g_daemon_limits, slot, module_index, peer, module->max_connections);
+  switch (result) {
+  case DAEMON_LIMIT_OK:
+    return NULL;
+  case DAEMON_LIMIT_MODULE_FULL:
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s': 'max connections' cap (%d) reached; refusing %s",
+                config->module, module->max_connections, peer[0] ? peer : "peer");
+    return "requested daemon module is at its connection limit";
+  case DAEMON_LIMIT_HOST_FULL:
+    log_message(LOG_LEVEL_ERROR,
+                "daemon: 'max connections per host' cap (%d) reached for %s; refusing module '%s'",
+                g_daemon_conf->global.max_connections_per_host, peer[0] ? peer : "peer",
+                config->module);
+    return "too many concurrent connections from this host";
+  case DAEMON_LIMIT_UNAVAILABLE:
+  default:
+    return NULL;
+  }
+}
+
+/* Per-module client-chosen ownership / super-user policy (P7 Wave E hardening):
+ * a daemon module refuses EVERY ownership-affecting request (--numeric-ids,
+ * --chown, --usermap/--groupmap, --fake-super, --copy-as, explicit --super)
+ * unless the operator opted THIS module in with `client owner = yes`.
+ * Otherwise any client could force arbitrary ownership inside the module root.
+ * The ownership check is evaluated against the ORIGINAL config so an explicit
+ * --super is refused even when an operator --no-super veto already forced the
+ * effective copy to OFF (the veto must not silently convert a refusal into an
+ * accept); when no ownership flag is present, super-user DEVICE activities are
+ * forced off for this connection instead.  Returns an error string on refusal,
+ * NULL on acceptance. */
+static const char* module_gate_check_ownership(const Config* config, const DaemonModule* module,
+                                               ModuleGateContext* gate_ctx) {
+  if (module->client_owner)
+    return NULL;
+  /* Ownership: refuse the whole transfer up front (a clear failure) for a
+   * client-CHOSEN owner/group request.  A plain -o/-g/-a preserve-source
+   * request is deliberately not in this narrow set: it falls through to the
+   * super-mode override below, which forces all ownership activity off for this
+   * connection so no chown happens (the transfer itself still succeeds). */
+  if (identity_explicit_ownership_requested(config)) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' refuses client-chosen ownership/super-user activities "
+                "(no `client owner = yes` opt-in); refusing",
+                config->module);
+    return "client-chosen ownership is not permitted by this daemon module";
+  }
+  /* Super-user DEVICE activities (char/block mknod and --write-devices) are
+     permitted under the default AUTO mode, so without this override a root
+     daemon would still let a non-opted module create arbitrary device nodes
+     and write raw devices.  Force them off for this connection: those entries
+     are skipped (never mknod'ed) while an ordinary `-a` push still succeeds
+     without device nodes, matching the operator's least-privilege choice.
+     The operator-level --no-super veto is already folded into this. */
+  if (gate_ctx)
+    gate_ctx->super_mode_override = SUPER_MODE_OFF;
+  return NULL;
+}
+
+/* Online-guessing throttle: sleep the configured `auth failure delay`
+ * milliseconds after a failed authentication.  Runs in the per-connection
+ * forked child, so it never blocks the accept loop or another connection.  0
+ * disables it; the parser already caps it at DAEMON_CONF_MAX_AUTH_FAILURE_DELAY_MS.
+ * Resumes after EINTR so a signal cannot cut the delay short. */
+static void daemon_auth_failure_delay(void) {
+  if (!g_daemon_conf || g_daemon_conf->global.auth_failure_delay_ms <= 0)
+    return;
+  int ms = g_daemon_conf->global.auth_failure_delay_ms;
+  struct timespec delay;
+  delay.tv_sec = ms / 1000;
+  delay.tv_nsec = (long)(ms % 1000) * 1000000L;
+  while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
+    ;
+}
+
+/* Host access control (global then per-module).  A configured list makes an
+ * unprovable peer fail closed.  Deny always takes precedence over allow, and a
+ * non-empty allow list rejects a peer that matches none of its entries.  The
+ * audit line names the peer, the module and the outcome.  Returns an
+ * error string on refusal, NULL on acceptance. */
+static const char* module_gate_check_hosts(const Config* config, const DaemonModule* module,
+                                           ModuleGateContext* gate_ctx) {
+  bool global_restricted = daemon_hosts_restricted(
+      g_daemon_conf->global.hosts_allow, g_daemon_conf->global.hosts_allow_count,
+      g_daemon_conf->global.hosts_deny, g_daemon_conf->global.hosts_deny_count);
+  bool module_restricted = daemon_hosts_restricted(module->hosts_allow, module->hosts_allow_count,
+                                                   module->hosts_deny, module->hosts_deny_count);
+  if (!global_restricted && !module_restricted)
+    return NULL;
+  if (!gate_ctx || !gate_ctx->has_peer_ip) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': cannot determine peer address with host ACLs configured; "
+                "refusing (fail closed)",
+                config->module);
+    return "cannot verify the client host against host access controls";
+  }
+  const char* peer = gate_ctx->peer_ip;
+  if (global_restricted && !daemon_hosts_allowed(peer, g_daemon_conf->global.hosts_allow,
+                                                 g_daemon_conf->global.hosts_allow_count,
+                                                 g_daemon_conf->global.hosts_deny,
+                                                 g_daemon_conf->global.hosts_deny_count)) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': peer %s denied by global 'hosts allow'/'hosts deny'; "
+                "refusing",
+                config->module, peer);
+    return "client host is not permitted by this daemon";
+  }
+  if (module_restricted &&
+      !daemon_hosts_allowed(peer, module->hosts_allow, module->hosts_allow_count,
+                            module->hosts_deny, module->hosts_deny_count)) {
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': peer %s denied by module 'hosts allow'/'hosts deny'; "
+                "refusing",
+                config->module, peer);
+    return "client host is not permitted by this daemon module";
+  }
+  return NULL;
+}
+
+/* A7 auth gate: runs the SCRAM challenge/response for an auth-required module
+ * BEFORE the module root is installed and before any data moves.  Returns
+ * MODULE_AUTH_ACCEPTED when the module needs no auth or the handshake succeeds,
+ * MODULE_AUTH_REFUSED with *error set on a config-level rejection, or
+ * MODULE_AUTH_TERMINATED when the handshake already wrote a terminal status. */
+static ModuleAuthResult module_gate_authenticate(const Config* config, const DaemonModule* module,
+                                                 ModuleGateContext* gate_ctx, const char** error) {
+  if (module->auth_user_count == 0)
+    return MODULE_AUTH_ACCEPTED;
+  /* Cross-process lockout: a source that failed too many authentications is
+   * refused before the challenge is sent (the counter lives in the shared
+   * registry, so it spans every forked child and survives a child exit).  A
+   * trusted loopback peer is exempt: all local clients share the 127.0.0.1
+   * identity, so a lockout would let one deny the others. */
+  if (g_daemon_limits && gate_ctx && gate_ctx->has_peer_ip && !gate_ctx->is_local) {
+    int remaining = 0;
+    if (daemon_limits_auth_locked(g_daemon_limits, gate_ctx->peer_ip, &remaining)) {
+      log_message(LOG_LEVEL_ERROR,
+                  "daemon module '%s': source %s is locked out after repeated authentication "
+                  "failures (%d s remaining); refusing",
+                  config->module, gate_ctx->peer_ip, remaining);
+      *error = "too many failed authentication attempts from this host; try again later";
+      return MODULE_AUTH_REFUSED;
+    }
+  }
+  /* Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR). */
+  if (g_credentials == NULL) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' requires authentication but no credential store is "
+                "configured (--password-file/--early-input); refusing",
+                config->module);
+    *error = "requested daemon module requires authentication and no credential "
+             "store is configured";
+    return MODULE_AUTH_REFUSED;
+  }
+  /* Transport policy (A7-3/S1): an auth-required module only accepts
+   * credentials over (a) an encrypted, verified TLS connection whose client
+   * certificate matches --client-cn, or (b) an actual PLAINTEXT connection
+   * from a loopback peer that the operator explicitly opted into with
+   * --allow-unauthenticated.  A remote plaintext peer, an un-flagged loopback
+   * plaintext peer, and a loopback TLS peer whose certificate does not match
+   * --client-cn are all refused HERE, before the challenge is sent, so an
+   * unverified client never receives a nonce: the loopback allowance requires
+   * !gate_ctx->ssl, so --tls + --allow-unauthenticated can never be used to
+   * bypass the client-CN check.  The operator flag never permits REMOTE
+   * plaintext auth: remote peers still require verified TLS regardless. */
+  bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
+                tls_client_identity_allowed(gate_ctx->ssl);
+  bool local_ok = allow_unauthenticated && gate_ctx && !gate_ctx->ssl && gate_ctx->fd >= 0 &&
+                  utils_fd_peer_is_local(gate_ctx->fd);
+  if (!tls_ok && !local_ok) {
+    log_message(LOG_LEVEL_ERROR,
+                "daemon module '%s' requires authentication over an encrypted, verified TLS "
+                "connection (or an opted-in loopback plaintext transport); refusing",
+                config->module);
+    *error = "daemon module requires authentication over an encrypted, verified TLS "
+             "connection";
+    return MODULE_AUTH_REFUSED;
+  }
+  /* Belt-and-braces: the transport policy above already guarantees a context
+   * with a usable socket (verified TLS implies a live SSL object and loopback
+   * allowance requires gate_ctx->fd >= 0), so this is unreachable today; keep
+   * the guard so the handshake can never be driven over an invalid fd. */
+  if (!gate_ctx || gate_ctx->fd < 0) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s': no auth transport available", config->module);
+    *error = "authentication failed for the requested daemon module";
+    return MODULE_AUTH_REFUSED;
+  }
+  /* The handshake writes exactly one terminal status on failure and signals so
+   * via MODULE_AUTH_TERMINATED; the username may be logged (never the password
+   * or any derived proof). */
+  if (!server_auth_handshake(gate_ctx->fd, config, module)) {
+    const char* peer = gate_ctx->has_peer_ip ? gate_ctx->peer_ip : "unknown";
+    char* escaped_user =
+        config->auth_user ? output_escape(config->auth_user, config->eight_bit_output) : NULL;
+    log_message(LOG_LEVEL_WARNING,
+                "daemon module '%s': authentication failed for user '%s' from %s; refusing",
+                config->module, escaped_user ? escaped_user : "(none)", peer);
+    free(escaped_user);
+    /* Count the failure in the shared registry (locks the source out once the
+     * configured threshold is reached) and rate-limit online guessing per
+     * connection (no delay on success).  A loopback peer is exempt from the
+     * shared counter. */
+    if (g_daemon_limits && gate_ctx->has_peer_ip && !gate_ctx->is_local)
+      daemon_limits_auth_record_failure(g_daemon_limits, gate_ctx->peer_ip);
+    daemon_auth_failure_delay();
+    return MODULE_AUTH_TERMINATED;
+  }
+  if (g_daemon_limits && gate_ctx->has_peer_ip && !gate_ctx->is_local)
+    daemon_limits_auth_record_success(g_daemon_limits, gate_ctx->peer_ip);
+  char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
+  log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' from %s authenticated", config->module,
+              escaped_user ? escaped_user : "<allocation failed>",
+              gate_ctx->has_peer_ip ? gate_ctx->peer_ip : "unknown");
+  free(escaped_user);
+  return MODULE_AUTH_ACCEPTED;
+}
+
+/* Installs the module's configured path as the connection's authorized root.
+ * Returns an error string when the root is unusable, NULL on success. */
+static const char* module_gate_install_root(const Config* config, const DaemonModule* module) {
+  if (!configure_authorization(module->path)) {
+    log_message(LOG_LEVEL_ERROR, "daemon module '%s' path '%s' is not usable", config->module,
+                module->path ? module->path : "(null)");
+    return "requested daemon module root is not usable";
+  }
+  return NULL;
 }
 
 /* Config-frame gate (runs inside config_receive_with_validate, BEFORE the
@@ -264,9 +595,10 @@ static bool configure_authorization(const char* root) {
  * becomes the authorized root via configure_authorization -- exactly the same
  * root confinement the standalone server applies to its single
  * --destination-root, but per-module and NEVER client-chosen.  The module is
- * refused (with a clear log) when it is unknown, when it is `read only` (every
- * FastSync network transfer writes; there is no read-only wire operation yet),
- * when it requests client-chosen ownership without the module's
+ * refused (with a clear log) when it is unknown, when it is `read only` for a
+ * real write transfer (a server-contacting --dry-run is a read-only wire
+ * operation and may target a `read only` module), when it requests
+ * client-chosen ownership without the module's
  * `client owner = yes` opt-in (P7 Wave E hardening), or when the presented
  * daemon credentials fail for a module that declares `auth users`.  Wave A
  * refused every auth-required module (auth was not yet implemented); Wave B
@@ -281,6 +613,22 @@ static const char* server_module_gate(const Config* config, void* context) {
      handler applies the recorded override to the accepted config exactly once. */
   Config effective = *config;
   if (server_no_super) {
+    effective.super_mode = SUPER_MODE_OFF;
+    if (gate_ctx)
+      gate_ctx->super_mode_override = SUPER_MODE_OFF;
+  }
+  /* C3: a privileged (root) STANDALONE receiver defaults to SUPER_MODE_OFF.
+   * Without this a client --devices/--write-devices/--super would let a root
+   * server create arbitrary device nodes and write raw devices, and
+   * client-chosen ownership (--numeric-ids/--chown/--usermap/--groupmap) would
+   * be applied, with no operator opt-in.  The operator must pass --allow-super
+   * to restore the historical permissive behavior; the flag is rejected for
+   * --stdio, whose client-composed argv must never defeat this default (an
+   * operator exposing `fastsync-server --stdio` over SSH needs a forced command
+   * to keep the permissive behavior).  An unprivileged receiver is unaffected
+   * (the kernel refuses the confined attempts) and the daemon path keeps its
+   * per-module `client owner = yes` gate. */
+  if (g_daemon_conf == NULL && geteuid() == 0 && !server_allow_super) {
     effective.super_mode = SUPER_MODE_OFF;
     if (gate_ctx)
       gate_ctx->super_mode_override = SUPER_MODE_OFF;
@@ -324,115 +672,42 @@ static const char* server_module_gate(const Config* config, void* context) {
     return "daemon connection did not select a module (expected a "
            "host::module/path destination)";
 
-  const DaemonModule* module = daemon_conf_find_module(g_daemon_conf, config->module);
-  if (module == NULL) {
-    char* escaped_module = output_escape(config->module, config->eight_bit_output);
-    log_message(LOG_LEVEL_ERROR, "unknown daemon module '%s' requested",
-                escaped_module ? escaped_module : "<allocation failed>");
-    free(escaped_module);
-    return "requested daemon module does not exist";
+  const char* error = NULL;
+  const DaemonModule* module = module_gate_lookup_module(config, &error);
+  if (!module)
+    return error;
+  /* Resolve the peer once, before any auth or ownership work, so the host ACL
+   * and the audit lines all use the same address.  A module with ACLs fails
+   * closed when the peer cannot be classified; an ACL-free module continues
+   * (the accept loop still logged the address). */
+  if (gate_ctx) {
+    gate_ctx->has_peer_ip =
+        utils_fd_peer_ip(gate_ctx->fd, gate_ctx->peer_ip, sizeof(gate_ctx->peer_ip));
+    if (!gate_ctx->has_peer_ip)
+      log_message(LOG_LEVEL_DEBUG, "daemon module '%s': peer address unavailable", config->module);
+    /* utils_fd_peer_is_local is fail-closed (getpeername must succeed and report
+     * a loopback peer), so "cannot tell" is never treated as trusted. */
+    gate_ctx->is_local = utils_fd_peer_is_local(gate_ctx->fd);
   }
-  if (module->read_only) {
-    log_message(LOG_LEVEL_ERROR, "daemon module '%s' is read only; refusing write transfer",
-                config->module);
-    return "requested daemon module is read only";
+  error = module_gate_check_hosts(config, module, gate_ctx);
+  if (error)
+    return error;
+  error = module_gate_check_limits(config, module, gate_ctx);
+  if (error)
+    return error;
+  error = module_gate_check_ownership(config, module, gate_ctx);
+  if (error)
+    return error;
+  switch (module_gate_authenticate(config, module, gate_ctx, &error)) {
+  case MODULE_AUTH_REFUSED:
+    return error;
+  case MODULE_AUTH_TERMINATED:
+    return CONFIG_VALIDATE_ALREADY_TERMINATED;
+  case MODULE_AUTH_ACCEPTED:
+    break;
   }
-  /* Client-chosen ownership / super-user policy (P7 Wave E hardening): a daemon
-     module refuses EVERY ownership-affecting request (--numeric-ids, --chown,
-     --usermap/--groupmap, --fake-super, --copy-as, explicit --super) unless the
-     operator opted THIS module in with `client owner = yes`.  Otherwise any
-     client could force arbitrary ownership inside the module root.  The
-     standalone/SSH server has a single operator-authorized root and keeps
-     honoring these. */
-  if (!module->client_owner) {
-    /* Ownership: refuse the whole transfer up front (a clear failure).
-       Evaluated against the ORIGINAL config so an explicit --super is refused
-       even when an operator --no-super veto already forced the effective copy
-       to OFF (the veto must not silently convert a refusal into an accept). */
-    if (identity_ownership_requested(config)) {
-      log_message(LOG_LEVEL_ERROR,
-                  "daemon module '%s' refuses client-chosen ownership/super-user activities "
-                  "(no `client owner = yes` opt-in); refusing",
-                  config->module);
-      return "client-chosen ownership is not permitted by this daemon module";
-    }
-    /* Super-user DEVICE activities (char/block mknod and --write-devices) are
-       permitted under the default AUTO mode, so without this override a root
-       daemon would still let a non-opted module create arbitrary device nodes
-       and write raw devices.  Force them off for this connection: those entries
-       are skipped (never mknod'ed) while an ordinary `-a` push still succeeds
-       without device nodes, matching the operator's least-privilege choice.
-       The operator-level --no-super veto is already folded into this. */
-    if (gate_ctx)
-      gate_ctx->super_mode_override = SUPER_MODE_OFF;
-  }
-  if (module->auth_user_count > 0) {
-    /* Auth-required module (A7, protocol 2.19.0): run the SCRAM challenge/
-     * response BEFORE the module root is installed and before any data moves.
-     * Fail closed: no store -> refuse (server misconfiguration, STATUS_ERROR);
-     * a handshake that fails before the success response writes exactly one
-     * STATUS_AUTH_FAILED before signalling ALREADY_TERMINATED (a failure while
-     * writing the success signature instead just drops the broken connection).
-     * The username may be logged (never the password or any derived proof). */
-    if (g_credentials == NULL) {
-      log_message(LOG_LEVEL_ERROR,
-                  "daemon module '%s' requires authentication but no credential store is "
-                  "configured (--password-file/--early-input); refusing",
-                  config->module);
-      return "requested daemon module requires authentication and no credential "
-             "store is configured";
-    }
-    /* Transport policy (A7-3/S1): an auth-required module only accepts
-     * credentials over (a) an encrypted, verified TLS connection whose client
-     * certificate matches --client-cn, or (b) an actual PLAINTEXT connection
-     * from a loopback peer that the operator explicitly opted into with
-     * --allow-unauthenticated.  A remote plaintext peer, an un-flagged loopback
-     * plaintext peer, and a loopback TLS peer whose certificate does not match
-     * --client-cn are all refused HERE, before the challenge is sent, so an
-     * unverified client never receives a nonce: the loopback allowance requires
-     * !gate_ctx->ssl, so --tls + --allow-unauthenticated can never be used to
-     * bypass the client-CN check.  The operator flag never permits REMOTE
-     * plaintext auth: remote peers still require verified TLS regardless. */
-    bool tls_ok = gate_ctx && gate_ctx->ssl && SSL_get_verify_result(gate_ctx->ssl) == X509_V_OK &&
-                  tls_client_identity_allowed(gate_ctx->ssl);
-    bool local_ok = allow_unauthenticated && gate_ctx && !gate_ctx->ssl && gate_ctx->fd >= 0 &&
-                    utils_fd_peer_is_local(gate_ctx->fd);
-    if (!tls_ok && !local_ok) {
-      log_message(LOG_LEVEL_ERROR,
-                  "daemon module '%s' requires authentication over an encrypted, verified TLS "
-                  "connection (or an opted-in loopback plaintext transport); refusing",
-                  config->module);
-      return "daemon module requires authentication over an encrypted, verified TLS "
-             "connection";
-    }
-    /* Belt-and-braces: the transport policy above already guarantees a context
-     * with a usable socket (verified TLS implies a live SSL object and loopback
-     * allowance requires gate_ctx->fd >= 0), so this is unreachable today; keep
-     * the guard so the handshake can never be driven over an invalid fd. */
-    if (!gate_ctx || gate_ctx->fd < 0) {
-      log_message(LOG_LEVEL_ERROR, "daemon module '%s': no auth transport available",
-                  config->module);
-      return "authentication failed for the requested daemon module";
-    }
-    if (!server_auth_handshake(gate_ctx->fd, config, module)) {
-      char* escaped_user =
-          config->auth_user ? output_escape(config->auth_user, config->eight_bit_output) : NULL;
-      log_message(LOG_LEVEL_ERROR, "daemon module '%s': authentication failed for user '%s'",
-                  config->module, escaped_user ? escaped_user : "(none)");
-      free(escaped_user);
-      return CONFIG_VALIDATE_ALREADY_TERMINATED;
-    }
-    char* escaped_user = output_escape(config->auth_user, config->eight_bit_output);
-    log_message(LOG_LEVEL_INFO, "daemon module '%s': user '%s' authenticated", config->module,
-                escaped_user ? escaped_user : "<allocation failed>");
-    free(escaped_user);
-  }
-  if (!configure_authorization(module->path)) {
-    log_message(LOG_LEVEL_ERROR, "daemon module '%s' path '%s' is not usable", config->module,
-                module->path ? module->path : "(null)");
-    return "requested daemon module root is not usable";
-  }
-  return NULL; /* accepted; authorized root is now the module's path */
+  /* accepted; the authorized root is now the module's path */
+  return module_gate_install_root(config, module);
 }
 
 void handler(int file_descriptor) {
@@ -445,12 +720,19 @@ void handler(int file_descriptor) {
   gate_ctx.ssl = ssl;
   gate_ctx.fd = file_descriptor;
   gate_ctx.super_mode_override = -1;
-  Config* config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
+  gate_ctx.has_peer_ip = false;
+  gate_ctx.peer_ip[0] = '\0';
+  gate_ctx.is_local = false;
+  /* All teardown state starts empty so the single `done` epilogue is safe to
+   * reach from any error path (including before the config frame arrives). */
+  Config* config = NULL;
+  PipelineContextReceiver* context = NULL;
+  char* joined_destination = NULL;
+  bool charset_ready = false;
+  config = config_receive_with_validate(file_descriptor, server_module_gate, &gate_ctx);
   if (config == NULL) {
     log_message(LOG_LEVEL_ERROR, "Failed to receive config");
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   /* Apply the super-mode veto the gate decided on (operator --no-super, or a
    * daemon module without the `client owner = yes` opt-in) exactly once, so
@@ -458,27 +740,39 @@ void handler(int file_descriptor) {
    * device-node creation) sees SUPER_MODE_OFF.  The gate never mutated the
    * received config. */
   if (gate_ctx.super_mode_override != -1)
-    config->super_mode = gate_ctx.super_mode_override;
+    config->super_mode = (SuperMode)gate_ctx.super_mode_override;
+  /* Install the codec this connection negotiated before the receiver/writer
+   * threads start (the server forks per connection, so the process-global
+   * codec is private to this session). */
+  compression_set_algo((CompressionAlgo)config->compression_algo);
+  /* If the client requested ownership but the effective super mode forbids it
+   * (operator --no-super, a privileged standalone receiver's secure default, or
+   * a daemon module without `client owner = yes`), say so ONCE per connection so
+   * a successful -a/-o/-g transfer is not mistaken for preserved ownership. */
+  if (config->super_mode == SUPER_MODE_OFF && identity_ownership_requested(config))
+    log_message(LOG_LEVEL_WARNING,
+                "requested ownership will NOT be applied: super-user activities are disabled "
+                "for this connection (operator veto, or module without `client owner = yes`)");
   protocol_set_8_bit_output(config->eight_bit_output);
+  /* Server-side per-message protocol deadline for every frame from here on.
+   * `timeout` is not serialized, so this is the server's own config (the server
+   * has no --timeout CLI and defaults it to 0).  A client's --timeout tightens
+   * only that client's own protocol I/O; the server floors its own deadline at
+   * SERVER_IO_TIMEOUT_SEC so a silent peer can never hold a session slot
+   * forever (the socket layer gets the same floor at startup). */
+  protocol_session_set_io_timeout(&session, protocol_server_io_timeout_sec(config->timeout));
+  const char* authorized_root = utils_get_authorized_root_path();
   if (!authorized_root) {
     log_message(LOG_LEVEL_ERROR, "No server-side destination root configured");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   if (!allow_unauthenticated && ssl == NULL) {
     log_message(LOG_LEVEL_ERROR, "Rejected unauthenticated plaintext connection");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   if (ssl && required_client_cn && !tls_client_identity_allowed(ssl)) {
     log_message(LOG_LEVEL_ERROR, "Rejected TLS client with unauthorized identity");
-    config_delete(config);
-    close(file_descriptor);
-    return;
+    goto done;
   }
   /* Daemon mode: the module's root is the authorized root (installed by
      server_module_gate), and the client's destination is a MODULE-RELATIVE
@@ -488,13 +782,9 @@ void handler(int file_descriptor) {
   if (g_daemon_conf && config->receive_root_directory && config->receive_root_directory[0] == '/') {
     log_message(LOG_LEVEL_ERROR, "Rejected absolute daemon destination (must be relative to the "
                                  "selected module root)");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   char* destination = config->receive_root_directory;
-  char* joined_destination = NULL;
   if (destination && destination[0] != '/')
     joined_destination = path_cat(authorized_root, destination);
   if (joined_destination)
@@ -503,34 +793,38 @@ void handler(int file_descriptor) {
       !path_is_within(authorized_root, destination)) {
     log_message(LOG_LEVEL_ERROR, "Rejected destination outside authorized root");
     free(joined_destination);
-    config_delete(config);
-    close(file_descriptor);
-    return;
+    joined_destination = NULL;
+    goto done;
   }
   if (joined_destination) {
     free(config->receive_root_directory);
     config->receive_root_directory = joined_destination;
+    joined_destination = NULL;
   }
   if (!config->receive_root_directory) {
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   config->use_delete = config->use_delete && allow_delete;
+  /* --force (receiver-side) is deletion authority too: it lets an incoming
+   * regular file recursively remove a non-empty destination directory tree, and
+   * lets --delete-missing-args remove a non-empty directory mirror.  Without
+   * the operator's --allow-delete it must be inert, exactly like --delete and
+   * --delete-missing-args, so a client cannot use --force to bypass the delete
+   * policy. */
+  config->force_delete = config->force_delete && allow_delete;
   /* --iconv (protocol 2.16.0): install the receiver-side wire->local conversion
      now that the client's full CONVERT_SPEC has been received and validated,
      before any received file name is decoded.  The server's own --iconv (if
      any) may override the local charset; a spec the client is known to have
      validated cannot fail here unless the server's override names an
      unsupported charset. */
-  if (config->iconv_spec && !charset_wire_init_receiver(config->iconv_spec, server_iconv_spec)) {
-    log_message(LOG_LEVEL_ERROR,
-                "--iconv: unsupported charset conversion requested (LOCAL[,REMOTE])");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+  if (config->iconv_spec) {
+    if (!charset_wire_init_receiver(config->iconv_spec, server_iconv_spec)) {
+      log_message(LOG_LEVEL_ERROR,
+                  "--iconv: unsupported charset conversion requested (LOCAL[,REMOTE])");
+      goto done;
+    }
+    charset_ready = true;
   }
   /* --delete-missing-args deletes destination mirrors receiver-side, so it is
      deletion and stays gated by the same --allow-delete server policy.  When
@@ -538,30 +832,29 @@ void handler(int file_descriptor) {
      skipped via its implied --ignore-missing-args, but nothing is deleted). */
   config->delete_missing_args = config->delete_missing_args && allow_delete;
   /* --mkpath: create the destination root (and its missing leading components)
-     before anything else; without it the root must pre-exist.  A failure here
-     aborts the connection cleanly before any file data is exchanged. */
-  if (!ensure_receive_root(config)) {
+   * before anything else; without it the root must pre-exist.  The precondition
+   * is UNCONDITIONAL: a server-contacting --dry-run must reject exactly the
+   * root a real session would reject, so a client cannot set the wire dry_run
+   * bit to relax it.  Dry-run only runs the existence/directory check (never
+   * --mkpath) so it creates nothing while still failing closed.  A failure here
+   * aborts the connection cleanly before any file data is exchanged. */
+  bool root_ok = config->dry_run ? receive_root_exists(config) : ensure_receive_root(config);
+  if (!root_ok) {
     char* escaped_root = output_escape(config->receive_root_directory, log_get_8_bit_output());
     log_message(LOG_LEVEL_ERROR, "destination root is not available: %s",
                 escaped_root ? escaped_root : "<allocation failed>");
     free(escaped_root);
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   /* A --delay-updates transfer stages under a private 0700 directory inside
      the receive root.  Create it up front (wiping leftovers of any previously
-     interrupted delayed transfer) so a fully-skipped run also starts clean. */
-  if (config->delay_updates) {
+     interrupted delayed transfer) so a fully-skipped run also starts clean.
+     A dry-run stages nothing, so the staging tree is never created. */
+  if (config->delay_updates && !config->dry_run) {
     config->delay_context = delay_updates_context_create(config->receive_root_directory);
     if (!config->delay_context || !delay_updates_prepare(config->delay_context)) {
       log_message(LOG_LEVEL_ERROR, "Failed to initialize --delay-updates staging area");
-      delay_updates_cleanup(config->delay_context);
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      return;
+      goto done;
     }
   }
   /* Preserve the negotiated identity policy for the fd-relative ownership
@@ -571,10 +864,7 @@ void handler(int file_descriptor) {
      rather than silently applying the wrong ownership policy. */
   if (!identity_set_active(config)) {
     log_message(LOG_LEVEL_ERROR, "Failed to activate identity policy");
-    config_delete(config);
-    close(file_descriptor);
-    protocol_session_unbind();
-    return;
+    goto done;
   }
   /* Persist the negotiated --keep-dirlinks policy once, here at config-accept,
      before any multithreaded receiver/writer threads are spawned, so the
@@ -605,38 +895,27 @@ void handler(int file_descriptor) {
     if (!motd_send(file_descriptor, motd ? motd : "")) {
       free(motd);
       log_message(LOG_LEVEL_ERROR, "Failed to send daemon MOTD");
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
+      goto done;
     }
     free(motd);
   }
   if (config->use_multithreading) {
     Queue* q = queue_create(100, file_destroy);
-    if (q == NULL) {
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
-    }
-    PipelineContextReceiver* context =
-        pipeline_context_receiver_create(config, q, file_descriptor, ssl);
+    if (q == NULL)
+      goto done;
+    context = pipeline_context_receiver_create(config, q, file_descriptor, ssl);
     if (context == NULL) {
       queue_destroy(q);
-      config_delete(config);
-      close(file_descriptor);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
+      goto done;
     }
     protocol_session_set_max_alloc(&context->session, config->max_alloc);
+    protocol_session_set_io_timeout(&context->session,
+                                    protocol_server_io_timeout_sec(config->timeout));
     atomic_store(&context->session.total_allocated_bytes,
                  atomic_load(&session.total_allocated_bytes));
     pipeline_context_receiver_set_queue_byte_limit(context, RECEIVER_QUEUE_MAX_BYTES);
-    thrd_t receiver, writer;
+    thrd_t receiver = {0};
+    thrd_t writer = {0};
     bool receiver_created = thrd_create(&receiver, receive_thread, context) == thrd_success;
     bool writer_created = false;
     if (receiver_created)
@@ -649,38 +928,67 @@ void handler(int file_descriptor) {
         cnd_broadcast(&context->condition_not_full);
         cnd_broadcast(&context->condition_not_empty);
         mtx_unlock(&context->mutex);
-        close(file_descriptor);
+        /* Unblock a worker parked in socket I/O without closing the fd (the
+         * child owns the single close).  shutdown() only affects sockets; for
+         * the --stdio pipe the receiver's per-message poll timeout still
+         * bounds the join, so do nothing there rather than close a descriptor
+         * another thread may still be using. */
+        struct stat fd_stat;
+        if (fstat(file_descriptor, &fd_stat) == 0 && S_ISSOCK(fd_stat.st_mode))
+          shutdown(file_descriptor, SHUT_RDWR);
         thrd_join(receiver, NULL);
-      } else {
-        close(file_descriptor);
       }
       if (writer_created)
         thrd_join(writer, NULL);
-      pipeline_context_receiver_destroy(context);
-      protocol_session_unbind();
-      identity_clear_active();
-      return;
+      goto done;
     }
     int receiver_result;
     int writer_result;
     thrd_join(receiver, &receiver_result);
     thrd_join(writer, &writer_result);
     bool transfer_ok = receiver_result == thrd_success && writer_result == thrd_success;
-    if (transfer_ok) {
+    if (transfer_ok && !config->dry_run) {
       /* Commit-style (late) deletion: receive_thread handed the keep-set
          manifest here instead of deleting while write_thread might still be
          draining, so by now every file is on disk and the whole transfer is
          known to have succeeded.  Remove the extras before publishing a
-         --delay-updates run; the walker skips the staging directory. */
+         --delay-updates run; the walker skips the staging directory.  A
+         server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
-        if (!manifest_delete_all(config, context->deferred_manifest)) {
+        size_t deleted = 0;
+        DeleteCommitResult deletion =
+            manifest_delete_all_counted(config, context->deferred_manifest, &deleted);
+        context->stats.deleted_files += deleted;
+        if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
+        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+          /* The transfer still succeeds; the terminal frame reports the capped
+             deletion so the sender exits 25 like rsync. */
+          context->delete_limit_reached = true;
         }
         delete_manifest_free(context->deferred_manifest);
         context->deferred_manifest = NULL;
       }
+      /* --delete-delay: receive_thread snapshotted each plan's extras as it
+         arrived; with the disk writer drained, commit the deferred removals.
+         --delete-during already applied its plans on the receive thread. */
+      if (context->deferred_plans) {
+        /* Defence in depth (the enclosing block already excludes dry-run): a
+           -n run never commits a deletion. */
+        DeleteCommitResult deletion =
+            config->dry_run ? DELETE_COMMIT_OK
+                            : delete_plan_session_commit(context->deferred_plans, config);
+        context->stats.deleted_files += delete_plan_session_deleted(context->deferred_plans);
+        if (deletion == DELETE_COMMIT_ERROR) {
+          transfer_ok = false;
+        } else if (deletion == DELETE_COMMIT_LIMIT_REACHED) {
+          context->delete_limit_reached = true;
+        }
+        delete_plan_session_destroy(context->deferred_plans);
+        context->deferred_plans = NULL;
+      }
     }
-    if (transfer_ok) {
+    if (transfer_ok && !config->dry_run) {
       /* --delay-updates: receive_thread has finished the whole protocol stream
          (including manifest/delete handling) and write_thread has drained its
          queue, so every staged file is complete.  Publish atomically before the
@@ -695,29 +1003,49 @@ void handler(int file_descriptor) {
          to stamp directory times; a directory's mtime must not be clobbered by
          its children or by an extra removal. */
       if (transfer_ok)
-        dir_time_list_apply(&context->dir_times, config->receive_root_directory);
+        dir_metadata_list_apply(&context->dir_times, config->receive_root_directory, config);
     }
     if (transfer_ok) {
-      if (!receiver_send_final_success(file_descriptor, config, &context->outcomes))
+      Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
+      /* Emit the optional wire-stats record first (protocol 2.25.0), then the
+         success/outcome frame, exactly like the single-threaded receiver. */
+      if (!receiver_send_stats_frame(file_descriptor, config, &context->stats,
+                                     context->would_delete) ||
+          !receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
         transfer_ok = false;
     } else {
-      send_status(file_descriptor, STATUS_ERROR);
+      send_error_detail(file_descriptor, "transfer failed on receiver");
     }
-    if (!transfer_ok) {
+    if (!transfer_ok)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
-      if (config->delay_updates && config->delay_context)
-        delay_updates_cleanup(config->delay_context);
-    }
-    pipeline_context_receiver_destroy(context);
   } else {
     if (receiver_receive_files(config, file_descriptor) != 0)
       log_message(LOG_LEVEL_ERROR, "Transfer failed");
-    config_delete(config);
   }
-  protocol_session_unbind();
+
+done:
+  /* Single cleanup epilogue: every error path jumps here, so the iconv
+   * receiver conversion is released, the identity snapshot cleared, the
+   * protocol session unbound and the config freed exactly once.  The
+   * connection fd is deliberately NOT closed here -- the child functions own
+   * its single close (plain_child_fn / tls_child_fn), and the --stdio call
+   * site must leave stdin/stdout open. */
+  if (charset_ready)
+    charset_wire_free();
+  /* The delay-updates staging tree is released by config_delete (which the
+     branch below always reaches), so it is cleaned exactly once. */
   identity_clear_active();
-  charset_wire_free();
-  close(file_descriptor);
+  protocol_session_unbind();
+  if (context != NULL) {
+    /* context owns both the config and the queue it was created with. */
+    pipeline_context_receiver_destroy(context);
+    context = NULL;
+    config = NULL;
+  } else {
+    config_delete(config);
+    config = NULL;
+  }
+  free(joined_destination);
 }
 
 #ifndef FASTSYNC_SERVER_AS_LIB
@@ -744,11 +1072,15 @@ static void print_server_usage(void) {
   printf("  --config=FILE       Daemon config file (default: ~/.config/fastsync/\n");
   printf("                      fastsyncd.conf, else /etc/fastsyncd.conf)\n");
   printf("  --dparam=KEY=VALUE  Override one global config key on the command line\n");
-  printf("                      (port, motd file, address)\n");
+  printf("                      (port, motd file, address, max connections,\n");
+  printf("                      max connections per host, auth failure delay,\n");
+  printf("                      auth lockout threshold, auth lockout duration,\n");
+  printf("                      hosts allow, hosts deny)\n");
   printf("  --no-detach         Stay in the foreground (default detaches to\n");
   printf("                      background when running --daemon)\n");
-  printf("  --password-file=FILE  Credential store for modules that declare\n");
-  printf("                      'auth users' (line format:\n");
+  printf("  --password-file=FILE  FastSync-native SCRAM/PBKDF2 credential store (NOT\n");
+  printf("                      rsync's auth scheme) for modules that declare 'auth\n");
+  printf("                      users' (line format:\n");
   printf("                      user:$fastsync$1$pbkdf2-sha256$iters$salt$stored$server,\n");
   printf("                      generated by --hash-credentials).  Legacy\n");
   printf("                      user:SHA256HEX lines are rejected.  Requires\n");
@@ -757,7 +1089,7 @@ static void print_server_usage(void) {
   printf("  --early-input=FILE  Second credential store layered over\n");
   printf("                      --password-file (same format); usually a secrets-\n");
   printf("                      manager/process-substitution file.  Requires --daemon\n");
-  printf("  -p <port>           TCP port (default: 8080, range: 1-65535)\n");
+  printf("  -p, --port <port>   TCP port (default: 8080, range: 1-65535)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");
@@ -768,10 +1100,19 @@ static void print_server_usage(void) {
   printf("  -4, --ipv4          Bind an IPv4 socket (default)\n");
   printf("  -6, --ipv6          Bind an IPv6 socket\n");
   printf("  --allow-delete      Permit manifest deletion\n");
-  printf("  --trust-sender      Trust the remote sender's file list\n");
+  printf("  --trust-sender      Trust the remote sender's file list (receiver-local;\n");
+  printf("                      this server-side flag is the only one that matters -- a\n");
+  printf("                      client --trust-sender is never sent to the server)\n");
   printf("  --no-super          Operator veto: never attempt super-user activities\n");
   printf("                      (ownership, device nodes) even as root, and refuse\n");
   printf("                      any client --copy-as/--super request\n");
+  printf("  --allow-super       Standalone TCP listener only: keep super-user\n");
+  printf("                      activities enabled for a root receiver.  Without it a\n");
+  printf("                      root standalone server forces SUPER_MODE_OFF, so client\n");
+  printf("                      --devices/--write-devices/--super and ownership\n");
+  printf("                      requests are refused/skipped.  Never honored with\n");
+  printf("                      --stdio (the SSH remote argv is client-composed, so\n");
+  printf("                      super stays off there); no effect when not root\n");
   printf("  --iconv=LOCAL[,REMOTE]  Declare this server's LOCAL charset for file-name\n");
   printf("                      conversion: received names are translated to this\n");
   printf("                      charset (the wire charset still comes from the\n");
@@ -838,10 +1179,18 @@ static bool daemonize(void) {
   if (chdir("/") != 0)
     log_message(LOG_LEVEL_WARNING, "daemon: chdir to / failed: %s", strerror(errno));
   umask(0);
+  /* Refresh the cached umask: main() captured the launch umask before this
+   * (single-threaded) umask(0), and file_mode_base() must see the daemon's
+   * actual umask. */
+  file_umask_capture();
   return true;
 }
 
 int main(int argc, char* argv[]) {
+  /* Capture the process umask now, while still single-threaded: the cached
+   * value is what file_mode_base() uses, and reading it later would race with
+   * receiver threads creating files. */
+  file_umask_capture();
   ServerCliOptions opts;
   char cli_err[512];
   int parse_result = server_cli_parse(argc, argv, &opts, cli_err, sizeof(cli_err));
@@ -896,9 +1245,16 @@ int main(int argc, char* argv[]) {
   trust_sender = opts.trust_sender;
   allow_unauthenticated = opts.allow_unauthenticated;
   server_no_super = opts.no_super;
+  /* --stdio rejects --allow-super at parse time; force it off here as well so
+   * this process-global policy cannot be re-enabled by a future caller. */
+  server_allow_super = opts.allow_super && !opts.stdio_mode;
   server_iconv_spec = opts.iconv_spec;
   signal(SIGINT, cleanup);
   signal(SIGTERM, cleanup);
+  /* Server-owned socket deadline floor: the client default --timeout=0 would
+   * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
+   * silent peer hold a connection (and its process slot) forever. */
+  tcp_set_timeouts(SERVER_IO_TIMEOUT_SEC, SERVER_IO_TIMEOUT_SEC);
 
   if (opts.stdio_mode) {
     /* SSH authenticates the stdio transport outside of FastSync. */
@@ -912,6 +1268,9 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     io_set_fds(STDIN_FILENO, STDOUT_FILENO);
+    /* handler() does not own the stdio fds: it never closes its descriptor
+     * argument, so STDIN/STDOUT stay open for this (single-shot) SSH session
+     * and are released by process exit. */
     handler(STDIN_FILENO);
     release_authorization();
     server_cli_options_free(&opts);
@@ -956,6 +1315,11 @@ int main(int argc, char* argv[]) {
                     "and device nodes within that module root -- pair it with `auth users` "
                     "unless the module is intentionally open to the network",
                     g_daemon_conf->modules[i].name);
+      if (g_daemon_conf->modules[i].max_connections > 0)
+        log_message(LOG_LEVEL_INFO,
+                    "daemon module '%s': per-module 'max connections' cap = %d (enforced "
+                    "across all connection children)",
+                    g_daemon_conf->modules[i].name, g_daemon_conf->modules[i].max_connections);
     }
     /* Daemon credential store (Wave B).  --password-file and --early-input
      * feed the same store, loaded BEFORE the listener forks so every
@@ -999,6 +1363,21 @@ int main(int argc, char* argv[]) {
                       module->name, module->auth_users[j]);
       }
     }
+    /* Shared cross-process registry for the per-module / per-source caps and
+     * the auth lockout.  Created HERE in the parent before any accept-loop
+     * fork; every connection child inherits the mapping.  A failure degrades to
+     * "registry disabled" (the global cap and host ACLs still apply) rather
+     * than refusing to start. */
+    g_daemon_limits = daemon_limits_create((int)g_daemon_conf->global.max_connections,
+                                           g_daemon_conf->module_count,
+                                           g_daemon_conf->global.max_connections_per_host,
+                                           g_daemon_conf->global.auth_lockout_threshold,
+                                           g_daemon_conf->global.auth_lockout_duration_sec);
+    if (!g_daemon_limits)
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon: could not allocate the shared connection registry; per-module / "
+                  "per-host caps and the cross-process auth lockout are disabled (the global "
+                  "'max connections' cap and host ACLs still apply)");
   } else {
     if (!configure_authorization(opts.destination_root)) {
       char* escaped = output_escape(opts.destination_root, false);
@@ -1020,6 +1399,10 @@ int main(int argc, char* argv[]) {
     exit_code = 1;
     goto out;
   }
+  if (g_daemon_conf)
+    server_set_max_connections(g_server, (unsigned int)g_daemon_conf->global.max_connections);
+  if (g_daemon_limits)
+    server_set_limit_registry(g_server, g_daemon_limits);
   if (opts.use_tls) {
     if (!opts.tls_cert || !opts.tls_key || !opts.tls_ca || !opts.client_cn) {
       fprintf(stderr, "Error: --tls requires --cert, --key, --ca, and --client-cn\n");
@@ -1059,6 +1442,8 @@ int main(int argc, char* argv[]) {
   release_authorization();
 
 out:
+  daemon_limits_destroy(g_daemon_limits);
+  g_daemon_limits = NULL;
   daemon_conf_free(g_daemon_conf);
   g_daemon_conf = NULL;
   credentials_free(g_credentials);

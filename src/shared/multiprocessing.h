@@ -5,11 +5,12 @@
 #include <stdatomic.h>
 
 #include "array_list.h"
+#include "chunk.h"
 #include "config.h"
+#include "delete_plan.h"
 #include "file.h"
 #include "protocol.h"
 #include "queue.h"
-#include "receiver.h"
 #include "stop_condition.h"
 #include <openssl/ssl.h>
 
@@ -25,6 +26,15 @@ typedef struct {
   cnd_t condition_not_full_loader;
   cnd_t condition_not_empty_loader;
   bool loader_done;
+  /* Aggregate loaded payload bytes queued on queue_loader but not yet released
+     by the sender.  Guarded by `mutex_loader`.  When `max_queue_bytes` is
+     non-zero the loader blocks before enqueueing a chunk that would push this
+     total over it, so the sender buffers a bounded number of bytes rather than
+     an unbounded count of chunks that may each be up to chunk_size (or a single
+     file) in size.  Files streamed straight from disk by sendfile hold no
+     payload, so only in-memory (`data->data`) payloads are counted. */
+  size_t queued_bytes;
+  size_t max_queue_bytes;
   ArrayList* manifest;
   /* Protected prefixes (paths the source scan excluded by user rules) sent
      with the keep-set manifest so --delete leaves them alone unless
@@ -33,6 +43,23 @@ typedef struct {
      scanner's exclusion sink) or, in the early modes, by the path-only pre-scan
      on the calling thread before the pipeline starts. */
   ArrayList* excluded_paths;
+  /* --max-size/--min-size pruned source paths.  These are ALWAYS sent as
+     protected prefixes (even with --delete-excluded), so the destination
+     mirrors of size-skipped files survive --delete like rsync.  Populated by
+     the scanner thread (workers append under mutex_scanner) or, in the early
+     modes, by the path-only pre-scan on the calling thread. */
+  ArrayList* size_skipped_paths;
+  /* Destination-relative paths of the directories the source scan synchronized
+     for this run (the receive root is the "." sentinel).  Sent with the
+     manifest so the receiver confines its extras walk to them, matching rsync's
+     "delete only in synchronized directories" (notably for --files-from).
+     Populated by the scanner thread or the early pre-scan. */
+  ArrayList* synced_dirs;
+  /* Destination-relative paths of every traversed source directory, for the
+     per-directory delete plan keep set (so an empty source directory survives
+     --delete rather than being removed as an extra).  Prebuilt by the path-only
+     pre-scan on the calling thread. */
+  ArrayList* plan_dirs;
   /* --delete-missing-args: the destination-relative mirrors of the --files-from
      entries that are missing under the source.  Computed by the preflight on
      the calling thread before the pipeline starts; the sender thread transmits
@@ -45,11 +72,16 @@ typedef struct {
      --ignore-errors kept the run going. */
   bool scan_had_io_error;
   ArrayList* remove_source_files;
-  /* True when --delete-before/--delete-during require the keep-set manifest to
-     be transmitted before any file data: context->manifest is then prebuilt by
-     a path-only pre-scan on the calling thread and the pipeline scanner must
-     not append to it.  Set once before the worker threads start. */
+  /* True when --delete-before requires the whole-tree keep-set manifest to be
+     transmitted before any file data: context->manifest is then prebuilt by a
+     path-only pre-scan on the calling thread and the pipeline scanner must not
+     append to it.  Set once before the worker threads start. */
   bool early_delete;
+  /* Non-NULL for --delete-during/--delete-delay: the per-directory plan set
+     prebuilt by the path-only pre-scan on the calling thread.  The sender
+     thread transmits the root plan before any data and the remaining plans
+     alongside the chunks.  Set once before the worker threads start. */
+  DeletePlanSender* delete_plans;
   mtx_t mutex_progress;
   int total_files;
   unsigned long long progress_bytes;
@@ -74,60 +106,31 @@ typedef struct {
   ArrayList* dir_entries;
   mtx_t dir_entries_mutex;
   bool dir_entries_mutex_init;
+  /* Set by the sender thread when the receiver reported a --max-delete-capped
+     deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
+     exit 25 like rsync.  Read by the caller after the sender thread is joined. */
+  bool delete_limit;
 } PipelineContextSender;
 
-typedef struct PipelineContextReceiver {
-  Queue* queue;
-  Config* config;
-  int file_descriptor;
-  SSL* ssl;
-  ProtocolSession session;
-  ReceiverOutcomes outcomes;
-  mtx_t mutex;
-  cnd_t condition_not_full;
-  cnd_t condition_not_empty;
-  bool receiver_done;
-  atomic_bool cancelled;
-  /* Aggregate payload bytes that have been received but not yet released by
-     the disk writer (queued or in the writer's hand).  Guarded by `mutex`.
-     When `max_queue_bytes` is non-zero the receiver blocks before enqueuing
-     once this total would exceed it, so decompressed/copied file payloads
-     buffered ahead of a slow disk writer respect the per-connection memory
-     budget instead of growing without bound. */
-  size_t queued_bytes;
-  size_t max_queue_bytes;
-  /* Keep-set manifest for the commit-style (late) deletion
-     (--delete/--delete-after/--delete-delay).  receive_thread parses the whole
-     protocol stream but hands the manifest here instead of deleting while the
-     disk writer may still be draining; the caller (server.c) commits the
-     deletion after both threads have joined, so no extra is removed unless the
-     transfer truly succeeded.  NULL in the early delete modes (which delete at
-     the manifest). */
-  DeleteManifest* deferred_manifest;
-  /* P7 Wave D: directory metadata collected by write_thread from received
-     directory entries.  Only write_thread mutates it (before it joins); the
-     caller (server.c) applies it after the delete/delay-updates phase. */
-  DirTimeList dir_times;
-} PipelineContextReceiver;
-
+/* `config` is borrowed and must outlive the context: destroy does NOT free it,
+   so the caller owns it and frees it with config_delete() afterwards. */
 PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* queue_scanner,
                                                       Queue* queue_loader);
 void pipeline_context_sender_destroy(PipelineContextSender* context);
-PipelineContextReceiver* pipeline_context_receiver_create(Config* config, Queue* queue_receiver,
-                                                          int file_descriptor, SSL* ssl);
-void pipeline_context_receiver_destroy(PipelineContextReceiver* context);
-/* Bound the bytes buffered ahead of the disk writer (see max_queue_bytes). */
-void pipeline_context_receiver_set_queue_byte_limit(PipelineContextReceiver* context,
-                                                    size_t max_bytes);
-/* Blocking enqueue used by the receive pipeline sink.  Blocks while the queue
-   is full by element count or when adding `file` would push queued_bytes over
-   the configured byte limit; waits until the disk writer releases bytes.
-   Takes ownership of `file` on success and destroys it on failure/cancel. */
-bool pipeline_context_receiver_enqueue_file(PipelineContextReceiver* context, File* file);
-/* Account for `released_bytes` of payload memory that has been freed by the
-   disk writer, unblocking a receiver that is waiting on the byte limit. */
-void pipeline_context_receiver_note_bytes_released(PipelineContextReceiver* context,
-                                                   size_t released_bytes);
-int receive_thread(void* pipeline_context);
-int write_thread(void* pipeline_context);
+/* Bound the loaded payload bytes the sender may buffer ahead of the network
+   writer (see max_queue_bytes). */
+void pipeline_context_sender_set_queue_byte_limit(PipelineContextSender* context, size_t max_bytes);
+/* Total payload bytes a chunk currently holds in memory (loaded file data
+   only; zero for entries with no payload or data streamed from disk). */
+size_t pipeline_context_sender_chunk_bytes(const Chunk* chunk);
+/* Blocking enqueue used by the sender's loader stage.  Blocks while
+   queue_loader is full by element count or when adding `chunk` would push the
+   queued payload bytes over the configured byte limit; waits until the sender
+   releases bytes.  Takes ownership of `chunk` on success and destroys it on
+   failure/cancel. */
+bool pipeline_context_sender_enqueue_chunk(PipelineContextSender* context, Chunk* chunk);
+/* Account for `released_bytes` of payload memory that the sender freed after
+   destroying a chunk, unblocking a loader waiting on the byte limit. */
+void pipeline_context_sender_note_bytes_released(PipelineContextSender* context,
+                                                 size_t released_bytes);
 #endif

@@ -1,7 +1,9 @@
 #include "test_log.h"
 #include "log.h"
 #include "test_utils.h"
+#include <fcntl.h>
 #include <string.h>
+#include <threads.h>
 #include <unistd.h>
 
 /* Test default log level: WARNING and ERROR should print, DEBUG and INFO should not.
@@ -147,6 +149,118 @@ static void test_log_debug_enabled_matches_gate() {
   set_log_debug_flags(LOG_DEBUG_ALL);
 }
 
+#define LOG_CONCURRENCY_THREADS 8
+#define LOG_CONCURRENCY_LINES 250
+
+typedef struct {
+  int id;
+} LogConcurrencyArg;
+
+static int log_concurrency_worker(void* context) {
+  LogConcurrencyArg* arg = context;
+  for (int i = 0; i < LOG_CONCURRENCY_LINES; i++) {
+    log_message(LOG_LEVEL_WARNING, "worker %d line %d", arg->id, i);
+  }
+  return 0;
+}
+
+static int count_substring(const char* haystack, const char* needle) {
+  int count = 0;
+  size_t needle_length = strlen(needle);
+  const char* cursor = haystack;
+  while ((cursor = strstr(cursor, needle)) != NULL) {
+    count++;
+    cursor += needle_length;
+  }
+  return count;
+}
+
+/* Concurrent log_message() calls from many threads must never interleave a
+ * single line: every emitted line has exactly one timestamp prefix and one
+ * body.  Before write_message() was serialized, the three separate fprintf
+ * calls (prefix, body, newline) let lines tear. */
+static void test_log_concurrent_no_torn_lines(void) {
+  FILE* fp = tmpfile();
+  EXPECT_NOT_NULL(fp);
+
+  /* Mute the console mirror so the workers don't flood the test output. */
+  fflush(stdout);
+  fflush(stderr);
+  int saved_stdout = dup(STDOUT_FILENO);
+  int saved_stderr = dup(STDERR_FILENO);
+  int null_fd = open("/dev/null", O_WRONLY);
+  EXPECT_TRUE(saved_stdout >= 0);
+  EXPECT_TRUE(saved_stderr >= 0);
+  EXPECT_TRUE(null_fd >= 0);
+  EXPECT_TRUE(dup2(null_fd, STDOUT_FILENO) >= 0);
+  EXPECT_TRUE(dup2(null_fd, STDERR_FILENO) >= 0);
+  close(null_fd);
+
+  set_log_level(LOG_LEVEL_WARNING);
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+  log_set_file(fp);
+
+  thrd_t threads[LOG_CONCURRENCY_THREADS];
+  LogConcurrencyArg args[LOG_CONCURRENCY_THREADS];
+  int created = 0;
+  for (int i = 0; i < LOG_CONCURRENCY_THREADS; i++) {
+    args[i].id = i;
+    if (thrd_create(&threads[i], log_concurrency_worker, &args[i]) != thrd_success)
+      break;
+    created++;
+  }
+  for (int i = 0; i < created; i++) {
+    thrd_join(threads[i], NULL);
+  }
+
+  log_set_file(NULL);
+  fflush(fp);
+
+  fflush(stdout);
+  fflush(stderr);
+  dup2(saved_stdout, STDOUT_FILENO);
+  dup2(saved_stderr, STDERR_FILENO);
+  close(saved_stdout);
+  close(saved_stderr);
+
+  rewind(fp);
+  char line[512];
+  int total_lines = 0;
+  int malformed_lines = 0;
+  bool saw_missing_newline = false;
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    size_t length = strlen(line);
+    if (length == 0 || line[length - 1] != '\n')
+      saw_missing_newline = true;
+    if (strncmp(line, "20", 2) != 0 || count_substring(line, "[WARN]: worker ") != 1)
+      malformed_lines++;
+    total_lines++;
+  }
+  fclose(fp);
+
+  EXPECT_EQ_INT(created, LOG_CONCURRENCY_THREADS);
+  EXPECT_FALSE(saw_missing_newline);
+  EXPECT_EQ_INT(malformed_lines, 0);
+  EXPECT_EQ_INT(total_lines, LOG_CONCURRENCY_THREADS * LOG_CONCURRENCY_LINES);
+  log_set_stderr_mode(LOG_STDERR_ERRORS);
+}
+
+/* Detaching the logger from a FILE* before it is closed must leave the logging
+ * subsystem safe: later calls must not touch the freed handle. */
+static void test_log_set_file_null_before_fclose(void) {
+  FILE* fp = tmpfile();
+  EXPECT_NOT_NULL(fp);
+
+  set_log_level(LOG_LEVEL_ERROR);
+  log_set_file(fp);
+  log_message(LOG_LEVEL_ERROR, "line before detach");
+  log_set_file(NULL);
+  fclose(fp);
+
+  log_message(LOG_LEVEL_ERROR, "line after close");
+  EXPECT_TRUE(true);
+}
+
 void test_log() {
   test_log_message_debug();
   test_log_message_info();
@@ -159,4 +273,6 @@ void test_log() {
   test_log_stderr_mode_all();
   test_log_message_formats();
   test_log_debug_enabled_matches_gate();
+  test_log_concurrent_no_torn_lines();
+  test_log_set_file_null_before_fclose();
 }

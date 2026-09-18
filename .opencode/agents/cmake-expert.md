@@ -27,16 +27,19 @@ FetchContent_Declare(xxhash GIT_REPOSITORY https://github.com/Cyan4973/xxHash GI
 FetchContent_MakeAvailable(xxhash)
 
 # Sanitizer option
-set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, none)")
-set_property(CACHE SANITIZER PROPERTY STRINGS address thread none)
+set(SANITIZER "none" CACHE STRING "Sanitizer to enable (address, thread, undefined, none)")
+set_property(CACHE SANITIZER PROPERTY STRINGS address thread undefined none)
 if(SANITIZER STREQUAL "address")
   add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=address)
 elseif(SANITIZER STREQUAL "thread")
   add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=thread)
+elseif(SANITIZER STREQUAL "undefined")
+  add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=undefined)
 elseif(NOT SANITIZER STREQUAL "none")
-  message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, none")
+  message(FATAL_ERROR "Unknown sanitizer: ${SANITIZER}. Supported values: address, thread, undefined, none")
 endif()
 
 option(STRICT_WARNINGS "Enable strict warnings" OFF)
@@ -52,6 +55,16 @@ if(NOT ZSTD_LIBRARY)
   message(FATAL_ERROR "zstd library not found. Ensure it is in your nix-shell!")
 endif()
 
+find_library(ZLIB_LIBRARY z)
+if(NOT ZLIB_LIBRARY)
+  message(FATAL_ERROR "zlib library not found. Ensure zlib1g-dev / nix zlib is available!")
+endif()
+
+find_library(LZ4_LIBRARY lz4)
+if(NOT LZ4_LIBRARY)
+  message(FATAL_ERROR "lz4 library not found. Ensure liblz4-dev / nix lz4 is available!")
+endif()
+
 find_package(OpenSSL REQUIRED)
 
 file(GLOB SHARED_SRCS "src/shared/*.c")
@@ -61,15 +74,15 @@ file(GLOB TEST_SRCS "tests/*.c")
 
 add_executable(server ${SERVER_SRCS} ${SHARED_SRCS})
 target_include_directories(server PRIVATE src/shared src/server src/client)
-target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+target_link_libraries(server PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY} ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(client ${CLIENT_SRCS} ${SHARED_SRCS})
 target_include_directories(client PRIVATE src/shared src/server src/client)
-target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+target_link_libraries(client PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY} ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 
 add_executable(tests ${TEST_SRCS} ${SHARED_SRCS} src/client/scanner.c)
 target_include_directories(tests PRIVATE tests src/shared src/server src/client)
-target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
+target_link_libraries(tests PRIVATE Threads::Threads ${ZSTD_LIBRARY} ${ZLIB_LIBRARY} ${LZ4_LIBRARY} OpenSSL::SSL OpenSSL::Crypto xxhash)
 ```
 
 ### Source Layout
@@ -82,19 +95,25 @@ tests/integration/ — Python pytest integration tests
 ```
 
 ### Dependencies
-- **zstd** — found via `find_library(ZSTD_LIBRARY zstd)`
+- **zstd** — found via `find_library(ZSTD_LIBRARY zstd)` (default compression codec)
+- **zlib** — found via `find_library(ZLIB_LIBRARY z)` (the `zlib`/`zlibx` codecs)
+- **lz4** — found via `find_library(LZ4_LIBRARY lz4)` (the `lz4` codec)
 - **OpenSSL** — found via `find_package(OpenSSL REQUIRED)` (TLS 1.2+ transport)
-- **xxHash** — fetched via `FetchContent` from GitHub (delta transfer hashing, v0.8.3)
+- **xxHash** — fetched via `FetchContent` from the upstream repository (delta transfer hashing, v0.8.3)
 - **pthreads** — found via `find_package(Threads REQUIRED)`
 - **C11 standard** — required
 - **CMake 3.22+** — minimum version
 
+The codec matrix (protocol 2.26.0) uses zstd/zlib/lz4 for compression and
+xxHash/OpenSSL for the `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1` checksums
+(`none` needs no library); both codec families are negotiated per transfer.
+
 ## Conventions
 
 - Use `file(GLOB ...)` for source collection (existing pattern).
-- All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
+- All targets link `Threads::Threads`, `${ZSTD_LIBRARY}`, `${ZLIB_LIBRARY}`, `${LZ4_LIBRARY}`, `OpenSSL::SSL`, `OpenSSL::Crypto`, and `xxhash`.
 - Include directories: `src/shared`, `src/server`, `src/client`, `tests` (for test target).
-- Sanitizer support: pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (live option in CMakeLists.txt).
+- Sanitizer support: pass `-DSANITIZER=address`, `-DSANITIZER=thread`, or `-DSANITIZER=undefined` to cmake (live option in CMakeLists.txt).
 - Build with `cmake -B build -S . && cmake --build build -j$(nproc)`.
 - For CI, dependencies are provided by the project's custom Docker image (repo-root `Dockerfile`, same image CI uses). For local development, use `nix-shell`. Never add `apt-get install` / `pip install` to CI workflows. See `AGENTS.md`.
 
@@ -105,7 +124,7 @@ tests/integration/ — Python pytest integration tests
 3. Add new dependencies with `find_package` or `find_library`.
 4. When adding a new executable target, follow the pattern of existing targets.
 5. When adding a new library (static/shared), use `add_library` and follow the project's naming.
-6. For sanitizer builds, pass `-DSANITIZER=address` or `-DSANITIZER=thread` to cmake (matching CI's matrix strategy).
+6. For sanitizer builds, pass `-DSANITIZER=address`, `-DSANITIZER=thread`, or `-DSANITIZER=undefined` to cmake (matching CI's matrix strategy).
 7. Always verify the build compiles after changes.
 
 ## Sanitizer Configurations
@@ -119,11 +138,9 @@ cmake -B build -S . -DSANITIZER=thread    # ThreadSanitizer (race conditions)
 cmake --build build -j$(nproc)
 ```
 
-For UndefinedBehaviorSanitizer (no `-DSANITIZER=undefined` option in CMakeLists.txt yet), use the manual flag approach:
+UndefinedBehaviorSanitizer uses the same built-in option:
 ```bash
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined"
+cmake -B build -S . -DSANITIZER=undefined
 cmake --build build -j$(nproc)
 ```
 
@@ -159,7 +176,7 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```bash
 cmake -B build -S .
 cmake --build build -j$(nproc)
-./build/server
+./build/server -p 8080 --allow-unauthenticated
 ./build/client
 ./build/tests
 ```
@@ -187,7 +204,7 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 

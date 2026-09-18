@@ -18,8 +18,9 @@ typedef struct {
 /* Receiver-side --delay-updates staging registry.  All successfully written
    files land under a private staging directory inside the receive root and are
    atomically renamed into their final destination only at the very end of the
-   transfer.  A single PipelineContextReceiver has exactly one writer thread,
-   but the registry is still mutex-protected so the same object can be safely
+   transfer.  A single receiver pipeline (see src/server/receiver_pipeline.h)
+   has exactly one writer thread, but the registry is still mutex-protected so
+   the same object can be safely
    shared with the publish/cleanup phase that runs after the threads join. */
 typedef struct DelayUpdatesContext {
   char* root_directory; /* receive root the staging dir lives under */

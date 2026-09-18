@@ -23,6 +23,7 @@ Data* data_create_reserve(size_t size) {
   d->data = NULL;
   d->size = size;
   d->protocol_charge = 0;
+  d->owner = NULL;
   return d;
 }
 
@@ -36,14 +37,19 @@ Data* data_create(void* data, size_t data_size) {
   new_data->data = data;
   new_data->size = data_size;
   new_data->protocol_charge = 0;
+  new_data->owner = NULL;
   return new_data;
 }
 
 void data_destroy(Data* data) {
   if (data == NULL)
     return;
-  if (data->protocol_charge != 0)
-    protocol_release_memory(data->protocol_charge);
+  if (data->protocol_charge != 0) {
+    if (data->owner != NULL)
+      protocol_release_memory_for_session(data->owner, data->protocol_charge);
+    else
+      protocol_release_memory(data->protocol_charge);
+  }
   free(data->data);
   free(data);
 }

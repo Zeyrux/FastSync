@@ -115,7 +115,9 @@ static void build_canonical_frame(void) {
   if (cfg->usermap) {
     cfg->usermap_count = 1;
     cfg->usermap[0].from = MAP_FROM;
+    cfg->usermap[0].from_hi = MAP_FROM;
     cfg->usermap[0].to = MAP_TO;
+    cfg->usermap[0].to_name = NULL;
   }
   if (!cfg->send_directory || !cfg->receive_root_directory || !cfg->usermap) {
     config_delete(cfg);

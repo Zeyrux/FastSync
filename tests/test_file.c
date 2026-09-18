@@ -3,7 +3,6 @@
 #endif
 #include "test_file.h"
 #include "file.h"
-#include "file_store.h"
 #include "file_receive.h"
 #include "data.h"
 #include "config.h"
@@ -15,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,6 +28,10 @@ static void test_file_create() {
   EXPECT_NULL(f->data->data);
   EXPECT_EQ_INT((int)f->data->size, 0);
   EXPECT_NULL(f->metadata);
+  /* An unset destination snapshot must read as known == false, never
+     indeterminate bytes (-i/--out-format without --incremental). */
+  EXPECT_FALSE(f->dest_state.known);
+  EXPECT_FALSE(f->dest_state.existed);
   file_destroy(f);
 }
 
@@ -326,6 +330,52 @@ static void test_file_save_to_disk_partial_install() {
   rmdir(root);
 }
 
+/* --temp-dir is a client-controlled wire value that must be confined below the
+ * receive root: an absolute or `..`-escaping value is rejected (a client must
+ * never make the receiver write scratch files in an arbitrary directory), while
+ * a relative one resolves under the root and is used for the atomic install. */
+static void test_file_save_to_disk_temp_dir_confined() {
+  const char* root = "test_temp_confine_tmp";
+  const char* dest_file = "test_temp_confine_tmp/file.txt";
+  char outside[PATH_MAX];
+  snprintf(outside, sizeof(outside), "/tmp/fastsync_temp_outside_%d", (int)getpid());
+  unlink(dest_file);
+  rmdir("test_temp_confine_tmp/scratch");
+  rmdir(root);
+  mkdir(root, 0755);
+  mkdir("test_temp_confine_tmp/scratch", 0755);
+  mkdir(outside, 0755);
+
+  File* f = file_create("file.txt");
+  EXPECT_NOT_NULL(f);
+  const char* content = "confined temp dir";
+  f->data->data = malloc(strlen(content));
+  EXPECT_NOT_NULL(f->data->data);
+  memcpy(f->data->data, content, strlen(content));
+  f->data->size = strlen(content);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->temp_dir = str_dup(outside);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
+  EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  free(config->temp_dir);
+  config->temp_dir = str_dup("../escape");
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
+  EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  free(config->temp_dir);
+  config->temp_dir = str_dup("scratch");
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(access(dest_file, F_OK), 0);
+
+  file_destroy(f);
+  config_delete(config);
+  unlink(dest_file);
+  rmdir("test_temp_confine_tmp/scratch");
+  rmdir(root);
+  rmdir(outside);
+}
+
 /* Issue #251: file_save_to_disk_full must distinguish receiver-side skips
    (--existing/--ignore-existing/--update) from real writes so the sender can
    decide whether --remove-source-files may unlink its source. */
@@ -410,7 +460,7 @@ static void test_file_write_to_disk_with_fsync() {
   const char* path = "test_file_write_to_disk_fsync.txt";
   const char* content = "fsync file content";
   EXPECT_TRUE(file_to_disk_secure_with_fsync(path, content, strlen(content), false, false, false,
-                                             NULL, false, true, NULL));
+                                             NULL, (FileAttrPolicy){0}, true, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -420,8 +470,8 @@ static void test_file_write_to_disk_with_fsync() {
 static void test_file_write_to_disk_preallocate_atomic() {
   const char* path = "test_file_write_prealloc_atomic.txt";
   const char* content = "prealloc atomic content";
-  EXPECT_TRUE(
-      file_to_disk_secure(path, content, strlen(content), false, false, true, NULL, false, NULL));
+  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), false, false, true, NULL,
+                                  (FileAttrPolicy){0}, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -438,8 +488,8 @@ static void test_file_write_to_disk_preallocate_atomic() {
 static void test_file_write_to_disk_preallocate_inplace() {
   const char* path = "test_file_write_prealloc_inplace.txt";
   const char* content = "prealloc inplace content";
-  EXPECT_TRUE(
-      file_to_disk_secure(path, content, strlen(content), true, false, true, NULL, false, NULL));
+  EXPECT_TRUE(file_to_disk_secure(path, content, strlen(content), true, false, true, NULL,
+                                  (FileAttrPolicy){0}, NULL));
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)st.st_size, (int)strlen(content));
@@ -518,6 +568,20 @@ static void test_file_symlink_helpers() {
   EXPECT_FALSE(file_symlink_target_contained("../escape"));
   EXPECT_FALSE(file_symlink_target_contained("a/../b"));
   EXPECT_FALSE(file_symlink_target_contained(""));
+
+  /* rsync 3.4.1 unsafe_symlink(): absolute/empty are unsafe; ".." is measured
+     against the symlink's own transfer-relative directory depth. */
+  EXPECT_TRUE(file_symlink_unsafe("/etc/passwd", "link"));
+  EXPECT_TRUE(file_symlink_unsafe("", "link"));
+  EXPECT_FALSE(file_symlink_unsafe("a.txt", "link"));
+  EXPECT_FALSE(file_symlink_unsafe("./a.txt", "link"));
+  EXPECT_FALSE(file_symlink_unsafe("../real.txt", "a/up1"));
+  EXPECT_FALSE(file_symlink_unsafe("../../real.txt", "a/b/up3"));
+  EXPECT_TRUE(file_symlink_unsafe("../../../outside", "a/b/esc"));
+  EXPECT_TRUE(file_symlink_unsafe("../outside", "esc"));
+  /* Internal /../ and a trailing /.. are rejected by rsync 3.4.1. */
+  EXPECT_TRUE(file_symlink_unsafe("a/b/../real.txt", "norm"));
+  EXPECT_TRUE(file_symlink_unsafe("dir/..", "link"));
 }
 
 static void test_file_symlink_at_secure() {
@@ -943,11 +1007,218 @@ static void test_inplace_overwrite_metadata_strips_special_bits() {
 
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
-  /* Metadata-derived mode is applied and never includes setuid/setgid/sticky. */
+  /* No -p: the pre-existing destination mode (without its special bits) is
+   * restored; the source mode is not applied. */
   EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
 
   unlink(path);
+  rmdir(root);
+}
+
+/* The per-attribute split: with no -p/-E the atomic (inode-replacing) write
+ * must restore the PRE-EXISTING destination mode instead of the source mode; a
+ * brand-new file keeps the historical 0644 default; -p applies the source. */
+static void test_atomic_no_perms_preserves_destination_mode() {
+  const char* path = "test_attr_split_mode.txt";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
+  EXPECT_TRUE(fd >= 0);
+  /* cppcheck-suppress knownConditionTrueFalse */
+  if (fd < 0)
+    return;
+  EXPECT_EQ_INT(fchmod(fd, 0640), 0);
+  EXPECT_EQ_INT(close(fd), 0);
+
+  FileMetadata m;
+  memset(&m, 0, sizeof(m));
+  m.mode = 0755;
+  m.uid = geteuid();
+  m.gid = getegid();
+  m.mtime_sec = 1700000000;
+
+  /* No -p/-E: the pre-existing 0640 survives the atomic overwrite. */
+  bool ok = file_to_disk_secure_attrs(path, "data", 4, false, false, false, &m,
+                                      (FileAttrPolicy){false, false, false, false}, false, false,
+                                      false, NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0640);
+
+  /* -p: the source mode wins. */
+  ok = file_to_disk_secure_attrs(path, "data2", 5, false, false, false, &m,
+                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
+
+  /* -E only (rsync rule): an executable source derives exec from the
+     pre-existing destination's read bits.  Dest 0640 (owner+group read) with a
+     source 0755 gives 0750, not 0751 and not the scratch 0711. */
+  EXPECT_EQ_INT(chmod(path, 0640), 0);
+  ok = file_to_disk_secure_attrs(path, "data3", 6, false, false, false, &m,
+                                 (FileAttrPolicy){false, false, false, true}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0750);
+
+  unlink(path);
+
+  /* A brand-new file with no -p uses rsync's source&~umask base when metadata
+     is available (m.mode is 0755 here). */
+  const char* fresh = "test_attr_split_fresh.txt";
+  unlink(fresh);
+  ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, &m,
+                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(fresh, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), (int)(m.mode & 0777 & ~(mode_t)file_process_umask()));
+  unlink(fresh);
+
+  /* Without any metadata the historical fixed 0644 default still applies. */
+  unlink(fresh);
+  ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, NULL,
+                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ_INT(stat(fresh, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  unlink(fresh);
+}
+
+/* Strict rsync parity: a brand-new destination file with no -p follows
+ * rsync's source_mode & ~umask base, so group/other write in the source mode is
+ * honored exactly as the umask allows (it is no longer force-cleared). */
+static void test_new_file_mode_honors_source_and_umask() {
+  const char* path = "test_new_file_mode.bin";
+  unlink(path);
+  FileMetadata m;
+  memset(&m, 0, sizeof(m));
+  m.mode = 0666; /* maximal group/other write in the source mode */
+  m.uid = geteuid();
+  m.gid = getegid();
+
+  bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
+                                      (FileAttrPolicy){false, false, false, false}, false, false,
+                                      false, NULL, false, false, NULL);
+  EXPECT_TRUE(ok);
+  struct stat st;
+  EXPECT_EQ_INT(stat(path, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), (int)(0666 & ~(mode_t)file_process_umask()));
+  unlink(path);
+}
+
+/* Strict rsync parity for recreated special nodes: with -p the source mode is
+ * copied exactly (0777 -> 0777), and without -p the same source & ~umask base
+ * as any other new entry applies.  The process umask is cleared so the source
+ * bits are what reaches mkfifo. */
+static void test_special_fifo_mode_honors_source_and_umask_impl() {
+  const char* root = "test_special_mode_tmp";
+  const char* with_p = "test_special_mode_tmp/with_p.fifo";
+  const char* no_p = "test_special_mode_tmp/no_p.fifo";
+  unlink(with_p);
+  unlink(no_p);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFIFO | 0777;
+  meta.uid = geteuid();
+  meta.gid = getegid();
+  meta.mtime_sec = 1000000000;
+
+  /* -p: the source mode (including group/other write) is copied exactly. */
+  File* f = file_create("with_p.fifo");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->metadata = &meta;
+  cfg->preserve_specials = true;
+  cfg->preserve_perms = true;
+  cfg->use_metadata = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(with_p, &st), 0);
+  EXPECT_TRUE(S_ISFIFO(st.st_mode));
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0777);
+  f->metadata = NULL;
+  file_destroy(f);
+
+  /* No -p: source & ~umask (umask is cleared, so 0777). */
+  f = file_create("no_p.fifo");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->metadata = &meta;
+  cfg->preserve_perms = false;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(lstat(no_p, &st), 0);
+  EXPECT_TRUE(S_ISFIFO(st.st_mode));
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0777);
+  f->metadata = NULL;
+  file_destroy(f);
+
+  config_delete(cfg);
+  unlink(with_p);
+  unlink(no_p);
+  rmdir(root);
+}
+
+/* The receiver daemon runs umask(0), so the source mode reaches mkfifo
+ * unmasked.  Run the body with umask(0) and refresh the cached process umask so
+ * file_process_umask() agrees, then restore both. */
+static void test_special_fifo_mode_honors_source_and_umask() {
+  mode_t saved_umask = umask(0);
+  file_umask_capture();
+  test_special_fifo_mode_honors_source_and_umask_impl();
+  umask(saved_umask);
+  file_umask_capture();
+}
+
+/* --specials recreates a unix-domain socket via mknod(S_IFSOCK), which Linux
+ * permits unprivileged.  Without --specials the entry is skipped. */
+static void test_special_socket_recreated() {
+  const char* root = "test_special_sock_tmp";
+  const char* sock = "test_special_sock_tmp/source.sock";
+  unlink(sock);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  FileMetadata meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.mode = S_IFSOCK | 0600;
+  meta.uid = geteuid();
+  meta.gid = getegid();
+
+  File* f = file_create("source.sock");
+  EXPECT_NOT_NULL(f);
+  f->is_special = true;
+  f->metadata = &meta;
+  cfg->preserve_specials = true;
+  cfg->use_metadata = true;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_WRITTEN);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(sock, &st), 0);
+  EXPECT_TRUE(S_ISSOCK(st.st_mode));
+
+  /* Without --specials the same entry is skipped, never a regular file. */
+  unlink(sock);
+  cfg->preserve_specials = false;
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, cfg), FILE_SAVE_SKIPPED);
+  EXPECT_EQ_INT(lstat(sock, &st), -1);
+
+  f->metadata = NULL;
+  file_destroy(f);
+  config_delete(cfg);
+  unlink(sock);
   rmdir(root);
 }
 
@@ -995,6 +1266,94 @@ static void test_inplace_overwrite_truncates_shorter_payload() {
   rmdir(root);
 }
 
+/* B2: --inplace must refuse an existing non-regular destination entry.  A FIFO
+   would block open(O_WRONLY) forever and a device node would be written
+   directly, bypassing the --write-devices/super gate.  Forked with an alarm so
+   a regression is a prompt failure instead of a hung suite. */
+static void test_inplace_refuses_fifo_destination() {
+  const char* root = "test_inplace_fifo_tmp";
+  const char* path = "test_inplace_fifo_tmp/fifo";
+  unlink(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  EXPECT_EQ_INT(mkfifo(path, 0600), 0);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(10);
+    File* f = file_create("fifo");
+    if (!f)
+      _exit(1);
+    const char* content = "payload";
+    f->data->data = malloc(strlen(content));
+    if (!f->data->data)
+      _exit(1);
+    memcpy(f->data->data, content, strlen(content));
+    f->data->size = strlen(content);
+    Config* cfg = config_create();
+    if (!cfg)
+      _exit(1);
+    cfg->inplace = true;
+    bool written = file_save_to_disk(root, f, cfg);
+    file_destroy(f);
+    config_delete(cfg);
+    _exit(written ? 1 : 0); /* must be refused */
+  }
+  int status;
+  waitpid(pid, &status, 0);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(path, &st), 0);
+  EXPECT_TRUE(S_ISFIFO(st.st_mode)); /* left untouched */
+  unlink(path);
+  rmdir(root);
+}
+
+/* B2: an existing char device must not be written by --inplace.  mknod needs
+   privilege, so a non-root run skips gracefully.  /dev/null's (1:3) rdev makes
+   the negative case harmless if it ever regresses. */
+static void test_inplace_refuses_device_destination() {
+  const char* root = "test_inplace_dev_tmp";
+  const char* path = "test_inplace_dev_tmp/dev";
+  unlink(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  if (mknod(path, S_IFCHR | 0600, makedev(1, 3)) != 0) {
+    rmdir(root);
+    return; /* no privilege to create a device node: skip */
+  }
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    alarm(10);
+    File* f = file_create("dev");
+    if (!f)
+      _exit(1);
+    const char* content = "payload";
+    f->data->data = malloc(strlen(content));
+    if (!f->data->data)
+      _exit(1);
+    memcpy(f->data->data, content, strlen(content));
+    f->data->size = strlen(content);
+    Config* cfg = config_create();
+    if (!cfg)
+      _exit(1);
+    cfg->inplace = true;
+    bool written = file_save_to_disk(root, f, cfg);
+    file_destroy(f);
+    config_delete(cfg);
+    _exit(written ? 1 : 0); /* must be refused */
+  }
+  int status;
+  waitpid(pid, &status, 0);
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  struct stat st;
+  EXPECT_EQ_INT(lstat(path, &st), 0);
+  EXPECT_TRUE(S_ISCHR(st.st_mode)); /* still a device, not replaced */
+  unlink(path);
+  rmdir(root);
+}
+
 /* Explicit directory entries (--dirs) create the directory under the receive
    root through the same save funnel, creating parents as needed, and reject
    traversal the same way a file path does. */
@@ -1037,34 +1396,27 @@ static void test_dir_entry_save_to_disk() {
  * receiver enables it from its own process (the standalone server's --trust-
  * sender CLI switch, which a client forwards as --remote-option=--trust-sender),
  * so these tests force file_set_trust_sender(true) directly.  Trust must RELAX
- * only the redundant list-level re-validation (an escaping symlink TARGET is
- * copied verbatim, rsync -l parity) and must NEVER disable the low-level
- * fd-relative confinement floor: file_open_secure_parent's ".." rejection, the
- * O_NOFOLLOW parent walk, leaf/destination confinement, and the ungated
- * has_path_traversal on the link's own placement path in file_symlink_at_secure
- * stay hard.  A hostile sender therefore still cannot place a file, directory
- * or symlink outside the receive root even with trust on. */
+ * only the redundant list-level re-validation and must NEVER disable the
+ * low-level fd-relative confinement floor: file_open_secure_parent's ".."
+ * rejection, the O_NOFOLLOW parent walk, leaf/destination confinement, and the
+ * ungated has_path_traversal on the link's own placement path in
+ * file_symlink_at_secure stay hard.  A hostile sender therefore still cannot
+ * place a file, directory or symlink outside the receive root. */
 
-static void test_trust_sender_relaxes_symlink_target() {
-  const char* root = "test_trust_sender_root";
-  const char* link = "test_trust_sender_root/escape_link";
+static void test_symlink_target_verbatim() {
+  const char* root = "test_symlink_verbatim_root";
+  const char* link = "test_symlink_verbatim_root/escape_link";
   unlink(link);
   rmdir(root);
   EXPECT_EQ_INT(mkdir(root, 0755), 0);
 
-  /* Control: without trust an absolute (escaping) target is refused and the
-     link is never placed. */
+  /* rsync -l parity: a symlink target is stored verbatim, absolute or not; the
+     scanner's --safe-links/--copy-unsafe-links is what filters links. */
   file_set_trust_sender(false);
-  EXPECT_FALSE(file_symlink_at_secure(link, "/etc/passwd"));
-  struct stat st;
-  EXPECT_EQ_INT(lstat(link, &st), -1);
-
-  /* Trust ON: the escaping target is copied verbatim (rsync -l parity) ... */
-  file_set_trust_sender(true);
   EXPECT_TRUE(file_symlink_at_secure(link, "/etc/passwd"));
+  struct stat st;
   EXPECT_EQ_INT(lstat(link, &st), 0);
   EXPECT_TRUE(S_ISLNK(st.st_mode));
-  /* ...but the link itself still lands beneath the receive root. */
   char target[128];
   ssize_t target_len = readlink(link, target, sizeof(target) - 1);
   EXPECT_TRUE(target_len > 0);
@@ -1075,10 +1427,10 @@ static void test_trust_sender_relaxes_symlink_target() {
   }
   unlink(link);
 
-  /* Same relaxation through the real save funnel (file_save_to_disk_full). */
+  /* The same through the real save funnel: verbatim by default. */
   Config* config = config_create();
   EXPECT_NOT_NULL(config);
-  const char* save_link = "test_trust_sender_root/save_link";
+  const char* save_link = "test_symlink_verbatim_root/save_link";
   unlink(save_link);
 
   File* sym = file_create("save_link");
@@ -1088,10 +1440,6 @@ static void test_trust_sender_relaxes_symlink_target() {
   EXPECT_NOT_NULL(sym->symlink_target);
 
   file_set_trust_sender(false);
-  EXPECT_EQ_INT(file_save_to_disk_full(root, sym, config), FILE_SAVE_SKIPPED);
-  EXPECT_EQ_INT(lstat(save_link, &st), -1);
-
-  file_set_trust_sender(true);
   EXPECT_EQ_INT(file_save_to_disk_full(root, sym, config), FILE_SAVE_WRITTEN);
   EXPECT_EQ_INT(lstat(save_link, &st), 0);
   EXPECT_TRUE(S_ISLNK(st.st_mode));
@@ -1181,7 +1529,7 @@ static void test_trust_sender_authorized_root_confinement() {
     rmdir(sibling);
     return;
   }
-  EXPECT_TRUE(file_set_authorized_root(root_fd, root_abs));
+  EXPECT_TRUE(utils_set_authorized_root(root_fd, root_abs));
 
   file_set_trust_sender(true);
   struct stat st;
@@ -1205,7 +1553,7 @@ static void test_trust_sender_authorized_root_confinement() {
 
   free(outside_link);
   free(inside_link);
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   close(root_fd);
   unlink("test_trust_sender_outside_link");
   rmdir(sibling);
@@ -1217,15 +1565,15 @@ void test_trust_sender() {
      helper), so a later group never inherits a stray trust/authorized-root
      policy. */
   file_set_trust_sender(false);
-  test_trust_sender_relaxes_symlink_target();
+  test_symlink_target_verbatim();
   test_trust_sender_confines_hostile_paths();
   test_trust_sender_authorized_root_confinement();
   file_set_trust_sender(false);
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
 }
 
 /* --sparse/-S hole preservation: a buffer with a long zero run written via
- * file_store_write_secure(sparse=true) must round-trip its content exactly and
+ * file_to_disk_secure(sparse=true) must round-trip its content exactly and
  * have the right logical size, and should additionally be genuinely sparse on
  * filesystems that support holes.  The sparseness assertion is tolerant: if the
  * filesystem reports no holes (SEEK_HOLE/SEEK_DATA -> ENXIO) we skip the strict
@@ -1247,7 +1595,8 @@ static void test_file_write_to_disk_sparse_preserves_holes() {
     buf[size - 1 - i] = (unsigned char)((i * 7) % 253);
   }
 
-  EXPECT_TRUE(file_store_write_secure(path, buf, size, false, true, NULL, false));
+  EXPECT_TRUE(
+      file_to_disk_secure(path, buf, size, false, true, false, NULL, (FileAttrPolicy){0}, NULL));
 
   /* Logical size must equal data_size exactly. */
   struct stat st;
@@ -1312,8 +1661,9 @@ static void test_file_write_to_disk_partial_retention() {
   m.mtime_nsec = 2000000000; /* invalid: forces futimens EINVAL after the write */
   m.atime_valid = false;
   m.crtime_valid = false;
-  bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m, false,
-                                      false, false, false, NULL, false, true, NULL);
+  bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
+                                      (FileAttrPolicy){true, true, false, false}, false, false,
+                                      false, NULL, false, true, NULL);
   EXPECT_FALSE(ok); /* the write itself succeeded, but metadata restore failed */
   /* Retained: the already-written temp now sits at the destination path. */
   int fd = open(path, O_RDONLY);
@@ -1331,8 +1681,9 @@ static void test_file_write_to_disk_partial_retention() {
   unlink(path);
 
   /* Same failure with keep_partial=false: temp is unlinked, nothing retained. */
-  ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m, false,
-                                 false, false, false, NULL, false, false, NULL);
+  ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
+                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
+                                 NULL, false, false, NULL);
   EXPECT_FALSE(ok);
   EXPECT_TRUE(access(path, F_OK) == -1);
 }
@@ -1342,7 +1693,7 @@ static void test_file_write_to_disk_partial_retention() {
 static void test_dir_time_list() {
   const char* root = "test_dir_time_root";
   const char* sub = "test_dir_time_root/sub";
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   rmdir(sub);
   rmdir(root);
   EXPECT_EQ_INT(mkdir(root, 0755), 0);
@@ -1352,22 +1703,108 @@ static void test_dir_time_list() {
   dir_time_list_init(&list);
   EXPECT_EQ_INT((int)list.count, 0);
   FileMetadata metadata = {.mtime_sec = 1000000000, .mtime_nsec = 0};
-  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
-  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata));
+  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata, NULL));
+  /* A captured xattr block is deep-copied into the list. */
+  FileXattrList* xl = xattr_list_new();
+  EXPECT_NOT_NULL(xl);
+  EXPECT_TRUE(xattr_list_append(xl, "user.dir", "v", 1));
+  EXPECT_TRUE(dir_time_list_add(&list, "sub", &metadata, xl));
+  xattr_list_free(xl); /* the list owns its own copy now */
   EXPECT_EQ_INT((int)list.count, 2);
+  EXPECT_NOT_NULL(list.xattrs);
+  EXPECT_NOT_NULL(list.xattrs[1]);
+  EXPECT_EQ_INT(list.xattrs[1]->count, 1);
+  EXPECT_EQ_STR(list.xattrs[1]->items[0].name, "user.dir");
+  EXPECT_NULL(list.xattrs[0]);
 
-  dir_time_list_apply(&list, root);
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->use_metadata = true;
+  cfg->preserve_times = true;
+  dir_metadata_list_apply(&list, root, cfg);
   struct stat st;
   EXPECT_EQ_INT(stat(sub, &st), 0);
   EXPECT_EQ_INT((int)st.st_mtime, 1000000000);
+  config_delete(cfg);
 
   dir_time_list_free(&list);
   EXPECT_EQ_INT((int)list.count, 0);
   EXPECT_NULL(list.paths);
   EXPECT_NULL(list.entries);
+  EXPECT_NULL(list.xattrs);
 
   rmdir(sub);
   rmdir(root);
+}
+
+/* A hostile sender can stream unbounded STATUS_DIR_TIMES frames; the
+ * accumulator must bound the CUMULATIVE path bytes (not just one frame) and
+ * reject the add that would cross the cap, leaving the list untouched. */
+static void test_dir_time_list_cap() {
+  DirTimeList list;
+  dir_time_list_init(&list);
+  EXPECT_EQ_INT((int)list.bytes, 0);
+  FileMetadata metadata = {.mtime_sec = 1, .mtime_nsec = 0};
+
+  size_t path_len = MAX_STRING_SIZE - 1;
+  char* path = malloc(path_len + 1);
+  EXPECT_NOT_NULL(path);
+  memset(path, 'a', path_len);
+  path[path_len] = '\0';
+
+  bool rejected = false;
+  for (size_t i = 0; i < MAX_DIR_TIME_ENTRIES + 1 && !rejected; i++) {
+    size_t before_count = list.count;
+    size_t before_bytes = list.bytes;
+    if (!dir_time_list_add(&list, path, &metadata, NULL)) {
+      rejected = true;
+      /* The rejected add must not have partially mutated the list. */
+      EXPECT_TRUE(list.count == before_count);
+      EXPECT_TRUE(list.bytes == before_bytes);
+    } else {
+      EXPECT_TRUE(list.count == before_count + 1);
+      EXPECT_TRUE(list.bytes == before_bytes + path_len + sizeof(FileMetadata) + 2 * sizeof(char*));
+    }
+  }
+  EXPECT_TRUE(rejected);
+  EXPECT_TRUE(list.count <= MAX_DIR_TIME_ENTRIES);
+  EXPECT_TRUE(list.bytes <= MAX_DIR_TIME_BYTES);
+
+  /* The retained entries are still intact and freeable after the rejection. */
+  EXPECT_TRUE(list.count > 0);
+  EXPECT_TRUE(strcmp(list.paths[0], path) == 0);
+  dir_time_list_free(&list);
+  EXPECT_EQ_INT((int)list.bytes, 0);
+  free(path);
+}
+
+/* receive_incremental_check must reject an empty check_path; every other
+ * receive path rejects path[0]=='\0'.  Feed the check header (empty wire path
+ * + size/mtime/nsec) and assert the check is refused without being skipped. */
+static void test_receive_incremental_check_empty_path() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->checksum = false;
+
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  size_t wire_len = 0;
+  unsigned long long check_size = 0;
+  long long check_mtime = 0;
+  long long check_mtime_nsec = 0;
+  EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+  EXPECT_TRUE(send_n_data(p[1], &check_size, sizeof(check_size)));
+  EXPECT_TRUE(send_n_data(p[1], &check_mtime, sizeof(check_mtime)));
+  EXPECT_TRUE(send_n_data(p[1], &check_mtime_nsec, sizeof(check_mtime_nsec)));
+
+  bool skipped = true;
+  const File* file = receive_incremental_check(p[0], cfg, &skipped);
+  EXPECT_NULL(file);
+  EXPECT_FALSE(skipped);
+
+  close(p[0]);
+  close(p[1]);
+  config_delete(cfg);
 }
 
 /* -K/--keep-dirlinks secure open: with an authorized root, a destination path
@@ -1416,7 +1853,7 @@ static void test_keep_dirlinks_secure_open_impl() {
     rmdir(outside);
     return;
   }
-  EXPECT_TRUE(file_set_authorized_root(root_fd, root_abs));
+  EXPECT_TRUE(utils_set_authorized_root(root_fd, root_abs));
   file_set_keep_dirlinks(true);
 
   struct stat real_st;
@@ -1469,7 +1906,7 @@ static void test_keep_dirlinks_secure_open_impl() {
   free(leaf);
 
   file_set_keep_dirlinks(false);
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   close(root_fd);
   unlink(link);
   unlink(abslink);
@@ -1483,11 +1920,180 @@ static void test_keep_dirlinks_secure_open_impl() {
  * cleared even when an EXPECT inside the body returns early (a failing EXPECT
  * returns from its own function, so the body's trailing resets may be skipped). */
 static void test_keep_dirlinks_secure_open() {
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   file_set_keep_dirlinks(false);
   test_keep_dirlinks_secure_open_impl();
-  file_set_authorized_root(-1, NULL);
+  utils_set_authorized_root(-1, NULL);
   file_set_keep_dirlinks(false);
+}
+
+/* Build an ArrayList of str_dup'd strings (NULL on allocation failure). */
+static ArrayList* make_manifest_string_list(const char* const* entries, int count) {
+  ArrayList* list = array_list_create(free);
+  if (!list)
+    return NULL;
+  for (int i = 0; i < count; i++) {
+    char* dup = str_dup(entries[i]);
+    if (!dup || !array_list_add(list, dup)) {
+      free(dup);
+      array_list_delete(list);
+      return NULL;
+    }
+  }
+  return list;
+}
+
+/* Regression (#3): a non-empty --delete-missing-args directory charges each
+ * removed entry exactly once.  The directory itself must not be counted twice;
+ * if it were, `deleted` would exceed --max-delete and the extras walk would
+ * underflow its remaining budget and delete past the user's cap. */
+static void test_manifest_delete_missing_dir_budget_double_count() {
+  char root[PATH_MAX];
+  snprintf(root, sizeof(root), "/tmp/fastsync_mgdir_%d", (int)getpid());
+  char* gone = path_cat(root, "gone");
+  char* gone_file = path_cat(gone, "f0");
+  char* extra = path_cat(root, "extra.txt");
+  EXPECT_NOT_NULL(gone);
+  EXPECT_NOT_NULL(gone_file);
+  EXPECT_NOT_NULL(extra);
+  mkdir(root, 0755);
+  mkdir(gone, 0755);
+  EXPECT_EQ_INT(access(extra, F_OK), -1);
+  EXPECT_TRUE(file_write_to_disk(extra, "extra", 5, false, false));
+  /* The missing-arg directory holds N-1 == 2 entries; with the directory itself
+     that is exactly --max-delete=3. */
+  EXPECT_TRUE(file_write_to_disk(gone_file, "x", 1, false, false));
+  char* gone_file2 = path_cat(gone, "f1");
+  EXPECT_TRUE(gone_file2 != NULL && file_write_to_disk(gone_file2, "x", 1, false, false));
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  cfg->delete_missing_args = true;
+  cfg->max_delete = 3;
+
+  const char* missing_names[] = {"gone"};
+  const char* synced[] = {"."};
+  DeleteManifest manifest = {0};
+  manifest.keeps = make_manifest_string_list(NULL, 0);
+  manifest.missing = make_manifest_string_list(missing_names, 1);
+  manifest.dirs = make_manifest_string_list(synced, 1);
+  EXPECT_NOT_NULL(manifest.keeps);
+  EXPECT_NOT_NULL(manifest.missing);
+  EXPECT_NOT_NULL(manifest.dirs);
+
+  DeleteCommitResult result = manifest_delete_all(cfg, &manifest);
+  EXPECT_EQ_INT((int)result, (int)DELETE_COMMIT_LIMIT_REACHED);
+  /* The whole missing-arg directory is gone (dir + its 2 entries == 3). */
+  EXPECT_EQ_INT(access(gone, F_OK), -1);
+  /* The saturated budget must leave the in-scope extra untouched. */
+  EXPECT_EQ_INT(access(extra, F_OK), 0);
+
+  array_list_delete(manifest.keeps);
+  array_list_delete(manifest.missing);
+  array_list_delete(manifest.dirs);
+  config_delete(cfg);
+  unlink(extra);
+  free(gone);
+  free(gone_file);
+  free(gone_file2);
+  free(extra);
+  rmdir(root);
+}
+
+/* Blocker #7: when the receive root is "/", every absolute basis path is below
+   it and its child relative form must drop only the single leading slash. */
+static void test_basis_delete_relative_root_slash() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup("/");
+
+  char* rel = file_receive_basis_delete_relative(cfg, "/a");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "a");
+  free(rel);
+  rel = file_receive_basis_delete_relative(cfg, "/a/b");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "a/b");
+  free(rel);
+  /* The root itself is not a child. */
+  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/"));
+  /* A relative entry is already root-relative. */
+  rel = file_receive_basis_delete_relative(cfg, "x/y");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "x/y");
+  free(rel);
+  /* An absolute path outside a non-"/" root is unreachable. */
+  free(cfg->receive_root_directory);
+  cfg->receive_root_directory = str_dup("/root");
+  EXPECT_NULL(file_receive_basis_delete_relative(cfg, "/other/a"));
+  rel = file_receive_basis_delete_relative(cfg, "/root/a");
+  EXPECT_NOT_NULL(rel);
+  EXPECT_EQ_STR(rel, "a");
+  free(rel);
+  config_delete(cfg);
+}
+
+/* Blocker #6: -n --delete would-delete enumeration must normalize an absolute
+   basis directory under the receive root exactly like the real commit path, so
+   the basis snapshot is protected rather than reported as a deletable extra. */
+static void test_manifest_would_delete_protects_absolute_basis() {
+  char root[PATH_MAX];
+  snprintf(root, sizeof(root), "/tmp/fastsync_wdbasis_%d", (int)getpid());
+  char* basis = path_cat(root, "basis");
+  char* basis_file = path_cat(basis, "snapshot.bin");
+  char* extra = path_cat(root, "extra.txt");
+  EXPECT_NOT_NULL(basis);
+  EXPECT_NOT_NULL(basis_file);
+  EXPECT_NOT_NULL(extra);
+  mkdir(root, 0755);
+  mkdir(basis, 0755);
+  EXPECT_TRUE(file_write_to_disk(basis_file, "x", 1, false, false));
+  EXPECT_TRUE(file_write_to_disk(extra, "e", 1, false, false));
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  cfg->receive_root_directory = str_dup(root);
+  cfg->use_delete = true;
+  EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_COMPARE, basis), 0);
+
+  const char* synced[] = {"."};
+  DeleteManifest manifest = {0};
+  manifest.keeps = make_manifest_string_list(NULL, 0);
+  manifest.protected = make_manifest_string_list(NULL, 0);
+  manifest.dirs = make_manifest_string_list(synced, 1);
+  EXPECT_NOT_NULL(manifest.keeps);
+  EXPECT_NOT_NULL(manifest.protected);
+  EXPECT_NOT_NULL(manifest.dirs);
+  ArrayList* out = array_list_create(free);
+  EXPECT_NOT_NULL(out);
+  size_t count = 0;
+  EXPECT_TRUE(manifest_would_delete_list(cfg, &manifest, out, &count));
+  bool saw_basis = false;
+  bool saw_extra = false;
+  for (int i = 0; i < out->size; i++) {
+    const char* p = (const char*)out->items[i];
+    if (strcmp(p, "basis") == 0 || strncmp(p, "basis/", 6) == 0)
+      saw_basis = true;
+    if (strcmp(p, "extra.txt") == 0)
+      saw_extra = true;
+  }
+  EXPECT_FALSE(saw_basis);
+  EXPECT_TRUE(saw_extra);
+
+  array_list_delete(out);
+  array_list_delete(manifest.keeps);
+  array_list_delete(manifest.protected);
+  array_list_delete(manifest.dirs);
+  config_delete(cfg);
+  unlink(basis_file);
+  rmdir(basis);
+  unlink(extra);
+  rmdir(root);
+  free(basis);
+  free(basis_file);
+  free(extra);
 }
 
 void test_file() {
@@ -1503,6 +2109,7 @@ void test_file() {
   test_file_save_to_disk_ignore_existing();
   test_file_save_to_disk_ignore_existing_entry_types();
   test_file_save_to_disk_partial_install();
+  test_file_save_to_disk_temp_dir_confined();
   test_file_save_to_disk_reports_skips();
   test_file_write_to_disk_sparse_preserves_holes();
   test_file_write_to_disk_partial_retention();
@@ -1531,8 +2138,19 @@ void test_file() {
   }
   test_file_metadata_create();
   test_dir_time_list();
+  test_dir_time_list_cap();
+  test_receive_incremental_check_empty_path();
   test_keep_dirlinks_secure_open();
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();
+  test_atomic_no_perms_preserves_destination_mode();
+  test_new_file_mode_honors_source_and_umask();
+  test_special_fifo_mode_honors_source_and_umask();
+  test_special_socket_recreated();
   test_inplace_overwrite_truncates_shorter_payload();
+  test_inplace_refuses_fifo_destination();
+  test_inplace_refuses_device_destination();
+  test_manifest_delete_missing_dir_budget_double_count();
+  test_basis_delete_relative_root_slash();
+  test_manifest_would_delete_protects_absolute_basis();
 }

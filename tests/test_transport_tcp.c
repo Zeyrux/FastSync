@@ -2,6 +2,7 @@
 #include "protocol.h"
 #include "test_utils.h"
 #include "transport_tcp.h"
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string.h>
@@ -143,14 +144,21 @@ static void test_client_delete_null() {
   client_delete(c);
 }
 
-/* Test tcp_set_timeouts with valid values */
+/* Test tcp_set_timeouts: a non-positive value disables the timeout (rsync's
+ * --timeout=0 / --contimeout=0), it is not a "leave unchanged" sentinel. */
 static void test_tcp_set_timeouts() {
-  /* Just verify the function doesn't crash with edge cases */
-  tcp_set_timeouts(0, 0);   /* zero means "don't change" */
-  tcp_set_timeouts(60, 20); /* normal values */
-  tcp_set_timeouts(-1, -1); /* negative means "don't change" */
-  /* If we got here without crashing, the test passes */
-  EXPECT_TRUE(true);
+  tcp_set_timeouts(0, 0);
+  EXPECT_EQ_INT(tcp_get_timeout_sec(), 0);
+  EXPECT_EQ_INT(tcp_get_contimeout_sec(), 0);
+  tcp_set_timeouts(60, 20);
+  EXPECT_EQ_INT(tcp_get_timeout_sec(), 60);
+  EXPECT_EQ_INT(tcp_get_contimeout_sec(), 20);
+  tcp_set_timeouts(-1, -1);
+  EXPECT_EQ_INT(tcp_get_timeout_sec(), 0);
+  EXPECT_EQ_INT(tcp_get_contimeout_sec(), 0);
+  /* Restore finite defaults so later tests that rely on a bounded connect/IO
+   * timeout (e.g. connecting to a non-routable address) cannot block forever. */
+  tcp_set_timeouts(30, 10);
 }
 
 /* Test client_connect with an invalid host (should fail gracefully) */
@@ -195,6 +203,49 @@ static void test_client_disconnect_delete() {
   client_delete(c);
 }
 
+/* TCP_NODELAY is enabled by default on a connected transfer socket, and an
+ * explicit --sockopts TCP_NODELAY=0 still overrides it. */
+static void test_tcp_nodelay_default_and_override() {
+  Server* s = server_create(0);
+  EXPECT_NOT_NULL(s);
+  EXPECT_EQ_INT(listen(s->file_descriptor, 1), 0);
+  struct sockaddr_in bound;
+  socklen_t bound_len = sizeof(bound);
+  EXPECT_EQ_INT(getsockname(s->file_descriptor, (struct sockaddr*)&bound, &bound_len), 0);
+  int port = (int)ntohs(bound.sin_port);
+  EXPECT_TRUE(port > 0);
+
+  Client* c = client_create();
+  EXPECT_NOT_NULL(c);
+  EXPECT_TRUE(client_connect(c, "127.0.0.1", port));
+  int got = 0;
+  socklen_t len = sizeof(got);
+  EXPECT_EQ_INT(getsockopt(c->file_descriptor, IPPROTO_TCP, TCP_NODELAY, &got, &len), 0);
+  EXPECT_EQ_INT(got, 1);
+  client_disconnect(c);
+  client_delete(c);
+
+  SockOptEntry* entries = NULL;
+  int count = 0;
+  EXPECT_EQ_INT(config_sockopts_parse("TCP_NODELAY=0", &entries, &count), 0);
+  TcpConnectOptions opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.sockopts = entries;
+  opts.sockopt_count = count;
+
+  Client* c2 = client_create();
+  EXPECT_NOT_NULL(c2);
+  EXPECT_TRUE(client_connect_ex(c2, "127.0.0.1", port, &opts));
+  got = 0;
+  len = sizeof(got);
+  EXPECT_EQ_INT(getsockopt(c2->file_descriptor, IPPROTO_TCP, TCP_NODELAY, &got, &len), 0);
+  EXPECT_EQ_INT(got, 0);
+  client_disconnect(c2);
+  client_delete(c2);
+  free(entries);
+  server_delete(&s);
+}
+
 void test_transport_tcp() {
   test_server_create_ephemeral();
   test_server_delete_null();
@@ -211,4 +262,5 @@ void test_transport_tcp() {
   test_sockopts_apply_sets_option();
   test_server_create_bind_address();
   test_server_create_bind_ipv6();
+  test_tcp_nodelay_default_and_override();
 }

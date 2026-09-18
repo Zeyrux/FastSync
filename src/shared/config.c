@@ -14,36 +14,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <limits.h>
 #include <errno.h>
 
 static void config_set_defaults(Config* config) {
-  config->version = str_dup(PROTOCOL_VERSION);
-  config->send_directory = NULL;
-  config->receive_root_directory = NULL;
-  config->save_to_disk = false;
-  config->use_multithreading = false;
-  config->use_chunk_serialization = false;
-  config->use_compression = false;
-  config->use_metadata = false;
-  config->use_executability = false;
+  config->scanner_threads = 0;
   config->metadata_explicitly_disabled = false;
+  config->preserve_perms_explicit_off = false;
+  config->preserve_times_explicit_off = false;
   config->show_progress = false;
-  config->dry_run = false;
-  config->remove_source_files = false;
-  config->use_delete = false;
-  config->compression_level = 5;
   config->compression_threads = 0;
-  config->use_sendfile = false;
-  config->chunk_size = DEFAULT_CHUNK_SIZE;
   config->ssh_port = 22;
   config->transport = TRANSPORT_TCP;
   config->ssh_destination = NULL;
-  config->module = NULL;
-  config->auth_user = NULL;
   config->auth_password = NULL;
   config->password_file = NULL;
-  config->iconv_spec = NULL;
   config->fastsync_server_path = NULL;
   config->exclude_patterns = NULL;
   config->exclude_count = 0;
@@ -51,47 +37,28 @@ static void config_set_defaults(Config* config) {
   config->include_count = 0;
   config->max_size = 0;
   config->min_size = 0;
-  config->max_alloc = DEFAULT_MAX_ALLOC;
-  config->use_incremental = false;
-  config->ignore_times = false;
-  config->size_only = false;
-  config->use_delta = false;
   config->whole_file = false;
-  config->fuzzy = false;
-  config->modify_window = 0;
-  config->delta_block_size = DELTA_BLOCK_SIZE_DEFAULT;
-  config->delta_max_file_size = DELTA_MAX_FILE_SIZE;
   config->use_tls = false;
   config->tls_cert = NULL;
   config->tls_key = NULL;
   config->tls_ca = NULL;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
-  config->timeout = 30;
-  config->contimeout = 10;
+  config->server_port_set = false;
+  config->server_host_set = false;
+  /* rsync defaults: --timeout=0 (I/O timeouts disabled) and --contimeout=60.
+   * A value of 0 disables the client's own deadline on both the socket layer
+   * (tcp_set_timeouts) and the protocol layer
+   * (protocol_session_set_io_timeout); a positive value sets it.  A server
+   * session floors the deadline at SERVER_IO_TIMEOUT_SEC so 0 can never hold a
+   * connection open forever. */
+  config->timeout = 0;
+  config->contimeout = 60;
   config->quiet = false;
-  config->backup = false;
-  config->backup_dir = NULL;
   config->stats = false;
   config->max_depth = 0;
   config->log_file = NULL;
-  config->queue_size = 100;
-  config->follow_symlinks = false;
-  config->partial = false;
-  config->copy_links = false;
-  config->safe_links = false;
-  config->copy_unsafe_links = false;
   config->copy_dirlinks = false;
-  config->munge_links = false;
-  config->keep_dirlinks = false;
-  config->preserve_hard_links = false;
-  config->preserve_acls = false;
-  config->preserve_xattrs = false;
-  config->preserve_devices = false;
-  config->preserve_sparse = false;
-  config->preserve_specials = false;
-  config->copy_devices = false;
-  config->write_devices = false;
   config->itemize_changes = false;
   config->out_format = NULL;
   config->log_file_format = NULL;
@@ -99,88 +66,36 @@ static void config_set_defaults(Config* config) {
   config->debug_level = 0;
   config->list_only = false;
   config->human_readable = false;
-  config->eight_bit_output = false;
-  config->existing = false;
-  config->ignore_existing = false;
-  config->update = false;
-  config->inplace = false;
-  config->delay_updates = false;
-  config->use_fsync = false;
-  config->append = false;
-  config->append_verify = false;
-  config->preallocate = false;
-  config->delete_excluded = false;
-  config->delete_after = false;
-  config->max_delete = -1;
   config->ignore_errors = false;
-  config->force_delete = false;
   config->ignore_missing_args = false;
-  config->delete_missing_args = false;
+  config->checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
+  config->cli_exit_code = 0;
   config->filters = NULL;
   config->files_from = NULL;
   config->files_from_set = NULL;
   config->from0 = false;
   config->cvs_exclude = false;
   config->per_dir_filter = false;
-  config->prune_empty_dirs = false;
+  config->per_dir_filter_count = 0;
   config->one_file_system = false;
-  config->relative = false;
   config->no_implied_dirs = false;
   config->dirs = false;
-  config->mkpath = false;
   config->rsh_command = NULL;
   config->blocking_io = false;
   config->outbuf = OUTBUF_BLOCK;
   config->old_args = false;
-  config->temp_dir = NULL;
   config->remote_options = NULL;
   config->remote_option_count = 0;
-  config->basis_dirs = NULL;
-  config->basis_count = 0;
-  config->partial_dir = NULL;
-  config->suffix = NULL;
-  config->delete_before = false;
-  config->delete_during = false;
-  config->delete_delay = false;
   config->address = NULL;
-  config->bind_address = NULL;
   config->ipv6 = false;
   config->ipv4 = false;
   config->sockopts = NULL;
   config->sockopt_count = 0;
   config->daemon = false;
-  config->daemon_config = NULL;
-  config->server_mode = false;
   config->no_motd = false;
-  config->checksum = false;
-  config->checksum_algo = CHECKSUM_ALGO_XXH64;
-  config->checksum_seed = 0;
-  config->compress_choice = NULL;
-  config->chmod_spec = NULL;
-  config->skip_compress_suffixes = NULL;
-  config->skip_compress_count = 0;
-  config->skip_compress_set = false;
-  config->numeric_ids = false;
-  config->chown_uid_set = false;
-  config->chown_uid = 0;
-  config->chown_gid_set = false;
-  config->chown_gid = 0;
-  config->usermap = NULL;
-  config->usermap_count = 0;
-  config->groupmap = NULL;
-  config->groupmap_count = 0;
-  config->super_mode = SUPER_MODE_AUTO;
   config->delay_context = NULL;
-  config->preserve_atimes = false;
-  config->preserve_crtimes = false;
-  config->omit_dir_times = false;
-  config->omit_link_times = false;
   config->open_noatime = false;
   config->use_xattrs = false;
-  config->fake_super = false;
-  config->copy_as_set = false;
-  config->copy_as_uid = 0;
-  config->copy_as_gid = 0;
   config->trust_sender = false;
   config->stop_after_mins = 0;
   config->stop_at = 0;
@@ -188,6 +103,12 @@ static void config_set_defaults(Config* config) {
   config->write_batch = NULL;
   config->only_write_batch = NULL;
   config->read_batch = NULL;
+
+  /* Serialized fields: defaults come from the CONFIG_WIRE_FIELDS table so the
+   * member declaration, default and wire codec can never drift apart. */
+#define CONFIG_DEFAULT_FIELD(name, ctype, def, kind) config->name = def;
+  CONFIG_WIRE_FIELDS(CONFIG_DEFAULT_FIELD)
+#undef CONFIG_DEFAULT_FIELD
 }
 
 static bool valid_wire_bool(int value) {
@@ -202,7 +123,57 @@ static bool receive_wire_bool(int fd, bool* value) {
   return true;
 }
 
+/* Cumulative budget for the strings retained by one received Config (see
+ * MAX_CONFIG_STRING_BYTES).  Config strings are received once per connection
+ * before authentication and live for its whole lifetime, so the charge is never
+ * released. */
+typedef struct {
+  unsigned long long used;
+} ConfigStringBudget;
+
+/* Charge `bytes` (the retained allocation: string body plus NUL) against the
+ * aggregate config-string budget.  Returns false when the ceiling would be
+ * exceeded, letting the caller reject the frame with a clear error instead of
+ * retaining unbounded pre-auth memory. */
+static bool config_string_budget_charge(ConfigStringBudget* budget, size_t bytes) {
+  if ((unsigned long long)bytes > MAX_CONFIG_STRING_BYTES ||
+      budget->used > MAX_CONFIG_STRING_BYTES - (unsigned long long)bytes) {
+    log_message(LOG_LEVEL_ERROR, "Config string budget exceeded (%llu + %zu > %llu bytes)",
+                budget->used, bytes, (unsigned long long)MAX_CONFIG_STRING_BYTES);
+    return false;
+  }
+  budget->used += (unsigned long long)bytes;
+  return true;
+}
+
+static char* config_receive_str(int fd, ConfigStringBudget* budget) {
+  char* value = receive_str(fd);
+  if (!value)
+    return NULL;
+  if (!config_string_budget_charge(budget, strlen(value) + 1)) {
+    free(value);
+    return NULL;
+  }
+  return value;
+}
+
+static char* config_receive_str_redacted(int fd, ConfigStringBudget* budget) {
+  char* value = receive_str_redacted(fd);
+  if (!value)
+    return NULL;
+  if (!config_string_budget_charge(budget, strlen(value) + 1)) {
+    free(value);
+    return NULL;
+  }
+  return value;
+}
+
 static bool validate_received_config(const Config* config) {
+  /* Cross-field invariants live in one place (config_invariants_error) so the
+     receiver enforces every combination the client relies on; a hostile peer
+     can forge a frame that violates any clause of the shared predicate. */
+  if (config_invariants_error(config) != NULL)
+    return false;
   return valid_wire_bool(config->save_to_disk) && valid_wire_bool(config->use_multithreading) &&
          valid_wire_bool(config->use_chunk_serialization) &&
          valid_wire_bool(config->use_compression) && valid_wire_bool(config->use_metadata) &&
@@ -226,48 +197,28 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->delete_delay) && valid_wire_bool(config->delete_during) &&
          valid_wire_bool(config->relative) && valid_wire_bool(config->prune_empty_dirs) &&
          valid_wire_bool(config->delay_updates) && valid_wire_bool(config->mkpath) &&
-         !(config->delay_updates && config->inplace) &&
-         !(config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir)) &&
          valid_wire_bool(config->partial) && valid_wire_bool(config->delete_before) &&
          valid_wire_bool(config->checksum) && valid_wire_bool(config->eight_bit_output) &&
-         checksum_algo_valid(config->checksum_algo) && config_has_valid_delete_timing(config) &&
-         identity_wire_valid(config) &&
-         !(config->skip_compress_set && config->use_chunk_serialization) &&
-         /* --append / --append-verify tail resume needs the per-file check,
-            which chunk serialization -s disables: reject on the receiver too
-            so a -s sender cannot negotiate an inert append mode. */
-         !((config->append || config->append_verify) && config->use_chunk_serialization) &&
-         !(config->preserve_hard_links && config->use_chunk_serialization) &&
-         !(config->preserve_hard_links && (config->append || config->append_verify)) &&
-         /* The xattr block rides the per-file streaming frame, which -s drops. */
-         !((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization) &&
+         valid_wire_bool(config->dry_run) && checksum_algo_valid(config->checksum_algo) &&
+         compression_algo_valid(config->compression_algo) && identity_wire_valid(config) &&
          valid_wire_bool(config->preserve_atimes) && valid_wire_bool(config->preserve_crtimes) &&
          valid_wire_bool(config->omit_dir_times) && valid_wire_bool(config->omit_link_times) &&
+         valid_wire_bool(config->preserve_perms) && valid_wire_bool(config->preserve_times) &&
+         valid_wire_bool(config->preserve_owner) && valid_wire_bool(config->preserve_group) &&
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
          valid_wire_bool(config->fake_super) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
-         /* --copy-as forces ownership through the metadata path; without
-            metadata it would pass the privilege gate but silently chown
-            nothing.  Refuse the frame instead. */
-         (!config->copy_as_set || config->use_metadata) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
          config->chunk_size > 0 && config->chunk_size <= MAX_CHUNK_SIZE &&
          config->delta_block_size >= DELTA_BLOCK_SIZE_MIN &&
          config->delta_block_size <= DELTA_BLOCK_SIZE_MAX &&
          config->delta_max_file_size <= DELTA_MAX_FILE_SIZE && config->modify_window >= 0 &&
-         config->max_delete >= -1 && config->skip_compress_count >= 0 &&
-         config->skip_compress_count <= 10000 && config->max_alloc > 0 &&
+         config->max_delete >= -1 && config->max_alloc <= MAX_SERVER_ALLOC &&
+         config->skip_compress_count >= 0 &&
+         config->skip_compress_count <= MAX_SKIP_COMPRESS_SUFFIXES &&
          (!config->chmod_spec || !*config->chmod_spec ||
           chmod_apply(0, config->chmod_spec, &(mode_t){0})) &&
-         /* The received --iconv CONVERT_SPEC is untrusted input that drives
-            the receiver's path decoding: reject a malformed spec or an
-            unsupported charset name so the run is refused up front instead of
-            every received file name failing mid-transfer.  A NULL spec (iconv
-            disabled) is always accepted. */
-         (!config->iconv_spec || charset_spec_valid(config->iconv_spec)) &&
-         /* --super / --no-super: the received tri-state must be one of the
-            defined values (AUTO/ON/OFF); anything else is a malformed frame. */
          config->super_mode >= SUPER_MODE_AUTO && config->super_mode <= SUPER_MODE_OFF;
 }
 
@@ -282,7 +233,13 @@ Config* config_create(void) {
 bool config_delete_timing_early(const Config* config) {
   if (!config)
     return false;
-  return config->delete_before || config->delete_during;
+  return config->delete_before;
+}
+
+bool config_delete_timing_per_dir(const Config* config) {
+  if (!config)
+    return false;
+  return config->delete_during || config->delete_delay;
 }
 
 /* A delete-timing flag is only meaningful together with --delete.  At most one
@@ -299,35 +256,122 @@ bool config_has_valid_delete_timing(const Config* config) {
   return timing_count <= 1;
 }
 
+/* The cross-field invariants FastSync relies on, in one place.  Every message
+ * here was previously duplicated (verbatim) in client_validation.c and/or
+ * config.c; the client reports the returned string for UX and the server
+ * enforces the same rules at its trust boundary.  Pure: no I/O, no logging.
+ * The order is deliberate (most specific structural conflicts first). */
+const char* config_invariants_error(const Config* config) {
+  if (!config)
+    return "Invalid configuration";
+  if (config_has_basis(config) && config->use_chunk_serialization)
+    return "--compare-dest/--copy-dest/--link-dest require per-file incremental checks and cannot "
+           "be combined with -s (chunk serialization)";
+  if (config->use_sendfile && (config->use_chunk_serialization || config->use_compression))
+    return "-f/--sendfile cannot be combined with -c (compression) or -s (chunk serialization)";
+  if (config->use_incremental && config->use_chunk_serialization)
+    return "--incremental is not supported with -s (chunk serialization)";
+  if (config->skip_compress_set && config->use_chunk_serialization)
+    return "--skip-compress cannot be combined with -s (chunk serialization)";
+  if (config->use_delta && !config->whole_file && !config->use_incremental)
+    return "--delta requires --incremental";
+  if (config->use_delta && !config->whole_file && config->use_chunk_serialization)
+    return "--delta cannot be combined with -s (chunk serialization)";
+  if (config->use_delta && !config->whole_file && config->use_sendfile)
+    return "--delta cannot be combined with -f (sendfile)";
+  /* --append / --append-verify resume a shorter existing destination by
+     transmitting only the tail.  The resume needs the per-file STATUS_CHECK
+     handshake (so the dest length is learned), which chunk serialization -s
+     disables; whole-file is the opposite intent (send everything). */
+  if ((config->append || config->append_verify) && config->use_chunk_serialization)
+    return "--append/--append-verify require the per-file incremental check and cannot be "
+           "combined with -s (chunk serialization)";
+  if ((config->append || config->append_verify) && config->whole_file)
+    return "--append/--append-verify are incompatible with --whole-file (which forces a full "
+           "transfer)";
+  /* -H transmits each later hard-link group member as a dedicated per-file
+     STATUS_HARDLINK frame, which -s does not support; and a hard-links sibling
+     carries no payload, so the tail-resume of --append is meaningless. */
+  if (config->preserve_hard_links && config->use_chunk_serialization)
+    return "--hard-links/-H cannot be combined with -s (chunk serialization)";
+  /* -X/-A ride the per-file metadata frame; the chunk-serialization wire format
+     does not carry the xattr block. */
+  if ((config->preserve_xattrs || config->preserve_acls) && config->use_chunk_serialization)
+    return "--xattrs/-X and --acls/-A cannot be combined with -s (chunk serialization)";
+  if (config->preserve_hard_links && (config->append || config->append_verify))
+    return "--hard-links/-H cannot be combined with --append/--append-verify";
+  if (config->delay_updates && config->inplace)
+    return "--delay-updates does not work with --inplace";
+  if (config->delay_updates && delay_updates_staging_name_conflict(config->backup_dir))
+    return "--backup-dir is reserved when --delay-updates is active (used for the internal "
+           "staging directory)";
+  if (!config_has_valid_delete_timing(config))
+    return "--delete-before/--delete-during/--delete-delay/--delete-after select the delete "
+           "timing; at most one may be given and each implies --delete";
+  if (config->iconv_spec && !charset_spec_valid(config->iconv_spec))
+    return "--iconv requires LOCAL[,REMOTE] charset names supported by iconv";
+  if ((config->preserve_perms || config->preserve_times || config->preserve_owner ||
+       config->preserve_group || config->preserve_atimes || config->preserve_crtimes ||
+       config->use_executability) &&
+      !config->use_metadata)
+    return "a preservation attribute requires metadata transmission";
+  if (config->copy_as_set && !config->use_metadata)
+    return "--copy-as requires metadata preservation and cannot be combined with --no-preserve";
+  return NULL;
+}
+
+bool config_derived_use_metadata(const Config* config) {
+  if (!config)
+    return false;
+  if (config->preserve_perms || config->preserve_times || config->preserve_owner ||
+      config->preserve_group || config->preserve_atimes || config->preserve_crtimes ||
+      config->use_executability || config->preserve_xattrs || config->preserve_acls ||
+      config->fake_super || config->preserve_devices || config->preserve_specials ||
+      config->copy_devices || config->write_devices ||
+      (config->chmod_spec && config->chmod_spec[0]) || config->copy_as_set ||
+      config->chown_uid_set || config->chown_gid_set || config->usermap_count > 0 ||
+      config->groupmap_count > 0 || config->update)
+    return true;
+  return (config->use_incremental || config->use_delta) && !config->metadata_explicitly_disabled;
+}
+
 bool config_has_basis(const Config* config) {
   return config && config->basis_count > 0;
 }
 
 /* A basis-dir path travels from the client to the receiver and is resolved
- * below the destination root, so it must be a non-empty relative path with no
- * "." or ".." component and no traversal: an absolute or escaping path would
- * make the receiver read or link files outside its authorized root.
+ * below the destination root when relative, or used verbatim when absolute
+ * (matching rsync).  Either form must be non-empty, traversal-free (no "..")
+ * and free of "." components: an escaping path would make the receiver read or
+ * link files outside its authorized root.  An absolute path is still subject to
+ * the receiver's root confinement at open time (file_open_secure_parent), so a
+ * basis outside the authorized root is simply not found rather than an escape.
  *
  * Returns a malloc'd CANONICAL copy of an accepted path, or NULL when the path
  * is rejected.  Canonicalization collapses interior empty components ("a//b" ->
- * "a/b"), drops "." components and trailing "/"s, so validation, the delete
- * walker prefix match and the receiver's basis lookup all agree on one form.
- * The normalizer is the single source of truth for both config_basis_path_valid
- * and config_basis_append. */
+ * "a/b"), drops "." components and trailing "/"s, and preserves a leading '/'
+ * for absolute paths, so validation, the delete walker prefix match and the
+ * receiver's basis lookup all agree on one form.  The normalizer is the single
+ * source of truth for both config_basis_path_valid and config_basis_append. */
 static char* basis_path_normalize(const char* path) {
-  if (!path || path[0] == '\0' || path[0] == '/' || has_path_traversal(path))
+  if (!path || path[0] == '\0' || has_path_traversal(path))
     return NULL;
-  if (strcmp(path, ".") == 0)
+  bool absolute = path[0] == '/';
+  if (!absolute && strcmp(path, ".") == 0)
+    return NULL;
+  if (absolute && strcmp(path, "/") == 0)
     return NULL;
   char* dup = str_dup(path);
   if (!dup)
     return NULL;
   size_t out_len = 0;
-  char* out = malloc(strlen(path) + 1);
+  char* out = malloc(strlen(path) + 2);
   if (!out) {
     free(dup);
     return NULL;
   }
+  if (absolute)
+    out[out_len++] = '/';
   char* saveptr = NULL;
   bool ok = true;
   for (char* part = strtok_r(dup, "/", &saveptr); part; part = strtok_r(NULL, "/", &saveptr)) {
@@ -337,14 +381,14 @@ static char* basis_path_normalize(const char* path) {
     }
     if (strcmp(part, ".") == 0)
       continue;
-    if (out_len > 0)
+    if (out_len > 0 && out[out_len - 1] != '/')
       out[out_len++] = '/';
     size_t len = strlen(part);
     memcpy(out + out_len, part, len);
     out_len += len;
   }
   free(dup);
-  if (!ok || out_len == 0) {
+  if (!ok || out_len == 0 || (absolute && out_len == 1)) {
     free(out);
     return NULL;
   }
@@ -615,19 +659,36 @@ int config_parse_transport_dest(Config* config) {
   int daemon_ret = config_parse_daemon_dest(config);
   if (daemon_ret != 0)
     return daemon_ret;
-  config_parse_ssh_dest(config);
-  return 0;
+  /* 0 for a local destination (nothing parsed) or a valid SSH destination;
+   * -1 (already logged) for an injection-shaped user@host. */
+  return config_parse_ssh_dest(config);
 }
 
-void config_parse_ssh_dest(Config* config) {
+int config_parse_ssh_dest(Config* config) {
+  if (!config || !config->receive_root_directory)
+    return 0;
   if (!config_is_remote_dest(config->receive_root_directory))
-    return;
+    return 0;
+  const char* dest = config->receive_root_directory;
+  const char* colon = strchr(dest, ':');
+  /* The user@host token is passed to ssh in option position, so a user or host
+   * beginning with '-' would be consumed by ssh as an option (argument
+   * injection: e.g. "-oProxyCommand=...").  An empty host is likewise not a
+   * valid destination.  Validate before any wire/argv construction. */
+  const char* at = memchr(dest, '@', (size_t)(colon - dest));
+  const char* host = at ? at + 1 : dest;
+  size_t host_len = (size_t)(colon - host);
+  size_t user_len = at ? (size_t)(at - dest) : 0;
+  if (host_len == 0 || host[0] == '-' || (user_len > 0 && dest[0] == '-'))
+    return daemon_dest_parse_error("invalid remote destination user@host (must not be empty or "
+                                   "start with '-')",
+                                   dest);
   config->transport = TRANSPORT_SSH;
-  config->ssh_destination = str_dup(config->receive_root_directory);
-  const char* colon = strchr(config->receive_root_directory, ':');
+  config->ssh_destination = str_dup(dest);
   char* path = str_dup(colon + 1);
   free(config->receive_root_directory);
   config->receive_root_directory = path;
+  return 0;
 }
 
 void config_burn_auth(Config* config) {
@@ -648,6 +709,9 @@ void config_delete(Config* config) {
   if (config == NULL)
     return;
   if (config->log_file) {
+    /* The logging subsystem borrows this FILE*; detach it before closing so a
+     * concurrent log call can never touch the freed handle. */
+    log_set_file(NULL);
     fclose(config->log_file);
     config->log_file = NULL;
   }
@@ -687,19 +751,19 @@ void config_delete(Config* config) {
   }
   config->remote_options = NULL;
   config->remote_option_count = 0;
-  for (int i = 0; i < config->basis_count; i++) {
-    free(config->basis_dirs[i].path);
-    config->basis_dirs[i].path = NULL;
+  if (config->basis_dirs) {
+    for (int i = 0; i < config->basis_count; i++) {
+      free(config->basis_dirs[i].path);
+      config->basis_dirs[i].path = NULL;
+    }
+    free(config->basis_dirs);
   }
-  free(config->basis_dirs);
   config->basis_dirs = NULL;
   config->basis_count = 0;
   free(config->partial_dir);
   free(config->suffix);
   free(config->address);
-  free(config->bind_address);
   free(config->sockopts);
-  free(config->daemon_config);
   free(config->compress_choice);
   free(config->chmod_spec);
   if (config->skip_compress_suffixes) {
@@ -707,10 +771,18 @@ void config_delete(Config* config) {
       free(config->skip_compress_suffixes[i]);
     free(config->skip_compress_suffixes);
   }
-  free(config->usermap);
+  if (config->usermap) {
+    for (int i = 0; i < config->usermap_count; i++)
+      free(config->usermap[i].to_name);
+    free(config->usermap);
+  }
   config->usermap = NULL;
   config->usermap_count = 0;
-  free(config->groupmap);
+  if (config->groupmap) {
+    for (int i = 0; i < config->groupmap_count; i++)
+      free(config->groupmap[i].to_name);
+    free(config->groupmap);
+  }
   config->groupmap = NULL;
   config->groupmap_count = 0;
   if (config->filters) {
@@ -725,412 +797,59 @@ void config_delete(Config* config) {
   free(config);
 }
 
-/* Each helper is deliberately ordered to match the wire format. Keep the
- * helper call order in config_send and config_receive unchanged when adding
- * fields. */
-static bool send_core_fields(int fd, const Config* c) {
-  if (!send_str(fd, c->version) || !send_int(fd, c->eight_bit_output))
+/* ---------------------------------------------------------------------------
+ * Wire codec helpers.
+ *
+ * The CONFIG_WIRE_*_FIELDS tables in config.h drive the send/receive
+ * sequences below.  Each field's KIND names a CONFIG_SEND_<KIND> /
+ * CONFIG_RECV_<KIND> macro (defined after the helpers) that expands to the
+ * exact primitive call the previous hand-written code used, so the byte
+ * stream is unchanged.  Fields whose per-field logic is not a plain scalar
+ * (bounded enums, redacted auth, repeated count+array blocks) delegate to a
+ * dedicated helper here.
+ * ------------------------------------------------------------------------- */
+
+/* --max-alloc: raw 64-bit value, clamped server-side and installed as the
+ * session allocation ceiling.  A received 0 is rsync's "no alloc limit"; on the
+ * receive path it is mapped to the server ceiling so a client can never disable
+ * it (client-side 0 remains unlimited).  Any value above the ceiling is clamped
+ * to it. */
+static bool config_receive_max_alloc(int fd, unsigned long long* value) {
+  if (!receive_n_data(fd, value, sizeof(*value)))
     return false;
-  protocol_set_8_bit_output(c->eight_bit_output);
-  if (!send_n_data(fd, &c->max_alloc, sizeof(c->max_alloc)))
-    return false;
-  return send_str(fd, c->send_directory) && send_str(fd, c->receive_root_directory) &&
-         send_int(fd, c->save_to_disk) && send_int(fd, c->use_multithreading) &&
-         send_int(fd, c->use_chunk_serialization) && send_int(fd, c->use_compression) &&
-         send_int(fd, c->use_metadata) && send_int(fd, c->use_executability) &&
-         send_int(fd, c->compression_level) &&
-         send_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)) && send_int(fd, c->use_sendfile);
-}
-
-static bool send_delta_fields(int fd, const Config* c) {
-  return send_int(fd, c->use_delete) && send_int(fd, c->use_incremental) &&
-         send_int(fd, c->size_only) && send_int(fd, c->ignore_times) &&
-         send_int(fd, c->use_delta && !c->whole_file) &&
-         send_n_data(fd, &c->delta_block_size, sizeof(c->delta_block_size)) &&
-         send_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
-}
-
-static bool send_file_options(int fd, const Config* c) {
-  /* Device/special preservation flags cross the wire so the receiver knows a
-   * special/device entry must be recreated.  Trailing fields; protocol 2.13.0. */
-  return send_int(fd, c->backup) && send_str(fd, c->backup_dir ? c->backup_dir : "") &&
-         send_int(fd, c->remove_source_files) && send_int(fd, c->follow_symlinks) &&
-         send_int(fd, c->copy_links) && send_int(fd, c->safe_links) &&
-         send_int(fd, c->copy_unsafe_links) && send_int(fd, c->preserve_hard_links) &&
-         send_int(fd, c->preserve_acls) && send_int(fd, c->preserve_xattrs) &&
-         send_int(fd, c->preserve_devices) && send_int(fd, c->preserve_sparse) &&
-         send_int(fd, c->preserve_specials) && send_int(fd, c->copy_devices) &&
-         send_int(fd, c->write_devices);
-}
-
-static bool send_selection_options(int fd, const Config* c) {
-  return send_int(fd, c->ignore_existing) && send_int(fd, c->existing) && send_int(fd, c->update) &&
-         send_int(fd, c->inplace) && send_int(fd, c->delay_updates) && send_int(fd, c->append) &&
-         send_int(fd, c->use_fsync) && send_int(fd, c->append_verify) &&
-         send_int(fd, c->delete_excluded) && send_int(fd, c->force_delete) &&
-         send_int(fd, c->delete_missing_args) && send_int(fd, c->delete_after) &&
-         send_int(fd, c->preallocate) && send_n_data(fd, &c->max_delete, sizeof(c->max_delete)) &&
-         send_int(fd, c->relative) && send_int(fd, c->prune_empty_dirs) &&
-         send_int(fd, c->mkpath) && send_int(fd, c->delete_during) && send_int(fd, c->delete_delay);
-}
-
-static bool send_skip_compress_options(int fd, const Config* c) {
-  if (!send_int(fd, c->skip_compress_set) || !send_int(fd, c->skip_compress_count))
-    return false;
-  for (int i = 0; i < c->skip_compress_count; i++) {
-    if (!send_str(fd, c->skip_compress_suffixes[i]))
-      return false;
-  }
+  if (*value == 0 || *value > MAX_SERVER_ALLOC)
+    *value = MAX_SERVER_ALLOC;
+  protocol_session_set_max_alloc(NULL, *value);
   return true;
 }
 
-static bool send_resume_options(int fd, const Config* c) {
-  return send_str(fd, c->temp_dir ? c->temp_dir : "") && send_int(fd, c->partial) &&
-         send_str(fd, c->partial_dir ? c->partial_dir : "") &&
-         send_str(fd, c->suffix ? c->suffix : "") && send_int(fd, c->delete_before) &&
-         send_int(fd, c->checksum) && send_int(fd, c->modify_window) &&
-         send_str(fd, c->compress_choice ? c->compress_choice : "") &&
-         send_str(fd, c->chmod_spec ? c->chmod_spec : "") && send_skip_compress_options(fd, c);
-}
-
-static bool send_basis_options(int fd, const Config* c) {
-  if (!send_int(fd, c->basis_count))
+/* Optional string: the sender serializes an unset (NULL) string as "", so the
+ * receiver canonicalizes the empty wire value back to NULL to preserve
+ * NULL-vs-empty semantics. */
+static bool config_receive_optional_str(int fd, ConfigStringBudget* budget, char** out) {
+  char* value = config_receive_str(fd, budget);
+  if (!value)
     return false;
-  for (int i = 0; i < c->basis_count; i++) {
-    if (!send_int(fd, (int)c->basis_dirs[i].type) ||
-        !send_str(fd, c->basis_dirs[i].path ? c->basis_dirs[i].path : ""))
-      return false;
+  if (*value == '\0') {
+    free(value);
+    *out = NULL;
+    return true;
   }
+  *out = value;
   return true;
 }
 
-/* -y/--fuzzy (receiver-side similar-file basis selection).  Trailing field on
- * the config frame; protocol 2.9.0. */
-static bool send_fuzzy_option(int fd, const Config* c) {
-  return send_int(fd, c->fuzzy);
-}
-
-/* --checksum-choice/--cc + --checksum-seed.  The algorithm id and seed travel
- * with the config so the receiver hashes the on-disk old file with the same
- * parameters the sender used for its digest (see checksum.h).  Trailing fields
- * on the config frame; protocol 2.10.0. */
-static bool send_checksum_options(int fd, const Config* c) {
-  return send_int(fd, c->checksum_algo) &&
-         send_n_data(fd, &c->checksum_seed, sizeof(c->checksum_seed));
-}
-
-static bool receive_core_fields(int fd, Config* c) {
-  int value;
-  if (!receive_wire_bool(fd, &c->eight_bit_output))
-    return false;
-  protocol_set_8_bit_output(c->eight_bit_output);
-  if (!receive_n_data(fd, &c->max_alloc, sizeof(c->max_alloc)) || c->max_alloc == 0)
-    return false;
-  if (c->max_alloc > MAX_SERVER_ALLOC)
-    c->max_alloc = MAX_SERVER_ALLOC;
-  protocol_session_set_max_alloc(NULL, c->max_alloc);
-  c->send_directory = receive_str(fd);
-  c->receive_root_directory = receive_str(fd);
-  if (!c->send_directory || !c->receive_root_directory)
-    return false;
-  if (!receive_wire_bool(fd, &c->save_to_disk) || !receive_wire_bool(fd, &c->use_multithreading) ||
-      !receive_wire_bool(fd, &c->use_chunk_serialization) ||
-      !receive_wire_bool(fd, &c->use_compression) || !receive_wire_bool(fd, &c->use_metadata) ||
-      !receive_wire_bool(fd, &c->use_executability))
-    return false;
-  if (!receive_int(fd, &value))
-    return false;
-  c->compression_level = value;
-  if (!receive_n_data(fd, &c->chunk_size, sizeof(c->chunk_size)))
-    return false;
-  if (!receive_wire_bool(fd, &c->use_sendfile))
-    return false;
-  return true;
-}
-
-static bool receive_delta_fields(int fd, Config* c) {
-  if (!receive_wire_bool(fd, &c->use_delete))
-    return false;
-  if (!receive_wire_bool(fd, &c->use_incremental))
-    return false;
-  if (!receive_wire_bool(fd, &c->size_only))
-    return false;
-  if (!receive_wire_bool(fd, &c->ignore_times))
-    return false;
-  if (!receive_wire_bool(fd, &c->use_delta))
-    return false;
-  return receive_n_data(fd, &c->delta_block_size, sizeof(c->delta_block_size)) &&
-         receive_n_data(fd, &c->delta_max_file_size, sizeof(unsigned long long));
-}
-
-static bool receive_file_options(int fd, Config* c) {
-  if (!receive_wire_bool(fd, &c->backup))
-    return false;
-  char* backup_dir = receive_str(fd);
-  if (!backup_dir)
-    return false;
-  if (*backup_dir != '\0') {
-    c->backup_dir = backup_dir;
-  } else {
-    /* The sender serializes an unset (NULL) string as "", so canonicalize the
-       empty wire value back to NULL to preserve NULL-vs-empty semantics. */
-    free(backup_dir);
-  }
-  if (!receive_wire_bool(fd, &c->remove_source_files))
-    return false;
-  bool* flags[] = {&c->follow_symlinks,   &c->copy_links,          &c->safe_links,
-                   &c->copy_unsafe_links, &c->preserve_hard_links, &c->preserve_acls,
-                   &c->preserve_xattrs,   &c->preserve_devices,    &c->preserve_sparse,
-                   &c->preserve_specials, &c->copy_devices,        &c->write_devices};
-  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
-    if (!receive_wire_bool(fd, flags[i]))
-      return false;
-  }
-  return true;
-}
-
-static bool receive_selection_options(int fd, Config* c) {
-  bool* flags[] = {&c->ignore_existing,
-                   &c->existing,
-                   &c->update,
-                   &c->inplace,
-                   &c->delay_updates,
-                   &c->append,
-                   &c->use_fsync,
-                   &c->append_verify,
-                   &c->delete_excluded,
-                   &c->force_delete,
-                   &c->delete_missing_args,
-                   &c->delete_after,
-                   &c->preallocate};
-  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
-    if (!receive_wire_bool(fd, flags[i]))
-      return false;
-  }
-  if (!receive_n_data(fd, &c->max_delete, sizeof(c->max_delete)))
-    return false;
-  if (!receive_wire_bool(fd, &c->relative))
-    return false;
-  if (!receive_wire_bool(fd, &c->prune_empty_dirs))
-    return false;
-  if (!receive_wire_bool(fd, &c->mkpath))
-    return false;
-  if (!receive_wire_bool(fd, &c->delete_during))
-    return false;
-  return receive_wire_bool(fd, &c->delete_delay);
-}
-
-static bool receive_resume_options(int fd, Config* c) {
-  char* temp_dir = receive_str(fd);
-  if (!temp_dir)
-    return false;
-  if (*temp_dir != '\0') {
-    c->temp_dir = temp_dir;
-  } else {
-    free(temp_dir);
-  }
-  if (!receive_wire_bool(fd, &c->partial))
-    return false;
-  /* These options have NULL client defaults, so the sender transmits an empty
-     string for "unset".  Canonicalize the empty wire value back to NULL so
-     receivers observe exactly what the client configured (plain --backup, for
-     example, must not look like --backup-dir ""). */
-  char* partial_dir = receive_str(fd);
-  if (!partial_dir)
-    return false;
-  if (*partial_dir != '\0') {
-    c->partial_dir = partial_dir;
-  } else {
-    free(partial_dir);
-  }
-  char* suffix = receive_str(fd);
-  if (!suffix)
-    return false;
-  if (*suffix != '\0') {
-    c->suffix = suffix;
-  } else {
-    free(suffix);
-  }
-  if (!receive_wire_bool(fd, &c->delete_before))
-    return false;
-  if (!receive_wire_bool(fd, &c->checksum))
-    return false;
-  if (!receive_n_data(fd, &c->modify_window, sizeof(c->modify_window)))
-    return false;
-  c->compress_choice = receive_str(fd);
-  if (!c->compress_choice)
-    return false;
-  c->chmod_spec = receive_str(fd);
-  if (!c->chmod_spec || !receive_wire_bool(fd, &c->skip_compress_set) ||
-      !receive_int(fd, &c->skip_compress_count) || c->skip_compress_count < 0 ||
-      c->skip_compress_count > 10000)
-    return false;
-  if (c->skip_compress_count > 0) {
-    c->skip_compress_suffixes = calloc((size_t)c->skip_compress_count, sizeof(char*));
-    if (!c->skip_compress_suffixes)
-      return false;
-    for (int i = 0; i < c->skip_compress_count; i++) {
-      c->skip_compress_suffixes[i] = receive_str(fd);
-      if (!c->skip_compress_suffixes[i])
-        return false;
-    }
-  }
-  return true;
-}
-
-static bool receive_basis_options(int fd, Config* c) {
-  int count;
-  if (!receive_int(fd, &count))
-    return false;
-  if (count < 0 || count > MAX_BASIS_DIRS)
-    return false;
-  for (int i = 0; i < count; i++) {
-    int type;
-    if (!receive_int(fd, &type) || type <= BASIS_DEST_NONE || type > BASIS_DEST_LINK)
-      return false;
-    char* path = receive_str(fd);
-    if (!path)
-      return false;
-    /* config_basis_append validates and canonicalizes the path; a rejected
-       path (absolute / traversal / empty) drops the whole connection. */
-    bool ok = config_basis_append(c, (BasisDestType)type, path) == 0;
-    free(path);
-    if (!ok)
-      return false;
-  }
-  return true;
-}
-
-static bool receive_fuzzy_option(int fd, Config* c) {
-  return receive_wire_bool(fd, &c->fuzzy);
-}
-
-static bool receive_checksum_options(int fd, Config* c) {
-  int algo;
-  if (!receive_int(fd, &algo) || !checksum_algo_valid(algo))
-    return false;
-  c->checksum_algo = algo;
-  return receive_n_data(fd, &c->checksum_seed, sizeof(c->checksum_seed));
-}
-
-/* --numeric-ids / --usermap / --groupmap / --chown (identity mapping).  The
- * receiver needs these to apply the ownership the client requested, so they
- * cross the config frame.  Trailing fields; protocol 2.11.0. */
-static bool send_identity_map(int fd, const IdentityMap* map, int count) {
-  if (!send_int(fd, count))
-    return false;
-  for (int i = 0; i < count; i++) {
-    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].to))
-      return false;
-  }
-  return true;
-}
-
-static bool send_identity_options(int fd, const Config* c) {
-  return send_int(fd, c->numeric_ids) && send_int(fd, c->chown_uid_set) &&
-         send_int(fd, c->chown_uid) && send_int(fd, c->chown_gid_set) &&
-         send_int(fd, c->chown_gid) && send_identity_map(fd, c->usermap, c->usermap_count) &&
-         send_identity_map(fd, c->groupmap, c->groupmap_count);
-}
-
-static bool receive_identity_map(int fd, int* pcount, IdentityMap** pmap) {
-  int count;
-  if (!receive_int(fd, &count) || count < 0 || count > MAX_IDENTITY_MAP)
-    return false;
-  if (count > 0) {
-    IdentityMap* map = calloc((size_t)count, sizeof(IdentityMap));
-    if (!map)
-      return false;
-    for (int i = 0; i < count; i++) {
-      if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].to)) {
-        free(map);
-        return false;
-      }
-    }
-    *pmap = map;
-  }
-  *pcount = count;
-  return true;
-}
-
-static bool receive_identity_options(int fd, Config* c) {
-  int numeric_ids;
-  if (!receive_int(fd, &numeric_ids) || !valid_wire_bool(numeric_ids))
-    return false;
-  c->numeric_ids = numeric_ids != 0;
-  if (!receive_wire_bool(fd, &c->chown_uid_set) || !receive_int(fd, &c->chown_uid) ||
-      !receive_wire_bool(fd, &c->chown_gid_set) || !receive_int(fd, &c->chown_gid))
-    return false;
-  if (c->chown_uid < IDENTITY_MATCH_ANY || c->chown_gid < IDENTITY_MATCH_ANY)
-    return false;
-  return receive_identity_map(fd, &c->usermap_count, &c->usermap) &&
-         receive_identity_map(fd, &c->groupmap_count, &c->groupmap);
-}
-
-/* -U/--atimes, -N/--crtimes (affect both sender capture and receiver apply)
- * and -O/--omit-dir-times, -J/--omit-link-times (receiver-side prefs) all cross
- * the wire so the receiver knows what to apply / suppress.  --open-noatime is
- * client-only (it only governs the sender's source reads) and is never
- * serialized.  Trailing fields; protocol 2.12.0. */
-static bool send_metadata_times_options(int fd, const Config* c) {
-  return send_int(fd, c->preserve_atimes) && send_int(fd, c->preserve_crtimes) &&
-         send_int(fd, c->omit_dir_times) && send_int(fd, c->omit_link_times);
-}
-
-static bool receive_metadata_times_options(int fd, Config* c) {
-  return receive_wire_bool(fd, &c->preserve_atimes) &&
-         receive_wire_bool(fd, &c->preserve_crtimes) && receive_wire_bool(fd, &c->omit_dir_times) &&
-         receive_wire_bool(fd, &c->omit_link_times);
-}
-
-/* Phase 4 symlink-trust: --munge-links and -K/--keep-dirlinks.  Both CROSS the
- * wire (the receiver unmunges symlink targets and, with -K, follows an in-root
- * destination symlink-to-directory).  -k/--copy-dirlinks is sender-only and is
- * never serialized.  Trailing fields; protocol 2.13.0. */
-static bool send_symlink_trust_options(int fd, const Config* c) {
-  return send_int(fd, c->munge_links) && send_int(fd, c->keep_dirlinks);
-}
-
-static bool receive_symlink_trust_options(int fd, Config* c) {
-  return receive_wire_bool(fd, &c->munge_links) && receive_wire_bool(fd, &c->keep_dirlinks);
-}
-
-/* -X/--xattrs, -A/--acls, --fake-super (Phase-4).  The receiver learns
- * preserve_xattrs/preserve_acls from the earlier file-options block and
- * recomputes the derived use_xattrs there; only --fake-super (receiver-side
- * behavior) needs an extra wire bit.  Trailing field; protocol 2.13.0. */
-static bool send_phase4_xattr_options(int fd, const Config* c) {
-  return send_int(fd, c->fake_super);
-}
-
-static bool receive_phase4_xattr_options(int fd, Config* c) {
-  if (!receive_wire_bool(fd, &c->fake_super))
-    return false;
-  c->use_xattrs = c->preserve_acls || c->preserve_xattrs;
-  return true;
-}
-
-/* Daemon module selection (Wave A, protocol 2.15.0).  Trailing string on the
- * config frame, sent after the Phase-4 xattr block and before the ack.  The
- * client composes it from a host::module/path destination; an unset module is
- * serialized as "" and canonicalized back to NULL on receive so the two never
- * look different to a peer. */
-static bool send_daemon_module(int fd, const Config* c) {
-  return send_str(fd, c->module ? c->module : "");
-}
-
-static bool receive_daemon_module(int fd, Config* c) {
-  char* module = receive_str(fd);
+/* Daemon module name (Wave A, protocol 2.15.0): an unset module is "" (-> NULL
+ * on receive).  A hostile over-long/invalid name is rejected with an explicit
+ * STATUS_ERROR rather than logged and accepted. */
+static bool config_receive_module(int fd, Config* c, ConfigStringBudget* budget) {
+  char* module = config_receive_str(fd, budget);
   if (!module)
     return false;
-  /* Guard against a hostile client flooding the log with an over-long module
-   * name: only an empty string (module-less) or a valid module name
-   * (bounded by DAEMON_MAX_MODULE_NAME) is accepted.  This is an input
-   * guard, not a wire-format change. */
   if (*module != '\0' && !daemon_module_name_valid(module)) {
     log_message(LOG_LEVEL_WARNING, "Daemon client sent an invalid or over-long module name");
+    send_error_detail(fd, "invalid or over-long daemon module name");
     free(module);
-    send_status(fd, STATUS_ERROR);
     return false;
   }
   if (*module != '\0') {
@@ -1141,28 +860,16 @@ static bool receive_daemon_module(int fd, Config* c) {
   return true;
 }
 
-/* Daemon password credentials (A7 remediation, protocol 2.19.0).  A single
- * presence int is followed, when set, by ONLY the username; the password is
- * never serialized.  The daemon answers an auth-required module with the SCRAM
- * challenge (see the auth exchange below). */
-static bool send_daemon_auth(int fd, const Config* c) {
-  bool present = c->auth_user != NULL && c->auth_user[0] != '\0';
-  if (!send_int(fd, present ? 1 : 0))
-    return false;
-  if (!present)
-    return true;
-  /* Redacted send: the username must never reach a --verbose debug log. */
-  return send_str_redacted(fd, c->auth_user);
-}
-
-static bool receive_daemon_auth(int fd, Config* c) {
+/* Daemon auth username (A7 remediation, protocol 2.19.0): a presence int is
+ * followed, when set, by ONLY the redacted username; the password is never
+ * serialized. */
+static bool config_receive_auth_user(int fd, Config* c, ConfigStringBudget* budget) {
   int present;
   if (!receive_int(fd, &present) || !valid_wire_bool(present))
     return false;
   if (!present)
     return true;
-  /* Redacted receive: never log the incoming username body. */
-  char* user = receive_str_redacted(fd);
+  char* user = config_receive_str_redacted(fd, budget);
   if (!user)
     return false;
   if (!credentials_username_valid(user)) {
@@ -1173,6 +880,336 @@ static bool receive_daemon_auth(int fd, Config* c) {
   c->auth_user = user;
   return true;
 }
+
+static bool config_send_auth_user(int fd, const Config* c) {
+  bool present = c->auth_user != NULL && c->auth_user[0] != '\0';
+  if (!send_int(fd, present ? 1 : 0))
+    return false;
+  if (!present)
+    return true;
+  /* Redacted send: the username must never reach a --verbose debug log. */
+  return send_str_redacted(fd, c->auth_user);
+}
+
+static bool config_receive_checksum_algo(int fd, int* value) {
+  int algo;
+  if (!receive_int(fd, &algo) || !checksum_algo_valid(algo))
+    return false;
+  *value = algo;
+  return true;
+}
+
+static bool config_receive_compression_algo(int fd, int* value) {
+  int algo;
+  if (!receive_int(fd, &algo) || !compression_algo_valid(algo))
+    return false;
+  *value = algo;
+  return true;
+}
+
+static bool config_receive_super_mode(int fd, SuperMode* value) {
+  int mode;
+  if (!receive_int(fd, &mode) || mode < SUPER_MODE_AUTO || mode > SUPER_MODE_OFF)
+    return false;
+  *value = (SuperMode)mode;
+  return true;
+}
+
+/* chown override ids: IDENTITY_MATCH_ANY (-1) is the lowest legal value. */
+static bool config_receive_identity_id(int fd, int32_t* value) {
+  int v;
+  if (!receive_int(fd, &v) || v < IDENTITY_MATCH_ANY)
+    return false;
+  *value = v;
+  return true;
+}
+
+/* Read a peer-controlled count into a LOCAL, validate the range, and only then
+ * publish it through `*value`.  Writing through `*value` before validating
+ * leaves the Config holding an over-cap count (e.g. 999999999) whose backing
+ * array is still NULL; the receive error path then runs config_delete(), which
+ * walks the array and dereferences NULL.  Leaving `*value` untouched on failure
+ * also keeps the failed Config in a coherent, safely-deletable state. */
+static bool config_receive_skip_count(int fd, int* value) {
+  int v;
+  if (!receive_int(fd, &v) || v < 0 || v > MAX_SKIP_COMPRESS_SUFFIXES)
+    return false;
+  *value = v;
+  return true;
+}
+
+static bool config_receive_basis_count(int fd, int* value) {
+  int v;
+  if (!receive_int(fd, &v) || v < 0 || v > MAX_BASIS_DIRS)
+    return false;
+  *value = v;
+  return true;
+}
+
+static bool config_receive_idmap_count(int fd, int* value) {
+  int v;
+  if (!receive_int(fd, &v) || v < 0 || v > MAX_IDENTITY_MAP)
+    return false;
+  *value = v;
+  return true;
+}
+
+static bool config_receive_copy_as_presence(int fd, bool* value) {
+  int present;
+  if (!receive_int(fd, &present) || !valid_wire_bool(present))
+    return false;
+  *value = present != 0;
+  return true;
+}
+
+/* --copy-as ids are forced onto the ownership path, so a hostile peer must not
+ * smuggle a negative sentinel. */
+static bool config_receive_copy_as_id(int fd, int32_t* value) {
+  int v;
+  if (!receive_int(fd, &v) || v < 0)
+    return false;
+  *value = v;
+  return true;
+}
+
+static bool send_skip_compress_suffixes(int fd, const Config* c) {
+  for (int i = 0; i < c->skip_compress_count; i++) {
+    if (!send_str(fd, c->skip_compress_suffixes[i]))
+      return false;
+  }
+  return true;
+}
+
+static bool receive_skip_compress_suffixes(int fd, Config* c, ConfigStringBudget* budget) {
+  if (c->skip_compress_count <= 0)
+    return true;
+  c->skip_compress_suffixes = calloc((size_t)c->skip_compress_count, sizeof(char*));
+  if (!c->skip_compress_suffixes)
+    return false;
+  for (int i = 0; i < c->skip_compress_count; i++) {
+    c->skip_compress_suffixes[i] = config_receive_str(fd, budget);
+    if (!c->skip_compress_suffixes[i])
+      return false;
+  }
+  return true;
+}
+
+static bool send_basis_entries(int fd, const Config* c) {
+  for (int i = 0; i < c->basis_count; i++) {
+    if (!send_int(fd, (int)c->basis_dirs[i].type) ||
+        !send_str(fd, c->basis_dirs[i].path ? c->basis_dirs[i].path : ""))
+      return false;
+  }
+  return true;
+}
+
+static bool receive_basis_entries(int fd, Config* c, ConfigStringBudget* budget) {
+  /* The count was read by the preceding INT_BASISCOUNT entry; config_basis_append
+   * rebuilds basis_count as it validates and canonicalizes each path. */
+  int count = c->basis_count;
+  c->basis_count = 0;
+  for (int i = 0; i < count; i++) {
+    int type;
+    if (!receive_int(fd, &type) || type <= BASIS_DEST_NONE || type > BASIS_DEST_LINK)
+      return false;
+    char* path = config_receive_str(fd, budget);
+    if (!path)
+      return false;
+    bool ok = config_basis_append(c, (BasisDestType)type, path) == 0;
+    free(path);
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
+static bool send_identity_entries(int fd, const IdentityMap* map, int count) {
+  for (int i = 0; i < count; i++) {
+    if (!send_int(fd, map[i].from) || !send_int(fd, map[i].from_hi) || !send_int(fd, map[i].to) ||
+        !send_str(fd, map[i].to_name ? map[i].to_name : ""))
+      return false;
+  }
+  return true;
+}
+
+static bool receive_identity_entries(int fd, ConfigStringBudget* budget, int count,
+                                     IdentityMap** out) {
+  if (count <= 0)
+    return true;
+  IdentityMap* map = calloc((size_t)count, sizeof(IdentityMap));
+  if (!map)
+    return false;
+  for (int i = 0; i < count; i++) {
+    if (!receive_int(fd, &map[i].from) || !receive_int(fd, &map[i].from_hi) ||
+        !receive_int(fd, &map[i].to))
+      goto fail;
+    char* name = config_receive_str(fd, budget);
+    if (!name)
+      goto fail;
+    if (name[0] == '\0') {
+      free(name);
+      map[i].to_name = NULL;
+    } else {
+      map[i].to_name = name;
+    }
+  }
+  *out = map;
+  return true;
+fail:
+  for (int i = 0; i < count; i++)
+    free(map[i].to_name);
+  free(map);
+  return false;
+}
+
+/* ---------------------------------------------------------------------------
+ * KIND dispatch.  A table entry X(member, ctype, def, KIND) expands to
+ * CONFIG_SEND_<KIND>(member) in a sender and CONFIG_RECV_<KIND>(member) in a
+ * receiver.  Send macros are bool expressions; receive macros are bool
+ * expressions too (strings allocate through `budget`).
+ * ------------------------------------------------------------------------- */
+#define CONFIG_SEND_BOOL(name) send_int(fd, c->name)
+#define CONFIG_RECV_BOOL(name) receive_wire_bool(fd, &c->name)
+
+#define CONFIG_SEND_INT(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT(name) receive_int(fd, &c->name)
+
+#define CONFIG_SEND_RAW(name) send_n_data(fd, &c->name, sizeof(c->name))
+#define CONFIG_RECV_RAW(name) receive_n_data(fd, &c->name, sizeof(c->name))
+
+#define CONFIG_SEND_BOOL_8BIT(name)                                                                \
+  (send_int(fd, c->name) && (protocol_set_8_bit_output(c->name), true))
+#define CONFIG_RECV_BOOL_8BIT(name)                                                                \
+  (receive_wire_bool(fd, &c->name) && (protocol_set_8_bit_output(c->name), true))
+
+#define CONFIG_SEND_RAW_MAXALLOC(name) send_n_data(fd, &c->name, sizeof(c->name))
+#define CONFIG_RECV_RAW_MAXALLOC(name) config_receive_max_alloc(fd, &c->name)
+
+/* --delta is sent as (use_delta && !whole_file); whole_file never crosses the
+ * wire, so the receiver observes the effective bit. */
+#define CONFIG_SEND_DERIVED_DELTA(name) send_int(fd, c->name && !c->whole_file)
+#define CONFIG_RECV_DERIVED_DELTA(name) receive_wire_bool(fd, &c->name)
+
+#define CONFIG_SEND_STR(name) send_str(fd, c->name)
+#define CONFIG_RECV_STR(name) ((c->name = config_receive_str(fd, budget)) != NULL)
+
+#define CONFIG_SEND_STR_OPT(name) send_str(fd, c->name ? c->name : "")
+#define CONFIG_RECV_STR_OPT(name) config_receive_optional_str(fd, budget, &c->name)
+
+#define CONFIG_SEND_STR_KEEP(name) send_str(fd, c->name ? c->name : "")
+#define CONFIG_RECV_STR_KEEP(name) ((c->name = config_receive_str(fd, budget)) != NULL)
+
+#define CONFIG_SEND_STR_MODULE(name) send_str(fd, c->name ? c->name : "")
+#define CONFIG_RECV_STR_MODULE(name) config_receive_module(fd, c, budget)
+
+#define CONFIG_SEND_STR_REDACTED_AUTH(name) config_send_auth_user(fd, c)
+#define CONFIG_RECV_STR_REDACTED_AUTH(name) config_receive_auth_user(fd, c, budget)
+
+#define CONFIG_SEND_INT_CHECKSUM_ALGO(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_CHECKSUM_ALGO(name) config_receive_checksum_algo(fd, &c->name)
+
+#define CONFIG_SEND_INT_COMPRESSION_ALGO(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_COMPRESSION_ALGO(name) config_receive_compression_algo(fd, &c->name)
+
+#define CONFIG_SEND_SUPERMODE(name) send_int(fd, (int)c->name)
+#define CONFIG_RECV_SUPERMODE(name) config_receive_super_mode(fd, &c->name)
+
+#define CONFIG_SEND_INT_IDENTITY(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_IDENTITY(name) config_receive_identity_id(fd, &c->name)
+
+#define CONFIG_SEND_INT_SKIPCOUNT(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_SKIPCOUNT(name) config_receive_skip_count(fd, &c->name)
+
+#define CONFIG_SEND_INT_BASISCOUNT(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_BASISCOUNT(name) config_receive_basis_count(fd, &c->name)
+
+#define CONFIG_SEND_INT_IDMAPCOUNT(name) send_int(fd, c->name)
+#define CONFIG_RECV_INT_IDMAPCOUNT(name) config_receive_idmap_count(fd, &c->name)
+
+/* use_xattrs is derived receiver-side from the xattr/acl preservation flags
+ * that crossed the wire in the file-options block. */
+#define CONFIG_SEND_BOOL_XATTR_DERIVE(name) send_int(fd, c->name)
+#define CONFIG_RECV_BOOL_XATTR_DERIVE(name)                                                        \
+  (receive_wire_bool(fd, &c->name) &&                                                              \
+   (c->use_xattrs = (c->preserve_acls || c->preserve_xattrs), true))
+
+#define CONFIG_SEND_COPY_AS_PRESENCE(name) send_int(fd, c->name ? 1 : 0)
+#define CONFIG_RECV_COPY_AS_PRESENCE(name) config_receive_copy_as_presence(fd, &c->name)
+
+/* The uid/gid follow the presence int only when --copy-as is set. */
+#define CONFIG_SEND_COPY_AS_ID(name) (!c->copy_as_set || send_int(fd, c->name))
+#define CONFIG_RECV_COPY_AS_ID(name) (!c->copy_as_set || config_receive_copy_as_id(fd, &c->name))
+
+#define CONFIG_SEND_BLOCK_SKIP_SUFFIXES(name) send_skip_compress_suffixes(fd, c)
+#define CONFIG_RECV_BLOCK_SKIP_SUFFIXES(name) receive_skip_compress_suffixes(fd, c, budget)
+
+#define CONFIG_SEND_BLOCK_BASIS(name) send_basis_entries(fd, c)
+#define CONFIG_RECV_BLOCK_BASIS(name) receive_basis_entries(fd, c, budget)
+
+#define CONFIG_SEND_BLOCK_IDMAP(name) send_identity_entries(fd, c->name, c->name##_count)
+#define CONFIG_RECV_BLOCK_IDMAP(name)                                                              \
+  receive_identity_entries(fd, budget, c->name##_count, &c->name)
+
+/* One table entry, applied in sequence.  XSEND/XRECV are statement macros so
+ * consecutive entries read as a plain sequence of assignments. */
+#define XSEND(name, ctype, def, kind) ok = ok && (CONFIG_SEND_##kind(name));
+#define XRECV(name, ctype, def, kind) ok = ok && (CONFIG_RECV_##kind(name));
+
+#define CONFIG_DEFINE_SEND(fn, fields)                                                             \
+  static bool fn(int fd, const Config* c) {                                                        \
+    bool ok = true;                                                                                \
+    fields(XSEND) return ok;                                                                       \
+  }
+
+#define CONFIG_DEFINE_RECV(fn, fields)                                                             \
+  static bool fn(int fd, Config* c, ConfigStringBudget* budget) {                                  \
+    (void)budget;                                                                                  \
+    bool ok = true;                                                                                \
+    fields(XRECV) return ok;                                                                       \
+  }
+
+CONFIG_DEFINE_SEND(send_core_fields, CONFIG_WIRE_CORE_FIELDS)
+CONFIG_DEFINE_SEND(send_delta_fields, CONFIG_WIRE_DELTA_FIELDS)
+CONFIG_DEFINE_SEND(send_file_options, CONFIG_WIRE_FILE_OPTIONS_FIELDS)
+CONFIG_DEFINE_SEND(send_selection_options, CONFIG_WIRE_SELECTION_FIELDS)
+CONFIG_DEFINE_SEND(send_resume_options, CONFIG_WIRE_RESUME_FIELDS)
+CONFIG_DEFINE_SEND(send_basis_options, CONFIG_WIRE_BASIS_FIELDS)
+CONFIG_DEFINE_SEND(send_fuzzy_option, CONFIG_WIRE_FUZZY_FIELDS)
+CONFIG_DEFINE_SEND(send_checksum_options, CONFIG_WIRE_CHECKSUM_FIELDS)
+CONFIG_DEFINE_SEND(send_identity_options, CONFIG_WIRE_IDENTITY_FIELDS)
+CONFIG_DEFINE_SEND(send_metadata_times_options, CONFIG_WIRE_METADATA_TIMES_FIELDS)
+CONFIG_DEFINE_SEND(send_symlink_trust_options, CONFIG_WIRE_SYMLINK_TRUST_FIELDS)
+CONFIG_DEFINE_SEND(send_phase4_xattr_options, CONFIG_WIRE_XATTR_FIELDS)
+CONFIG_DEFINE_SEND(send_daemon_module, CONFIG_WIRE_MODULE_FIELDS)
+CONFIG_DEFINE_SEND(send_daemon_auth, CONFIG_WIRE_DAEMON_AUTH_FIELDS)
+CONFIG_DEFINE_SEND(send_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
+CONFIG_DEFINE_SEND(send_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
+CONFIG_DEFINE_SEND(send_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
+CONFIG_DEFINE_SEND(send_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
+CONFIG_DEFINE_SEND(send_codec_options, CONFIG_WIRE_CODEC_FIELDS)
+
+CONFIG_DEFINE_RECV(receive_core_fields, CONFIG_WIRE_CORE_FIELDS)
+CONFIG_DEFINE_RECV(receive_delta_fields, CONFIG_WIRE_DELTA_FIELDS)
+CONFIG_DEFINE_RECV(receive_file_options, CONFIG_WIRE_FILE_OPTIONS_FIELDS)
+CONFIG_DEFINE_RECV(receive_selection_options, CONFIG_WIRE_SELECTION_FIELDS)
+CONFIG_DEFINE_RECV(receive_resume_options, CONFIG_WIRE_RESUME_FIELDS)
+CONFIG_DEFINE_RECV(receive_basis_options, CONFIG_WIRE_BASIS_FIELDS)
+CONFIG_DEFINE_RECV(receive_fuzzy_option, CONFIG_WIRE_FUZZY_FIELDS)
+CONFIG_DEFINE_RECV(receive_checksum_options, CONFIG_WIRE_CHECKSUM_FIELDS)
+CONFIG_DEFINE_RECV(receive_identity_options, CONFIG_WIRE_IDENTITY_FIELDS)
+CONFIG_DEFINE_RECV(receive_metadata_times_options, CONFIG_WIRE_METADATA_TIMES_FIELDS)
+CONFIG_DEFINE_RECV(receive_symlink_trust_options, CONFIG_WIRE_SYMLINK_TRUST_FIELDS)
+CONFIG_DEFINE_RECV(receive_phase4_xattr_options, CONFIG_WIRE_XATTR_FIELDS)
+CONFIG_DEFINE_RECV(receive_daemon_module, CONFIG_WIRE_MODULE_FIELDS)
+CONFIG_DEFINE_RECV(receive_daemon_auth, CONFIG_WIRE_DAEMON_AUTH_FIELDS)
+CONFIG_DEFINE_RECV(receive_iconv_spec, CONFIG_WIRE_ICONV_FIELDS)
+CONFIG_DEFINE_RECV(receive_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
+CONFIG_DEFINE_RECV(receive_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
+CONFIG_DEFINE_RECV(receive_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
+CONFIG_DEFINE_RECV(receive_codec_options, CONFIG_WIRE_CODEC_FIELDS)
+
+#undef XSEND
+#undef XRECV
 
 /* Client half of the SCRAM challenge/response (A7 remediation).  Called by
  * config_send after the config frame is written and the server answered
@@ -1262,96 +1299,37 @@ static bool client_auth_exchange(int fd, const Config* c) {
   return ok;
 }
 
-/* --iconv CONVERT_SPEC (protocol 2.16.0).  Trailing string on the config frame,
- * sent after the Wave A/B daemon-auth block and before the ack, so the
- * receiver knows the wire charset before the first file name arrives.  The full
- * spec travels (LOCAL,REMOTE) and each end derives its own LOCAL and the wire
- * (REMOTE) charset symmetrically; an unset spec is serialized as "" and
- * canonicalized back to NULL on receive. */
-static bool send_iconv_spec(int fd, const Config* c) {
-  return send_str(fd, c->iconv_spec ? c->iconv_spec : "");
-}
+/* The --iconv, --super/--no-super and --copy-as segment functions are
+ * generated above from CONFIG_WIRE_ICONV_FIELDS, CONFIG_WIRE_PRIVILEGE_FIELDS
+ * and CONFIG_WIRE_COPY_AS_FIELDS. */
 
-static bool receive_iconv_spec(int fd, Config* c) {
-  char* spec = receive_str(fd);
-  if (!spec)
-    return false;
-  if (*spec == '\0') {
-    free(spec);
-    c->iconv_spec = NULL;
-    return true;
-  }
-  c->iconv_spec = spec;
-  return true;
-}
-
-/* --super / --no-super privilege policy (P7 Wave E, protocol 2.18.0).  One
- * trailing int on the config frame, sent after the --iconv spec and before the
- * STATUS_OK ack, so the receiver knows whether it may attempt super-user
- * activities (ownership application, char/block device-node creation) that are
- * already confined below the authorized receive root.  The received value is
- * validated to the SUPER_MODE_AUTO..SUPER_MODE_OFF range (also re-checked by
- * validate_received_config). */
-static bool send_privilege_options(int fd, const Config* c) {
-  return send_int(fd, c->super_mode);
-}
-
-static bool receive_privilege_options(int fd, Config* c) {
-  int mode;
-  if (!receive_int(fd, &mode) || mode < SUPER_MODE_AUTO || mode > SUPER_MODE_OFF)
-    return false;
-  c->super_mode = mode;
-  return true;
-}
-
-/* --copy-as=USER[:GROUP] (P7 Wave E, protocol 2.18.0).  Trailing block on the
- * config frame, sent after the --super int and before the ack: a presence int,
- * then (when set) the target uid and gid as int32.  The receiver forces the
- * ownership of every entry it writes to these ids through the confined
- * fd-relative identity path and requires privilege; both ids are validated
- * `>= 0` on receive so a hostile peer cannot smuggle a negative (sentinel)
- * value into the ownership path. */
-static bool send_copy_as_options(int fd, const Config* c) {
-  if (!send_int(fd, c->copy_as_set ? 1 : 0))
-    return false;
-  if (!c->copy_as_set)
-    return true;
-  return send_int(fd, c->copy_as_uid) && send_int(fd, c->copy_as_gid);
-}
-
-static bool receive_copy_as_options(int fd, Config* c) {
-  int present;
-  if (!receive_int(fd, &present) || !valid_wire_bool(present))
-    return false;
-  if (!present) {
-    c->copy_as_set = false;
-    return true;
-  }
-  int uid, gid;
-  if (!receive_int(fd, &uid) || !receive_int(fd, &gid) || uid < 0 || gid < 0)
-    return false;
-  c->copy_as_set = true;
-  c->copy_as_uid = uid;
-  c->copy_as_gid = gid;
-  return true;
+bool config_send_wire_block(int file_descriptor, const Config* config) {
+  protocol_session_set_max_alloc(NULL, config->max_alloc);
+  /* The version is the frame header: the receiver validates it before parsing
+   * any other field (see config_receive_with_validate), so it is not part of
+   * the generated segment sequence.  It is still declared once, in
+   * CONFIG_WIRE_HEADER_FIELDS. */
+  return send_str(file_descriptor, config->version) && send_core_fields(file_descriptor, config) &&
+         send_delta_fields(file_descriptor, config) && send_file_options(file_descriptor, config) &&
+         send_selection_options(file_descriptor, config) &&
+         send_resume_options(file_descriptor, config) &&
+         send_basis_options(file_descriptor, config) &&
+         send_fuzzy_option(file_descriptor, config) &&
+         send_checksum_options(file_descriptor, config) &&
+         send_identity_options(file_descriptor, config) &&
+         send_metadata_times_options(file_descriptor, config) &&
+         send_symlink_trust_options(file_descriptor, config) &&
+         send_phase4_xattr_options(file_descriptor, config) &&
+         send_daemon_module(file_descriptor, config) && send_daemon_auth(file_descriptor, config) &&
+         send_iconv_spec(file_descriptor, config) &&
+         send_privilege_options(file_descriptor, config) &&
+         send_copy_as_options(file_descriptor, config) &&
+         send_output_options(file_descriptor, config) &&
+         send_codec_options(file_descriptor, config);
 }
 
 bool config_send(int file_descriptor, const Config* config) {
-  protocol_session_set_max_alloc(NULL, config->max_alloc);
-  if (!send_core_fields(file_descriptor, config) || !send_delta_fields(file_descriptor, config) ||
-      !send_file_options(file_descriptor, config) ||
-      !send_selection_options(file_descriptor, config) ||
-      !send_resume_options(file_descriptor, config) ||
-      !send_basis_options(file_descriptor, config) || !send_fuzzy_option(file_descriptor, config) ||
-      !send_checksum_options(file_descriptor, config) ||
-      !send_identity_options(file_descriptor, config) ||
-      !send_metadata_times_options(file_descriptor, config) ||
-      !send_symlink_trust_options(file_descriptor, config) ||
-      !send_phase4_xattr_options(file_descriptor, config) ||
-      !send_daemon_module(file_descriptor, config) || !send_daemon_auth(file_descriptor, config) ||
-      !send_iconv_spec(file_descriptor, config) ||
-      !send_privilege_options(file_descriptor, config) ||
-      !send_copy_as_options(file_descriptor, config))
+  if (!config_send_wire_block(file_descriptor, config))
     return false;
   Status status;
   if (!receive_status(file_descriptor, &status))
@@ -1365,7 +1343,16 @@ bool config_send(int file_descriptor, const Config* config) {
       return false;
   }
   if (status != STATUS_OK) {
-    log_message(LOG_LEVEL_ERROR, "Error transmitting config");
+    const char* detail = protocol_last_error();
+    if (detail && detail[0] != '\0') {
+      /* The detail is peer-controlled: escape it before logging. */
+      char* escaped = output_escape(detail, log_get_8_bit_output());
+      log_message(LOG_LEVEL_ERROR, "Error transmitting config: %s",
+                  escaped ? escaped : "<allocation failed>");
+      free(escaped);
+    } else {
+      log_message(LOG_LEVEL_ERROR, "Error transmitting config");
+    }
     return false;
   }
   return true;
@@ -1376,48 +1363,96 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
   Config* config = config_create();
   if (!config)
     return NULL;
+  ConfigStringBudget budget = {0};
   free(config->version);
-  config->version = receive_str(file_descriptor);
+  config->version = config_receive_str(file_descriptor, &budget);
   if (!config->version)
     goto error;
   if (strcmp(config->version, PROTOCOL_VERSION) != 0) {
     char* escaped_version = output_escape(config->version, false);
-    fprintf(stderr, "Protocol version mismatch: client=%s, server=%s\n",
-            escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    log_message(LOG_LEVEL_ERROR, "Protocol version mismatch: client=%s, server=%s",
+                escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    char detail[160];
+    snprintf(detail, sizeof(detail), "protocol version mismatch (client=%s, server=%s)",
+             escaped_version ? escaped_version : "<allocation failed>", PROTOCOL_VERSION);
+    send_error_detail(file_descriptor, detail);
     free(escaped_version);
-    send_status(file_descriptor, STATUS_ERROR);
     goto error;
   }
-  if (!receive_core_fields(file_descriptor, config) ||
-      !receive_delta_fields(file_descriptor, config) ||
-      !receive_file_options(file_descriptor, config) ||
-      !receive_selection_options(file_descriptor, config) ||
-      !receive_resume_options(file_descriptor, config) ||
-      !receive_basis_options(file_descriptor, config) ||
-      !receive_fuzzy_option(file_descriptor, config) ||
-      !receive_checksum_options(file_descriptor, config) ||
-      !receive_identity_options(file_descriptor, config) ||
-      !receive_metadata_times_options(file_descriptor, config) ||
-      !receive_symlink_trust_options(file_descriptor, config) ||
-      !receive_phase4_xattr_options(file_descriptor, config) ||
-      !receive_daemon_module(file_descriptor, config) ||
-      !receive_daemon_auth(file_descriptor, config) ||
-      !receive_iconv_spec(file_descriptor, config) ||
-      !receive_privilege_options(file_descriptor, config) ||
-      !receive_copy_as_options(file_descriptor, config))
+  if (!receive_core_fields(file_descriptor, config, &budget) ||
+      !receive_delta_fields(file_descriptor, config, &budget) ||
+      !receive_file_options(file_descriptor, config, &budget) ||
+      !receive_selection_options(file_descriptor, config, &budget) ||
+      !receive_resume_options(file_descriptor, config, &budget) ||
+      !receive_basis_options(file_descriptor, config, &budget) ||
+      !receive_fuzzy_option(file_descriptor, config, &budget) ||
+      !receive_checksum_options(file_descriptor, config, &budget) ||
+      !receive_identity_options(file_descriptor, config, &budget) ||
+      !receive_metadata_times_options(file_descriptor, config, &budget) ||
+      !receive_symlink_trust_options(file_descriptor, config, &budget) ||
+      !receive_phase4_xattr_options(file_descriptor, config, &budget) ||
+      !receive_daemon_module(file_descriptor, config, &budget) ||
+      !receive_daemon_auth(file_descriptor, config, &budget) ||
+      !receive_iconv_spec(file_descriptor, config, &budget) ||
+      !receive_privilege_options(file_descriptor, config, &budget) ||
+      !receive_copy_as_options(file_descriptor, config, &budget) ||
+      !receive_output_options(file_descriptor, config, &budget) ||
+      !receive_codec_options(file_descriptor, config, &budget))
     goto error;
-  if (config->compress_choice[0] != '\0' && strcmp(config->compress_choice, "zstd") != 0 &&
-      strcmp(config->compress_choice, "none") != 0) {
-    char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
-    fprintf(stderr, "Unsupported compression choice: %s\n",
-            escaped_choice ? escaped_choice : "<allocation failed>");
-    free(escaped_choice);
-    send_status(file_descriptor, STATUS_ERROR);
+  /* Validate/normalize the negotiated codec.  compress_choice is the human
+   * spelling (NULL or "" when -z was not given); compression_algo is the
+   * concrete codec id the sender used.  They must agree, and "auto" is
+   * canonicalized to FastSync's negotiated default so the stored spelling is
+   * always concrete (a hostile/older client may still send "auto"). */
+  if (config->compress_choice && config->compress_choice[0] != '\0') {
+    int choice_algo = compression_algo_from_name(config->compress_choice);
+    if (choice_algo < 0 && strcasecmp(config->compress_choice, "auto") != 0) {
+      char* escaped_choice = output_escape(config->compress_choice, config->eight_bit_output);
+      log_message(LOG_LEVEL_ERROR, "Unsupported compression choice: %s",
+                  escaped_choice ? escaped_choice : "<allocation failed>");
+      char detail[160];
+      snprintf(detail, sizeof(detail), "unsupported compression choice: %s",
+               escaped_choice ? escaped_choice : "<allocation failed>");
+      send_error_detail(file_descriptor, detail);
+      free(escaped_choice);
+      goto error;
+    }
+    if (choice_algo < 0)
+      choice_algo = (int)compression_negotiate_default();
+    if (strcasecmp(config->compress_choice, "auto") == 0 ||
+        choice_algo == (int)COMPRESSION_ALGO_NONE) {
+      const char* canonical = compression_algo_name((CompressionAlgo)choice_algo);
+      char* dup = str_dup(canonical);
+      if (!dup)
+        goto error;
+      free(config->compress_choice);
+      config->compress_choice = dup;
+    }
+    if (config->compression_algo != choice_algo) {
+      log_message(LOG_LEVEL_ERROR, "Compression choice '%s' does not match codec id %d",
+                  config->compress_choice, config->compression_algo);
+      send_error_detail(file_descriptor, "compression choice/codec mismatch");
+      goto error;
+    }
+  }
+  /* The concrete codec must exist only when compression is on.  A client that
+   * left -z off has no codec in effect, but the field keeps whatever id it
+   * carried (the receiver never dispatches on it without use_compression), so
+   * the wire value round-trips untouched. */
+  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Compression requested with the 'none' codec");
+    send_error_detail(file_descriptor, "compression requested with the none codec");
+    goto error;
+  }
+  /* rsync: "none" as the pre-transfer checksum is invalid with --checksum. */
+  if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
+    log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
+    send_error_detail(file_descriptor, "checksum-choice 'none' cannot be used with --checksum");
     goto error;
   }
   if (!validate_received_config(config)) {
-    fprintf(stderr, "Invalid configuration received from client\n");
-    send_status(file_descriptor, STATUS_ERROR);
+    log_message(LOG_LEVEL_ERROR, "Invalid configuration received from client");
+    send_error_detail(file_descriptor, "invalid configuration received from client");
     goto error;
   }
   if (validate) {
@@ -1430,8 +1465,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
        * the CONFIG_VALIDATE_ALREADY_TERMINATED sentinel, so no second status is
        * written. */
       if (rejection != CONFIG_VALIDATE_ALREADY_TERMINATED) {
-        fprintf(stderr, "%s\n", rejection);
-        send_status(file_descriptor, STATUS_ERROR);
+        log_message(LOG_LEVEL_ERROR, "%s", rejection);
+        send_error_detail(file_descriptor, rejection);
       }
       goto error;
     }

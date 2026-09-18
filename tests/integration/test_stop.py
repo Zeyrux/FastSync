@@ -151,12 +151,35 @@ class TestStopAt:
             f"expected nothing transferred, got {_received_files(received)}"
 
     @pytest.mark.ci
+    def test_stop_at_rsync_date_form(self, shared_server):
+        """rsync's full date form (Y-M-DTh:m) is accepted; a deadline well in the
+        future lets the transfer complete normally."""
+        source, dest = _make("dateform")
+        _seed_source(source)
+        stamp = time.strftime("%Y-%m-%dT%H:%M", time.localtime(time.time() + 3600))
+        result, _ = run_client(source, dest, flags=[f"--stop-at={stamp}"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--stop-at={stamp} should be accepted: " \
+            f"{(result.stderr or result.stdout)[:400]}"
+        received = get_dest_received_dir(dest, source)
+        mismatches, missing = verify_transfer(source, received)
+        assert not mismatches and not missing
+
+        # The slash-separated date spelling is accepted too.
+        slash = time.strftime("%Y/%m/%dT%H:%M", time.localtime(time.time() + 3600))
+        result, _ = run_client(source, dest, flags=[f"--stop-at={slash}"],
+                               port=shared_server.port)
+        assert result.returncode == 0, f"--stop-at={slash} should be accepted"
+
+    @pytest.mark.ci
     def test_stop_rejects_garbage(self, shared_server):
         """Malformed --stop-at/--stop-after values are rejected up front."""
         source, dest = _make("garbage")
         _seed_source(source)
-        for flag in ("--stop-after=abc", "--stop-at=12:99", "--stop-at=12",
-                     "--stop-at=now+5x", "--stop-at=now-5s"):
+        for flag in ("--stop-after=abc", "--stop-at=12:99", "--stop-at=1234",
+                     "--stop-at=now+5x", "--stop-at=now-5s",
+                     "--stop-at=2000-13-45", "--stop-at=2030-12-31T23:59:59"):
             result, _ = run_client(source, dest, flags=[flag],
                                    port=shared_server.port)
             assert result.returncode != 0, f"{flag} should be rejected"

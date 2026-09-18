@@ -75,6 +75,15 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
     memcpy(r->host, dest, host_len);
     r->host[host_len] = '\0';
   }
+  /* The user@host token is handed to ssh in option position.  Reject anything
+   * that ssh would consume as an option (a leading '-') or an empty host, so a
+   * crafted destination can never inject an ssh option such as
+   * -oProxyCommand=... .  This mirrors config_parse_ssh_dest's validation and
+   * is defense-in-depth for callers that bypass it. */
+  if (r->host[0] == '\0' || r->host[0] == '-' || r->user[0] == '-') {
+    remote_dest_destroy(r);
+    return -1;
+  }
   return 0;
 }
 
@@ -128,7 +137,7 @@ char* ssh_build_remote_command(const char* server_path, bool old_args, char* con
         q++;
       len++;
     }
-    if (len > SIZE_MAX - q * 3 || len + q * 3 + 3 > SIZE_MAX - command_len)
+    if (q > (SIZE_MAX - len) / 3 || len + q * 3 + 3 > SIZE_MAX - command_len)
       return NULL;
     command_len += len + q * 3 + 3;
   }
@@ -216,10 +225,10 @@ char** ssh_build_client_argv(const char* rsh_command, int port, const char* user
     nwords = 1;
   }
 
-  /* Fixed tail: three -o pairs (6) + optional -p/value (2) + user@host +
-   * remote command + terminating NULL. */
+  /* Fixed tail: three -o pairs (6) + optional -p/value (2) + the "--" end of
+   * options marker + user@host + remote command + terminating NULL. */
   int port_extra = (port > 0 && port != 22) ? 2 : 0;
-  size_t total = (size_t)nwords + 6 + (size_t)port_extra + 3;
+  size_t total = (size_t)nwords + 6 + (size_t)port_extra + 4;
   char** argv = calloc(total, sizeof(char*));
   if (!argv) {
     for (int i = 0; i < nwords; i++)
@@ -253,6 +262,13 @@ char** ssh_build_client_argv(const char* rsh_command, int port, const char* user
       goto fail_argv;
     ac++;
   }
+  /* End of options: guarantees the user@host token that follows is treated as
+   * the destination and never re-interpreted as an ssh option, even if every
+   * caller-side validation were bypassed. */
+  argv[ac] = str_dup("--");
+  if (!argv[ac])
+    goto fail_argv;
+  ac++;
   argv[ac] = str_dup(userhost);
   if (!argv[ac])
     goto fail_argv;

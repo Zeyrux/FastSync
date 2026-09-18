@@ -138,11 +138,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
 Build for fuzzing:
 ```bash
-cmake -B build-fuzz -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=fuzzer,address,undefined -g" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=fuzzer,address,undefined"
+CC=clang CXX=clang++ cmake -B build-fuzz -S . -DENABLE_FUZZ=ON
 cmake --build build-fuzz -j$(nproc)
-./build-fuzz/tests/fuzz_chunk_deserialize corpus/ -max_len=1048576
+./build-fuzz/fuzz_chunk_deserialize corpus/ -max_len=1048576
 ```
 
 ### AFL++ Harness
@@ -216,7 +214,7 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 

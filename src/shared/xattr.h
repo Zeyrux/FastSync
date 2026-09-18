@@ -1,6 +1,7 @@
 #ifndef XATTR_H
 #define XATTR_H
 
+#include "file_attr.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,24 +56,34 @@ typedef struct {
 
 FileXattrList* xattr_list_new(void);
 void xattr_list_free(FileXattrList* list);
+/* Deep-copy `list` (NULL in, NULL out).  Returns NULL on allocation failure. */
+FileXattrList* xattr_list_clone(const FileXattrList* list);
 /* Append one entry (deep copy).  Returns false on allocation failure. */
 bool xattr_list_append(FileXattrList* list, const char* name, const void* value, size_t value_len);
 
 /* True when `name` is a well-formed xattr name AND belongs to a namespace this
- * build is authorized to apply (user.* or the two POSIX ACL xattrs).  Used for
- * both capture and receiver-side validation. */
-bool xattr_name_appliable(const char* name);
+ * build is authorized to apply.  `user.*` is always accepted for -X; the two
+ * POSIX ACL xattrs are accepted only when `preserve_acls` (--acls/-A) is set, so
+ * a plain -X run can never carry or apply an ACL the receiver did not ask for.
+ * Used for both capture and receiver-side validation. */
+bool xattr_name_appliable(const char* name, bool preserve_acls);
 
-/* Sender: read the whitelisted xattrs of `path` into a new list.  Returns NULL
- * when the path has no appliable xattrs (or the filesystem has no xattr
- * support); an empty-but-valid list is never returned distinct from NULL. */
-FileXattrList* xattr_capture_path(const char* path);
+/* Sender: read the whitelisted xattrs of `path` into a new list.  The POSIX ACL
+ * names are captured only when `preserve_acls` (--acls/-A) is set, so a plain
+ * -X run never carries an ACL it was not asked to preserve; `user.*` is
+ * unaffected.  Returns NULL when the path has no appliable xattrs (or the
+ * filesystem has no xattr support); an empty-but-valid list is never returned
+ * distinct from NULL. */
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls);
 
 /* Wire: bounded serialization.  xattr_send returns false on write failure; an
  * empty/NULL list transmits a zero-count block.  xattr_receive returns NULL and
- * sets *ok = 0 on any malformed / oversized / non-whitelisted entry. */
+ * sets *ok = 0 on any malformed / oversized / non-whitelisted entry.  When
+ * `preserve_acls` is false, any POSIX ACL entries are consumed and DROPPED (so
+ * a -X transfer still succeeds and never applies an ACL it did not negotiate);
+ * a genuinely disallowed namespace is still rejected. */
 bool xattr_send(int fd, const FileXattrList* list);
-FileXattrList* xattr_receive(int fd, int* ok);
+FileXattrList* xattr_receive(int fd, int* ok, bool preserve_acls);
 
 /* Receiver: apply every entry fd-relative (fsetxattr) to the just-written file
  * descriptor.  A per-attribute failure (e.g. ACL set refused for non-root on a
@@ -87,15 +98,17 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
                          int64_t mtime_nsec);
 
 /* --fake-super replay: parse the FAKESUPER_XATTR record previously written on
- * `fd` by fake_super_store_fd and re-apply uid/gid/mode/mtime fd-relative.
- * Best-effort: absence of the xattr or a malformed record is a silent no-op
- * that never fails the transfer.  The OWNER leg is applied only when an explicit
- * ownership identity policy is active (numeric-ids/chown/usermap/groupmap/
- * copy-as), when super-user activities are permitted, and when --copy-as is not
- * authoritative; a non-root EPERM/EACCES is skipped silently, matching
- * FastSync's identity philosophy.  The mode is sanitized exactly like the normal
- * metadata path (group/other write bits never granted).  Returns true when the
- * xattr was present and parsed. */
-bool fake_super_restore_fd(int fd);
+ * `fd` by fake_super_store_fd and re-apply mode/mtime fd-relative.  The
+ * recorded uid/gid are deliberately NOT chowned for real: --fake-super only
+ * RECORDS ownership (the caller stores the resolved mapping via
+ * identity_resolve_storage_ids), it never performs a real chown.  Best-effort:
+ * absence of the xattr or a malformed record is a silent no-op that never fails
+ * the transfer.  The MODE leg is applied only when policy.perms||policy.
+ * executability and the MTIME leg only when policy.times, so the fake-super
+ * replay cannot bypass the per-attribute split; the mode follows the normal
+ * metadata path exactly (under --perms the source mode is copied verbatim,
+ * special and group/other write bits included).
+ * Returns true when the xattr was present and parsed. */
+bool fake_super_restore_fd(int fd, FileAttrPolicy policy);
 
 #endif

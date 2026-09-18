@@ -179,6 +179,8 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
       opts->trust_sender = true;
     } else if (arg_is(argv[i], "--no-super")) {
       opts->no_super = true;
+    } else if (arg_is(argv[i], "--allow-super")) {
+      opts->allow_super = true;
     } else if (arg_is(argv[i], "--allow-unauthenticated")) {
       opts->allow_unauthenticated = true;
     } else if (arg_has_value(argv[i], "--iconv", &inline_value)) {
@@ -190,14 +192,20 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
         inline_value = argv[++i];
       }
       opts->iconv_spec = inline_value;
-    } else if (arg_is(argv[i], "-p")) {
-      if (i + 1 >= argc) {
-        set_error(err, err_size, "missing argument for -p");
-        return -1;
+    } else if (arg_is(argv[i], "-p") || arg_has_value(argv[i], "--port", &inline_value)) {
+      if (inline_value) {
+        opts->port_set = true;
+        if (parse_port_arg(inline_value, &opts->port, err, err_size) != 0)
+          return -1;
+      } else {
+        if (i + 1 >= argc) {
+          set_error(err, err_size, "missing argument for %s", argv[i]);
+          return -1;
+        }
+        opts->port_set = true;
+        if (parse_port_arg(argv[++i], &opts->port, err, err_size) != 0)
+          return -1;
       }
-      opts->port_set = true;
-      if (parse_port_arg(argv[++i], &opts->port, err, err_size) != 0)
-        return -1;
     } else {
       if (arg_has_value(argv[i], "--config", &inline_value)) {
         if (!inline_value) {
@@ -257,6 +265,28 @@ int server_cli_parse(int argc, char* argv[], ServerCliOptions* opts, char* err, 
   }
   if (opts->hash_credentials_file != NULL && (opts->daemon_mode || opts->stdio_mode)) {
     set_error(err, err_size, "--hash-credentials cannot be combined with --daemon or --stdio");
+    return -1;
+  }
+  if (opts->allow_super && opts->no_super) {
+    set_error(err, err_size, "--allow-super and --no-super are mutually exclusive");
+    return -1;
+  }
+  if (opts->allow_super && opts->daemon_mode) {
+    set_error(err, err_size,
+              "--allow-super is for a locally-launched standalone TCP server; daemon modules opt "
+              "in per module with 'client owner = yes'");
+    return -1;
+  }
+  /* --stdio is the SSH transport: the remote server argv is composed by the
+   * CLIENT (directly and via --remote-option), so a client could otherwise pass
+   * --allow-super to a root --stdio receiver and defeat the C3 secure default.
+   * Never honor it there; the super mode stays forced OFF.  An operator who
+   * must keep the historical permissive behavior over SSH has to launch the
+   * receiver through a forced command, not via client-composed argv. */
+  if (opts->allow_super && opts->stdio_mode) {
+    set_error(err, err_size,
+              "--allow-super is not accepted with --stdio (the remote argv is client-composed; "
+              "use a forced command if the default must hold)");
     return -1;
   }
   if (opts->hash_iterations_set && opts->hash_credentials_file == NULL) {

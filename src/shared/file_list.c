@@ -2,6 +2,7 @@
 #include "log.h"
 #include "utils.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,8 @@ static void string_list_destroy(StringList* list) {
 
 static bool string_list_add(StringList* list, const char* text) {
   if (list->count == list->capacity) {
+    if (list->capacity > INT_MAX / 2)
+      return false;
     int new_cap = list->capacity > 0 ? list->capacity * 2 : 16;
     char** grown = realloc(list->items, (size_t)new_cap * sizeof(char*));
     if (!grown)
@@ -51,11 +54,18 @@ static int normalize_entry(const char* raw, size_t len, bool strip_line_endings,
   if (len == 0)
     return 0;
   if (raw[0] == '/') {
-    snprintf(err, err_size, "absolute path entries are not allowed: '%.*s'", (int)len, raw);
+    int print_len = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+    snprintf(err, err_size, "absolute path entries are not allowed: '%.*s'", print_len, raw);
     return -1;
   }
-  /* Reject NUL bytes inside a token defensively (NUL-delimited mode splits on
-   * them, so this only guards against embedded garbage). */
+  /* Reject NUL bytes inside a token defensively.  In NUL-delimited mode the
+   * delimiter itself is the final byte and is expected; in line mode any NUL is
+   * embedded garbage (strlen-based parsing would otherwise silently truncate). */
+  size_t scan_len = strip_line_endings ? len : len - 1;
+  if (memchr(raw, '\0', scan_len)) {
+    snprintf(err, err_size, "entry contains an embedded NUL byte");
+    return -1;
+  }
   char* dup = malloc(len + 1);
   if (!dup) {
     snprintf(err, err_size, "memory allocation failed");
@@ -102,8 +112,27 @@ static int normalize_entry(const char* raw, size_t len, bool strip_line_endings,
   return result;
 }
 
+/* Build the membership index over the exact entries only.  `file_list_affects`
+   combines the exact/descendant lookups with a walk of the query's own ancestor
+   prefixes, so no ancestor prefix is ever materialized as a copy and the index
+   stays O(entry count) memory regardless of path depth.  An empty entry (the
+   source root) sets whole_tree and short-circuits every query. */
+static bool file_list_index_build(FileListSet* set, char* err, size_t err_size) {
+  if (!path_index_build(&set->index, (const char* const*)set->entries, (size_t)set->count)) {
+    snprintf(err, err_size, "memory allocation failed");
+    return false;
+  }
+  for (int i = 0; i < set->count; i++) {
+    if (set->entries[i][0] == '\0') {
+      set->whole_tree = true;
+      break;
+    }
+  }
+  return true;
+}
+
 static FileListSet* string_list_to_set(StringList* raw, char* err, size_t err_size) {
-  FileListSet* set = malloc(sizeof(FileListSet));
+  FileListSet* set = calloc(1, sizeof(FileListSet));
   if (!set) {
     snprintf(err, err_size, "memory allocation failed");
     return NULL;
@@ -112,6 +141,10 @@ static FileListSet* string_list_to_set(StringList* raw, char* err, size_t err_si
   set->entries = raw->items;
   raw->items = NULL;
   raw->count = 0;
+  if (!file_list_index_build(set, err, err_size)) {
+    file_list_destroy(set);
+    return NULL;
+  }
   return set;
 }
 
@@ -133,10 +166,20 @@ FileListSet* file_list_load(const char* path, bool null_separated, char* err, si
   StringList raw = {0};
   char* line = NULL;
   size_t line_cap = 0;
-  ssize_t n;
   bool ok = true;
   char delim = null_separated ? '\0' : '\n';
-  while (ok && (n = getdelim(&line, &line_cap, delim, fp)) != -1) {
+  while (ok) {
+    ssize_t n = utils_getdelim_bounded(fp, &line, &line_cap, delim, UTILS_MAX_LINE_LEN);
+    if (n < 0) {
+      if (errno == EFBIG)
+        snprintf(err, err_size, "entry in file list exceeds %d bytes", (int)UTILS_MAX_LINE_LEN);
+      else
+        snprintf(err, err_size, "error reading file list: %s", strerror(errno));
+      ok = false;
+      break;
+    }
+    if (n == 0)
+      break;
     int r = normalize_entry(line, (size_t)n, !null_separated, &raw, err, err_size);
     if (r < 0) {
       ok = false;
@@ -158,17 +201,11 @@ FileListSet* file_list_load(const char* path, bool null_separated, char* err, si
 void file_list_destroy(FileListSet* set) {
   if (!set)
     return;
+  path_index_free(&set->index);
   for (int i = 0; i < set->count; i++)
     free(set->entries[i]);
   free(set->entries);
   free(set);
-}
-
-static bool path_has_prefix(const char* path, const char* prefix) {
-  size_t plen = strlen(prefix);
-  if (strncmp(path, prefix, plen) != 0)
-    return false;
-  return path[plen] == '/' || path[plen] == '\0';
 }
 
 bool file_list_affects(const FileListSet* set, const char* rel) {
@@ -176,16 +213,56 @@ bool file_list_affects(const FileListSet* set, const char* rel) {
     return true;
   if (!rel)
     return false;
-  for (int i = 0; i < set->count; i++) {
-    const char* entry = set->entries[i];
-    if (entry[0] == '\0')
-      return true; /* whole tree listed */
-    if (strcmp(rel, entry) == 0)
-      return true; /* the entry itself is listed */
-    if (path_has_prefix(rel, entry))
-      return true; /* rel lives under a listed directory */
-    if (path_has_prefix(entry, rel))
-      return true; /* rel is an ancestor directory of a listed entry */
+  if (set->whole_tree)
+    return true; /* whole tree listed */
+  /* An exact entry match means `rel` itself is listed. */
+  if (path_index_contains(&set->index, rel))
+    return true;
+  /* Otherwise `rel` is affected when a listed entry is an ancestor directory of
+     it; walk rel's own directory prefixes (which preserve path-boundary
+     semantics) and test each for an exact entry.  No prefixes are stored. */
+  size_t len = strlen(rel);
+  while (len > 0) {
+    const char* slash = NULL;
+    for (size_t i = len; i-- > 0;) {
+      if (rel[i] == '/') {
+        slash = rel + i;
+        break;
+      }
+    }
+    if (!slash)
+      break;
+    len = (size_t)(slash - rel);
+    if (path_index_contains_n(&set->index, rel, len))
+      return true;
   }
-  return false;
+  /* Finally `rel` is affected when it is an ancestor directory of a listed
+     entry (binary search for the first entry at or after `rel` + '/'). */
+  return path_index_has_descendant(&set->index, rel);
+}
+
+bool file_list_dir_in_scope(const FileListSet* set, const char* rel) {
+  if (!set || set->whole_tree)
+    return true;
+  if (!rel || rel[0] == '\0')
+    return false;
+  /* `rel` itself is listed, or one of its ancestor prefixes is an exact listed
+     directory (a listed prefix of a directory path is necessarily a
+     directory). */
+  size_t len = strlen(rel);
+  while (len > 0) {
+    const char* slash = NULL;
+    for (size_t i = len; i-- > 0;) {
+      if (rel[i] == '/') {
+        slash = rel + i;
+        break;
+      }
+    }
+    if (!slash)
+      break;
+    len = (size_t)(slash - rel);
+    if (path_index_contains_n(&set->index, rel, len))
+      return true;
+  }
+  return path_index_contains(&set->index, rel);
 }

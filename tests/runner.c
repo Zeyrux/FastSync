@@ -9,12 +9,16 @@
 #include "test_credentials.h"
 #include "test_data.h"
 #include "test_daemon_conf.h"
+#include "test_daemon_limits.h"
 #include "test_delay_updates.h"
 #include "test_delta.h"
 #include "test_file.h"
+#include "test_file_list.h"
 #include "test_file_sendfile.h"
+#include "test_format.h"
 #include "test_fuzz_smoke.h"
 #include "test_glob.h"
+#include "test_hardlink.h"
 #include "test_iconv.h"
 #include "test_log.h"
 #include "test_metadata.h"
@@ -22,7 +26,9 @@
 #include "test_multiprocessing.h"
 #include "test_property.h"
 #include "test_protocol.h"
+#include "test_protocol_error.h"
 #include "test_queue.h"
+#include "test_receiver_timeout.h"
 #include "test_robustness.h"
 #include "test_scanner.h"
 #include "test_server.h"
@@ -53,6 +59,7 @@ int main() {
   RUN_TEST(test_chunk);
   RUN_TEST(test_batch);
   RUN_TEST(test_change_list);
+  RUN_TEST(test_format);
   RUN_TEST(test_config);
   RUN_TEST(test_credentials);
   RUN_TEST(test_compression);
@@ -61,10 +68,13 @@ int main() {
   RUN_TEST(test_delta);
   RUN_TEST(test_data);
   RUN_TEST(test_protocol);
+  RUN_TEST(test_protocol_error);
+  RUN_TEST(test_receiver_timeout);
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
   RUN_TEST(test_iconv);
   RUN_TEST(test_file);
+  RUN_TEST(test_file_list);
   RUN_TEST(test_trust_sender);
   RUN_TEST(test_delay_updates);
   RUN_TEST(test_file_sendfile);
@@ -80,10 +90,12 @@ int main() {
   RUN_TEST(test_client_cli);
   RUN_TEST(test_server);
   RUN_TEST(test_daemon_conf);
+  RUN_TEST(test_daemon_limits);
   RUN_TEST(test_motd);
   RUN_TEST(test_server_cli);
   RUN_TEST(test_fuzz_smoke);
   RUN_TEST(test_xattr);
+  RUN_TEST(test_hardlink);
 
   printf("\n\033[1;36m=== TEST SUMMARY ===\033[0m\n");
   printf("Total Tests Run: %d\n", tests_run);

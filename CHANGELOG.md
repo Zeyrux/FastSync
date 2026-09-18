@@ -4,6 +4,321 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [2.26.0] - 2026-09-17
+
+### Added
+
+- **Parity-completion wave.** Closed the remaining rsync-parity gaps against
+  rsync 3.4.1 and reclassified the inherently non-rsync rows. It moved the wire
+  protocol three times (`2.23.0 → 2.24.0 → 2.25.0 → 2.26.0`).
+  - **Delete timing (2.24.0):** per-directory delete plans
+    (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`. An interrupted
+    during-transfer has already removed the reached directories' extras, while a
+    delayed transfer commits per directory only after the whole transfer
+    succeeds (a late-created extra survives `--delete-delay` but not
+    `--delete-after`). `-R --delete` is scoped to the transferred prefix; empty
+    in-scope source directories survive; dry-run never deletes.
+  - **Wire stats (2.25.0):** `STATUS_STATS` carries the receiver counters
+    (matched data, deleted files) and the dry-run would-delete list. `--stats`
+    prints rsync's protocol-independent lines; `--progress`/`-P` print per-file
+    blocks; `--out-format` gains `%b` (wire bytes), `%c` (block-sum bytes) and
+    `%C` (whole-file digest); `-n --delete` prints escaped `*deleting` lines in
+    the sequential and `--threads` paths.
+  - **Codecs (2.26.0):** `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/
+    `none` checksums, with rsync-style `auto` negotiation (default `xxh128` +
+    `zstd`) and exit-4 rejection of unknown names; the resolved `compression_algo`
+    crosses the wire.
+  - General `-R`/`--relative` (including the `/./` cut) and `--no-implied-dirs`;
+    one-level `-d`/`--dirs` listing for `dir`, `dir/` and `.`; the full filter
+    grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` and
+    modifiers) with `-f` bound to `--filter`; a single `-F` transfers
+    `.rsync-filter` and `-FF` excludes it.
+  - Receiver-side `--chown`/`--usermap`/`--groupmap` TO-name resolution; absolute
+    basis directories and a `--link-dest` relink of an up-to-date destination;
+    a receiver-side `--ignore-existing` short-circuit before any payload;
+    `--preallocate` now wins over `--sparse` via `fallocate(2)`.
+  - Client quick wins: `--iconv=.`/`-`/`--no-iconv`, a lone `-h` prints help, an
+    empty `--files-from` succeeds (exit 0), a broken referent under
+    `-L`/`--copy-unsafe-links` exits 23, the full `--info`/`--debug`
+    vocabularies, and the aliases `--ignore-non-existing`, `--protect-args`,
+    `--msgs2stderr`.
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.23.0 → 2.24.0` (delete plans),
+  `2.24.0 → 2.25.0` (`STATUS_STATS` + `report_stats`), and
+  `2.25.0 → 2.26.0` (codec negotiation + `md4`/`sha1`/`none`).
+- `--checksum-choice`/`--cc` now accepts `md4`, `sha1`, `none` and the two-name
+  form; the negotiated whole-file default is `xxh128`.
+- `--compress-choice`/`--zc` now accepts `lz4`, `zlib`, `zlibx`.
+- `RSYNC_COMPAT.md` reclassifies the matrix: 9 already-parity rows to ✅, 17
+  inherently non-rsync rows to ❌ (native daemon config/auth, batch, privileged
+  xattr namespaces, and the safe-subset device/privilege flags), and the genuine
+  fixes to ✅; new rows cover `--bwlimit`, `--partial`, `--partial-dir`,
+  `--no-whole-file`, `--inc-recursive`/`--no-inc-recursive`, `--protect-args`
+  and `--msgs2stderr`.
+- The client `--help` `--max-delete` text now describes the implemented partial
+  semantics (delete up to N, skip the rest, exit 25).
+
+### Notes
+
+- Remaining documented divergences include the `--stats` per-type file-count
+  breakdown, `%b`/`%c` being FastSync wire counts, `-n --delete` line ordering,
+  the default `--delete` timing (delete-after, not rsync's delete-during),
+  destination-only exclude protection (still sender-derived), `--temp-dir`
+  absolute paths, basis-dir attribute re-application and the 256 MiB whole-file
+  cap, `--fuzzy` tie-breaking, `--bwlimit=0`/decimal rates, `zlibx`==`zlib`, and
+  recursive empty-directory creation.
+- Build: adds zlib and lz4 as link dependencies.
+
+## [2.23.0] - 2026-09-16
+
+### Added
+
+- **Rsync-parity wave.** Closed the remaining CLI, filesystem, ownership,
+  deletion, and output gaps against rsync 3.4.1.
+  - Short options `-r` (`--recursive`), `-b` (`--backup`), `-L`
+    (`--copy-links`), and `-B` (`--block-size`/`--delta-block`); rsync
+    short-option clustering (`-av`, `-aAX`, `-rlpt`) and attached/inline values
+    (`--opt=value`, `-B1000`, `-essh`, `-MOPT`). A value that starts with `-`
+    is not mistaken for a cluster.
+  - `-c`/`--checksum` now implies the incremental checksum quick-check (and,
+    like rsync, does not imply `-t`).
+  - `--checksum-choice`/`--cc` accepts `xxh64`/`xxhash`/`xxh3`/`xxh128`/`md5`/
+    `auto` and rejects `md4`/`sha1`/`none` and the two-name form by name;
+    `--checksum-seed=0` (the default) is randomized per transfer and the chosen
+    seed is sent to the receiver.
+  - `--compress-choice`/`--zc` accepts `zstd`/`none`/`auto` and rejects
+    `lz4`/`zlib`/`zlibx` by name; `--skip-compress` defaults to rsync 3.4.1's
+    built-in suffix list; `--no-whole-file` is accepted.
+  - `--timeout` defaults to 0 (disabled) and `--contimeout` to 60 s (both `0`
+    disables), matching rsync; `--max-alloc=0` means no local limit.
+  - `--temp-dir` is confined to the receive root (absolute/`..` rejected by the
+    receiver) and an `EXDEV` install falls back to a non-atomic copy.
+  - `--numeric-ids` is documented as a mapping modifier only;
+    `--usermap`/`--groupmap` support inclusive `LOW-HIGH` ranges, `*`,
+    empty-`FROM` (unnamed ids), and receiver-resolved `TO` names; `--chown`
+    conflicts with a map on the same side are rejected.
+  - `--fake-super` records the *resolved* owner (never a real chown) and replays
+    mode/time; directory ownership and directory xattrs/ACLs are preserved.
+  - `-l`/`--links` stores symlink targets verbatim (absolute and `..`-bearing
+    included), matching rsync; `--safe-links`/`--copy-unsafe-links` are applied
+    sender-side and `--munge-links` uses rsync's `/rsyncd-munged/` marker;
+    `--trust-sender` no longer affects symlink targets.
+  - `--specials` recreates unix sockets with `mknod(S_IFSOCK)` (so `-D` covers
+    the full rsync node set).
+  - Deletion: the manifest carries a synchronized-directory section so
+    `--files-from` subsets no longer delete untransmitted paths;
+    `--delete-excluded` leaves size-pruned mirrors protected; extraneous
+    destination symlinks are unlinked (never followed); `--max-delete=N` is
+    partial (delete up to N, skip the rest, exit 25) and `--delete-missing-args`
+    removals draw from the same budget; `--force` is honored during
+    `--delay-updates` publication.
+  - `-x`/`--one-file-system` emits the mount-point directory entry; the
+    `--include`/`--exclude` layers are an ordered first-match rule list.
+  - `--chmod` is a faithful port of rsync 3.4.1 (numeric/symbolic, `D`/`F`/`X`,
+    `s`/`t`, append semantics, no `-p` implication, no sanitization).
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.22.0 → 2.23.0`: the delete manifest gains a
+  synchronized-directory section and the terminal status gains
+  `STATUS_DELETE_LIMIT` (client exit 25 on a `--max-delete`-capped commit).
+- **The 2.22.0 mode-masking divergence is removed.** Under `-p` the source mode
+  is copied exactly, including `S_IWGRP`/`S_IWOTH` and setuid/setgid/sticky;
+  `--chmod` no longer implies `-p`. New files without `-p` still use
+  `source_mode & ~umask` when metadata is present (else `0644`), and new
+  directories without `-p` still use the `0755` creation default.
+- `--protocol=NUM` accepts only the current `2.23.0` version string.
+
+### Notes
+
+- The rsync-compatibility matrix (`RSYNC_COMPAT.md`) now classifies every row
+  as **parity**, **caveat** (works with a documented divergence), or
+  **divergent** (not supported/no-op/impossible), replacing the previous
+  misleading "N implemented / 0 divergence" summary. Durable documented
+  divergences remain: receiver-side symlink target containment is not enforced
+  by default (verbatim storage is rsync parity; use `--safe-links`),
+  `--temp-dir` rejects absolute/foreign-filesystem paths, `--copy-devices`
+  reads a bounded `st_size`, a broken referent under `--copy-links` exits 0,
+  new directories without `-p` use `0755`, `--stats` receiver-only counters are
+  0, and `--password-file`/`--early-input`/`--hash-credentials`/`--iterations`
+  and the batch format are FastSync-native.
+
+## [2.22.0] - 2026-09-15
+
+### Added
+
+- **Per-attribute metadata preservation (protocol 2.22.0).** The former single
+  metadata bundle is split into four independent, rsync-compatible flags:
+  `-p/--perms`, `-t/--times`, `-o/--owner`, and `-g/--group`, each applied
+  independently on the receiver, with negations `--no-perms`/`--no-times`/
+  `--no-owner`/`--no-group` (short `--no-p`/`--no-t`/`--no-o`/`--no-g`) and
+  `--no-preserve` clearing all four. `-a/--archive` is now full rsync
+  `-rlptgoD` (owner and group included; their application stays
+  privilege-gated). `-A/--acls` and `--chmod` imply `-p`, `-X/--xattrs` does
+  not, `-E/--executability` sets only executability, and `-U`/`-N` do not imply
+  `-t`. `--incremental`/`--delta` still auto-preserve perms+times unless the
+  user explicitly negated them.
+- Receiver applies directory modes under `-p` (at the end of the transfer,
+  alongside the deferred directory times) and symlink mode under `-p`; `-O`
+  suppresses directory times only.
+
+### Changed
+
+- `PROTOCOL_VERSION` bumped `2.21.0 → 2.22.0`: the binary config frame gains
+  four appended booleans (`preserve_perms`/`preserve_times`/`preserve_owner`/
+  `preserve_group`) after `omit_link_times`. The fixed-width `FileMetadata`
+  layout is unchanged; the receiver derives the metadata-frame gate
+  (`use_metadata`) from the four attributes.
+
+### Notes
+
+- Documented divergences from rsync: a client-supplied mode never grants
+  group/other write (`S_IWGRP|S_IWOTH` are stripped for files, directories,
+  symlinks, and specials; rsync's `-p` preserves them exactly); a brand-new file
+  without `-p` gets `source_mode & ~umask` (sanitized) when metadata is present,
+  else the historical fixed `0644`; `--chmod` implies `-p` (rsync does not);
+  `-o`/`-g` map by name on the receiver with a raw-numeric fallback (only
+  numeric ids cross the wire); and a daemon module without `client owner = yes`
+  does not refuse a plain `-a`/`-o`/`-g` but forces super-user activities off,
+  applies no ownership, and logs a warning (explicit `--chown`/`--usermap`/
+  `--groupmap`/`--numeric-ids`/`--copy-as`/`--super` are still refused).
+
+## [2.21.0] - 2026-09-14
+
+### Added
+
+- Optional server→client rejection detail (protocol 2.21.0). A rejected
+  operation may now carry a bounded human-readable reason via
+  `STATUS_ERROR_DETAIL` instead of a bare `STATUS_ERROR`, so the client can
+  report *why* the server refused (daemon module gate, config validation,
+  receiver-side path/node validation). `receive_status()` transparently maps the
+  new status back to `STATUS_ERROR` for every existing call site and captures
+  the reason into a thread-local buffer exposed by `protocol_last_error()`. The
+  detail body is always consumed, so the stream cannot desynchronize, and
+  messages are sliced to `MAX_ERROR_DETAIL_BYTES` (4096) on send.
+- **Server-contacting `--dry-run` (protocol 2.21.0).** `--dry-run` now performs
+  a real handshake with a remote/daemon receiver and reports exactly what WOULD
+  change based on receiver state (existing destination files, mtimes, checksums,
+  basis dirs). The wire config carries the dry-run intent (`Config.dry_run`) and
+  the receiver answers each per-file check with `STATUS_DRY_RUN_TRANSFER` (would
+  transfer) or `STATUS_OK` (already up to date); the sender prints the
+  would-transfer set and its trailer without sending any file data. The receiver
+  performs the normal read-only incremental decision but mutates nothing: no temp
+  files, writes, renames, deletes, metadata/xattr/chown, or directory creation.
+  A plain local destination (no explicit `--server-port`/remote) keeps the
+  original client-side dry-run. Would-delete reporting for `--delete*` is
+  deferred to a follow-up; dry-run never deletes.
+- Daemon `max connections per host` (per-source-IP concurrent cap, default 0 =
+  unlimited), `auth lockout threshold` (default 10; 0 disables) and
+  `auth lockout duration` (default 300 s) config keys.
+- `fastsync-server --allow-super` opt-in for a privileged standalone TCP server;
+  without it a root standalone receiver forces super-user activities off (device
+  nodes, `--write-devices`, ownership). The `--stdio` SSH argv is client-composed,
+  so super activities always stay off there.
+
+### Changed
+
+- Config wire fields are now declared once in an X-macro table
+  (`CONFIG_WIRE_FIELDS` in `src/shared/config.h`) that generates the struct
+  members, defaults, and the send/receive sequence, removing the manual
+  six-site field sync. Wire bytes and `PROTOCOL_VERSION` are unchanged.
+- `receive_incremental_check()` (the per-file `STATUS_CHECK` fast path) is split
+  into small static helpers with a short linear orchestrator. Pure refactor: the
+  wire byte stream and all cleanup are unchanged.
+- `authorized_root` state has a single owner (`utils.c`) with read accessors; the
+  duplicated statics in `file.c` and the server were removed.
+- `Data` records its owning `ProtocolSession` so its memory charge is returned to
+  the session that reserved it, regardless of the destroying thread.
+- The receiver pipeline moved out of `shared` into `server/receiver_pipeline.[ch]`;
+  the build now uses explicit `fastsync_shared` / `fastsync_client_core` /
+  `fastsync_server_core` targets instead of a GLOB, and the client no longer links
+  server code.
+- The benchmark tool generates the requested random/compressible data mix
+  accurately, verifies each transfer before recording it, computes correct
+  percentiles, adds a MB/s column, handles `tc`/netem without requiring `sudo`
+  when already root, builds into a dedicated `build-bench/` directory, and adds a
+  `--warm` incremental-transfer mode.
+- The `nix-shell` dev environment provides the full toolchain (clang-format,
+  cppcheck, pytest-xdist, OpenSSH, rsync, iproute2, valgrind, lcov) and no longer
+  builds on entry.
+
+### Security
+
+- Enforce the daemon's per-module `max connections` cap (0 = unlimited) and add
+  the shared per-source `max connections per host` cap plus a cross-process
+  `auth lockout`. Because the listener forks one child per connection, the
+  counters live in an anonymous shared mapping created before the accept loop and
+  reclaimed by the parent's `SIGCHLD` handler, so the per-module, per-source and
+  auth-failure state is shared across every child (including after `SIGKILL`). The
+  per-source table has a bounded lifetime (expired/idle entries are reclaimed,
+  with a rate-limited warning when genuinely full), and the occupancy counters are
+  re-derived from the shared slot table on every child exit. Trusted loopback
+  peers are exempt (they share one address); clients behind a shared NAT/proxy
+  share a single per-host budget and lockout, which is documented.
+- Hardening from a full security audit:
+  - Fail a truncated zstd frame instead of spinning forever (remote DoS).
+  - Open receiver destination/basis/hard-link entries `O_NONBLOCK` so a
+    client-planted FIFO cannot block a worker indefinitely.
+  - Require a regular file before `--inplace` writes, closing a FIFO-hang and a
+    raw-device write that bypassed the `--write-devices` gate.
+  - Reject SSH destinations whose user/host begins with `-` and insert `--` before
+    the host token, closing `-o ProxyCommand=…` argument injection (RCE).
+  - Gate client `--force` recursive removal behind the server `--allow-delete`
+    policy.
+  - Reject empty `hosts allow`/`hosts deny`/`auth users` values instead of
+    silently meaning "unrestricted".
+  - Restrict TLS 1.2 to AEAD suites and set server cipher preference; load the
+    private key TOCTOU-safely from an `O_NOFOLLOW` fd; verify IP literals against
+    IP SANs; guard client-cert CN truncation.
+  - Make `--dry-run` content-blind: it neither reads destination files nor
+    hashes basis files, removing a 1-bit content oracle against `read only`
+    modules.
+  - Bound glob matching (iterative DP, no exponential backtracking) and bound
+    line reads for filter/`--files-from`/pattern files.
+  - Gate `system.posix_acl_*` xattrs on `--acls` and charge decompression/chunk
+    allocations against the per-connection memory budget.
+
+### Fixed
+
+- Pre-auth NULL dereference in `config_delete()` when an over-long
+  `basis_count` (and the analogous count fields) was received and then failed
+  validation; received counts are now validated before being published.
+- Leaked inherited `Data` in the forked compression-truncation unit test
+  (valgrind definite leak).
+- `receive_status()` no longer loses a captured rejection reason when owed
+  keepalives are drained.
+
+## [2.20.0] - 2026-09-13
+
+### Security
+
+- Cap cumulative `DirTimeList` growth and bound pre-auth config-string memory
+  (remote memory-exhaustion DoS).
+- Daemon host access control (`hosts allow`/`hosts deny`, IPv4/IPv6/CIDR),
+  configurable global `max connections`, connection audit logging, and a
+  bounded `auth failure delay` throttle. IPv4-mapped peers are normalized and
+  invalid patterns are rejected at parse time (no silent fail-open).
+- Honor `--timeout` for protocol I/O and bound idle/session time to defeat
+  keepalive slowloris; child-safe signal handling in the forked daemon.
+- Compiler/linker hardening (`_FORTIFY_SOURCE`, stack protector, PIE, RELRO)
+  and pinned build dependencies.
+
+### Fixed
+
+- Use-after-free in the basis-dir oversize preflight.
+- Placeholder `Data` leaks, `missing_args` leak, scanner chunk leak.
+- Thread-safe logging; single fd owner and cleanup epilogue in the server
+  handler.
+
+### Performance
+
+- Metadata now crosses the wire as one packed frame (protocol 2.20.0).
+- Delete keep-set and `--files-from` lookups indexed (O(n*m) → O(n)).
+- Reused per-thread zstd contexts; `TCP_NODELAY` by default.
+- Byte-bounded sender queues; removed a redundant scanner `stat()`.
+
 ## [2.19.0] - 2026-09-12
 
 ### Security

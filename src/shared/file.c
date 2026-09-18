@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,19 +40,27 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
 }
 
 /* Preallocate `size` bytes on `fd` before any data is written (--preallocate).
- * posix_fallocate reserves real disk blocks, so an out-of-space condition
+ * fallocate(2) reserves real disk blocks, so an out-of-space condition
  * (ENOSPC/EDQUOT) surfaces up front instead of partway through a transfer;
- * unavoidable fragmentation of a streamed file is also reduced.  Some
- * filesystems (e.g. tmpfs, ZFS) do not support it and return EOPNOTSUPP/ENOSYS,
- * where we fall back to ftruncate, which still extends the logical size so the
- * fail-fast/contiguity intent degrades gracefully but never fails.  Genuine
- * allocation failures are propagated as the error code (caller fails the write).
- * posix_fallocate leaves the fd's file offset unchanged, so the subsequent
- * write_all at offset 0 is unaffected.  Returns 0 on success (including the
- * fallback) or a nonzero error code. */
+ * unavoidable fragmentation of a streamed file is also reduced.  rsync favors
+ * the syscall over glibc posix_fallocate (whose emulation can be subtly
+ * different), so try fallocate(2) first and only fall back to posix_fallocate,
+ * then to ftruncate on filesystems (e.g. tmpfs, ZFS) that support neither.  The
+ * logical size is always extended, so the fail-fast/contiguity intent degrades
+ * gracefully but never fails on an unsupported filesystem; genuine allocation
+ * failures are propagated as the error code (caller fails the write).  Neither
+ * leaves the fd's file offset guaranteed, so the caller seeks back to 0 before
+ * writing.  Returns 0 on success (including the fallback) or a nonzero error
+ * code. */
 static int preallocate_fd(int fd, unsigned long long size) {
   if (size == 0)
     return 0;
+#ifdef __linux__
+  if (fallocate(fd, 0, 0, (off_t)size) == 0)
+    return 0;
+  if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL)
+    return errno;
+#endif
   int rc = posix_fallocate(fd, 0, (off_t)size);
   if (rc == EOPNOTSUPP || rc == ENOSYS) {
     if (ftruncate(fd, (off_t)size) == 0)
@@ -70,6 +79,58 @@ static int preallocate_fd(int fd, unsigned long long size) {
 static unsigned long long next_temp_sequence(void) {
   static atomic_ullong sequence;
   return atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+}
+
+/* Process-wide umask, captured exactly once.  Reading the umask requires a
+ * get+set round trip (umask(0); umask(old)); doing that per write would be racy
+ * in the multithreaded receiver, so the value is captured at process startup by
+ * file_umask_capture() (called at the top of main(), before any threads exist).
+ * The pthread_once fallback keeps a caller that never called the capture (e.g. a
+ * unit test) correct. */
+static unsigned g_process_umask;
+static atomic_bool g_process_umask_captured;
+static pthread_once_t g_process_umask_once = PTHREAD_ONCE_INIT;
+
+static void file_capture_umask_now(void) {
+  mode_t mask = umask(0);
+  umask(mask);
+  g_process_umask = (unsigned)mask;
+  atomic_store_explicit(&g_process_umask_captured, true, memory_order_release);
+}
+
+static void file_capture_umask_once(void) {
+  if (atomic_load_explicit(&g_process_umask_captured, memory_order_acquire))
+    return;
+  file_capture_umask_now();
+}
+
+/* Re-captures the umask.  Must only be called while the process is still
+ * single-threaded (startup, or the daemon's post-fork setup after umask(0)),
+ * so a later re-capture can refresh the cached value before any receiver
+ * thread exists. */
+void file_umask_capture(void) {
+  file_capture_umask_now();
+}
+
+unsigned file_process_umask(void) {
+  if (!atomic_load_explicit(&g_process_umask_captured, memory_order_acquire))
+    pthread_once(&g_process_umask_once, file_capture_umask_once);
+  return g_process_umask;
+}
+
+/* Base mode applied when the policy does not take the source mode wholesale
+ * (i.e. --perms is off).  A pre-existing destination keeps its own mode; a
+ * brand-new file is created like rsync: source_mode & 0777 & ~umask (special
+ * bits are not part of a mode-preserving transfer without -p).  Only when no
+ * metadata is available at all does the historical fixed 0644 default apply.
+ * The -E rule (and no-op for a plain -t) is layered on top of this base. */
+static mode_t file_mode_base(const FileMetadata* metadata, bool existing_known,
+                             mode_t existing_mode) {
+  if (existing_known)
+    return existing_mode;
+  if (metadata)
+    return metadata->mode & 0777 & ~(mode_t)file_process_umask();
+  return S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 }
 
 bool file_checksum(File* file, ChecksumAlgo algo, uint64_t seed, uint8_t* out, size_t out_capacity,
@@ -124,6 +185,8 @@ File* file_create(const char* path) {
   file->rdev_major = 0;
   file->rdev_minor = 0;
   file->xattrs = NULL;
+  file->dest_state = (OutputDestState){0};
+  file->matched_bytes = 0;
   return file;
 }
 
@@ -284,28 +347,6 @@ size_t file_content_to_buffer(File* file) {
 
 /* ---- Secure filesystem primitives ---- */
 
-static int authorized_root_fd = -1;
-static char* authorized_root_path;
-
-static bool path_is_within_root(const char* root, const char* path) {
-  size_t root_len = strlen(root);
-  return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
-}
-
-bool file_set_authorized_root(int fd, const char* canonical_path) {
-  char* path_copy = canonical_path ? str_dup(canonical_path) : NULL;
-  if (canonical_path && !path_copy) {
-    authorized_root_fd = -1;
-    free(authorized_root_path);
-    authorized_root_path = NULL;
-    return false;
-  }
-  authorized_root_fd = fd;
-  free(authorized_root_path);
-  authorized_root_path = path_copy;
-  return true;
-}
-
 bool file_path_exists_secure(const char* path) {
   if (!path)
     return false;
@@ -362,10 +403,6 @@ void file_set_keep_dirlinks(bool enable) {
   file_keep_dirlinks = enable;
 }
 
-bool file_get_keep_dirlinks(void) {
-  return file_keep_dirlinks;
-}
-
 /* --trust-sender (Phase 5) receiver process-wide policy: when set, the receiver
  * trusts the sender's file list and skips its own redundant up-front re-
  * validation (empty/".." path rejection, escaping-symlink-target containment).
@@ -383,10 +420,69 @@ bool file_get_trust_sender(void) {
   return file_trust_sender;
 }
 
-/* True when `target` is a lexical symlink target that can never escape the
- * receive root once created beneath it: relative (not absolute) and containing
- * no ".." path component.  Used by --munge-links' sender-side containment: an
- * escaping target is never transmitted (the entry is skipped/contained). */
+/* rsync 3.4.1 unsafe_symlink(): true when `target` (the link's destination
+ * string) points outside the transfer tree rooted at the symlink's own
+ * location.  `link_path` is the symlink's path relative to the top of the
+ * transfer (including its name).  This is a purely lexical test matching
+ * rsync's util1.c: absolute/empty targets are always unsafe; leading "../"
+ * components are counted against the symlink's own directory depth; a ".."
+ * that would climb above the transfer root is unsafe.  rsync 3.4.1 additionally
+ * rejects any INTERNAL "/../" component and a trailing "/..". */
+bool file_symlink_unsafe(const char* target, const char* link_path) {
+  if (!target || target[0] == '\0' || target[0] == '/')
+    return true;
+  const char* rest = target;
+  while (strncmp(rest, "../", 3) == 0) {
+    rest += 3;
+    while (*rest == '/')
+      rest++;
+  }
+  if (strstr(rest, "/../") != NULL)
+    return true;
+  size_t target_len = strlen(target);
+  if (target_len > 3 && strcmp(&target[target_len - 3], "/..") == 0)
+    return true;
+
+  int depth = 0;
+  const char* name;
+  const char* slash;
+  const char* src = link_path ? link_path : "";
+  for (name = src; (slash = strchr(name, '/')) != NULL; name = slash + 1) {
+    if (*name == '.' && (name[1] == '/' || (name[1] == '.' && name[2] == '/'))) {
+      if (name[1] == '.')
+        depth = 0;
+    } else {
+      depth++;
+    }
+    while (slash[1] == '/')
+      slash++;
+  }
+  if (*name == '.' && name[1] == '.' && name[2] == '\0')
+    depth = 0;
+
+  for (name = target; (slash = strchr(name, '/')) != NULL; name = slash + 1) {
+    if (*name == '.' && (name[1] == '/' || (name[1] == '.' && name[2] == '/'))) {
+      if (name[1] == '.') {
+        if (--depth < 0)
+          return true;
+      }
+    } else {
+      depth++;
+    }
+    while (slash[1] == '/')
+      slash++;
+  }
+  if (*name == '.' && name[1] == '.' && name[2] == '\0')
+    depth--;
+  return depth < 0;
+}
+
+/* Strict lexical helper: true when `target` is relative (not absolute) and
+ * contains no ".." component at all, so it can never escape the directory it
+ * is created in.  This is stricter than rsync's unsafe_symlink() (which allows
+ * an in-tree ".."); the scanner/receiver use file_symlink_unsafe()/--safe-links
+ * for rsync parity, and this helper is retained for callers that want the
+ * ".."-free guarantee. */
 bool file_symlink_target_contained(const char* target) {
   if (!target || target[0] == '\0' || target[0] == '/')
     return false;
@@ -417,8 +513,9 @@ bool file_symlink_unmunge(char* target) {
   return true;
 }
 
-/* Owned copy of `target` prefixed with SYMLINK_MUNGE_PREFIX (the sender-side
- * --munge-links rewriting).  Returns NULL on allocation failure. */
+/* Owned copy of `target` prefixed with SYMLINK_MUNGE_PREFIX (the receiver-side
+ * --munge-links rewriting, matching rsync's receiver).  Returns NULL on
+ * allocation failure. */
 char* file_symlink_munge(const char* target) {
   if (!target)
     return NULL;
@@ -439,22 +536,13 @@ char* file_symlink_munge(const char* target) {
  * the target is ever followed.  The final component is never dereferenced: an
  * existing non-directory entry at `path` is unlinked by name before the link is
  * placed; an existing directory there is left untouched (returns false, so a
- * caller can treat it as a collision).  As a receiver-side trust-boundary
- * invariant, `target` must be file_symlink_target_contained() (relative and
- * ".."-free): an absolute or escaping target is rejected outright (returns
- * false) so a malicious sender can never materialize a symlink that points
- * outside the receive root. */
+ * caller can treat it as a collision).  The link VALUE `target` is copied
+ * verbatim, matching rsync -l (which stores absolute and ".."-bearing targets
+ * as-is); target policy is the caller's job -- the scanner applies
+ * --safe-links/--copy-unsafe-links, and the receiver applies --munge-links.
+ * The PLACEMENT path is always confined below the authorized root. */
 bool file_symlink_at_secure(const char* path, const char* target) {
-  /* The link itself (`path`) is always kept below the authorized root.  The
-     TARGET may point anywhere: normally only a contained (relative, ".."-free)
-     target is permitted so a malicious sender can never plant a symlink that
-     later dereferences outside the root.  Under --trust-sender that target
-     containment check is relaxed (the receiver trusts the sender and copies the
-     link verbatim, matching rsync -l), but path/leaf confinement is never
-     disabled, so the link still cannot be placed outside the tree. */
   if (!path || !target || has_path_traversal(path))
-    return false;
-  if (!file_trust_sender && !file_symlink_target_contained(target))
     return false;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(path, &leaf, true);
@@ -492,7 +580,10 @@ static int open_dir_beneath_root(const char* resolved, const char* root) {
     rel++;
   if (*rel == '\0')
     return -1;
-  int fd = dup(authorized_root_fd);
+  int root_fd = utils_get_authorized_root_fd();
+  if (root_fd < 0)
+    return -1;
+  int fd = dup(root_fd);
   if (fd < 0)
     return -1;
   char* copy = str_dup(rel);
@@ -534,20 +625,21 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
     return -1;
   }
   int fd;
-  if (authorized_root_fd >= 0) {
-    if (!authorized_root_path || path[0] != '/' ||
-        !path_is_within_root(authorized_root_path, path)) {
+  int root_fd = utils_get_authorized_root_fd();
+  const char* root_path = utils_get_authorized_root_path();
+  if (root_fd >= 0) {
+    if (!root_path || path[0] != '/' || !path_is_within_root(root_path, path)) {
       free(copy);
       free(leaf);
       return -1;
     }
-    fd = dup(authorized_root_fd);
+    fd = dup(root_fd);
     if (fd < 0) {
       free(copy);
       free(leaf);
       return -1;
     }
-    size_t root_len = strlen(authorized_root_path);
+    size_t root_len = strlen(root_path);
     char* relative = str_dup(path + root_len);
     if (!relative) {
       free(copy);
@@ -580,7 +672,7 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
     if (strcmp(component, ".") != 0) {
       int next = openat(fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (next < 0 && create_dirs && errno == ENOENT) {
-        bool created = mkdirat(fd, component, 0755) == 0;
+        bool created = mkdirat(fd, component, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0;
         if (created || errno == EEXIST) {
           /* P7 Wave E: --copy-as owns EVERY entry, including the intermediate
              directories this walk creates implicitly.  Its target ids are a
@@ -611,15 +703,14 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
          O_NOFOLLOW walk.  Only honoured when the symlink resolves to a
          directory that stays beneath the authorized root, so a malicious link
          can never redirect the write outside it. */
-      if (next < 0 && file_keep_dirlinks && authorized_root_path != NULL &&
+      if (next < 0 && file_keep_dirlinks && root_path != NULL &&
           (errno == ELOOP || errno == ENOTDIR || errno == EACCES)) {
         struct stat lst;
         if (fstatat(fd, component, &lst, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode)) {
           char candidate[PATH_MAX];
           char root[PATH_MAX];
-          if (realpath(authorized_root_path, root) &&
-              snprintf(candidate, sizeof(candidate), "%s%s/%s", root, rel_buf, component) <
-                  (int)sizeof(candidate)) {
+          if (realpath(root_path, root) && snprintf(candidate, sizeof(candidate), "%s%s/%s", root,
+                                                    rel_buf, component) < (int)sizeof(candidate)) {
             char resolved[PATH_MAX];
             if (realpath(candidate, resolved) && strcmp(resolved, root) != 0 &&
                 strncmp(root, resolved, strlen(root)) == 0 &&
@@ -694,8 +785,9 @@ bool file_ensure_directory_secure(const char* path) {
     return false;
   /* The authorized root is already an open directory, and the filesystem root
      is always present: there is no final component left to create for them. */
+  const char* root_path = utils_get_authorized_root_path();
   bool root_is_open =
-      authorized_root_fd >= 0 && authorized_root_path && strcmp(norm, authorized_root_path) == 0;
+      utils_get_authorized_root_fd() >= 0 && root_path && strcmp(norm, root_path) == 0;
   if (root_is_open || strcmp(norm, "/") == 0) {
     free(norm);
     return true;
@@ -709,7 +801,7 @@ bool file_ensure_directory_secure(const char* path) {
   int dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   bool created = false;
   if (dir_fd < 0 && errno == ENOENT) {
-    if (mkdirat(parent_fd, leaf, 0755) == 0) {
+    if (mkdirat(parent_fd, leaf, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0) {
       created = true;
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     } else if (errno == EEXIST) {
@@ -742,8 +834,9 @@ bool file_directory_exists_secure(const char* path) {
   char* norm = normalize_directory_path(path);
   if (!norm)
     return false;
+  const char* root_path = utils_get_authorized_root_path();
   bool root_is_open =
-      authorized_root_fd >= 0 && authorized_root_path && strcmp(norm, authorized_root_path) == 0;
+      utils_get_authorized_root_fd() >= 0 && root_path && strcmp(norm, root_path) == 0;
   if (root_is_open || strcmp(norm, "/") == 0) {
     free(norm);
     return true;
@@ -876,29 +969,48 @@ int file_open_private_dir(const char* dir_path) {
   return fd;
 }
 
+/* Open a --temp-dir scratch directory exactly as rsync does: the directory must
+ * already exist and is used as given (an absolute path is used verbatim, a
+ * relative one was already resolved against the destination root by the
+ * caller).  Unlike file_open_private_dir this neither creates it nor confines
+ * it below the receive root, because rsync accepts any temp dir -- including
+ * one outside the destination tree or on another filesystem.  Returns an
+ * O_DIRECTORY|O_CLOEXEC fd, or -1 on error. */
+int file_open_temp_dir(const char* dir_path) {
+  if (!dir_path)
+    return -1;
+  return open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
 /* After the content and mode/times are restored on the just-written file, apply
  * the per-file xattrs (-X/-A) and, for --fake-super, park the source's
  * uid/gid/mode/mtime in the reserved xattr.  All fd-relative (confined to the
  * destination file) and best-effort: a per-attribute or privilege failure is
  * logged and skipped, never fatal. */
 static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXattrList* xattrs,
-                             bool fake_super) {
+                             bool fake_super, FileAttrPolicy policy) {
   xattr_apply_fd(fd, xattrs);
   if (fake_super && metadata) {
-    fake_super_store_fd(fd, (uint32_t)metadata->uid, (uint32_t)metadata->gid,
-                        (uint32_t)metadata->mode, metadata->mtime_sec, metadata->mtime_nsec);
-    /* Replay: re-apply the recorded uid/gid/mode/mtime fd-relative so a save
-       under --fake-super restores the attrs (when privileged) instead of only
-       recording them.  Best-effort; fake_super_restore_fd silently skips a
-       non-root fchown EPERM/EACCES and never fatal. */
-    fake_super_restore_fd(fd);
+    /* Record the ownership that WOULD have been applied: when an explicit
+       ownership request (--chown/--usermap/--groupmap/--copy-as or -o/-g) is
+       active, the resolved mapping; otherwise the source's own id.  The real
+       chown is suppressed (identity_apply_ownership early-returns under
+       --fake-super) so recording never defeats the flag.  Mode/mtime are still
+       replayed (policy-gated) so unprivileged --fake-super keeps working. */
+    uint32_t store_uid;
+    uint32_t store_gid;
+    identity_resolve_storage_ids((int32_t)metadata->uid, (int32_t)metadata->gid, &store_uid,
+                                 &store_gid);
+    fake_super_store_fd(fd, store_uid, store_gid, (uint32_t)metadata->mode, metadata->mtime_sec,
+                        metadata->mtime_nsec);
+    fake_super_restore_fd(fd, policy);
   }
 }
 
 static bool file_to_disk_secure_impl(const char* path, const void* data,
                                      unsigned long long data_size, bool inplace, bool sparse,
                                      bool preallocate, const FileMetadata* metadata,
-                                     bool preserve_executability, bool update, bool no_replace,
+                                     FileAttrPolicy policy, bool update, bool no_replace,
                                      bool use_fsync, const char* temp_dir,
                                      const FileXattrList* xattrs, bool fake_super,
                                      bool keep_partial) {
@@ -908,27 +1020,65 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
     return false;
   int fd = -1;
   bool ok = false;
+  /* Set when a --temp-dir install fails with EXDEV: rsync then falls back to a
+   * non-atomic write directly in the destination directory (see the tail of
+   * this function). */
+  bool cross_device_fallback = false;
+  /* The base mode applied when --perms is off (neither the source mode nor an
+   * exec-only change is taken wholesale): a pre-existing destination keeps its
+   * own mode (special bits dropped), while a brand-new file uses
+   * source&~umask when metadata is available (see file_mode_base) or 0644 when
+   * there is none.  Captured from the destination probe before the write. */
+  mode_t existing_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+  bool existing_mode_known = false;
   if (inplace) {
     /* --inplace writes directly into the destination; a scratch --temp-dir
        does not apply and must never redirect these writes. */
-    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+    /* Type gate BEFORE opening: an existing destination entry that is not a
+       regular file (FIFO, socket, char/block device, directory) must never be
+       opened for writing.  Opening a FIFO would block the receive thread
+       forever and writing into a device would bypass the --write-devices /
+       super-mode gate (a client-controlled device write).  fstatat with
+       AT_SYMLINK_NOFOLLOW does not follow a symlink and does not block. */
+    struct stat pre_stat;
+    if (fstatat(dirfd, leaf, &pre_stat, AT_SYMLINK_NOFOLLOW) == 0) {
+      if (!S_ISREG(pre_stat.st_mode)) {
+        close(dirfd);
+        free(leaf);
+        return false;
+      }
+      /* Capture the old destination mode before the overwrite so a no--p/-E
+       * write can restore it (the write itself may clear setuid/setgid). */
+      existing_mode = pre_stat.st_mode & 0777;
+      existing_mode_known = true;
+    }
+    /* O_NONBLOCK: a no-op for a regular file, but a raced-in FIFO cannot block
+       the open before the post-open S_ISREG re-check rejects it. */
+    fd = openat(dirfd, leaf, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
     if (fd >= 0) {
       struct stat destination_stat;
+      /* Re-check the opened descriptor: a concurrent replacement between the
+         fstatat probe and the open (or a device/FIFO raced in) must never be
+         written through. */
+      if (fstat(fd, &destination_stat) != 0 || !S_ISREG(destination_stat.st_mode)) {
+        close(fd);
+        close(dirfd);
+        free(leaf);
+        return false;
+      }
       bool newer = false;
-      if (update && metadata && fstat(fd, &destination_stat) == 0 &&
-          S_ISREG(destination_stat.st_mode)) {
-        newer = stat_is_newer(&destination_stat, metadata);
+      if (update && metadata && stat_is_newer(&destination_stat, metadata)) {
+        newer = true;
       }
       if (newer) {
         ok = true;
       } else {
         /* Preallocate the expected payload size before writing so an
            out-of-space condition fails cleanly up front (--preallocate).
-           --sparse takes precedence: posix_fallocate would allocate every
-           block, defeating the holes the sparse writer would create, so the
-           two never combine here (the ftruncate presize below stays). */
+           rsync lets --preallocate win over --sparse (the reserved blocks
+           survive the sparse writer's seeks), so both flags can be active. */
         int prealloc_rc = 0;
-        if (preallocate && !sparse && data_size > 0) {
+        if (preallocate && data_size > 0) {
           prealloc_rc = preallocate_fd(fd, data_size);
           if (prealloc_rc != 0) {
             char* escaped_path = output_escape(path, log_get_8_bit_output());
@@ -952,15 +1102,25 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
           /* Normalize the mode: apply the metadata-derived safe mode when the
              sender supplied metadata (setuid/setgid/sticky are never honored);
              otherwise fall back to a safe default so dangerous bits on an
-             existing destination cannot survive an overwrite. */
+             existing destination cannot survive an overwrite.  When the policy
+             requests neither -p nor -E the source mode is deliberately ignored
+             and the pre-existing destination mode (or 0644 for a new file) is
+             restored instead.  The exec-bits-only -E change is likewise applied
+             on top of that destination-derived base, not the scratch file's
+             0600. */
           if (ok) {
-            if (metadata)
-              ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
-            else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
+            if (metadata) {
+              if (!policy.perms &&
+                  fchmod(fd, file_mode_base(metadata, existing_mode_known, existing_mode)) != 0)
+                ok = false;
+              if (ok)
+                ok = file_restore_metadata_fd(fd, metadata, policy);
+            } else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0) {
               ok = false;
+            }
           }
           if (ok)
-            restore_extra_fd(fd, metadata, xattrs, fake_super);
+            restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
           if (ok && use_fsync)
             ok = fsync(fd) == 0;
         }
@@ -973,25 +1133,31 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
        install failure (partial data may exist, --partial may retain it) from a
        pre-write validation failure (nothing to retain). */
     bool write_attempted = false;
-    if (update && metadata) {
-      /* This check protects the normal atomic path as far as possible.  A
-         concurrent replacement can still occur before the final rename. */
-      struct stat destination_stat;
-      if (fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
-          S_ISREG(destination_stat.st_mode) && stat_is_newer(&destination_stat, metadata)) {
-        close(dirfd);
-        free(leaf);
-        return true;
-      }
+    /* Probe the destination ONCE up front: it both drives the --update check
+       and records the pre-existing mode the no--p/-E fallback preserves. */
+    struct stat destination_stat;
+    bool destination_is_regular =
+        fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(destination_stat.st_mode);
+    if (destination_is_regular) {
+      existing_mode = destination_stat.st_mode & 0777;
+      existing_mode_known = true;
+    }
+    if (update && metadata && destination_is_regular &&
+        stat_is_newer(&destination_stat, metadata)) {
+      close(dirfd);
+      free(leaf);
+      return true;
     }
     /* Scratch directory for the temporary working copy.  When NULL the temp
        file is created in the destination directory, exactly as historically. */
     int scratch_dirfd = -1;
     if (temp_dir) {
-      scratch_dirfd = file_open_private_dir(temp_dir);
+      scratch_dirfd = file_open_temp_dir(temp_dir);
       if (scratch_dirfd < 0) {
         int saved_errno = errno;
-        log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s",
+        log_message(LOG_LEVEL_ERROR,
+                    "--temp-dir '%s' could not be opened (rsync requires it to already exist): %s",
                     temp_dir, strerror(saved_errno));
         close(dirfd);
         free(leaf);
@@ -1038,7 +1204,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
       if (fd < 0)
         continue; /* EEXIST (or a transient open error): try a fresh name. */
       int prealloc_rc = 0;
-      if (preallocate && !sparse && data_size > 0) {
+      if (preallocate && data_size > 0) {
         prealloc_rc = preallocate_fd(fd, data_size);
         if (prealloc_rc != 0) {
           char* escaped_path = output_escape(path, log_get_8_bit_output());
@@ -1060,10 +1226,19 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                    ? file_store_write_sparse(fd, (const unsigned char*)data, data_size)
                    : write_all(fd, data, data_size);
         }
-        if (ok && metadata)
-          ok = file_restore_metadata_fd(fd, metadata, preserve_executability);
+        if (ok) {
+          if (metadata) {
+            if (!policy.perms &&
+                fchmod(fd, file_mode_base(metadata, existing_mode_known, existing_mode)) != 0)
+              ok = false;
+            if (ok)
+              ok = file_restore_metadata_fd(fd, metadata, policy);
+          } else if (fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0) {
+            ok = false;
+          }
+        }
         if (ok)
-          restore_extra_fd(fd, metadata, xattrs, fake_super);
+          restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
         if (ok && use_fsync)
           ok = fsync(fd) == 0;
       }
@@ -1080,17 +1255,16 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                 errno != ENOENT)
               ok = false;
           } else {
+            /* Cross-device (or otherwise impossible) link: rsync falls back to
+               writing the file directly in the destination directory.  Record
+               it and retry below with no scratch dir. */
             if (scratch_dirfd >= 0 && errno == EXDEV)
-              log_message(LOG_LEVEL_ERROR,
-                          "temp dir is on a different filesystem than the destination; cannot "
-                          "link file into place (EXDEV); no fallback copy is attempted");
+              cross_device_fallback = true;
             ok = false;
           }
         } else if (renameat(scratch_dirfd >= 0 ? scratch_dirfd : dirfd, tmp, dirfd, leaf) != 0) {
           if (scratch_dirfd >= 0 && errno == EXDEV)
-            log_message(LOG_LEVEL_ERROR,
-                        "temp dir is on a different filesystem than the destination; cannot "
-                        "atomically install file (EXDEV); no fallback copy is attempted");
+            cross_device_fallback = true;
           ok = false;
         }
       }
@@ -1123,43 +1297,49 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
     close(fd);
   close(dirfd);
   free(leaf);
+  if (cross_device_fallback) {
+    /* rsync semantics: a --temp-dir on another filesystem must not abort the
+       write.  Retry once with no scratch dir so the file is written and
+       installed non-atomically in the destination directory. */
+    log_message(LOG_LEVEL_WARNING,
+                "temp dir is on a different filesystem than the destination; falling back to a "
+                "non-atomic copy into the destination directory");
+    return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
+                                    policy, update, no_replace, use_fsync, NULL, xattrs, fake_super,
+                                    keep_partial);
+  }
   return ok;
 }
 
 bool file_to_disk_secure(const char* path, const void* data, unsigned long long data_size,
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
-                         bool preserve_executability, const char* temp_dir) {
+                         FileAttrPolicy policy, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, false, false, false, temp_dir, NULL,
-                                  false, false);
+                                  policy, false, false, false, temp_dir, NULL, false, false);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
                                 bool inplace, bool sparse, bool preallocate,
-                                const FileMetadata* metadata, bool preserve_executability,
+                                const FileMetadata* metadata, FileAttrPolicy policy,
                                 const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, true, false, false, temp_dir, NULL, false,
-                                  false);
+                                  policy, true, false, false, temp_dir, NULL, false, false);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     unsigned long long data_size, bool inplace, bool sparse,
                                     bool preallocate, const FileMetadata* metadata,
-                                    bool preserve_executability, bool use_fsync,
-                                    const char* temp_dir) {
+                                    FileAttrPolicy policy, bool use_fsync, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, false, false, use_fsync, temp_dir, NULL,
-                                  false, false);
+                                  policy, false, false, use_fsync, temp_dir, NULL, false, false);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     unsigned long long data_size, bool sparse, bool preallocate,
-                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const FileMetadata* metadata, FileAttrPolicy policy,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
-                                  preserve_executability, false, true, false, temp_dir, NULL, false,
-                                  false);
+                                  policy, false, true, false, temp_dir, NULL, false, false);
 }
 
 /* Receiver write-path variant that also applies the per-file xattrs (-X/-A)
@@ -1169,13 +1349,12 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
  * failed write's temp.  See file_to_disk_secure_impl for the semantics. */
 bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long long data_size,
                                bool inplace, bool sparse, bool preallocate,
-                               const FileMetadata* metadata, bool preserve_executability,
-                               bool update, bool no_replace, bool use_fsync,
-                               const FileXattrList* xattrs, bool fake_super, bool keep_partial,
-                               const char* temp_dir) {
+                               const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+                               bool no_replace, bool use_fsync, const FileXattrList* xattrs,
+                               bool fake_super, bool keep_partial, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  preserve_executability, update, no_replace, use_fsync, temp_dir,
-                                  xattrs, fake_super, keep_partial);
+                                  policy, update, no_replace, use_fsync, temp_dir, xattrs,
+                                  fake_super, keep_partial);
 }
 
 /* Atomic --link-dest install.  The destination is replaced (via a temporary
@@ -1196,7 +1375,7 @@ bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long
 static bool file_to_disk_secure_link_impl(const char* path, const char* basis_path,
                                           const void* data, unsigned long long data_size,
                                           bool preallocate, const FileMetadata* metadata,
-                                          bool preserve_executability, bool use_fsync,
+                                          FileAttrPolicy policy, bool use_fsync,
                                           const FileXattrList* xattrs, bool fake_super,
                                           const char* temp_dir) {
   if (!path || !basis_path)
@@ -1208,11 +1387,12 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
 
   int scratch_dirfd = -1;
   if (temp_dir) {
-    scratch_dirfd = file_open_private_dir(temp_dir);
+    scratch_dirfd = file_open_temp_dir(temp_dir);
     if (scratch_dirfd < 0) {
       int saved_errno = errno;
-      log_message(LOG_LEVEL_ERROR, "could not open --temp-dir scratch directory '%s': %s", temp_dir,
-                  strerror(saved_errno));
+      log_message(LOG_LEVEL_ERROR,
+                  "--temp-dir '%s' could not be opened (rsync requires it to already exist): %s",
+                  temp_dir, strerror(saved_errno));
       close(dirfd);
       free(leaf);
       return false;
@@ -1247,11 +1427,19 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
       if (linked) {
         int target_dirfd = scratch_dirfd >= 0 ? scratch_dirfd : dirfd;
         if (use_fsync) {
-          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-          if (tfd < 0 || fsync(tfd) != 0) {
+          /* O_NONBLOCK: the freshly linked temp is normally the basis's regular
+             file, but a raced-in FIFO at the name must not block this reopen
+             forever.  With O_NONBLOCK such an open fails with ENXIO instead of
+             blocking, which is treated as a benign fsync-skip (the link itself
+             is still installed); any other open/fsync failure falls back to the
+             byte-copy path as before. */
+          int tfd = openat(target_dirfd, tmp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+          if (tfd < 0) {
+            if (errno != ENXIO)
+              linked = false;
+          } else if (fsync(tfd) != 0) {
             linked = false;
-            if (tfd >= 0)
-              close(tfd);
+            close(tfd);
           } else {
             close(tfd);
           }
@@ -1277,8 +1465,8 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
     /* The basis file could not be linked in (missing, cross-device, refused
        by the filesystem).  Write a byte-identical local copy instead. */
     return file_to_disk_secure_attrs(path, data, data_size, false, false, preallocate, metadata,
-                                     preserve_executability, false, false, use_fsync, xattrs,
-                                     fake_super, false, temp_dir);
+                                     policy, false, false, use_fsync, xattrs, fake_super, false,
+                                     temp_dir);
   }
 
   if (scratch_dirfd >= 0)
@@ -1290,25 +1478,25 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
 
 bool file_to_disk_secure_link(const char* path, const char* basis_path, const void* data,
                               unsigned long long data_size, bool preallocate,
-                              const FileMetadata* metadata, bool preserve_executability,
-                              bool use_fsync, const char* temp_dir) {
+                              const FileMetadata* metadata, FileAttrPolicy policy, bool use_fsync,
+                              const char* temp_dir) {
   return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
-                                       preserve_executability, use_fsync, NULL, false, temp_dir);
+                                       policy, use_fsync, NULL, false, temp_dir);
 }
 
 bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, const void* data,
                                     unsigned long long data_size, bool preallocate,
-                                    const FileMetadata* metadata, bool preserve_executability,
+                                    const FileMetadata* metadata, FileAttrPolicy policy,
                                     bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                     const char* temp_dir) {
   return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
-                                       preserve_executability, use_fsync, xattrs, fake_super,
-                                       temp_dir);
+                                       policy, use_fsync, xattrs, fake_super, temp_dir);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, false, NULL);
+  FileAttrPolicy policy = {false, false, false, false};
+  return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, policy, NULL);
 }

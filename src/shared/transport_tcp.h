@@ -7,6 +7,10 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
+/* Cross-process daemon registry (daemon_limits.c).  Only an opaque pointer is
+ * stored here so the transport layer does not depend on daemon config. */
+struct DaemonLimitRegistry;
+
 typedef struct Server {
   struct sockaddr_storage address;
   unsigned int address_length;
@@ -14,6 +18,7 @@ typedef struct Server {
   void* ssl_ctx;
   unsigned int max_connections;
   volatile unsigned int active_connections;
+  struct DaemonLimitRegistry* limit_registry;
 } Server;
 
 typedef struct Client {
@@ -45,6 +50,17 @@ typedef struct {
 
 Server* server_create_ex(int port, const ServerBindOptions* bind_opts);
 Server* server_create(int port);
+/* Override the listener's connection cap (the global daemon `max connections`
+ * value).  A non-positive value is ignored so the default cap stands. */
+void server_set_max_connections(Server* server, unsigned int max_connections);
+/* Install the shared per-module / per-source registry used by the accept loop
+ * to reserve a slot for each forked child.  NULL disables the accounting (the
+ * global cap and ACLs still apply). */
+void server_set_limit_registry(Server* server, struct DaemonLimitRegistry* registry);
+/* Slot reserved for the connection child currently running (set by the parent
+ * before fork, inherited by the child).  Returns DAEMON_LIMITS_NO_SLOT (-1)
+ * outside the accept-loop child path. */
+int transport_tcp_current_slot(void);
 bool server_listen(Server* server, void (*handler)(int file_descriptor));
 void server_accept_loop(Server* server, void (*child_fn)(int, void*), void* child_ctx,
                         const char* log_fmt);
@@ -54,7 +70,6 @@ bool client_connect_ex(Client* client, const char* host, int port, const TcpConn
 bool client_connect(Client* client, const char* host, int port);
 bool tcp_connect_socket_ex(Client* client, const char* host, int port,
                            const TcpConnectOptions* opts);
-bool tcp_connect_socket(Client* client, const char* host, int port);
 void client_disconnect(Client* client);
 void client_delete(Client* client);
 void tcp_set_timeouts(int timeout_sec, int contimeout_sec);

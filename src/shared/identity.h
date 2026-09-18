@@ -80,15 +80,36 @@ void identity_clear_active(void);
  * snapshot.  Ownership stays OFF ("do not apply") for every transfer that
  * requests none of them, preserving FastSync's existing behavior.  --super /
  * --no-super alone does NOT enable ownership; an explicit identity flag
- * (--numeric-ids / --chown / --usermap / --groupmap / --copy-as) is required. */
+ * (--numeric-ids / --chown / --usermap / --groupmap / --copy-as) or a
+ * preserve-source -o/--owner / -g/--group request is required. */
 bool identity_active_enabled(void);
 
-/* Pure, config-only predicate: true when the client requested ANY
- * client-chosen ownership or super-user activity (--numeric-ids, --chown,
- * --usermap/--groupmap, --copy-as, --fake-super, or an explicit --super).  Used
- * by the daemon module gate to decide whether a module's per-module opt-in is
- * required; it never reads the per-connection snapshot. */
+/* Per-side predicates over the ACTIVE per-connection snapshot (call
+ * identity_set_active() first).  They mirror the owner_requested /
+ * group_requested conditions inside identity_resolve_targets() exactly, so
+ * callers that must apply only one side (e.g. the --fake-super owner replay)
+ * can pass (uid_t)-1 / (gid_t)-1 for the side that was NOT requested and leave
+ * it untouched.  The owner side is requested by --copy-as, --chown USER,
+ * --numeric-ids, -o/--owner, or a non-empty --usermap; the group side by
+ * --copy-as, --chown :GROUP, --numeric-ids, -g/--group, or a non-empty
+ * --groupmap. */
+bool identity_owner_requested(void);
+bool identity_group_requested(void);
+
+/* Pure, config-only predicate: true when the client requested ANY client-chosen
+ * ownership or super-user activity (--numeric-ids, --chown, --usermap/--groupmap,
+ * --copy-as, --fake-super, an explicit --super, or a preserve-source -o/-g).
+ * General awareness only; the daemon module gate uses the narrower
+ * identity_explicit_ownership_requested() below.  Never reads the snapshot. */
 bool identity_ownership_requested(const Config* config);
+
+/* Pure, config-only predicate for the narrow set that lets the CLIENT choose an
+ * arbitrary owner/group: --numeric-ids, --chown, --usermap/--groupmap,
+ * --copy-as, --fake-super, or an explicit --super.  Deliberately EXCLUDES a
+ * plain -o/--owner / -g/--group (or -a) preserve-source request, which the
+ * daemon gate handles by forcing super-user ownership activity off rather than
+ * refusing the whole transfer.  Never reads the snapshot. */
+bool identity_explicit_ownership_requested(const Config* config);
 
 /* Apply the negotiated ownership to an already-written file descriptor.
  * source_uid/source_gid are the transmitted numeric ids.  Resolution order:
@@ -105,6 +126,14 @@ bool identity_ownership_requested(const Config* config);
  * (rsync parity: the transfer must not abort).  A no-op when no identity policy
  * is active returns true. */
 bool identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid);
+
+/* Resolve the ownership that --fake-super should RECORD in the reserved xattr
+ * (rather than chown for real).  A requested side (--copy-as / usermap /
+ * --chown / -o / -g, with --numeric-ids as the raw-id modifier) yields the
+ * resolved target; a side that was not requested keeps the transmitted source
+ * id.  Must be called after identity_set_active(). */
+void identity_resolve_storage_ids(int32_t source_uid, int32_t source_gid, uint32_t* out_uid,
+                                  uint32_t* out_gid);
 
 /* P7 Wave D: the no-follow (symlink) counterpart.  Resolves the same
  * usermap/groupmap/chown/numeric-ids/copy-as policy but applies it with
@@ -128,6 +157,6 @@ bool identity_wire_valid(const Config* config);
  * best-effort behavior where an unprivileged attempt is refused by the kernel
  * and skipped.  Neither EVER elevates privileges. */
 bool privilege_super_permitted(void);
-bool privilege_super_mode_permitted(int mode);
+bool privilege_super_mode_permitted(SuperMode mode);
 
 #endif

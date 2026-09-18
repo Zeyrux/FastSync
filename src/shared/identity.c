@@ -30,20 +30,40 @@ typedef struct {
   /* --super / --no-super tri-state (SUPER_MODE_AUTO when unset).  Snapshotted
    * per connection so privilege_super_permitted() can gate super-user
    * activities without a Config argument. */
-  int super_mode;
+  SuperMode super_mode;
   /* --copy-as=USER[:GROUP]: snapshotted so the ownership resolver can force the
    * target ids without a Config argument. */
   bool copy_as_set;
   int32_t copy_as_uid;
   int32_t copy_as_gid;
+  /* -o/--owner and -g/--group: preserve the source owner/group through the
+   * normal name/identity resolution path.  Split out of the former
+   * use_metadata bundle; unlike --numeric-ids/--chown/--usermap/--groupmap/-a
+   * these are a preserve-source request, not an arbitrary client-chosen owner,
+   * so they are tracked separately from the explicit ownership gate. */
+  bool preserve_owner;
+  bool preserve_group;
+  /* --fake-super: when active the receiver must only RECORD the (resolved)
+   * ownership in the reserved xattr, never perform a real chown.  Snapshotted
+   * so the fd-relative ownership helpers can suppress the chown without a
+   * Config argument. */
+  bool fake_super;
   bool set;
 } IdentityActive;
 
 static IdentityActive g_identity;
 
 static void identity_active_reset(void) {
-  free(g_identity.usermap);
-  free(g_identity.groupmap);
+  if (g_identity.usermap) {
+    for (int i = 0; i < g_identity.usermap_count; i++)
+      free(g_identity.usermap[i].to_name);
+    free(g_identity.usermap);
+  }
+  if (g_identity.groupmap) {
+    for (int i = 0; i < g_identity.groupmap_count; i++)
+      free(g_identity.groupmap[i].to_name);
+    free(g_identity.groupmap);
+  }
   g_identity.usermap = NULL;
   g_identity.groupmap = NULL;
   g_identity.usermap_count = 0;
@@ -57,6 +77,9 @@ static void identity_active_reset(void) {
   g_identity.copy_as_set = false;
   g_identity.copy_as_uid = 0;
   g_identity.copy_as_gid = 0;
+  g_identity.preserve_owner = false;
+  g_identity.preserve_group = false;
+  g_identity.fake_super = false;
   g_identity.set = false;
 }
 
@@ -77,32 +100,57 @@ bool identity_set_active(const Config* config) {
   g_identity.copy_as_set = config->copy_as_set;
   g_identity.copy_as_uid = config->copy_as_uid;
   g_identity.copy_as_gid = config->copy_as_gid;
+  g_identity.preserve_owner = config->preserve_owner;
+  g_identity.preserve_group = config->preserve_group;
+  g_identity.fake_super = config->fake_super;
   if (config->usermap_count > 0) {
     g_identity.usermap = calloc((size_t)config->usermap_count, sizeof(IdentityMap));
     if (!g_identity.usermap)
       goto alloc_failed;
-    memcpy(g_identity.usermap, config->usermap,
-           (size_t)config->usermap_count * sizeof(IdentityMap));
+    for (int i = 0; i < config->usermap_count; i++) {
+      g_identity.usermap[i] = config->usermap[i];
+      g_identity.usermap[i].to_name =
+          config->usermap[i].to_name ? str_dup(config->usermap[i].to_name) : NULL;
+      if (config->usermap[i].to_name && !g_identity.usermap[i].to_name) {
+        g_identity.usermap_count = i; /* free only the entries already duplicated */
+        goto alloc_failed;
+      }
+    }
     g_identity.usermap_count = config->usermap_count;
   }
   if (config->groupmap_count > 0) {
     g_identity.groupmap = calloc((size_t)config->groupmap_count, sizeof(IdentityMap));
     if (!g_identity.groupmap)
       goto alloc_failed;
-    memcpy(g_identity.groupmap, config->groupmap,
-           (size_t)config->groupmap_count * sizeof(IdentityMap));
+    for (int i = 0; i < config->groupmap_count; i++) {
+      g_identity.groupmap[i] = config->groupmap[i];
+      g_identity.groupmap[i].to_name =
+          config->groupmap[i].to_name ? str_dup(config->groupmap[i].to_name) : NULL;
+      if (config->groupmap[i].to_name && !g_identity.groupmap[i].to_name) {
+        g_identity.groupmap_count = i;
+        goto alloc_failed;
+      }
+    }
     g_identity.groupmap_count = config->groupmap_count;
   }
   g_identity.set = true;
   /* A root receiver would honor any client-supplied ownership request (a
-     --usermap/--groupmap/--chown/--copy-as, or raw ids under --numeric-ids).
-     Surface that prominently; a privileged daemon applying arbitrary client
-     ownership is a deliberate, opt-in choice the operator should be aware of. */
-  if (geteuid() == 0)
-    log_message(LOG_LEVEL_WARNING,
-                "identity mapping active and running as root: client-supplied "
-                "ownership (usermap/groupmap/chown/numeric-ids) will be honored; "
-                "run the daemon as an unprivileged user unless intended");
+     --usermap/--groupmap/--chown/--copy-as, or raw ids under --numeric-ids)
+     ONLY when super-user activities are permitted.  --no-super (or a daemon
+     veto that forced SUPER_MODE_OFF) forbids the chown even for root, so do
+     not claim the ownership will be honored in that case. */
+  if (geteuid() == 0) {
+    if (privilege_super_mode_permitted(g_identity.super_mode))
+      log_message(LOG_LEVEL_WARNING,
+                  "identity mapping active and running as root: client-supplied "
+                  "ownership (usermap/groupmap/chown/numeric-ids) will be honored; "
+                  "run the daemon as an unprivileged user unless intended");
+    else
+      log_message(LOG_LEVEL_WARNING,
+                  "identity mapping active and running as root, but super-user activities are "
+                  "disabled (--no-super): requested ownership will NOT be applied; run the "
+                  "daemon as an unprivileged user unless intended");
+  }
   /* --super explicitly requests super-user activities, but FastSync never
      elevates privileges: when the receiver is not already root the kernel will
      refuse those confined attempts and each is skipped per entry.  Warn exactly
@@ -128,7 +176,7 @@ bool privilege_super_permitted(void) {
   return privilege_super_mode_permitted(g_identity.super_mode);
 }
 
-bool privilege_super_mode_permitted(int mode) {
+bool privilege_super_mode_permitted(SuperMode mode) {
   /* AUTO and ON both attempt the confined operation; OFF forbids it even for a
    * root receiver.  AUTO is the historical FastSync behavior (always attempt
    * and let the kernel refuse an unprivileged call, which the caller skips), so
@@ -138,25 +186,55 @@ bool privilege_super_mode_permitted(int mode) {
 }
 
 bool identity_active_enabled(void) {
-  /* numeric_ids is included: this set only gates identity_apply_ownership,
-     which runs only when metadata is present (a -M/--preserve transfer).  A
-     standalone --numeric-ids (no ownership-affecting flag) carries no
-     metadata, never reaches identity_apply_ownership, and therefore correctly
-     stays inert; combined with -M it activates raw-id application.  --super /
-     --no-super does NOT enable ownership: it only permits or forbids the
-     already-requested super-user activities, so a --super with no explicit
-     identity flag must never silently apply client-chosen ownership. */
+  /* --numeric-ids is deliberately NOT included: it is a mapping MODIFIER (use
+   * the transmitted numeric id raw instead of a name lookup), not a request to
+   * change ownership.  rsync's --numeric-ids on its own never chowns anything;
+   * it only changes how an already-requested -o/-g/map resolves.  Ownership is
+   * activated only by an explicit request: --chown/--usermap/--groupmap/
+   * --copy-as or a preserve-source -o/--owner / -g/--group.  --super/--no-super
+   * likewise does NOT enable ownership: it only permits or forbids the
+   * already-requested super-user activities. */
   return g_identity.set &&
-         (g_identity.numeric_ids || g_identity.chown_uid_set || g_identity.chown_gid_set ||
-          g_identity.usermap_count > 0 || g_identity.groupmap_count > 0 || g_identity.copy_as_set);
+         (g_identity.chown_uid_set || g_identity.chown_gid_set || g_identity.usermap_count > 0 ||
+          g_identity.groupmap_count > 0 || g_identity.copy_as_set || g_identity.preserve_owner ||
+          g_identity.preserve_group);
+}
+
+bool identity_owner_requested(void) {
+  return g_identity.set && (g_identity.copy_as_set || g_identity.chown_uid_set ||
+                            g_identity.preserve_owner || g_identity.usermap_count > 0);
+}
+
+bool identity_group_requested(void) {
+  return g_identity.set && (g_identity.copy_as_set || g_identity.chown_gid_set ||
+                            g_identity.preserve_group || g_identity.groupmap_count > 0);
 }
 
 bool identity_ownership_requested(const Config* config) {
   if (!config)
     return false;
-  /* Every value that makes the receiver act on a client-chosen owner, plus an
-   * explicit --super (super-user device-node activities).  Pure config, so the
-   * daemon gate can evaluate it before identity_set_active(). */
+  /* General-awareness predicate: every value that makes the receiver act on a
+   * client-chosen owner, plus an explicit --super (super-user device-node
+   * activities) and the preserve-source -o/-g requests.  Pure config, so callers
+   * can evaluate it before identity_set_active().  The daemon module gate uses
+   * the narrower identity_explicit_ownership_requested() below, which treats a
+   * plain -o/-g/-a as a preserve-source request rather than arbitrary
+   * client-chosen ownership. */
+  return config->numeric_ids || config->chown_uid_set || config->chown_gid_set ||
+         config->usermap_count > 0 || config->groupmap_count > 0 || config->copy_as_set ||
+         config->preserve_owner || config->preserve_group || config->fake_super ||
+         config->super_mode == SUPER_MODE_ON;
+}
+
+bool identity_explicit_ownership_requested(const Config* config) {
+  if (!config)
+    return false;
+  /* The narrow set the daemon gate refuses for a non-opted module: a request
+   * that lets the CLIENT choose an arbitrary owner/group (rather than preserve
+   * the source's own).  Deliberately EXCLUDES preserve_owner/preserve_group so a
+   * plain -a/-o/-g push is not refused; for those the gate instead forces
+   * super-user ownership activity off (no chown happens) unless the module has
+   * `client owner = yes`. */
   return config->numeric_ids || config->chown_uid_set || config->chown_gid_set ||
          config->usermap_count > 0 || config->groupmap_count > 0 || config->copy_as_set ||
          config->fake_super || config->super_mode == SUPER_MODE_ON;
@@ -177,6 +255,29 @@ bool identity_copy_as_refused(const Config* config) {
   return geteuid() != 0 || config->super_mode == SUPER_MODE_OFF;
 }
 
+/* Validate one received FROM:TO map rule.  `from` is a single id, the LOW end
+ * of an inclusive range, IDENTITY_MATCH_ANY, or IDENTITY_MATCH_UNNAMED; a
+ * sentinel FROM must carry the same value in from_hi.  `to` is a non-negative
+ * id, IDENTITY_CURRENT, or ignored when a bounded receiver-resolved `to_name`
+ * is present. */
+static bool identity_wire_map_valid(const IdentityMap* map) {
+  if (!map)
+    return false;
+  if (map->from < IDENTITY_MATCH_UNNAMED)
+    return false;
+  if (map->from < 0) {
+    if (map->from_hi != map->from)
+      return false;
+  } else if (map->from_hi < map->from) {
+    return false;
+  }
+  if (map->to < IDENTITY_CURRENT)
+    return false;
+  if (map->to_name && strlen(map->to_name) > 255)
+    return false;
+  return true;
+}
+
 bool identity_wire_valid(const Config* config) {
   if (!config)
     return false;
@@ -188,11 +289,11 @@ bool identity_wire_valid(const Config* config) {
   if (config->chown_gid_set && config->chown_gid < IDENTITY_MATCH_ANY)
     return false;
   for (int i = 0; i < config->usermap_count; i++) {
-    if (config->usermap[i].from < IDENTITY_MATCH_ANY || config->usermap[i].to < IDENTITY_CURRENT)
+    if (!identity_wire_map_valid(&config->usermap[i]))
       return false;
   }
   for (int i = 0; i < config->groupmap_count; i++) {
-    if (config->groupmap[i].from < IDENTITY_MATCH_ANY || config->groupmap[i].to < IDENTITY_CURRENT)
+    if (!identity_wire_map_valid(&config->groupmap[i]))
       return false;
   }
   /* Defense-in-depth: a --copy-as block must never carry a negative (sentinel)
@@ -250,15 +351,137 @@ static int identity_resolve_token(const char* token, bool is_group, int32_t* out
   return 0;
 }
 
-static int identity_append_rule(IdentityMap** map, int* count, int32_t from, int32_t to) {
+static bool identity_all_digits(const char* token) {
+  if (!token || *token == '\0')
+    return false;
+  for (const char* p = token; *p; p++)
+    if (*p < '0' || *p > '9')
+      return false;
+  return true;
+}
+
+static bool identity_token_has_glob(const char* token) {
+  return token && (strchr(token, '*') || strchr(token, '?') || strchr(token, '['));
+}
+
+/* Parse a --usermap/--groupmap FROM token into a matcher (from/from_hi).  rsync
+ * accepts a name, a numeric id, an inclusive LOW-HIGH range, '*' (any id), or an
+ * empty token (ids with no name on the sender).  Returns 0 on success, -1 on a
+ * malformed token or an unresolvable sender-side name. */
+static int identity_parse_from(const char* token, bool is_group, int32_t* out_from,
+                               int32_t* out_hi) {
+  if (token[0] == '\0') {
+    *out_from = IDENTITY_MATCH_UNNAMED;
+    *out_hi = IDENTITY_MATCH_UNNAMED;
+    return 0;
+  }
+  if (strcmp(token, "*") == 0) {
+    *out_from = IDENTITY_MATCH_ANY;
+    *out_hi = IDENTITY_MATCH_ANY;
+    return 0;
+  }
+  const char* num = token[0] == '@' ? token + 1 : token;
+  if (identity_all_digits(num)) {
+    int32_t id;
+    if (identity_resolve_token(token, is_group, &id) != 0)
+      return -1;
+    *out_from = id;
+    *out_hi = id;
+    return 0;
+  }
+  /* An inclusive LOW-HIGH numeric range. */
+  const char* dash = strchr(num, '-');
+  if (dash && dash != num && dash[1] != '\0' && strchr(dash + 1, '-') == NULL) {
+    size_t lo_len = (size_t)(dash - num);
+    size_t hi_len = strlen(dash + 1);
+    char low[16];
+    char high[16];
+    if (lo_len < sizeof(low) && hi_len < sizeof(high)) {
+      memcpy(low, num, lo_len);
+      low[lo_len] = '\0';
+      memcpy(high, dash + 1, hi_len);
+      high[hi_len] = '\0';
+      if (identity_all_digits(low) && identity_all_digits(high)) {
+        char* endptr = NULL;
+        errno = 0;
+        long lo = strtol(low, &endptr, 10);
+        if (errno != 0 || !endptr || *endptr != '\0')
+          return -1;
+        errno = 0;
+        long hi = strtol(high, &endptr, 10);
+        if (errno != 0 || !endptr || *endptr != '\0' || hi < lo || hi > INT32_MAX)
+          return -1;
+        *out_from = (int32_t)lo;
+        *out_hi = (int32_t)hi;
+        return 0;
+      }
+    }
+    /* Not a numeric LOW-HIGH range: fall through and treat as a name (a
+     * hyphenated account name like "wayne-smith" must still resolve). */
+  }
+  /* A sender-side name.  A wildcard other than the bare '*' is matched by rsync
+   * against the sender's names; because FastSync transmits numeric ids only, the
+   * receiver cannot evaluate it, so reject rather than silently mis-match. */
+  if (identity_token_has_glob(token)) {
+    log_message(LOG_LEVEL_ERROR,
+                "%smap FROM '%s': name wildcards other than '*' are not supported "
+                "(FastSync transmits numeric ids, so sender names are unavailable on the "
+                "receiver)",
+                is_group ? "--group" : "--user", token);
+    return -1;
+  }
+  int32_t id;
+  if (identity_resolve_token(token, is_group, &id) != 0)
+    return -1;
+  *out_from = id;
+  *out_hi = id;
+  return 0;
+}
+
+/* Parse a --usermap/--groupmap TO token.  '*', a bare numeric id, or an @N id is
+ * stored numerically; every other non-empty token is a NAME resolved on the
+ * RECEIVER at apply time (rsync resolves TO names against the receiving side).
+ * Returns 0 on success, -1 on an empty/malformed token. */
+static int identity_parse_to(const char* token, bool is_group, int32_t* out_to, char** out_name) {
+  if (token[0] == '\0') {
+    log_message(LOG_LEVEL_ERROR, "%smap TO value is missing", is_group ? "--group" : "--user");
+    return -1;
+  }
+  if (strcmp(token, "*") == 0) {
+    *out_to = IDENTITY_CURRENT;
+    *out_name = NULL;
+    return 0;
+  }
+  const char* num = token[0] == '@' ? token + 1 : token;
+  if (identity_all_digits(num)) {
+    int32_t id;
+    if (identity_resolve_token(token, is_group, &id) != 0)
+      return -1;
+    *out_to = id;
+    *out_name = NULL;
+    return 0;
+  }
+  if (identity_token_has_glob(token)) {
+    log_message(LOG_LEVEL_ERROR, "%smap TO '%s' may not contain a wildcard",
+                is_group ? "--group" : "--user", token);
+    return -1;
+  }
+  char* name = str_dup(token);
+  if (!name)
+    return -1;
+  *out_to = 0;
+  *out_name = name;
+  return 0;
+}
+
+static int identity_append_rule(IdentityMap** map, int* count, const IdentityMap* rule) {
   if (*count >= MAX_IDENTITY_MAP)
     return -1;
   IdentityMap* grown = realloc(*map, (size_t)(*count + 1) * sizeof(IdentityMap));
   if (!grown)
     return -1;
   *map = grown;
-  (*map)[*count].from = from;
-  (*map)[*count].to = to;
+  (*map)[*count] = *rule;
   (*count)++;
   return 0;
 }
@@ -275,7 +498,7 @@ int identity_parse_map(Config* config, const char* value, bool is_group) {
   char* saveptr = NULL;
   for (char* rule = strtok_r(list, ",", &saveptr); rule; rule = strtok_r(NULL, ",", &saveptr)) {
     char* colon = strchr(rule, ':');
-    if (!colon || colon == rule) {
+    if (!colon) {
       /* Log before freeing: `rule` points into the str_dup'd list. */
       log_message(LOG_LEVEL_ERROR, "%s rules must be FROM:TO (got '%s')", optname, rule);
       free(list);
@@ -284,25 +507,25 @@ int identity_parse_map(Config* config, const char* value, bool is_group) {
     *colon = '\0';
     char* from_token = rule;
     char* to_token = colon + 1;
-    if (*to_token == '\0') {
+    IdentityMap parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (identity_parse_from(from_token, is_group, &parsed.from, &parsed.from_hi) != 0) {
+      log_message(LOG_LEVEL_ERROR,
+                  "%s could not resolve FROM '%s' in '%s' (a name must exist on the "
+                  "source; use @N for a numeric id)",
+                  optname, from_token, value);
       free(list);
-      log_message(LOG_LEVEL_ERROR, "%s rule 'FROM:' is missing the TO value (got '%s')", optname,
-                  value);
       return -1;
     }
-    int32_t from_id, to_id;
-    if (identity_resolve_token(from_token, is_group, &from_id) != 0 ||
-        identity_resolve_token(to_token, is_group, &to_id) != 0) {
+    if (identity_parse_to(to_token, is_group, &parsed.to, &parsed.to_name) != 0) {
+      log_message(LOG_LEVEL_ERROR, "%s could not parse TO '%s' in '%s'", optname, to_token, value);
       free(list);
-      log_message(LOG_LEVEL_ERROR,
-                  "%s could not resolve '%s' (name must exist on the source; use "
-                  "@N for a numeric id)",
-                  optname, value);
       return -1;
     }
     if (identity_append_rule(is_group ? &config->groupmap : &config->usermap,
-                             is_group ? &config->groupmap_count : &config->usermap_count, from_id,
-                             to_id) != 0) {
+                             is_group ? &config->groupmap_count : &config->usermap_count,
+                             &parsed) != 0) {
+      free(parsed.to_name);
       free(list);
       log_message(LOG_LEVEL_ERROR, "%s has too many rules (max %d)", optname, MAX_IDENTITY_MAP);
       return -1;
@@ -366,6 +589,67 @@ static int identity_split_chown(const char* value, char** puser, char** pgroup) 
   return 0;
 }
 
+/* --chown is rsync's shorthand for "--usermap=*:USER --groupmap=*:GROUP", so a
+ * name TO value must be resolved on the RECEIVER, not on the sender.  Append the
+ * equivalent map rule (FROM matches every id).  The numeric/'*' forms are stored
+ * numerically exactly as rsync's id_parse/user_to_uid would.  Returns 0 on
+ * success, -1 on a malformed numeric token or allocation failure. */
+static int identity_append_chown_rule(Config* config, bool is_group, const char* token) {
+  IdentityMap rule;
+  memset(&rule, 0, sizeof(rule));
+  rule.from = IDENTITY_MATCH_ANY;
+  rule.from_hi = IDENTITY_MATCH_ANY;
+  if (strcmp(token, "*") == 0) {
+    rule.to = IDENTITY_CURRENT;
+  } else if (identity_all_digits(token[0] == '@' ? token + 1 : token)) {
+    if (identity_resolve_token(token, is_group, &rule.to) != 0) {
+      log_message(LOG_LEVEL_ERROR, "--chown numeric id is out of range: %s", token);
+      return -1;
+    }
+  } else {
+    rule.to = 0;
+    rule.to_name = str_dup(token);
+    if (!rule.to_name)
+      return -1;
+  }
+  if (identity_append_rule(is_group ? &config->groupmap : &config->usermap,
+                           is_group ? &config->groupmap_count : &config->usermap_count,
+                           &rule) != 0) {
+    free(rule.to_name);
+    log_message(LOG_LEVEL_ERROR, "--chown has too many rules (max %d)", MAX_IDENTITY_MAP);
+    return -1;
+  }
+  return 0;
+}
+
+/* Resolve/record one --chown side.  The source-side numeric value is kept in
+ * chown_uid/chown_gid purely as a fallback (the appended map rule resolves the
+ * name on the receiver and wins); a name that does not exist on the sender is
+ * accepted and left to receiver-side resolution, matching rsync. */
+static int identity_parse_chown_side(Config* config, bool is_group, const char* token) {
+  if (identity_append_chown_rule(config, is_group, token) != 0)
+    return -1;
+  bool numeric = identity_all_digits(token[0] == '@' ? token + 1 : token);
+  int32_t resolved;
+  if (identity_resolve_token(token, is_group, &resolved) == 0) {
+    if (is_group) {
+      config->chown_gid = resolved;
+      config->chown_gid_set = true;
+    } else {
+      config->chown_uid = resolved;
+      config->chown_uid_set = true;
+    }
+    return 0;
+  }
+  if (numeric) {
+    log_message(LOG_LEVEL_ERROR, "--chown could not resolve numeric id '%s'", token);
+    return -1;
+  }
+  /* Unknown sender-side name: rsync accepts it and resolves it (or warns) on
+   * the receiver; do the same instead of failing the whole run. */
+  return 0;
+}
+
 int identity_parse_chown(Config* config, const char* value) {
   if (!config || !value || *value == '\0') {
     log_message(LOG_LEVEL_ERROR, "--chown requires a value (USER:GROUP, USER, or :GROUP)");
@@ -404,32 +688,18 @@ int identity_parse_chown(Config* config, const char* value) {
     if (*user == '\0') {
       log_message(LOG_LEVEL_ERROR, "--chown requires a user or group (got '%s')", value);
       ret = -1;
-    } else if (identity_resolve_token(user, false, &config->chown_uid) != 0) {
-      log_message(LOG_LEVEL_ERROR,
-                  "--chown could not resolve user '%s' (use a name that exists "
-                  "on the source, '*', or @N)",
-                  value);
+    } else if (identity_parse_chown_side(config, false, user) != 0) {
       ret = -1;
-    } else {
-      config->chown_uid_set = true;
     }
   } else {
     /* --chown=USER:GROUP, --chown=:GROUP, --chown=USER: */
-    if (*user != '\0') {
-      if (identity_resolve_token(user, false, &config->chown_uid) != 0) {
-        log_message(LOG_LEVEL_ERROR, "--chown could not resolve user '%s'", value);
-        ret = -1;
-        goto done;
-      }
-      config->chown_uid_set = true;
+    if (*user != '\0' && identity_parse_chown_side(config, false, user) != 0) {
+      ret = -1;
+      goto done;
     }
-    if (*group != '\0') {
-      if (identity_resolve_token(group, true, &config->chown_gid) != 0) {
-        log_message(LOG_LEVEL_ERROR, "--chown could not resolve group '%s'", value);
-        ret = -1;
-        goto done;
-      }
-      config->chown_gid_set = true;
+    if (*group != '\0' && identity_parse_chown_side(config, true, group) != 0) {
+      ret = -1;
+      goto done;
     }
     if (!*user && !*group) {
       log_message(LOG_LEVEL_ERROR, "--chown must set a user, a group, or both (got '%s')", value);
@@ -567,9 +837,6 @@ int identity_parse_copy_as(Config* config, const char* value) {
   config->copy_as_set = true;
   config->copy_as_uid = uid;
   config->copy_as_gid = gid;
-  /* Ownership application needs the metadata path (the source uid/gid must be
-   * transmitted); imply it exactly like --chown/--usermap/--groupmap. */
-  config->use_metadata = true;
   ret = 0;
 
 done:
@@ -580,15 +847,106 @@ done:
 
 /* ---- Receiver-side ownership application ---- */
 
-static bool identity_map_lookup(const IdentityMap* map, int count, int32_t source_id,
+/* True when a map rule's FROM matcher accepts `id`.  A sentinel FROM never
+ * carries a range.  IDENTITY_MATCH_UNNAMED mirrors rsync's empty FROM: it
+ * matches only ids that have no name in the account database (rsync matches the
+ * sender's names; FastSync transmits numeric ids only, so it approximates this
+ * with the receiver's database -- documented in RSYNC_COMPAT.md). */
+static bool identity_map_from_matches(const IdentityMap* map, int32_t id, bool is_group) {
+  if (map->from == IDENTITY_MATCH_ANY)
+    return true;
+  if (map->from == IDENTITY_MATCH_UNNAMED)
+    return is_group ? (getgrgid((gid_t)id) == NULL) : (getpwuid((uid_t)id) == NULL);
+  return id >= map->from && id <= map->from_hi;
+}
+
+/* First matching rule wins.  A rule whose TO is a receiver-side name resolves it
+ * against the receiver's account database here; an unresolvable TO name is
+ * skipped with a warning and the next rule is considered (rsync prints "Unknown
+ * --usermap name on receiver" and leaves the id unmapped rather than aborting). */
+static bool identity_map_lookup(const IdentityMap* map, int count, int32_t source_id, bool is_group,
                                 int32_t* out_to) {
   for (int i = 0; i < count; i++) {
-    if (map[i].from == IDENTITY_MATCH_ANY || map[i].from == source_id) {
+    if (!identity_map_from_matches(&map[i], source_id, is_group))
+      continue;
+    if (map[i].to_name) {
+      if (is_group) {
+        struct group* gr = getgrnam(map[i].to_name);
+        if (!gr) {
+          log_message(LOG_LEVEL_WARNING, "Unknown --groupmap name on receiver: %s", map[i].to_name);
+          continue;
+        }
+        *out_to = (int32_t)gr->gr_gid;
+      } else {
+        struct passwd* pw = getpwnam(map[i].to_name);
+        if (!pw) {
+          log_message(LOG_LEVEL_WARNING, "Unknown --usermap name on receiver: %s", map[i].to_name);
+          continue;
+        }
+        *out_to = (int32_t)pw->pw_uid;
+      }
+    } else {
       *out_to = map[i].to;
-      return true;
     }
+    return true;
   }
   return false;
+}
+
+/* Resolve the owner side from the negotiated policy.  Sets *out and returns
+ * true when an owner-affecting request is active (a usermap, --chown USER, or
+ * -o/--owner); returns false (leaving *out untouched) when the owner side is
+ * not requested, so callers can pass (uid_t)-1 to fchown and leave it as-is.
+ * --numeric-ids only changes the RESOLUTION (raw id instead of a name lookup);
+ * it never makes the side requested. */
+static bool identity_resolve_owner(int32_t source_uid, uid_t* out) {
+  if (!(g_identity.chown_uid_set || g_identity.preserve_owner || g_identity.usermap_count > 0))
+    return false;
+  int32_t target;
+  if (identity_map_lookup(g_identity.usermap, g_identity.usermap_count, source_uid, false,
+                          &target)) {
+    *out = target == IDENTITY_CURRENT ? geteuid() : (uid_t)target;
+  } else if (g_identity.chown_uid_set) {
+    *out = g_identity.chown_uid == IDENTITY_CURRENT ? geteuid() : (uid_t)g_identity.chown_uid;
+  } else if (g_identity.numeric_ids) {
+    *out = (uid_t)source_uid;
+  } else {
+    /* Best-effort name mapping against the receiver's own database.  When the
+     * transmitted (numeric) id has no name here, fall back to the raw numeric id
+     * so -o still preserves the source owner. */
+    struct passwd* pw = getpwuid((uid_t)source_uid);
+    if (pw) {
+      const struct passwd* mapped = getpwnam(pw->pw_name);
+      *out = mapped ? mapped->pw_uid : (uid_t)source_uid;
+    } else {
+      *out = (uid_t)source_uid;
+    }
+  }
+  return true;
+}
+
+/* Group-side counterpart of identity_resolve_owner(). */
+static bool identity_resolve_group(int32_t source_gid, gid_t* out) {
+  if (!(g_identity.chown_gid_set || g_identity.preserve_group || g_identity.groupmap_count > 0))
+    return false;
+  int32_t target;
+  if (identity_map_lookup(g_identity.groupmap, g_identity.groupmap_count, source_gid, true,
+                          &target)) {
+    *out = target == IDENTITY_CURRENT ? getegid() : (gid_t)target;
+  } else if (g_identity.chown_gid_set) {
+    *out = g_identity.chown_gid == IDENTITY_CURRENT ? getegid() : (gid_t)g_identity.chown_gid;
+  } else if (g_identity.numeric_ids) {
+    *out = (gid_t)source_gid;
+  } else {
+    struct group* gr = getgrgid((gid_t)source_gid);
+    if (gr) {
+      const struct group* mapped = getgrnam(gr->gr_name);
+      *out = mapped ? mapped->gr_gid : (gid_t)source_gid;
+    } else {
+      *out = (gid_t)source_gid;
+    }
+  }
+  return true;
 }
 
 /* Resolve the target ownership from the negotiated policy against the entry's
@@ -596,18 +954,13 @@ static bool identity_map_lookup(const IdentityMap* map, int count, int32_t sourc
  * paths.  Returns false when no side is to be changed. */
 static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, int32_t source_gid,
                                      uid_t* out_uid, gid_t* out_gid) {
-  bool set_uid = false;
-  bool set_gid = false;
-  uid_t uid = 0;
-  gid_t gid = 0;
-
   /* --copy-as (P7 Wave E) has the highest priority: it forces BOTH the owner
    * and group of every written entry to the requested ids, beating usermap /
    * groupmap / --chown / --numeric-ids and the best-effort name lookup.  Only
    * skip when the entry already carries exactly those ids. */
   if (g_identity.copy_as_set) {
-    uid = (uid_t)g_identity.copy_as_uid;
-    gid = (gid_t)g_identity.copy_as_gid;
+    uid_t uid = (uid_t)g_identity.copy_as_uid;
+    gid_t gid = (gid_t)g_identity.copy_as_gid;
     if (st->st_uid == uid && st->st_gid == gid)
       return false;
     *out_uid = uid;
@@ -615,65 +968,50 @@ static bool identity_resolve_targets(const struct stat* st, int32_t source_uid, 
     return true;
   }
 
-  int32_t target;
-  if (identity_map_lookup(g_identity.usermap, g_identity.usermap_count, source_uid, &target)) {
-    uid = target == IDENTITY_CURRENT ? geteuid() : (uid_t)target;
-    set_uid = true;
-  } else if (g_identity.chown_uid_set) {
-    uid = g_identity.chown_uid == IDENTITY_CURRENT ? geteuid() : (uid_t)g_identity.chown_uid;
-    set_uid = true;
-  } else if (g_identity.numeric_ids) {
-    uid = (uid_t)source_uid;
-    set_uid = true;
-  } else {
-    /* Best-effort name mapping against the receiver's own database: if the
-     * transmitted (numeric) id resolves to a name present on this machine,
-     * re-resolve it.  On a shared-account host this is the identity operation;
-     * when the id has no name here, the user side is left alone. */
-    struct passwd* pw = getpwuid((uid_t)source_uid);
-    if (pw) {
-      const struct passwd* mapped = getpwnam(pw->pw_name);
-      if (mapped) {
-        uid = mapped->pw_uid;
-        set_uid = true;
-      }
-    }
-  }
-
-  if (identity_map_lookup(g_identity.groupmap, g_identity.groupmap_count, source_gid, &target)) {
-    gid = target == IDENTITY_CURRENT ? getegid() : (gid_t)target;
-    set_gid = true;
-  } else if (g_identity.chown_gid_set) {
-    gid = g_identity.chown_gid == IDENTITY_CURRENT ? getegid() : (gid_t)g_identity.chown_gid;
-    set_gid = true;
-  } else if (g_identity.numeric_ids) {
-    gid = (gid_t)source_gid;
-    set_gid = true;
-  } else {
-    struct group* gr = getgrgid((gid_t)source_gid);
-    if (gr) {
-      const struct group* mapped = getgrnam(gr->gr_name);
-      if (mapped) {
-        gid = mapped->gr_gid;
-        set_gid = true;
-      }
-    }
-  }
-
-  if (!set_uid && !set_gid)
+  /* Each side is resolved independently: -o/-g and the explicit identity flags
+   * request the owner/group respectively, and a side that is NOT requested must
+   * be left exactly as it is (`-1` to fchown on that side).  This is what lets
+   * plain -g change only the group, or -o only the owner. */
+  uid_t uid = (uid_t)-1;
+  gid_t gid = (gid_t)-1;
+  bool owner_requested = identity_resolve_owner(source_uid, &uid);
+  bool group_requested = identity_resolve_group(source_gid, &gid);
+  if (!owner_requested && !group_requested)
     return false;
-  /* An unset side keeps the file's current id so the other side can change. */
-  if (!set_uid)
-    uid = st->st_uid;
-  if (!set_gid)
-    gid = st->st_gid;
-  /* Only change ownership when the target differs (avoid needless syscalls and
-   * any chance of clearing setuid/setgid on an already-correct entry). */
-  if (st->st_uid == uid && st->st_gid == gid)
+
+  /* Only change ownership when a requested side actually differs (avoid
+   * needless syscalls and any chance of clearing setuid/setgid on an
+   * already-correct entry). */
+  bool changed = (owner_requested && uid != st->st_uid) || (group_requested && gid != st->st_gid);
+  if (!changed)
     return false;
   *out_uid = uid;
   *out_gid = gid;
   return true;
+}
+
+/* --fake-super storage resolution: the receiver records the ownership it WOULD
+ * have applied.  A requested side uses the resolved mapping (--copy-as /
+ * usermap / --chown / -o/-g, with --numeric-ids as the raw-id modifier); a side
+ * that was not requested keeps the source's own id, so a plain --fake-super run
+ * records the source owner untouched. */
+void identity_resolve_storage_ids(int32_t source_uid, int32_t source_gid, uint32_t* out_uid,
+                                  uint32_t* out_gid) {
+  if (g_identity.copy_as_set) {
+    *out_uid = (uint32_t)g_identity.copy_as_uid;
+    *out_gid = (uint32_t)g_identity.copy_as_gid;
+    return;
+  }
+  uid_t uid = (uid_t)source_uid;
+  gid_t gid = (gid_t)source_gid;
+  uid_t resolved_uid;
+  gid_t resolved_gid;
+  if (identity_resolve_owner(source_uid, &resolved_uid))
+    uid = resolved_uid;
+  if (identity_resolve_group(source_gid, &resolved_gid))
+    gid = resolved_gid;
+  *out_uid = (uint32_t)uid;
+  *out_gid = (uint32_t)gid;
 }
 
 static void identity_log_chown_failure(const char* what, uid_t uid, gid_t gid) {
@@ -710,8 +1048,12 @@ bool identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
   /* Ownership application is OFF unless the client requested an identity flag.
    * This is the controlled gate: a default (or plain -M) transfer never changes
    * ownership, byte-for-byte preserving FastSync's existing behavior.  --no-super
-   * additionally forbids it even when the receiver is root. */
-  if (!identity_active_enabled() || !privilege_super_permitted() || fd < 0)
+   * additionally forbids it even when the receiver is root.  --fake-super never
+   * performs a REAL chown: that would defeat the point of the flag (record the
+   * source ownership on an unprivileged receiver for a later privileged
+   * restore); the resolved ownership is stored in the reserved xattr instead by
+   * fake_super_store_fd(). */
+  if (!identity_active_enabled() || g_identity.fake_super || !privilege_super_permitted() || fd < 0)
     return true;
   struct stat st;
   if (fstat(fd, &st) != 0)
@@ -731,7 +1073,8 @@ bool identity_apply_ownership(int fd, int32_t source_uid, int32_t source_gid) {
 
 bool identity_apply_ownership_link(int parent_fd, const char* leaf, int32_t source_uid,
                                    int32_t source_gid) {
-  if (!identity_active_enabled() || !privilege_super_permitted() || parent_fd < 0 || !leaf)
+  if (!identity_active_enabled() || g_identity.fake_super || !privilege_super_permitted() ||
+      parent_fd < 0 || !leaf)
     return true;
   struct stat st;
   if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)

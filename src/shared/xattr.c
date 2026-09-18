@@ -2,6 +2,7 @@
 #include "xattr.h"
 #include "identity.h"
 #include "log.h"
+#include "metadata.h"
 #include "protocol.h"
 #include "utils.h"
 #include "file_types.h"
@@ -35,6 +36,22 @@ void xattr_list_free(FileXattrList* list) {
   }
   free(list->items);
   free(list);
+}
+
+FileXattrList* xattr_list_clone(const FileXattrList* list) {
+  if (!list)
+    return NULL;
+  FileXattrList* clone = xattr_list_new();
+  if (!clone)
+    return NULL;
+  for (int i = 0; i < list->count; i++) {
+    if (!xattr_list_append(clone, list->items[i].name, list->items[i].value,
+                           list->items[i].value_len)) {
+      xattr_list_free(clone);
+      return NULL;
+    }
+  }
+  return clone;
 }
 
 bool xattr_list_append(FileXattrList* list, const char* name, const void* value, size_t value_len) {
@@ -73,13 +90,17 @@ bool xattr_list_append(FileXattrList* list, const char* name, const void* value,
 
 /* A Linux xattr name is "namespace.name" with an optional leading "trusted.",
  * "system.", "security.", "user.", or "trusted." prefix.  We only ever touch
- * the unprivileged "user.*" namespace and the two POSIX ACL xattrs carried in
- * the "system." namespace.  Everything else -- especially "security.*" (ACLs,
- * capabilities, SELinux labels) and "trusted.*" -- is refused so a client can
- * never compel the receiver to apply a privileged attribute it would not
- * otherwise be able to set (and which would be a local privilege escalation if
- * it could). */
-bool xattr_name_appliable(const char* name) {
+ * the unprivileged "user.*" namespace and, only when --acls/-A was negotiated,
+ * the two POSIX ACL xattrs carried in the "system." namespace.  Everything else
+ * -- especially "security.*" (ACLs, capabilities, SELinux labels) and
+ * "trusted.*" -- is refused so a client can never compel the receiver to apply a
+ * privileged attribute it would not otherwise be able to set (and which would be
+ * a local privilege escalation if it could).
+ *
+ * The ACL gate is deliberate: --xattrs/-X alone derives use_xattrs but must NOT
+ * authorize the ACL names, otherwise a -X client could plant an ACL the
+ * receiver never opted into (B4). */
+bool xattr_name_appliable(const char* name, bool preserve_acls) {
   if (!name || name[0] == '\0')
     return false;
   size_t len = strlen(name);
@@ -95,15 +116,24 @@ bool xattr_name_appliable(const char* name) {
   if (strncmp(name, "user.", 5) == 0)
     return name[5] != '\0';
   if (strcmp(name, "system.posix_acl_access") == 0)
-    return true;
+    return preserve_acls;
   if (strcmp(name, "system.posix_acl_default") == 0)
-    return true;
+    return preserve_acls;
   return false;
+}
+
+/* The two POSIX ACL xattr names: the only names whose applicablity is
+ * conditional (they require --acls).  Used by the receiver to distinguish "not
+ * negotiated" (drop the entry, keep user.* working for -X) from a genuinely
+ * disallowed namespace (hard reject). */
+static bool xattr_name_is_posix_acl(const char* name) {
+  return name != NULL && (strcmp(name, "system.posix_acl_access") == 0 ||
+                          strcmp(name, "system.posix_acl_default") == 0);
 }
 
 /* ---- SENDER: capture ---- */
 
-FileXattrList* xattr_capture_path(const char* path) {
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
   if (!path)
     return NULL;
   ssize_t list_size = listxattr(path, NULL, 0);
@@ -130,7 +160,10 @@ FileXattrList* xattr_capture_path(const char* path) {
     if (name_len == 0)
       break; /* trailing double NUL not expected; stop */
     offset += (ssize_t)name_len + 1;
-    if (!xattr_name_appliable(name))
+    /* Capture is sender-side: the scanner has already gated on -X/-A, so the
+       per-name whitelist here allows the ACL names only when --acls was
+       negotiated.  Without it a plain -X capture never carries an ACL. */
+    if (!xattr_name_appliable(name, preserve_acls))
       continue;
     ssize_t value_size = getxattr(path, name, NULL, 0);
     if (value_size < 0)
@@ -190,7 +223,7 @@ bool xattr_send(int fd, const FileXattrList* list) {
   return true;
 }
 
-FileXattrList* xattr_receive(int fd, int* ok) {
+FileXattrList* xattr_receive(int fd, int* ok, bool preserve_acls) {
   if (ok)
     *ok = 0;
   int count;
@@ -232,11 +265,19 @@ FileXattrList* xattr_receive(int fd, int* ok) {
       xattr_list_free(list);
       return NULL;
     }
-    if (!xattr_name_appliable(name)) {
-      log_message(LOG_LEVEL_ERROR, "rejected xattr block: disallowed namespace for '%s'", name);
-      free(name);
-      xattr_list_free(list);
-      return NULL;
+    bool skip = false;
+    if (!xattr_name_appliable(name, preserve_acls)) {
+      if (!preserve_acls && xattr_name_is_posix_acl(name)) {
+        /* -X without -A: the sender may still carry ACLs, but the receiver must
+           never apply an ACL it was not asked to preserve.  Consume and drop the
+           entry (keeping -X compatibility) rather than failing the transfer. */
+        skip = true;
+      } else {
+        log_message(LOG_LEVEL_ERROR, "rejected xattr block: disallowed namespace for '%s'", name);
+        free(name);
+        xattr_list_free(list);
+        return NULL;
+      }
     }
     int32_t value_len32;
     if (!receive_n_data(fd, &value_len32, sizeof(value_len32))) {
@@ -272,6 +313,12 @@ FileXattrList* xattr_receive(int fd, int* ok) {
         xattr_list_free(list);
         return NULL;
       }
+    }
+    if (skip) {
+      free(value);
+      free(name);
+      budget += (size_t)name_len32 + (size_t)value_len32;
+      continue;
     }
     if (!xattr_list_append(list, name, value, (size_t)value_len32)) {
       free(value);
@@ -334,26 +381,12 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int6
   }
 }
 
-/* --fake-super replay: read the freshly-stored record and re-apply the source
- * stat fd-relative.  A privileged (root) run can actually change the owner;
- * a non-root run silently skips the fchown on EPERM/EACCES (never fatal,
- * mirroring the normal metadata identity path; other errors are logged) and
- * still applies mode/mtime where permitted.
- *
- * The OWNER leg additionally honors three policies:
- *   - an explicit ownership identity policy must be active (numeric-ids /
- *     chown / usermap / groupmap / copy-as).  --fake-super on its own only
- *     RECORDS the source owner; replaying that owner as a live chown without an
- *     explicit ownership opt-in would be an un-gated client-chosen-ownership
- *     primitive.
- *   - --no-super (privilege_super_permitted() false) suppresses it even for a
- *     root receiver, exactly like the normal metadata identity path.
- *   - an active --copy-as is AUTHORITATIVE: the identity path already forced the
- *     target owner, so replaying the recorded source owner here would silently
- *     override it.  The xattr record is still stored/replayed for a later
- *     privileged restore; only the live chown is skipped.  Mode/mtime remain
- *     applied either way so unprivileged --fake-super still works. */
-bool fake_super_restore_fd(int fd) {
+/* --fake-super replay: read the freshly-stored record and re-apply mode/mtime
+ * fd-relative.  The recorded uid/gid are retained for a later privileged
+ * restore but are NEVER chowned here: --fake-super only RECORDS ownership, it
+ * must not real-chown the recorded (resolved) owner.  Mode/mtime still apply so
+ * unprivileged --fake-super keeps working. */
+bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
   if (fd < 0)
     return false;
   char record[128];
@@ -368,28 +401,37 @@ bool fake_super_restore_fd(int fd) {
       5)
     return false; /* malformed record: skip, never fatal */
 
-  /* Owner is applied best-effort only: a non-root process cannot chown and
-     must not abort the transfer for that reason (FastSync identity philosophy).
-     EPERM/EACCES (expected for a non-root receiver) are skipped silently; a
-     genuine EINVAL (an impossible stored id) is logged so the corruption is
-     not hidden.  --no-super suppresses the owner leg even for root, and an
-     active --copy-as is authoritative so its forced owner must not be
-     overwritten by the recorded source owner. */
-  if (identity_active_enabled() && privilege_super_permitted() && !identity_copy_as_active() &&
-      fchown(fd, (uid_t)ul_uid, (gid_t)ul_gid) != 0 && errno != EPERM && errno != EACCES)
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore owner on destination file: %s",
-                strerror(errno));
-  /* Mode is applied through the same sanitization the normal metadata path
-     uses (metadata_mode): group/other write bits are never granted, so a
-     recorded source mode of 0666 restores as 0644 — identical to a non-fake-
-     super --preserve run, never a privilege-granting regression. */
-  if (fchmod(fd, (mode_t)(ul_mode & 0777U & ~(S_IWGRP | S_IWOTH))) != 0)
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mode on destination file: %s",
-                strerror(errno));
-  struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
-                              {.tv_sec = (time_t)mtime_sec, .tv_nsec = mtime_nsec}};
-  if (futimens(fd, times) != 0)
-    log_message(LOG_LEVEL_WARNING, "--fake-super: could not restore mtime on destination file: %s",
-                strerror(errno));
+  /* --fake-super NEVER performs a real chown: that would defeat the whole
+     point of the flag (record privileged ownership on an unprivileged receiver
+     for a later privileged restore).  The uid/gid parsed above are retained in
+     the record for that later restore, but no ownership change happens here. */
+  (void)ul_uid;
+  (void)ul_gid;
+  /* Mode is applied only when the per-attribute policy asks for it, through the
+     SAME shared helper the normal metadata path uses (metadata_mode_for_policy):
+     under --perms the recorded source mode is copied exactly, including
+     group/other write and setuid/setgid/sticky bits (rsync parity), and the -E
+     rule derives exec bits from the destination's read bits exactly like
+     file_restore_metadata_fd. */
+  if (policy.perms || policy.executability) {
+    struct stat cur;
+    mode_t want = 0;
+    if (fstat(fd, &cur) != 0) {
+      log_message(LOG_LEVEL_WARNING, "--fake-super: could not read destination mode: %s",
+                  strerror(errno));
+    } else if (metadata_mode_for_policy((mode_t)ul_mode, cur.st_mode, policy, &want)) {
+      if (fchmod(fd, want) != 0)
+        log_message(LOG_LEVEL_WARNING,
+                    "--fake-super: could not restore mode on destination file: %s",
+                    strerror(errno));
+    }
+  }
+  if (policy.times) {
+    struct timespec times[2] = {{.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+                                {.tv_sec = (time_t)mtime_sec, .tv_nsec = mtime_nsec}};
+    if (futimens(fd, times) != 0)
+      log_message(LOG_LEVEL_WARNING,
+                  "--fake-super: could not restore mtime on destination file: %s", strerror(errno));
+  }
   return true;
 }

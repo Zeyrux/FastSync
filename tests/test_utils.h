@@ -6,10 +6,22 @@
 #include <string.h>
 #include <stdbool.h>
 
-// Detect if running under valgrind by checking /proc/self/maps for vgpreload.
-// This is used to skip fork-based tests that are incompatible with valgrind
-// (the instrumented parent runs too slowly, causing pipe timeouts).
+// Reset the thread-local protocol descriptor redirection installed by
+// io_set_fds(), so a suite that leaks a test pipe's fds cannot redirect a later
+// suite's raw send_n_data()/receive_n_data() to the wrong descriptor.
+void io_set_fds(int read_fd, int write_fd);
+
+// Detect if running under valgrind.  The CI valgrind step exports
+// FASTSYNC_UNDER_VALGRIND=1; a /proc/self/maps scan is the fallback for a local
+// valgrind run (newer valgrind versions can hide their own mappings from the
+// guest, so the "vgpreload" match is not reliable on every version -- set
+// FASTSYNC_UNDER_VALGRIND=1 when invoking valgrind by hand).  Used to skip
+// fork-based tests incompatible with valgrind, whose instrumented parent runs
+// too slowly and causes pipe timeouts.
 static inline bool is_running_under_valgrind(void) {
+  const char* env = getenv("FASTSYNC_UNDER_VALGRIND");
+  if (env && env[0] != '\0' && strcmp(env, "0") != 0)
+    return true;
   FILE* f = fopen("/proc/self/maps", "r");
   if (!f)
     return false;
@@ -31,6 +43,7 @@ extern bool current_test_failed;
     printf("Running %s...\n", #test_func);                                                         \
     tests_run++;                                                                                   \
     current_test_failed = false;                                                                   \
+    io_set_fds(-1, -1);                                                                            \
     test_func();                                                                                   \
     if (current_test_failed) {                                                                     \
       tests_failed++;                                                                              \
@@ -110,6 +123,14 @@ extern bool current_test_failed;
       current_test_failed = true;                                                                  \
       return;                                                                                      \
     }                                                                                              \
+  } while (0)
+
+/* Unconditional test failure carrying an explanatory message. */
+#define EXPECT_FAIL(message)                                                                       \
+  do {                                                                                             \
+    printf("    \033[1;31m[FAIL]\033[0m %s:%d: %s\n", __FILE__, __LINE__, (message));              \
+    current_test_failed = true;                                                                    \
+    return;                                                                                        \
   } while (0)
 
 #endif

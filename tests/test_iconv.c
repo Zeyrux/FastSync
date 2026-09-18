@@ -213,5 +213,8 @@ void test_iconv() {
   test_iconv_wire_sender_converts_local_to_remote();
   test_iconv_wire_receiver_converts_remote_to_local();
   test_iconv_wire_disabled_passthrough();
-  test_iconv_wire_str_roundtrip();
+  // This subtest forks to exercise the wire string handshake; the instrumented
+  // parent is too slow under valgrind for the child's blocking reads.
+  if (!is_running_under_valgrind())
+    test_iconv_wire_str_roundtrip();
 }

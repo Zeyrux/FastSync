@@ -16,7 +16,7 @@ Ask the user or determine from context:
 - **Minor** (x.Y.0) — new features, backward compatible
 - **Patch** (x.y.Z) — bug fixes, no protocol changes
 
-Current version: `PROTOCOL_VERSION "1.1.0"` in `src/shared/config.h`
+Current version: `PROTOCOL_VERSION "2.26.0"` in `src/shared/config.h`
 
 ### Step 2: Check Protocol Version
 
@@ -37,7 +37,7 @@ rm -rf build
 cmake -B build -S .
 cmake --build build -j$(nproc)
 ./build/tests
-python3 test.py
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"
 ```
 
 ALL tests must pass before release.
@@ -46,12 +46,10 @@ ALL tests must pass before release.
 
 ```bash
 # ASan
-rm -rf build
-cmake -B build -S . \
-  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
-cmake --build build -j$(nproc)
-./build/tests
+rm -rf build-asan
+cmake -B build-asan -S . -DSANITIZER=address
+cmake --build build-asan -j$(nproc)
+./build-asan/tests
 ```
 
 ### Step 5: Update README (If Needed)
@@ -79,11 +77,22 @@ git commit -m "Release vX.Y.Z
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 ```
 
-### Step 8: Push
+### Step 8: Push and Open dev → main PR
+
+`main` is protected and only receives changes via `dev` → `main` PRs (see AGENTS.md). Never push directly to `main`.
 
 ```bash
-git push origin main --tags
+# Push the release commit and tag to dev
+git push origin dev
+git push origin vX.Y.Z
+
+# Open the dev → main release PR for review + CI
+tea pr create --repo TapTap/FastSync --head dev --base main \
+  --title "Release vX.Y.Z" \
+  --description "Release vX.Y.Z"
 ```
+
+Then wait for the full CI to pass and request review before the PR is merged to `main`.
 
 ### Step 9: Report
 

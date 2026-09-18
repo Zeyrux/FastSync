@@ -27,7 +27,7 @@ FastSync is a file synchronization tool (like rsync, but faster). It transfers f
 cmake -B build -S . && cmake --build build -j$(nproc)
 
 # Server (TCP mode)
-./build/server
+./build/server -p 8080 --allow-unauthenticated
 
 # Client (TCP mode)
 ./build/client --source-dir /path/to/send --dest-dir /path/to/receive --save-to-disk
@@ -37,13 +37,13 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 
 # Run tests
 ./build/tests          # unit tests
-python3 test.py        # integration tests
+python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"   # integration tests
 ```
 
 ## Code Walkthrough
 
 ### Client Entry Point (`src/client/client_cli.c`)
-- Parses CLI arguments using `getopt_long`
+- Parses CLI arguments using a custom option-table parser (`OPTION_TABLE` in `src/client/client_cli.c`); there is no `getopt*` usage
 - Creates `Config` struct with all options
 - Detects SSH destinations (contains `:`)
 - Calls into `client_send.c` for the actual transfer
@@ -109,7 +109,7 @@ Collection of files for batch transfer. Serialized with file count, then per-fil
 zstd streaming compression via `ZSTD_compressStream2`/`ZSTD_decompressStream`. Compression happens per-chunk in the sender stage. Level 1-22 (default 5). Streaming means memory usage stays bounded regardless of file size.
 
 ### "How does sendfile() work?"
-On Linux, `sendfile()` copies data directly from kernel file buffer to socket, bypassing userspace. ~2x faster for large files. Enabled with `-f` flag. Only works with TCP (not SSH, not compression).
+On Linux, `sendfile()` copies data directly from kernel file buffer to socket, bypassing userspace. ~2x faster for large files. Enabled with `--sendfile` (long form only). Only works with TCP (not SSH, not compression).
 
 ### "How does incremental sync work?"
 Client sends file metadata (path, size, mtime) to server. Server checks if destination file has same size+mtime. If match, server responds `STATUS_OK` (skip). If mismatch, server responds `STATUS_NEXT` (send).
@@ -138,7 +138,7 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 

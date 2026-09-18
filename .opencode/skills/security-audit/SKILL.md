@@ -102,9 +102,9 @@ Informational: <count>
 ...
 
 === VERDICT ===
-[PASS] No critical/high issues found
+[PASS] No critical/high-severity issues found
   — or —
-[FAIL] <N> critical/high issues must be fixed
+[FAIL] <N> critical/high-severity issues must be fixed
 ```
 
 ## Rules

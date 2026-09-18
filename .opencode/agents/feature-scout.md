@@ -16,12 +16,18 @@ Scan the codebase for patterns that suggest new feature opportunities. You ident
 ### Module Map
 ```
 src/client/         Client-side: CLI parsing, scanning, sending
-  client_cli.c      Entry point, argument parsing, config setup
+  client_cli.c      Entry point, OPTION_TABLE parser, config setup
+  usage.c           Usage/help text (authoritative CLI flag list)
   client_send.c     Transfer orchestration, pipeline management
+  client_validation.c  Destination/CLI validation
   scanner.c         BFS directory traversal, chunk building
+  change_list.c     File change-list bookkeeping
 
 src/server/         Server-side: listening, receiving, writing
   server.c          TCP accept loop, per-connection handling
+  server_cli.c      Server option-table CLI parsing
+  receiver.c        Receiver-side file handling
+  receiver_pipeline.c  Receiver worker pipeline
 
 src/shared/         Shared libraries (used by both client and server)
   protocol.c/h      Wire protocol: status codes, send/receive primitives
@@ -32,40 +38,63 @@ src/shared/         Shared libraries (used by both client and server)
   data.c/h          Generic buffer type (Data)
   metadata.c/h      File metadata (mode, uid, gid, mtime)
   file.c/h          File representation
+  file_send.c/h     Sender-side file transfer
+  file_receive.c/h  Receiver-side file transfer
+  file_list.c/h     File list model
+  file_store.c/h    Destination file store
   array_list.c/h    Dynamic array
+  delta.c/h         Delta transfer algorithm
+  checksum.c/h      Whole-file/block checksums (xxHash, md5)
+  filter.c/h        rsync-style filter rules
+  batch.c/h         Batch files (--write-batch/--read-batch)
+  charset.c/h       Filename charset conversion (--iconv)
+  chmod.c/h         Permission modification (--chmod)
+  xattr.c/h         Extended attributes
+  hardlink.c/h      Hard-link handling
+  identity.c/h      uid/gid mapping (--usermap/--groupmap/--chown)
+  credentials.c/h   Daemon credentials
+  daemon_conf.c/h   Daemon module configuration
+  motd.c/h          Daemon MOTD
+  delay_updates.c/h Delayed update staging
+  stop_condition.c/h Stop-after/stop-at handling
   transport_tcp.c/h TCP client/server with sendfile() zero-copy
   transport_ssh.c/h SSH transport with ControlMaster
   transport_tls.c/h TLS encryption via OpenSSL
   multiprocessing.c/h Fork-based concurrency
   log.c/h           Logging utilities
   utils.c/h         Shared utilities
+  file_types.h      Shared file type definitions
 ```
 
-### Existing CLI Flags (from client_cli.c)
+### Existing CLI Flags (authoritative source: `src/client/usage.c`)
 ```
---source-dir <dir>       Source directory to sync (required)
---dest-dir <dir>         Destination directory on server (required)
---host <host>            Server hostname/IP (required)
---port <port>            Server TCP port
---server-mode            Listen as server
---use-compression, -c    Enable zstd compression
---use-multithreading, -m Enable multithreaded transfer
---use-sendfile, -s       Use sendfile() zero-copy TCP
---use-ssh, -S            Use SSH transport
---use-tls, -T            Enable TLS encryption
---cert <file>            TLS certificate file
---key <file>             TLS key file
---ca <file>              TLS CA certificate file
---insecure               Skip TLS verification
---bwlimit <bytes/s>      Bandwidth limit
---delete                 Delete files not in source
---include <pattern>      Include filter pattern
---exclude <pattern>      Exclude filter pattern
---dry-run                Print what would be transferred
---save-to-disk           Save transferred files to disk (for server tests)
+--source-dir <dir>       Source directory
+--dest-dir <dir>         Destination directory on server
+--server-host <ip>       Server IP address (default: 127.0.0.1)
+--server-port <n>        Server port (default: 8080); --port is an alias
+-c, --checksum           Verify content by checksum instead of size+mtime
+-z, --compress [level]   Enable compression (level 1-22, default 5)
+-j, --threads[=N]        Enable multithreaded scanner/loader/sender pipeline
+--chunk-serialization    Enable chunk serialization (long form only)
+--sendfile               sendfile() zero-copy (TCP only; long form only)
+-s, --secluded-args      Protect-args compatibility option (no effect)
+--tls                    Enable TLS encryption; --cert/--key/--ca give PEMs
+--bwlimit <KB/s>         Bandwidth limit in kilobytes per second
+--delete                 Delete files on receiver not in source
+--incremental            Skip files unchanged since last transfer
+--delta                  Delta transfer for changed files (needs --incremental)
+-f, --filter=RULE        rsync-style filter rule (+/- include/exclude)
+--exclude <pattern>      Exclude files matching pattern
+--include <pattern>      Only include files matching pattern
+-m, --prune-empty-dirs   Do not transfer empty directory entries
+-n, --dry-run            Show what would be transferred
+--save-to-disk           Write received files to disk
 --version                Print version and exit
---help                   Print help
+--help                   Show help
 ```
+> Always confirm the current flags with `./build/client --help`; the table above
+> is a representative subset. `src/client/usage.c` is the authoritative list and
+> `OPTION_TABLE` in `src/client/client_cli.c` is the parser (there is no `getopt*`).
 
 ## Feature Scout Checklist
 
@@ -288,7 +317,7 @@ When using `tea` (the task execution agent) to run CI or tests, always set a suf
 
 ## Branch Strategy
 
-Never push directly to `main`. All changes must be developed on a feature branch and merged via a pull request. Always create a new branch (`git checkout -b <branch-name>`) before making changes, push it, and open a PR with `gh pr create --fill`. Wait for CI to pass before merging.
+Never push directly to `dev` or `main`. All changes must be developed on a feature branch and merged via a pull request targeting `dev`. Create a branch (`git checkout -b <branch-name>`), push it, and open the PR with `tea pr create --repo TapTap/FastSync --base dev --head <branch-name>`. Wait for CI to pass before merging.
 
 ## Dependency Installation
 
