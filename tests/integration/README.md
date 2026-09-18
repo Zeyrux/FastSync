@@ -58,12 +58,8 @@ Each entry maps a case id to the aspects that may differ (`tree`, `stdout`,
 
 ```python
 CAVEATS = {
-    "max_delete": {
-        "tree": "which destination extras survive a partial --max-delete abort "
-                "is deletion-order dependent and unspecified; rc=25 and the "
-                "number of survivors match rsync. ref: RSYNC_COMPAT.md "
-                "`--max-delete=NUM` row.",
-    },
+    # no known residuals at present -- the burn-down reached zero
+    # "some_case_id": {"tree": "documented residual ... ref: RSYNC_COMPAT.md ..."},
 }
 ```
 

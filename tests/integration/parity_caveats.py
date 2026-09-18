@@ -24,19 +24,7 @@ re-triaged when the row moves.
 """
 
 # case id -> {aspect: "reason (ref: RSYNC_COMPAT.md ...)"}
-CAVEATS = {
-    # --max-delete stops the extras walk part-way and exits 25 in both
-    # implementations; which of the remaining extras survives depends on
-    # deletion order, which neither tool specifies.  The exit code and the
-    # number of survivors match (asserted implicitly by the harness's rc
-    # comparison and the one-for-one diff below).
-    "max_delete": {
-        "tree": "which destination extras survive a partial --max-delete abort "
-                "is deletion-order dependent and unspecified; rc=25 and the "
-                "number of survivors match rsync. ref: RSYNC_COMPAT.md "
-                "`--max-delete=NUM` row.",
-    },
-}
+CAVEATS = {}
 
 # Accepted aspect names (guards against typos in this file).
 ASPECTS = ("tree", "stdout", "extra", "rc")
