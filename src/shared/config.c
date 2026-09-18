@@ -206,7 +206,8 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->preserve_perms) && valid_wire_bool(config->preserve_times) &&
          valid_wire_bool(config->preserve_owner) && valid_wire_bool(config->preserve_group) &&
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
-         valid_wire_bool(config->fake_super) &&
+         valid_wire_bool(config->fake_super) && valid_wire_bool(config->report_dest_info) &&
+         valid_wire_bool(config->report_stats) && valid_wire_bool(config->report_deletes) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&

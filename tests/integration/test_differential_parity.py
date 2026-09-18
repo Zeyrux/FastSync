@@ -218,7 +218,8 @@ _CASES = [
     H.Case("files_from", "relative", ["--dirs", "-R"],
            files_from=("dir1", "sub/x.txt"), layout=H.RELATIVE, ci=True,
            ref="-d/--dirs + --files-from"),
-    H.Case("dirs_plain", "basic", ["-d"], ref="-d/--dirs (plain)"),
+    H.Case("dirs_plain", "basic", ["-d"], fs_src_suffix="/",
+           ref="-d/--dirs (plain)"),
     H.Case("empty_dirs_recursive", "empty_dir", ["-a"],
            ref="recursive empty-directory residual"),
     H.Case("empty_dirs_files_from", "empty_dir", ["--dirs", "-R"],
@@ -232,6 +233,11 @@ _CASES = [
            ["-a", "--iconv=ISO-8859-1,UTF-8"],
            server_args=("--allow-super", "--iconv=UTF-8"),
            ref="--iconv conversion (receiver declares its own charset)"),
+    # rsync's spec is LOCAL,REMOTE and the destination end's charset is REMOTE
+    # on a push, so a default server writes the wire (UTF-8) names verbatim.
+    H.Case("iconv_default_server", "iconv",
+           ["-a", "--iconv=ISO-8859-1,UTF-8"],
+           ref="--iconv push direction (default receiver charset = REMOTE)"),
 
     # --- partial ----------------------------------------------------------
     H.Case("partial_complete", "basic", ["-a", "--partial"], ref="--partial"),

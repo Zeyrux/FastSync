@@ -94,14 +94,14 @@ def _seed_protocol_source(source):
 class TestProtocol:
     @pytest.mark.ci
     def test_protocol_current_version_accepted(self, shared_server):
-        """--protocol=2.26.0 (the current PROTOCOL_VERSION) is accepted and the
+        """--protocol=2.27.0 (the current PROTOCOL_VERSION) is accepted and the
         transfer completes normally."""
         source = os.path.join(TEST_DATA_DIR, "proto_ok_src")
         dest = os.path.join(TEST_DATA_DIR, "proto_ok_dst")
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest)
         _seed_protocol_source(source)
-        result, _ = run_client(source, dest, flags=["--protocol=2.26.0"],
+        result, _ = run_client(source, dest, flags=["--protocol=2.27.0"],
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"--protocol current run failed: {(result.stderr or result.stdout)[:400]}"

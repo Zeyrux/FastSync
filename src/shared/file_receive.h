@@ -3,6 +3,7 @@
 
 #include "config.h"
 #include "file_types.h"
+#include "utils.h"
 #include <stdbool.h>
 
 /* Server-side file receive/save path. */
@@ -126,6 +127,13 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
 bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
                                           size_t max_delete, size_t* deleted, size_t* skipped,
                                           bool* limit_hit);
+/* Observer-aware form of manifest_delete_missing_args_limited: `observer` (may
+   be NULL) is invoked for every destination-relative path truly removed. */
+bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteManifest* manifest,
+                                                   size_t max_delete, size_t* deleted,
+                                                   size_t* skipped, bool* limit_hit,
+                                                   DeletePathObserver observer,
+                                                   void* observer_context);
 /* Outcome of committing a delete manifest.  LIMIT_REACHED reports rsync's
    partial --max-delete result: the budget allowed some deletions and the rest
    were skipped (the run still stores all file data but the client exits 25). */
@@ -146,6 +154,11 @@ DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* man
    removed (for the end-of-transfer wire stats).  `deleted` may be NULL. */
 DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
                                                size_t* deleted);
+/* Observer-aware form of manifest_delete_all_counted: `observer` (may be NULL)
+   is invoked for every destination-relative path truly removed. */
+DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteManifest* manifest,
+                                                size_t* deleted, DeletePathObserver observer,
+                                                void* observer_context);
 
 /* -n/--dry-run --delete would-delete reporting: walk the destination exactly as
    the delete pass would and append (strdup'd) destination-relative paths that

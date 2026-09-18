@@ -82,7 +82,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.26.0).
+ * Config wire-field table (single source of truth for protocol 2.27.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -259,9 +259,18 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  * for -n/--dry-run --delete, the destination-relative paths it WOULD have
  * deleted.  It is set by the client only when --stats, --progress/-P, an
  * --out-format token needs a wire counter (%b/%c), or a dry-run carries
- * --delete; the transfer decision itself is unchanged. */
+ * --delete; the transfer decision itself is unchanged.
+ *
+ * --info wave (protocol 2.27.0).  report_deletes tells the receiver to include
+ * the destination-relative paths it ACTUALLY removed in its terminal
+ * STATUS_STATS record (the same path-list field the dry-run would-delete report
+ * uses), so the sender can print rsync's `deleting PATH`/`*deleting` lines for a
+ * real (non-dry-run) deletion.  It is set when --delete is active and any of
+ * --info=del, -i/--itemize-changes or --out-format requests per-file change
+ * output; the transfer decision itself is unchanged. */
 #define CONFIG_WIRE_OUTPUT_FIELDS(X)                                                               \
-  X(report_dest_info, bool, false, BOOL) X(report_stats, bool, false, BOOL)
+  X(report_dest_info, bool, false, BOOL)                                                           \
+  X(report_stats, bool, false, BOOL) X(report_deletes, bool, false, BOOL)
 
 /* Codec-negotiation wave (protocol 2.26.0).  compression_algo is the concrete
  * codec the client selected for this transfer (a CompressionAlgo id) and is the
@@ -424,8 +433,10 @@ typedef struct Config {
    * repeated -F adds --filter='- .rsync-filter' so they are excluded too. */
   int per_dir_filter_count;
   bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
-  /* --no-implied-dirs: client-only.  With -R + --files-from, refuse to place a
-   * listed file whose ancestor directory is not itself explicitly listed. */
+  /* --no-implied-dirs: client-only.  With -R, do not transfer the source
+   * metadata of the parent directories implied by a listed path; an unlisted
+   * implied parent is still created (with default attributes) so the listed
+   * file can be placed, matching rsync. */
   bool no_implied_dirs;
   /* -d/--dirs: client-only.  Transfer the directory entries named by the
    * source argument / --files-from list without recursing into contents. */
@@ -988,7 +999,14 @@ typedef struct Config {
  * boundary, and the strict same-version handshake (config_receive rejects a
  * mismatched version before parsing anything else) keeps mixed deployments from
  * ever reaching that state. */
-#define PROTOCOL_VERSION "2.26.0"
+/* (7) --info=del report (protocol 2.27.0): the config frame gains one trailing
+ * bool, report_deletes, appended after report_stats.  When set, the receiver
+ * lists the paths it actually removed in the terminal STATUS_STATS path list
+ * (the same count-delimited list the -n/--dry-run would-delete report uses), so
+ * the sender can print rsync's `deleting PATH` lines for a real deletion.  No
+ * change to the fixed STATUS_STATS record itself; only a new trailing config
+ * bool, which still requires the version bump for the strict lockstep. */
+#define PROTOCOL_VERSION "2.27.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

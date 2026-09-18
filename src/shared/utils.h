@@ -138,6 +138,20 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,
                                        size_t* deleted_out, size_t* skipped_out);
+
+/* Optional per-deletion observer: called for each destination-relative path
+   actually removed (a file, symlink, or directory), in removal order, so the
+   receiver can stream rsync's `--info=del`/`--info=remove` lines. */
+typedef void (*DeletePathObserver)(void* context, const char* rel_path);
+
+/* `delete_extras_limited_observed` is delete_extras_limited with an optional
+   observer; the observer is invoked only for entries truly removed. */
+DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
+                                                const ArrayList* synced_dirs, size_t max_delete,
+                                                const DeleteSkipEntry* skips, int skip_count,
+                                                size_t* deleted_out, size_t* skipped_out,
+                                                DeletePathObserver observer,
+                                                void* observer_context);
 /* Read-only companion to delete_extras_limited: walk the destination exactly as
    the delete pass would and APPEND (strdup'd) destination-relative paths that
    WOULD be removed, without touching disk.  Used for -n/--dry-run --delete
@@ -177,6 +191,11 @@ const char* utils_get_authorized_root_path(void);
  * callers guarantee this); this is containment by string, not by resolved
  * symlinks.  Shared by the utils and file secure-walk root confinement. */
 bool path_is_within_root(const char* root, const char* path);
+/* Non-allocating transfer-relative view of `path`: strip any leading '/' and
+ * then a `root` prefix (leading/trailing slashes tolerated), returning a
+ * borrowed pointer into `path`.  A NULL/empty root, or a path not under
+ * `root`, yields just the leading-slash strip.  `path`/`root` must stay alive. */
+const char* utils_strip_transfer_root(const char* path, const char* root);
 /* True when `path` contains a ".." component.  This is a purely lexical
  * dot-dot check: an absolute path is NOT rejected here, because default
  * (non-relative) transfers legitimately put the sender's absolute source path

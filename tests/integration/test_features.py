@@ -583,6 +583,55 @@ class TestRemoteDryRun:
             assert os.path.exists(extra), f"{flags} deleted an extra in dry-run"
             assert _snapshot_tree(received) == before, f"{flags} mutated the destination"
 
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_dry_run_delete_lines_over_report_residual(self):
+        """Documented residual (RSYNC_COMPAT.md `-n/--dry-run` row): FastSync's
+        dry-run would-delete report includes the file that is merely being
+        updated (derived from the receiver's STATUS_STATS extras) and, unlike
+        rsync, also reports an excluded-but-protected extra.  rsync `-n -i
+        --delete` lists only genuine extras.  Pins the residual that keeps the
+        row Divergent."""
+        source = os.path.join(TEST_DATA_DIR, "dryrep_src")
+        rdst = os.path.join(TEST_DATA_DIR, "dryrep_rdst")
+        fdst = os.path.join(TEST_DATA_DIR, "dryrep_fdst")
+        clean_dir(source)
+        clean_dir(rdst)
+        clean_dir(fdst)
+        with open(os.path.join(source, "a.txt"), "wb") as fh:
+            fh.write(b"new content\n")
+        os.utime(os.path.join(source, "a.txt"), (1_700_000_000, 1_700_000_000))
+        for root in (rdst, fdst):
+            with open(os.path.join(root, "a.txt"), "wb") as fh:
+                fh.write(b"old\n")
+            for name, data in (("extra.log", b"log\n"), ("extra.txt", b"extra\n")):
+                with open(os.path.join(root, name), "wb") as fh:
+                    fh.write(data)
+            for p in (os.path.join(root, "a.txt"), os.path.join(root, "extra.log"),
+                      os.path.join(root, "extra.txt")):
+                os.utime(p, (1_500_000_000, 1_500_000_000))
+
+        r = subprocess.run(["rsync", "-an", "-i", "--delete", "--exclude=*.log",
+                            source + "/", rdst + "/"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"))
+        assert r.returncode == 0, r.stderr
+        rsync_del = {l.split(None, 1)[1] for l in r.stdout.splitlines()
+                     if l.startswith("*deleting")}
+        assert rsync_del == {"extra.txt"}, f"unexpected rsync deleting set: {rsync_del}"
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, fdst,
+                                   flags=["-a", "-n", "-i", "--delete", "--exclude=*.log"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        fs_del = {l.split(None, 1)[1] for l in (result.stdout or "").splitlines()
+                  if l.startswith("*deleting")}
+        # Documented over-report: the transferred/updated file and the excluded
+        # extra appear in FastSync's would-delete set.
+        assert "a.txt" in fs_del, "residual changed: FastSync no longer over-reports the update"
+        assert "extra.log" in fs_del, "residual changed: FastSync no longer reports excluded extra"
+
     @pytest.mark.ci
     def test_remote_dry_run_quiet_is_silent(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "remote_dry_quiet_src")
@@ -2376,6 +2425,61 @@ class TestTempDir:
         assert not mismatches, f"Mismatch: {mismatches}"
         self._assert_clean_scratch(os.path.join(dest, "scratch"))
 
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_relative_temp_dir_matches_rsync_absolute_rejected(self):
+        """Differential: a relative --temp-dir is resolved under the destination
+        by both (rsync 3.4.1 and FastSync), producing identical trees.  An
+        absolute --temp-dir is used verbatim by rsync standalone, but the
+        receiver deliberately confines it to the receive root (security
+        invariant), so FastSync rejects it without writing outside the root.
+        """
+        source = self._make_source("tempdir_diff_src")
+        rdst = os.path.join(TEST_DATA_DIR, "tempdir_diff_rdst")
+        fdst = os.path.join(TEST_DATA_DIR, "tempdir_diff_fdst")
+        clean_dir(rdst)
+        clean_dir(fdst)
+        os.makedirs(os.path.join(rdst, "scratch"), exist_ok=True)
+        os.makedirs(os.path.join(fdst, "scratch"), exist_ok=True)
+        r = subprocess.run(["rsync", "-a", "--temp-dir=scratch", source + "/", rdst + "/"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"))
+        assert r.returncode == 0, r.stderr
+        with ServerManager() as server:
+            server.start()
+            result, _ = run_client(source, fdst, flags=["--temp-dir=scratch"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        # rsync lays the source contents directly in rdst; FastSync mirrors the
+        # absolute source path below fdst.  Compare the mirrored content trees
+        # (the scratch dir lives at each destination root).
+        rtree = sorted(os.path.relpath(os.path.join(dp, n), rdst)
+                       for dp, dn, fn in os.walk(rdst)
+                       for n in dn + fn if os.path.join(dp, n) != os.path.join(rdst, "scratch"))
+        mirror = get_dest_received_dir(fdst, source)
+        ftree = sorted(os.path.relpath(os.path.join(dp, n), mirror)
+                       for dp, dn, fn in os.walk(mirror) for n in dn + fn)
+        assert rtree == ftree, f"relative temp-dir tree mismatch: {rtree} != {ftree}"
+        assert _walk_tmp_files(os.path.join(rdst, "scratch")) == []
+        assert _walk_tmp_files(os.path.join(fdst, "scratch")) == []
+
+        # Absolute temp dir: rsync accepts it; FastSync rejects it safely.
+        abs_scratch = os.path.join(TEST_DATA_DIR, "tempdir_diff_abs")
+        clean_dir(abs_scratch)
+        rdst2 = os.path.join(TEST_DATA_DIR, "tempdir_diff_rdst2")
+        clean_dir(rdst2)
+        r2 = subprocess.run(["rsync", "-a", "--temp-dir=" + abs_scratch, source + "/", rdst2 + "/"],
+                            capture_output=True, text=True,
+                            env=dict(os.environ, LC_ALL="C"))
+        assert r2.returncode == 0, r2.stderr
+        fdst2 = os.path.join(TEST_DATA_DIR, "tempdir_diff_fdst2")
+        clean_dir(fdst2)
+        with ServerManager() as server:
+            server.start()
+            result2, _ = run_client(source, fdst2, flags=["--temp-dir", abs_scratch],
+                                    port=server.port)
+        assert result2.returncode != 0, "an absolute --temp-dir must be rejected (confined)"
+        assert os.listdir(abs_scratch) == [], "receiver wrote into an unconfined temp dir"
+
     def test_default_behavior_has_no_scratch_dir(self, shared_server):
         source = self._make_source("tempdir_default_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_default_dst")
@@ -2836,6 +2940,41 @@ class TestDelayUpdates:
                                    os.path.join(delay_received, rel), shallow=False), rel
         assert not os.path.isdir(os.path.join(delay_dest, self.STAGING)), \
             "staging directory left behind after a successful delayed transfer"
+
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_delay_updates_staging_name_collision_residual(self):
+        """Documented residual (RSYNC_COMPAT.md `--delay-updates` row): FastSync
+        uses a fixed `.fastsync-stage` staging name and wipes a pre-existing tree
+        of that name at the start of a delayed run (crash-leftover cleanup),
+        even without `--delete`; rsync leaves a genuine destination entry of that
+        name untouched.  Pins the divergence that keeps the row Divergent."""
+        source = self._make_source("delay_collide_src")
+        rdst = os.path.join(TEST_DATA_DIR, "delay_collide_rdst")
+        fdst = os.path.join(TEST_DATA_DIR, "delay_collide_fdst")
+        clean_dir(rdst)
+        clean_dir(fdst)
+        for root in (rdst, fdst):
+            with open(os.path.join(root, "top.txt"), "wb") as fh:
+                fh.write(b"old\n")
+            stage = os.path.join(root, self.STAGING)
+            os.makedirs(stage, exist_ok=True)
+            with open(os.path.join(stage, "keepme.txt"), "wb") as fh:
+                fh.write(b"genuine user data\n")
+
+        r = subprocess.run(["rsync", "-a", "--delay-updates", source + "/", rdst + "/"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"))
+        assert r.returncode == 0, r.stderr
+        assert os.path.exists(os.path.join(rdst, self.STAGING, "keepme.txt")), \
+            "rsync removed an unrelated destination entry named like the staging dir"
+
+        with ServerManager() as server:
+            server.start()
+            result, _ = run_client(source, fdst, flags=["--delay-updates"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert not os.path.exists(os.path.join(fdst, self.STAGING)), \
+            "FastSync did not wipe the reserved staging name (residual changed)"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_delay_updates_incremental_rerun_no_leftovers(self, shared_server, mt):
@@ -3523,23 +3662,25 @@ class TestMissingArgs:
 
 
 class TestNoImpliedDirs:
-    """--no-implied-dirs (only meaningful with -R + --files-from) refuses to
-    place a listed file whose parent directory is not itself listed."""
+    """--no-implied-dirs (meaningful with -R) omits the source metadata of a
+    listed path's implied parent directories but still creates those parents
+    with default attributes, matching rsync 3.4.1."""
 
     def _make(self):
         return _make_relative_source("noimplied_src")
 
     @pytest.mark.parametrize("mt", [False, True])
-    def test_implied_dir_only_fails_entry(self, shared_server, mt):
+    def test_implied_dir_created_with_default_attrs(self, shared_server, mt):
         source = self._make()
         dest = os.path.join(TEST_DATA_DIR, "noimplied_dst")
         clean_dir(dest)
         lst = _write_rel_list(b"a/b.txt\n")  # "a" itself is not listed
         flags = ["--files-from", lst, "-R", "--no-implied-dirs"] + (["--threads"] if mt else [])
         result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
-        assert result.returncode != 0, "implied parent directory was not rejected"
-        assert "--no-implied-dirs" in (result.stderr or result.stdout)
-        assert not os.path.exists(os.path.join(dest, "a", "b.txt"))
+        assert result.returncode == 0, \
+            f"implied parent directory was not created: {result.stderr[:200]}"
+        assert os.path.isdir(os.path.join(dest, "a")), "implied parent 'a' was not created"
+        assert _read_file(os.path.join(dest, "a", "b.txt")) == b"nested\n"
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_listed_dir_allows_file(self, shared_server, mt):
@@ -3666,9 +3807,10 @@ class TestDirs:
                 files.extend(os.path.relpath(os.path.join(root, n), mirror) for n in names)
             assert files == [], f"--dirs descended into contents: {files}"
 
-    def test_dirs_listed_dir_colliding_with_file_fails(self, shared_server):
-        """A listed directory that already exists as a regular file at the
-        destination fails the transfer cleanly instead of clobbering the file."""
+    def test_dirs_listed_dir_replaces_blocking_file(self, shared_server):
+        """rsync parity: a listed directory replaces a regular file already at
+        its destination path (rsync removes the non-directory and creates the
+        directory)."""
         source = self._make()
         dest = os.path.join(TEST_DATA_DIR, "dirs_coll_dst")
         clean_dir(dest)
@@ -3678,8 +3820,10 @@ class TestDirs:
         lst = _write_rel_list(b"dir1\n")
         result, _ = run_client(source, dest, flags=["--files-from", lst, "--dirs", "-R"],
                                port=shared_server.port)
-        assert result.returncode != 0, "dir entry over an existing file did not fail"
-        assert os.path.isfile(blocker), "blocking regular file was clobbered"
+        assert result.returncode == 0, \
+            f"dir entry over an existing file failed: {(result.stderr or result.stdout)[:300]}"
+        assert os.path.isdir(blocker) and not os.path.islink(blocker), \
+            "blocking regular file was not replaced by the incoming directory"
 
 
 class TestMkpath:
@@ -4463,11 +4607,11 @@ class TestDeletePolicy:
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.setpriv
     def test_ignore_errors_keeps_deletion_active_on_scan_error(self, mt):
-        """A source I/O error (unreadable subdirectory) aborts the run so no
-        deletion happens by default; --ignore-errors continues, still transfers
-        the readable tree and still deletes, single-threaded and under -m.  Run
-        as an unprivileged user so the mode-000 directory is genuinely
-        unreadable."""
+        """rsync's --ignore-errors semantics: a source I/O error (unreadable
+        subdirectory) makes the run continue and transfer the readable tree, but
+        the default suppresses deletion ("IO error encountered -- skipping file
+        deletion"); --ignore-errors lets deletion proceed.  Both exit 23.  Run as
+        an unprivileged user so the mode-000 directory is genuinely unreadable."""
         if os.geteuid() != 0 or shutil.which("setpriv") is None:
             pytest.skip("requires root + setpriv to drop privileges for the client")
         tag = f"ioerr_{os.getpid()}_{mt}"
@@ -4487,11 +4631,15 @@ class TestDeletePolicy:
             try:
                 os.chmod(os.path.join(source, "locked"), 0)
 
-                # Default: scan error aborts the run; nothing is deleted.
+                # Default: the scan continues past the unreadable dir and the
+                # readable tree transfers, but deletion is skipped (exit 23).
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
                 flags = ["--delete"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
-                assert result.returncode != 0, "unreadable source dir did not fail the run"
+                assert result.returncode == 23, \
+                    f"unreadable source dir should exit 23 (got {result.returncode})"
+                assert os.path.exists(os.path.join(received, "top.txt")), \
+                    "readable tree did not transfer past the I/O error"
                 assert os.path.exists(os.path.join(received, "extra.txt")), \
                     "default run deleted although the scan hit an I/O error"
 
@@ -4499,6 +4647,8 @@ class TestDeletePolicy:
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
                 flags = ["--delete", "--ignore-errors"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
+                assert result.returncode == 23, \
+                    f"--ignore-errors run should still exit 23 (got {result.returncode})"
                 assert not os.path.exists(os.path.join(received, "extra.txt")), \
                     f"--ignore-errors did not keep deletion active: {result.stderr[:300]}"
                 assert not os.path.exists(os.path.join(received, "locked")), \
@@ -6690,11 +6840,10 @@ class TestDirectoryAndSymlinkTimes:
 
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
-    def test_preserve_does_not_create_empty_source_dir(self, shared_server, mt):
-        """P7 Wave D #1: a captured-but-EMPTY source directory is never created
-        at the destination.  The scanner records its time (it is transmitted via
-        STATUS_DIR_TIMES), but the receiver treats that entry as record-only, so
-        `-a` keeps the documented "empty dirs are never transferred" behavior."""
+    def test_preserve_creates_empty_source_dir(self, shared_server, mt):
+        """rsync parity: a recursive `-a` transfer recreates an empty source
+        directory at the destination (the scanner emits it as an explicit
+        directory entry)."""
         source = os.path.join(TEST_DATA_DIR, f"empty_dir_{'m' if mt else 's'}_src")
         dest = os.path.join(TEST_DATA_DIR, f"empty_dir_{'m' if mt else 's'}_dst")
         clean_dir(source)
@@ -6705,8 +6854,8 @@ class TestDirectoryAndSymlinkTimes:
         flags = ["-a"] + (["--threads"] if mt else [])
         received = self._run(source, dest, flags, shared_server)
         assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
-        assert not os.path.lexists(os.path.join(received, "empty_sub")), \
-            f"-a created an empty source directory at {received}/empty_sub"
+        assert os.path.isdir(os.path.join(received, "empty_sub")), \
+            f"-a did not recreate the empty source directory at {received}/empty_sub"
 
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
@@ -6729,10 +6878,10 @@ class TestDirectoryAndSymlinkTimes:
 
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
-    def test_collision_at_dir_time_path_does_not_abort(self, shared_server, mt):
-        """P7 Wave D #1: a pre-existing regular file at a source-empty-dir's
-        mirror path must not abort the transfer (the old mkdir failed and failed
-        the run) and must not be clobbered."""
+    def test_collision_at_empty_dir_path_replaces_blocker(self, shared_server, mt):
+        """rsync parity: a pre-existing regular file at a source empty-dir's
+        mirror path is replaced by the incoming directory (rsync removes the
+        non-directory and creates the directory); the run succeeds."""
         source = os.path.join(TEST_DATA_DIR, f"dirtime_collide_{'m' if mt else 's'}_src")
         dest = os.path.join(TEST_DATA_DIR, f"dirtime_collide_{'m' if mt else 's'}_dst")
         clean_dir(source)
@@ -6751,10 +6900,8 @@ class TestDirectoryAndSymlinkTimes:
         assert result.returncode == 0, \
             f"-a aborted on a pre-existing file at an empty-dir path: " \
             f"{(result.stderr or result.stdout)[:400]}"
-        assert os.path.isfile(blocker) and not os.path.islink(blocker), \
-            "the pre-existing blocker was replaced by a directory"
-        with open(blocker, "rb") as fh:
-            assert fh.read() == b"pre-existing blocker\n", "the blocker file was clobbered"
+        assert os.path.isdir(blocker) and not os.path.islink(blocker), \
+            "the pre-existing blocker was not replaced by the incoming directory"
         assert os.path.isfile(os.path.join(received, "keep.txt")), "regular file missing"
 
 

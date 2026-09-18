@@ -807,6 +807,25 @@ bool file_ensure_directory_secure(const char* path) {
     } else if (errno == EEXIST) {
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     }
+  } else if (dir_fd < 0 && errno == ENOTDIR) {
+    /* rsync replaces a destination non-directory (regular file) with an
+       incoming directory.  Confined to the already-opened secure parent fd:
+       the leaf is unlinked by name (never followed) and only a non-directory
+       is ever removed, so this cannot escape the authorized root or remove a
+       pre-existing directory tree.  A symlink is left alone (openat with
+       O_NOFOLLOW reports ELOOP, which takes no branch here), since replacing
+       it is not required for FastSync's transferred directories and keeps
+       --keep-dirlinks semantics untouched. */
+    struct stat leaf_st;
+    if (fstatat(parent_fd, leaf, &leaf_st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(leaf_st.st_mode) &&
+        !S_ISLNK(leaf_st.st_mode)) {
+      if (unlinkat(parent_fd, leaf, 0) == 0) {
+        if (mkdirat(parent_fd, leaf, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0)
+          created = true;
+        /* On failure dir_fd stays < 0 below, so the caller still sees it. */
+        dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      }
+    }
   }
   bool ok = dir_fd >= 0;
   /* --copy-as owns a directory this call just created (the final component;

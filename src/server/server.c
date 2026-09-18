@@ -956,8 +956,9 @@ void handler(int file_descriptor) {
          server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
         size_t deleted = 0;
-        DeleteCommitResult deletion =
-            manifest_delete_all_counted(config, context->deferred_manifest, &deleted);
+        DeletePathObserver observer = config->report_deletes ? receiver_record_deleted_path : NULL;
+        DeleteCommitResult deletion = manifest_delete_all_observed(
+            config, context->deferred_manifest, &deleted, observer, (void*)context->deleted_paths);
         context->stats.deleted_files += deleted;
         if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
@@ -975,6 +976,9 @@ void handler(int file_descriptor) {
       if (context->deferred_plans) {
         /* Defence in depth (the enclosing block already excludes dry-run): a
            -n run never commits a deletion. */
+        if (config->report_deletes)
+          delete_plan_session_set_delete_observer(
+              context->deferred_plans, receiver_record_deleted_path, (void*)context->deleted_paths);
         DeleteCommitResult deletion =
             config->dry_run ? DELETE_COMMIT_OK
                             : delete_plan_session_commit(context->deferred_plans, config);
@@ -1010,7 +1014,7 @@ void handler(int file_descriptor) {
       /* Emit the optional wire-stats record first (protocol 2.25.0), then the
          success/outcome frame, exactly like the single-threaded receiver. */
       if (!receiver_send_stats_frame(file_descriptor, config, &context->stats,
-                                     context->would_delete) ||
+                                     context->would_delete, context->deleted_paths) ||
           !receiver_send_final_success(file_descriptor, config, &context->outcomes, final_status))
         transfer_ok = false;
     } else {

@@ -11,6 +11,7 @@
 #include "test_daemon_conf.h"
 #include "test_daemon_limits.h"
 #include "test_delay_updates.h"
+#include "test_delete_plan.h"
 #include "test_delta.h"
 #include "test_file.h"
 #include "test_file_list.h"
@@ -66,6 +67,7 @@ int main() {
   RUN_TEST(test_scanner);
   RUN_TEST(test_checksum);
   RUN_TEST(test_delta);
+  RUN_TEST(test_delete_plan);
   RUN_TEST(test_data);
   RUN_TEST(test_protocol);
   RUN_TEST(test_protocol_error);

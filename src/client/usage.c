@@ -90,8 +90,8 @@ void print_usage(void) {
   printf("                      entry's destination mirror receiver-side.  Independent of\n");
   printf("                      --delete (it does not imply --delete; a non-empty directory\n");
   printf("                      mirror is removed only with --force or --delete)\n");
-  printf("  -m, --prune-empty-dirs  Do not transfer empty directory entries (--dirs mode);\n");
-  printf("                      recursive transfers never send empty dirs\n");
+  printf("  -m, --prune-empty-dirs  Do not create empty directories (a recursive transfer\n");
+  printf("                      otherwise recreates them, like rsync)\n");
   printf("  Note: each timing flag implies --delete.  Combining a timing flag with\n");
   printf("  --no-delete (in either order) is rejected as a config error.\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
@@ -103,8 +103,9 @@ void print_usage(void) {
   printf("  -R, --relative    With --files-from, preserve each listed entry's relative path\n");
   printf("                    below the destination root instead of mirroring the full\n");
   printf("                    source path (no effect without --files-from)\n");
-  printf("  --no-implied-dirs  With -R --files-from, refuse to place a listed file whose\n");
-  printf("                    parent directory is not itself listed\n");
+  printf("  --no-implied-dirs  With -R, do not apply the source metadata of a listed file's\n");
+  printf("                    implied parent directories (they are still created with\n");
+  printf("                    default attributes)\n");
   printf("  --mkpath          Create the destination root directory on the server when it\n");
   printf("                    does not exist yet\n");
   printf("  --exclude <pattern>, --exclude=<pattern>  Exclude files matching pattern\n");
@@ -243,7 +244,9 @@ void print_usage(void) {
   printf("                      reusable digest is sent (keep the file mode 0600)\n");
   printf("  --no-motd           Suppress display of the daemon's MOTD (the server\n");
   printf("                      still sends it; the client just does not show it)\n");
-  printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
+  printf("  --bwlimit=RATE      Limit socket I/O bandwidth (default unit KiB/s,\n");
+  printf("                      rsync-style: 0 = no limit; K/M/G/T/P suffixes are\n");
+  printf("                      binary, KB/MB decimal, KiB/MiB binary; decimals allowed)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");

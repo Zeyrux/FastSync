@@ -111,6 +111,45 @@ class TestRelativeGeneral:
                     assert int(rs.st_mtime) == int(fs.st_mtime), \
                         f"mtime mismatch for {rel} with {extra}"
 
+    @requires_rsync
+    @pytest.mark.ci
+    def test_no_implied_dirs_files_from_matches_rsync(self, shared_server):
+        """-R --no-implied-dirs --files-from: a listed file whose parent is not
+        itself listed still transfers; the implied parent is created with
+        default attributes (rsync 3.4.1 parity)."""
+        source = _make_tree(os.path.join(TEST_DATA_DIR, "sel_nidff_src"))
+        # Make the implied parent unmistakably non-default on the source so a
+        # wrongly-applied attribute would be observable.
+        os.chmod(os.path.join(source, "foo"), 0o700)
+        os.chmod(os.path.join(source, "foo", "bar"), 0o711)
+        os.utime(os.path.join(source, "foo"), (978307200, 978307200))
+        os.utime(os.path.join(source, "foo", "bar"), (978307200, 978307200))
+        lst = os.path.join(TEST_DATA_DIR, "sel_nidff_list")
+        with open(lst, "w") as fh:
+            fh.write("foo/bar/baz/f.txt\n")
+        dest = os.path.join(TEST_DATA_DIR, "sel_nidff_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "sel_nidff_rdst")
+        clean_dir(dest)
+        clean_dir(rdst)
+        r = _rsync(["-rlpt", "-R", "--no-implied-dirs", "--files-from=" + lst,
+                    source + "/", rdst + "/"])
+        assert r.returncode == 0, r.stderr
+        result, _ = run_client(source, dest, flags=[
+            "-rlpt", "-R", "--no-implied-dirs", "--files-from", lst],
+            port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert _tree(rdst) == _tree(dest), "implied-parent layout mismatch"
+        # The implied parents exist on both sides and carry the run-time default
+        # attributes, not the source's (non-default) ones.
+        for rel in ("foo", "foo/bar", "foo/bar/baz"):
+            rs = os.stat(os.path.join(rdst, rel))
+            fs = os.stat(os.path.join(dest, rel))
+            assert (rs.st_mode & 0o7777) == (fs.st_mode & 0o7777), \
+                f"mode mismatch for implied {rel}"
+        # The listed file is transferred with its content.
+        with open(os.path.join(dest, "foo", "bar", "baz", "f.txt"), "rb") as fh:
+            assert fh.read() == b"deep\n"
+
 
 class TestDirsOneLevel:
     """#13: -d with a trailing slash (or '.') lists the source's immediate

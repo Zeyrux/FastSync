@@ -8,8 +8,8 @@
 - **Release PR #284 (`dev` -> `main`)** open, CI green (run 553).
   `main` is protected: it needs review/approval to merge.
   https://gitea.tap-tap.win/TapTap/FastSync/pulls/284
-- **`PROTOCOL_VERSION` = `"2.26.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.26.0)`.
+- **`PROTOCOL_VERSION` = `"2.27.0"`** (`src/shared/config.h`); CMake
+  `project(FastFileTransfer VERSION 2.27.0)`.
 - Working tree clean; no wave worktrees remain.
 
 ## What landed this session
@@ -39,7 +39,47 @@
    docs state push-only / remote-source unsupported.
 5. **Preserve-attribute split (protocol 2.22.0)** landed on `feat/preserve-attr-split`: per-attribute `-p/-t/-o/-g` + `--no-*` negations, `-a` = `-rlptgoD`, and the 2.21.0 → 2.22.0 wire bump.
 6. **Rsync-parity wave (protocol 2.23.0)** on `feat/rsync-parity`: rsync short options/clustering/attached values (`-r`/`-b`/`-L`/`-B`, `-av`, `-aAX`, `-B1000`, `-essh`, `-MOPT`), `-c` checksum quick-check, `--checksum-choice`/`--compress-choice` validation and seed randomization, rsync timeout/max-alloc defaults, temp-dir confinement + `EXDEV` fallback, ownership/mapping parity (numeric-ids modifier, map ranges/`*`/empty-FROM, `--chown`+map conflicts, fake-super resolved-owner record), verbatim symlink storage with rsync `--safe-links`/`--munge-links`, socket recreation under `--specials`, `--chmod` 3.4.1 semantics, and delete scoping + `--max-delete` partial/exit-25. Wire: appended delete-manifest synchronized-directory section and `STATUS_DELETE_LIMIT`.
-7. **Parity-completion wave (protocol 2.24.0 → 2.26.0)** on `feat/parity-completion`: per-directory delete plans (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`; receiver `STATUS_STATS` counters feeding `--stats`/`--progress` and `--out-format %b/%c/%C`, plus `-n --delete` lines; `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/`none` checksums with `auto` negotiation (default `xxh128`/`zstd`); general `-R`/`--no-implied-dirs`/`-d`; the full filter grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` + modifiers) and corrected `-F`/`-FF`; receiver-side `--chown`/map TO-name resolution; absolute basis dirs + `--link-dest` relink; receiver-side `--ignore-existing` short-circuit; `--preallocate` over `--sparse` via `fallocate(2)`; `--iconv=.`/`-`/`--no-iconv`; lone `-h` help; aliases `--ignore-non-existing`/`--protect-args`/`--msgs2stderr`; and the full `--info`/`--debug` vocabulary. `RSYNC_COMPAT.md` reclassifies the matrix to 106 ✅ / 27 ⚠️ / 23 ❌.
+7. **Parity-completion wave (protocol 2.24.0 → 2.26.0)** on `feat/parity-completion`: per-directory delete plans (`STATUS_DELETE_PLAN`) for `--delete-during`/`--delete-delay`; receiver `STATUS_STATS` counters feeding `--stats`/`--progress` and `--out-format %b/%c/%C`, plus `-n --delete` lines; `lz4`/`zlib`/`zlibx` compression and `md4`/`sha1`/`none` checksums with `auto` negotiation (default `xxh128`/`zstd`); general `-R`/`--no-implied-dirs`/`-d`; the full filter grammar (`merge`/`dir-merge`/`hide`/`show`/`protect`/`risk`/`clear` + modifiers) and corrected `-F`/`-FF`; receiver-side `--chown`/map TO-name resolution; absolute basis dirs + `--link-dest` relink; receiver-side `--ignore-existing` short-circuit; `--preallocate` over `--sparse` via `fallocate(2)`; `--iconv=.`/`-`/`--no-iconv`; lone `-h` help; aliases `--ignore-non-existing`/`--protect-args`/`--msgs2stderr`; and the full `--info`/`--debug` vocabulary. `RSYNC_COMPAT.md` reclassifies the matrix to 106 ✅ / 27 ⚠️ / 23 ❌; the later rsync-parity-stats pass (`fix/parity-stats`) moves it to 107 ✅ / 25 ⚠️ / 24 ❌ (see item 8).
+8. **rsync-parity-stats pass** on `fix/parity-stats` (no wire change, `PROTOCOL_VERSION` stays `2.26.0`): `--delete-delay` now reports only entries it actually removes, while the `--max-delete` budget is charged at plan/snapshot time (`planned`, via `defer_add`) to bound the deferred list (a refilled deferred directory that survives `ENOTEMPTY` is not reported but still consumes budget); `--stats` gained the `(reg/dir/link/special)` `Number of files` breakdown and now counts only regular files actually stored for `Number of regular files transferred`/transferred size/literal data (up-to-date re-runs report 0); `Total file size` includes symlink target lengths; `--progress` prints the leading `./` root line and counts it in `to-chk` so a single-file transfer matches rsync; and `%C` uses the selected transfer checksum with `checksum_digest_file` supporting md4/sha1/none, byte-identical to rsync for every algorithm. `--out-format` reclassified ❌ (`%b`/delta-`%c` are protocol-specific). Differential + regression tests added; full suite + ASan + clang-format + cppcheck clean.
+9. **Option-parity wave (protocol 2.26.0 → 2.27.0, on `fix/parity-options`):**
+   `--bwlimit` now ports rsync 3.4.1's units/quantization and paces like its
+   leaky bucket; `--ignore-errors` reproduces rsync's default (an I/O error
+   skips deletion unless the flag is set; the readable tree still transfers and
+   the run exits 23) across every delete timing; the `--info` categories with a
+   FastSync event (`name`/`flist`/`del`/`remove`/`nonreg`/`progress`) emit
+   rsync's line format, with real-run `deleting`/`*deleting` lines carried over
+   the new trailing config bool `report_deletes` (golden wire updated by
+   `tests/test_config.c`). Two residuals were reclassified **divergent**: `-M`
+   over daemon/TCP (no argv channel in FastSync's binary config handshake;
+   rsync-daemon differential pins the rsync behavior) and receiver-side
+   `protect`/`risk` re-derivation for destination-only entries (would need a
+   receiver filter engine; differential pins the divergence). The options pass
+   stands at **110 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
+   holds the rsync differentials (bwlimit parse+rate, info lines, real-setpriv
+   `--ignore-errors`, rsync-daemon `-M`, filter-protect pin).
+
+10. **rsync-parity-fs pass** on `fix/parity-fs` (no wire change of its own; integrated
+   on top of the 2.27.0 options wave): recursive transfers now recreate empty source directories (and
+   `-m/--prune-empty-dirs` still suppresses them), a directory entry replaces a
+   blocking destination regular file, and `-R --no-implied-dirs --files-from`
+   places a listed file under a missing implied parent with default attributes
+   instead of refusing (real rsync 3.4.1 parity, differential-tested). `--iconv`
+   now reproduces rsync's push direction (destination charset = the spec's REMOTE
+   half; a server `--iconv` overrides), and `-T/--temp-dir` relative semantics are
+   confirmed identical while the absolute-path confinement is a deliberate
+   divergence. The basis-dir options, `--delay-updates` and `--dry-run` were
+   reclassified to ❌ after a differential test reproduced each exact residual
+   (basis content verification, fixed staging-name collision, and dry-run
+   would-delete over-report). `--fuzzy` was also reclassified to ❌ (deterministic
+   heuristic with a 10× size window, not rsync's matcher), but its residual is the
+   candidate-selection heuristic itself: the final tree is byte-exact by design, so
+   it is pinned by the `TestFuzzy` threshold suite rather than a byte-level rsync
+   differential. The parity-review pass then moved `--delete-delay` to ⚠️ (the
+   plan-time `--max-delete` charge and non-recursive deferred removal differ from
+   rsync when a snapshotted entry fails removal). Differential-gate allowlist
+   entries `min_size`/`empty_dirs_recursive`/`dirs_plain` were removed. The
+   integrated stats+options+fs branch stands at **111 ✅ / 13 ⚠️ / 33 ❌ = 157**;
+   full suite + ASan + clang-format + cppcheck clean.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).

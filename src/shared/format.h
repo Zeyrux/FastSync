@@ -73,4 +73,27 @@ typedef struct {
 bool format_stats_send(int fd, const ReceiverStats* stats);
 bool format_stats_receive(int fd, ReceiverStats* stats);
 
+/* Sender-side file-list accounting for rsync's `--stats` block.  Filled while
+ * the scan/send loops walk each entry: the flist counters describe every
+ * scanned source entry (transferred or skipped), while the transferred/literal
+ * counters describe only the regular files the receiver actually stored.  The
+ * type split lets the client print rsync's `Number of files` breakdown; the
+ * receiver-only counters (matched data, deleted, created) come from
+ * STATUS_STATS. */
+typedef struct {
+  unsigned long long flist_reg;
+  unsigned long long flist_dir;
+  unsigned long long flist_link;
+  unsigned long long flist_special;
+  unsigned long long total_file_size;       /* sum of entry sizes (link target len) */
+  unsigned long long transferred_regular;   /* regular files actually stored */
+  unsigned long long transferred_file_size; /* source size of those files */
+  /* Whole-file accuracy: the `--stats` "Literal data" row.  The sender counts
+   * the source size of every stored file, so a whole-file transfer matches
+   * rsync.  A delta run actually ships only the literal fragments of the diff
+   * (the rest is matched/copied), so here the value is an upper bound, not
+   * rsync's literal-byte total; see RSYNC_COMPAT.md's `--stats` row. */
+  unsigned long long literal_data;
+} TransferStats;
+
 #endif

@@ -168,9 +168,14 @@ bool charset_spec_valid_direction(const char* from_charset, const char* to_chars
   return direction_probe_valid(from_charset, to_charset);
 }
 
-/* The receiver's real conversion is wire(client REMOTE) -> server-local (the
- * server's own --iconv LOCAL half, or the client's LOCAL half when the server
- * has no --iconv).  A dedicated pre-ack check so an impossible direction is
+/* The receiver's conversion is wire charset -> destination charset.  rsync's
+ * CONVERT_SPEC is LOCAL,REMOTE and "stays the same whether you're pushing or
+ * pulling", so for a PUSH (FastSync's only direction) the destination end's
+ * charset is the spec's REMOTE half: the client converts LOCAL -> REMOTE on the
+ * sender and the receiver writes the wire bytes verbatim.  Only a server that
+ * declares its OWN --iconv (the daemon "charset" analog) has a different local
+ * charset, and then it is that spec's LOCAL half and the receiver converts
+ * wire -> server-local.  A dedicated pre-ack check so an impossible direction is
  * rejected before the connection instead of refusing mid-transfer. */
 bool charset_wire_receiver_spec_valid(const char* spec, const char* server_spec) {
   if (!spec)
@@ -180,7 +185,7 @@ bool charset_wire_receiver_spec_valid(const char* spec, const char* server_spec)
   if (charset_spec_parse(spec, &local, &remote) != 0)
     return false;
   const char* wire = remote;
-  const char* target_local = local;
+  const char* target_local = remote;
   char* server_local = NULL;
   char* server_remote = NULL;
   if (server_spec) {
@@ -302,13 +307,13 @@ bool charset_wire_init_receiver(const char* spec, const char* server_spec) {
   char* remote;
   if (charset_spec_parse(spec, &local, &remote) != 0)
     return false;
-  /* The wire charset is the client spec's REMOTE half; the local charset is
-   * the client spec's LOCAL half unless the server was itself started with
-   * --iconv naming a different local charset (the server halves above never
-   * travel, so the server's own flag is the only way its local charset can
-   * differ from what the client assumed). */
+  /* The wire charset is the client spec's REMOTE half (rsync's LOCAL,REMOTE
+   * spec stays the same push or pull, so on a push the destination end's
+   * charset is REMOTE and the receiver writes the wire bytes verbatim).  Only a
+   * server started with its own --iconv declares a different local charset (the
+   * server halves above never travel), and then it is that spec's LOCAL half. */
   const char* wire = remote;
-  const char* target_local = local;
+  const char* target_local = remote;
   char* server_local = NULL;
   char* server_remote = NULL;
   if (server_spec) {

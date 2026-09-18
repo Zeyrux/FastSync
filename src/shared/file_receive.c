@@ -3195,8 +3195,9 @@ char* file_receive_basis_delete_relative(const Config* config, const char* path)
    alternate basis directories are never destination content and are skipped at
    any depth.  Returns true unless a traversal/unlink error aborted the walk;
    the budget's limit_hit/skipped fields report a cap-stopped run. */
-static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifest,
-                                   DeleteBudgetState* budget) {
+static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest* manifest,
+                                            DeleteBudgetState* budget, DeletePathObserver observer,
+                                            void* observer_context) {
   if (!config || !manifest || !manifest->keeps)
     return false;
   fprintf(stderr, "Deleting files not in manifest...\n");
@@ -3260,9 +3261,9 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
     remaining = budget->max_delete - budget->deleted;
   size_t deleted = 0;
   size_t skipped = 0;
-  DeleteWalkResult result =
-      delete_extras_limited(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                            remaining, skips, used, &deleted, &skipped);
+  DeleteWalkResult result = delete_extras_limited_observed(
+      config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips, used,
+      &deleted, &skipped, observer, observer_context);
   if (owned_prefixes) {
     for (int i = 0; i < config->basis_count; i++)
       free(owned_prefixes[i]);
@@ -3282,6 +3283,31 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
   return true;
 }
 
+static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifest,
+                                   DeleteBudgetState* budget) {
+  return delete_extras_budgeted_observed(config, manifest, budget, NULL, NULL);
+}
+
+/* Prefixes every observed path with a fixed subtree root, so a nested walk
+   (a recursively removed missing-arg directory) reports receive-root-relative
+   names like the rest of the delete output. */
+typedef struct {
+  DeletePathObserver inner;
+  void* inner_context;
+  const char* prefix;
+} PrefixedDeleteObserver;
+
+static void prefixed_delete_observer(void* context, const char* rel) {
+  PrefixedDeleteObserver* prefixed = context;
+  if (!prefixed->inner || !rel)
+    return;
+  char* joined = path_cat((char*)prefixed->prefix, rel);
+  if (joined) {
+    prefixed->inner(prefixed->inner_context, joined);
+    free(joined);
+  }
+}
+
 /* --delete-missing-args exact-path deletions: each destination mirror in
    manifest->missing is an explicit user request, so it is removed even when the
    ordinary extras walk (with its protected prefixes) would leave it alone.  The
@@ -3295,8 +3321,10 @@ static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifes
    --max-delete budget: once it is exhausted the remaining requests are skipped
    and counted.  Returns false only on a genuine error (a confinement failure on
    a validated path or an I/O error), which fails the run. */
-static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* manifest,
-                                         DeleteBudgetState* budget) {
+static bool delete_missing_args_budgeted_observed(const Config* config, DeleteManifest* manifest,
+                                                  DeleteBudgetState* budget,
+                                                  DeletePathObserver observer,
+                                                  void* observer_context) {
   if (!config || !manifest)
     return false;
   if (!manifest->missing || manifest->missing->size == 0)
@@ -3413,9 +3441,12 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
               budget->deleted >= budget->max_delete ? 0 : budget->max_delete - budget->deleted;
           size_t contents_deleted = 0;
           size_t contents_skipped = 0;
+          PrefixedDeleteObserver nested = {observer, observer_context, rel};
           DeleteWalkResult walk =
-              no_keeps ? delete_extras_limited(full, no_keeps, NULL, remaining, NULL, 0,
-                                               &contents_deleted, &contents_skipped)
+              no_keeps ? delete_extras_limited_observed(full, no_keeps, NULL, remaining, NULL, 0,
+                                                        &contents_deleted, &contents_skipped,
+                                                        observer ? prefixed_delete_observer : NULL,
+                                                        observer ? &nested : NULL)
                        : DELETE_WALK_ERROR;
           if (no_keeps)
             array_list_delete(no_keeps);
@@ -3455,6 +3486,8 @@ static bool delete_missing_args_budgeted(const Config* config, DeleteManifest* m
     }
     if (removed) {
       budget->deleted++;
+      if (observer)
+        observer(observer_context, rel);
       char* escaped = output_escape(rel, log_get_8_bit_output());
       fprintf(stderr, "  Deleted: %s\n", escaped ? escaped : "<allocation failed>");
       free(escaped);
@@ -3541,15 +3574,25 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
 bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
   DeleteBudgetState budget = {
       .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
-  return delete_missing_args_budgeted(config, manifest, &budget);
+  return delete_missing_args_budgeted_observed(config, manifest, &budget, NULL, NULL);
 }
 
 bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
                                           size_t max_delete, size_t* deleted, size_t* skipped,
                                           bool* limit_hit) {
+  return manifest_delete_missing_args_limited_observed(config, manifest, max_delete, deleted,
+                                                       skipped, limit_hit, NULL, NULL);
+}
+
+bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteManifest* manifest,
+                                                   size_t max_delete, size_t* deleted,
+                                                   size_t* skipped, bool* limit_hit,
+                                                   DeletePathObserver observer,
+                                                   void* observer_context) {
   DeleteBudgetState budget = {
       .max_delete = max_delete, .deleted = 0, .skipped = 0, .limit_hit = false};
-  bool ok = delete_missing_args_budgeted(config, manifest, &budget);
+  bool ok =
+      delete_missing_args_budgeted_observed(config, manifest, &budget, observer, observer_context);
   if (deleted)
     *deleted = budget.deleted;
   if (skipped)
@@ -3572,6 +3615,12 @@ DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* man
 
 DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
                                                size_t* deleted) {
+  return manifest_delete_all_observed(config, manifest, deleted, NULL, NULL);
+}
+
+DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteManifest* manifest,
+                                                size_t* deleted, DeletePathObserver observer,
+                                                void* observer_context) {
   if (deleted)
     *deleted = 0;
   if (!config || !manifest)
@@ -3590,9 +3639,11 @@ DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManif
                               .deleted = 0,
                               .skipped = 0,
                               .limit_hit = false};
-  if (config->delete_missing_args && !delete_missing_args_budgeted(config, manifest, &budget))
+  if (config->delete_missing_args &&
+      !delete_missing_args_budgeted_observed(config, manifest, &budget, observer, observer_context))
     return DELETE_COMMIT_ERROR;
-  if (config->use_delete && !delete_extras_budgeted(config, manifest, &budget))
+  if (config->use_delete &&
+      !delete_extras_budgeted_observed(config, manifest, &budget, observer, observer_context))
     return DELETE_COMMIT_ERROR;
   if (deleted)
     *deleted = budget.deleted;

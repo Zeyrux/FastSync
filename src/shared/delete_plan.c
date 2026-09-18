@@ -412,6 +412,11 @@ struct DeletePlanSession {
   bool dry_run;
   size_t max_delete;
   size_t deleted;
+  /* Removals charged against --max-delete.  In --delete-delay mode a path is
+     planned (and the budget consumed) while scanning, but `deleted` advances
+     only when the commit actually unlinks it, so an entry that survives the
+     commit (a directory refilled mid-transfer -> ENOTEMPTY) is not reported. */
+  size_t planned;
   size_t skipped;
   bool limit_hit;
   bool limit_logged;
@@ -421,7 +426,15 @@ struct DeletePlanSession {
   ArrayList* size_skipped;
   ArrayList* missing;
   ArrayList* deferred;
+  DeletePathObserver observer;
+  void* observer_context;
 };
+
+/* Report one path the session truly removed (no-op without an observer). */
+static void notify_deleted(DeletePlanSession* session, const char* rel) {
+  if (session && session->observer && rel)
+    session->observer(session->observer_context, rel);
+}
 
 DeletePlanSession* delete_plan_session_create(const Config* config) {
   if (!config)
@@ -565,7 +578,7 @@ static bool build_plan_skips(const Config* config, const DeletePlanSession* sess
 }
 
 static bool budget_available(const DeletePlanSession* session) {
-  return session->deleted < session->max_delete;
+  return session->planned < session->max_delete;
 }
 
 static void note_skipped(DeletePlanSession* session) {
@@ -579,7 +592,9 @@ static void log_deleted(const char* rel) {
   free(escaped);
 }
 
-/* Append a snapshot path for --delete-delay. */
+/* Append a snapshot path for --delete-delay.  The budget is charged here, but
+ * `deleted` is not: the path counts only once apply_deferred_path truly
+ * unlinks it. */
 static bool defer_add(DeletePlanSession* session, const char* rel) {
   char* copy = str_dup(rel);
   if (!copy)
@@ -588,7 +603,7 @@ static bool defer_add(DeletePlanSession* session, const char* rel) {
     free(copy);
     return false;
   }
-  session->deleted++;
+  session->planned++;
   return true;
 }
 
@@ -633,7 +648,9 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
   }
   if (unlinkat(dirfd, name, AT_REMOVEDIR) == 0) {
     session->deleted++;
+    session->planned++;
     log_deleted(child_rel);
+    notify_deleted(session, child_rel);
     *removed = true;
     return true;
   }
@@ -657,7 +674,9 @@ static bool process_extra_file(int dirfd, const char* name, const char* child_re
   }
   if (unlinkat(dirfd, name, 0) == 0) {
     session->deleted++;
+    session->planned++;
     log_deleted(child_rel);
+    notify_deleted(session, child_rel);
   } else if (errno != ENOENT) {
     return false;
   }
@@ -768,13 +787,15 @@ static bool apply_missing(DeletePlanSession* session, const Config* config) {
     return true;
   DeleteManifest manifest = {
       .keeps = NULL, .protected = NULL, .missing = session->missing, .dirs = NULL};
-  size_t remaining = budget_available(session) ? session->max_delete - session->deleted : 0;
+  size_t remaining = budget_available(session) ? session->max_delete - session->planned : 0;
   size_t deleted = 0;
   size_t skipped = 0;
   bool limit = false;
-  bool ok = manifest_delete_missing_args_limited(config, &manifest, remaining, &deleted, &skipped,
-                                                 &limit);
+  bool ok = manifest_delete_missing_args_limited_observed(config, &manifest, remaining, &deleted,
+                                                          &skipped, &limit, session->observer,
+                                                          session->observer_context);
   session->deleted += deleted;
+  session->planned += deleted;
   session->skipped += skipped;
   if (limit)
     session->limit_hit = true;
@@ -839,7 +860,6 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
 /* Apply one snapshotted --delete-delay path (post-order: children precede their
  * parent directory). */
 static bool apply_deferred_path(DeletePlanSession* session, const Config* config, const char* rel) {
-  (void)session;
   char* full = path_cat(config->receive_root_directory, rel);
   if (!full)
     return false;
@@ -863,11 +883,22 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
   else
     rc = unlinkat(parent_fd, leaf, 0);
   bool ok = rc == 0 || errno == ENOENT || errno == ENOTEMPTY || errno == EEXIST;
-  if (rc == 0)
+  if (rc == 0) {
+    session->deleted++;
     log_deleted(rel);
+    notify_deleted(session, rel);
+  }
   close(parent_fd);
   free(leaf);
   return ok;
+}
+
+void delete_plan_session_set_delete_observer(DeletePlanSession* session,
+                                             DeletePathObserver observer, void* context) {
+  if (!session)
+    return;
+  session->observer = observer;
+  session->observer_context = context;
 }
 
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config) {

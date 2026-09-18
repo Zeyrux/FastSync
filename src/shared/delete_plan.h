@@ -5,6 +5,7 @@
 #include "config.h"
 #include "file_receive.h"
 #include "protocol.h"
+#include "utils.h"
 #include <stdbool.h>
 
 /* Per-directory delete plans (protocol 2.24.0).
@@ -76,8 +77,16 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config);
 /* True once the shared --max-delete budget stopped part of a deletion. */
 bool delete_plan_session_limit_reached(const DeletePlanSession* session);
-/* Number of destination entries the session's plans removed (or, for
-   --delete-delay, snapshotted for removal), for the end-of-transfer stats. */
+/* Number of destination entries the session actually removed, for the
+   end-of-transfer stats.  For --delete-delay this excludes a snapshotted entry
+   that survived (e.g. a refilled directory that failed ENOTEMPTY), even though
+   that entry already consumed --max-delete budget at snapshot time. */
 size_t delete_plan_session_deleted(const DeletePlanSession* session);
+/* Install an observer invoked for every destination-relative path the session
+   truly removes (including the deferred --delete-delay commit), so the receiver
+   can report rsync's `deleting PATH` lines through the terminal STATUS_STATS
+   record.  Pass NULL/0 to clear. */
+void delete_plan_session_set_delete_observer(DeletePlanSession* session,
+                                             DeletePathObserver observer, void* context);
 
 #endif

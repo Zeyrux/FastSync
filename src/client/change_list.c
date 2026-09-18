@@ -1,5 +1,6 @@
 #include "change_list.h"
 #include "checksum.h"
+#include "log.h"
 #include "utils.h"
 #include <fcntl.h>
 #include <limits.h>
@@ -70,7 +71,8 @@ static bool strbuf_append(StrBuf* buf, const char* text) {
 
 bool change_list_enabled(const Config* config) {
   return config != NULL && (config->itemize_changes || config->out_format != NULL ||
-                            (config->log_file != NULL && config->log_file_format != NULL));
+                            (config->log_file != NULL && config->log_file_format != NULL) ||
+                            (config->info_level & LOG_INFO_NAME) != 0);
 }
 
 /* ---- Itemize code ---- */
@@ -192,27 +194,38 @@ char* change_render_itemize(const Config* config, const ChangeEvent* event) {
   return line.data;
 }
 
-/* ---- --out-format / --log-file-format ---- */
-
-/* rsync 3.4.1's `%C` uses the negotiated transfer checksum; with the default
- * "auto" choice on both ends that is xxh128.  FastSync's internal XXH64 default
- * is not an rsync algorithm, so map it to xxh128 for parity. */
-static ChecksumAlgo out_format_checksum_algo(const Config* config) {
-  switch ((ChecksumAlgo)config->checksum_algo) {
-  case CHECKSUM_ALGO_MD5:
-    return CHECKSUM_ALGO_MD5;
-  case CHECKSUM_ALGO_XXH3:
-    return CHECKSUM_ALGO_XXH3;
-  case CHECKSUM_ALGO_XXH128:
-    return CHECKSUM_ALGO_XXH128;
-  case CHECKSUM_ALGO_XXH64:
-  default:
-    return CHECKSUM_ALGO_XXH128;
+/* rsync's `--info=name` line for an updated entry: the transfer-relative name
+ * (trailing slash for directories) plus the ` -> target` / ` => target` link
+ * suffix.  `--info=name` does not alter an itemize/out-format run. */
+static char* change_render_name(const ChangeEvent* event) {
+  StrBuf line = {0};
+  bool ok = append_name(&line, event) && append_link_suffix(&line, event);
+  if (!ok) {
+    strbuf_free(&line);
+    return NULL;
   }
+  if (line.data == NULL) {
+    line.data = str_dup("");
+    if (!line.data)
+      return NULL;
+  }
+  return line.data;
 }
 
-/* Render a digest as rsync's sum_as_hex: for xxh128 the HIGH 64-bit half is
- * printed before the low half; every other algorithm prints its bytes in order. */
+/* ---- --out-format / --log-file-format ---- */
+
+/* rsync 3.4.1's `%C` uses the negotiated TRANSFER checksum (the first name of a
+ * two-name "transfer,pre-transfer" --checksum-choice), not the pre-transfer
+ * whole-file digest FastSync compares against on the wire.  The default "auto"
+ * resolves to xxh128, so an explicit selection and the default both render the
+ * selected algorithm's digest. */
+static ChecksumAlgo out_format_checksum_algo(const Config* config) {
+  return (ChecksumAlgo)config->checksum_transfer_algo;
+}
+
+/* Render a digest as rsync's sum_as_hex: xxh128 prints the HIGH 64-bit half
+ * before the low half, and xxh64/xxh3 print their 64-bit value big-endian; every
+ * other algorithm prints its bytes in order. */
 static void digest_to_hex(ChecksumAlgo algo, const uint8_t* digest, size_t len, char* out) {
   if (algo == CHECKSUM_ALGO_XXH128 && len == 16) {
     uint64_t low = 0;
@@ -220,6 +233,12 @@ static void digest_to_hex(ChecksumAlgo algo, const uint8_t* digest, size_t len, 
     memcpy(&low, digest, sizeof(low));
     memcpy(&high, digest + 8, sizeof(high));
     snprintf(out, len * 2 + 1, "%016llx%016llx", (unsigned long long)high, (unsigned long long)low);
+    return;
+  }
+  if ((algo == CHECKSUM_ALGO_XXH64 || algo == CHECKSUM_ALGO_XXH3) && len == 8) {
+    uint64_t value = 0;
+    memcpy(&value, digest, sizeof(value));
+    snprintf(out, len * 2 + 1, "%016llx", (unsigned long long)value);
     return;
   }
   static const char hex[] = "0123456789abcdef";
@@ -260,6 +279,9 @@ static void fill_event_checksum(const Config* config, const File* file, ChangeEv
   if (file->path == NULL)
     return;
   ChecksumAlgo algo = out_format_checksum_algo(config);
+  /* rsync renders `--checksum-choice=none` as a blank 2-character column. */
+  if (algo == CHECKSUM_ALGO_NONE)
+    return;
   uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t len = 0;
   /* rsync's %C is the transfer checksum, which is always seeded with 0 (it is
@@ -329,9 +351,10 @@ char* change_render_format(const char* format, const Config* config, const Chang
       if (event->checksum_known) {
         ok = strbuf_append(&line, event->checksum);
       } else {
-        /* rsync pads a non-regular / untransferred entry with spaces. */
+        /* rsync pads a non-regular / untransferred / `none` entry with spaces;
+           `none` renders as a blank 2-character column. */
         ChecksumAlgo algo = out_format_checksum_algo(config);
-        int width = checksum_digest_len(algo) * 2;
+        int width = algo == CHECKSUM_ALGO_NONE ? 2 : checksum_digest_len(algo) * 2;
         for (int i = 0; i < width && ok; i++)
           ok = strbuf_append_char(&line, ' ');
       }
@@ -446,6 +469,16 @@ void change_emit(const Config* config, const ChangeEvent* event) {
     char* line = config->out_format != NULL
                      ? change_render_format(config->out_format, config, event)
                      : change_render_itemize(config, event);
+    if (line != NULL) {
+      print_escaped_line(stdout, line, config->eight_bit_output);
+      free(line);
+    }
+  } else if ((config->info_level & LOG_INFO_NAME) != 0 &&
+             !(config->show_progress || (config->info_level & LOG_INFO_PROGRESS))) {
+    /* --info=name without -i/--out-format: print the updated entry's name.  The
+       --progress path owns the name line when progress output is active (it
+       emits the same names before the progress frames), so do not duplicate. */
+    char* line = change_render_name(event);
     if (line != NULL) {
       print_escaped_line(stdout, line, config->eight_bit_output);
       free(line);
