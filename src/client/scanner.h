@@ -218,7 +218,7 @@ typedef struct {
   int completed;
   Chunk* initial_chunk;
   ProtocolSession* allocation_session;
-  FilterNode* root_filter_node; /* root .rsync-filter context (owned by ps) */
+  FilterNode* root_filter_node;  /* root .rsync-filter context (owned by ps) */
   const ScannerOptions* options; /* borrowed scan options (--info=nonreg output) */
 } ParallelScanner;
 

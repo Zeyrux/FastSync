@@ -84,7 +84,7 @@ size_t delete_plan_session_deleted(const DeletePlanSession* session);
    truly removes (including the deferred --delete-delay commit), so the receiver
    can report rsync's `deleting PATH` lines through the terminal STATUS_STATS
    record.  Pass NULL/0 to clear. */
-void delete_plan_session_set_delete_observer(DeletePlanSession* session, DeletePathObserver observer,
-                                             void* context);
+void delete_plan_session_set_delete_observer(DeletePlanSession* session,
+                                             DeletePathObserver observer, void* context);
 
 #endif

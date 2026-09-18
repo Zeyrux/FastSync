@@ -501,7 +501,9 @@ static bool is_accepted_debug_category(const char* name) {
 
 static bool is_accepted_info_category(const char* name) {
   static const char* const categories[] = {
-      "mount", "syms", "symsafe",
+      "mount",
+      "syms",
+      "symsafe",
   };
   for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
     if (strcmp(name, categories[i]) == 0)
@@ -1846,9 +1848,9 @@ static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_
   long long mult;
   while (*arg >= '0' && *arg <= '9')
     arg++;
-  if (*arg != '\0' &&
-      (*arg == '.' || *arg == localeconv()->decimal_point[0]))
-    for (arg++; *arg >= '0' && *arg <= '9'; arg++) {}
+  if (*arg != '\0' && (*arg == '.' || *arg == localeconv()->decimal_point[0]))
+    for (arg++; *arg >= '0' && *arg <= '9'; arg++) {
+    }
 
   char suffix = *arg && *arg != '+' && *arg != '-' ? *arg++ : 'K';
   switch (suffix) {
@@ -1932,8 +1934,7 @@ static int set_bwlimit_option(const char* value) {
   if (parse_bwlimit_value(value, &bytes_per_sec) != 0)
     return -1;
   io_set_bwlimit(bytes_per_sec);
-  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s",
-                   bytes_per_sec / 1024);
+  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", bytes_per_sec / 1024);
   return 0;
 }
 
@@ -2651,10 +2652,9 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   /* --info=del on a real --delete run asks the receiver to report the paths it
      actually removed; the report rides the STATUS_STATS path list, so the wire
      stats frame must be negotiated too. */
-  config->report_deletes =
-      config->use_delete && !config->dry_run &&
-      ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
-       config->out_format != NULL);
+  config->report_deletes = config->use_delete && !config->dry_run &&
+                           ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
+                            config->out_format != NULL);
   config->report_stats = config->stats || config->show_progress ||
                          (config->info_level & LOG_INFO_PROGRESS) || format_needs_wire ||
                          config->report_deletes || (config->dry_run && config->use_delete);

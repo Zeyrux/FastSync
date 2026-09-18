@@ -3261,10 +3261,9 @@ static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest
     remaining = budget->max_delete - budget->deleted;
   size_t deleted = 0;
   size_t skipped = 0;
-  DeleteWalkResult result =
-      delete_extras_limited_observed(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                                     remaining, skips, used, &deleted, &skipped, observer,
-                                     observer_context);
+  DeleteWalkResult result = delete_extras_limited_observed(
+      config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips, used,
+      &deleted, &skipped, observer, observer_context);
   if (owned_prefixes) {
     for (int i = 0; i < config->basis_count; i++)
       free(owned_prefixes[i]);
@@ -3592,8 +3591,8 @@ bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteM
                                                    void* observer_context) {
   DeleteBudgetState budget = {
       .max_delete = max_delete, .deleted = 0, .skipped = 0, .limit_hit = false};
-  bool ok = delete_missing_args_budgeted_observed(config, manifest, &budget, observer,
-                                                  observer_context);
+  bool ok =
+      delete_missing_args_budgeted_observed(config, manifest, &budget, observer, observer_context);
   if (deleted)
     *deleted = budget.deleted;
   if (skipped)

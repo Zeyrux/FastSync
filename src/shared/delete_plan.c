@@ -791,9 +791,9 @@ static bool apply_missing(DeletePlanSession* session, const Config* config) {
   size_t deleted = 0;
   size_t skipped = 0;
   bool limit = false;
-  bool ok = manifest_delete_missing_args_limited_observed(
-      config, &manifest, remaining, &deleted, &skipped, &limit, session->observer,
-      session->observer_context);
+  bool ok = manifest_delete_missing_args_limited_observed(config, &manifest, remaining, &deleted,
+                                                          &skipped, &limit, session->observer,
+                                                          session->observer_context);
   session->deleted += deleted;
   session->planned += deleted;
   session->skipped += skipped;
@@ -893,8 +893,8 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
   return ok;
 }
 
-void delete_plan_session_set_delete_observer(DeletePlanSession* session, DeletePathObserver observer,
-                                             void* context) {
+void delete_plan_session_set_delete_observer(DeletePlanSession* session,
+                                             DeletePathObserver observer, void* context) {
   if (!session)
     return;
   session->observer = observer;

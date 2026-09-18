@@ -417,8 +417,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            --max-delete-capped commit still succeeds and the transfer proceeds;
            the terminal success frame reports the cap. */
         size_t deleted = 0;
-        DeletePathObserver observer =
-            sink->deleted_paths ? receiver_record_deleted_path : NULL;
+        DeletePathObserver observer = sink->deleted_paths ? receiver_record_deleted_path : NULL;
         DeleteCommitResult deletion =
             (config->use_delete || config->delete_missing_args)
                 ? manifest_delete_all_observed(config, manifest, &deleted, observer,
@@ -506,8 +505,7 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       deferred_manifest = NULL;
     } else {
       size_t deleted = 0;
-      DeletePathObserver observer =
-          sink->deleted_paths ? receiver_record_deleted_path : NULL;
+      DeletePathObserver observer = sink->deleted_paths ? receiver_record_deleted_path : NULL;
       DeleteCommitResult deletion = manifest_delete_all_observed(
           config, deferred_manifest, &deleted, observer, (void*)sink->deleted_paths);
       receiver_tally_deleted(sink, deleted);

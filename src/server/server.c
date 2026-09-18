@@ -956,11 +956,9 @@ void handler(int file_descriptor) {
          server-contacting --dry-run deletes nothing (no manifest is sent). */
       if (context->deferred_manifest) {
         size_t deleted = 0;
-        DeletePathObserver observer =
-            config->report_deletes ? receiver_record_deleted_path : NULL;
-        DeleteCommitResult deletion =
-            manifest_delete_all_observed(config, context->deferred_manifest, &deleted, observer,
-                                         (void*)context->deleted_paths);
+        DeletePathObserver observer = config->report_deletes ? receiver_record_deleted_path : NULL;
+        DeleteCommitResult deletion = manifest_delete_all_observed(
+            config, context->deferred_manifest, &deleted, observer, (void*)context->deleted_paths);
         context->stats.deleted_files += deleted;
         if (deletion == DELETE_COMMIT_ERROR) {
           transfer_ok = false;
@@ -979,9 +977,8 @@ void handler(int file_descriptor) {
         /* Defence in depth (the enclosing block already excludes dry-run): a
            -n run never commits a deletion. */
         if (config->report_deletes)
-          delete_plan_session_set_delete_observer(context->deferred_plans,
-                                                  receiver_record_deleted_path,
-                                                  (void*)context->deleted_paths);
+          delete_plan_session_set_delete_observer(
+              context->deferred_plans, receiver_record_deleted_path, (void*)context->deleted_paths);
         DeleteCommitResult deletion =
             config->dry_run ? DELETE_COMMIT_OK
                             : delete_plan_session_commit(context->deferred_plans, config);

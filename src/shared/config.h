@@ -268,8 +268,8 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
  * real (non-dry-run) deletion.  It is set only when --info=del is requested with
  * --delete; the transfer decision itself is unchanged. */
 #define CONFIG_WIRE_OUTPUT_FIELDS(X)                                                               \
-  X(report_dest_info, bool, false, BOOL) X(report_stats, bool, false, BOOL)                        \
-      X(report_deletes, bool, false, BOOL)
+  X(report_dest_info, bool, false, BOOL)                                                           \
+  X(report_stats, bool, false, BOOL) X(report_deletes, bool, false, BOOL)
 
 /* Codec-negotiation wave (protocol 2.26.0).  compression_algo is the concrete
  * codec the client selected for this transfer (a CompressionAlgo id) and is the

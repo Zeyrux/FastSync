@@ -70,10 +70,9 @@ static bool strbuf_append(StrBuf* buf, const char* text) {
 }
 
 bool change_list_enabled(const Config* config) {
-  return config != NULL &&
-         (config->itemize_changes || config->out_format != NULL ||
-          (config->log_file != NULL && config->log_file_format != NULL) ||
-          (config->info_level & LOG_INFO_NAME) != 0);
+  return config != NULL && (config->itemize_changes || config->out_format != NULL ||
+                            (config->log_file != NULL && config->log_file_format != NULL) ||
+                            (config->info_level & LOG_INFO_NAME) != 0);
 }
 
 /* ---- Itemize code ---- */

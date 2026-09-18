@@ -244,6 +244,7 @@ static void test_write_thread_done() {
    * and queue_destroy which would double-free since we created them
    * in this test. Let me just free the context directly. */
   array_list_delete(ctx->would_delete);
+  array_list_delete(ctx->deleted_paths);
   mtx_destroy(&ctx->mutex);
   cnd_destroy(&ctx->condition_not_full);
   cnd_destroy(&ctx->condition_not_empty);
@@ -329,6 +330,7 @@ static void test_receiver_enqueue_byte_budget() {
 
   /* Tear down: the second file is still queued and is freed by queue_destroy. */
   array_list_delete(ctx->would_delete);
+  array_list_delete(ctx->deleted_paths);
   mtx_destroy(&ctx->mutex);
   cnd_destroy(&ctx->condition_not_full);
   cnd_destroy(&ctx->condition_not_empty);

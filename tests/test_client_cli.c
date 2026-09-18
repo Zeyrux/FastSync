@@ -1361,8 +1361,8 @@ static void test_parse_args_rsync_flag_vocabulary_accepted() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_BACKUP | LOG_INFO_DEL | LOG_INFO_FLIST |
-                                    LOG_INFO_NONREG | LOG_INFO_PROGRESS | LOG_INFO_REMOVE);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_BACKUP | LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_NONREG |
+                                     LOG_INFO_PROGRESS | LOG_INFO_REMOVE);
   EXPECT_EQ_INT(cfg->debug_level, 0);
   config_delete(cfg);
 }

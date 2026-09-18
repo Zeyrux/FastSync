@@ -347,8 +347,8 @@ static void print_delete_reports(const Config* config, const ArrayList* paths) {
 }
 
 static void client_progress_begin(const Config* config) {
-  g_progress_active = (config->show_progress || info_flag_enabled(config, LOG_INFO_PROGRESS)) &&
-                      !config->quiet;
+  g_progress_active =
+      (config->show_progress || info_flag_enabled(config, LOG_INFO_PROGRESS)) && !config->quiet;
   g_progress_xferred = 0;
   g_progress_seen = 0;
   if (!g_progress_active) {
@@ -3307,7 +3307,8 @@ int send_files(Config* config) {
     /* rsync default: a scan I/O error suppresses deletion unless
        --ignore-errors, even in the late (commit) modes.  Drop the keep-set so
        the receiver removes nothing; the readable tree still transferred. */
-    bool late_delete = (manifest || config->delete_missing_args) && !delete_early && !delete_per_dir;
+    bool late_delete =
+        (manifest || config->delete_missing_args) && !delete_early && !delete_per_dir;
     if (late_delete && !ignore_errors_allows_delete(config, had_scan_io)) {
       log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
       if (manifest) {

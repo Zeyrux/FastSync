@@ -876,7 +876,8 @@ DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const Arr
                                                 const ArrayList* synced_dirs, size_t max_delete,
                                                 const DeleteSkipEntry* skips, int skip_count,
                                                 size_t* deleted_out, size_t* skipped_out,
-                                                DeletePathObserver observer, void* observer_context) {
+                                                DeletePathObserver observer,
+                                                void* observer_context) {
   if (deleted_out)
     *deleted_out = 0;
   if (skipped_out)
