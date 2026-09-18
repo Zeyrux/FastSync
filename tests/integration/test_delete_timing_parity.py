@@ -229,10 +229,13 @@ class TestDeleteTimingFinalStateParity:
     @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
     @requires_rsync
     def test_success_final_state_matches_rsync(self, timing):
+        # Worker-safe names: xdist may run both parametrizations concurrently, so
+        # the timing is part of every fixture path.
+        label = timing.lstrip("-")
         # Build the rsync fixture from the same seed so both sides start equal.
-        source, dest, received = _seed_pair("parity_rsync")
+        source, dest, received = _seed_pair(f"parity_rsync_{label}")
         source2 = source
-        rsync_dst = os.path.join(TEST_DATA_DIR, "dtp_parity_rsync_dst")
+        rsync_dst = os.path.join(TEST_DATA_DIR, f"dtp_rsync_{label}_dst")
         clean_dir(rsync_dst)
         # rsync mirrors src/ into dst/; seed the same extra.
         _write(os.path.join(rsync_dst, "d", "old_extra"), b"stale extra\n")
@@ -258,7 +261,8 @@ class TestDeleteTimingTypeConflictParity:
     @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
     @requires_rsync
     def test_type_conflicts_match_rsync(self, timing):
-        source = os.path.join(TEST_DATA_DIR, "dtc_src")
+        label = timing.lstrip("-")
+        source = os.path.join(TEST_DATA_DIR, f"dtc_{label}_src")
         clean_dir(source)
         _write(os.path.join(source, "foo"), b"now a file\n")
         _write(os.path.join(source, "bar", "inner.txt"), b"now a dir\n")
@@ -268,13 +272,13 @@ class TestDeleteTimingTypeConflictParity:
             _write(os.path.join(root, "foo", "inner.txt"), b"was a dir\n")
             _write(os.path.join(root, "bar"), b"was a file\n")
 
-        rsync_dst = os.path.join(TEST_DATA_DIR, "dtc_rsync_dst")
+        rsync_dst = os.path.join(TEST_DATA_DIR, f"dtc_{label}_rsync_dst")
         seed_dest(rsync_dst)
         rsync_result = _rsync(["-a", timing, source + "/", rsync_dst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         rsync_tree = _tree(rsync_dst)
 
-        dest = os.path.join(TEST_DATA_DIR, "dtc_dst")
+        dest = os.path.join(TEST_DATA_DIR, f"dtc_{label}_dst")
         clean_dir(dest)
         received = get_dest_received_dir(dest, source)
         seed_dest(received)
@@ -292,7 +296,7 @@ class TestDeleteTimingFailure:
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_during_removes_delay_preserves_on_failure(self, mt):
-        source, dest, received = _seed_pair("failure", big=True)
+        source, dest, received = _seed_pair(f"failure_mt{int(mt)}", big=True)
         extra = os.path.join(received, "d", "old_extra")
         assert os.path.exists(extra)
         with ServerManager() as server:
@@ -404,7 +408,7 @@ class TestDeleteDelayVsAfterSnapshot:
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_created_extra_survives_delay_not_after(self, mt):
-        source, dest, received = _seed_pair("latecreate", big=True)
+        source, dest, received = _seed_pair(f"latecreate_mt{int(mt)}", big=True)
         old_extra = os.path.join(received, "d", "old_extra")
         new_extra = os.path.join(received, "d", "new_extra")
         with ServerManager() as server:
@@ -441,3 +445,48 @@ class TestDeleteDelayVsAfterSnapshot:
                     f"{timing} (mt={mt}): new_extra present="
                     f"{os.path.exists(new_extra)}, expected survives={new_survives}"
                 )
+
+
+class TestDeleteDelayMaxDeleteRefilledDir:
+    """--delete-delay charges the --max-delete budget at plan/snapshot time, so a
+    refilled snapshotted directory that survives ENOTEMPTY still spends its slot
+    and a later extra is skipped, while the reported count stays at actual
+    removals.
+
+    The refilled directory is at the destination ROOT (its plan is always sent
+    first) and the skipped extra is under a separate source directory, so the
+    ordering that decides the budget charge is deterministic -- not readdir
+    order.  The refill is injected through the byte-barrier proxy so it is
+    causally after the plan frame."""
+
+    def test_budget_charged_at_plan_time(self):
+        source = os.path.join(TEST_DATA_DIR, "ddmb_src")
+        dest = os.path.join(TEST_DATA_DIR, "ddmb_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        _write(os.path.join(source, "a", "keep.bin"), b"B" * BIG_BYTES)
+        _write(os.path.join(source, "b", "keep.txt"), b"keep\n")
+        received = get_dest_received_dir(dest, source)
+        refilled_dir = os.path.join(received, "xdir")
+        os.makedirs(refilled_dir, exist_ok=True)
+        later_dir = os.path.join(received, "b", "ydir")
+        os.makedirs(later_dir, exist_ok=True)
+
+        def hook():
+            _write(os.path.join(refilled_dir, "new.txt"), b"created mid-transfer\n")
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            proxy = _SlicingProxy(server.port, hook=hook, hook_after=MID_TRANSFER_BYTES,
+                                  throttle=PROXY_THROTTLE, wait_for_reply=True)
+            flags = ["--delete-delay", "--max-delete=1", "--incremental", "--ignore-times", "--stats"]
+            result, _ = run_client(source, dest, flags=flags, port=proxy.port)
+            proxy.finish()
+        assert result.returncode == 25, (result.stderr or result.stdout)[:400]
+        assert proxy.hook_called.is_set(), "hook never fired"
+        # The refilled directory still consumes the plan-time budget, so the
+        # later extra is skipped...
+        assert os.path.exists(os.path.join(refilled_dir, "new.txt")), "late file vanished"
+        assert os.path.isdir(later_dir), "later extra was not skipped by the plan-time budget"
+        # ...while the reported count reflects only actual removals (none here).
+        assert _deleted_count(result.stdout) == 0, result.stdout

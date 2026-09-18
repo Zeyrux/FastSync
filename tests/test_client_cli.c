@@ -4456,6 +4456,26 @@ static void test_parse_args_rejects_unsupported_short() {
   }
 }
 
+/* The --ignore-errors deletion gate, unit-tested without a privileged source
+ * directory: a clean scan always deletes; an I/O error suppresses deletion
+ * unless --ignore-errors is set.  (The end-to-end mode-000 differential lives in
+ * the setpriv integration test; this pins the decision itself in the PR gate.) */
+static void test_ignore_errors_allows_delete(void) {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_TRUE(ignore_errors_allows_delete(cfg, false));
+  EXPECT_FALSE(ignore_errors_allows_delete(cfg, true));
+
+  cfg->ignore_errors = true;
+  EXPECT_TRUE(ignore_errors_allows_delete(cfg, false));
+  EXPECT_TRUE(ignore_errors_allows_delete(cfg, true));
+
+  /* A NULL config cannot opt into --ignore-errors. */
+  EXPECT_TRUE(ignore_errors_allows_delete(NULL, false));
+  EXPECT_FALSE(ignore_errors_allows_delete(NULL, true));
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -4650,4 +4670,5 @@ void test_client_cli() {
   test_parse_args_noop_does_not_consume_argv();
   test_parse_args_backup_copy_links_shorts();
   test_parse_args_rejects_unsupported_short();
+  test_ignore_errors_allows_delete();
 }

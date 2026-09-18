@@ -38,11 +38,17 @@ FastSync mirrors the absolute source path under its receive root (see
 # Fast subset that guards the ✅ surface on pull requests
 python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity_ci
 
-# Full set (all ✅ cases plus the documented ⚠️/❌ residuals)
+# Full differential case table (`_CASES`): every row is marked `parity`, and a
+# case with an allowlisted residual in `parity_caveats.py` is included too.
 python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity
 ```
 
-The suite skips cleanly when `rsync` is not installed.
+`-m parity` selects only the `_CASES` table in this module. Differential
+coverage for options outside that table (`--temp-dir`, `--delay-updates`,
+`--dry-run`, `--fuzzy`, the basis-dir options, `-M` over daemon/TCP, and
+receiver filter-protect) lives in dedicated modules (`test_option_parity.py`,
+`test_parity_blockers.py`, `test_parity_quickwins.py`, ...) and is not part of
+this gate. The suite skips cleanly when `rsync` is not installed.
 
 ## Allowlist (`parity_caveats.py`)
 
@@ -52,10 +58,11 @@ Each entry maps a case id to the aspects that may differ (`tree`, `stdout`,
 
 ```python
 CAVEATS = {
-    "min_size": {
-        "tree": "recursive transfer does not create a source directory that "
-                "becomes empty after --min-size filtering. ref: RSYNC_COMPAT.md "
-                "`-d/--dirs` row and completion-wave residual.",
+    "max_delete": {
+        "tree": "which destination extras survive a partial --max-delete abort "
+                "is deletion-order dependent and unspecified; rc=25 and the "
+                "number of survivors match rsync. ref: RSYNC_COMPAT.md "
+                "`--max-delete=NUM` row.",
     },
 }
 ```
