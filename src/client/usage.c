@@ -243,7 +243,9 @@ void print_usage(void) {
   printf("                      reusable digest is sent (keep the file mode 0600)\n");
   printf("  --no-motd           Suppress display of the daemon's MOTD (the server\n");
   printf("                      still sends it; the client just does not show it)\n");
-  printf("  --bwlimit <KB/s>    Bandwidth limit in kilobytes per second\n");
+  printf("  --bwlimit=RATE      Limit socket I/O bandwidth (default unit KiB/s,\n");
+  printf("                      rsync-style: 0 = no limit; K/M/G/T/P suffixes are\n");
+  printf("                      binary, KB/MB decimal, KiB/MiB binary; decimals allowed)\n");
   printf("  --tls               Enable TLS encryption\n");
   printf("  --cert <path>       TLS certificate file (PEM)\n");
   printf("  --key <path>        TLS private key file (PEM)\n");

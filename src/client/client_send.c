@@ -66,6 +66,16 @@ static void log_server_rejection(const char* context) {
   }
 }
 
+/* rsync's --ignore-errors semantics: an I/O error during the transfer normally
+ * suppresses deletion entirely ("IO error encountered -- skipping file
+ * deletion"); --ignore-errors lets the deletion run anyway.  FastSync always
+ * continues past an unreadable subdirectory so the readable tree transfers, and
+ * always reports the partial transfer (exit 23); this only decides whether the
+ * deletion phase is skipped.  Returns true when deletion may proceed. */
+static bool ignore_errors_allows_delete(const Config* config, bool had_io_error) {
+  return !had_io_error || (config && config->ignore_errors);
+}
+
 static const char* display_bytes(unsigned long long bytes, bool human_readable, char* buffer,
                                  size_t buffer_size) {
   if (human_readable && format_human_size_decimal(bytes, buffer, buffer_size))
@@ -293,12 +303,23 @@ static void progress_final_frame(unsigned long long size, char* out, size_t out_
            rate, units, rembuf, g_progress_xferred, to_chk, total);
 }
 
+static bool info_flag_enabled(const Config* config, LogInfoFlag flag) {
+  return config != NULL && (config->info_level & flag) != 0;
+}
+
 static void client_progress_begin(const Config* config) {
-  g_progress_active = config->show_progress && !config->quiet;
+  g_progress_active = (config->show_progress || info_flag_enabled(config, LOG_INFO_PROGRESS)) &&
+                      !config->quiet;
   g_progress_xferred = 0;
   g_progress_seen = 0;
-  if (!g_progress_active)
+  if (!g_progress_active) {
+    /* `--info=flist` prints rsync's file-list header even without progress. */
+    if (!config->quiet && info_flag_enabled(config, LOG_INFO_FLIST)) {
+      printf("sending incremental file list\n");
+      fflush(stdout);
+    }
     return;
+  }
   printf("sending incremental file list\n");
   /* rsync prints the transfer-root directory's name before the first file when
      that directory is created; FastSync mirrors the source root below the
@@ -428,6 +449,9 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->prune_empty_dirs = config->prune_empty_dirs;
   options->ignore_io_errors = config->ignore_errors;
   options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
+  options->note_nonreg = (config->info_level & LOG_INFO_NONREG) != 0 && !config->quiet;
+  options->send_directory = config->send_directory;
+  options->eight_bit_output = config->eight_bit_output;
   options->excluded_paths = NULL;
   options->excluded_mutex = NULL;
   options->size_skipped_paths = NULL;
@@ -936,6 +960,8 @@ static void source_file_destroy(void* item) {
   }
 }
 
+static const char* delete_display_path(const Config* config, const char* path);
+
 /* Remove only the same regular source file that was sent. */
 static void remove_transferred_sources(const Config* config, ArrayList* paths) {
   if (!config->remove_source_files || !paths)
@@ -973,6 +999,13 @@ static void remove_transferred_sources(const Config* config, ArrayList* paths) {
       log_message(LOG_LEVEL_WARNING, "Could not remove source file %s",
                   escaped_path ? escaped_path : "<allocation failed>");
       free(escaped_path);
+    } else if (info_flag_enabled(config, LOG_INFO_REMOVE) && !config->quiet) {
+      /* rsync's --info=remove line: the transfer-relative name. */
+      const char* rel = delete_display_path(config, source->path);
+      char* escaped = output_escape(rel, config->eight_bit_output);
+      printf("sender removed %s\n", escaped ? escaped : rel);
+      free(escaped);
+      fflush(stdout);
     }
     close(dirfd);
   }
@@ -1540,8 +1573,11 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
                             ArrayList* manifest, DeletePlanSender* plans, bool* io_error_out) {
   if (io_error_out)
     *io_error_out = false;
-  DirectoryScanner* scanner =
-      directory_scanner_create_with_options(config->send_directory, options);
+  ScannerOptions local = *options;
+  /* The pre-scan is a paths-only pass with no client output; it must not emit
+     --info=nonreg lines (the data pass does that once). */
+  local.note_nonreg = false;
+  DirectoryScanner* scanner = directory_scanner_create_with_options(config->send_directory, &local);
   if (!scanner)
     return false;
   bool ok = true;
@@ -2045,10 +2081,10 @@ static int send_dry_run_remote(Config* config) {
       array_list_delete(would_delete);
       goto dry_fail;
     }
-    /* rsync prints `*deleting   PATH` when itemizing (or `deleting PATH` with
-       --out-format / -v); the plain-total output used here has no delete
-       counterpart, so only the itemize/out-format cases are rendered. */
-    if (!config->quiet && (config->itemize_changes || config->out_format != NULL)) {
+    /* rsync prints `*deleting   PATH` when itemizing, `deleting PATH` under
+       --info=del/--info=remove, and the --out-format expansion when set. */
+    if (!config->quiet && (config->itemize_changes || config->out_format != NULL ||
+                           info_flag_enabled(config, LOG_INFO_DEL))) {
       for (int i = 0; i < would_delete->size; i++) {
         const char* raw = (const char*)would_delete->items[i];
         const char* path = delete_display_path(config, raw);
@@ -2071,7 +2107,10 @@ static int send_dry_run_remote(Config* config) {
           }
         } else {
           char* escaped = output_escape(path, config->eight_bit_output);
-          printf("*deleting   %s\n", escaped ? escaped : path);
+          if (config->itemize_changes)
+            printf("*deleting   %s\n", escaped ? escaped : path);
+          else
+            printf("deleting %s\n", escaped ? escaped : path);
           free(escaped);
         }
       }
@@ -2599,7 +2638,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                   "unscanned source mirrors are not deleted");
     else
       log_message(LOG_LEVEL_WARNING, "transfer stopped early (stop deadline)");
-  } else if (context->config->use_delete && !context->early_delete && !context->delete_plans) {
+  } else if (context->config->use_delete && !context->early_delete && !context->delete_plans &&
+             !context->delete_suppressed) {
     /* Empty keep-set + scan I/O error must not delete the whole destination
        (the source may not be genuinely empty -- see send_files). */
     bool empty_io;
@@ -2612,12 +2652,20 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                   "with an empty keep-set (--delete)");
       goto send_fail;
     }
-    if (send_delete_manifest(client->file_descriptor, context->manifest, context->excluded_paths,
-                             context->size_skipped_paths, context->missing_args,
-                             context->synced_dirs) != 0)
+    /* rsync default: an I/O error suppresses deletion unless --ignore-errors.
+       The keep-set manifest is not sent, so the receiver removes nothing. */
+    mtx_lock(&context->mutex_scanner);
+    bool scan_io_now = context->scan_had_io_error;
+    mtx_unlock(&context->mutex_scanner);
+    if (!ignore_errors_allows_delete(context->config, scan_io_now)) {
+      log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
+    } else if (send_delete_manifest(client->file_descriptor, context->manifest,
+                                    context->excluded_paths, context->size_skipped_paths,
+                                    context->missing_args, context->synced_dirs) != 0) {
       goto send_fail;
+    }
   } else if (context->config->delete_missing_args && !context->early_delete &&
-             !context->delete_plans) {
+             !context->delete_suppressed && !context->delete_plans) {
     /* --delete-missing-args without --delete: no keep-set is built, but the
        exact-delete paths still ride the same manifest frame (commit once the
        transfer succeeded). */
@@ -2744,7 +2792,8 @@ static int scan_directory_multithreaded(void* pipeline_context) {
       failed = use_dscanner ? directory_scanner_failed(dscanner) : parallel_scanner_failed(scanner);
       break;
     }
-    if (context->config->use_delete && !context->early_delete && !context->delete_plans) {
+    if (context->config->use_delete && !context->early_delete && !context->delete_plans &&
+        !context->delete_suppressed) {
       mtx_lock(&context->mutex_scanner);
       bool manifest_ok = add_chunk_to_manifest(context->manifest, current_chunk);
       mtx_unlock(&context->mutex_scanner);
@@ -3037,6 +3086,7 @@ int send_files(Config* config) {
     bool prescan_ok =
         scan_paths_only(config, &prepared.options, early_manifest, NULL, &had_scan_io);
     bool early_ok = false;
+    bool skip_delete = false;
     if (prescan_ok) {
       /* A scan that hit an I/O error and produced NO keep entries is ambiguous
          (the source may not be genuinely empty -- part of it was unreadable),
@@ -3048,6 +3098,11 @@ int send_files(Config* config) {
                     "source scan hit an I/O error before finding any file; refusing to delete "
                     "with an empty keep-set (--delete)");
         prescan_ok = false;
+      } else if (!ignore_errors_allows_delete(config, had_scan_io)) {
+        /* rsync default: an I/O error suppresses deletion unless
+           --ignore-errors.  Skip the manifest; the transfer still proceeds. */
+        log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
+        skip_delete = true;
       } else {
         early_ok = send_delete_manifest_early(client, early_manifest, excluded, size_skipped,
                                               missing_args, synced_dirs);
@@ -3059,7 +3114,7 @@ int send_files(Config* config) {
     prepared.options.excluded_paths = NULL;
     prepared.options.size_skipped_paths = NULL;
     prepared.options.synced_dirs = NULL;
-    if (!prescan_ok || !early_ok)
+    if (!prescan_ok || (!early_ok && !skip_delete))
       goto send_fail;
   } else if (delete_per_dir) {
     /* --delete-during/--delete-delay: build one plan per source directory from a
@@ -3073,6 +3128,7 @@ int send_files(Config* config) {
     prepared.options.plan_dirs = plan_dirs;
     bool prescan_ok = scan_paths_only(config, &prepared.options, NULL, plan_sender, &had_scan_io);
     bool plans_ok = false;
+    bool skip_delete = false;
     if (prescan_ok) {
       const char* walk_root = delete_plan_walk_root(config, synced_dirs);
       const ArrayList* scope =
@@ -3084,6 +3140,15 @@ int send_files(Config* config) {
                     "source scan hit an I/O error before finding any file; refusing to delete "
                     "with an empty keep-set (--delete)");
         prescan_ok = false;
+      } else if (!ignore_errors_allows_delete(config, had_scan_io)) {
+        /* rsync default: an I/O error suppresses deletion unless
+           --ignore-errors.  Drop the plans; the transfer still proceeds. */
+        log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
+        delete_plan_sender_destroy(plan_sender);
+        plan_sender = NULL;
+        array_list_delete(plan_dirs);
+        plan_dirs = NULL;
+        skip_delete = true;
       } else {
         plans_ok = delete_plan_send_root(client->file_descriptor, plan_sender) == 0;
       }
@@ -3092,7 +3157,7 @@ int send_files(Config* config) {
     prepared.options.size_skipped_paths = NULL;
     prepared.options.synced_dirs = NULL;
     prepared.options.plan_dirs = NULL;
-    if (!prescan_ok || !plans_ok)
+    if (!prescan_ok || (!plans_ok && !skip_delete))
       goto send_fail;
   } else if (config->use_delete) {
     manifest = array_list_create(free);
@@ -3222,7 +3287,17 @@ int send_files(Config* config) {
                   "an empty keep-set (--delete)");
       goto send_fail;
     }
-    if ((manifest || config->delete_missing_args) && !delete_early && !delete_per_dir) {
+    /* rsync default: a scan I/O error suppresses deletion unless
+       --ignore-errors, even in the late (commit) modes.  Drop the keep-set so
+       the receiver removes nothing; the readable tree still transferred. */
+    bool late_delete = (manifest || config->delete_missing_args) && !delete_early && !delete_per_dir;
+    if (late_delete && !ignore_errors_allows_delete(config, had_scan_io)) {
+      log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
+      if (manifest) {
+        array_list_delete(manifest);
+        manifest = NULL;
+      }
+    } else if (late_delete) {
       /* Late (commit) ordering: all file data is out; transmit the manifest so
          the receiver commits the extras walk (--delete) and/or the
          --delete-missing-args exact-path deletions only after the transfer
@@ -3476,8 +3551,28 @@ int send_files_multithreaded(Config** config_ptr) {
         pipeline_context_sender_destroy(context);
         return 1;
       }
-      if (!per_dir)
+      if (context->scan_had_io_error && !ignore_errors_allows_delete(config, true)) {
+        /* rsync default: an I/O error suppresses deletion unless
+           --ignore-errors.  Drop the prebuilt keep-set so nothing is sent; the
+           data pass still transfers the readable tree and exits 23. */
+        log_message(LOG_LEVEL_WARNING, "IO error encountered -- skipping file deletion");
+        if (context->manifest) {
+          array_list_delete(context->manifest);
+          context->manifest = NULL;
+        }
+        if (context->delete_plans) {
+          delete_plan_sender_destroy(context->delete_plans);
+          context->delete_plans = NULL;
+        }
+        if (context->plan_dirs) {
+          array_list_delete(context->plan_dirs);
+          context->plan_dirs = NULL;
+        }
+        /* A later --delete pass must not try to rebuild/send a keep-set. */
+        context->delete_suppressed = true;
+      } else if (!per_dir) {
         context->early_delete = true;
+      }
     } else {
       context->manifest = array_list_create(free);
       if (!context->manifest) {
@@ -3488,7 +3583,8 @@ int send_files_multithreaded(Config** config_ptr) {
   }
   if (config->remove_source_files)
     context->remove_source_files = array_list_create(source_file_destroy);
-  if ((config->use_delete && !context->manifest && !context->delete_plans) ||
+  if ((config->use_delete && !context->manifest && !context->delete_plans &&
+       !context->delete_suppressed) ||
       (config->remove_source_files && !context->remove_source_files)) {
     pipeline_context_sender_destroy(context);
     return 1;

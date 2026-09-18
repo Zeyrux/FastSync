@@ -432,6 +432,30 @@ static void scanner_record_protected(DirectoryScanner* scanner, const char* fs_p
     scanner->failed = true;
 }
 
+/* rsync's `--info=nonreg` line for a non-regular entry that is not being
+ * preserved: `skipping non-regular file "NAME"`.  The name is the path relative
+ * to the transfer root, so it matches rsync's displayed name. */
+static void scanner_note_nonreg(const ScannerOptions* options, const char* fs_path) {
+  if (!options || !options->note_nonreg || !fs_path)
+    return;
+  const char* rel = *fs_path == '/' ? fs_path + 1 : fs_path;
+  const char* root = options->send_directory;
+  if (root != NULL) {
+    while (*root == '/')
+      root++;
+    size_t root_len = strlen(root);
+    while (root_len > 0 && root[root_len - 1] == '/')
+      root_len--;
+    if (root_len > 0 && strncmp(root, rel, root_len) == 0 &&
+        (rel[root_len] == '/' || rel[root_len] == '\0'))
+      rel += root_len + (rel[root_len] == '/' ? 1 : 0);
+  }
+  char* escaped = output_escape(rel, options->eight_bit_output);
+  printf("skipping non-regular file \"%s\"\n", escaped ? escaped : rel);
+  free(escaped);
+  fflush(stdout);
+}
+
 /* A user-selection exclusion (--filter/-C/per-dir or --exclude/--include). */
 static void scanner_record_excluded(DirectoryScanner* scanner, const char* fs_path) {
   scanner_record_protected(scanner, fs_path, scanner->options.excluded_paths);
@@ -954,11 +978,18 @@ static int open_next_directory(DirectoryScanner* scanner) {
       scanner->current_rel = NULL;
       free(scanner->current_path);
       scanner->current_path = NULL;
-      if (!scanner->options.ignore_io_errors || is_root_seed) {
+      if (is_root_seed) {
+        /* The transfer ROOT being unreadable is always fatal: an empty keep-set
+           would delete the whole destination.  Mark the scan as errored so the
+           client can report the partial-transfer exit code (rsync's 23). */
+        scanner->root_io_error = true;
         scanner->failed = true;
         return -1;
       }
-      /* --ignore-errors: record the I/O error and keep scanning the rest. */
+      /* A subdirectory that cannot be opened is always skipped (rsync continues
+         with a partial transfer), whether or not --ignore-errors is set.  The
+         error is recorded so the client exits 23; --ignore-errors only changes
+         what the deletion phase does with the recorded error. */
       continue;
     }
     if (open_directory_filter_context(scanner, inherited) != 0) {
@@ -1554,6 +1585,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
                                                        scanner->options.preserve_specials,
                                                        scanner->options.copy_devices, file, &stats);
       if (special == SCANNER_SPECIAL_SKIP) {
+        scanner_note_nonreg(&scanner->options, file->path);
         free(rel_copy);
         file_destroy(file);
         continue;
@@ -1604,7 +1636,7 @@ bool directory_scanner_failed(const DirectoryScanner* scanner) {
 }
 
 bool directory_scanner_had_io_error(const DirectoryScanner* scanner) {
-  return scanner != NULL && scanner->io_error;
+  return scanner != NULL && (scanner->io_error || scanner->root_io_error);
 }
 
 typedef struct {
@@ -1974,6 +2006,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   ScannerSpecial special = scanner_prepare_special(
       options->preserve_devices, options->preserve_specials, options->copy_devices, file, &st);
   if (special == SCANNER_SPECIAL_SKIP) {
+    scanner_note_nonreg(ps->options, file->path);
     free(rel);
     file_destroy(file);
     return;
@@ -2134,6 +2167,7 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     return NULL;
   }
   ps->allocation_session = allocation_session;
+  ps->options = options;
 
   ArrayList* root_files = array_list_create(file_destroy);
   ArrayList* subdirs = array_list_create(free);

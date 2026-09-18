@@ -4463,11 +4463,11 @@ class TestDeletePolicy:
     @pytest.mark.parametrize("mt", [False, True])
     @pytest.mark.setpriv
     def test_ignore_errors_keeps_deletion_active_on_scan_error(self, mt):
-        """A source I/O error (unreadable subdirectory) aborts the run so no
-        deletion happens by default; --ignore-errors continues, still transfers
-        the readable tree and still deletes, single-threaded and under -m.  Run
-        as an unprivileged user so the mode-000 directory is genuinely
-        unreadable."""
+        """rsync's --ignore-errors semantics: a source I/O error (unreadable
+        subdirectory) makes the run continue and transfer the readable tree, but
+        the default suppresses deletion ("IO error encountered -- skipping file
+        deletion"); --ignore-errors lets deletion proceed.  Both exit 23.  Run as
+        an unprivileged user so the mode-000 directory is genuinely unreadable."""
         if os.geteuid() != 0 or shutil.which("setpriv") is None:
             pytest.skip("requires root + setpriv to drop privileges for the client")
         tag = f"ioerr_{os.getpid()}_{mt}"
@@ -4487,11 +4487,15 @@ class TestDeletePolicy:
             try:
                 os.chmod(os.path.join(source, "locked"), 0)
 
-                # Default: scan error aborts the run; nothing is deleted.
+                # Default: the scan continues past the unreadable dir and the
+                # readable tree transfers, but deletion is skipped (exit 23).
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
                 flags = ["--delete"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
-                assert result.returncode != 0, "unreadable source dir did not fail the run"
+                assert result.returncode == 23, \
+                    f"unreadable source dir should exit 23 (got {result.returncode})"
+                assert os.path.exists(os.path.join(received, "top.txt")), \
+                    "readable tree did not transfer past the I/O error"
                 assert os.path.exists(os.path.join(received, "extra.txt")), \
                     "default run deleted although the scan hit an I/O error"
 
@@ -4499,6 +4503,8 @@ class TestDeletePolicy:
                 self._write(os.path.join(received, "extra.txt"), b"extra\n")
                 flags = ["--delete", "--ignore-errors"] + (["--threads"] if mt else [])
                 result = self._run_client_as_nobody(source, dest, server.port, flags)
+                assert result.returncode == 23, \
+                    f"--ignore-errors run should still exit 23 (got {result.returncode})"
                 assert not os.path.exists(os.path.join(received, "extra.txt")), \
                     f"--ignore-errors did not keep deletion active: {result.stderr[:300]}"
                 assert not os.path.exists(os.path.join(received, "locked")), \

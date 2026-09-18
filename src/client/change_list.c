@@ -1,5 +1,6 @@
 #include "change_list.h"
 #include "checksum.h"
+#include "log.h"
 #include "utils.h"
 #include <fcntl.h>
 #include <limits.h>
@@ -69,8 +70,10 @@ static bool strbuf_append(StrBuf* buf, const char* text) {
 }
 
 bool change_list_enabled(const Config* config) {
-  return config != NULL && (config->itemize_changes || config->out_format != NULL ||
-                            (config->log_file != NULL && config->log_file_format != NULL));
+  return config != NULL &&
+         (config->itemize_changes || config->out_format != NULL ||
+          (config->log_file != NULL && config->log_file_format != NULL) ||
+          (config->info_level & LOG_INFO_NAME) != 0);
 }
 
 /* ---- Itemize code ---- */
@@ -188,6 +191,24 @@ char* change_render_itemize(const Config* config, const ChangeEvent* event) {
   if (!ok) {
     strbuf_free(&line);
     return NULL;
+  }
+  return line.data;
+}
+
+/* rsync's `--info=name` line for an updated entry: the transfer-relative name
+ * (trailing slash for directories) plus the ` -> target` / ` => target` link
+ * suffix.  `--info=name` does not alter an itemize/out-format run. */
+static char* change_render_name(const ChangeEvent* event) {
+  StrBuf line = {0};
+  bool ok = append_name(&line, event) && append_link_suffix(&line, event);
+  if (!ok) {
+    strbuf_free(&line);
+    return NULL;
+  }
+  if (line.data == NULL) {
+    line.data = str_dup("");
+    if (!line.data)
+      return NULL;
   }
   return line.data;
 }
@@ -449,6 +470,16 @@ void change_emit(const Config* config, const ChangeEvent* event) {
     char* line = config->out_format != NULL
                      ? change_render_format(config->out_format, config, event)
                      : change_render_itemize(config, event);
+    if (line != NULL) {
+      print_escaped_line(stdout, line, config->eight_bit_output);
+      free(line);
+    }
+  } else if ((config->info_level & LOG_INFO_NAME) != 0 &&
+             !(config->show_progress || (config->info_level & LOG_INFO_PROGRESS))) {
+    /* --info=name without -i/--out-format: print the updated entry's name.  The
+       --progress path owns the name line when progress output is active (it
+       emits the same names before the progress frames), so do not duplicate. */
+    char* line = change_render_name(event);
     if (line != NULL) {
       print_escaped_line(stdout, line, config->eight_bit_output);
       free(line);

@@ -183,6 +183,10 @@ void io_set_bwlimit(unsigned long long bytes_per_sec) {
   mtx_unlock(&bw_mutex);
 }
 
+unsigned long long io_get_bwlimit(void) {
+  return global_bwlimit();
+}
+
 void protocol_session_set_bwlimit(ProtocolSession* session, unsigned long long bytes_per_sec) {
   if (!session)
     return;

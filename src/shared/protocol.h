@@ -207,6 +207,7 @@ enum NET_STATUS {
 
 void io_set_fds(int read_fd, int write_fd);
 void io_set_bwlimit(unsigned long long bytes_per_sec);
+unsigned long long io_get_bwlimit(void);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
 

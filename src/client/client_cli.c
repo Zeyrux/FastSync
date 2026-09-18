@@ -501,7 +501,7 @@ static bool is_accepted_debug_category(const char* name) {
 
 static bool is_accepted_info_category(const char* name) {
   static const char* const categories[] = {
-      "backup", "del", "flist", "mount", "nonreg", "progress", "remove", "syms", "symsafe",
+      "mount", "syms", "symsafe",
   };
   for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
     if (strcmp(name, categories[i]) == 0)
@@ -608,14 +608,28 @@ static int parse_info_flags(const char* value, Config* config) {
       free(flags);
       return 1;
     }
-    if (strcmp(name, "copy") == 0 || strcmp(name, "name") == 0)
+    if (strcmp(name, "copy") == 0)
       flag = LOG_INFO_COPY;
+    else if (strcmp(name, "name") == 0)
+      flag = LOG_INFO_NAME;
     else if (strcmp(name, "misc") == 0)
       flag = LOG_INFO_MISC;
     else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;
     else if (strcmp(name, "stats") == 0)
       flag = LOG_INFO_STATS;
+    else if (strcmp(name, "del") == 0)
+      flag = LOG_INFO_DEL;
+    else if (strcmp(name, "remove") == 0)
+      flag = LOG_INFO_REMOVE;
+    else if (strcmp(name, "flist") == 0)
+      flag = LOG_INFO_FLIST;
+    else if (strcmp(name, "nonreg") == 0)
+      flag = LOG_INFO_NONREG;
+    else if (strcmp(name, "backup") == 0)
+      flag = LOG_INFO_BACKUP;
+    else if (strcmp(name, "progress") == 0)
+      flag = LOG_INFO_PROGRESS;
     else if (is_accepted_info_category(name))
       continue;
     else {
@@ -1819,22 +1833,107 @@ static int set_log_file_option(Config* config, const char* log_path) {
   return 0;
 }
 
-/* Apply a --bwlimit value (kilobytes per second).  Returns 0 on success, -1 on
- * error. */
+/* Faithful port of rsync 3.4.1's `parse_size_arg(bwlimit_arg, 'K', "bwlimit",
+ * 512, -1, True)`: a default KiB suffix, binary (1024) multipliers unless a
+ * `b`/`B` decimal suffix or explicit `iB` is given, an optional decimal
+ * fraction, the P/T/G/M/K suffixes, and the special rules that a value of 0
+ * means "no limit" while any other value below 512 bytes is rejected.  The
+ * parsed byte count is then quantized to whole KiB exactly like rsync's
+ * `bwlimit = (size + 512) / 1024`.  Returns 0 on success, -1 on a parse error. */
+static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_sec_out) {
+  const char* arg = value;
+  int reps;
+  long long mult;
+  while (*arg >= '0' && *arg <= '9')
+    arg++;
+  if (*arg != '\0' &&
+      (*arg == '.' || *arg == localeconv()->decimal_point[0]))
+    for (arg++; *arg >= '0' && *arg <= '9'; arg++) {}
+
+  char suffix = *arg && *arg != '+' && *arg != '-' ? *arg++ : 'K';
+  switch (suffix) {
+  case 'b':
+  case 'B':
+    reps = 0;
+    break;
+  case 'k':
+  case 'K':
+    reps = 1;
+    break;
+  case 'm':
+  case 'M':
+    reps = 2;
+    break;
+  case 'g':
+  case 'G':
+    reps = 3;
+    break;
+  case 't':
+  case 'T':
+    reps = 4;
+    break;
+  case 'p':
+  case 'P':
+    reps = 5;
+    break;
+  default:
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value ? value : "");
+    return -1;
+  }
+  if (*arg == 'b' || *arg == 'B') {
+    mult = 1000;
+    arg++;
+  } else if (*arg == '\0' || *arg == '+' || *arg == '-') {
+    mult = 1024;
+  } else if ((arg[0] == 'i' || arg[0] == 'I') && (arg[1] == 'b' || arg[1] == 'B')) {
+    mult = 1024;
+    arg += 2;
+  } else {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value ? value : "");
+    return -1;
+  }
+
+  long long size = 1;
+  for (int i = 0; i < reps; i++) {
+    if (size > LLONG_MAX / mult) {
+      log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value ? value : "");
+      return -1;
+    }
+    size *= mult;
+  }
+  size = (long long)((double)size * atof(value));
+  if ((*arg == '+' || *arg == '-') && arg[1] == '1' && arg != value) {
+    size += atoi(arg);
+    arg += 2;
+  }
+  if (*arg != '\0' || size < 0) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is %s", value ? value : "",
+                size < 0 ? "too large" : "invalid");
+    return -1;
+  }
+  if (size != 0 && size < 512) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too small (min: 512 or 0 for unlimited)",
+                value ? value : "");
+    return -1;
+  }
+  long long kib = size == 0 ? 0 : (size + 512) / 1024;
+  if (kib > (long long)(ULLONG_MAX / 1024)) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value ? value : "");
+    return -1;
+  }
+  *bytes_per_sec_out = (unsigned long long)kib * 1024;
+  return 0;
+}
+
+/* Apply a --bwlimit value using rsync 3.4.1's units/semantics.  Returns 0 on
+ * success, -1 on error. */
 static int set_bwlimit_option(const char* value) {
-  unsigned long long kbps;
-  if (parse_ull_arg(value, &kbps, "--bwlimit") != 0)
+  unsigned long long bytes_per_sec;
+  if (parse_bwlimit_value(value, &bytes_per_sec) != 0)
     return -1;
-  if (kbps == 0) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
-    return -1;
-  }
-  if (kbps > ULLONG_MAX / 1024) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
-    return -1;
-  }
-  io_set_bwlimit(kbps * 1024);
-  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
+  io_set_bwlimit(bytes_per_sec);
+  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s",
+                   bytes_per_sec / 1024);
   return 0;
 }
 
@@ -2549,7 +2648,8 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
       }
     }
   }
-  config->report_stats = config->stats || config->show_progress || format_needs_wire ||
+  config->report_stats = config->stats || config->show_progress ||
+                         (config->info_level & LOG_INFO_PROGRESS) || format_needs_wire ||
                          (config->dry_run && config->use_delete);
   return 0;
 }

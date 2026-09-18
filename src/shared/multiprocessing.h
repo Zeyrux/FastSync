@@ -83,6 +83,11 @@ typedef struct {
      thread transmits the root plan before any data and the remaining plans
      alongside the chunks.  Set once before the worker threads start. */
   DeletePlanSender* delete_plans;
+  /* A scan I/O error without --ignore-errors suppressed deletion: the prebuilt
+     keep-set/plans were dropped, and the streaming scanner must not build a
+     fresh manifest or re-send the per-directory plans.  Set once before the
+     worker threads start. */
+  bool delete_suppressed;
   mtx_t mutex_progress;
   int total_files;
   unsigned long long progress_bytes;
