@@ -207,7 +207,8 @@ _CASES = [
            seed=seed_delete_excluded, server_args=DELETE, ref="--delete-excluded"),
     H.Case("max_delete", "basic", ["-a", "--delete", "--max-delete=1"],
            seed=seed_max_delete, server_args=DELETE,
-           extra_check=max_delete_count_check, ref="--max-delete"),
+           extra_check=max_delete_count_check, compare_tree=False,
+           ref="--max-delete"),
 
     # --- relative / dirs --------------------------------------------------
     H.Case("relative_general", "basic", ["-a", "-R"], layout=H.MIRROR_ABS,

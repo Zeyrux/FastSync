@@ -92,6 +92,10 @@ class Case:
     # rsync receives ``src + "/"``; FastSync mirrors the path it is given, so a
     # trailing-slash-sensitive case must hand FastSync the same form.
     fs_src_suffix: str = ""
+    # Some cases have an unspecified result (e.g. which extras survive a
+    # partial --max-delete abort): assert the case-specific invariants via
+    # extra_check and skip the exact-tree comparison.
+    compare_tree: bool = True
     ci: bool = False
     ref: str = ""
 
@@ -422,6 +426,7 @@ def run_differential(  # noqa: PLR0913 (explicit scenario parameters)
     extra_check: Optional[Callable] = None,
     files_from: Optional[Tuple[str, ...]] = None,
     fs_src_suffix: str = "",
+    compare_tree: bool = True,
 ) -> Dict[str, object]:
     """Run one rsync/FastSync pair and return the diff aspects.
 
@@ -466,7 +471,7 @@ def run_differential(  # noqa: PLR0913 (explicit scenario parameters)
         "fastsync_rc": fs_result.returncode,
         "rsync_stderr": rs.stderr,
         "fastsync_stderr": fs_result.stderr or fs_result.stdout,
-        "tree": tree_diff(rroot, froot, _View()),
+        "tree": tree_diff(rroot, froot, _View()) if compare_tree else [],
         "stdout": [],
         "extra": [],
     }
@@ -491,6 +496,7 @@ def execute_case(case: Case, server) -> Dict[str, object]:
         compare_modes=case.compare_modes, compare_hardlinks=case.compare_hardlinks,
         ignore_paths=case.ignore_paths, extra_check=case.extra_check,
         files_from=case.files_from, fs_src_suffix=case.fs_src_suffix,
+        compare_tree=case.compare_tree,
     )
 
 
