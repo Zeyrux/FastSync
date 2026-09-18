@@ -412,6 +412,9 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->exclude_per_dir_filter_files = config->per_dir_filter_count >= 2;
   options->dirs = config->dirs;
   options->relative = config->relative;
+  /* A real recursive transfer recreates empty source directories (rsync
+     parity); low-level scanner users leave this off. */
+  options->emit_empty_dirs = true;
   /* --no-implied-dirs only has meaning with -R (rsync): without it the option
      is a documented no-op, so the scanner must not suppress directory
      metadata. */

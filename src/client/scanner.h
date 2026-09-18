@@ -151,6 +151,12 @@ typedef struct {
   bool capture_dir_times;
   ArrayList* dir_entries;
   mtx_t* dir_entries_mutex;
+  /* Recreate empty source directories on a recursive transfer: emit a
+   * payload-less directory entry for every traversed directory that produced
+   * no transferred/descended child.  Off by default so low-level scanner users
+   * (unit helpers, --list-only) see only the historical file list; the real
+   * sender sets it in prepare_scanner. */
+  bool emit_empty_dirs;
   /* --no-implied-dirs with -R + --files-from: a directory that is only an
    * implied parent of a listed entry (not itself listed, nor below a listed
    * directory) must not carry source metadata; it is created with default

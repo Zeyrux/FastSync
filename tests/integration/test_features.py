@@ -2376,6 +2376,61 @@ class TestTempDir:
         assert not mismatches, f"Mismatch: {mismatches}"
         self._assert_clean_scratch(os.path.join(dest, "scratch"))
 
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_relative_temp_dir_matches_rsync_absolute_rejected(self):
+        """Differential: a relative --temp-dir is resolved under the destination
+        by both (rsync 3.4.1 and FastSync), producing identical trees.  An
+        absolute --temp-dir is used verbatim by rsync standalone, but the
+        receiver deliberately confines it to the receive root (security
+        invariant), so FastSync rejects it without writing outside the root.
+        """
+        source = self._make_source("tempdir_diff_src")
+        rdst = os.path.join(TEST_DATA_DIR, "tempdir_diff_rdst")
+        fdst = os.path.join(TEST_DATA_DIR, "tempdir_diff_fdst")
+        clean_dir(rdst)
+        clean_dir(fdst)
+        os.makedirs(os.path.join(rdst, "scratch"), exist_ok=True)
+        os.makedirs(os.path.join(fdst, "scratch"), exist_ok=True)
+        r = subprocess.run(["rsync", "-a", "--temp-dir=scratch", source + "/", rdst + "/"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C"))
+        assert r.returncode == 0, r.stderr
+        with ServerManager() as server:
+            server.start()
+            result, _ = run_client(source, fdst, flags=["--temp-dir=scratch"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        # rsync lays the source contents directly in rdst; FastSync mirrors the
+        # absolute source path below fdst.  Compare the mirrored content trees
+        # (the scratch dir lives at each destination root).
+        rtree = sorted(os.path.relpath(os.path.join(dp, n), rdst)
+                       for dp, dn, fn in os.walk(rdst)
+                       for n in dn + fn if os.path.join(dp, n) != os.path.join(rdst, "scratch"))
+        mirror = get_dest_received_dir(fdst, source)
+        ftree = sorted(os.path.relpath(os.path.join(dp, n), mirror)
+                       for dp, dn, fn in os.walk(mirror) for n in dn + fn)
+        assert rtree == ftree, f"relative temp-dir tree mismatch: {rtree} != {ftree}"
+        assert _walk_tmp_files(os.path.join(rdst, "scratch")) == []
+        assert _walk_tmp_files(os.path.join(fdst, "scratch")) == []
+
+        # Absolute temp dir: rsync accepts it; FastSync rejects it safely.
+        abs_scratch = os.path.join(TEST_DATA_DIR, "tempdir_diff_abs")
+        clean_dir(abs_scratch)
+        rdst2 = os.path.join(TEST_DATA_DIR, "tempdir_diff_rdst2")
+        clean_dir(rdst2)
+        r2 = subprocess.run(["rsync", "-a", "--temp-dir=" + abs_scratch, source + "/", rdst2 + "/"],
+                            capture_output=True, text=True,
+                            env=dict(os.environ, LC_ALL="C"))
+        assert r2.returncode == 0, r2.stderr
+        fdst2 = os.path.join(TEST_DATA_DIR, "tempdir_diff_fdst2")
+        clean_dir(fdst2)
+        with ServerManager() as server:
+            server.start()
+            result2, _ = run_client(source, fdst2, flags=["--temp-dir", abs_scratch],
+                                    port=server.port)
+        assert result2.returncode != 0, "an absolute --temp-dir must be rejected (confined)"
+        assert os.listdir(abs_scratch) == [], "receiver wrote into an unconfined temp dir"
+
     def test_default_behavior_has_no_scratch_dir(self, shared_server):
         source = self._make_source("tempdir_default_src")
         dest = os.path.join(TEST_DATA_DIR, "tempdir_default_dst")

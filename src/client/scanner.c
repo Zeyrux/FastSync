@@ -1399,8 +1399,9 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     if (entry == NULL) {
       /* The directory is exhausted: if nothing was transferred or descended
          from it, recreate it at the destination as an explicit entry. */
-      if (!scanner->current_dir_produced && !scanner->options.prune_empty_dirs &&
-          !scanner->options.list_dirs && scanner->options.file_list == NULL) {
+      if (scanner->options.emit_empty_dirs && !scanner->current_dir_produced &&
+          !scanner->options.prune_empty_dirs && !scanner->options.list_dirs &&
+          scanner->options.file_list == NULL) {
         if (!scanner_emit_empty_dir(scanner, chunk_data))
           scanner->failed = true;
       }

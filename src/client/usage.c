@@ -90,8 +90,8 @@ void print_usage(void) {
   printf("                      entry's destination mirror receiver-side.  Independent of\n");
   printf("                      --delete (it does not imply --delete; a non-empty directory\n");
   printf("                      mirror is removed only with --force or --delete)\n");
-  printf("  -m, --prune-empty-dirs  Do not transfer empty directory entries (--dirs mode);\n");
-  printf("                      recursive transfers never send empty dirs\n");
+  printf("  -m, --prune-empty-dirs  Do not create empty directories (a recursive transfer\n");
+  printf("                      otherwise recreates them, like rsync)\n");
   printf("  Note: each timing flag implies --delete.  Combining a timing flag with\n");
   printf("  --no-delete (in either order) is rejected as a config error.\n");
   printf("  --ignore-existing  Skip files that already exist on receiver\n");
