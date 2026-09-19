@@ -217,9 +217,58 @@ static void test_delete_delay_actual_removal_charges_budget(void) {
   config_delete(config);
 }
 
+/* Send a config-only carrier frame (apply=false): the per-run config block with
+ * one --delete-missing-args exact path, and no directory walk. */
+static void send_config_only_frame(int fd, const char* missing_path) {
+  EXPECT_TRUE(send_int(fd, 1)); /* has_config */
+  EXPECT_TRUE(send_int(fd, 0)); /* protected prefixes */
+  EXPECT_TRUE(send_int(fd, 0)); /* size-skipped */
+  EXPECT_TRUE(send_int(fd, 1)); /* missing args */
+  EXPECT_TRUE(send_wire_str(fd, missing_path));
+  EXPECT_TRUE(send_int(fd, 0)); /* apply = false */
+  EXPECT_TRUE(send_wire_str(fd, "."));
+  EXPECT_TRUE(send_int(fd, 0));
+  EXPECT_TRUE(send_int(fd, 0));
+}
+
+/* The config-only carrier frame (apply=false) still applies the
+ * --delete-missing-args exact deletions even though it walks no directory.  This
+ * is the fix for a --files-from list that synchronizes no directory. */
+static void test_config_only_frame_applies_missing_args(void) {
+  char root[] = "/tmp/fastsync_dp_cfgonly_XXXXXX";
+  EXPECT_TRUE(mkdtemp(root) != NULL);
+  char gone[1024];
+  snprintf(gone, sizeof(gone), "%s/gone.txt", root);
+  int fd = open(gone, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  EXPECT_TRUE(fd >= 0);
+  close(fd);
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->receive_root_directory = str_dup(root);
+  config->delete_missing_args = true;
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+
+  DeletePlanSession* session = delete_plan_session_create(config);
+  EXPECT_NOT_NULL(session);
+  send_config_only_frame(p[1], "gone.txt");
+  EXPECT_EQ_INT(delete_plan_session_receive(session, config, p[0]), 0);
+  EXPECT_EQ_INT((int)delete_plan_session_deleted(session), 1);
+  EXPECT_TRUE(lstat(gone, &(struct stat){0}) != 0);
+
+  delete_plan_session_destroy(session);
+  close(p[0]);
+  close(p[1]);
+  rmdir(root);
+  config_delete(config);
+}
+
 void test_delete_plan(void) {
   test_delete_delay_refilled_dir_removed_recursively();
   test_delete_delay_removed_file_counted();
   test_delete_delay_max_delete_bounds_actual();
   test_delete_delay_actual_removal_charges_budget();
+  test_config_only_frame_applies_missing_args();
 }
