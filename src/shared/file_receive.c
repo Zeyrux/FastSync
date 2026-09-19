@@ -37,7 +37,12 @@
 #define MANIFEST_ENTRY_OVERHEAD (sizeof(char*) + 16)
 
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config) {
-  return file_save_to_disk_full(root_directory, file, config) != FILE_SAVE_ERROR;
+  return file_save_to_disk_full_ex(root_directory, file, config, NULL, NULL) != FILE_SAVE_ERROR;
+}
+
+FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
+                                      const Config* config) {
+  return file_save_to_disk_full_ex(root_directory, file, config, NULL, NULL);
 }
 
 /* --delay-updates receiver path: write the file into a private staging tree
@@ -208,13 +213,14 @@ static FileSaveResult hardlink_sibling_absent_first(const char* destination_path
    --existing/--ignore-existing/--update policies are decided against the final
    destination like every normal write. */
 static FileSaveResult file_save_hardlink_sibling(const char* root_directory, const File* file,
-                                                 const Config* config) {
+                                                 const Config* config, bool* created) {
   Config* cfg = (Config*)config;
   if (!root_directory || !file || !file->path || !file->hardlink_target)
     return FILE_SAVE_ERROR;
   char* destination_path = path_cat(root_directory, file->path);
   if (!destination_path)
     return FILE_SAVE_ERROR;
+  bool existed = file_path_exists_secure(destination_path);
 
   if (cfg->existing && !file_path_exists_secure(destination_path)) {
     free(destination_path);
@@ -278,6 +284,8 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
     free(staged_first);
     free(staged_sibling);
     free(destination_path);
+    if (ok && created && !existed)
+      *created = true;
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
 
@@ -324,6 +332,8 @@ static FileSaveResult file_save_hardlink_sibling(const char* root_directory, con
   free(content);
   free(first_disk);
   free(destination_path);
+  if (ok && created && !existed)
+    *created = true;
   return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
 }
 
@@ -360,7 +370,7 @@ bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode) {
  * non-device entry must carry an empty rdev.
  */
 static FileSaveResult file_save_special_to_disk(const char* root_directory, const File* file,
-                                                const Config* config) {
+                                                const Config* config, bool* created) {
   /* The empty-path and structural checks stay unconditional; the redundant
      ".." list-path re-check is skipped under --trust-sender exactly like the
      receive layer (confinement is deferred to the secure parent walk below,
@@ -412,6 +422,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   char* destination = path_cat(root_directory, file->path);
   if (!destination)
     return FILE_SAVE_ERROR;
+  bool existed = file_path_exists_secure(destination);
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(destination, &leaf, true);
   if (parent_fd < 0) {
@@ -532,6 +543,8 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   free(destination);
   /* A failed required --copy-as ownership marks the node as failed; every other
    * identity policy stays best-effort. */
+  if (owner_ok && created && !existed)
+    *created = true;
   return owner_ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
 }
 
@@ -610,8 +623,13 @@ static FileSaveResult file_save_write_device(const char* root_directory, const F
   return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_SKIPPED;
 }
 
-FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
-                                      const Config* config) {
+FileSaveResult file_save_to_disk_full_ex(const char* root_directory, const File* file,
+                                         const Config* config, bool* created,
+                                         unsigned* created_dirs) {
+  if (created)
+    *created = false;
+  if (created_dirs)
+    *created_dirs = 0;
   /* Central no-mutation guard: a server-contacting --dry-run (or a local batch
      apply that somehow carries dry_run) must never touch the destination, no
      matter which caller reached this primitive.  The per-caller guards remain,
@@ -658,7 +676,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   /* Device/special node (--devices/--specials): recreate the node instead of
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special)
-    return file_save_special_to_disk(root_directory, file, config);
+    return file_save_special_to_disk(root_directory, file, config, created);
   /* --write-devices: write straight into an existing device node.  Writing
      into a device is a super-user activity, so --no-super must suppress it just
      like device-node creation; the default AUTO/--super attempt it (the wide
@@ -689,6 +707,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     char* dir_path = path_cat(root_directory, file->path);
     if (!dir_path)
       return FILE_SAVE_ERROR;
+    bool dir_existed = file_path_exists_secure(dir_path);
     bool ok = file_ensure_directory_secure(dir_path);
     /* P7 Wave E: apply the negotiated ownership to the directory ITSELF (not
        just the files inside it).  --copy-as and every explicit identity policy
@@ -712,6 +731,8 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
       free(leaf);
     }
     free(dir_path);
+    if (ok && created && !dir_existed)
+      *created = true;
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
 
@@ -728,6 +749,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     char* link_path = path_cat(root_directory, file->path);
     if (!link_path)
       return FILE_SAVE_ERROR;
+    bool link_existed = file_path_exists_secure(link_path);
     /* The link value is stored verbatim (rsync -l parity: absolute and
        ".."-bearing targets are preserved; the scanner's --safe-links /
        --copy-unsafe-links decide which links are sent at all).  --munge-links
@@ -768,6 +790,8 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
       ok = file_restore_symlink_metadata(link_path, file->metadata, link_policy,
                                          config->omit_link_times);
     }
+    if (ok && created && !link_existed)
+      *created = true;
     free(link_path);
     return ok ? FILE_SAVE_WRITTEN : FILE_SAVE_ERROR;
   }
@@ -777,7 +801,7 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      byte-identical copy of) the group's first member.  Handled entirely here,
      before the normal data-write paths (which would create an empty file). */
   if (file->link_group != 0 && !file->link_first && file->hardlink_target != NULL) {
-    return file_save_hardlink_sibling(root_directory, file, config);
+    return file_save_hardlink_sibling(root_directory, file, config, created);
   }
 
   /* These options arrive from the client.  --backup-dir, --partial-dir and
@@ -808,12 +832,18 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
     free(disk_path);
     return FILE_SAVE_ERROR;
   }
+  /* Snapshot the final destination's existence BEFORE any backup/force/partial
+     step can move or remove it, so the receiver can report rsync's
+     `Number of created files` (protocol 2.28.0). */
+  bool dest_existed = file_path_exists_secure(destination_path);
 
   /* --delay-updates diverts the whole write into the staging tree; the rest of
      this function is the immediate-install path. */
   if (config && config->delay_updates) {
     FileSaveResult result =
         file_stage_delayed_update(root_directory, destination_path, file, (Config*)config);
+    if (result == FILE_SAVE_WRITTEN && created && !dest_existed)
+      *created = true;
     free(confined_backup);
     free(confined_partial);
     free(destination_path);
@@ -939,19 +969,23 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
      existing/ignore-existing/update/backup preamble above has already made the
      policy decision. */
   bool ok;
+  char* count_floor = file_transfer_root_floor(config);
   if (config && file->basis_link) {
-    ok = file_to_disk_secure_link_attrs(
+    ok = file_to_disk_secure_link_attrs_counted(
         disk_path, file->basis_link, file->data->data, file->data->size, config->preallocate,
-        metadata, policy, config->use_fsync, file->xattrs, config->fake_super, confined_temp);
+        metadata, policy, config->use_fsync, file->xattrs, config->fake_super, confined_temp,
+        created_dirs, count_floor);
   } else {
     /* The plain no-replace / update / with-fsync engines, plus per-file xattr
        (-X/-A) and --fake-super application on the written fd. */
-    ok = file_to_disk_secure_attrs(
+    ok = file_to_disk_secure_attrs_counted(
         disk_path, file->data->data, file->data->size, inplace, sparse,
         config && config->preallocate, metadata, policy, config && config->update,
         config && config->ignore_existing, config && config->use_fsync, file->xattrs,
-        config ? config->fake_super : false, config ? config->partial : false, confined_temp);
+        config ? config->fake_super : false, config ? config->partial : false, confined_temp,
+        created_dirs, count_floor);
   }
+  free(count_floor);
   free(confined_temp);
   confined_temp = NULL;
   if (!ok)
@@ -972,6 +1006,8 @@ FileSaveResult file_save_to_disk_full(const char* root_directory, const File* fi
   free(confined_partial);
   free(destination_path);
   free(disk_path);
+  if (created && !dest_existed)
+    *created = true;
   return FILE_SAVE_WRITTEN;
 
 fail:
@@ -982,6 +1018,30 @@ fail:
   free(destination_path);
   free(disk_path);
   return FILE_SAVE_ERROR;
+}
+
+void receiver_stats_note_saved(ReceiverStats* stats, const File* file, bool created,
+                               unsigned created_dirs) {
+  if (!stats || !file)
+    return;
+  bool is_sibling = file->link_group != 0 && !file->link_first;
+  if (!file->is_dir && !file->is_symlink && !file->is_special && !is_sibling) {
+    unsigned long long literal = file->literal_bytes;
+    if (literal == 0 && file->matched_bytes == 0)
+      literal = file->data ? file->data->size : 0;
+    stats->literal_bytes += literal;
+  }
+  stats->created_dir += created_dirs;
+  if (!created)
+    return;
+  if (file->is_dir)
+    stats->created_dir++;
+  else if (file->is_symlink)
+    stats->created_link++;
+  else if (file->is_special)
+    stats->created_special++;
+  else
+    stats->created_reg++;
 }
 
 /* Receive a file's xattr block (when the config enables xattr transport) and
@@ -1094,11 +1154,15 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       return NULL;
     }
     /* Wire-stats tally: bytes taken straight from the basis file (matched
-       delta blocks).  Computed before the delta is destroyed. */
+       delta blocks) and bytes shipped literally (protocol 2.28.0).  Computed
+       before the delta is destroyed. */
     unsigned long long matched = 0;
+    unsigned long long literal = 0;
     for (uint32_t k = 0; k < delta->instruction_count; k++) {
       if (delta->instructions[k].type == DELTA_INSTR_BLOCK_MATCH)
         matched += delta->instructions[k].match.length;
+      else if (delta->instructions[k].type == DELTA_INSTR_LITERAL)
+        literal += delta->instructions[k].literal.length;
     }
     void* new_data = delta_apply(old_data, old_size, delta, config->delta_block_size);
     delta_destroy(delta);
@@ -1119,6 +1183,7 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
       return NULL;
     }
     file->matched_bytes = matched;
+    file->literal_bytes = literal;
 
     if (config->use_metadata) {
       int meta_ok = 1;

@@ -57,14 +57,26 @@ bool format_dest_state_send(int fd, const OutputDestState* state);
 bool format_dest_state_receive(int fd, OutputDestState* state);
 
 /* End-of-transfer receiver counters reported through STATUS_STATS (protocol
- * 2.25.0) when the wire config carries report_stats.  `would_delete_count` is
- * the number of destination-relative paths the receiver would have deleted in a
- * -n/--dry-run --delete run; that many wire strings immediately follow the
- * fixed record (sent/read by the caller). */
+ * 2.25.0, extended in 2.28.0) when the wire config carries report_stats.
+ * `would_delete_count` is the number of destination-relative paths the receiver
+ * would have deleted in a -n/--dry-run --delete run; that many wire strings
+ * immediately follow the fixed record (sent/read by the caller).
+ *
+ * Protocol 2.28.0 adds the receiver-observed counters the sender cannot see:
+ * `literal_bytes` is the file data the receiver actually stored literally
+ * (whole files plus the literal fragments of a delta) and the four `created_*`
+ * counters split the destination entries the receiver newly created by type,
+ * reproducing rsync's `Number of created files` breakdown and an exact
+ * `Literal data` for a delta run. */
 typedef struct {
   unsigned long long matched_data;
   unsigned long long deleted_files;
   unsigned long long would_delete_count;
+  unsigned long long literal_bytes;
+  unsigned long long created_reg;
+  unsigned long long created_dir;
+  unsigned long long created_link;
+  unsigned long long created_special;
 } ReceiverStats;
 
 /* Fixed-width STATUS_STATS counter record.  The status frame and the optional

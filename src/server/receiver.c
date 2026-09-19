@@ -613,6 +613,8 @@ typedef struct {
 static bool receiver_save_file(File* file, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
   FileSaveResult result = FILE_SAVE_ERROR;
+  bool created = false;
+  unsigned created_dirs = 0;
   if (context->config->dry_run) {
     /* Defense in depth: a dry-run receiver mutates nothing even if a data
        frame reaches the sink (the sender is not supposed to send one). */
@@ -622,12 +624,17 @@ static bool receiver_save_file(File* file, void* context_pointer) {
        --remove-source-files sender keeps its source. */
     result = FILE_SAVE_SKIPPED;
   } else {
-    result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
+    result = file_save_to_disk_full_ex(context->config->receive_root_directory, file,
+                                       context->config, &created, &created_dirs);
   }
   /* Wire-stats tally: bytes reconstructed from the basis file (delta matches)
      count as matched data in the end-of-transfer report. */
   if (result != FILE_SAVE_ERROR && file->matched_bytes > 0)
     context->stats.matched_data += file->matched_bytes;
+  /* Protocol 2.28.0: receiver-observed literal bytes and the created-entry
+     breakdown (regular/dir/link/special) for the `--stats` report. */
+  if (result == FILE_SAVE_WRITTEN)
+    receiver_stats_note_saved(&context->stats, file, created, created_dirs);
   /* A directory's metadata is deferred, never applied inline: collect it now
      and apply it at the end.  -O/--omit-dir-times and --preserve_perms/-times
      are honored by dir_metadata_list_apply's caller (see

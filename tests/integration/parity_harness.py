@@ -56,10 +56,13 @@ STDOUT_OUTFMT = "outfmt"
 STDOUT_STATS = "stats"
 
 # rsync --stats lines that are protocol-independent and must match exactly.
-# Deliberately excluded: the per-type "Number of files"/"Number of created
-# files" breakdown and Total bytes sent/received (documented residual, see the
-# `--stats` row in RSYNC_COMPAT.md).
+# `Number of files` and `Number of created files` carry rsync's per-type
+# breakdown; protocol 2.28.0 reports the receiver-created split over
+# STATUS_STATS.  Deliberately excluded: Total bytes sent/received (protocol
+# framing differs, see the `--stats` row in RSYNC_COMPAT.md).
 STATS_KEYS = (
+    "Number of files",
+    "Number of created files",
     "Number of deleted files",
     "Number of regular files transferred",
     "Total file size",
@@ -443,6 +446,11 @@ def run_differential(  # noqa: PLR0913 (explicit scenario parameters)
         rroot, froot = os.path.join(rdst, rel), get_dest_received_dir(fdst, src)
     else:
         rroot, froot = rdst, get_dest_received_dir(fdst, src)
+    # rsync's destination root always exists (clean_dir created it).  FastSync's
+    # logical transfer root is the mirror path below the destination argument,
+    # so pre-create it too: `Number of created files` counts the root only when
+    # it is genuinely absent, and the two tools must start from the same state.
+    os.makedirs(froot, exist_ok=True)
     if seed:
         seed(src, rroot, froot)
 

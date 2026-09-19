@@ -2831,15 +2831,17 @@ static void golden_config_populate(Config* c) {
   c->copy_as_gid = 222;
 }
 
-/* The pinned golden frame (protocol 2.27.0).  The values below are the only
+/* The pinned golden frame (protocol 2.28.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
  * delete-plan wave changed only the version string; 2.25.0 appended the
- * report_stats bool, 2.26.0 appended the compression_algo int, and 2.27.0
- * appended the report_deletes bool.  The byte-exact values are recomputed for
- * the merged layout. */
+ * report_stats bool, 2.26.0 appended the compression_algo int, 2.27.0 appended
+ * the report_deletes bool, and 2.28.0 changed only the version string (the
+ * STATUS_STATS body grew, but the config frame layout is unchanged, so the
+ * frame length is identical).  The byte-exact values are recomputed for the
+ * merged layout. */
 #define GOLDEN_WIRE_LEN 709
-#define GOLDEN_WIRE_HASH 14423869696887880000ULL
+#define GOLDEN_WIRE_HASH 417335736347473203ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2921,7 +2923,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.27.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.28.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())

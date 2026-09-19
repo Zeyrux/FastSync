@@ -3,6 +3,8 @@
 #include "config.h"
 #include "delta.h"
 #include "file.h"
+#include "file_receive.h"
+#include "format.h"
 #include "log.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -132,6 +134,124 @@ static void test_receive_files_single_file() {
     EXPECT_EQ_INT(resp, STATUS_OK);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+}
+
+/* Protocol 2.28.0: a fresh single-file transfer over the wire reports the
+ * receiver-observed literal bytes and the created-regular counter through the
+ * terminal STATUS_STATS frame, and an update reports created_reg == 0. */
+static void test_receive_stats_frame_created_and_literal() {
+  const char* content = "stats frame content";
+  size_t len = strlen(content);
+  char root_template[] = "/tmp/fastsync_stats_XXXXXX";
+  char* root = mkdtemp(root_template);
+  EXPECT_NOT_NULL(root);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->save_to_disk = true;
+  cfg->report_stats = true;
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
+    close(p[0]);
+    config_delete(cfg);
+    _exit(ret == 0 ? 0 : 1);
+  }
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  send_status(p[1], STATUS_NEXT);
+  File* file = file_create("created.bin");
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(len);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, content, len);
+  file->data->size = len;
+  send_str(p[1], file->path);
+  send_data(p[1], file->data);
+  file_destroy(file);
+  send_status(p[1], STATUS_FINISHED);
+
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_STATS);
+  ReceiverStats stats;
+  EXPECT_TRUE(format_stats_receive(p[1], &stats));
+  int would = 0;
+  EXPECT_TRUE(receive_int(p[1], &would));
+  EXPECT_EQ_INT(would, 0);
+  EXPECT_TRUE(stats.created_reg == 1);
+  EXPECT_TRUE(stats.created_dir == 0);
+  EXPECT_TRUE(stats.created_link == 0);
+  EXPECT_TRUE(stats.created_special == 0);
+  EXPECT_TRUE(stats.literal_bytes == (unsigned long long)len);
+  EXPECT_TRUE(stats.matched_data == 0);
+
+  Status final;
+  EXPECT_TRUE(receive_status(p[1], &final));
+  EXPECT_EQ_INT(final, STATUS_OK);
+  int wstatus;
+  waitpid(pid, &wstatus, 0);
+  close(p[1]);
+  config_delete(cfg);
+  EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0);
+
+  /* Second run against the now-existing destination: no created file. */
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->save_to_disk = true;
+  cfg->report_stats = true;
+  pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
+    close(p[0]);
+    config_delete(cfg);
+    _exit(ret == 0 ? 0 : 1);
+  }
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  send_status(p[1], STATUS_NEXT);
+  file = file_create("created.bin");
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(len);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, content, len);
+  file->data->size = len;
+  send_str(p[1], file->path);
+  send_data(p[1], file->data);
+  file_destroy(file);
+  send_status(p[1], STATUS_FINISHED);
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_STATS);
+  EXPECT_TRUE(format_stats_receive(p[1], &stats));
+  EXPECT_TRUE(receive_int(p[1], &would));
+  EXPECT_TRUE(stats.created_reg == 0);
+  EXPECT_TRUE(stats.literal_bytes == (unsigned long long)len);
+  EXPECT_TRUE(receive_status(p[1], &final));
+  waitpid(pid, &wstatus, 0);
+  close(p[1]);
+  config_delete(cfg);
+  EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0);
 }
 
 /* Test receive_files with STATUS_ABORT */
@@ -1183,6 +1303,7 @@ void test_server() {
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
     test_receive_files_single_file();
+    test_receive_stats_frame_created_and_literal();
     test_receive_files_abort();
     test_receive_manifest_rejects_traversal();
     test_receive_incremental_check_rejects_invalid_nanoseconds();

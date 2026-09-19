@@ -93,12 +93,11 @@ static const char* stats_bytes(const Config* config, unsigned long long bytes, c
   return buffer;
 }
 
-/* Build rsync's `Number of files` parenthetical: each non-zero category, in
-   reg/dir/link/special order.  Empty when the flist counted nothing. */
-static void stats_type_breakdown(const TransferStats* stats, char* out, size_t out_size) {
-  unsigned long long total =
-      stats->flist_reg + stats->flist_dir + stats->flist_link + stats->flist_special;
-  if (total == 0) {
+/* Build rsync's per-type parenthetical: each non-zero category, in
+   reg/dir/link/special order.  Empty when every count is zero. */
+static void type_breakdown(unsigned long long reg, unsigned long long dir, unsigned long long link,
+                           unsigned long long special, char* out, size_t out_size) {
+  if (reg + dir + link + special == 0) {
     out[0] = '\0';
     return;
   }
@@ -107,10 +106,7 @@ static void stats_type_breakdown(const TransferStats* stats, char* out, size_t o
   const struct {
     const char* name;
     unsigned long long count;
-  } parts[4] = {{"reg", stats->flist_reg},
-                {"dir", stats->flist_dir},
-                {"link", stats->flist_link},
-                {"special", stats->flist_special}};
+  } parts[4] = {{"reg", reg}, {"dir", dir}, {"link", link}, {"special", special}};
   bool first = true;
   for (size_t i = 0; i < 4; i++) {
     if (parts[i].count == 0)
@@ -125,6 +121,12 @@ static void stats_type_breakdown(const TransferStats* stats, char* out, size_t o
   if (!first && used + 1 < out_size)
     out[used++] = ')';
   out[used] = '\0';
+}
+
+/* Build rsync's `Number of files` parenthetical from the scan's flist counts. */
+static void stats_type_breakdown(const TransferStats* stats, char* out, size_t out_size) {
+  type_breakdown(stats->flist_reg, stats->flist_dir, stats->flist_link, stats->flist_special, out,
+                 out_size);
 }
 
 /* Print the rsync `--stats` block on stdout.  The source-side flist and
@@ -151,6 +153,7 @@ static void report_transfer_stats(const Config* config, const TransferStats* sta
   char total_buffer[32];
   char transferred_buffer[32];
   char literal_buffer[32];
+  char matched_buffer[32];
   char sent_buffer[32];
   char recv_buffer[32];
   char rate_buffer[32] = {0};
@@ -159,8 +162,15 @@ static void report_transfer_stats(const Config* config, const TransferStats* sta
       stats_bytes(config, stats->total_file_size, total_buffer, sizeof(total_buffer));
   const char* transferred = stats_bytes(config, stats->transferred_file_size, transferred_buffer,
                                         sizeof(transferred_buffer));
-  const char* literal =
-      stats_bytes(config, stats->literal_data, literal_buffer, sizeof(literal_buffer));
+  /* Protocol 2.28.0: the receiver reports the bytes it literally stored, which
+     is exact for a delta transfer (the sender's own literal_data counts each
+     stored file's whole source size and is only an upper bound).  Fall back to
+     the sender total when the receiver reported no delta/literal accounting
+     (e.g. a local no-server path). */
+  unsigned long long literal_bytes = (recv->literal_bytes != 0 || recv->matched_data != 0)
+                                         ? recv->literal_bytes
+                                         : stats->literal_data;
+  const char* literal = stats_bytes(config, literal_bytes, literal_buffer, sizeof(literal_buffer));
   const char* sent_s = stats_bytes(config, sent, sent_buffer, sizeof(sent_buffer));
   const char* recv_s = stats_bytes(config, received, recv_buffer, sizeof(recv_buffer));
   const char* rate_str = rate_buffer;
@@ -177,21 +187,30 @@ static void report_transfer_stats(const Config* config, const TransferStats* sta
   stats_type_breakdown(stats, breakdown, sizeof(breakdown));
   unsigned long long flist_total =
       stats->flist_reg + stats->flist_dir + stats->flist_link + stats->flist_special;
+  char created_breakdown[128];
+  type_breakdown(recv->created_reg, recv->created_dir, recv->created_link, recv->created_special,
+                 created_breakdown, sizeof(created_breakdown));
+  unsigned long long created_total =
+      recv->created_reg + recv->created_dir + recv->created_link + recv->created_special;
   printf("\n");
   if (breakdown[0] != '\0')
     printf("Number of files: %llu %s\n", flist_total, breakdown);
   else
     printf("Number of files: %llu\n", flist_total);
-  /* FastSync cannot tell which entries the receiver newly created, so it
-     reports the transferred regular files (which are created on a fresh
-     destination).  See RSYNC_COMPAT.md for the documented residual. */
-  printf("Number of created files: %llu\n", stats->transferred_regular);
+  /* Protocol 2.28.0: the receiver reports which destination entries it newly
+     created, split by type, so this line matches rsync exactly. */
+  if (created_breakdown[0] != '\0')
+    printf("Number of created files: %llu %s\n", created_total, created_breakdown);
+  else
+    printf("Number of created files: %llu\n", created_total);
   printf("Number of deleted files: %llu\n", recv->deleted_files);
   printf("Number of regular files transferred: %llu\n", stats->transferred_regular);
   printf("Total file size: %s bytes\n", total);
   printf("Total transferred file size: %s bytes\n", transferred);
   printf("Literal data: %s bytes\n", literal);
-  printf("Matched data: %llu bytes\n", recv->matched_data);
+  const char* matched =
+      stats_bytes(config, recv->matched_data, matched_buffer, sizeof(matched_buffer));
+  printf("Matched data: %s bytes\n", matched);
   printf("File list size: 0\n");
   printf("File list generation time: 0.000 seconds\n");
   printf("File list transfer time: 0.000 seconds\n");

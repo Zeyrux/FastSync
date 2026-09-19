@@ -82,7 +82,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.27.0).
+ * Config wire-field table (single source of truth for protocol 2.28.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -1006,7 +1006,20 @@ typedef struct Config {
  * the sender can print rsync's `deleting PATH` lines for a real deletion.  No
  * change to the fixed STATUS_STATS record itself; only a new trailing config
  * bool, which still requires the version bump for the strict lockstep. */
-#define PROTOCOL_VERSION "2.27.0"
+/* (8) --stats receiver-observed counters (protocol 2.28.0): the fixed
+ * STATUS_STATS record grows from three counters to eight.  The receiver now
+ * reports the bytes it literally stored (`literal_data`) and the count of
+ * destination entries it newly CREATED, split by type
+ * (reg/dir/link/special), so the sender can print rsync's exact
+ * `Number of created files: N (reg: X, dir: Y, link: Z, special: W)` line and
+ * an exact `Literal data` total even for delta transfers.  The config-frame
+ * LAYOUT is unchanged (no new config field), but the STATUS_STATS body grows,
+ * so a 2.27 peer that does not consume the five new fixed-width counters would
+ * desynchronize on the trailing would-delete path list; the strict
+ * same-version handshake (config_receive rejects a mismatched version before
+ * parsing anything else) keeps mixed deployments from ever reaching that
+ * state. */
+#define PROTOCOL_VERSION "2.28.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64

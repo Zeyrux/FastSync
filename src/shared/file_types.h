@@ -97,6 +97,11 @@ typedef struct {
    * basis file (matched delta blocks) for this entry.  0 when the file was sent
    * whole.  Accumulated into ReceiverStats.matched_data by the receiver sink. */
   unsigned long long matched_bytes;
+  /* Receiver-only (protocol 2.28.0) wire-stats tally: the literal delta fragment
+   * bytes this entry carried (DELTA_INSTR_LITERAL).  0 when the file was sent
+   * whole; the sink then falls back to the whole payload size.  Accumulated
+   * into ReceiverStats.literal_bytes. */
+  unsigned long long literal_bytes;
 } File;
 
 /* The path that should be sent on the wire and used for the receiver-side

@@ -289,6 +289,15 @@ def _make_one_file(root, name="f.bin", size=100):
         fh.write(bytes((i * 7 + 3) & 0xFF for i in range(size)))
 
 
+def _pick_stats(text, keys):
+    out = {}
+    for line in text.splitlines():
+        for key in keys:
+            if line.startswith(key + ":"):
+                out[key] = line
+    return out
+
+
 class TestWireStatsParity:
     """Wire-counter output parity: --out-format %b/%c/%C, --progress and
     --stats versus real rsync 3.4.1."""
@@ -496,6 +505,9 @@ class TestWireStatsParity:
         _make_one_file(source, "f.bin", 6000)
         clean_dir(dest)
         clean_dir(rdst)
+        # Start both tools from the same state: rsync's destination root exists,
+        # so pre-create FastSync's mirrored logical root as well.
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
         rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         flags = ["-a", "--stats"] + (["--threads"] if mt else [])
@@ -526,17 +538,18 @@ class TestWireStatsParity:
     @requires_rsync
     @pytest.mark.ci
     def test_stats_file_count_breakdown_matches_rsync(self, shared_server):
-        """`Number of files` now carries rsync's per-type breakdown: the scanner
-        accounts directory entries (captured for -a/-t/-p) plus reg/link/special
-        from the transfer list.  `Number of created files` still lacks the type
-        breakdown (FastSync cannot tell which entries the receiver newly
-        created), so that residual is pinned separately."""
+        """`Number of files` and `Number of created files` both carry rsync's
+        per-type breakdown (protocol 2.28.0 reports the receiver-created
+        reg/dir/link/special split over STATUS_STATS)."""
         source = os.path.join(TEST_DATA_DIR, "wire_stc_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_stc_dst")
         rdst = os.path.join(TEST_DATA_DIR, "wire_stc_rdst")
         _make_one_file(source, "f.bin", 6000)
         clean_dir(dest)
         clean_dir(rdst)
+        # Start both tools from the same state: rsync's destination root exists,
+        # so pre-create FastSync's mirrored logical root as well.
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
         rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         result, _ = run_client(source, dest, flags=["-a", "--stats"],
@@ -556,10 +569,71 @@ class TestWireStatsParity:
 
         assert re.match(r"Number of files: 2 \(reg: 1, dir: 1\)$", r_files), r_files
         assert r_files == f_files, (r_files, f_files)
-        # rsync always carries the created type breakdown; FastSync prints the
-        # bare transferred-regular count (documented residual).
         assert re.match(r"Number of created files: 1 \(reg: 1\)$", r_created), r_created
-        assert re.fullmatch(r"Number of created files: 1", f_created), f_created
+        assert f_created == r_created, (r_created, f_created)
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_stats_created_and_literal_fresh_update_delta(self, shared_server, mt):
+        """The receiver-observed counters must match rsync for the three
+        transfer shapes: a fresh create (created breakdown + whole-file literal),
+        an update (created == 0, whole-file literal), and a delta update (only
+        the literal delta fragments are counted, not the whole file)."""
+        source = os.path.join(TEST_DATA_DIR, "wire_stcd_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_stcd_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_stcd_rdst")
+        clean_dir(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+        os.makedirs(source, exist_ok=True)
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
+        with open(os.path.join(source, "big.bin"), "wb") as fh:
+            fh.write(bytes(range(256)) * 4096)  # 1 MiB
+        mt_flag = ["--threads"] if mt else []
+
+        def compare(tag):
+            # Pin the delta block size on both ends: rsync's adaptive block size
+            # would otherwise make the literal/matched split non-comparable.
+            rsync_result = _rsync(["-a", "--stats", "--no-whole-file", "-B8192",
+                                   source + "/", rdst + "/"])
+            assert rsync_result.returncode == 0, rsync_result.stderr
+            result, _ = run_client(
+                source, dest,
+                flags=["-a", "--stats", "--incremental", "--delta", "-B8192"] + mt_flag,
+                port=shared_server.port)
+            assert result.returncode == 0, result.stderr[:300]
+            keys = ("Number of created files", "Literal data", "Matched data",
+                    "Total transferred file size")
+            r = _pick_stats(rsync_result.stdout, keys)
+            f = _pick_stats(result.stdout, keys)
+            assert r == f, f"{tag}: rsync={r} fastsync={f}"
+            return r
+
+        fresh = compare("fresh")
+        assert re.match(r"Number of created files: 1 \(reg: 1\)$",
+                        fresh["Number of created files"]), fresh
+
+        # Update the source and re-run: the destination already exists.
+        sleep_mtime = os.path.getmtime(os.path.join(source, "big.bin")) + 2
+        with open(os.path.join(source, "big.bin"), "r+b") as fh:
+            fh.seek(100)
+            fh.write(b"XXXXXXXXXX")
+        os.utime(os.path.join(source, "big.bin"), (sleep_mtime, sleep_mtime))
+        update = compare("update")
+        assert update["Number of created files"] == "Number of created files: 0", update
+
+        # Second delta update: change bytes far apart, so rsync ships only the
+        # literal fragments and FastSync must report the same Literal data.
+        sleep_mtime = os.path.getmtime(os.path.join(source, "big.bin")) + 2
+        with open(os.path.join(source, "big.bin"), "r+b") as fh:
+            fh.seek(500000)
+            fh.write(b"YYYYYYYYYY")
+        os.utime(os.path.join(source, "big.bin"), (sleep_mtime, sleep_mtime))
+        delta = compare("delta")
+        assert delta["Number of created files"] == "Number of created files: 0", delta
+        lit = int(delta["Literal data"].split(":", 1)[1].strip().split()[0].replace(",", ""))
+        assert 0 < lit < 1024 * 1024, delta
 
     @requires_rsync
     @pytest.mark.ci
