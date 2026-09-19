@@ -3,6 +3,8 @@
 #include "config.h"
 #include "delta.h"
 #include "file.h"
+#include "file_receive.h"
+#include "format.h"
 #include "log.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -132,6 +134,124 @@ static void test_receive_files_single_file() {
     EXPECT_EQ_INT(resp, STATUS_OK);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+}
+
+/* Protocol 2.28.0: a fresh single-file transfer over the wire reports the
+ * receiver-observed literal bytes and the created-regular counter through the
+ * terminal STATUS_STATS frame, and an update reports created_reg == 0. */
+static void test_receive_stats_frame_created_and_literal() {
+  const char* content = "stats frame content";
+  size_t len = strlen(content);
+  char root_template[] = "/tmp/fastsync_stats_XXXXXX";
+  char* root = mkdtemp(root_template);
+  EXPECT_NOT_NULL(root);
+
+  int p[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->save_to_disk = true;
+  cfg->report_stats = true;
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
+    close(p[0]);
+    config_delete(cfg);
+    _exit(ret == 0 ? 0 : 1);
+  }
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  send_status(p[1], STATUS_NEXT);
+  File* file = file_create("created.bin");
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(len);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, content, len);
+  file->data->size = len;
+  send_str(p[1], file->path);
+  send_data(p[1], file->data);
+  file_destroy(file);
+  send_status(p[1], STATUS_FINISHED);
+
+  Status status;
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_STATS);
+  ReceiverStats stats;
+  EXPECT_TRUE(format_stats_receive(p[1], &stats));
+  int would = 0;
+  EXPECT_TRUE(receive_int(p[1], &would));
+  EXPECT_EQ_INT(would, 0);
+  EXPECT_TRUE(stats.created_reg == 1);
+  EXPECT_TRUE(stats.created_dir == 0);
+  EXPECT_TRUE(stats.created_link == 0);
+  EXPECT_TRUE(stats.created_special == 0);
+  EXPECT_TRUE(stats.literal_bytes == (unsigned long long)len);
+  EXPECT_TRUE(stats.matched_data == 0);
+
+  Status final;
+  EXPECT_TRUE(receive_status(p[1], &final));
+  EXPECT_EQ_INT(final, STATUS_OK);
+  int wstatus;
+  waitpid(pid, &wstatus, 0);
+  close(p[1]);
+  config_delete(cfg);
+  EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0);
+
+  /* Second run against the now-existing destination: no created file. */
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+  io_set_fds(p[0], p[1]);
+  io_set_bwlimit(0);
+  cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  free(cfg->version);
+  cfg->version = str_dup(PROTOCOL_VERSION);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup(root);
+  cfg->save_to_disk = true;
+  cfg->report_stats = true;
+  pid = fork();
+  if (pid == 0) {
+    close(p[1]);
+    io_set_fds(p[0], p[0]);
+    int ret = receiver_receive_files(cfg, p[0]);
+    close(p[0]);
+    config_delete(cfg);
+    _exit(ret == 0 ? 0 : 1);
+  }
+  close(p[0]);
+  io_set_fds(p[1], p[1]);
+  send_status(p[1], STATUS_NEXT);
+  file = file_create("created.bin");
+  EXPECT_NOT_NULL(file);
+  file->data->data = malloc(len);
+  EXPECT_NOT_NULL(file->data->data);
+  memcpy(file->data->data, content, len);
+  file->data->size = len;
+  send_str(p[1], file->path);
+  send_data(p[1], file->data);
+  file_destroy(file);
+  send_status(p[1], STATUS_FINISHED);
+  EXPECT_TRUE(receive_status(p[1], &status));
+  EXPECT_EQ_INT(status, STATUS_STATS);
+  EXPECT_TRUE(format_stats_receive(p[1], &stats));
+  EXPECT_TRUE(receive_int(p[1], &would));
+  EXPECT_TRUE(stats.created_reg == 0);
+  EXPECT_TRUE(stats.literal_bytes == (unsigned long long)len);
+  EXPECT_TRUE(receive_status(p[1], &final));
+  waitpid(pid, &wstatus, 0);
+  close(p[1]);
+  config_delete(cfg);
+  EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0);
 }
 
 /* Test receive_files with STATUS_ABORT */
@@ -943,14 +1063,18 @@ static void test_incremental_check_fifo_destination_does_not_hang() {
 }
 
 /* A server-contacting --dry-run with an alternate basis dir must never read or
-   hash the basis file.  An exact (size+mtime+content) basis match would
-   otherwise let a client probe the basis bytes against its own supplied digest
-   (a 1-bit content oracle).  The dry-run decision is metadata-only, so even a
-   byte-identical basis is reported as would-transfer, not a compare-dest skip. */
-static void test_incremental_check_dry_run_basis_does_not_read_content() {
+   hash the basis file.  Under the default metadata quick-check a hit needs no
+   basis bytes, so a compare-dest match is reported as a skip (STATUS_OK) just
+   like a real run -- and still no content is read.  Under --verify-basis a hit
+   would require hashing the basis against the client-supplied digest (a 1-bit
+   content oracle), which a dry-run must never do, so even a byte-identical
+   basis is reported as would-transfer.  The destination is never materialized
+   in either arm. */
+static void run_dry_run_basis_check(bool verify, Status expected) {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   cfg->dry_run = true;
+  cfg->verify_basis = verify;
   char* root = make_check_root("dryb");
   EXPECT_NOT_NULL(root);
   cfg->receive_root_directory = str_dup(root);
@@ -966,8 +1090,8 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
   EXPECT_EQ_INT(stat(basis_path, &bst), 0);
   EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_COMPARE, "basis"), 0);
 
-  /* The (correct) source digest for the basis bytes: an unfixed dry-run would
-     read+hash the basis and treat this as an exact compare-dest hit. */
+  /* The (correct) source digest for the basis bytes: a buggy dry-run that read
+     and hashed the basis would treat this as an exact compare-dest hit. */
   uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t digest_len = 0;
   EXPECT_TRUE(checksum_digest((ChecksumAlgo)cfg->checksum_algo, cfg->checksum_seed, content,
@@ -986,7 +1110,8 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
     bool skipped = false;
     bool would_transfer = false;
     File* file = receive_incremental_check_ex(p[0], cfg, &skipped, &would_transfer);
-    bool ok = file == NULL && !skipped && would_transfer;
+    bool ok = file == NULL && skipped == (expected == STATUS_OK) &&
+              would_transfer == (expected != STATUS_OK);
     file_destroy(file);
     config_delete(cfg);
     close(p[0]);
@@ -1004,13 +1129,16 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
     EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
     EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
     EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
-    uint8_t wire_len = (uint8_t)digest_len;
-    EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
-    EXPECT_TRUE(send_n_data(p[1], digest, digest_len));
+    /* The digest is only on the wire when --checksum or --verify-basis needs it
+       (cfg->checksum is false here); the default quick-check arm sends none. */
+    if (verify) {
+      uint8_t wire_len = (uint8_t)digest_len;
+      EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+      EXPECT_TRUE(send_n_data(p[1], digest, digest_len));
+    }
     Status s;
     EXPECT_TRUE(receive_status(p[1], &s));
-    /* A skip here would mean the receiver read+hashed the basis file. */
-    EXPECT_EQ_INT(s, STATUS_DRY_RUN_TRANSFER);
+    EXPECT_EQ_INT(s, expected);
 
     int status;
     waitpid(pid, &status, 0);
@@ -1026,6 +1154,11 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
     free(root);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+}
+
+static void test_incremental_check_dry_run_basis_does_not_read_content() {
+  run_dry_run_basis_check(false, STATUS_OK);
+  run_dry_run_basis_check(true, STATUS_DRY_RUN_TRANSFER);
 }
 
 /* B1: a FIFO planted in a --link-dest basis directory must not block
@@ -1158,6 +1291,7 @@ static void test_dry_run_delete_plan_commit_does_not_delete() {
   EXPECT_TRUE(send_int(p[1], 0)); /* size-skipped prefixes */
   EXPECT_TRUE(send_int(p[1], 1)); /* missing-args exact deletions */
   EXPECT_TRUE(send_str(p[1], "victim.txt"));
+  EXPECT_TRUE(send_int(p[1], 1));   /* apply: a real plan */
   EXPECT_TRUE(send_str(p[1], ".")); /* receive root plan */
   EXPECT_TRUE(send_int(p[1], 0));   /* kept child directories */
   EXPECT_TRUE(send_int(p[1], 0));   /* kept child files */
@@ -1183,6 +1317,7 @@ void test_server() {
   if (!is_running_under_valgrind()) {
     test_receive_files_finished();
     test_receive_files_single_file();
+    test_receive_stats_frame_created_and_literal();
     test_receive_files_abort();
     test_receive_manifest_rejects_traversal();
     test_receive_incremental_check_rejects_invalid_nanoseconds();

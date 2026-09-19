@@ -191,7 +191,9 @@ enum NET_STATUS {
    * (--delete-delay).  Payload: an int32 has_config flag (1 on the first plan
    * of the run, 0 afterwards); when set, the three global config sections
    * (protected-prefix count+paths, size-skipped count+paths, missing-args
-   * count+paths); then the destination-relative directory path wire string
+   * count+paths); then an int32 apply flag (1 for a real plan, 0 for a
+   * config-only carrier frame that must not walk a directory); then the
+   * destination-relative directory path wire string
    * ("." for the receive root); then the child-directory count + names and the
    * child-file count + names that must be kept.  Appended after
    * STATUS_DEST_INFO so no existing status is renumbered. */

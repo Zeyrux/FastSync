@@ -35,6 +35,26 @@ bool compression_algo_valid(int algo);
  * "auto". */
 CompressionAlgo compression_negotiate_default(void);
 
+/* Resolve "auto" the way rsync does: the first supported name in
+ * RSYNC_COMPRESS_LIST (whitespace-separated, client half ends at '&'), then the
+ * compiled-in preference order when the variable is unset/blank.  Returns -1
+ * when the variable is set but names no supported codec (rsync's failed
+ * negotiation), otherwise a valid CompressionAlgo id. */
+int compression_choice_resolve(void);
+
+/* rsync 3.4.1's per-codec default level, applied when the user did not pass
+ * --compress-level/--zl.  zstd uses ZSTD_CLEVEL_DEFAULT (3) and zlib/zlibx the
+ * resolved Z_DEFAULT_COMPRESSION (6).  lz4 has no tunable level in rsync
+ * (always the default acceleration); FastSync returns a positive placeholder so
+ * its "level > 0" compression gate stays engaged, and lz4_compress ignores the
+ * value, so the output is identical to rsync's.  none is 0. */
+int compression_default_level(CompressionAlgo algo);
+
+/* Clamp an explicit --compress-level to the codec's accepted range the way
+ * rsync's init_compression_level() does: zstd 1..22, zlib/zlibx 1..9, lz4
+ * ignored (fixed positive placeholder), none 0. */
+int compression_clamp_level(CompressionAlgo algo, int level);
+
 /* True when the algorithm actually compresses (i.e. is not NONE). */
 bool compression_algo_enabled(CompressionAlgo algo);
 

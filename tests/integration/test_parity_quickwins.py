@@ -719,13 +719,18 @@ class TestVerifyAndFlip:
         source = self._src("cmpd")
         dest = self._dst("cmpd")
         rdst = self._dst("cmpd_r")
+        # Pin the mtime so rsync's size+mtime quick-check (and FastSync's
+        # default) matches deterministically across a second boundary.
+        OLD = 1_500_000_000
         with open(os.path.join(source, "f.txt"), "wb") as fh:
             fh.write(b"basis-content\n")
+        os.utime(os.path.join(source, "f.txt"), (OLD, OLD))
         # rsync resolves --compare-dest relative to the destination dir; its
         # basis file sits at the transfer-relative path.
         os.makedirs(os.path.join(rdst, "basis"), exist_ok=True)
         with open(os.path.join(rdst, "basis", "f.txt"), "wb") as fh:
             fh.write(b"basis-content\n")
+        os.utime(os.path.join(rdst, "basis", "f.txt"), (OLD, OLD))
         rs = _rsync(["-a", "--compare-dest=basis", source + "/", rdst + "/"])
         assert rs.returncode == 0, rs.stderr
         assert not os.path.exists(os.path.join(rdst, "f.txt")), \
@@ -738,6 +743,7 @@ class TestVerifyAndFlip:
         os.makedirs(basis, exist_ok=True)
         with open(os.path.join(basis, "f.txt"), "wb") as fh:
             fh.write(b"basis-content\n")
+        os.utime(os.path.join(basis, "f.txt"), (OLD, OLD))
         received = get_dest_received_dir(dest, source)
         result, _ = run_client(source, dest,
                                flags=["--compare-dest=basis", "--incremental"],
@@ -751,14 +757,17 @@ class TestVerifyAndFlip:
     def test_link_dest_hardlinks_matches_rsync(self, shared_server):
         source = self._src("linkd")
         dest = self._dst("linkd")
+        OLD = 1_500_000_000
         with open(os.path.join(source, "f.txt"), "wb") as fh:
             fh.write(b"link-basis-content\n")
+        os.utime(os.path.join(source, "f.txt"), (OLD, OLD))
         rel = os.path.abspath(source).lstrip(os.sep)
         basis = os.path.join(dest, "basis", rel)
         os.makedirs(basis, exist_ok=True)
         basis_file = os.path.join(basis, "f.txt")
         with open(basis_file, "wb") as fh:
             fh.write(b"link-basis-content\n")
+        os.utime(basis_file, (OLD, OLD))
         received = get_dest_received_dir(dest, source)
         result, _ = run_client(source, dest,
                                flags=["--link-dest=basis", "--incremental"],
@@ -771,12 +780,11 @@ class TestVerifyAndFlip:
 
     @requires_rsync
     def test_basis_dir_size_only_content_residual(self, shared_server):
-        """Documented residual (RSYNC_COMPAT.md basis-dir rows): FastSync
-        xxHash-verifies a basis hit, while rsync's `--size-only` quick check
-        trusts the size alone.  With a same-size, different-content basis,
-        rsync links/copies the wrong basis content while FastSync transfers the
-        source.  This test pins both observed behaviors (FastSync is stricter,
-        so the rows are reclassified Divergent)."""
+        """rsync parity (default): a basis hit is decided by the metadata
+        quick-check alone.  With `--size-only`, a same-size, different-content
+        basis is trusted, so rsync links the basis content and FastSync must now
+        do the same instead of xxHash-verifying it.  `--verify-basis` restores
+        the stricter content equality (covered by the differential test)."""
         source = self._src("basissz")
         rdest = self._dst("basissz_r")
         fdest = self._dst("basissz_f")
@@ -807,8 +815,122 @@ class TestVerifyAndFlip:
                                port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
         with open(os.path.join(received, "f.txt"), "rb") as fh:
+            assert fh.read() == b"BBBB\n", \
+                "FastSync must trust the metadata quick-check exactly like rsync"
+
+    @requires_rsync
+    def test_verify_basis_restores_content_check(self, shared_server):
+        """FastSync-only `--verify-basis`: a same-size, same-mtime basis with
+        different content is rejected by the whole-file digest, so the source is
+        transferred instead of installing the wrong basis bytes.  The default
+        (no flag) installs the basis content, matching rsync."""
+        source = self._src("vbasis")
+        fdest = self._dst("vbasis_f")
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"AAAA\n")
+        OLD = 1_400_000_000
+        os.utime(os.path.join(source, "f.txt"), (OLD, OLD))
+        rel = os.path.abspath(source).lstrip(os.sep)
+        basis = os.path.join(fdest, "basis", rel)
+        os.makedirs(basis, exist_ok=True)
+        with open(os.path.join(basis, "f.txt"), "wb") as fh:
+            fh.write(b"BBBB\n")
+        os.utime(os.path.join(basis, "f.txt"), (OLD, OLD))
+        received = get_dest_received_dir(fdest, source)
+        result, _ = run_client(source, fdest,
+                               flags=["-a", "--link-dest=basis", "--incremental",
+                                      "--verify-basis"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        with open(os.path.join(received, "f.txt"), "rb") as fh:
             assert fh.read() == b"AAAA\n", \
-                "FastSync must verify the basis content and transfer the source"
+                "--verify-basis must reject the same-size/different-content basis"
+
+
+def _stat_bytes(output, key):
+    """Parse a --stats byte counter (e.g. ``Matched data: 65,536 bytes``)."""
+    for line in output.splitlines():
+        if line.startswith(key + ":"):
+            raw = line.split(":", 1)[1].strip().split()[0]
+            return int(raw.replace(",", ""))
+    return None
+
+
+class TestFuzzy:
+    """Track 5b: `-y`/`--fuzzy` is an internal bandwidth optimization with a
+    byte-exact result.  FastSync ports rsync 3.4.1's weighted-Levenshtein name
+    heuristic, so where both delta engines admit the candidate the tools pick
+    the same basis (the ``fuzzy_basis`` differential asserts the tree and the
+    Matched/Literal counters match with the block size pinned).  The residual is
+    candidate ELIGIBILITY: FastSync's delta size gate (both files >= 16 KiB and
+    a <= 10x size ratio) is narrower than rsync's, which empirically uses a
+    fuzzy basis well beyond 10x and below 16 KiB.  These tests pin the window
+    boundary and prove the byte-exact fallback on both sides of it."""
+
+    _BASE = b"the quick brown fox jumps over the lazy dog\n" * 4000
+
+    def _src(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"fz_{tag}_src")
+        clean_dir(source)
+        return source
+
+    def _dst(self, tag):
+        d = os.path.join(TEST_DATA_DIR, f"fz_{tag}_dst")
+        clean_dir(d)
+        return d
+
+    def _run_both(self, shared_server, source, dest, rdst, payload, sibling,
+                  rs_extra=(), fs_extra=()):
+        with open(os.path.join(source, "report_v2.txt"), "wb") as fh:
+            fh.write(payload)
+        for root in (rdst, get_dest_received_dir(dest, source)):
+            os.makedirs(root, exist_ok=True)
+            with open(os.path.join(root, "report_v1.txt"), "wb") as fh:
+                fh.write(sibling)
+        rs = _rsync(["-a", "--no-whole-file", "--fuzzy", "--stats"] +
+                    list(rs_extra) + [source + "/", rdst + "/"])
+        assert rs.returncode == 0, rs.stderr[:300]
+        result, _ = run_client(
+            source, dest,
+            flags=["-a", "--incremental", "--delta", "--fuzzy", "--stats"] +
+            list(fs_extra),
+            port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        _assert_same_tree(rdst, get_dest_received_dir(dest, source), "(--fuzzy)")
+        return rs, result
+
+    @requires_rsync
+    def test_fuzzy_above_size_window_declines_but_tree_exact(self, shared_server):
+        """A sibling >10x the source is used by rsync but declined by FastSync's
+        delta size-ratio gate; both destinations stay byte-identical."""
+        n = 65536
+        payload = (self._BASE * ((n // len(self._BASE)) + 1))[:n]
+        sibling = (self._BASE * 200)[: n * 20]
+        source, dest, rdst = (self._src("big"), self._dst("big"),
+                              self._dst("big_r"))
+        rs, result = self._run_both(shared_server, source, dest, rdst,
+                                    payload, sibling)
+        assert _stat_bytes(rs.stdout, "Matched data") > 0, \
+            "rsync should still use a >10x fuzzy basis"
+        assert _stat_bytes(result.stdout, "Matched data") == 0, \
+            "FastSync's 10x delta size-ratio gate must decline the oversized basis"
+        assert _stat_bytes(result.stdout, "Literal data") == n
+
+    @requires_rsync
+    def test_fuzzy_below_delta_minimum_declines_but_tree_exact(self, shared_server):
+        """A sibling below the 16 KiB delta minimum is used by rsync but never
+        enters FastSync's delta/fuzzy path; both trees stay byte-identical."""
+        n = 8192
+        payload = (self._BASE * ((n // len(self._BASE)) + 1))[:n]
+        source, dest, rdst = (self._src("small"), self._dst("small"),
+                              self._dst("small_r"))
+        rs, result = self._run_both(shared_server, source, dest, rdst,
+                                    payload, payload)
+        assert _stat_bytes(rs.stdout, "Matched data") > 0, \
+            "rsync applies --fuzzy below 16 KiB"
+        assert _stat_bytes(result.stdout, "Matched data") == 0, \
+            "FastSync's 16 KiB delta minimum must bypass the fuzzy basis"
+        assert _stat_bytes(result.stdout, "Literal data") == n
 
 
 class TestIgnoreExistingShortCircuit:

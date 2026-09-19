@@ -43,6 +43,7 @@
 #include "test_utils.h"
 #include "test_xattr.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <signal.h>
 
 // Define global test state variables
@@ -52,6 +53,11 @@ bool current_test_failed = false;
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
+  /* The codec/checksum resolvers consult rsync's preference-list environment
+   * variables; clear them so a developer's shell cannot change test outcomes.
+   * The env-specific tests set and restore their own values. */
+  unsetenv("RSYNC_COMPRESS_LIST");
+  unsetenv("RSYNC_CHECKSUM_LIST");
   printf("\033[1;36m=== RUNNING UNIT TESTS ===\033[0m\n\n");
 
   RUN_TEST(test_queue);

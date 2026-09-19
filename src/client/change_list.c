@@ -75,6 +75,14 @@ bool change_list_enabled(const Config* config) {
                             (config->info_level & LOG_INFO_NAME) != 0);
 }
 
+/* Emitted once, lazily, ahead of the first --info=name entry: rsync prints the
+ * transfer-root `./` name line when the root directory is (re)created. */
+static bool name_root_printed = false;
+
+void change_reset_name_root(void) {
+  name_root_printed = false;
+}
+
 /* ---- Itemize code ---- */
 
 /* Format the permission bits as an `ls -l` string, e.g. `-rw-r--r--`. */
@@ -210,6 +218,23 @@ static char* change_render_name(const ChangeEvent* event) {
       return NULL;
   }
   return line.data;
+}
+
+/* rsync's `--info=name2` line for an unchanged entry: `NAME is uptodate`. */
+static char* change_render_name_uptodate(const ChangeEvent* event) {
+  char* name = change_render_name(event);
+  if (name == NULL)
+    return NULL;
+  size_t length = strlen(name);
+  char* line = malloc(length + sizeof(" is uptodate"));
+  if (line == NULL) {
+    free(name);
+    return NULL;
+  }
+  memcpy(line, name, length);
+  memcpy(line + length, " is uptodate", sizeof(" is uptodate"));
+  free(name);
+  return line;
 }
 
 /* ---- --out-format / --log-file-format ---- */
@@ -461,10 +486,24 @@ static void print_escaped_line(FILE* stream, const char* line, bool eight_bit_ou
 void change_emit(const Config* config, const ChangeEvent* event) {
   if (event == NULL || !change_list_enabled(config))
     return;
-  if (event->decision == CHANGE_UP_TO_DATE)
-    return;
   bool to_stdout = config->itemize_changes || config->out_format != NULL;
   bool to_log = config->log_file != NULL && config->log_file_format != NULL;
+  bool progress_active = config->show_progress || (config->info_level & LOG_INFO_PROGRESS);
+  if (event->decision == CHANGE_UP_TO_DATE) {
+    /* --info=name2 prints `NAME is uptodate` for entries the receiver already
+       had.  An itemize/out-format run reports them through its own format (or
+       not at all), the progress stream has no frame for them, and neither the
+       itemize nor the log-file stream previously reported an up-to-date entry,
+       so nothing else here changes. */
+    if (!to_stdout && (config->info_level & LOG_INFO_NAME_UPTODATE) != 0 && !progress_active) {
+      char* line = change_render_name_uptodate(event);
+      if (line != NULL) {
+        print_escaped_line(stdout, line, config->eight_bit_output);
+        free(line);
+      }
+    }
+    return;
+  }
   if (to_stdout) {
     char* line = config->out_format != NULL
                      ? change_render_format(config->out_format, config, event)
@@ -473,11 +512,15 @@ void change_emit(const Config* config, const ChangeEvent* event) {
       print_escaped_line(stdout, line, config->eight_bit_output);
       free(line);
     }
-  } else if ((config->info_level & LOG_INFO_NAME) != 0 &&
-             !(config->show_progress || (config->info_level & LOG_INFO_PROGRESS))) {
+  } else if ((config->info_level & LOG_INFO_NAME) != 0 && !progress_active) {
     /* --info=name without -i/--out-format: print the updated entry's name.  The
        --progress path owns the name line when progress output is active (it
-       emits the same names before the progress frames), so do not duplicate. */
+       emits the same names before the progress frames), so do not duplicate.
+       The transfer-root `./` line precedes the first such name. */
+    if (!name_root_printed) {
+      name_root_printed = true;
+      fputs("./\n", stdout);
+    }
     char* line = change_render_name(event);
     if (line != NULL) {
       print_escaped_line(stdout, line, config->eight_bit_output);
@@ -641,6 +684,29 @@ void change_emit_file_sent(const Config* config, const File* file) {
     return;
   unsigned long long payload = file->data != NULL ? file->data->size : 0;
   change_emit_file_sent_bytes(config, file, payload, 0);
+}
+
+void change_emit_file_uptodate(const Config* config, const File* file) {
+  if (file == NULL || !change_list_enabled(config))
+    return;
+  ChangeEvent event;
+  memset(&event, 0, sizeof(event));
+  event.decision = CHANGE_UP_TO_DATE;
+  event.is_directory = false;
+  event.is_symlink = file->is_symlink;
+  event.is_special = file->is_special;
+  event.is_hardlink = file->link_group != 0 && !file->link_first;
+  event.symlink_target = file->symlink_target;
+  event.hardlink_target = file->hardlink_target;
+  event.size = file->data != NULL ? file->data->size : 0;
+  event.dest = file->dest_state;
+  char* name = NULL;
+  char* path = NULL;
+  fill_event_from_file(config, file, &event, &name, &path);
+  if (name != NULL && path != NULL)
+    change_emit(config, &event);
+  free(name);
+  free(path);
 }
 
 void change_emit_dir_sent(const Config* config, const File* file) {

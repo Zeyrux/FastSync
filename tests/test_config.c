@@ -1,6 +1,7 @@
 #include "test_config.h"
 #include "config.h"
 #include "delta.h"
+#include "filter.h"
 #include "identity.h"
 #include "multiprocessing.h"
 #include "protocol.h"
@@ -2119,6 +2120,48 @@ static void test_config_receive_rejects_oversized_string_budget() {
   config_delete(over_bytes);
 }
 
+/* Pre-auth bounds for the receiver-side filter rule block (protocol 2.28.0).
+   A peer may send `protect`/`risk` rules; the receiver must reject an over-cap
+   count or an over-long pattern before evaluating anything, so a crafted config
+   cannot drive unbounded glob work or install a rule that silently never
+   matches. */
+static void test_config_receive_rejects_bad_protect_rules() {
+  if (is_running_under_valgrind())
+    return;
+
+  /* Over-cap rule count: one more than MAX_FILTER_RULES rules. */
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->filters = array_list_create(free);
+  EXPECT_NOT_NULL(c->filters);
+  for (int i = 0; i <= MAX_FILTER_RULES; i++)
+    EXPECT_TRUE(array_list_add(c->filters, str_dup("- *.tmp")));
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* A pattern longer than the receiver's evaluation bound is rejected by the
+     sender (mirroring the receiver's guard) instead of being sent as an inert
+     rule. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->filters = array_list_create(free);
+  EXPECT_NOT_NULL(c->filters);
+  size_t big = MAX_PROTECT_PATTERN_LEN + 1;
+  char* long_rule = malloc(big + 3);
+  EXPECT_NOT_NULL(long_rule);
+  long_rule[0] = '-';
+  long_rule[1] = ' ';
+  memset(long_rule + 2, 'x', big);
+  long_rule[big + 2] = '\0';
+  EXPECT_TRUE(array_list_add(c->filters, long_rule));
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+}
+
 /* identity_copy_as_refused() is the pure, pre-snapshot refusal predicate: a
    --copy-as is refused when the receiver is not root OR the effective super
    mode is OFF (an operator veto), and never when --copy-as is unset. */
@@ -2590,6 +2633,46 @@ static bool basis_equal(const Config* a, const Config* b) {
   return true;
 }
 
+/* The receiver reconstructs its delete-protection list from the sender's
+ * compiled base rules, so compare the received list against a fresh
+ * filter_base_build() of the sender's raw --filter texts. */
+static bool filter_rules_equal(const Config* a, const FilterRuleList* got) {
+  int count = a->filters ? a->filters->size : 0;
+  const char** texts = NULL;
+  if (count > 0) {
+    texts = calloc((size_t)count, sizeof(char*));
+    if (!texts)
+      return false;
+    for (int i = 0; i < count; i++)
+      texts[i] = (const char*)a->filters->items[i];
+  }
+  char err[160];
+  FilterRuleList* expected =
+      filter_base_build(texts, count, a->cvs_exclude, a->delete_excluded, err, sizeof(err));
+  free(texts);
+  if (!expected)
+    return false;
+  bool equal = true;
+  int want = expected->count;
+  int have = got ? got->count : 0;
+  if (want != have) {
+    equal = false;
+  } else {
+    for (int i = 0; i < want; i++) {
+      const FilterRule* x = expected->items[i];
+      const FilterRule* y = got->items[i];
+      if (x->action != y->action || x->sides != y->sides || x->anchored != y->anchored ||
+          x->dir_only != y->dir_only || x->negate != y->negate ||
+          !str_opt_equal(x->owner, y->owner) || !str_opt_equal(x->pattern, y->pattern)) {
+        equal = false;
+        break;
+      }
+    }
+  }
+  filter_rule_list_free(expected);
+  return equal;
+}
+
 #define CONFIG_CMP_BOOL(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_INT(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_RAW(a, b, name) ((a)->name == (b)->name)
@@ -2615,6 +2698,7 @@ static bool basis_equal(const Config* a, const Config* b) {
 #define CONFIG_CMP_COPY_AS_ID(a, b, name) (!(a)->copy_as_set || (a)->name == (b)->name)
 #define CONFIG_CMP_BLOCK_SKIP_SUFFIXES(a, b, name) skip_suffixes_equal((a), (b))
 #define CONFIG_CMP_BLOCK_BASIS(a, b, name) basis_equal((a), (b))
+#define CONFIG_CMP_BLOCK_PROTECT_RULES(a, b, name) filter_rules_equal((a), (b)->name)
 #define CONFIG_CMP_BLOCK_IDMAP(a, b, name)                                                         \
   idmap_equal((a)->name, (a)->name##_count, (b)->name, (b)->name##_count)
 
@@ -2784,6 +2868,7 @@ static void golden_config_populate(Config* c) {
   c->skip_compress_suffixes[1] = str_dup(".xz");
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_COMPARE, "compare"), 0);
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "link"), 0);
+  c->verify_basis = true;
   c->fuzzy = true;
   c->checksum_algo = CHECKSUM_ALGO_MD5;
   c->checksum_seed = 0x1122334455667788ULL;
@@ -2829,17 +2914,29 @@ static void golden_config_populate(Config* c) {
   c->copy_as_set = true;
   c->copy_as_uid = 111;
   c->copy_as_gid = 222;
+  /* Compile-through delete-protection rules (protocol 2.28.0).  The golden
+   * sender serializes its compiled base rules, so populate a diverse set that
+   * exercises both sides, negate, anchoring and dir-only. */
+  c->filters = array_list_create(free);
+  array_list_add(c->filters, str_dup("P *.log"));
+  array_list_add(c->filters, str_dup("+r **/*.txt"));
+  array_list_add(c->filters, str_dup("H,!secret"));
+  array_list_add(c->filters, str_dup("- /sub/dir/"));
 }
 
-/* The pinned golden frame (protocol 2.27.0).  The values below are the only
+/* The pinned golden frame (protocol 2.28.0).  The values below are the only
  * thing that ties the generated table to the historical wire format; update
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
  * delete-plan wave changed only the version string; 2.25.0 appended the
- * report_stats bool, 2.26.0 appended the compression_algo int, and 2.27.0
- * appended the report_deletes bool.  The byte-exact values are recomputed for
- * the merged layout. */
-#define GOLDEN_WIRE_LEN 709
-#define GOLDEN_WIRE_HASH 14423869696887880000ULL
+ * report_stats bool, 2.26.0 appended the compression_algo int, 2.27.0 appended
+ * the report_deletes bool, and 2.28.0 changed only the version string and
+ * appended the receiver-side delete-protection rule block (the STATUS_STATS
+ * body also grew, but that is not part of this frame).  Track 5a appends the
+ * FastSync-only verify_basis bool to the basis block WITHOUT a version bump
+ * (project decision), so the frame grew by one int to 886 bytes.  The
+ * byte-exact values are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 886
+#define GOLDEN_WIRE_HASH 5809509022716816757ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -2921,7 +3018,7 @@ static unsigned long long capture_wire_hash(const Config* cfg, size_t* out_len) 
   return h;
 }
 
-/* Byte-for-byte wire compatibility guard (protocol 2.27.0).  The expected hash
+/* Byte-for-byte wire compatibility guard (protocol 2.28.0).  The expected hash
  * pins the pre-X-macro byte stream; the refactor MUST NOT change it. */
 static void test_config_wire_golden() {
   if (is_running_under_valgrind())
@@ -2988,6 +3085,7 @@ static void test_config_wire_golden_receive() {
            recv->groupmap[0].to_name != NULL && strcmp(recv->groupmap[0].to_name, "root") == 0;
       ok = ok && recv->basis_count == 2 && recv->basis_dirs[0].type == BASIS_DEST_COMPARE &&
            recv->basis_dirs[1].type == BASIS_DEST_LINK;
+      ok = ok && recv->verify_basis;
       ok = ok && recv->module != NULL && strcmp(recv->module, "goldenmod") == 0;
       ok = ok && recv->copy_as_set && recv->copy_as_uid == 111 && recv->copy_as_gid == 222;
     }
@@ -3248,6 +3346,7 @@ void test_config() {
     test_config_wire_golden_receive();
     test_config_wire_receive_bounds();
     test_config_receive_rejects_overcap_counts();
+    test_config_receive_rejects_bad_protect_rules();
     test_config_wire_roundtrip_all_fields();
     test_config_preserve_attribute_wire_roundtrip();
   }

@@ -86,9 +86,43 @@ static void test_dest_state_roundtrip() {
   close(fds[1]);
 }
 
+static void test_stats_roundtrip() {
+  /* STATUS_STATS grew from three counters (2.25.0) to eight (2.28.0); the codec
+   * must carry every field, including the receiver-observed literal/created
+   * counters, across the wire in order. */
+  int fds[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+    return;
+  ReceiverStats out;
+  memset(&out, 0, sizeof(out));
+  out.matched_data = 111111111ULL;
+  out.deleted_files = 7;
+  out.would_delete_count = 3;
+  out.literal_bytes = 222222222ULL;
+  out.created_reg = 5;
+  out.created_dir = 4;
+  out.created_link = 2;
+  out.created_special = 1;
+  ReceiverStats in;
+  memset(&in, 0, sizeof(in));
+  EXPECT_TRUE(format_stats_send(fds[0], &out));
+  EXPECT_TRUE(format_stats_receive(fds[1], &in));
+  EXPECT_TRUE(in.matched_data == out.matched_data);
+  EXPECT_TRUE(in.deleted_files == out.deleted_files);
+  EXPECT_TRUE(in.would_delete_count == out.would_delete_count);
+  EXPECT_TRUE(in.literal_bytes == out.literal_bytes);
+  EXPECT_TRUE(in.created_reg == out.created_reg);
+  EXPECT_TRUE(in.created_dir == out.created_dir);
+  EXPECT_TRUE(in.created_link == out.created_link);
+  EXPECT_TRUE(in.created_special == out.created_special);
+  close(fds[0]);
+  close(fds[1]);
+}
+
 void test_format(void) {
   test_human_size_decimal();
   test_big_num_grouping();
   test_datetime_format();
   test_dest_state_roundtrip();
+  test_stats_roundtrip();
 }

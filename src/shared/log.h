@@ -33,6 +33,11 @@ typedef enum {
   LOG_INFO_FLIST = 1u << 7,
   LOG_INFO_NONREG = 1u << 8,
   LOG_INFO_PROGRESS = 1u << 9,
+  /* Marker for `--info=name2` and higher: also print rsync's
+     "NAME is uptodate" line for entries the receiver already has.  It rides in
+     the info_level bitset (there is no separate Config field) and is never set
+     by --info=all (which selects level 1). */
+  LOG_INFO_NAME_UPTODATE = 1u << 10,
   LOG_INFO_ALL = LOG_INFO_COPY | LOG_INFO_MISC | LOG_INFO_SKIP | LOG_INFO_STATS | LOG_INFO_DEL |
                  LOG_INFO_REMOVE | LOG_INFO_NAME | LOG_INFO_FLIST | LOG_INFO_NONREG |
                  LOG_INFO_PROGRESS,

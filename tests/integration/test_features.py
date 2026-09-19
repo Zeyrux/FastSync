@@ -584,53 +584,55 @@ class TestRemoteDryRun:
             assert _snapshot_tree(received) == before, f"{flags} mutated the destination"
 
     @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
-    def test_dry_run_delete_lines_over_report_residual(self):
-        """Documented residual (RSYNC_COMPAT.md `-n/--dry-run` row): FastSync's
-        dry-run would-delete report includes the file that is merely being
-        updated (derived from the receiver's STATUS_STATS extras) and, unlike
-        rsync, also reports an excluded-but-protected extra.  rsync `-n -i
-        --delete` lists only genuine extras.  Pins the residual that keeps the
-        row Divergent."""
+    def test_dry_run_delete_lines_match_rsync(self):
+        """`-n --delete` lists exactly the destination extras rsync would remove.
+
+        Covers the three cases that a real run protects: the file being updated
+        (in the keep set), a filter-excluded source entry (protected prefix), and
+        a --max-size-pruned source entry (always-protected prefix).  Track 4a
+        adds a fourth: a destination-only entry matching the exclude rule is
+        re-derived on the receiver and also protected, so only the genuine
+        destination-only `extra.txt` appears.
+        """
         source = os.path.join(TEST_DATA_DIR, "dryrep_src")
         rdst = os.path.join(TEST_DATA_DIR, "dryrep_rdst")
         fdst = os.path.join(TEST_DATA_DIR, "dryrep_fdst")
         clean_dir(source)
         clean_dir(rdst)
         clean_dir(fdst)
-        with open(os.path.join(source, "a.txt"), "wb") as fh:
-            fh.write(b"new content\n")
+        for name, data in (("a.txt", b"new content\n"), ("keep.log", b"log\n"),
+                           ("big.bin", b"B" * 2000)):
+            with open(os.path.join(source, name), "wb") as fh:
+                fh.write(data)
         os.utime(os.path.join(source, "a.txt"), (1_700_000_000, 1_700_000_000))
-        for root in (rdst, fdst):
-            with open(os.path.join(root, "a.txt"), "wb") as fh:
-                fh.write(b"old\n")
-            for name, data in (("extra.log", b"log\n"), ("extra.txt", b"extra\n")):
+        received = get_dest_received_dir(fdst, source)
+        os.makedirs(received, exist_ok=True)
+        for root in (rdst, received):
+            for name, data in (("a.txt", b"old\n"), ("keep.log", b"log\n"),
+                               ("big.bin", b"B" * 2000), ("extra.txt", b"extra\n"),
+                               ("stray.log", b"dest only\n")):
                 with open(os.path.join(root, name), "wb") as fh:
                     fh.write(data)
-            for p in (os.path.join(root, "a.txt"), os.path.join(root, "extra.log"),
-                      os.path.join(root, "extra.txt")):
-                os.utime(p, (1_500_000_000, 1_500_000_000))
+                os.utime(os.path.join(root, name), (1_500_000_000, 1_500_000_000))
 
+        flags = ["-a", "-n", "-i", "--delete", "--exclude=*.log", "--max-size=1000"]
         r = subprocess.run(["rsync", "-an", "-i", "--delete", "--exclude=*.log",
-                            source + "/", rdst + "/"],
+                            "--max-size=1000", source + "/", rdst + "/"],
                            capture_output=True, text=True,
                            env=dict(os.environ, LC_ALL="C"))
         assert r.returncode == 0, r.stderr
-        rsync_del = {l.split(None, 1)[1] for l in r.stdout.splitlines()
-                     if l.startswith("*deleting")}
-        assert rsync_del == {"extra.txt"}, f"unexpected rsync deleting set: {rsync_del}"
+        rsync_del = sorted(l for l in r.stdout.splitlines() if l.startswith("*deleting"))
+        assert rsync_del == ["*deleting   extra.txt"], f"unexpected rsync set: {rsync_del}"
 
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(source, fdst,
-                                   flags=["-a", "-n", "-i", "--delete", "--exclude=*.log"],
-                                   port=server.port)
+            result, _ = run_client(source, fdst, flags=flags, port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
-        fs_del = {l.split(None, 1)[1] for l in (result.stdout or "").splitlines()
-                  if l.startswith("*deleting")}
-        # Documented over-report: the transferred/updated file and the excluded
-        # extra appear in FastSync's would-delete set.
-        assert "a.txt" in fs_del, "residual changed: FastSync no longer over-reports the update"
-        assert "extra.log" in fs_del, "residual changed: FastSync no longer reports excluded extra"
+        fs_del = sorted(l for l in (result.stdout or "").splitlines()
+                        if l.startswith("*deleting"))
+        assert fs_del == rsync_del, f"rsync={rsync_del}\nfastsync={fs_del}"
+        assert os.path.exists(os.path.join(received, "stray.log")), \
+            "destination-only exclude match must be protected in the dry-run report"
 
     @pytest.mark.ci
     def test_remote_dry_run_quiet_is_silent(self, shared_server):
@@ -3980,15 +3982,16 @@ class TestDeleteTiming:
             assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n", \
                 f"{flag}: nested file was not written after the early deletion"
 
-    @pytest.mark.parametrize("flag", ["--delete", "--delete-after"])
+    @pytest.mark.parametrize("flag", ["--delete-commit", "--delete-after"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_flags_commit_only_after_success(self, flag, mt):
-        """Plain --delete/--delete-after defer deletion until the whole transfer
+        """--delete-commit/--delete-after defer deletion until the whole transfer
         succeeds: a mid-transfer write failure must leave every extra in place
-        (commit-style safety).  The -m receiver must also keep the extras: the
-        deferred keep-set is committed by the server only after the disk-writer
-        thread has finished, and a failing writer means the manifest is freed,
-        never applied."""
+        (commit-style safety).  Plain --delete no longer defers (it defaults to
+        delete-during), so only the explicitly late timings are exercised here.
+        The --threads receiver must also keep the extras: the deferred keep-set is
+        committed by the server only after the disk-writer thread has finished,
+        and a failing writer means the manifest is freed, never applied."""
         source = self._seed("late")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_late_dst")
         clean_dir(dest)
@@ -4693,11 +4696,11 @@ class TestDeletePolicy:
             finally:
                 os.chmod(source, 0o755)
 
-    def test_delete_excluded_protection_is_sender_derived(self):
+    def test_delete_protection_reapplied_on_receiver(self):
         """Plain --delete protects destination mirrors of files the SOURCE scan
-        excluded, but a destination-only file that merely matches an exclude
-        rule is still an extra and is removed (protection never re-applies rules
-        to the destination)."""
+        excluded, and (track 4a) also protects a destination-only file matching
+        an exclude rule because the compiled rule set is re-applied on the
+        receiver, matching rsync."""
         source = os.path.join(TEST_DATA_DIR, "senderderived_src")
         clean_dir(source)
         self._write(os.path.join(source, "keep.txt"), b"kept\n")
@@ -4717,8 +4720,8 @@ class TestDeletePolicy:
                 f"delete sync failed: {(result.stderr or result.stdout)[:300]}"
             assert os.path.exists(os.path.join(received, "secret.log")), \
                 "source-excluded mirror was deleted under plain --delete"
-            assert not os.path.exists(os.path.join(received, "stray.log")), \
-                "destination-only file matching the exclude rule was left (should be deleted)"
+            assert os.path.exists(os.path.join(received, "stray.log")), \
+                "destination-only file matching the exclude rule must be protected like rsync"
 
 
 def _pin_mtime(path, ts):
@@ -4738,11 +4741,12 @@ class TestBasisDestDirs:
     STAGING = ".fastsync-stage"
     TS = 1577836800  # 2020-01-01 00:00:00 UTC, used to pin matching mtimes
 
-    # fixture files: source and basis share the mtime pin, so a basis "match"
-    # is decided purely by content (xxHash).  unchanged.txt is byte-identical;
-    # changed.txt is byte-DIFFERENT but has the SAME SIZE as the source (and
-    # the same pinned mtime), which is what forces the content-hash gate;
-    # added.txt does not exist in the basis at all.
+    # fixture files: source and basis share the mtime pin, so the DEFAULT
+    # (rsync-parity) quick-check is a size+mtime match and trusts the basis even
+    # when the body differs.  unchanged.txt is byte-identical; changed.txt is
+    # byte-DIFFERENT but has the SAME SIZE as the source (and the same pinned
+    # mtime), which is what the FastSync-only --verify-basis content gate
+    # rejects; added.txt does not exist in the basis at all.
     UNCHANGED = "unchanged.txt"
     CHANGED = "changed.txt"
     ADDED = "added.txt"
@@ -4782,18 +4786,19 @@ class TestBasisDestDirs:
         }
 
     def _basis_tree(self, prefix):
-        # unchanged.txt is identical to the source; changed.txt has the SAME
-        # byte size and pinned mtime but a different body (equal size forces
-        # the xxHash gate); added.txt is missing from the basis.
+        # unchanged.txt is identical to the source; changed.txt has a DIFFERENT
+        # size (and body) so the size leg of the quick-check fails and it is
+        # transferred normally; added.txt is missing from the basis.
         return {
             self.UNCHANGED: b"stable content v1\n",
-            self.CHANGED: b"CHANGED CONTENT NOW\n",
+            self.CHANGED: b"CHANGED CONTENT NOW AND LONGER\n",
         }
 
-    def test_same_size_different_content_is_not_a_basis_match(self, shared_server):
-        # Core safety property: equal size + pinned mtime but different content
-        # must NEVER be hard-linked or copied from the basis -- the xxHash gate
-        # rejects it and the sender's data is transferred instead.
+    def test_same_size_different_content_default_trusts_quick_check(self, shared_server):
+        # Default rsync-parity behavior: equal size + pinned mtime is a basis
+        # match, so the basis body is materialized/linked without reading it.
+        # This mirrors rsync 3.4.1's quick check (differential-tested in
+        # test_differential_parity.py::test_verify_basis_restores_strict_content).
         for flag, basis_dir in (("--link-dest", "szlb"), ("--copy-dest", "szcp"),
                                 ("--compare-dest", "szcmp")):
             source = self._make_source("basis_same_size_src",
@@ -4805,7 +4810,36 @@ class TestBasisDestDirs:
             result, _ = run_client(source, dest, flags=[f"{flag}={basis_dir}"],
                                    port=shared_server.port)
             assert result.returncode == 0, \
-                f"{flag} same-size mismatch failed: {result.stderr[:300]}"
+                f"{flag} same-size quick-check failed: {result.stderr[:300]}"
+            received = get_dest_received_dir(dest, source)
+            dest_file = os.path.join(received, self.UNCHANGED)
+            if flag == "--compare-dest":
+                assert not os.path.exists(dest_file), \
+                    f"{flag}: compare-dest must leave a matching file sparse"
+            else:
+                assert _read_file(dest_file) == b"SAME LENGTH BODY!", \
+                    f"{flag}: default quick-check did not trust the basis body"
+                if flag == "--link-dest":
+                    assert os.stat(dest_file).st_ino == os.stat(basis_file).st_ino, \
+                        f"{flag}: basis was not hard-linked"
+
+    def test_verify_basis_rejects_same_size_different_content(self, shared_server):
+        # FastSync-only --verify-basis: the whole-file digest gate rejects the
+        # same-size/different-content basis, so the source data is transferred
+        # instead of the wrong basis bytes.
+        for flag, basis_dir in (("--link-dest", "vszlb"), ("--copy-dest", "vszcp"),
+                                ("--compare-dest", "vszcmp")):
+            source = self._make_source("basis_verify_src",
+                                       {self.UNCHANGED: b"same length body\n"})
+            dest = os.path.join(TEST_DATA_DIR, f"basis_verify_dst_{basis_dir}")
+            clean_dir(dest)
+            basis_file = self._seed_basis_file(dest, source, basis_dir, self.UNCHANGED,
+                                               b"SAME LENGTH BODY!")
+            result, _ = run_client(source, dest,
+                                   flags=[f"{flag}={basis_dir}", "--verify-basis"],
+                                   port=shared_server.port)
+            assert result.returncode == 0, \
+                f"{flag} --verify-basis failed: {result.stderr[:300]}"
             received = get_dest_received_dir(dest, source)
             dest_file = os.path.join(received, self.UNCHANGED)
             assert _read_file(dest_file) == b"same length body\n", \
@@ -4837,11 +4871,13 @@ class TestBasisDestDirs:
             self._source_tree("c")[self.ADDED], "added file not transferred"
 
     @pytest.mark.ci
-    def test_dry_run_compare_dest_does_not_read_basis(self, shared_server):
-        # A dry-run --compare-dest must never read/hash the basis file: doing so
-        # is a 1-bit content oracle against the client-supplied digest.  Even a
-        # byte-identical basis with a matching size+mtime is therefore reported
-        # as would-transfer, and nothing is created.
+    def test_dry_run_compare_dest_quick_check_does_not_read_basis(self, shared_server):
+        # A dry-run --compare-dest must never read/hash the basis file.  Under
+        # the default metadata quick-check a matching basis is reported as a
+        # skip (matching rsync) without reading it; nothing is created.  Under
+        # --verify-basis, which would require hashing, the dry-run cannot
+        # confirm the hit (that would be a 1-bit content oracle) and reports
+        # would-transfer instead.
         source = self._make_source("basis_dry_src", {self.UNCHANGED: b"stable content v1\n"})
         dest = os.path.join(TEST_DATA_DIR, "basis_dry_dst")
         clean_dir(dest)
@@ -4852,10 +4888,29 @@ class TestBasisDestDirs:
                                port=shared_server.port)
         assert result.returncode == 0, \
             f"dry-run compare-dest failed: {result.stderr[:300]}"
-        assert self.UNCHANGED in result.stdout, (
-            "dry-run compare-dest silently skipped: receiver read the basis content"
+        assert self.UNCHANGED not in result.stdout, (
+            "dry-run compare-dest did not honor the metadata quick-check "
+            "(reported would-transfer for a matching basis)"
         )
         assert _snapshot_tree(dest) == before, "dry-run compare-dest mutated the destination"
+
+        # --verify-basis: the hit needs the basis content, which a dry-run must
+        # not read, so the file is reported as would-transfer.
+        dest2 = os.path.join(TEST_DATA_DIR, "basis_dry_verify_dst")
+        clean_dir(dest2)
+        self._seed_basis(dest2, source, "drybasis", {self.UNCHANGED: b"stable content v1\n"})
+        before2 = _snapshot_tree(dest2)
+        result, _ = run_client(source, dest2,
+                               flags=["--compare-dest=drybasis", "--dry-run",
+                                      "--verify-basis"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"dry-run --verify-basis compare-dest failed: {result.stderr[:300]}"
+        assert self.UNCHANGED in result.stdout, (
+            "dry-run --verify-basis must not read the basis to confirm a hit"
+        )
+        assert _snapshot_tree(dest2) == before2, \
+            "dry-run --verify-basis compare-dest mutated the destination"
 
     def test_compare_dest_content_mismatch_forces_transfer(self, shared_server):
         # The basis holds a file with a DIFFERENT body: even though it shares
@@ -5095,27 +5150,36 @@ class TestBasisDestDirs:
         assert os.stat(dest_file).st_ino != os.stat(basis_file).st_ino, \
             "--ignore-times must not hard-link to a basis file"
 
-    def test_basis_refuses_file_above_whole_file_limit(self, shared_server):
-        # Every whole-file payload path in FastSync (basis dirs included) is
-        # bounded by MAX_RECEIVE_WHOLE_FILE_SIZE.  rsync supports basis dirs for
-        # arbitrary sizes; FastSync refuses such a run up front with a clear
-        # diagnostic instead of letting the receiver abort the whole transfer
-        # mid-stream with no client-side explanation.
+    def test_basis_handles_file_above_whole_file_limit(self, shared_server):
+        # Track 5a: a basis hit streams the copy (and the --verify-basis digest
+        # streams the basis), so a source larger than the whole-file payload
+        # bound is supported for basis dirs exactly like rsync.  A basis MISS
+        # still falls back to the normal transfer, which keeps its own bound.
         source = self._make_source("basis_oversize_src", {"small.txt": b"ok\n"})
         big = os.path.join(source, "huge.bin")
         with open(big, "wb") as fh:
             os.ftruncate(fh.fileno(), 256 * 1024 * 1024 + 4096)
         dest = os.path.join(TEST_DATA_DIR, "basis_oversize_dst")
         clean_dir(dest)
-        result, _ = run_client(source, dest, flags=["--link-dest=nope"],
-                               port=shared_server.port)
-        assert result.returncode != 0, \
-            "basis run with an over-limit file unexpectedly succeeded"
-        assert "larger than" in result.stderr, \
-            f"no clear over-limit diagnostic: {result.stderr[:300]}"
         received = get_dest_received_dir(dest, source)
-        assert not os.path.exists(received), \
-            "over-limit basis run transferred files before failing"
+        rel = os.path.relpath(received, dest)
+        basis_big = os.path.join(dest, "ob", rel, "huge.bin")
+        os.makedirs(os.path.dirname(basis_big), exist_ok=True)
+        shutil.copyfile(big, basis_big)
+        os.utime(basis_big, (self.TS, self.TS))
+        os.utime(big, (self.TS, self.TS))
+
+        result, _ = run_client(source, dest,
+                               flags=["--link-dest=ob", "--incremental"],
+                               port=shared_server.port)
+        assert result.returncode == 0, \
+            f"over-limit basis run failed: {result.stderr[:300]}"
+        dest_big = os.path.join(received, "huge.bin")
+        assert os.path.exists(dest_big), "over-limit basis hit was not materialized"
+        assert os.path.getsize(dest_big) == 256 * 1024 * 1024 + 4096
+        assert os.stat(dest_big).st_ino == os.stat(basis_big).st_ino, \
+            "over-limit --link-dest did not hard-link to the basis"
+        assert _read_file(os.path.join(received, "small.txt")) == b"ok\n"
 
 
 def _random_payloads(size=2 * 1024 * 1024, changed=64 * 1024, seed=1234):

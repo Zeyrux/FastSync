@@ -4,6 +4,7 @@
 #include "array_list.h"
 #include "checksum.h"
 #include "compression.h"
+#include "filter.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -82,7 +83,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.27.0).
+ * Config wire-field table (single source of truth for protocol 2.28.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -197,9 +198,18 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   X(skip_compress_count, int, 0, INT_SKIPCOUNT)                                                    \
   X(skip_compress_suffixes, char**, NULL, BLOCK_SKIP_SUFFIXES)
 
+/* FastSync-only --verify-basis (protocol 2.28.0, no version bump by project
+ * decision): restores the stricter content equality on a basis hit.  By
+ * default a basis hit is accepted on rsync's metadata quick-check alone (equal
+ * size plus equal mtime, or size alone under --size-only); with this flag the
+ * receiver ALSO requires the basis bytes' whole-file digest (the negotiated
+ * --checksum-choice algorithm) to equal the sender's, exactly FastSync's
+ * historical behavior.  It is a receiver policy and crosses the wire so the
+ * receiver knows whether to read and hash the basis content. */
 #define CONFIG_WIRE_BASIS_FIELDS(X)                                                                \
   X(basis_count, int, 0, INT_BASISCOUNT)                                                           \
-  X(basis_dirs, BasisDest*, NULL, BLOCK_BASIS)
+  X(basis_dirs, BasisDest*, NULL, BLOCK_BASIS)                                                     \
+  X(verify_basis, bool, false, BOOL)
 
 #define CONFIG_WIRE_FUZZY_FIELDS(X) X(fuzzy, bool, false, BOOL)
 
@@ -293,6 +303,20 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
 #define CONFIG_WIRE_CODEC_FIELDS(X)                                                                \
   X(compression_algo, int, COMPRESSION_ALGO_ZSTD, INT_COMPRESSION_ALGO)
 
+/* Receiver-side delete-protection filter rules (protocol 2.28.0).  The sender
+ * compiles its root-level selection rules exactly as the scanner does
+ * (filter_base_build over --filter/-f/--exclude/--include/-C) and streams them
+ * as one self-describing, bounded block (count followed by per-rule records).
+ * The receiver reconstructs `protect_rules` and evaluates them against
+ * DESTINATION-ONLY entries during the --delete extras walk, so a
+ * `protect`/`P` rule protects an extra that never appeared on the sender
+ * (rsync re-derives deletion protection from the filter list; FastSync
+ * historically derived it only from the source scan).  `protect_rules` is NULL
+ * on the sender and is owned/freed by the receiver Config.  Bounded by
+ * MAX_FILTER_RULES and MAX_FILTER_BYTES; an unknown action/sides is a protocol
+ * error. */
+#define CONFIG_WIRE_PROTECT_FIELDS(X) X(protect_rules, FilterRuleList*, NULL, BLOCK_PROTECT_RULES)
+
 /* All serialized fields, in exact wire order.  Concatenating the per-segment
  * lists here is what keeps the declaration order = the wire order. */
 #define CONFIG_WIRE_FIELDS(X)                                                                      \
@@ -315,7 +339,8 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   CONFIG_WIRE_PRIVILEGE_FIELDS(X)                                                                  \
   CONFIG_WIRE_COPY_AS_FIELDS(X)                                                                    \
   CONFIG_WIRE_OUTPUT_FIELDS(X)                                                                     \
-  CONFIG_WIRE_CODEC_FIELDS(X)
+  CONFIG_WIRE_CODEC_FIELDS(X)                                                                      \
+  CONFIG_WIRE_PROTECT_FIELDS(X)
 
 typedef struct Config {
   /* -j/--threads=N: number of parallel scanner worker threads for the -m
@@ -419,6 +444,12 @@ typedef struct Config {
    * for an unsupported checksum/compress algorithm) so main() can mirror it. */
   int checksum_transfer_algo;
   int cli_exit_code;
+  /* Client-only "the user explicitly chose" bits.  They let the per-codec
+   * default level / checksum list be applied only when the corresponding
+   * rsync option was omitted (an explicit --compress-level / --checksum-choice
+   * always wins).  Never serialized. */
+  bool compression_level_set;
+  bool checksum_choice_set;
 
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).
@@ -611,10 +642,14 @@ typedef struct Config {
      source directory is streamed in directory order, and the receiver removes
      each directory's extras when its plan arrives (during) or snapshots them
      and removes them only after a successful transfer (delay).  delete_after
-     (and plain --delete) keep the whole-tree commit mode: extras are removed
-     from a fresh end-of-transfer destination scan only after the whole transfer
-     succeeded.  See config_delete_timing_early()/config_delete_timing_per_dir()
-     below. */
+     keeps the whole-tree commit mode: extras are removed from a fresh
+     end-of-transfer destination scan only after the whole transfer succeeded.
+     A plain --delete with no explicit timing flag defaults to delete_during on
+     the client (cli_finalize_config), matching rsync's --del default; the old
+     late-commit behavior is selected explicitly by --delete-after or the
+     FastSync-only long spelling --delete-commit (an exact alias for
+     --delete-after, mapped onto the same wire field).  See
+     config_delete_timing_early()/config_delete_timing_per_dir() below. */
   /* partial_dir */
   // PR #174: Partial transfer resumption
   /* suffix */
@@ -1006,10 +1041,43 @@ typedef struct Config {
  * the sender can print rsync's `deleting PATH` lines for a real deletion.  No
  * change to the fixed STATUS_STATS record itself; only a new trailing config
  * bool, which still requires the version bump for the strict lockstep. */
-#define PROTOCOL_VERSION "2.27.0"
+/* (8) --stats receiver-observed counters (protocol 2.28.0): the fixed
+ * STATUS_STATS record grows from three counters to eight.  The receiver now
+ * reports the bytes it literally stored (`literal_data`) and the count of
+ * destination entries it newly CREATED, split by type
+ * (reg/dir/link/special), so the sender can print rsync's exact
+ * `Number of created files: N (reg: X, dir: Y, link: Z, special: W)` line and
+ * an exact `Literal data` total even for delta transfers.  The config-frame
+ * LAYOUT is unchanged (no new config field), but the STATUS_STATS body grows,
+ * so a 2.27 peer that does not consume the five new fixed-width counters would
+ * desynchronize on the trailing would-delete path list; the strict
+ * same-version handshake (config_receive rejects a mismatched version before
+ * parsing anything else) keeps mixed deployments from ever reaching that
+ * state. */
+/* (9) Receiver-side delete protection (still protocol 2.28.0): the config frame
+ * gains one trailing self-describing block carrying the sender's compiled base
+ * filter rules so the receiver can protect DESTINATION-ONLY entries from
+ * --delete with `protect`/`risk` rules (rsync parity).  The block appends after
+ * compression_algo; see CONFIG_WIRE_PROTECT_FIELDS. */
+#define PROTOCOL_VERSION "2.28.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
+
+/* Bounds on the received receiver-side delete-protection rule block.  The rule
+ * count and the aggregate pattern+owner bytes are each capped so a hostile
+ * peer cannot pin unbounded pre-auth memory; both are validated strictly on
+ * receive (alongside the per-string ConfigStringBudget). */
+/* A peer may supply protect rules; cap the list so a crafted config cannot make
+ * the receiver's delete walk evaluate an unbounded number of glob patterns per
+ * destination entry (glob_match is O(pattern x path)).  1024 is far above any
+ * legitimate selection. */
+#define MAX_FILTER_RULES 1024
+#define MAX_FILTER_BYTES (256 * 1024)
+/* glob_match's DP is capped at 64 Mi work units; a pattern longer than this
+ * could exceed the cap against a PATH_MAX path and silently stop matching,
+ * leaving a protect rule inert.  Reject such a rule at receive time. */
+#define MAX_PROTECT_PATTERN_LEN 8192
 
 /* Upper bound on the number of --skip-compress suffixes accepted from the wire.
  * Each suffix is an independent wire string (up to MAX_STRING_SIZE = 64 KiB), so
@@ -1112,8 +1180,11 @@ bool config_delete_timing_early(const Config* config);
  * commits them only after a fully-successful transfer (delay). */
 bool config_delete_timing_per_dir(const Config* config);
 /* Delete-timing sanity: with deletion enabled at most one timing flag may be
- * set (none = the default delete-after commit timing); without deletion no
- * timing flag may be set (each timing flag implies --delete). */
+ * set; without deletion no timing flag may be set (each timing flag implies
+ * --delete).  A plain --delete is normalized to delete_during by
+ * cli_finalize_config on the client, so a transmitted use_delete config always
+ * carries exactly one timing; the zero-timing case remains valid only for a
+ * config that has not been through the CLI. */
 bool config_has_valid_delete_timing(const Config* config);
 
 /* Single source of truth for the cross-field ("combination") invariants a

@@ -247,12 +247,23 @@ int write_thread(void* pipeline_context) {
     }
     size_t file_bytes = file->data ? file->data->size : 0;
     FileSaveResult result = FILE_SAVE_SKIPPED;
+    bool created = false;
+    unsigned created_dirs = 0;
     /* Server-contacting --dry-run: never write.  The receiver thread does not
        enqueue anything on the dry-run path, but this keeps the writer thread
        provably mutation-free if a data frame ever reached it. */
     bool dry_run = context->config->dry_run;
     if (save_to_disk && !dry_run) {
-      result = file_save_to_disk_full(root_directory, file, context->config);
+      result =
+          file_save_to_disk_full_ex(root_directory, file, context->config, &created, &created_dirs);
+      if (result == FILE_SAVE_WRITTEN) {
+        /* Protocol 2.28.0: fold the receiver-observed literal bytes and the
+           created-entry type into the shared stats block under its mutex (the
+           receive thread also writes stats.matched_data). */
+        mtx_lock(&context->mutex);
+        receiver_stats_note_saved(&context->stats, file, created, created_dirs);
+        mtx_unlock(&context->mutex);
+      }
       if (result == FILE_SAVE_ERROR) {
         file_destroy(file);
         pipeline_context_receiver_note_bytes_released(context, file_bytes);

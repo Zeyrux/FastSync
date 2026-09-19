@@ -265,6 +265,28 @@ static void test_checksum_digest_file_matches_oneshot(void) {
   free(data);
 }
 
+/* RSYNC_CHECKSUM_LIST precedence, syntax and fallback. */
+static void test_checksum_choice_env_list() {
+  unsetenv("RSYNC_CHECKSUM_LIST");
+  EXPECT_EQ_INT(checksum_choice_resolve(), (int)CHECKSUM_ALGO_XXH128);
+  EXPECT_EQ_INT((int)checksum_negotiate_default(), (int)CHECKSUM_ALGO_XXH128);
+
+  setenv("RSYNC_CHECKSUM_LIST", "bogus md5 xxh3", 1);
+  EXPECT_EQ_INT(checksum_choice_resolve(), (int)CHECKSUM_ALGO_MD5);
+
+  setenv("RSYNC_CHECKSUM_LIST", "SHA1", 1);
+  EXPECT_EQ_INT(checksum_choice_resolve(), (int)CHECKSUM_ALGO_SHA1);
+
+  /* Whitespace-separated only: comma is not a separator in rsync's syntax. */
+  setenv("RSYNC_CHECKSUM_LIST", "md5,xxh3", 1);
+  EXPECT_EQ_INT(checksum_choice_resolve(), -1);
+
+  setenv("RSYNC_CHECKSUM_LIST", "  ", 1);
+  EXPECT_EQ_INT(checksum_choice_resolve(), (int)CHECKSUM_ALGO_XXH128);
+
+  unsetenv("RSYNC_CHECKSUM_LIST");
+}
+
 void test_checksum(void) {
   test_checksum_xxh64_seed0();
   test_checksum_xxh64_empty();
@@ -281,4 +303,5 @@ void test_checksum(void) {
   test_checksum_truncated_buffer_rejected();
   test_checksum_null_empty_digest();
   test_checksum_digest_file_matches_oneshot();
+  test_checksum_choice_env_list();
 }

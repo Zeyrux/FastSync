@@ -54,12 +54,16 @@ STDOUT_NONE = None
 STDOUT_ITEMIZE = "itemize"
 STDOUT_OUTFMT = "outfmt"
 STDOUT_STATS = "stats"
+STDOUT_PROGRESS = "progress"
 
 # rsync --stats lines that are protocol-independent and must match exactly.
-# Deliberately excluded: the per-type "Number of files"/"Number of created
-# files" breakdown and Total bytes sent/received (documented residual, see the
-# `--stats` row in RSYNC_COMPAT.md).
+# `Number of files` and `Number of created files` carry rsync's per-type
+# breakdown; protocol 2.28.0 reports the receiver-created split over
+# STATUS_STATS.  Deliberately excluded: Total bytes sent/received (protocol
+# framing differs, see the `--stats` row in RSYNC_COMPAT.md).
 STATS_KEYS = (
+    "Number of files",
+    "Number of created files",
     "Number of deleted files",
     "Number of regular files transferred",
     "Total file size",
@@ -70,6 +74,8 @@ STATS_KEYS = (
 )
 
 _ITEMIZE_RE = re.compile(r"^(<|>|c|h|\.|\*)[fdLDS][.+\-][.+\-][.+\-][.+\-]")
+_PROGRESS_TOTAL_RE = re.compile(r"to-chk=\d+/(\d+)")
+_PROGRESS_XFR_RE = re.compile(r"xfr#(\d+)")
 
 
 @dataclass
@@ -181,6 +187,24 @@ def corpus_empty_dir(root: str) -> None:
     _write(os.path.join(root, "nonempty", "f.txt"), b"f\n")
 
 
+def corpus_multidir(root: str) -> None:
+    """Multi-directory tree for the --progress file-list naming/denominator.
+
+    Nested files, a directory-only branch, an empty directory and a symlink
+    exercise every file-list entry type rsync counts in `to-chk` but FastSync's
+    streaming scanner never emits as a transfer entry.
+    """
+    clean_dir(root)
+    _write(os.path.join(root, "a.txt"), b"alpha\n")
+    _write(os.path.join(root, "b.txt"), b"bravo\n")
+    _write(os.path.join(root, "sub1", "c.txt"), b"charlie\n")
+    _write(os.path.join(root, "sub1", "deep", "d.txt"), b"delta\n")
+    _write(os.path.join(root, "sub2", "e.txt"), b"echo\n")
+    os.symlink("a.txt", os.path.join(root, "link1"))
+    os.makedirs(os.path.join(root, "emptydir"), exist_ok=True)
+    os.utime(os.path.join(root, "emptydir"), (_SRC_MTIME, _SRC_MTIME))
+
+
 def corpus_relative(root: str) -> None:
     """Tree for the -R/--files-from cases."""
     clean_dir(root)
@@ -205,6 +229,18 @@ def corpus_iconv(root: str) -> None:
         os.utime(full, (_SRC_MTIME, _SRC_MTIME))
 
 
+# Payload for the --fuzzy basis corpus: large enough for the delta engine's
+# 16 KiB minimum and with repeated content so a coinciding basis yields a
+# non-zero (and identical) Matched data count in both tools.
+FUZZY_PAYLOAD = (b"the quick brown fox jumps over the lazy dog\n" * 2000)[:65536]
+
+
+def corpus_fuzzy(root: str) -> None:
+    """A named regular file; the `fuzzy` seed adds the similar-suffix sibling."""
+    clean_dir(root)
+    _write(os.path.join(root, "report_v2.txt"), FUZZY_PAYLOAD)
+
+
 CORPORA: Dict[str, Callable[[str], None]] = {
     "basic": corpus_basic,
     "unicode": corpus_unicode,
@@ -213,8 +249,10 @@ CORPORA: Dict[str, Callable[[str], None]] = {
     "sparse": corpus_sparse,
     "filters": corpus_filters,
     "empty_dir": corpus_empty_dir,
+    "multidir": corpus_multidir,
     "relative": corpus_relative,
     "iconv": corpus_iconv,
+    "fuzzy": corpus_fuzzy,
 }
 
 
@@ -379,6 +417,37 @@ def normalize_stdout(text: str, mode: Optional[str]) -> object:
                 if line.startswith(key + ":"):
                     found[key] = _parse_bytes(line.split(":", 1)[1])
         return found
+    if mode == STDOUT_PROGRESS:
+        # rsync prints the file-list entries in sorted depth-first order while
+        # FastSync's streaming scan emits them in readdir/BFS order; only the
+        # entry set and deterministic fields are compared.  The transfer-root
+        # `./` line's trigger condition is a separate documented residual, and
+        # the per-frame rate/elapsed/xfr#/to-chk numerator are wall-clock- or
+        # order-dependent, so only the `to-chk` denominator and the name set are
+        # asserted.
+        names = []
+        totals = set()
+        max_xfr = 0
+        for line in (text or "").splitlines():
+            line = line.rstrip()
+            if not line:
+                continue
+            if "%" in line:
+                m = _PROGRESS_TOTAL_RE.search(line)
+                if m:
+                    totals.add(int(m.group(1)))
+                mx = _PROGRESS_XFR_RE.search(line)
+                if mx:
+                    max_xfr = max(max_xfr, int(mx.group(1)))
+                continue
+            if line == "sending incremental file list":
+                continue
+            if line.startswith("created directory "):
+                continue
+            if line == "./":
+                continue
+            names.append(line)
+        return {"names": sorted(names), "total": sorted(totals), "xfr": max_xfr}
     # raw
     return sorted(l.rstrip() for l in (text or "").splitlines() if l.strip())
 
@@ -390,6 +459,8 @@ def stdout_diff(rsync_out: str, fs_out: str, mode: Optional[str]) -> List[str]:
         return []
     if mode == STDOUT_STATS:
         return [f"stats rsync={r}", f"stats fastsync={f}"]
+    if mode == STDOUT_PROGRESS:
+        return [f"progress rsync={r}", f"progress fastsync={f}"]
     return list(difflib.unified_diff(
         [str(x) for x in r], [str(x) for x in f],
         fromfile="rsync", tofile="fastsync", lineterm=""))
@@ -443,6 +514,11 @@ def run_differential(  # noqa: PLR0913 (explicit scenario parameters)
         rroot, froot = os.path.join(rdst, rel), get_dest_received_dir(fdst, src)
     else:
         rroot, froot = rdst, get_dest_received_dir(fdst, src)
+    # rsync's destination root always exists (clean_dir created it).  FastSync's
+    # logical transfer root is the mirror path below the destination argument,
+    # so pre-create it too: `Number of created files` counts the root only when
+    # it is genuinely absent, and the two tools must start from the same state.
+    os.makedirs(froot, exist_ok=True)
     if seed:
         seed(src, rroot, froot)
 

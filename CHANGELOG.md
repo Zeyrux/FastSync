@@ -4,6 +4,37 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [Unreleased]
+
+### Changed
+
+- **`--delete` now defaults to delete-during (rsync `--del`) timing.** With no
+  explicit timing flag, a plain `--delete` removes each directory's extras as
+  that directory is processed instead of committing one whole-tree deletion only
+  after the entire transfer succeeds. This matches rsync, frees destination
+  space progressively, and avoids the whole-old+new-tree peak that could
+  `ENOSPC` a tight destination. The client maps the default onto the existing
+  `delete_during` wire boolean, so `PROTOCOL_VERSION` stays `2.28.0`.
+- Added the FastSync-only long option **`--delete-commit`** (implies
+  `--delete`): it selects the old late whole-tree commit and is timing-identical
+  to `--delete-after` (the same `delete_after` wire boolean). Explicit timing
+  flags always win over the default, at most one timing flag may be given, and a
+  timing flag combined with `--no-delete` is still rejected.
+- The per-directory `STATUS_DELETE_PLAN` frame gained a one-int `apply` flag:
+  the one-shot per-run config block (protected prefixes, size-pruned mirrors,
+  `--delete-missing-args` exact paths) is now always transmitted first on a
+  config-only carrier (`apply=false`), fixing a latent bug where a
+  `--delete-missing-args` run whose `--files-from` list synchronized no directory
+  never sent its exact deletions.
+
+### Migration
+
+- Scripts that relied on plain `--delete` deleting nothing until the transfer
+  fully succeeded must pass **`--delete-commit`** (or `--delete-after`) to keep
+  that behavior. Plain `--delete` now removes reached directories' extras during
+  the transfer, exactly like rsync's default; on a completed run the final tree
+  is unchanged.
+
 ## [2.26.0] - 2026-09-17
 
 ### Added

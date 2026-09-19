@@ -166,6 +166,64 @@ class TestInfoParity:
 
     @requires_rsync
     @pytest.mark.ci
+    def test_info_name_root_line_matches_rsync(self, shared_server):
+        """A fresh destination: rsync prints `created directory`, then the
+        transfer-root `./` name line before the entries; FastSync must emit the
+        same `./` line."""
+        source = os.path.join(TEST_DATA_DIR, "inf_root_src")
+        dest = os.path.join(TEST_DATA_DIR, "inf_root_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "inf_root_rdst")
+        clean_dir(source)
+        _write(os.path.join(source, "f.bin"), b"payload\n")
+        clean_dir(dest)
+        shutil.rmtree(rdst, ignore_errors=True)
+        rsync_result = _rsync(["-a", "--info=name", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--info=name"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:200]
+
+        def names(text):
+            return [l for l in text.splitlines()
+                    if l and not l.startswith("created directory")
+                    and not (l.endswith("/") and l != "./")]
+
+        assert names(rsync_result.stdout) == ["./", "f.bin"], names(rsync_result.stdout)
+        assert names(result.stdout) == ["./", "f.bin"], names(result.stdout)
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_info_name2_uptodate_matches_rsync(self, shared_server):
+        """--info=name2 prints `NAME is uptodate` for entries the receiver
+        already has, matching rsync byte-for-byte."""
+        source = os.path.join(TEST_DATA_DIR, "inf_up_src")
+        dest = os.path.join(TEST_DATA_DIR, "inf_up_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "inf_up_rdst")
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "sub"))
+        _write(os.path.join(source, "a.txt"), b"a\n")
+        _write(os.path.join(source, "sub", "b.txt"), b"b\n")
+        clean_dir(rdst)
+        assert _rsync(["-a", source + "/", rdst + "/"]).returncode == 0
+        rsync_result = _rsync(["-a", "--info=name2", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+
+        clean_dir(dest)
+        seed, _ = run_client(source, dest, flags=["-a", "--incremental"],
+                             port=shared_server.port)
+        assert seed.returncode == 0, (seed.stderr or seed.stdout)[:200]
+        result, _ = run_client(source, dest, flags=["-a", "--incremental", "--info=name2"],
+                               port=shared_server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:200]
+        rsync_lines = sorted(l for l in rsync_result.stdout.splitlines()
+                             if l.endswith("is uptodate"))
+        fast_lines = sorted(l for l in result.stdout.splitlines()
+                            if l.endswith("is uptodate"))
+        assert fast_lines == rsync_lines, (rsync_lines, fast_lines)
+        assert fast_lines == ["a.txt is uptodate", "sub/b.txt is uptodate"], fast_lines
+
+    @requires_rsync
+    @pytest.mark.ci
     def test_info_nonreg_matches_rsync(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "inf_nr_src")
         dest = os.path.join(TEST_DATA_DIR, "inf_nr_dst")
@@ -420,14 +478,14 @@ class TestRemoteOptionDaemon:
         assert "remote-option" in (result.stderr + result.stdout)
 
 
-class TestFilterProtectDivergence:
-    """Documented residual: a protect rule that matches only a destination-only
-    entry is not re-derived on the receiver (FastSync derives delete protection
-    from the source scan), so rsync protects the extra but FastSync removes it."""
+class TestFilterProtect:
+    """Receiver-derived delete protection: a `protect`/`P` rule is compiled by
+    the sender and sent on the config frame, so the receiver shields a
+    destination-only entry that never appeared on the sender, matching rsync."""
 
     @requires_rsync
     @pytest.mark.ci
-    def test_protect_dest_only_divergence(self, shared_server):
+    def test_protect_dest_only_matches_rsync(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "fpd_src")
         dest = os.path.join(TEST_DATA_DIR, "fpd_dst")
         rdst = os.path.join(TEST_DATA_DIR, "fpd_rdst")
@@ -440,6 +498,7 @@ class TestFilterProtectDivergence:
         rsync_result = _rsync(["-a", "--delete", "--filter=P *.log", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         assert os.path.exists(os.path.join(rdst, "extra.log")), "rsync did not protect extra.log"
+        assert not os.path.exists(os.path.join(rdst, "other.txt")), "rsync did not delete other.txt"
 
         clean_dir(dest)
         received = get_dest_received_dir(dest, source)
@@ -451,9 +510,29 @@ class TestFilterProtectDivergence:
                                    flags=["-a", "--delete", "--filter=P *.log"],
                                    port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:200]
-        # Pin the known divergence: FastSync deletes the destination-only file.
-        assert not os.path.exists(os.path.join(received, "extra.log")), (
-            "FastSync now protects destination-only P matches; the --filter row may be "
-            "upgradable to full parity"
-        )
+        assert os.path.exists(os.path.join(received, "extra.log")), (
+            "FastSync must protect a destination-only P match like rsync")
         assert not os.path.exists(os.path.join(received, "other.txt"))
+
+    @pytest.mark.ci
+    def test_protect_dest_only_dry_run_enumeration(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "fpd_nd_src")
+        dest = os.path.join(TEST_DATA_DIR, "fpd_nd_dst")
+        clean_dir(source)
+        _write(os.path.join(source, "keep.txt"), b"keep\n")
+        received = get_dest_received_dir(dest, source)
+        clean_dir(received)
+        _write(os.path.join(received, "keep.txt"), b"keep\n")
+        _write(os.path.join(received, "extra.log"), b"extra\n")
+        _write(os.path.join(received, "other.txt"), b"other\n")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest,
+                                   flags=["-a", "-n", "--delete", "--out-format=%n",
+                                          "--filter=P *.log"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert "other.txt" in result.stdout, result.stdout
+        assert "extra.log" not in result.stdout, result.stdout
+        assert os.path.exists(os.path.join(received, "extra.log"))
+        assert os.path.exists(os.path.join(received, "other.txt"))

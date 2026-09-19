@@ -113,13 +113,18 @@ matrix is classified as parity, caveat, or divergent in
   (`-B1000`, `-essh`, `-MOPT`, `--opt=value`) are accepted, matching rsync.
 - `-r`, `-b`, `-L`, and `-B` are parsed with the rsync short names.
 - `--stats` prints the counters FastSync can observe plus the receiver-only
-  counters (`Matched data`, deleted files) reported over the wire; rsync's
-  per-type `Number of files` breakdown is not reproduced. `--progress` prints
-  rsync-style per-file blocks (without rsync's leading `./` line).
+  counters reported over the wire (`Matched data`, deleted files, and the
+  created/literal counters); `Number of files` and `Number of created files`
+  carry rsync's per-type breakdown. `--progress` prints rsync-style per-file
+  blocks including the leading `./` line, and (when progress is requested) a
+  paths-only pre-count supplies rsync's `to-chk` denominator.
 - Codecs match rsync 3.4.1: `zstd`/`lz4`/`zlib`/`zlibx` compression and
-  `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1`/`none` checksums, negotiated with
-  `auto`; `zlibx` behaves as `zlib`, and the transfer checksum is not separately
-  selectable.
+  `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1`/`none` checksums. `auto` honors
+  `RSYNC_COMPRESS_LIST`/`RSYNC_CHECKSUM_LIST` and otherwise follows rsync's
+  compiled-in order. An omitted `--compress-level` uses the codec's rsync
+  default (zstd 3, zlib/zlibx 6, lz4 ignored); `zlib`/`zlibx` share the
+  literal-only zlib path (rsync's zlibx semantics), and the transfer checksum is
+  not separately selectable.
 
 The detailed flag matrix is maintained in
 [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md). It reports each row as **parity**,
@@ -202,11 +207,13 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`) |
 | `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination |
 | `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win) |
-| `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded). Scoped to the synchronized directories, so `--files-from` subsets are safe |
+| `--verify-basis` | FastSync-only: require a basis hit (`--compare-dest`/`--copy-dest`/`--link-dest`) to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync) |
+| `--delete` | Delete files on receiver not present in source (default timing: delete-during, matching rsync, so destination space is freed progressively). Scoped to the synchronized directories, so `--files-from` subsets are safe |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
 | `--delete-during`, `--del` | Delete extras once the keep-set is known, before data is applied (implies `--delete`) |
 | `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`) |
 | `--delete-after` | Explicit delete-after timing (implies `--delete`) |
+| `--delete-commit` | FastSync-only: keep the pre-2.28 atomic timing — delete only after the whole transfer succeeded (identical timing to `--delete-after`) |
 | `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected) |
 | `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync |
 | `--delay-updates` | Put updated files into place only at the end of the transfer (`--force` is honored at publication) |
@@ -505,8 +512,8 @@ features without changing the meaning of ordinary compatibility options.
 |---|---|
 | `-j`, `--threads[=N]` | Enable the multithreaded scanner/loader/sender pipeline. `N` (1–256) sets the parallel scanner worker count; bare `-j`/`--threads` uses the default. |
 | `-z [level]`, `--compress [level]` | Enable streaming compression (default `zstd`), levels 1-22. |
-| `--compress-level <n>` | Set the compression level. |
-| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` (default), `lz4`, `zlib`, `zlibx`, `none`, and `auto`; `zlibx` behaves as `zlib`. |
+| `--compress-level <n>` | Set the compression level (1-22). Omitted, each codec uses its rsync default: zstd 3, zlib/zlibx 6, lz4 ignored. |
+| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` (default), `lz4`, `zlib`, `zlibx`, `none`, and `auto`; `zlib`/`zlibx` share the same literal-only zlib path. |
 | `--zl <n>` | Alias for `--compress-level`. |
 | `--skip-compress <list>` | Skip compression for `/`- or `,`-separated suffixes; defaults to rsync 3.4.1's built-in list. Incompatible with `--chunk-serialization`. |
 | `--compress-threads <n>` | Use `n` zstd compression workers. Requires compression and a zstd build with threaded support; the setting affects sender CPU work only. |
@@ -564,6 +571,7 @@ remote SSH argv is already built injection-safe.
 | `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`). |
 | `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination. |
 | `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win). |
+| `--verify-basis` | FastSync-only: require a basis hit to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync). |
 | `--preallocate` | Allocate destination file space up front (fail-fast on a full disk). |
 | `--append` | Resume a shorter destination by appending only its tail (prefix not verified; requires `--incremental`). |
 | `--append-verify` | Like `--append`, but verifies the retained prefix checksum first (falls back to a full transfer on mismatch). |
@@ -571,6 +579,7 @@ remote SSH argv is already built injection-safe.
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`). |
 | `--delete-during`, `--del` | Delete extras once the keep-set manifest is known, before data is applied (implies `--delete`; early mode, same engine behaviour as `--delete-before`). |
 | `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`; commit mode, same behaviour as `--delete-after`). |
+| `--delete-commit` | FastSync-only: atomic delete-after timing (only after the whole transfer succeeded). |
 | `--delete-after` | Explicit delete-after timing: delete only after the transfer succeeded (implies `--delete`). |
 | `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected). |
 | `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync. |

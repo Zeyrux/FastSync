@@ -119,6 +119,13 @@ static void build_canonical_frame(void) {
     cfg->usermap[0].to = MAP_TO;
     cfg->usermap[0].to_name = NULL;
   }
+  /* Force a non-empty receiver delete-protection block so the fuzzer mutates
+   * its rule count, action/sides codes and pattern strings. */
+  cfg->filters = array_list_create(free);
+  if (cfg->filters) {
+    array_list_add(cfg->filters, str_dup("P *.log"));
+    array_list_add(cfg->filters, str_dup("+r keep/**"));
+  }
   if (!cfg->send_directory || !cfg->receive_root_directory || !cfg->usermap) {
     config_delete(cfg);
     return;

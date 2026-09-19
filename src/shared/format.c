@@ -105,25 +105,27 @@ bool format_dest_state_receive(int fd, OutputDestState* state) {
 bool format_stats_send(int fd, const ReceiverStats* stats) {
   if (!stats)
     return false;
-  unsigned long long matched = stats->matched_data;
-  unsigned long long deleted = stats->deleted_files;
-  unsigned long long would = stats->would_delete_count;
-  return send_n_data(fd, &matched, sizeof(matched)) && send_n_data(fd, &deleted, sizeof(deleted)) &&
-         send_n_data(fd, &would, sizeof(would));
+  unsigned long long fields[8] = {
+      stats->matched_data, stats->deleted_files, stats->would_delete_count, stats->literal_bytes,
+      stats->created_reg,  stats->created_dir,   stats->created_link,       stats->created_special,
+  };
+  return send_n_data(fd, fields, sizeof(fields));
 }
 
 bool format_stats_receive(int fd, ReceiverStats* stats) {
   if (!stats)
     return false;
-  unsigned long long matched = 0;
-  unsigned long long deleted = 0;
-  unsigned long long would = 0;
-  if (!receive_n_data(fd, &matched, sizeof(matched)) ||
-      !receive_n_data(fd, &deleted, sizeof(deleted)) || !receive_n_data(fd, &would, sizeof(would)))
+  unsigned long long fields[8] = {0};
+  if (!receive_n_data(fd, fields, sizeof(fields)))
     return false;
   memset(stats, 0, sizeof(*stats));
-  stats->matched_data = matched;
-  stats->deleted_files = deleted;
-  stats->would_delete_count = would;
+  stats->matched_data = fields[0];
+  stats->deleted_files = fields[1];
+  stats->would_delete_count = fields[2];
+  stats->literal_bytes = fields[3];
+  stats->created_reg = fields[4];
+  stats->created_dir = fields[5];
+  stats->created_link = fields[6];
+  stats->created_special = fields[7];
   return true;
 }

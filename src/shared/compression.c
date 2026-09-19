@@ -2,6 +2,7 @@
 #include "data.h"
 #include "log.h"
 #include "protocol.h"
+#include "utils.h"
 #include <limits.h>
 #include <lz4.h>
 #include <stdatomic.h>
@@ -119,7 +120,7 @@ bool compression_algo_enabled(CompressionAlgo algo) {
   return algo != COMPRESSION_ALGO_NONE;
 }
 
-CompressionAlgo compression_negotiate_default(void) {
+static CompressionAlgo compiled_preference_first(void) {
   /* rsync 3.4.1 default preference order; every entry is compiled in, so this
    * resolves to zstd. */
   static const CompressionAlgo preference[] = {
@@ -131,6 +132,57 @@ CompressionAlgo compression_negotiate_default(void) {
       return preference[i];
   }
   return COMPRESSION_ALGO_ZSTD;
+}
+
+int compression_choice_resolve(void) {
+  bool specified = false;
+  int env = env_choice_first("RSYNC_COMPRESS_LIST", compression_algo_from_name, &specified);
+  if (specified)
+    return env; /* -1 = the list named no supported codec */
+  return (int)compiled_preference_first();
+}
+
+CompressionAlgo compression_negotiate_default(void) {
+  int resolved = compression_choice_resolve();
+  return resolved >= 0 ? (CompressionAlgo)resolved : compiled_preference_first();
+}
+
+int compression_default_level(CompressionAlgo algo) {
+  switch (algo) {
+  case COMPRESSION_ALGO_ZSTD:
+    return ZSTD_CLEVEL_DEFAULT;
+  case COMPRESSION_ALGO_ZLIB:
+  case COMPRESSION_ALGO_ZLIBX:
+    return 6; /* rsync resolves zlib's Z_DEFAULT_COMPRESSION (-1) to 6 */
+  case COMPRESSION_ALGO_LZ4:
+    return 1; /* rsync lz4 level is 0/ignored; positive keeps the gate on */
+  case COMPRESSION_ALGO_NONE:
+    return 0;
+  }
+  return 0;
+}
+
+int compression_clamp_level(CompressionAlgo algo, int level) {
+  switch (algo) {
+  case COMPRESSION_ALGO_ZSTD:
+    if (level < 1)
+      return 1;
+    if (level > 22)
+      return 22;
+    return level;
+  case COMPRESSION_ALGO_ZLIB:
+  case COMPRESSION_ALGO_ZLIBX:
+    if (level < 1)
+      return 1;
+    if (level > 9)
+      return 9;
+    return level;
+  case COMPRESSION_ALGO_LZ4:
+    return 1; /* ignored by lz4_compress; keeps the "compress" gate on */
+  case COMPRESSION_ALGO_NONE:
+    return 0;
+  }
+  return level;
 }
 
 void compression_set_algo(CompressionAlgo algo) {

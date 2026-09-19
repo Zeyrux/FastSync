@@ -52,9 +52,10 @@
    `tests/test_config.c`). Two residuals were reclassified **divergent**: `-M`
    over daemon/TCP (no argv channel in FastSync's binary config handshake;
    rsync-daemon differential pins the rsync behavior) and receiver-side
-   `protect`/`risk` re-derivation for destination-only entries (would need a
-   receiver filter engine; differential pins the divergence). The options pass
-   stands at **110 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
+    `protect`/`risk` re-derivation for destination-only entries (would need a
+    receiver filter engine; differential pins the divergence — **reversed by
+    track 4a below**, which adds that engine). The options pass
+    stands at **110 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
    holds the rsync differentials (bwlimit parse+rate, info lines, real-setpriv
    `--ignore-errors`, rsync-daemon `-M`, filter-protect pin).
 
@@ -74,12 +75,122 @@
    heuristic with a 10× size window, not rsync's matcher), but its residual is the
    candidate-selection heuristic itself: the final tree is byte-exact by design, so
    it is pinned by the `TestFuzzy` threshold suite rather than a byte-level rsync
-   differential. The parity-review pass then moved `--delete-delay` to ⚠️ (the
+   differential. (Track 5b later found the name heuristic is rsync's own and moved
+   the row ❌ → ⚠️, leaving only the narrower delta size window; see entry 15.) The parity-review pass then moved `--delete-delay` to ⚠️ (the
    plan-time `--max-delete` charge and non-recursive deferred removal differ from
    rsync when a snapshotted entry fails removal). Differential-gate allowlist
    entries `min_size`/`empty_dirs_recursive`/`dirs_plain` were removed. The
    integrated stats+options+fs branch stands at **111 ✅ / 13 ⚠️ / 33 ❌ = 157**;
    full suite + ASan + clang-format + cppcheck clean.
+
+11. **No-wire parity track 1** on `feat/parity-2.28` (no protocol change):
+    `-n --delete` now sends the same filter-excluded + size-pruned protected
+    prefixes and synchronized-directory scope as a real run (dry-run would-delete
+    matches rsync for source-derived protections; the destination-only exclude
+    residual was later closed by track 4a, readdir ordering remains);
+    `--delete-delay` now charges
+    `--max-delete` on actual removals and re-scans a queued directory at commit
+    to remove content created after the plan, with an independent deferred-list
+    cap (only partial-delete ordering remains); and `--info=name2` emits `NAME is
+    uptodate` plus the leading `./` root name line for `--info=name` (only the
+    root-line trigger condition and receiver-side `skip` wording remain). Matrix
+    now **111 ✅ / 14 ⚠️ / 32 ❌ = 157**; differential + unit tests added in
+    `test_features.py`, `test_option_parity.py`, `test_delete_plan.c`,
+    `test_delete_delay_budget_parity.py`, `test_delete_timing_parity.py`.
+12. **No-wire parity track 2b** on `feat/parity-2.28` (no protocol change):
+    `--progress`/`-P`/`--info=progress` (when not `--quiet`) now run an opt-in
+    paths-only metadata pre-count (no file reads/hashing) that supplies rsync's
+    full file-list total for the `to-chk` denominator and the directory names,
+    and emits per-directory/symlink/special name lines, in both the sequential
+    and `--threads` paths. `--delete-during`/`--delete-delay` reuse their
+    keep-set pre-scan instead of a second walk; non-progress runs are
+    unaffected. Differential tests (`progress`/`progress_threads` over a new
+    `multidir` corpus) match rsync's name set and `to-chk` denominator on a
+    fresh transfer, and the single-file byte-identical test still passes;
+    emission order (rsync's sorted depth-first vs FastSync's readdir/BFS stream)
+    plus re-run over-naming (unconditional `./`, ancestor dirs named with a
+    transferred child, and no quick-check for symlinks/empty dirs) remain the
+    caveats, so the row stays ⚠️ and the matrix is unchanged at
+    **111 ✅ / 14 ⚠️ / 32 ❌ = 157**.
+
+13. **Wire parity track 4a** on `feat/parity-2.28` (`PROTOCOL_VERSION` stays
+    `2.28.0`): the receiver now has a delete-time filter engine. The sender
+    compiles its root-level selection rules exactly as the scanner does
+    (`filter_base_build`) and streams them as one bounded, self-describing
+    config-frame block (action, sides, anchored, dir-only, negate, owner,
+    pattern; bounded rule count and pattern bytes, unknown action/sides is a
+    protocol error). The receiver reconstructs `protect_rules` and applies them
+    first-match-wins to each extraneous destination path in every delete timing
+    (the whole-tree commit walker, the `--delete-during`/`--delete-delay`
+    per-directory plans, and the `-n` would-delete enumeration), so a
+    `P *.log` rule protects a destination-only `extra.log` like rsync (with
+    `risk` cancelling); the sender-derived protected-prefix behavior is
+    preserved when no rules are sent and `--delete-excluded` semantics are
+    unchanged. Per-directory merge (`:`/`.`) receiver re-derivation remains the
+    residual. `TestFilterProtect` (real + dry-run) plus differential cases
+    `filter_protect`, `filter_protect_during`, `filter_protect_delay` added and
+    the `--filter=RULE` row moves ❌ → ✅: matrix now
+    **115 ✅ / 11 ⚠️ / 31 ❌ = 157**; unit tests, the three named integration
+    files, clang-format and cppcheck clean.
+
+14. **Wire parity track 5a** on `feat/parity-2.28` (`PROTOCOL_VERSION` stays
+    `2.28.0` by project decision): the three basis-dir options now default to
+    rsync's metadata quick-check (equal size + equal mtime, or size alone under
+    `--size-only`; `-I` disables matching) instead of FastSync's historical
+    xxHash64 content equality, so a same-size/different-content basis is trusted
+    exactly as rsync trusts it. A new FastSync-only, long-only `--verify-basis`
+    flag restores the strict whole-file content equality; its bool is appended to
+    the basis block of the config frame (golden wire frame 882 → 886 bytes).
+    `--verify-basis` streams the confined basis descriptor to hash it, and a
+    basis hit is no longer capped at the 256 MiB whole-file payload bound:
+    `--copy-dest` streams the basis through a bounded buffer and `--link-dest`'s
+    copy fallback streams from the basis, so an over-limit hit materializes (a
+    basis MISS still falls back to the normal transfer and keeps its own bound).
+    A `--copy-dest` hit re-applies the SOURCE attributes (the sender transmits
+    the source metadata with the basis check frame), matching rsync's
+    "copy then fix attributes"; a `--link-dest` success keeps the shared inode's
+    attributes (writing through it would mutate the basis). Differential cases
+    `copy_dest` and `verify_basis` added; `test_basis_dir_size_only_content_residual`
+    converted to a passing parity assertion; `TestBasisDestDirs` updated for the
+    new default + `--verify-basis`; unit tests cover the quick-check/verify
+    decision and the same-size/different-content handshake. The
+    `--compare-dest`/`--copy-dest`/`--link-dest` rows move ❌ → ⚠️ (relative-DIR
+    resolution base and over-limit MISS refusal): matrix now
+    **116 ✅ / 13 ⚠️ / 28 ❌ = 157**.
+
+15. **No-wire parity track 5b** on `feat/parity-2.28` (`PROTOCOL_VERSION` stays
+    `2.28.0` by project decision): `-y`/`--fuzzy` reclassified ❌ → ⚠️. A probe
+    against real rsync 3.4.1 (pinned `-B8192`, repeated-content 64 KiB corpus)
+    showed the name heuristic is already rsync's (`util1.c fuzzy_distance` /
+    `find_filename_suffix` + the exact size+mtime pass) and the output is always
+    byte-exact; the only residual is candidate ELIGIBILITY, because FastSync's
+    `delta_should_attempt` gate caps the size ratio at 10× and requires both
+    files ≥ 16 KiB while rsync will reuse a basis from 0.25× to 10000× and below
+    16 KiB. The choice is observable only as `--stats` bandwidth counters. Added
+    differential case `fuzzy_basis` (same-suffix sibling, one name edit,
+    identical content, block size pinned) asserting tree **and** normalized
+    `--stats` parity where the choices coincide, plus `TestFuzzy` pinning the
+    window boundary on both sides (>10× and <16 KiB siblings declined by
+    FastSync while rsync uses them, both trees byte-identical). Matrix now
+    **116 ✅ / 14 ⚠️ / 27 ❌ = 157**.
+
+16. **Lockstep delete-default track 6** on `feat/parity-2.28` (`PROTOCOL_VERSION`
+    stays `2.28.0`): plain `--delete` now defaults to rsync's delete-during
+    (`--del`) timing, normalized on the client onto the existing `delete_during`
+    wire bool. The old late whole-tree commit is opt-in via `--delete-after` or
+    the FastSync-only long `--delete-commit` (identical `delete_after` timing).
+    `-d/--dirs` still falls back to the end commit, `--delay-updates` still
+    deletes before publication, and `--files-from`/`-R` scope is unchanged. The
+    `STATUS_DELETE_PLAN` frame gained a one-int `apply` flag so the per-run
+    config block (including `--delete-missing-args` exact paths) is always
+    transmitted, on a config-only carrier when the scope allows no directory
+    plan — fixing a latent bug with a file-only `--files-from` list. Differential
+    cases `delete`/`delete_commit`/`filter_protect_after` plus the extended
+    `test_delete_timing_parity.py` (plain `--delete` mid-abort removes reached
+    extras, `--delete-commit` defers) pass; full `-m "not setpriv"` suite,
+    clang-format and cppcheck clean. Matrix unchanged at
+    **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (the `--delete`/`--delete-during` rows stay
+    ⚠️ for the abort boundary; `--delete-after` stays ✅).
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
