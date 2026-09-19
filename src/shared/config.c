@@ -70,6 +70,8 @@ static void config_set_defaults(Config* config) {
   config->ignore_missing_args = false;
   config->checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
   config->cli_exit_code = 0;
+  config->compression_level_set = false;
+  config->checksum_choice_set = false;
   config->filters = NULL;
   config->files_from = NULL;
   config->files_from_set = NULL;

@@ -419,6 +419,12 @@ typedef struct Config {
    * for an unsupported checksum/compress algorithm) so main() can mirror it. */
   int checksum_transfer_algo;
   int cli_exit_code;
+  /* Client-only "the user explicitly chose" bits.  They let the per-codec
+   * default level / checksum list be applied only when the corresponding
+   * rsync option was omitted (an explicit --compress-level / --checksum-choice
+   * always wins).  Never serialized. */
+  bool compression_level_set;
+  bool checksum_choice_set;
 
   // Issue #129: Advanced file selection. These fields are CLIENT-ONLY: they are
   // never serialized to the wire (the receiver must not learn them).

@@ -161,10 +161,16 @@ static int set_compression_choice(Config* config, const char* value) {
     return -1;
   }
   int algo;
-  if (strcasecmp(value, "auto") == 0)
-    algo = (int)compression_negotiate_default();
-  else
+  if (strcasecmp(value, "auto") == 0) {
+    algo = compression_choice_resolve();
+    if (algo < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+  } else {
     algo = compression_algo_from_name(value);
+  }
   if (algo < 0) {
     log_message(LOG_LEVEL_ERROR,
                 "--compress-choice '%s' is not a supported algorithm; FastSync supports zstd, "
@@ -228,16 +234,25 @@ static int set_checksum_choice(Config* config, const char* value) {
     config->cli_exit_code = 4;
     return -1;
   }
-  ChecksumAlgo negotiated = checksum_negotiate_default();
+  int negotiated = -1;
+  if (rc1 == 1 || rc2 == 1) {
+    negotiated = checksum_choice_resolve();
+    if (negotiated < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+  }
   if (rc1 == 1)
-    transfer = (int)negotiated;
+    transfer = negotiated;
   if (!name2)
     pre = transfer;
   else if (rc2 == 1)
-    pre = (int)negotiated;
+    pre = negotiated;
 
   config->checksum_algo = pre;
   config->checksum_transfer_algo = transfer;
+  config->checksum_choice_set = true;
   /* rsync: "none" for the transfer checksum forces --whole-file. */
   if (transfer == (int)CHECKSUM_ALGO_NONE)
     config->whole_file = true;
@@ -1464,6 +1479,8 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
         ctx->exit_code = -1;
         return true;
       }
+      if (entry->offset == offsetof(Config, compression_level))
+        config->compression_level_set = true;
       if (entry->offset == offsetof(Config, chmod_spec)) {
         mode_t ignored;
         if (!chmod_apply(0, config->chmod_spec, &ignored)) {
@@ -1748,6 +1765,7 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
           return true;
         }
         config->compression_level = (int)level;
+        config->compression_level_set = true;
         log_info_message(LOG_INFO_MISC, "Set Compression level to %ld", level);
         ctx->i++;
       }
@@ -2550,8 +2568,43 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
       config->use_compression = (algo != (int)COMPRESSION_ALGO_NONE);
     }
   }
-  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE)
-    config->compression_algo = (int)compression_negotiate_default();
+  /* A bare -z (no --compress-choice) resolves like rsync's "auto": the
+   * RSYNC_COMPRESS_LIST preference list first, then the compiled-in order.  A
+   * list that names no supported codec is rsync's failed negotiation (exit 4). */
+  if (config->use_compression && !config->compress_choice) {
+    int resolved = compression_choice_resolve();
+    if (resolved < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+    config->compression_algo = resolved;
+    if (resolved == (int)COMPRESSION_ALGO_NONE)
+      config->use_compression = false;
+  }
+  /* Apply rsync's per-codec compression level: an explicit --compress-level is
+   * clamped to the codec's range, otherwise the codec's own default is used. */
+  if (config->use_compression) {
+    CompressionAlgo algo = (CompressionAlgo)config->compression_algo;
+    config->compression_level = config->compression_level_set
+                                    ? compression_clamp_level(algo, config->compression_level)
+                                    : compression_default_level(algo);
+    log_debug_message(LOG_DEBUG_UTIL, "Client compression: %s (level %d)",
+                      compression_algo_name(algo), config->compression_level);
+  }
+  /* The negotiated checksum is always resolved (rsync negotiates one for the
+   * delta strong sum even without --checksum): RSYNC_CHECKSUM_LIST first, then
+   * the compiled-in order.  An explicit --checksum-choice already set it. */
+  if (!config->checksum_choice_set) {
+    int resolved = checksum_choice_resolve();
+    if (resolved < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+    config->checksum_algo = resolved;
+    config->checksum_transfer_algo = resolved;
+  }
   /* rsync parity: "none" as the pre-transfer checksum cannot be combined with
    * --checksum (exit 4).  The check runs here because --checksum may appear on
    * either side of --checksum-choice. */

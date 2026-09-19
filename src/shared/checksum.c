@@ -1,4 +1,5 @@
 #include "checksum.h"
+#include "utils.h"
 #include <fcntl.h>
 #include <openssl/evp.h>
 #include <string.h>
@@ -396,7 +397,7 @@ uint8_t checksum_digest_len(ChecksumAlgo algo) {
   return 0;
 }
 
-ChecksumAlgo checksum_negotiate_default(void) {
+static ChecksumAlgo compiled_checksum_preference_first(void) {
   /* rsync 3.4.1 default preference order; every entry is compiled in, so this
    * resolves to xxh128. */
   static const ChecksumAlgo preference[] = {
@@ -408,4 +409,17 @@ ChecksumAlgo checksum_negotiate_default(void) {
       return preference[i];
   }
   return CHECKSUM_ALGO_XXH64;
+}
+
+int checksum_choice_resolve(void) {
+  bool specified = false;
+  int env = env_choice_first("RSYNC_CHECKSUM_LIST", checksum_algo_from_name, &specified);
+  if (specified)
+    return env; /* -1 = the list named no supported checksum */
+  return (int)compiled_checksum_preference_first();
+}
+
+ChecksumAlgo checksum_negotiate_default(void) {
+  int resolved = checksum_choice_resolve();
+  return resolved >= 0 ? (ChecksumAlgo)resolved : compiled_checksum_preference_first();
 }

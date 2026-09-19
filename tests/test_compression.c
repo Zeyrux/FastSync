@@ -4,6 +4,7 @@
 #include "data.h"
 #include "file.h"
 #include "utils.h"
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -390,6 +391,56 @@ static void test_codec_name_mapping() {
   EXPECT_TRUE(compression_algo_enabled(COMPRESSION_ALGO_ZSTD));
 }
 
+/* rsync 3.4.1's per-codec default levels and its clamping ranges. */
+static void test_codec_level_defaults_and_clamp() {
+  EXPECT_EQ_INT(compression_default_level(COMPRESSION_ALGO_ZSTD), ZSTD_CLEVEL_DEFAULT);
+  EXPECT_EQ_INT(compression_default_level(COMPRESSION_ALGO_ZSTD), 3);
+  EXPECT_EQ_INT(compression_default_level(COMPRESSION_ALGO_ZLIB), 6);
+  EXPECT_EQ_INT(compression_default_level(COMPRESSION_ALGO_ZLIBX), 6);
+  /* lz4 has no tunable level; a positive placeholder keeps the codec engaged. */
+  EXPECT_TRUE(compression_default_level(COMPRESSION_ALGO_LZ4) > 0);
+  EXPECT_EQ_INT(compression_default_level(COMPRESSION_ALGO_NONE), 0);
+
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZSTD, 1), 1);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZSTD, 22), 22);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZSTD, 23), 22);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZSTD, 0), 1);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZLIB, 15), 9);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZLIBX, 15), 9);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_ZLIB, 1), 1);
+  EXPECT_TRUE(compression_clamp_level(COMPRESSION_ALGO_LZ4, 20) > 0);
+  EXPECT_EQ_INT(compression_clamp_level(COMPRESSION_ALGO_NONE, 20), 0);
+}
+
+/* RSYNC_COMPRESS_LIST precedence, syntax and fallback. */
+static void test_codec_choice_env_list() {
+  unsetenv("RSYNC_COMPRESS_LIST");
+  EXPECT_EQ_INT(compression_choice_resolve(), (int)COMPRESSION_ALGO_ZSTD);
+  EXPECT_EQ_INT((int)compression_negotiate_default(), (int)COMPRESSION_ALGO_ZSTD);
+
+  /* Unknown entries are skipped; the first supported wins. */
+  setenv("RSYNC_COMPRESS_LIST", "bogus zlib lz4", 1);
+  EXPECT_EQ_INT(compression_choice_resolve(), (int)COMPRESSION_ALGO_ZLIB);
+
+  /* Case-insensitive. */
+  setenv("RSYNC_COMPRESS_LIST", "ZSTD", 1);
+  EXPECT_EQ_INT(compression_choice_resolve(), (int)COMPRESSION_ALGO_ZSTD);
+
+  /* Whitespace-separated; the client half ends at '&'. */
+  setenv("RSYNC_COMPRESS_LIST", "lz4  zlib & zstd", 1);
+  EXPECT_EQ_INT(compression_choice_resolve(), (int)COMPRESSION_ALGO_LZ4);
+
+  /* Blank falls back to the compiled-in order. */
+  setenv("RSYNC_COMPRESS_LIST", "   ", 1);
+  EXPECT_EQ_INT(compression_choice_resolve(), (int)COMPRESSION_ALGO_ZSTD);
+
+  /* rsync's syntax has no comma/colon separator: this is one unknown name. */
+  setenv("RSYNC_COMPRESS_LIST", "bogus,lz4", 1);
+  EXPECT_EQ_INT(compression_choice_resolve(), -1);
+
+  unsetenv("RSYNC_COMPRESS_LIST");
+}
+
 /* The process-global codec selects what the legacy wrappers produce. */
 static void test_codec_global_selection() {
   Data* original = data_create_empty(64);
@@ -423,5 +474,7 @@ void test_compression() {
   test_chunk_compress_decompress_roundtrip();
   test_codec_roundtrips();
   test_codec_name_mapping();
+  test_codec_level_defaults_and_clamp();
+  test_codec_choice_env_list();
   test_codec_global_selection();
 }

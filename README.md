@@ -117,9 +117,12 @@ matrix is classified as parity, caveat, or divergent in
   per-type `Number of files` breakdown is not reproduced. `--progress` prints
   rsync-style per-file blocks (without rsync's leading `./` line).
 - Codecs match rsync 3.4.1: `zstd`/`lz4`/`zlib`/`zlibx` compression and
-  `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1`/`none` checksums, negotiated with
-  `auto`; `zlibx` behaves as `zlib`, and the transfer checksum is not separately
-  selectable.
+  `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1`/`none` checksums. `auto` honors
+  `RSYNC_COMPRESS_LIST`/`RSYNC_CHECKSUM_LIST` and otherwise follows rsync's
+  compiled-in order. An omitted `--compress-level` uses the codec's rsync
+  default (zstd 3, zlib/zlibx 6, lz4 ignored); `zlib`/`zlibx` share the
+  literal-only zlib path (rsync's zlibx semantics), and the transfer checksum is
+  not separately selectable.
 
 The detailed flag matrix is maintained in
 [`RSYNC_COMPAT.md`](RSYNC_COMPAT.md). It reports each row as **parity**,
@@ -505,8 +508,8 @@ features without changing the meaning of ordinary compatibility options.
 |---|---|
 | `-j`, `--threads[=N]` | Enable the multithreaded scanner/loader/sender pipeline. `N` (1–256) sets the parallel scanner worker count; bare `-j`/`--threads` uses the default. |
 | `-z [level]`, `--compress [level]` | Enable streaming compression (default `zstd`), levels 1-22. |
-| `--compress-level <n>` | Set the compression level. |
-| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` (default), `lz4`, `zlib`, `zlibx`, `none`, and `auto`; `zlibx` behaves as `zlib`. |
+| `--compress-level <n>` | Set the compression level (1-22). Omitted, each codec uses its rsync default: zstd 3, zlib/zlibx 6, lz4 ignored. |
+| `--zc <alg>` | Alias for `--compress-choice`. FastSync supports `zstd` (default), `lz4`, `zlib`, `zlibx`, `none`, and `auto`; `zlib`/`zlibx` share the same literal-only zlib path. |
 | `--zl <n>` | Alias for `--compress-level`. |
 | `--skip-compress <list>` | Skip compression for `/`- or `,`-separated suffixes; defaults to rsync 3.4.1's built-in list. Incompatible with `--chunk-serialization`. |
 | `--compress-threads <n>` | Use `n` zstd compression workers. Requires compression and a zstd build with threaded support; the setting affects sender CPU work only. |

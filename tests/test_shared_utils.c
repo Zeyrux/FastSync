@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <threads.h>
@@ -578,7 +579,43 @@ static void test_getdelim_bounded() {
   fclose(fp);
 }
 
+static int test_env_resolver(const char* name) {
+  if (strcasecmp(name, "alpha") == 0)
+    return 10;
+  if (strcasecmp(name, "beta") == 0)
+    return 20;
+  return -1;
+}
+
+static void test_env_choice_first_parsing() {
+  const char* var = "FASTSYNC_TEST_CHOICE_LIST";
+  bool specified = true;
+  unsetenv(var);
+  EXPECT_EQ_INT(env_choice_first(var, test_env_resolver, &specified), -1);
+  EXPECT_FALSE(specified);
+
+  /* Unknown entries are skipped, case-insensitive, first supported wins. */
+  setenv(var, "bogus BETA alpha", 1);
+  EXPECT_EQ_INT(env_choice_first(var, test_env_resolver, &specified), 20);
+  EXPECT_TRUE(specified);
+
+  /* The client half ends at '&'. */
+  setenv(var, "alpha & beta", 1);
+  EXPECT_EQ_INT(env_choice_first(var, test_env_resolver, &specified), 10);
+
+  /* Blank means "unspecified"; all-unknown means "specified but no match". */
+  setenv(var, "   ", 1);
+  EXPECT_EQ_INT(env_choice_first(var, test_env_resolver, &specified), -1);
+  EXPECT_FALSE(specified);
+  setenv(var, "nope,alpha", 1);
+  EXPECT_EQ_INT(env_choice_first(var, test_env_resolver, &specified), -1);
+  EXPECT_TRUE(specified);
+
+  unsetenv(var);
+}
+
 void test_shared_utils() {
+  test_env_choice_first_parsing();
   test_path_index_bounded();
   test_path_index_semantics();
   test_getdelim_bounded();

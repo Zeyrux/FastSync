@@ -2,6 +2,7 @@
 #include "array_list.h"
 #include "log.h"
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -140,6 +141,47 @@ char* str_dup(const char* string) {
     return NULL;
   memcpy(new_string, string, str_len + 1);
   return new_string;
+}
+
+int env_choice_first(const char* env_name, int (*resolve)(const char*), bool* specified) {
+  if (specified)
+    *specified = false;
+  if (!env_name || !resolve)
+    return -1;
+  const char* env = getenv(env_name);
+  if (!env)
+    return -1;
+
+  bool saw_nonblank = false;
+  const char* p = env;
+  while (*p) {
+    if (*p == '&')
+      break;
+    if (isspace((unsigned char)*p)) {
+      p++;
+      continue;
+    }
+    saw_nonblank = true;
+    char token[64];
+    size_t len = 0;
+    while (*p && *p != '&' && !isspace((unsigned char)*p)) {
+      if (len < sizeof(token) - 1)
+        token[len++] = *p;
+      p++;
+    }
+    token[len] = '\0';
+    if (len > 0) {
+      int id = resolve(token);
+      if (id >= 0) {
+        if (specified)
+          *specified = true;
+        return id;
+      }
+    }
+  }
+  if (specified)
+    *specified = saw_nonblank;
+  return -1;
 }
 
 #define STR_HASH_SET_MIN_CAPACITY 16

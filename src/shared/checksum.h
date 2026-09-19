@@ -72,4 +72,11 @@ uint8_t checksum_digest_len(ChecksumAlgo algo);
  * xxh128 xxh3 xxh64 md5 md4 sha1 none).  Used to resolve "auto". */
 ChecksumAlgo checksum_negotiate_default(void);
 
+/* Resolve "auto" the way rsync does: the first supported name in
+ * RSYNC_CHECKSUM_LIST (whitespace-separated, client half ends at '&'), then the
+ * compiled-in preference order when the variable is unset/blank.  Returns -1
+ * when the variable is set but names no supported checksum (rsync's failed
+ * negotiation), otherwise a valid ChecksumAlgo id. */
+int checksum_choice_resolve(void);
+
 #endif /* CHECKSUM_H */

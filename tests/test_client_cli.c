@@ -2431,6 +2431,119 @@ static void test_parse_args_rejects_invalid_compression_choice() {
   config_delete(cfg);
 }
 
+/* rsync gives each codec its own default --compress-level; an omitted level
+ * resolves to that default and an explicit one is clamped to the codec range. */
+static void test_parse_args_per_codec_compression_level_defaults() {
+  unsetenv("RSYNC_COMPRESS_LIST");
+  struct {
+    const char* choice;
+    int level;
+  } cases[] = {
+      {"zstd", 3},
+      {"zlib", 6},
+      {"zlibx", 6},
+      {"lz4", 1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "-z", "--compress-choice", (char*)cases[i].choice, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->use_compression);
+    EXPECT_EQ_INT(cfg->compression_level, cases[i].level);
+    config_delete(cfg);
+  }
+
+  /* Bare -z resolves to the zstd default. */
+  Config* cfg = config_create();
+  char* bare[] = {"fastsync", "-z", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, bare, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_level, 3);
+  config_delete(cfg);
+
+  /* An explicit level wins unchanged for zstd... */
+  cfg = config_create();
+  char* zv[] = {"fastsync", "-z", "--compress-level", "10", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, zv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_level, 10);
+  config_delete(cfg);
+
+  /* ...but zlib clamps an over-range level to 9 like rsync. */
+  cfg = config_create();
+  char* zc[] = {"fastsync", "-z",  "--compress-choice", "zlib", "--compress-level", "15",
+                "/src",     "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 8, zc, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_level, 9);
+  config_delete(cfg);
+}
+
+/* RSYNC_COMPRESS_LIST drives the bare -z ("auto") resolution. */
+static void test_parse_args_compression_env_list() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-z", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  setenv("RSYNC_COMPRESS_LIST", "zlib lz4", 1);
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_algo, (int)COMPRESSION_ALGO_ZLIB);
+  EXPECT_EQ_INT(cfg->compression_level, 6);
+  config_delete(cfg);
+
+  /* An explicit --compress-choice beats the env list. */
+  cfg = config_create();
+  char* explicit_argv[] = {"fastsync", "-z", "--compress-choice", "zstd", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, explicit_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_algo, (int)COMPRESSION_ALGO_ZSTD);
+  config_delete(cfg);
+
+  /* A list with no supported name is rsync's failed negotiation (exit 4). */
+  setenv("RSYNC_COMPRESS_LIST", "bogus", 1);
+  cfg = config_create();
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+  unsetenv("RSYNC_COMPRESS_LIST");
+}
+
+/* RSYNC_CHECKSUM_LIST drives the default checksum choice. */
+static void test_parse_args_checksum_env_list() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  setenv("RSYNC_CHECKSUM_LIST", "md5", 1);
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
+  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_MD5);
+  config_delete(cfg);
+
+  /* An explicit --cc wins. */
+  cfg = config_create();
+  char* cc_argv[] = {"fastsync", "--checksum", "--cc=sha1", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, cc_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_SHA1);
+  config_delete(cfg);
+
+  /* A list with no supported name is rsync's failed negotiation (exit 4). */
+  setenv("RSYNC_CHECKSUM_LIST", "bogus", 1);
+  cfg = config_create();
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+  unsetenv("RSYNC_CHECKSUM_LIST");
+}
+
 /* Every value-taking table option accepts an inline "--opt=value" form. */
 static void test_parse_args_table_equals_size_options() {
   Config* cfg = config_create();
@@ -4682,6 +4795,9 @@ void test_client_cli() {
   test_parse_args_compression_alias_equals();
   test_parse_args_rejects_invalid_compression_level_equals();
   test_parse_args_rejects_invalid_compression_choice();
+  test_parse_args_per_codec_compression_level_defaults();
+  test_parse_args_compression_env_list();
+  test_parse_args_checksum_env_list();
   test_parse_args_table_equals_size_options();
   test_parse_args_table_equals_string_and_int_options();
   test_parse_args_missing_argument_diagnostic();

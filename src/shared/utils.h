@@ -81,6 +81,17 @@ bool path_index_has_descendant(const PathIndex* index, const char* path);
 
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
+
+/* Resolve the first supported name from a rsync algorithm-preference
+ * environment variable (RSYNC_COMPRESS_LIST / RSYNC_CHECKSUM_LIST).  `resolve`
+ * maps a case-insensitive name to an algorithm id (>= 0) or -1 for an unknown
+ * name.  rsync's syntax is a whitespace-separated list (comma/colon are NOT
+ * separators); the client-side half ends at '&'.  Unknown entries are skipped
+ * and the first resolvable one wins.  *specified is set true when the variable
+ * holds at least one non-blank character.  Returns the first resolvable id, or
+ * -1 when the variable is unset/blank or names no supported algorithm. */
+int env_choice_first(const char* env_name, int (*resolve)(const char*), bool* specified);
+
 /* Upper bound on one line/token read from a local list file (--files-from,
  * --exclude-from/--include-from, .rsync-filter).  Mirrors MAX_STRING_SIZE and
  * stops a hostile multi-gigabyte line from forcing unbounded allocation. */
