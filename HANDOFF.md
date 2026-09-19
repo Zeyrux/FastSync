@@ -1,16 +1,19 @@
-# FastSync — Session Handoff (2026-09-17)
+# FastSync — Session Handoff (2026-09-19)
 
 ## Current status
-- **Release `v2.21.0`** tagged (`919a729`, "Release v2.21.0"); full CI green
-  (run 552: lint, build-and-test, ASan, UBSan, fuzz-build, coverage, valgrind).
-  `dev` has the release commit plus later doc-only merges (a README refresh and
-  this handoff).
-- **Release PR #284 (`dev` -> `main`)** open, CI green (run 553).
-  `main` is protected: it needs review/approval to merge.
-  https://gitea.tap-tap.win/TapTap/FastSync/pulls/284
-- **`PROTOCOL_VERSION` = `"2.27.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.27.0)`.
-- Working tree clean; no wave worktrees remain.
+- **rsync-parity tracks 1-6 landed on `dev`** via **PR #303** (`10159dc`,
+  "feat(parity): rsync parity tracks 1-6 (protocol 2.28.0)"). Dev push CI run
+  **581** fully green: lint, build-and-test, parity-full, ASan, UBSan,
+  fuzz-build, coverage, valgrind.
+- **`PROTOCOL_VERSION` = `"2.28.0"`** (`src/shared/config.h`); CMake
+  `project(FastFileTransfer VERSION 2.28.0)`. The cycle batched all wire
+  changes (stats counters, filter-rule block, `--verify-basis`) under the one
+  bump.
+- **`main` = `ef76c90`** (tag `v2.26.0`); the 2.27.0/2.28.0 work is on `dev`
+  and not yet released. A `dev -> main` v2.28.0 release PR is the next step.
+- Parity matrix: **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (was 111/13/33 at cycle start).
+- Working tree clean; feature branch deleted; no scratch trees or worktrees.
+
 
 ## What landed this session
 1. **Wave 8 (refactors):** Config X-macro wire table; single-owner `authorized_root`;
