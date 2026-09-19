@@ -798,7 +798,7 @@ before the module list, before authentication, and the connecting peer address
 
 ## Protocol and Security
 
-FastSync protocol version `2.27.0` is shared by the client and server. The
+FastSync protocol version `2.28.0` is shared by the client and server. The
 current protocol is sender-driven and includes configuration negotiation,
 including the maximum allocation limit, incremental checks, checksums,
 manifests, keep-alives, abort handling, per-file remove-source results, and

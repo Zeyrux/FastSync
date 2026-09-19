@@ -4,7 +4,45 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
-## [Unreleased]
+## [2.28.0] - 2026-09-20
+
+The rsync-parity cycle. `PROTOCOL_VERSION` moves `2.26.0 → 2.27.0 → 2.28.0`;
+client and server must run the same version (the handshake is strict). See
+`RSYNC_COMPAT.md` for the per-option matrix, now **116 ✅ / 14 ⚠️ / 27 ❌** of
+157 rows.
+
+### Added
+
+- **Differential rsync 3.4.1 parity gate** (`tests/integration/
+  test_differential_parity.py`, `parity_harness.py`, `parity_caveats.py`): runs
+  real `rsync` and FastSync over generated corpora and diffs the destination
+  tree, normalized stdout and exit code. A fast subset runs on pull requests and
+  the full strict set on push; the residual allowlist is empty.
+- FastSync-only long option **`--verify-basis`**: require a
+  `--compare-dest`/`--copy-dest`/`--link-dest` hit to match the source by
+  whole-file digest instead of trusting the size+mtime quick-check.
+- FastSync-only long option **`--delete-commit`** (implies `--delete`): the old
+  atomic late whole-tree commit.
+- `--bwlimit` now parses rsync's units exactly and paces like rsync's leaky
+  bucket; `--ignore-errors` reproduces rsync's skip-unreadable-subdir and
+  IO-error-suppressed deletion (exit 23).
+- `--info=name/flist/del/remove/nonreg/progress` emit rsync's line format,
+  including real-run `deleting`/`*deleting` lines carried by a new
+  `report_deletes` wire bool.
+- Receiver-observed `--stats` counters: `Number of created files` now carries
+  rsync's `(reg/dir/link/special)` breakdown and `Literal data` is exact for a
+  delta transfer (extended `STATUS_STATS`).
+- `--progress` uses an opt-in paths-only pre-count so the `to-chk` denominator
+  counts every entry like rsync, and emits per-directory/symlink/special names.
+- Receiver-side `protect`/`risk` filter engine (new bounded filter-rule wire
+  block): `--filter='P ...'` now shields a destination-only entry like rsync.
+- `auto` for `--compress-choice`/`--checksum-choice` honors
+  `RSYNC_COMPRESS_LIST`/`RSYNC_CHECKSUM_LIST`, and per-codec compression-level
+  defaults match rsync.
+- Empty source directories are recreated recursively; `-R --no-implied-dirs
+  --files-from` places listed files under missing implied parents; `--iconv`
+  matches rsync's push direction; `--delete-delay` reports actual removals and
+  recursively removes a refilled deferred directory.
 
 ### Changed
 
@@ -15,17 +53,27 @@ run the same version because the handshake is strict.
   space progressively, and avoids the whole-old+new-tree peak that could
   `ENOSPC` a tight destination. The client maps the default onto the existing
   `delete_during` wire boolean, so `PROTOCOL_VERSION` stays `2.28.0`.
-- Added the FastSync-only long option **`--delete-commit`** (implies
-  `--delete`): it selects the old late whole-tree commit and is timing-identical
-  to `--delete-after` (the same `delete_after` wire boolean). Explicit timing
-  flags always win over the default, at most one timing flag may be given, and a
-  timing flag combined with `--no-delete` is still rejected.
+- Basis directories (`--compare-dest`/`--copy-dest`/`--link-dest`) now default
+  to rsync's metadata quick-check (equal size and mtime; `--size-only` drops the
+  mtime leg) instead of FastSync's historical always-verify content hash.
+  `--copy-dest` re-applies the source attributes, and basis materialization is
+  streamed so the 256 MiB whole-file cap no longer applies to a basis hit.
 - The per-directory `STATUS_DELETE_PLAN` frame gained a one-int `apply` flag:
   the one-shot per-run config block (protected prefixes, size-pruned mirrors,
   `--delete-missing-args` exact paths) is now always transmitted first on a
   config-only carrier (`apply=false`), fixing a latent bug where a
   `--delete-missing-args` run whose `--files-from` list synchronized no directory
   never sent its exact deletions.
+
+### Notes
+
+- `--delete`/`--delete-during` remain caveats for the mid-transfer abort
+  boundary (rsync's generator removes all planned extras ahead of its throttled
+  sender; FastSync removes only reached directories — final trees agree).
+  `--delete-before`, `--progress`, `--stats`, `--fuzzy` and the basis rows keep
+  their documented residuals in `RSYNC_COMPAT.md`; `--filter` and
+  `--delete-excluded` are now parity, including protection of a destination-only
+  excluded entry under default `--delete`.
 
 ### Migration
 
@@ -34,8 +82,12 @@ run the same version because the handshake is strict.
   that behavior. Plain `--delete` now removes reached directories' extras during
   the transfer, exactly like rsync's default; on a completed run the final tree
   is unchanged.
+- Deployments that relied on FastSync's stricter basis verification should pass
+  **`--verify-basis`**; the default now trusts the size+mtime quick-check like
+  rsync.
 
 ## [2.26.0] - 2026-09-17
+
 
 ### Added
 
