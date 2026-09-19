@@ -642,10 +642,14 @@ typedef struct Config {
      source directory is streamed in directory order, and the receiver removes
      each directory's extras when its plan arrives (during) or snapshots them
      and removes them only after a successful transfer (delay).  delete_after
-     (and plain --delete) keep the whole-tree commit mode: extras are removed
-     from a fresh end-of-transfer destination scan only after the whole transfer
-     succeeded.  See config_delete_timing_early()/config_delete_timing_per_dir()
-     below. */
+     keeps the whole-tree commit mode: extras are removed from a fresh
+     end-of-transfer destination scan only after the whole transfer succeeded.
+     A plain --delete with no explicit timing flag defaults to delete_during on
+     the client (cli_finalize_config), matching rsync's --del default; the old
+     late-commit behavior is selected explicitly by --delete-after or the
+     FastSync-only long spelling --delete-commit (an exact alias for
+     --delete-after, mapped onto the same wire field).  See
+     config_delete_timing_early()/config_delete_timing_per_dir() below. */
   /* partial_dir */
   // PR #174: Partial transfer resumption
   /* suffix */
@@ -1168,8 +1172,11 @@ bool config_delete_timing_early(const Config* config);
  * commits them only after a fully-successful transfer (delay). */
 bool config_delete_timing_per_dir(const Config* config);
 /* Delete-timing sanity: with deletion enabled at most one timing flag may be
- * set (none = the default delete-after commit timing); without deletion no
- * timing flag may be set (each timing flag implies --delete). */
+ * set; without deletion no timing flag may be set (each timing flag implies
+ * --delete).  A plain --delete is normalized to delete_during by
+ * cli_finalize_config on the client, so a transmitted use_delete config always
+ * carries exactly one timing; the zero-timing case remains valid only for a
+ * config that has not been through the CLI. */
 bool config_has_valid_delete_timing(const Config* config);
 
 /* Single source of truth for the cross-field ("combination") invariants a

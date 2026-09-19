@@ -305,14 +305,16 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
 
 /* Runs the whole receive loop.  The delete manifest may legitimately arrive
    either FIRST (--delete-before / --delete-during: the sender transmits the
-   validated keep-set before any file data) or LAST (plain --delete /
-   --delete-after / --delete-delay: the manifest closes the data stream).  In
+   validated keep-set before any file data) or LAST (--delete-after /
+   --delete-commit / --delete-delay: the manifest closes the data stream).  In
    the early modes the receiver deletes as soon as the manifest has been read
    and acknowledges with STATUS_OK so the sender only starts streaming once the
    deletion has committed (or failed); in the late modes the manifest is held
    and the deletion is committed only after the terminal STATUS_FINISHED proves
-   the whole transfer succeeded.  See receiver_process_pending() for how the -m
-   receiver defers that commit until its disk writer has drained. */
+   the whole transfer succeeded.  A plain --delete defaults to the per-directory
+   delete-during plan mode (no manifest at all).  See
+   receiver_process_pending() for how the -m receiver defers that commit until
+   its disk writer has drained. */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
                              DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
   Status status;

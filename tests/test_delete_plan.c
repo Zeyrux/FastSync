@@ -17,6 +17,7 @@
  * caller/receiver entry point) describing `dir` with no kept children. */
 static void send_plan_frame(int fd, const char* dir) {
   EXPECT_TRUE(send_int(fd, 0)); /* has_config */
+  EXPECT_TRUE(send_int(fd, 1)); /* apply: a real plan */
   EXPECT_TRUE(send_wire_str(fd, dir));
   EXPECT_TRUE(send_int(fd, 0)); /* kept child dirs */
   EXPECT_TRUE(send_int(fd, 0)); /* kept child files */

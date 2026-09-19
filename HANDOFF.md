@@ -174,6 +174,24 @@
     FastSync while rsync uses them, both trees byte-identical). Matrix now
     **116 ✅ / 14 ⚠️ / 27 ❌ = 157**.
 
+16. **Lockstep delete-default track 6** on `feat/parity-2.28` (`PROTOCOL_VERSION`
+    stays `2.28.0`): plain `--delete` now defaults to rsync's delete-during
+    (`--del`) timing, normalized on the client onto the existing `delete_during`
+    wire bool. The old late whole-tree commit is opt-in via `--delete-after` or
+    the FastSync-only long `--delete-commit` (identical `delete_after` timing).
+    `-d/--dirs` still falls back to the end commit, `--delay-updates` still
+    deletes before publication, and `--files-from`/`-R` scope is unchanged. The
+    `STATUS_DELETE_PLAN` frame gained a one-int `apply` flag so the per-run
+    config block (including `--delete-missing-args` exact paths) is always
+    transmitted, on a config-only carrier when the scope allows no directory
+    plan — fixing a latent bug with a file-only `--files-from` list. Differential
+    cases `delete`/`delete_commit`/`filter_protect_after` plus the extended
+    `test_delete_timing_parity.py` (plain `--delete` mid-abort removes reached
+    extras, `--delete-commit` defers) pass; full `-m "not setpriv"` suite,
+    clang-format and cppcheck clean. Matrix unchanged at
+    **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (the `--delete`/`--delete-during` rows stay
+    ⚠️ for the abort boundary; `--delete-after` stays ✅).
+
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
 2. **Deferred security items** (documented, not implemented):

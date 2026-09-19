@@ -997,6 +997,12 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
     {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
+    /* FastSync-only long spelling of the late whole-tree commit, which selects
+       the same timing as rsync's --delete-after in FastSync (the whole-tree
+       keep-set manifest is committed only after the entire transfer succeeded).
+       Plain --delete now defaults to delete-during, so this restores the old
+       FastSync behavior; it maps onto the same delete_after wire field. */
+    {"--delete-commit", NULL, OPT_FLAG, offsetof(Config, delete_after)},
     {"--delete-excluded", NULL, OPT_FLAG, offsetof(Config, delete_excluded)},
     {"--max-delete", NULL, OPT_SIGNED_INT, offsetof(Config, max_delete)},
     {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
@@ -1513,7 +1519,9 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
   if (entry->offset == offsetof(Config, per_dir_filter) && config->per_dir_filter_count < INT_MAX)
     config->per_dir_filter_count++;
   /* A delete-timing flag selects when --delete removes extras, so it
-     implies --delete exactly like the rsync options do. */
+     implies --delete exactly like the rsync options do.  --delete-commit (the
+     FastSync-only late-commit spelling) is mapped onto delete_after and so is
+     covered here too. */
   if (entry->offset == offsetof(Config, delete_before) ||
       entry->offset == offsetof(Config, delete_during) ||
       entry->offset == offsetof(Config, delete_delay) ||
@@ -2567,6 +2575,18 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
  * -1 on error. */
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
   set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  /* rsync's plain --delete defaults to delete-during (--del): each directory's
+     extras are removed as that directory is processed, so space is freed
+     progressively and a tight destination never has to hold the whole old+new
+     tree at once.  The late whole-tree commit FastSync historically used is
+     still selected explicitly by --delete-after or by the FastSync-only long
+     spelling --delete-commit (an exact alias for --delete-after).  Resolve the
+     default on the client, before validation and before the config crosses the
+     wire, so exactly one timing flag is ever set; an explicit timing (including
+     --delete-commit) always wins. */
+  if (config->use_delete && !config->delete_before && !config->delete_during &&
+      !config->delete_delay && !config->delete_after)
+    config->delete_during = true;
   if (config->compress_choice) {
     int algo = compression_algo_from_name(config->compress_choice);
     if (algo >= 0) {

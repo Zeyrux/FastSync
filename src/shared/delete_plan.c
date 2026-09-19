@@ -331,11 +331,36 @@ static int send_plan_node(int fd, DeletePlanSender* sender, PlanNode* node) {
       return -1;
     sender->config_sent = true;
   }
+  if (!send_int(fd, 1)) /* apply = true */
+    return -1;
   if (!send_wire_str(fd, node->dir))
     return -1;
   if (send_str_section(fd, node->dirs) != 0 || send_str_section(fd, node->files) != 0)
     return -1;
   node->sent = true;
+  return 0;
+}
+
+/* Transmit the one-shot per-run config block (protected prefixes, size-pruned
+ * mirrors, --delete-missing-args exact paths) on its own carrier frame, with
+ * apply=false so the receiver consumes the config but walks nothing.  This is
+ * how the config still reaches the receiver when the scope allows no directory
+ * plan at all (a --files-from list of bare files synchronizes no directory):
+ * without it, the missing-args exact deletions would be lost.  Idempotent. */
+static int send_config_only(int fd, DeletePlanSender* sender) {
+  if (!sender || sender->config_sent)
+    return 0;
+  if (!send_status(fd, STATUS_DELETE_PLAN) || !send_int(fd, 1))
+    return -1;
+  if (send_str_section(fd, sender->protected_prefixes) != 0 ||
+      send_str_section(fd, sender->size_skipped) != 0 ||
+      send_str_section(fd, sender->missing_args) != 0)
+    return -1;
+  sender->config_sent = true;
+  if (!send_int(fd, 0)) /* apply = false */
+    return -1;
+  if (!send_wire_str(fd, ".") || !send_int(fd, 0) || !send_int(fd, 0))
+    return -1;
   return 0;
 }
 
@@ -353,6 +378,10 @@ int delete_plan_send_root(int fd, DeletePlanSender* sender) {
     return -1;
   const char* root = sender->walk_root ? sender->walk_root : ".";
   if (!plan_ensure(sender, root))
+    return -1;
+  /* Put the config block on the wire first, on its own carrier frame, so the
+     receiver always sees it even when the scope permits no directory plan. */
+  if (send_config_only(fd, sender) != 0)
     return -1;
   return send_prefix_plan(fd, sender, root);
 }
@@ -850,6 +879,14 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
     }
     session->config_seen = true;
   }
+  /* apply=false is the config-only carrier frame: the receiver consumes the
+     config (and the missing-args exact deletions) but must not walk any
+     directory.  Every real plan carries apply=true. */
+  int apply;
+  if (!receive_int(fd, &apply) || (apply != 0 && apply != 1)) {
+    send_status(fd, STATUS_ERROR);
+    return -1;
+  }
   char* dir = receive_wire_str(fd);
   ArrayList* dirs = array_list_create(free);
   ArrayList* files = array_list_create(free);
@@ -867,7 +904,7 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
   if (!session->dry_run && enabled) {
     if (!session->defer && !apply_missing(session, config))
       ok = false;
-    if (ok && !apply_plan_dir(session, config, dir, dirs, files))
+    if (ok && apply && !apply_plan_dir(session, config, dir, dirs, files))
       ok = false;
   }
   free(dir);

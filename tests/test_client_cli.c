@@ -1150,6 +1150,63 @@ static void test_parse_args_delete_timing_flags() {
   config_delete(cfg);
 }
 
+/* Plain --delete with no explicit timing defaults to delete-during, matching
+ * rsync's --del default (progressive deletion).  --delete-commit is the
+ * FastSync-only long spelling that selects rsync's --delete-after timing (the
+ * late whole-tree commit), and an explicit timing always wins over the default.
+ */
+static void test_parse_args_delete_default_timing_and_commit() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delete", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_during);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_delay);
+  EXPECT_FALSE(cfg->delete_after);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* --delete-commit selects the late whole-tree commit (delete_after) and
+     implies --delete. */
+  cfg = config_create();
+  char* argv_commit[] = {"fastsync", "--delete-commit", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_commit, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_during);
+  EXPECT_FALSE(cfg->delete_delay);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* An explicit --delete-after alongside plain --delete keeps the late timing:
+     the default never overwrites an explicit timing. */
+  cfg = config_create();
+  char* argv_after[] = {"fastsync", "--delete", "--delete-after", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_after, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_during);
+  config_delete(cfg);
+
+  /* --delete-commit conflicts with a different timing. */
+  cfg = config_create();
+  char* argv_conflict[] = {"fastsync", "--delete-commit", "--delete-during", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_conflict, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
+  config_delete(cfg);
+}
+
 /* Two different delete-timing flags on one command line are a conflict, not a
  * silent last-one-wins choice. */
 static void test_parse_args_delete_timing_conflict_rejected() {
@@ -4758,6 +4815,7 @@ void test_client_cli() {
   test_parse_args_relative_no_implied_mkpath();
   test_parse_args_delete_during_alias();
   test_parse_args_delete_timing_flags();
+  test_parse_args_delete_default_timing_and_commit();
   test_parse_args_delete_timing_conflict_rejected();
   test_parse_args_delete_timing_without_delete_rejected();
   test_parse_args_rejects_unimplemented_options();

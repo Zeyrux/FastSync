@@ -3982,15 +3982,16 @@ class TestDeleteTiming:
             assert _read_file(os.path.join(received, "sub", "deep.txt")) == b"deeply nested file\n", \
                 f"{flag}: nested file was not written after the early deletion"
 
-    @pytest.mark.parametrize("flag", ["--delete", "--delete-after"])
+    @pytest.mark.parametrize("flag", ["--delete-commit", "--delete-after"])
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_flags_commit_only_after_success(self, flag, mt):
-        """Plain --delete/--delete-after defer deletion until the whole transfer
+        """--delete-commit/--delete-after defer deletion until the whole transfer
         succeeds: a mid-transfer write failure must leave every extra in place
-        (commit-style safety).  The -m receiver must also keep the extras: the
-        deferred keep-set is committed by the server only after the disk-writer
-        thread has finished, and a failing writer means the manifest is freed,
-        never applied."""
+        (commit-style safety).  Plain --delete no longer defers (it defaults to
+        delete-during), so only the explicitly late timings are exercised here.
+        The --threads receiver must also keep the extras: the deferred keep-set is
+        committed by the server only after the disk-writer thread has finished,
+        and a failing writer means the manifest is freed, never applied."""
         source = self._seed("late")
         dest = os.path.join(TEST_DATA_DIR, "deltiming_late_dst")
         clean_dir(dest)

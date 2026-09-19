@@ -1291,6 +1291,7 @@ static void test_dry_run_delete_plan_commit_does_not_delete() {
   EXPECT_TRUE(send_int(p[1], 0)); /* size-skipped prefixes */
   EXPECT_TRUE(send_int(p[1], 1)); /* missing-args exact deletions */
   EXPECT_TRUE(send_str(p[1], "victim.txt"));
+  EXPECT_TRUE(send_int(p[1], 1));   /* apply: a real plan */
   EXPECT_TRUE(send_str(p[1], ".")); /* receive root plan */
   EXPECT_TRUE(send_int(p[1], 0));   /* kept child directories */
   EXPECT_TRUE(send_int(p[1], 0));   /* kept child files */

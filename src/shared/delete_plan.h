@@ -48,11 +48,14 @@ void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* sync
    Directory keep entries do not count, so an I/O error that hid every file
    still refuses to delete. */
 bool delete_plan_sender_empty(const DeletePlanSender* sender);
-/* Attach the global config sections advertised on the first plan frame. */
+/* Attach the global config sections advertised on the first plan frame.  The
+ * block is always transmitted by delete_plan_send_root(), on a config-only
+ * carrier frame when the scope allows no directory plan. */
 void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* protected_prefixes,
                                    const ArrayList* size_skipped, const ArrayList* missing_args);
 /* Send the root plan (even before any data, so root extras are handled like
- * rsync's first generator directory).  Returns -1 on I/O error. */
+ * rsync's first generator directory), after transmitting the per-run config
+ * block on its own carrier frame.  Returns -1 on I/O error. */
 int delete_plan_send_root(int fd, DeletePlanSender* sender);
 /* Send the plans for every ancestor of `path` (root-first) and, when is_dir,
  * for `path` itself; already-sent plans are skipped. */

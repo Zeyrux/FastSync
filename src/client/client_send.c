@@ -3287,7 +3287,8 @@ int send_files(Config* config) {
       prepared.options.synced_dirs = synced_dirs;
     }
   }
-  /* The late-timing modes (plain --delete / --delete-after) build the manifest
+  /* The late-timing modes (--delete-after/--delete-commit and a plain --delete
+     that fell back from per-dir mode because of -d/--dirs) build the manifest
      while streaming and send it after the last data frame.  --delete-before
      sends a whole-tree keep-set up front; --delete-during/--delete-delay build a
      per-directory plan set up front (paths only) and stream the plans alongside
