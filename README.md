@@ -113,9 +113,11 @@ matrix is classified as parity, caveat, or divergent in
   (`-B1000`, `-essh`, `-MOPT`, `--opt=value`) are accepted, matching rsync.
 - `-r`, `-b`, `-L`, and `-B` are parsed with the rsync short names.
 - `--stats` prints the counters FastSync can observe plus the receiver-only
-  counters (`Matched data`, deleted files) reported over the wire; rsync's
-  per-type `Number of files` breakdown is not reproduced. `--progress` prints
-  rsync-style per-file blocks (without rsync's leading `./` line).
+  counters reported over the wire (`Matched data`, deleted files, and the
+  created/literal counters); `Number of files` and `Number of created files`
+  carry rsync's per-type breakdown. `--progress` prints rsync-style per-file
+  blocks including the leading `./` line, and (when progress is requested) a
+  paths-only pre-count supplies rsync's `to-chk` denominator.
 - Codecs match rsync 3.4.1: `zstd`/`lz4`/`zlib`/`zlibx` compression and
   `xxh128`/`xxh3`/`xxh64`/`md5`/`md4`/`sha1`/`none` checksums. `auto` honors
   `RSYNC_COMPRESS_LIST`/`RSYNC_CHECKSUM_LIST` and otherwise follows rsync's
@@ -206,11 +208,12 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination |
 | `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win) |
 | `--verify-basis` | FastSync-only: require a basis hit (`--compare-dest`/`--copy-dest`/`--link-dest`) to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync) |
-| `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded). Scoped to the synchronized directories, so `--files-from` subsets are safe |
+| `--delete` | Delete files on receiver not present in source (default timing: delete-during, matching rsync, so destination space is freed progressively). Scoped to the synchronized directories, so `--files-from` subsets are safe |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
 | `--delete-during`, `--del` | Delete extras once the keep-set is known, before data is applied (implies `--delete`) |
 | `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`) |
 | `--delete-after` | Explicit delete-after timing (implies `--delete`) |
+| `--delete-commit` | FastSync-only: keep the pre-2.28 atomic timing — delete only after the whole transfer succeeded (identical timing to `--delete-after`) |
 | `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected) |
 | `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync |
 | `--delay-updates` | Put updated files into place only at the end of the transfer (`--force` is honored at publication) |
@@ -576,6 +579,7 @@ remote SSH argv is already built injection-safe.
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`). |
 | `--delete-during`, `--del` | Delete extras once the keep-set manifest is known, before data is applied (implies `--delete`; early mode, same engine behaviour as `--delete-before`). |
 | `--delete-delay` | Delete extras only after a successful transfer (implies `--delete`; commit mode, same behaviour as `--delete-after`). |
+| `--delete-commit` | FastSync-only: atomic delete-after timing (only after the whole transfer succeeded). |
 | `--delete-after` | Explicit delete-after timing: delete only after the transfer succeeded (implies `--delete`). |
 | `--delete-excluded` | Also delete filter-excluded destination mirrors (size-pruned mirrors stay protected). |
 | `--max-delete <n>` | Delete at most n destination entries; the rest are skipped and the run exits 25 (partial), matching rsync. |

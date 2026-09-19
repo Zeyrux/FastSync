@@ -382,7 +382,9 @@ _STANDALONE_REFS = {
     "compare_dest": "--compare-dest",
     "copy_dest": "--copy-dest",
     "link_dest": "--link-dest",
+    "link_dest_stats": "--link-dest + --stats",
     "verify_basis": "--verify-basis (FastSync-only)",
+    "verify_basis_default": "--verify-basis (default quick-check vs rsync)",
     "added_and_deleted": "--delete across two runs",
     "added_and_deleted_seed": "--delete across two runs",
     "one_file_system": "-x/--one-file-system",
@@ -508,6 +510,34 @@ def test_link_dest_hardlinks_basis(parity_server_factory):
         ["-a", f"--link-dest={os.path.join(fdst, 'basis')}", "--incremental"],
         server, seed=seed, ignore_paths=("basis",), extra_check=extra)
     _run_and_check(case_id, result)
+
+
+@requires_rsync
+@parity
+def test_link_dest_stats_matches_rsync(parity_server_factory):
+    """A basis hit must not be counted as created or literal data: rsync reports
+    zero for both, so FastSync's receiver tallies must too (regression for the
+    basis materialization over-report)."""
+    case_id = "link_dest_stats"
+    src = os.path.join(TEST_DATA_DIR, "parity_linkds_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_linkds_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_linkds_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "f.txt"), b"link-basis-content\n")
+    _pin(os.path.join(src, "f.txt"), _OLD_MTIME)
+    server = parity_server_factory(SUPER)
+    rel = os.path.abspath(src).lstrip(os.sep)
+
+    def seed(_src, rroot, froot):
+        _mk(os.path.join(rroot, "basis", "f.txt"), b"link-basis-content\n", _OLD_MTIME)
+        _mk(os.path.join(fdst, "basis", rel, "f.txt"), b"link-basis-content\n", _OLD_MTIME)
+
+    result = H.run_differential(
+        src, rdst, fdst,
+        ["-a", "--link-dest=basis", "--stats"],
+        ["-a", f"--link-dest={os.path.join(fdst, 'basis')}", "--incremental", "--stats"],
+        server, seed=seed, ignore_paths=("basis",), stdout=H.STDOUT_STATS)
+    _run_and_check(case_id, result, ref="--link-dest + --stats")
 
 
 @requires_rsync

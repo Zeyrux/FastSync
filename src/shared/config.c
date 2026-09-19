@@ -1055,6 +1055,13 @@ static bool send_protect_entries(int fd, const Config* c) {
   bool ok = send_int(fd, rules->count);
   for (int i = 0; ok && i < rules->count; i++) {
     const FilterRule* r = rules->items[i];
+    /* Mirror the receiver's limit so the peer never receives a rule it will
+       reject as a protocol error. */
+    if (r->pattern && strlen(r->pattern) > MAX_PROTECT_PATTERN_LEN) {
+      log_message(LOG_LEVEL_ERROR, "filter pattern exceeds %d bytes", MAX_PROTECT_PATTERN_LEN);
+      filter_rule_list_free(rules);
+      return false;
+    }
     ok = send_int(fd, (int)r->action) && send_int(fd, (int)r->sides) &&
          send_int(fd, r->anchored ? 1 : 0) && send_int(fd, r->dir_only ? 1 : 0) &&
          send_int(fd, r->negate ? 1 : 0) && send_str(fd, r->owner ? r->owner : "") &&
@@ -1094,6 +1101,15 @@ static bool receive_protect_entries(int fd, Config* c, ConfigStringBudget* budge
       goto fail;
     char* pattern = config_receive_str(fd, budget);
     if (!pattern || pattern[0] == '\0') {
+      free(owner);
+      free(pattern);
+      goto fail;
+    }
+    /* A pattern too long to be evaluated by glob_match against a PATH_MAX path
+       would silently fail to match and leave a protect rule inert (fail-open:
+       the entry is then deleted).  Reject it up front as a protocol error
+       rather than accept a rule that can never shield anything. */
+    if (strlen(pattern) > MAX_PROTECT_PATTERN_LEN) {
       free(owner);
       free(pattern);
       goto fail;

@@ -1068,8 +1068,16 @@ typedef struct Config {
  * count and the aggregate pattern+owner bytes are each capped so a hostile
  * peer cannot pin unbounded pre-auth memory; both are validated strictly on
  * receive (alongside the per-string ConfigStringBudget). */
-#define MAX_FILTER_RULES 4096
+/* A peer may supply protect rules; cap the list so a crafted config cannot make
+ * the receiver's delete walk evaluate an unbounded number of glob patterns per
+ * destination entry (glob_match is O(pattern x path)).  1024 is far above any
+ * legitimate selection. */
+#define MAX_FILTER_RULES 1024
 #define MAX_FILTER_BYTES (256 * 1024)
+/* glob_match's DP is capped at 64 Mi work units; a pattern longer than this
+ * could exceed the cap against a PATH_MAX path and silently stop matching,
+ * leaving a protect rule inert.  Reject such a rule at receive time. */
+#define MAX_PROTECT_PATTERN_LEN 8192
 
 /* Upper bound on the number of --skip-compress suffixes accepted from the wire.
  * Each suffix is an independent wire string (up to MAX_STRING_SIZE = 64 KiB), so

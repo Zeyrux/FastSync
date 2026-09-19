@@ -1038,6 +1038,13 @@ void receiver_stats_note_saved(ReceiverStats* stats, const File* file, bool crea
                                unsigned created_dirs) {
   if (!stats || !file)
     return;
+  /* A basis-dir hit (--link-dest/--copy-dest) materializes bytes the sender
+   * never transferred.  rsync reports no literal data and no created entry for
+   * such a file, and does not count the parent directories it creates only to
+   * hold it, so exclude the whole entry from the receiver tallies. */
+  bool basis_sourced = file->basis_link != NULL || file->basis_copy != NULL;
+  if (basis_sourced)
+    return;
   bool is_sibling = file->link_group != 0 && !file->link_first;
   if (!file->is_dir && !file->is_symlink && !file->is_special && !is_sibling) {
     unsigned long long literal = file->literal_bytes;

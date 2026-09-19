@@ -2120,6 +2120,48 @@ static void test_config_receive_rejects_oversized_string_budget() {
   config_delete(over_bytes);
 }
 
+/* Pre-auth bounds for the receiver-side filter rule block (protocol 2.28.0).
+   A peer may send `protect`/`risk` rules; the receiver must reject an over-cap
+   count or an over-long pattern before evaluating anything, so a crafted config
+   cannot drive unbounded glob work or install a rule that silently never
+   matches. */
+static void test_config_receive_rejects_bad_protect_rules() {
+  if (is_running_under_valgrind())
+    return;
+
+  /* Over-cap rule count: one more than MAX_FILTER_RULES rules. */
+  Config* c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->filters = array_list_create(free);
+  EXPECT_NOT_NULL(c->filters);
+  for (int i = 0; i <= MAX_FILTER_RULES; i++)
+    EXPECT_TRUE(array_list_add(c->filters, str_dup("- *.tmp")));
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+
+  /* A pattern longer than the receiver's evaluation bound is rejected by the
+     sender (mirroring the receiver's guard) instead of being sent as an inert
+     rule. */
+  c = config_create();
+  EXPECT_NOT_NULL(c);
+  c->send_directory = str_dup("/src");
+  c->receive_root_directory = str_dup("/dst");
+  c->filters = array_list_create(free);
+  EXPECT_NOT_NULL(c->filters);
+  size_t big = MAX_PROTECT_PATTERN_LEN + 1;
+  char* long_rule = malloc(big + 3);
+  EXPECT_NOT_NULL(long_rule);
+  long_rule[0] = '-';
+  long_rule[1] = ' ';
+  memset(long_rule + 2, 'x', big);
+  long_rule[big + 2] = '\0';
+  EXPECT_TRUE(array_list_add(c->filters, long_rule));
+  EXPECT_TRUE(roundtrip_config_rejected(c));
+  config_delete(c);
+}
+
 /* identity_copy_as_refused() is the pure, pre-snapshot refusal predicate: a
    --copy-as is refused when the receiver is not root OR the effective super
    mode is OFF (an operator veto), and never when --copy-as is unset. */
@@ -3304,6 +3346,7 @@ void test_config() {
     test_config_wire_golden_receive();
     test_config_wire_receive_bounds();
     test_config_receive_rejects_overcap_counts();
+    test_config_receive_rejects_bad_protect_rules();
     test_config_wire_roundtrip_all_fields();
     test_config_preserve_attribute_wire_roundtrip();
   }
