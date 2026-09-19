@@ -94,6 +94,21 @@
     now **111 ✅ / 14 ⚠️ / 32 ❌ = 157**; differential + unit tests added in
     `test_features.py`, `test_option_parity.py`, `test_delete_plan.c`,
     `test_delete_delay_budget_parity.py`, `test_delete_timing_parity.py`.
+12. **No-wire parity track 2b** on `feat/parity-2.28` (no protocol change):
+    `--progress`/`-P`/`--info=progress` (when not `--quiet`) now run an opt-in
+    paths-only metadata pre-count (no file reads/hashing) that supplies rsync's
+    full file-list total for the `to-chk` denominator and the directory names,
+    and emits per-directory/symlink/special name lines, in both the sequential
+    and `--threads` paths. `--delete-during`/`--delete-delay` reuse their
+    keep-set pre-scan instead of a second walk; non-progress runs are
+    unaffected. Differential tests (`progress`/`progress_threads` over a new
+    `multidir` corpus) match rsync's name set and `to-chk` denominator on a
+    fresh transfer, and the single-file byte-identical test still passes;
+    emission order (rsync's sorted depth-first vs FastSync's readdir/BFS stream)
+    plus re-run over-naming (unconditional `./`, ancestor dirs named with a
+    transferred child, and no quick-check for symlinks/empty dirs) remain the
+    caveats, so the row stays ⚠️ and the matrix is unchanged at
+    **111 ✅ / 14 ⚠️ / 32 ❌ = 157**.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).

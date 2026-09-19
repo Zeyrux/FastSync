@@ -289,6 +289,40 @@ def _make_one_file(root, name="f.bin", size=100):
         fh.write(bytes((i * 7 + 3) & 0xFF for i in range(size)))
 
 
+def _make_multidir_tree(root):
+    """Multi-directory corpus for the --progress file-list tests: nested files,
+    a directory-only branch, an empty directory and a symlink."""
+    clean_dir(root)
+    for rel, data in (("a.txt", b"alpha\n"), ("b.txt", b"bravo\n"),
+                      ("sub1/c.txt", b"charlie\n"), ("sub1/deep/d.txt", b"delta\n"),
+                      ("sub2/e.txt", b"echo\n")):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+    os.symlink("a.txt", os.path.join(root, "link1"))
+    os.makedirs(os.path.join(root, "emptydir"), exist_ok=True)
+
+
+def _parse_progress(text):
+    """Name lines and the `to-chk` denominators from a --progress run."""
+    names = []
+    totals = set()
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line == "sending incremental file list":
+            continue
+        if "%" in line:
+            match = re.search(r"to-chk=\d+/(\d+)", line)
+            if match:
+                totals.add(int(match.group(1)))
+            continue
+        if line == "./":  # root-line trigger is a separate documented residual
+            continue
+        names.append(line)
+    return sorted(names), totals
+
+
 def _pick_stats(text, keys):
     out = {}
     for line in text.splitlines():
@@ -492,6 +526,62 @@ class TestWireStatsParity:
         # The final frame's to-chk denominator must include the source-root entry.
         assert "to-chk=0/2" in fast_lines[-1], fast_lines[-1]
         assert fast_lines[-1] == rsync_lines[-1], (rsync_lines[-1], fast_lines[-1])
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_progress_multidir_file_list_matches_rsync(self, shared_server, mt):
+        """A multi-directory tree: the paths-only pre-count must reproduce
+        rsync's file-list set and `to-chk` denominator.  Per-directory name
+        lines are emitted for directories, symlinks and the empty directory; the
+        name set and the denominator (every entry plus the transfer root) match
+        rsync, while the emitted *order* remains a documented residual (rsync
+        sorts depth-first, FastSync streams in readdir/BFS order)."""
+        source = os.path.join(TEST_DATA_DIR, "wire_pgmd_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_pgmd_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_pgmd_rdst")
+        _make_multidir_tree(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+
+        rsync_result = _rsync(["-a", "--progress", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        flags = ["-a", "--progress"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        rsync_names, rsync_totals = _parse_progress(rsync_result.stdout)
+        fast_names, fast_totals = _parse_progress(result.stdout)
+        assert sorted(rsync_names) == [
+            "a.txt", "b.txt", "emptydir/", "link1 -> a.txt", "sub1/",
+            "sub1/c.txt", "sub1/deep/", "sub1/deep/d.txt", "sub2/", "sub2/e.txt",
+        ], rsync_names
+        assert fast_names == rsync_names, (rsync_names, fast_names)
+        # 10 entries + the transfer-root "." counted by rsync's file list.
+        assert rsync_totals == {11}, rsync_totals
+        assert fast_totals == rsync_totals, (rsync_totals, fast_totals)
+
+    @pytest.mark.ci
+    def test_progress_delete_during_reuses_pre_scan(self):
+        """--delete-during + --progress reuses the keep-set pre-scan instead of
+        walking the tree a second time: the file-list total and directory name
+        lines are identical to a plain --progress run."""
+        source = os.path.join(TEST_DATA_DIR, "wire_pgdel_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_pgdel_dst")
+        _make_multidir_tree(source)
+        clean_dir(dest)
+        server = ServerManager()
+        server.start(extra_args=["--allow-super", "--allow-delete"])
+        try:
+            result, _ = run_client(source, dest, flags=["-a", "--progress", "--delete-during"],
+                                   port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode == 0, result.stderr[:300]
+        names, totals = _parse_progress(result.stdout)
+        assert totals == {11}, totals
+        assert "sub1/" in names and "sub1/deep/" in names and "emptydir/" in names, names
+        assert "link1 -> a.txt" in names, names
 
     @requires_rsync
     @pytest.mark.ci

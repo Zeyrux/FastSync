@@ -173,6 +173,12 @@ _CASES = [
            stdout=H.STDOUT_OUTFMT, ref="--out-format %n %l"),
     H.Case("out_format_i_n", "basic", ["-a", "--out-format=%i %n"],
            stdout=H.STDOUT_OUTFMT, ref="--out-format %i %n"),
+    H.Case("progress", "multidir", ["-a", "--progress"], stdout=H.STDOUT_PROGRESS,
+           ci=True, ref="--progress multi-directory file list"),
+    H.Case("progress_threads", "multidir", ["-a", "--progress"],
+           fastsync_flags=["-a", "--progress", "--threads"],
+           stdout=H.STDOUT_PROGRESS, ci=True,
+           ref="--progress multi-directory file list (--threads)"),
 
     # --- transfer modifications -------------------------------------------
     H.Case("update", "basic", ["-a", "--update"], seed=seed_update,
