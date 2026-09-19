@@ -46,10 +46,19 @@ typedef struct {
      carries the -n/--dry-run --delete path list. */
   ReceiverStats* stats;
   struct ArrayList* would_delete;
+  /* When --info=del requested it, receiver-owned strings for every path the
+     deletion commit ACTUALLY removed, sent in the terminal STATUS_STATS frame's
+     path list so the sender can print rsync's `deleting PATH` lines. */
+  struct ArrayList* deleted_paths;
 } ReceiverSink;
 
 bool receiver_outcomes_append(ReceiverOutcomes* outcomes, unsigned char code);
 void receiver_outcomes_destroy(ReceiverOutcomes* outcomes);
+
+/* DeletePathObserver implementation for --info=del: `context` is an ArrayList*
+   that receives owned copies of every truly-removed destination-relative path.
+   Shared by the single-threaded receiver and the -m pipeline's deferred commit. */
+void receiver_record_deleted_path(void* context, const char* rel_path);
 
 /* Send the terminal success frame.  `final_status` is usually STATUS_OK, or
    STATUS_DELETE_LIMIT when a --max-delete commit was capped. */
@@ -60,7 +69,8 @@ bool receiver_send_final_success(int fd, const Config* config, const ReceiverOut
    non-NULL, a count and that many wire strings) when the wire config requested
    report_stats.  A no-op otherwise. */
 bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats* stats,
-                               const struct ArrayList* would_delete);
+                               const struct ArrayList* would_delete,
+                               const struct ArrayList* deleted_paths);
 
 int receiver_process(Config* config, int file_descriptor, const ReceiverSink* sink);
 /* receiver_process with an escape hatch for the commit-style (late) deletion:

@@ -38,10 +38,12 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   context->remove_source_files = NULL;
   context->early_delete = false;
   context->delete_plans = NULL;
+  context->delete_suppressed = false;
   context->scan_stopped_early = false;
   context->total_files = 0;
   context->progress_bytes = 0;
   context->total_bytes = 0;
+  memset(&context->stats, 0, sizeof(context->stats));
   context->sender_done = false;
   atomic_init(&context->cancelled, false);
   protocol_session_init(&context->allocation_session, -1, -1);

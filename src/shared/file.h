@@ -87,6 +87,11 @@ bool file_path_exists_secure(const char* path);
 bool file_stat_secure(const char* path, struct stat* st);
 bool file_destination_is_newer_secure(const char* path, const FileMetadata* metadata);
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs);
+/* Protocol 2.28.0 variant: also increments *dirs_created for every missing
+ * parent directory this walk creates that lies strictly below `count_floor`
+ * (a receive-root-relative path, or NULL to count all of them). */
+int file_open_secure_parent_counted(const char* path, char** leaf_out, bool create_dirs,
+                                    unsigned* dirs_created, const char* count_floor);
 bool file_ensure_directory_secure(const char* path);
 bool file_directory_exists_secure(const char* path);
 bool file_rename_secure(const char* old_path, const char* new_path);
@@ -158,5 +163,37 @@ bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, co
                                     const FileMetadata* metadata, FileAttrPolicy policy,
                                     bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                     const char* temp_dir);
+/* Streaming --copy-dest install: atomically materialize `path` by copying the
+ * bytes of `basis_path` through a bounded buffer (no whole-file buffering, so
+ * an arbitrarily large basis works), applying the SOURCE metadata and the
+ * per-file xattrs / --fake-super record.  `update` honors a newer destination;
+ * a --temp-dir scratch location falls back to a direct write on EXDEV. */
+bool file_copy_basis_stream_attrs(const char* path, const char* basis_path,
+                                  unsigned long long expected_size, bool preallocate,
+                                  const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+                                  bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                  const char* temp_dir);
+/* Protocol 2.28.0 receiver-stat variants: like the two above but additionally
+ * report through `dirs_created` (when non-NULL) how many parent directories the
+ * confined secure walk had to create that lie strictly below `count_floor` (a
+ * receive-root-relative prefix, or NULL for all).  Used to reproduce rsync's
+ * `Number of created files` directory count on a fresh destination. */
+bool file_to_disk_secure_attrs_counted(const char* path, const void* data,
+                                       unsigned long long data_size, bool inplace, bool sparse,
+                                       bool preallocate, const FileMetadata* metadata,
+                                       FileAttrPolicy policy, bool update, bool no_replace,
+                                       bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                       bool keep_partial, const char* temp_dir,
+                                       unsigned* dirs_created, const char* count_floor);
+bool file_to_disk_secure_link_attrs_counted(const char* path, const char* basis_path,
+                                            const void* data, unsigned long long data_size,
+                                            bool preallocate, const FileMetadata* metadata,
+                                            FileAttrPolicy policy, bool use_fsync,
+                                            const FileXattrList* xattrs, bool fake_super,
+                                            const char* temp_dir, unsigned* dirs_created,
+                                            const char* count_floor);
+/* The logical transfer root expressed receive-root-relative, or NULL when the
+ * wire paths carry no mirror scaffolding above it.  Caller frees non-NULL. */
+char* file_transfer_root_floor(const Config* config);
 
 #endif

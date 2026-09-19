@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include "array_list.h"
+#include "filter.h"
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -81,6 +82,17 @@ bool path_index_has_descendant(const PathIndex* index, const char* path);
 
 char* str_dup(const char* string);
 char* output_escape(const char* string, bool eight_bit_output);
+
+/* Resolve the first supported name from a rsync algorithm-preference
+ * environment variable (RSYNC_COMPRESS_LIST / RSYNC_CHECKSUM_LIST).  `resolve`
+ * maps a case-insensitive name to an algorithm id (>= 0) or -1 for an unknown
+ * name.  rsync's syntax is a whitespace-separated list (comma/colon are NOT
+ * separators); the client-side half ends at '&'.  Unknown entries are skipped
+ * and the first resolvable one wins.  *specified is set true when the variable
+ * holds at least one non-blank character.  Returns the first resolvable id, or
+ * -1 when the variable is unset/blank or names no supported algorithm. */
+int env_choice_first(const char* env_name, int (*resolve)(const char*), bool* specified);
+
 /* Upper bound on one line/token read from a local list file (--files-from,
  * --exclude-from/--include-from, .rsync-filter).  Mirrors MAX_STRING_SIZE and
  * stops a hostile multi-gigabyte line from forcing unbounded allocation. */
@@ -137,7 +149,27 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,
-                                       size_t* deleted_out, size_t* skipped_out);
+                                       const FilterRuleList* protect_rules, size_t* deleted_out,
+                                       size_t* skipped_out);
+
+/* Optional per-deletion observer: called for each destination-relative path
+   actually removed (a file, symlink, or directory), in removal order, so the
+   receiver can stream rsync's `--info=del`/`--info=remove` lines. */
+typedef void (*DeletePathObserver)(void* context, const char* rel_path);
+
+/* `delete_extras_limited_observed` is delete_extras_limited with an optional
+ * observer; the observer is invoked only for entries truly removed.  When
+ * `protect_rules` is non-NULL its receiver-side verdict is evaluated for every
+ * candidate extra: a first-match PROTECT leaves the entry (and, for a
+ * directory, its whole subtree) in place, while RISK/NONE fall through to the
+ * ordinary skip-prefix/keep-set logic. */
+DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
+                                                const ArrayList* synced_dirs, size_t max_delete,
+                                                const DeleteSkipEntry* skips, int skip_count,
+                                                const FilterRuleList* protect_rules,
+                                                size_t* deleted_out, size_t* skipped_out,
+                                                DeletePathObserver observer,
+                                                void* observer_context);
 /* Read-only companion to delete_extras_limited: walk the destination exactly as
    the delete pass would and APPEND (strdup'd) destination-relative paths that
    WOULD be removed, without touching disk.  Used for -n/--dry-run --delete
@@ -145,7 +177,7 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
    strings appended to `out` and receives their count in *count_out. */
 bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
                         const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
-                        ArrayList* out, size_t* count_out);
+                        const FilterRuleList* protect_rules, ArrayList* out, size_t* count_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
 /* Open the existing destination directory at `dest_root`, confined to the
    authorized root with an O_NOFOLLOW component walk (the same confinement the
@@ -177,6 +209,11 @@ const char* utils_get_authorized_root_path(void);
  * callers guarantee this); this is containment by string, not by resolved
  * symlinks.  Shared by the utils and file secure-walk root confinement. */
 bool path_is_within_root(const char* root, const char* path);
+/* Non-allocating transfer-relative view of `path`: strip any leading '/' and
+ * then a `root` prefix (leading/trailing slashes tolerated), returning a
+ * borrowed pointer into `path`.  A NULL/empty root, or a path not under
+ * `root`, yields just the leading-slash strip.  `path`/`root` must stay alive. */
+const char* utils_strip_transfer_root(const char* path, const char* root);
 /* True when `path` contains a ".." component.  This is a purely lexical
  * dot-dot check: an absolute path is NOT rejected here, because default
  * (non-relative) transfers legitimately put the sender's absolute source path

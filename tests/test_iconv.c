@@ -148,8 +148,21 @@ static void test_iconv_wire_sender_converts_local_to_remote() {
   charset_wire_free();
 }
 
-static void test_iconv_wire_receiver_converts_remote_to_local() {
+/* rsync push parity: with no server --iconv the destination charset is the
+ * client spec's REMOTE half, so the receiver writes the wire bytes verbatim. */
+static void test_iconv_wire_receiver_default_writes_remote() {
   EXPECT_TRUE(charset_wire_init_receiver("utf-8,iso-8859-1", NULL));
+  char* local = charset_wire_apply("caf\xe9");
+  EXPECT_NOT_NULL(local);
+  EXPECT_EQ_INT(strcmp(local, "caf\xe9"), 0);
+  free(local);
+  charset_wire_free();
+}
+
+/* A server that declares its own --iconv LOCAL converts wire(REMOTE) into that
+ * declared charset (the daemon "charset" analog). */
+static void test_iconv_wire_receiver_server_local_override() {
+  EXPECT_TRUE(charset_wire_init_receiver("utf-8,iso-8859-1", "utf-8"));
   char* local = charset_wire_apply("caf\xe9");
   EXPECT_NOT_NULL(local);
   EXPECT_EQ_INT(strcmp(local, "caf\xc3\xa9"), 0);
@@ -179,7 +192,7 @@ static void test_iconv_wire_str_roundtrip() {
     close(p[1]);
     io_set_fds(p[0], p[0]);
     charset_wire_free();
-    charset_wire_init_receiver("utf-8,iso-8859-1", NULL);
+    charset_wire_init_receiver("utf-8,iso-8859-1", "utf-8");
     char* got = receive_wire_str(p[0]);
     bool ok = got != NULL && strcmp(got, "caf\xc3\xa9") == 0;
     free(got);
@@ -211,7 +224,8 @@ void test_iconv() {
   test_iconv_exact_fill_no_overflow();
   test_iconv_growth_expanding_name();
   test_iconv_wire_sender_converts_local_to_remote();
-  test_iconv_wire_receiver_converts_remote_to_local();
+  test_iconv_wire_receiver_default_writes_remote();
+  test_iconv_wire_receiver_server_local_override();
   test_iconv_wire_disabled_passthrough();
   // This subtest forks to exercise the wire string handshake; the instrumented
   // parent is too slow under valgrind for the child's blocking reads.

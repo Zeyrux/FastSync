@@ -289,6 +289,49 @@ def _make_one_file(root, name="f.bin", size=100):
         fh.write(bytes((i * 7 + 3) & 0xFF for i in range(size)))
 
 
+def _make_multidir_tree(root):
+    """Multi-directory corpus for the --progress file-list tests: nested files,
+    a directory-only branch, an empty directory and a symlink."""
+    clean_dir(root)
+    for rel, data in (("a.txt", b"alpha\n"), ("b.txt", b"bravo\n"),
+                      ("sub1/c.txt", b"charlie\n"), ("sub1/deep/d.txt", b"delta\n"),
+                      ("sub2/e.txt", b"echo\n")):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+    os.symlink("a.txt", os.path.join(root, "link1"))
+    os.makedirs(os.path.join(root, "emptydir"), exist_ok=True)
+
+
+def _parse_progress(text):
+    """Name lines and the `to-chk` denominators from a --progress run."""
+    names = []
+    totals = set()
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line == "sending incremental file list":
+            continue
+        if "%" in line:
+            match = re.search(r"to-chk=\d+/(\d+)", line)
+            if match:
+                totals.add(int(match.group(1)))
+            continue
+        if line == "./":  # root-line trigger is a separate documented residual
+            continue
+        names.append(line)
+    return sorted(names), totals
+
+
+def _pick_stats(text, keys):
+    out = {}
+    for line in text.splitlines():
+        for key in keys:
+            if line.startswith(key + ":"):
+                out[key] = line
+    return out
+
+
 class TestWireStatsParity:
     """Wire-counter output parity: --out-format %b/%c/%C, --progress and
     --stats versus real rsync 3.4.1."""
@@ -449,6 +492,99 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
+    def test_progress_leading_root_line_and_to_chk_match_rsync(self, shared_server):
+        """A single-file transfer: rsync emits the transfer-root `./` name line
+        and a `to-chk=0/2` denominator that counts that root entry.  Both must
+        match FastSync byte-for-byte for the deterministic frames."""
+        source = os.path.join(TEST_DATA_DIR, "wire_pgroot_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_pgroot_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_pgroot_rdst")
+        _make_one_file(source, "f.bin", 100)
+        clean_dir(dest)
+        # rsync prints the `./` root line only when the transfer root itself is
+        # created, so make the rsync destination absent.  The "created directory"
+        # line it then emits has no FastSync counterpart (different mirror
+        # layout), so only the name/frame lines are compared.
+        shutil.rmtree(rdst, ignore_errors=True)
+        rsync_result = _rsync(["-a", "--progress", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=["-a", "--progress"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        # subprocess text mode normalizes \r to \n (universal newlines).
+        def lines_of(text):
+            return [ln for ln in text.splitlines() if ln and not ln.startswith("created directory")]
+
+        rsync_lines = lines_of(rsync_result.stdout)
+        fast_lines = lines_of(result.stdout)
+        rsync_names = [ln for ln in rsync_lines if "%" not in ln]
+        fast_names = [ln for ln in fast_lines if "%" not in ln]
+
+        assert rsync_names == ["sending incremental file list", "./", "f.bin"], rsync_names
+        assert fast_names == rsync_names, (rsync_names, fast_names)
+        # The final frame's to-chk denominator must include the source-root entry.
+        assert "to-chk=0/2" in fast_lines[-1], fast_lines[-1]
+        assert fast_lines[-1] == rsync_lines[-1], (rsync_lines[-1], fast_lines[-1])
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_progress_multidir_file_list_matches_rsync(self, shared_server, mt):
+        """A multi-directory tree: the paths-only pre-count must reproduce
+        rsync's file-list set and `to-chk` denominator.  Per-directory name
+        lines are emitted for directories, symlinks and the empty directory; the
+        name set and the denominator (every entry plus the transfer root) match
+        rsync, while the emitted *order* remains a documented residual (rsync
+        sorts depth-first, FastSync streams in readdir/BFS order)."""
+        source = os.path.join(TEST_DATA_DIR, "wire_pgmd_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_pgmd_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_pgmd_rdst")
+        _make_multidir_tree(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+
+        rsync_result = _rsync(["-a", "--progress", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        flags = ["-a", "--progress"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        rsync_names, rsync_totals = _parse_progress(rsync_result.stdout)
+        fast_names, fast_totals = _parse_progress(result.stdout)
+        assert sorted(rsync_names) == [
+            "a.txt", "b.txt", "emptydir/", "link1 -> a.txt", "sub1/",
+            "sub1/c.txt", "sub1/deep/", "sub1/deep/d.txt", "sub2/", "sub2/e.txt",
+        ], rsync_names
+        assert fast_names == rsync_names, (rsync_names, fast_names)
+        # 10 entries + the transfer-root "." counted by rsync's file list.
+        assert rsync_totals == {11}, rsync_totals
+        assert fast_totals == rsync_totals, (rsync_totals, fast_totals)
+
+    @pytest.mark.ci
+    def test_progress_delete_during_reuses_pre_scan(self):
+        """--delete-during + --progress reuses the keep-set pre-scan instead of
+        walking the tree a second time: the file-list total and directory name
+        lines are identical to a plain --progress run."""
+        source = os.path.join(TEST_DATA_DIR, "wire_pgdel_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_pgdel_dst")
+        _make_multidir_tree(source)
+        clean_dir(dest)
+        server = ServerManager()
+        server.start(extra_args=["--allow-super", "--allow-delete"])
+        try:
+            result, _ = run_client(source, dest, flags=["-a", "--progress", "--delete-during"],
+                                   port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode == 0, result.stderr[:300]
+        names, totals = _parse_progress(result.stdout)
+        assert totals == {11}, totals
+        assert "sub1/" in names and "sub1/deep/" in names and "emptydir/" in names, names
+        assert "link1 -> a.txt" in names, names
+
+    @requires_rsync
+    @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
     def test_stats_selected_lines_match_rsync(self, shared_server, mt):
         """The protocol-independent --stats lines must match rsync exactly, in
@@ -459,6 +595,9 @@ class TestWireStatsParity:
         _make_one_file(source, "f.bin", 6000)
         clean_dir(dest)
         clean_dir(rdst)
+        # Start both tools from the same state: rsync's destination root exists,
+        # so pre-create FastSync's mirrored logical root as well.
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
         rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         flags = ["-a", "--stats"] + (["--threads"] if mt else [])
@@ -488,24 +627,19 @@ class TestWireStatsParity:
 
     @requires_rsync
     @pytest.mark.ci
-    def test_stats_file_count_breakdown_residual(self, shared_server):
-        """Residual (row #3): rsync prints the `Number of files` and
-        `Number of created files` lines with a per-type breakdown
-        (`(reg: X, dir: Y, link: Z)`).
-
-        FastSync cannot reproduce it from what the sender currently knows: the
-        scanner does not put directory entries in the transfer list (directories
-        are created implicitly), and without a per-entry destination-probe the
-        sender cannot tell which entries the receiver newly created.  So FastSync
-        prints the bare transferred-entry count.  This test pins the divergence
-        explicitly -- the row must not be marked ✅.
-        """
+    def test_stats_file_count_breakdown_matches_rsync(self, shared_server):
+        """`Number of files` and `Number of created files` both carry rsync's
+        per-type breakdown (protocol 2.28.0 reports the receiver-created
+        reg/dir/link/special split over STATUS_STATS)."""
         source = os.path.join(TEST_DATA_DIR, "wire_stc_src")
         dest = os.path.join(TEST_DATA_DIR, "wire_stc_dst")
         rdst = os.path.join(TEST_DATA_DIR, "wire_stc_rdst")
         _make_one_file(source, "f.bin", 6000)
         clean_dir(dest)
         clean_dir(rdst)
+        # Start both tools from the same state: rsync's destination root exists,
+        # so pre-create FastSync's mirrored logical root as well.
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
         rsync_result = _rsync(["-a", "--stats", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         result, _ = run_client(source, dest, flags=["-a", "--stats"],
@@ -523,14 +657,104 @@ class TestWireStatsParity:
         f_files = stats_line(result.stdout, "Number of files")
         f_created = stats_line(result.stdout, "Number of created files")
 
-        # rsync always carries the type breakdown (the source root counts as a
-        # directory; the single regular file as reg).
         assert re.match(r"Number of files: 2 \(reg: 1, dir: 1\)$", r_files), r_files
+        assert r_files == f_files, (r_files, f_files)
         assert re.match(r"Number of created files: 1 \(reg: 1\)$", r_created), r_created
-        # FastSync prints only the bare count: no directory accounting and no
-        # per-entry "created" knowledge.
-        assert re.fullmatch(r"Number of files: 1", f_files), f_files
-        assert re.fullmatch(r"Number of created files: 1", f_created), f_created
+        assert f_created == r_created, (r_created, f_created)
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_stats_created_and_literal_fresh_update_delta(self, shared_server, mt):
+        """The receiver-observed counters must match rsync for the three
+        transfer shapes: a fresh create (created breakdown + whole-file literal),
+        an update (created == 0, whole-file literal), and a delta update (only
+        the literal delta fragments are counted, not the whole file)."""
+        source = os.path.join(TEST_DATA_DIR, "wire_stcd_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_stcd_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_stcd_rdst")
+        clean_dir(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+        os.makedirs(source, exist_ok=True)
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
+        with open(os.path.join(source, "big.bin"), "wb") as fh:
+            fh.write(bytes(range(256)) * 4096)  # 1 MiB
+        mt_flag = ["--threads"] if mt else []
+
+        def compare(tag):
+            # Pin the delta block size on both ends: rsync's adaptive block size
+            # would otherwise make the literal/matched split non-comparable.
+            rsync_result = _rsync(["-a", "--stats", "--no-whole-file", "-B8192",
+                                   source + "/", rdst + "/"])
+            assert rsync_result.returncode == 0, rsync_result.stderr
+            result, _ = run_client(
+                source, dest,
+                flags=["-a", "--stats", "--incremental", "--delta", "-B8192"] + mt_flag,
+                port=shared_server.port)
+            assert result.returncode == 0, result.stderr[:300]
+            keys = ("Number of created files", "Literal data", "Matched data",
+                    "Total transferred file size")
+            r = _pick_stats(rsync_result.stdout, keys)
+            f = _pick_stats(result.stdout, keys)
+            assert r == f, f"{tag}: rsync={r} fastsync={f}"
+            return r
+
+        fresh = compare("fresh")
+        assert re.match(r"Number of created files: 1 \(reg: 1\)$",
+                        fresh["Number of created files"]), fresh
+
+        # Update the source and re-run: the destination already exists.
+        sleep_mtime = os.path.getmtime(os.path.join(source, "big.bin")) + 2
+        with open(os.path.join(source, "big.bin"), "r+b") as fh:
+            fh.seek(100)
+            fh.write(b"XXXXXXXXXX")
+        os.utime(os.path.join(source, "big.bin"), (sleep_mtime, sleep_mtime))
+        update = compare("update")
+        assert update["Number of created files"] == "Number of created files: 0", update
+
+        # Second delta update: change bytes far apart, so rsync ships only the
+        # literal fragments and FastSync must report the same Literal data.
+        sleep_mtime = os.path.getmtime(os.path.join(source, "big.bin")) + 2
+        with open(os.path.join(source, "big.bin"), "r+b") as fh:
+            fh.seek(500000)
+            fh.write(b"YYYYYYYYYY")
+        os.utime(os.path.join(source, "big.bin"), (sleep_mtime, sleep_mtime))
+        delta = compare("delta")
+        assert delta["Number of created files"] == "Number of created files: 0", delta
+        lit = int(delta["Literal data"].split(":", 1)[1].strip().split()[0].replace(",", ""))
+        assert 0 < lit < 1024 * 1024, delta
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("choice", ["xxh128", "xxh64", "xxh3", "md5", "md4", "sha1", "none"])
+    def test_out_format_C_selected_algorithm_matches_rsync(self, shared_server, choice):
+        """`%C` must use the algorithm selected by --checksum-choice, not always
+        xxh128, and render it exactly like rsync (big-endian for the 64-bit
+        hashes, high-then-low for xxh128, standard hex for md5/md4/sha1)."""
+        source = os.path.join(TEST_DATA_DIR, f"wire_cc_{choice}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"wire_cc_{choice}_dst")
+        rdst = os.path.join(TEST_DATA_DIR, f"wire_cc_{choice}_rdst")
+        _make_one_file(source, "f.bin", 200000)
+        clean_dir(dest)
+        clean_dir(rdst)
+        fmt = "%C %l %n"
+        rsync_result = _rsync(["-a", "--checksum-choice=" + choice,
+                               "--out-format=" + fmt, source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest,
+                               flags=["-a", "--checksum-choice=" + choice,
+                                      "--out-format=" + fmt],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        def file_lines(text):
+            return [line for line in text.splitlines()
+                    if line and not line.rsplit(" ", 1)[-1].endswith("/")]
+
+        assert file_lines(result.stdout) == file_lines(rsync_result.stdout), (
+            f"choice={choice}: rsync={rsync_result.stdout!r} fastsync={result.stdout!r}"
+        )
 
     @requires_rsync
     @pytest.mark.ci

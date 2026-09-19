@@ -121,9 +121,18 @@ typedef struct {
    * it) and to emit its plan after the data stream, when no file frame would
    * otherwise trigger it.  Guarded by `excluded_mutex`. */
   ArrayList* plan_dirs;
-  /* --ignore-errors: an unreadable directory during the scan is recorded as an
-   * I/O error and skipped instead of aborting the scan.  Client-only. */
+  /* --ignore-errors: an unreadable subdirectory no longer aborts the scan (it
+   * is always skipped so the rest of the tree transfers); this flag is kept so
+   * the client can distinguish the option state when deciding deletion policy.
+   * Client-only. */
   bool ignore_io_errors;
+  /* --info=nonreg: print rsync's `skipping non-regular file "NAME"` line for a
+   * non-regular entry that is not being preserved.  Client-only. */
+  bool note_nonreg;
+  /* Source root and 8-bit-output policy used to render a `--info=nonreg` name
+   * relative to the transfer root.  Borrowed read-only. */
+  const char* send_directory;
+  bool eight_bit_output;
   /* --ignore-missing-args (implied by --delete-missing-args): an explicitly
    * --files-from-listed entry that does not exist under the source is skipped
    * instead of failing (the --dirs generator is the only scanner path that
@@ -151,6 +160,17 @@ typedef struct {
   bool capture_dir_times;
   ArrayList* dir_entries;
   mtx_t* dir_entries_mutex;
+  /* Recreate empty source directories on a recursive transfer: emit a
+   * payload-less directory entry for every traversed directory that produced
+   * no transferred/descended child.  Off by default so low-level scanner users
+   * (unit helpers, --list-only) see only the historical file list; the real
+   * sender sets it in prepare_scanner. */
+  bool emit_empty_dirs;
+  /* --no-implied-dirs with -R + --files-from: a directory that is only an
+   * implied parent of a listed entry (not itself listed, nor below a listed
+   * directory) must not carry source metadata; it is created with default
+   * attributes at the destination, matching rsync. */
+  bool no_implied_dirs;
 } ScannerOptions;
 
 /* Internal per-scanner filter state. FilterNode chains represent the ordered
@@ -168,6 +188,11 @@ typedef struct {
   int current_depth;
   dev_t root_dev;
   bool failed;
+  /* Recursive scan: whether the open directory yielded any transferred or
+     descended entry.  When it did not, closing it emits a directory entry so
+     the empty source directory is recreated at the destination (rsync
+     parity). */
+  bool current_dir_produced;
   /* Phase 2 (files-from / filter layer). */
   char* root_path;          /* transfer root (fs path) for rel computation */
   char* current_rel;        /* rel path of the open directory ("" == root) */
@@ -186,6 +211,10 @@ typedef struct {
      --ignore-errors the scan continues past it and the caller decides what to
      do; `failed` is reserved for fatal errors that always abort the scan. */
   bool io_error;
+  /* The transfer ROOT could not be opened.  It is always fatal, even under
+     --ignore-errors, but the client still maps it to rsync's partial-transfer
+     exit (23) rather than a generic failure. */
+  bool root_io_error;
 } DirectoryScanner;
 
 typedef struct {
@@ -205,7 +234,8 @@ typedef struct {
   int completed;
   Chunk* initial_chunk;
   ProtocolSession* allocation_session;
-  FilterNode* root_filter_node; /* root .rsync-filter context (owned by ps) */
+  FilterNode* root_filter_node;  /* root .rsync-filter context (owned by ps) */
+  const ScannerOptions* options; /* borrowed scan options (--info=nonreg output) */
 } ParallelScanner;
 
 DirectoryScanner* directory_scanner_create(const char* root_directory, bool use_metadata,

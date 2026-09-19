@@ -70,6 +70,8 @@ static void config_set_defaults(Config* config) {
   config->ignore_missing_args = false;
   config->checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
   config->cli_exit_code = 0;
+  config->compression_level_set = false;
+  config->checksum_choice_set = false;
   config->filters = NULL;
   config->files_from = NULL;
   config->files_from_set = NULL;
@@ -206,7 +208,8 @@ static bool validate_received_config(const Config* config) {
          valid_wire_bool(config->preserve_perms) && valid_wire_bool(config->preserve_times) &&
          valid_wire_bool(config->preserve_owner) && valid_wire_bool(config->preserve_group) &&
          valid_wire_bool(config->munge_links) && valid_wire_bool(config->keep_dirlinks) &&
-         valid_wire_bool(config->fake_super) &&
+         valid_wire_bool(config->fake_super) && valid_wire_bool(config->report_dest_info) &&
+         valid_wire_bool(config->report_stats) && valid_wire_bool(config->report_deletes) &&
          (!config->copy_as_set || (config->copy_as_uid >= 0 && config->copy_as_gid >= 0)) &&
          (!config->use_compression ||
           (config->compression_level >= 1 && config->compression_level <= 22)) &&
@@ -788,6 +791,8 @@ void config_delete(Config* config) {
   if (config->filters) {
     array_list_delete(config->filters);
   }
+  filter_rule_list_free(config->protect_rules);
+  config->protect_rules = NULL;
   /* A --delay-updates staging tree is transient receiver state: remove any
      leftovers on every exit path (success already emptied it). */
   if (config->delay_context)
@@ -1023,6 +1028,124 @@ static bool receive_basis_entries(int fd, Config* c, ConfigStringBudget* budget)
   return true;
 }
 
+/* Receiver-side delete-protection rules (protocol 2.28.0).  The sender compiles
+ * its command-line selection rules exactly as the scanner does and streams the
+ * result as one bounded, self-describing block (count + per-rule records); the
+ * receiver reconstructs a FilterRuleList for the --delete extras walk.  owner
+ * and pattern are charged through the shared ConfigStringBudget and the block
+ * additionally enforces MAX_FILTER_RULES / MAX_FILTER_BYTES. */
+static bool send_protect_entries(int fd, const Config* c) {
+  int count = c->filters ? c->filters->size : 0;
+  const char** texts = NULL;
+  if (count > 0) {
+    texts = malloc((size_t)count * sizeof(char*));
+    if (!texts)
+      return false;
+    for (int i = 0; i < count; i++)
+      texts[i] = (const char*)c->filters->items[i];
+  }
+  char err[160];
+  FilterRuleList* rules =
+      filter_base_build(texts, count, c->cvs_exclude, c->delete_excluded, err, sizeof(err));
+  free(texts);
+  if (!rules) {
+    log_message(LOG_LEVEL_ERROR, "invalid filter rule: %s", err);
+    return false;
+  }
+  bool ok = send_int(fd, rules->count);
+  for (int i = 0; ok && i < rules->count; i++) {
+    const FilterRule* r = rules->items[i];
+    /* Mirror the receiver's limit so the peer never receives a rule it will
+       reject as a protocol error. */
+    if (r->pattern && strlen(r->pattern) > MAX_PROTECT_PATTERN_LEN) {
+      log_message(LOG_LEVEL_ERROR, "filter pattern exceeds %d bytes", MAX_PROTECT_PATTERN_LEN);
+      filter_rule_list_free(rules);
+      return false;
+    }
+    ok = send_int(fd, (int)r->action) && send_int(fd, (int)r->sides) &&
+         send_int(fd, r->anchored ? 1 : 0) && send_int(fd, r->dir_only ? 1 : 0) &&
+         send_int(fd, r->negate ? 1 : 0) && send_str(fd, r->owner ? r->owner : "") &&
+         send_str(fd, r->pattern ? r->pattern : "");
+  }
+  filter_rule_list_free(rules);
+  return ok;
+}
+
+static bool receive_protect_entries(int fd, Config* c, ConfigStringBudget* budget) {
+  int count;
+  if (!receive_int(fd, &count))
+    return false;
+  if (count < 0 || count > MAX_FILTER_RULES)
+    return false;
+  if (count == 0)
+    return true;
+  FilterRuleList* list = filter_rule_list_create();
+  if (!list)
+    return false;
+  size_t pattern_bytes = 0;
+  for (int i = 0; i < count; i++) {
+    int action;
+    int sides;
+    bool anchored;
+    bool dir_only;
+    bool negate;
+    if (!receive_int(fd, &action) ||
+        (action != FILTER_ACTION_EXCLUDE && action != FILTER_ACTION_INCLUDE) ||
+        !receive_int(fd, &sides) || sides < (int)FILTER_SIDE_SENDER ||
+        sides > (int)(FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER) ||
+        !receive_wire_bool(fd, &anchored) || !receive_wire_bool(fd, &dir_only) ||
+        !receive_wire_bool(fd, &negate))
+      goto fail;
+    char* owner = config_receive_str(fd, budget);
+    if (!owner)
+      goto fail;
+    char* pattern = config_receive_str(fd, budget);
+    if (!pattern || pattern[0] == '\0') {
+      free(owner);
+      free(pattern);
+      goto fail;
+    }
+    /* A pattern too long to be evaluated by glob_match against a PATH_MAX path
+       would silently fail to match and leave a protect rule inert (fail-open:
+       the entry is then deleted).  Reject it up front as a protocol error
+       rather than accept a rule that can never shield anything. */
+    if (strlen(pattern) > MAX_PROTECT_PATTERN_LEN) {
+      free(owner);
+      free(pattern);
+      goto fail;
+    }
+    size_t bytes = strlen(owner) + strlen(pattern);
+    if (bytes > MAX_FILTER_BYTES - pattern_bytes) {
+      free(owner);
+      free(pattern);
+      goto fail;
+    }
+    pattern_bytes += bytes;
+    FilterRule* rule = calloc(1, sizeof(FilterRule));
+    if (!rule) {
+      free(owner);
+      free(pattern);
+      goto fail;
+    }
+    rule->action = (FilterAction)action;
+    rule->sides = (unsigned)sides;
+    rule->anchored = anchored;
+    rule->dir_only = dir_only;
+    rule->negate = negate;
+    rule->owner = owner;
+    rule->pattern = pattern;
+    if (!filter_rule_list_add(list, rule)) {
+      filter_rule_free(rule);
+      goto fail;
+    }
+  }
+  c->protect_rules = list;
+  return true;
+fail:
+  filter_rule_list_free(list);
+  return false;
+}
+
 static bool send_identity_entries(int fd, const IdentityMap* map, int count) {
   for (int i = 0; i < count; i++) {
     if (!send_int(fd, map[i].from) || !send_int(fd, map[i].from_hi) || !send_int(fd, map[i].to) ||
@@ -1150,6 +1273,9 @@ fail:
 #define CONFIG_RECV_BLOCK_IDMAP(name)                                                              \
   receive_identity_entries(fd, budget, c->name##_count, &c->name)
 
+#define CONFIG_SEND_BLOCK_PROTECT_RULES(name) send_protect_entries(fd, c)
+#define CONFIG_RECV_BLOCK_PROTECT_RULES(name) receive_protect_entries(fd, c, budget)
+
 /* One table entry, applied in sequence.  XSEND/XRECV are statement macros so
  * consecutive entries read as a plain sequence of assignments. */
 #define XSEND(name, ctype, def, kind) ok = ok && (CONFIG_SEND_##kind(name));
@@ -1187,6 +1313,7 @@ CONFIG_DEFINE_SEND(send_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_SEND(send_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
 CONFIG_DEFINE_SEND(send_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
 CONFIG_DEFINE_SEND(send_codec_options, CONFIG_WIRE_CODEC_FIELDS)
+CONFIG_DEFINE_SEND(send_protect_options, CONFIG_WIRE_PROTECT_FIELDS)
 
 CONFIG_DEFINE_RECV(receive_core_fields, CONFIG_WIRE_CORE_FIELDS)
 CONFIG_DEFINE_RECV(receive_delta_fields, CONFIG_WIRE_DELTA_FIELDS)
@@ -1207,6 +1334,7 @@ CONFIG_DEFINE_RECV(receive_privilege_options, CONFIG_WIRE_PRIVILEGE_FIELDS)
 CONFIG_DEFINE_RECV(receive_copy_as_options, CONFIG_WIRE_COPY_AS_FIELDS)
 CONFIG_DEFINE_RECV(receive_output_options, CONFIG_WIRE_OUTPUT_FIELDS)
 CONFIG_DEFINE_RECV(receive_codec_options, CONFIG_WIRE_CODEC_FIELDS)
+CONFIG_DEFINE_RECV(receive_protect_options, CONFIG_WIRE_PROTECT_FIELDS)
 
 #undef XSEND
 #undef XRECV
@@ -1325,7 +1453,8 @@ bool config_send_wire_block(int file_descriptor, const Config* config) {
          send_privilege_options(file_descriptor, config) &&
          send_copy_as_options(file_descriptor, config) &&
          send_output_options(file_descriptor, config) &&
-         send_codec_options(file_descriptor, config);
+         send_codec_options(file_descriptor, config) &&
+         send_protect_options(file_descriptor, config);
 }
 
 bool config_send(int file_descriptor, const Config* config) {
@@ -1397,7 +1526,8 @@ Config* config_receive_with_validate(int file_descriptor, ConfigValidateFunc val
       !receive_privilege_options(file_descriptor, config, &budget) ||
       !receive_copy_as_options(file_descriptor, config, &budget) ||
       !receive_output_options(file_descriptor, config, &budget) ||
-      !receive_codec_options(file_descriptor, config, &budget))
+      !receive_codec_options(file_descriptor, config, &budget) ||
+      !receive_protect_options(file_descriptor, config, &budget))
     goto error;
   /* Validate/normalize the negotiated codec.  compress_choice is the human
    * spelling (NULL or "" when -z was not given); compression_algo is the

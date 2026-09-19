@@ -7,6 +7,7 @@
 #include "delta.h"
 #include "file_list.h"
 #include "log.h"
+#include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
 #include <pwd.h>
@@ -317,7 +318,7 @@ static void test_parse_args_protocol_accept_current() {
   Config* cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_equals[] = {"fastsync",   "--source-dir", "/src",
-                         "--dest-dir", "/dst",         "--protocol=2.26.0"};
+                         "--dest-dir", "/dst",         "--protocol=2.28.0"};
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 6, argv_equals, positional_args, &positional_count), 0);
@@ -327,7 +328,7 @@ static void test_parse_args_protocol_accept_current() {
   cfg = valid_client_config();
   EXPECT_NOT_NULL(cfg);
   char* argv_space[] = {"fastsync", "--source-dir", "/src",  "--dest-dir",
-                        "/dst",     "--protocol",   "2.26.0"};
+                        "/dst",     "--protocol",   "2.28.0"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 7, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->version, PROTOCOL_VERSION);
@@ -339,6 +340,7 @@ static void test_parse_args_protocol_accept_current() {
 static void test_parse_args_protocol_rejects_other_versions() {
   static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
                                              "2.18.0", "2.19.0", "2.20.0", "2.21.0", "2.22.0",
+                                             "2.23.0", "2.24.0", "2.25.0", "2.26.0", "2.27.0",
                                              "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
@@ -1044,6 +1046,23 @@ static void test_parse_args_basis_dirs() {
   config_delete(cfg);
 }
 
+/* --verify-basis (FastSync-only, long-only): default off; parses on as a plain
+   boolean and leaves the basis implications intact. */
+static void test_parse_args_verify_basis() {
+  Config* cfg = config_create();
+  EXPECT_FALSE(cfg->verify_basis);
+  config_delete(cfg);
+
+  cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--link-dest=prior", "--verify-basis", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->verify_basis);
+  EXPECT_TRUE(config_has_basis(cfg));
+  config_delete(cfg);
+}
+
 /* Escaping or degenerate basis-dir values must be rejected up front (they would
    resolve outside the destination root on the receiver); an absolute path is
    accepted (rsync parity) and canonicalized with its leading '/' preserved. */
@@ -1128,6 +1147,63 @@ static void test_parse_args_delete_timing_flags() {
   EXPECT_TRUE(cfg->delete_delay);
   EXPECT_FALSE(cfg->delete_before);
   EXPECT_FALSE(cfg->delete_after);
+  config_delete(cfg);
+}
+
+/* Plain --delete with no explicit timing defaults to delete-during, matching
+ * rsync's --del default (progressive deletion).  --delete-commit is the
+ * FastSync-only long spelling that selects rsync's --delete-after timing (the
+ * late whole-tree commit), and an explicit timing always wins over the default.
+ */
+static void test_parse_args_delete_default_timing_and_commit() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--delete", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_during);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_delay);
+  EXPECT_FALSE(cfg->delete_after);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* --delete-commit selects the late whole-tree commit (delete_after) and
+     implies --delete. */
+  cfg = config_create();
+  char* argv_commit[] = {"fastsync", "--delete-commit", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_commit, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_before);
+  EXPECT_FALSE(cfg->delete_during);
+  EXPECT_FALSE(cfg->delete_delay);
+  cfg->send_directory = str_dup("/src");
+  cfg->receive_root_directory = str_dup("/dst");
+  EXPECT_TRUE(validate_config(cfg));
+  config_delete(cfg);
+
+  /* An explicit --delete-after alongside plain --delete keeps the late timing:
+     the default never overwrites an explicit timing. */
+  cfg = config_create();
+  char* argv_after[] = {"fastsync", "--delete", "--delete-after", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_after, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->use_delete);
+  EXPECT_TRUE(cfg->delete_after);
+  EXPECT_FALSE(cfg->delete_during);
+  config_delete(cfg);
+
+  /* --delete-commit conflicts with a different timing. */
+  cfg = config_create();
+  char* argv_conflict[] = {"fastsync", "--delete-commit", "--delete-during", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv_conflict, positional_args, &positional_count), 0);
+  EXPECT_FALSE(validate_config(cfg));
   config_delete(cfg);
 }
 
@@ -1327,7 +1403,7 @@ static void test_parse_args_rejects_invalid_info_flag() {
   config_delete(cfg);
 }
 
-/* rsync's info "name" category maps to fastsync's per-file name logging, and
+/* rsync's info "name" category maps to fastsync's per-file name output, and
  * --info=help prints the flag list and exits without error. */
 static void test_parse_args_info_name_and_help() {
   Config* cfg = config_create();
@@ -1335,7 +1411,7 @@ static void test_parse_args_info_name_and_help() {
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_COPY);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_NAME);
   config_delete(cfg);
 
   cfg = config_create();
@@ -1345,8 +1421,10 @@ static void test_parse_args_info_name_and_help() {
   config_delete(cfg);
 }
 
-/* rsync 3.4.1's remaining --info/--debug categories parse successfully but
- * have no FastSync output wired to them, so they must not set any log flag. */
+/* rsync 3.4.1's full --info/--debug vocabulary parses.  The info categories
+ * with a FastSync event set their flag; the remaining rsync-only categories
+ * (backup/mount/symsafe/syms) parse but stay silent.  Every --debug category
+ * listed here is FastSync-silent, so debug_level stays 0. */
 static void test_parse_args_rsync_flag_vocabulary_accepted() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--info=backup,del,flist,mount,nonreg,progress,remove,symsafe,syms",
@@ -1358,7 +1436,8 @@ static void test_parse_args_rsync_flag_vocabulary_accepted() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->info_level, 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_NONREG |
+                                     LOG_INFO_PROGRESS | LOG_INFO_REMOVE);
   EXPECT_EQ_INT(cfg->debug_level, 0);
   config_delete(cfg);
 }
@@ -1387,6 +1466,29 @@ static void test_parse_args_debug_info_levels() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, info_argv, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->info_level, LOG_INFO_STATS);
+  config_delete(cfg);
+
+  /* --info=name level 2 enables the "is uptodate" marker; a later level-1 or
+     level-0 token clears it again. */
+  cfg = config_create();
+  char* name2_argv[] = {"fastsync", "--info=name2", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, name2_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_NAME | LOG_INFO_NAME_UPTODATE);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* name1_argv[] = {"fastsync", "--info=name2,name1", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, name1_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_NAME);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* name0_argv[] = {"fastsync", "--info=name2,name0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, name0_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, 0);
   config_delete(cfg);
 
   cfg = config_create();
@@ -2402,6 +2504,119 @@ static void test_parse_args_rejects_invalid_compression_choice() {
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
   config_delete(cfg);
+}
+
+/* rsync gives each codec its own default --compress-level; an omitted level
+ * resolves to that default and an explicit one is clamped to the codec range. */
+static void test_parse_args_per_codec_compression_level_defaults() {
+  unsetenv("RSYNC_COMPRESS_LIST");
+  struct {
+    const char* choice;
+    int level;
+  } cases[] = {
+      {"zstd", 3},
+      {"zlib", 6},
+      {"zlibx", 6},
+      {"lz4", 1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "-z", "--compress-choice", (char*)cases[i].choice, "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 6, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->use_compression);
+    EXPECT_EQ_INT(cfg->compression_level, cases[i].level);
+    config_delete(cfg);
+  }
+
+  /* Bare -z resolves to the zstd default. */
+  Config* cfg = config_create();
+  char* bare[] = {"fastsync", "-z", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, bare, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_level, 3);
+  config_delete(cfg);
+
+  /* An explicit level wins unchanged for zstd... */
+  cfg = config_create();
+  char* zv[] = {"fastsync", "-z", "--compress-level", "10", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, zv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_level, 10);
+  config_delete(cfg);
+
+  /* ...but zlib clamps an over-range level to 9 like rsync. */
+  cfg = config_create();
+  char* zc[] = {"fastsync", "-z",  "--compress-choice", "zlib", "--compress-level", "15",
+                "/src",     "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 8, zc, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_level, 9);
+  config_delete(cfg);
+}
+
+/* RSYNC_COMPRESS_LIST drives the bare -z ("auto") resolution. */
+static void test_parse_args_compression_env_list() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "-z", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  setenv("RSYNC_COMPRESS_LIST", "zlib lz4", 1);
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_algo, (int)COMPRESSION_ALGO_ZLIB);
+  EXPECT_EQ_INT(cfg->compression_level, 6);
+  config_delete(cfg);
+
+  /* An explicit --compress-choice beats the env list. */
+  cfg = config_create();
+  char* explicit_argv[] = {"fastsync", "-z", "--compress-choice", "zstd", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 6, explicit_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->compression_algo, (int)COMPRESSION_ALGO_ZSTD);
+  config_delete(cfg);
+
+  /* A list with no supported name is rsync's failed negotiation (exit 4). */
+  setenv("RSYNC_COMPRESS_LIST", "bogus", 1);
+  cfg = config_create();
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+  unsetenv("RSYNC_COMPRESS_LIST");
+}
+
+/* RSYNC_CHECKSUM_LIST drives the default checksum choice. */
+static void test_parse_args_checksum_env_list() {
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--checksum", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+
+  setenv("RSYNC_CHECKSUM_LIST", "md5", 1);
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
+  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_MD5);
+  config_delete(cfg);
+
+  /* An explicit --cc wins. */
+  cfg = config_create();
+  char* cc_argv[] = {"fastsync", "--checksum", "--cc=sha1", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, cc_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_SHA1);
+  config_delete(cfg);
+
+  /* A list with no supported name is rsync's failed negotiation (exit 4). */
+  setenv("RSYNC_CHECKSUM_LIST", "bogus", 1);
+  cfg = config_create();
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
+  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  config_delete(cfg);
+  unsetenv("RSYNC_CHECKSUM_LIST");
 }
 
 /* Every value-taking table option accepts an inline "--opt=value" form. */
@@ -3870,6 +4085,113 @@ static void test_parse_args_unsigned_options_reject_sign() {
   config_delete(cfg);
 }
 
+/* --bwlimit must parse with rsync 3.4.1's units and quantization: a bare value
+ * is KiB/s, K/M/G/T/P are binary multipliers, KB/MB are decimal, KiB/MiB are
+ * binary, decimals are rounded to whole KiB like rsync's (size + 512) / 1024,
+ * and 0 (or an empty value) means "no limit". */
+static void test_parse_args_bwlimit_rsync_units() {
+  struct {
+    const char* value;
+    unsigned long long expected; /* bytes/sec */
+    int ok;
+  } cases[] = {
+      {"100", 100ULL * 1024, 1},
+      {"0", 0, 1},
+      {"", 0, 1},
+      {"1.5", 2ULL * 1024, 1},
+      {"100K", 100ULL * 1024, 1},
+      {"100KiB", 100ULL * 1024, 1},
+      {"100KB", (100000ULL + 512) / 1024 * 1024, 1},
+      {"1M", 1024ULL * 1024, 1},
+      {"1MB", (1000000ULL + 512) / 1024 * 1024, 1},
+      {"1.5m", 1536ULL * 1024, 1},
+      {"1G", 1024ULL * 1024 * 1024, 1},
+      {"1000B", (1000ULL + 512) / 1024 * 1024, 1},
+      {"100B", 0, 0}, /* below the 512-byte floor (not 0) */
+      {"0.4", 0, 0},  /* 409 bytes, below the floor */
+      {"511", 511ULL * 1024, 1},
+      {"-1", 0, 0},
+      {"abc", 0, 0},
+      {"1x", 0, 0},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    int positional_args[2];
+    int positional_count = 0;
+    char option[32];
+    snprintf(option, sizeof(option), "--bwlimit=%s", cases[i].value);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int rc = parse_args(cfg, 4, argv, positional_args, &positional_count);
+    if (cases[i].ok) {
+      EXPECT_EQ_INT(rc, 0);
+      EXPECT_TRUE(io_get_bwlimit() == cases[i].expected);
+    } else {
+      EXPECT_EQ_INT(rc, -1);
+    }
+    config_delete(cfg);
+  }
+
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--bwlimit", "512", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(io_get_bwlimit() == 512ULL * 1024);
+  config_delete(cfg);
+  io_set_bwlimit(0);
+}
+
+/* Huge/malformed --bwlimit values must be rejected (not accepted or UB) and
+ * oversized-but-representable ones must still be accepted: the scaling used to
+ * be done with an unchecked signed double->long long cast, which is undefined
+ * when the product leaves long long's range. */
+static void test_parse_args_bwlimit_huge_and_boundary() {
+  struct {
+    const char* value;
+    unsigned long long expected; /* bytes/sec, ignored when !ok */
+    int ok;
+  } cases[] = {
+      /* Malformed / non-numeric prefixes. */
+      {"1e300", 0, 0},
+      {"99999999999999999999999999e3", 0, 0},
+      /* Products that exceed LLONG_MAX at every suffix. */
+      {"99999999999999999999999999", 0, 0},
+      {"99999999999999999999999999K", 0, 0},
+      {"100000000000000000000P", 0, 0},
+      {"99999999999999999999999999999999999999999999999999B", 0, 0},
+      /* `strtod` overflow to +inf must be caught by the isfinite() guard. */
+      {"9999999999999999999999999999999999999999999999999999999999999999999999"
+       "9999999999999999999999999999999999999999999999999999999999999999999999"
+       "99999999999999999999999999999999999999999999999999999999999999999999999",
+       0, 0},
+      /* 2^52 KiB/s: the largest power-of-two scaling that still fits. */
+      {"4503599627370496", 4611686018427387904ULL, 1},
+      /* The +/-1 suffix forms accepted by rsync. */
+      {"1+1", 1024ULL, 1},
+      {"1-1", 1024ULL, 1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    int positional_args[2];
+    int positional_count = 0;
+    char option[1024];
+    snprintf(option, sizeof(option), "--bwlimit=%s", cases[i].value);
+    char* argv[] = {"fastsync", option, "/src", "/dst"};
+    int rc = parse_args(cfg, 4, argv, positional_args, &positional_count);
+    if (cases[i].ok) {
+      EXPECT_EQ_INT(rc, 0);
+      EXPECT_TRUE(io_get_bwlimit() == cases[i].expected);
+    } else {
+      EXPECT_EQ_INT(rc, -1);
+    }
+    config_delete(cfg);
+    io_set_bwlimit(0);
+  }
+}
+
 /* --dry-run must not emit a batch file, so it is rejected alongside
  * --read-batch/--only-write-batch. */
 static void test_validate_config_dry_run_rejects_write_batch() {
@@ -4394,6 +4716,26 @@ static void test_parse_args_rejects_unsupported_short() {
   }
 }
 
+/* The --ignore-errors deletion gate, unit-tested without a privileged source
+ * directory: a clean scan always deletes; an I/O error suppresses deletion
+ * unless --ignore-errors is set.  (The end-to-end mode-000 differential lives in
+ * the setpriv integration test; this pins the decision itself in the PR gate.) */
+static void test_ignore_errors_allows_delete(void) {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_TRUE(ignore_errors_allows_delete(cfg, false));
+  EXPECT_FALSE(ignore_errors_allows_delete(cfg, true));
+
+  cfg->ignore_errors = true;
+  EXPECT_TRUE(ignore_errors_allows_delete(cfg, false));
+  EXPECT_TRUE(ignore_errors_allows_delete(cfg, true));
+
+  /* A NULL config cannot opt into --ignore-errors. */
+  EXPECT_TRUE(ignore_errors_allows_delete(NULL, false));
+  EXPECT_FALSE(ignore_errors_allows_delete(NULL, true));
+  config_delete(cfg);
+}
+
 void test_client_cli() {
   test_validate_config_required_paths();
   test_parse_args_numeric_ids();
@@ -4473,6 +4815,7 @@ void test_client_cli() {
   test_parse_args_relative_no_implied_mkpath();
   test_parse_args_delete_during_alias();
   test_parse_args_delete_timing_flags();
+  test_parse_args_delete_default_timing_and_commit();
   test_parse_args_delete_timing_conflict_rejected();
   test_parse_args_delete_timing_without_delete_rejected();
   test_parse_args_rejects_unimplemented_options();
@@ -4528,6 +4871,9 @@ void test_client_cli() {
   test_parse_args_compression_alias_equals();
   test_parse_args_rejects_invalid_compression_level_equals();
   test_parse_args_rejects_invalid_compression_choice();
+  test_parse_args_per_codec_compression_level_defaults();
+  test_parse_args_compression_env_list();
+  test_parse_args_checksum_env_list();
   test_parse_args_table_equals_size_options();
   test_parse_args_table_equals_string_and_int_options();
   test_parse_args_missing_argument_diagnostic();
@@ -4561,6 +4907,7 @@ void test_client_cli() {
   test_parse_args_filter_rules();
   test_parse_args_from0_cvs_filter_file_flags();
   test_parse_args_basis_dirs();
+  test_parse_args_verify_basis();
   test_parse_args_basis_invalid_paths();
   test_validate_config_basis_rejects_chunk_serialization();
   test_parse_args_delete_policy_flags();
@@ -4579,6 +4926,8 @@ void test_client_cli() {
   test_parse_args_password_file();
   test_parse_args_pattern_file_oversized_rejected();
   test_parse_args_unsigned_options_reject_sign();
+  test_parse_args_bwlimit_rsync_units();
+  test_parse_args_bwlimit_huge_and_boundary();
   test_validate_config_dry_run_rejects_write_batch();
   test_parse_args_short_clustering();
   test_parse_args_attached_short_values();
@@ -4587,4 +4936,5 @@ void test_client_cli() {
   test_parse_args_noop_does_not_consume_argv();
   test_parse_args_backup_copy_links_shorts();
   test_parse_args_rejects_unsupported_short();
+  test_ignore_errors_allows_delete();
 }

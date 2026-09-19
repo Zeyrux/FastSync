@@ -9,6 +9,7 @@
 #include "config.h"
 #include "delete_plan.h"
 #include "file.h"
+#include "format.h"
 #include "protocol.h"
 #include "queue.h"
 #include "stop_condition.h"
@@ -82,10 +83,22 @@ typedef struct {
      thread transmits the root plan before any data and the remaining plans
      alongside the chunks.  Set once before the worker threads start. */
   DeletePlanSender* delete_plans;
+  /* A scan I/O error without --ignore-errors suppressed deletion: the prebuilt
+     keep-set/plans were dropped, and the streaming scanner must not build a
+     fresh manifest or re-send the per-directory plans.  Set once before the
+     worker threads start. */
+  bool delete_suppressed;
   mtx_t mutex_progress;
   int total_files;
   unsigned long long progress_bytes;
   unsigned long long total_bytes;
+  /* Per-type flist / transferred accounting for the rsync --stats breakdown and
+     the progress `to-chk` denominator.  Owned by the sender thread: it is the
+     only writer (the entry/transfer notes in send_chunks_multithreaded) and it
+     reads the totals in its completion tail, so no lock is needed.  This is NOT
+     guarded by mutex_progress (which covers total_files/progress_bytes/
+     total_bytes/sender_done). */
+  TransferStats stats;
   bool sender_done;
   atomic_bool cancelled;
   ProtocolSession allocation_session;

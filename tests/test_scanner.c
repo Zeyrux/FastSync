@@ -1240,6 +1240,55 @@ static int collect_scan_info_parallel(ParallelScanner* scanner, const char* root
   return failed ? -1 : count;
 }
 
+/* The --progress paths-only pre-count relies on `list_dirs` emitting every
+ * directory (including empty ones) exactly once, alongside the files and
+ * symlinks the streaming scanner already emits. */
+static void test_scanner_list_dirs_counts_every_entry() {
+  const char* root = "test_scan_listdirs";
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_listdirs/sub1", 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_listdirs/sub1/deep", 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_listdirs/sub2", 0755), 0);
+  EXPECT_EQ_INT(mkdir("test_scan_listdirs/emptydir", 0755), 0);
+  create_test_file("test_scan_listdirs/a.txt", "a");
+  create_test_file("test_scan_listdirs/sub1/c.txt", "c");
+  create_test_file("test_scan_listdirs/sub1/deep/d.txt", "d");
+  create_test_file("test_scan_listdirs/sub2/e.txt", "e");
+  EXPECT_EQ_INT(symlink("a.txt", "test_scan_listdirs/link1"), 0);
+
+  ScannerOptions options = {0};
+  options.list_dirs = true;
+  options.emit_empty_dirs = true;
+  options.follow_symlinks = true; /* -l/--links: carry symlinks, don't skip */
+  ScanInfo infos[16];
+  int count = collect_scan_info(root, &options, infos, 16);
+  EXPECT_EQ_INT(count, 9);
+  int dirs = 0;
+  for (int i = 0; i < count; i++) {
+    if (infos[i].is_dir)
+      dirs++;
+  }
+  EXPECT_EQ_INT(dirs, 4);
+  EXPECT_TRUE(scan_info_present(infos, count, "sub1", true, NULL));
+  EXPECT_TRUE(scan_info_present(infos, count, "sub1/deep", true, NULL));
+  EXPECT_TRUE(scan_info_present(infos, count, "sub2", true, NULL));
+  EXPECT_TRUE(scan_info_present(infos, count, "emptydir", true, NULL));
+  EXPECT_TRUE(scan_info_present(infos, count, "a.txt", false, ""));
+  EXPECT_TRUE(scan_info_present(infos, count, "sub1/c.txt", false, ""));
+  EXPECT_TRUE(scan_info_present(infos, count, "link1", false, ""));
+
+  unlink("test_scan_listdirs/a.txt");
+  unlink("test_scan_listdirs/sub1/c.txt");
+  unlink("test_scan_listdirs/sub1/deep/d.txt");
+  unlink("test_scan_listdirs/sub2/e.txt");
+  unlink("test_scan_listdirs/link1");
+  rmdir("test_scan_listdirs/sub1/deep");
+  rmdir("test_scan_listdirs/sub1");
+  rmdir("test_scan_listdirs/sub2");
+  rmdir("test_scan_listdirs/emptydir");
+  rmdir(root);
+}
+
 /* -d without --files-from emits exactly the source-root directory (empty) and
  * never descends. */
 static void test_dirs_no_descent() {
@@ -1667,6 +1716,7 @@ void test_scanner() {
   test_per_dir_filter_override(true);
   test_dirs_no_descent();
   test_dirs_files_from();
+  test_scanner_list_dirs_counts_every_entry();
   test_files_from_relative_send_path();
   test_scanner_captures_directory_times();
   test_scanner_chunk_ownership();

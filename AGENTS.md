@@ -56,6 +56,21 @@ cmake -B build -S . && cmake --build build -j$(nproc)
 ./build/tests                # unit tests
 python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv"   # full integration suite (CI excludes env-dependent privilege tests)
 python3 -m pytest tests/integration/ -n 4 --dist=load -m ci   # PR-gate subset only
+
+# Differential rsync-parity gate (real rsync 3.4.1 vs FastSync)
+python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity_ci  # fast PR subset
+python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity     # full set
+```
+
+See `tests/integration/README.md` for the differential parity gate and its
+`parity_caveats.py` allowlist (the residual burn-down mechanism).
+
+Unit tests under valgrind must set `FASTSYNC_UNDER_VALGRIND=1` (CI does): the
+tests use it to skip fork-based tests, because valgrind 3.22 does not expose
+`vgpreload` in the guest's `/proc/self/maps`.
+
+```bash
+FASTSYNC_UNDER_VALGRIND=1 valgrind --leak-check=full --show-leak-kinds=definite --error-exitcode=1 ./build/tests
 ```
 
 ## CI Workflow — Waiting for Results

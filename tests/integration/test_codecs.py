@@ -9,6 +9,7 @@ directory when the shared test server is launched), so every scratch tree lives
 under ``TEST_DATA_DIR`` rather than pytest's ``tmp_path``.
 """
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,84 @@ def _tree_bytes(root):
             with open(path, "rb") as fh:
                 out[os.path.relpath(path, root)] = fh.read()
     return out
+
+
+_CC_DELTA_T0 = 1_600_000_000
+_CC_DELTA_T1 = 1_600_000_100
+
+_DELTA_STATS_KEYS = (
+    "Number of created files",
+    "Number of regular files transferred",
+    "Total transferred file size",
+    "Literal data",
+    "Matched data",
+)
+
+
+def _pin_tree(root, mtime):
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                os.utime(path, (mtime, mtime))
+    os.utime(root, (mtime, mtime))
+
+
+def _make_delta_basis(src, size=512 * 1024):
+    """Build a source and a matching pre-modification basis tree.
+
+    The source's ``big.bin`` is then modified in a few disjoint places and given
+    a newer mtime so both tools take the delta path.  Returns the basis dir.
+    """
+    clean_dir(src)
+    original = random.Random(20240101).randbytes(size)
+    with open(os.path.join(src, "big.bin"), "wb") as fh:
+        fh.write(original)
+    with open(os.path.join(src, "small.txt"), "wb") as fh:
+        fh.write(b"hello world\n")
+    _pin_tree(src, _CC_DELTA_T0)
+
+    basis = src.rstrip("/") + "_basis"
+    clean_dir(basis)
+    shutil.copy2(os.path.join(src, "big.bin"), os.path.join(basis, "big.bin"))
+    shutil.copy2(os.path.join(src, "small.txt"), os.path.join(basis, "small.txt"))
+    _pin_tree(basis, _CC_DELTA_T0)
+
+    modified = bytearray(original)
+    for off in (0, size // 3, 2 * size // 3, size - 64):
+        for i in range(32):
+            modified[off + i] ^= 0x5A
+    with open(os.path.join(src, "big.bin"), "wb") as fh:
+        fh.write(bytes(modified))
+    os.utime(os.path.join(src, "big.bin"), (_CC_DELTA_T1, _CC_DELTA_T1))
+    return basis
+
+
+def _seed_from_basis(basis, target):
+    clean_dir(target)
+    for name in os.listdir(basis):
+        shutil.copy2(os.path.join(basis, name), os.path.join(target, name))
+
+
+def _delta_stats(text):
+    found = {}
+    for line in text.splitlines():
+        for key in _DELTA_STATS_KEYS:
+            if line.startswith(key + ":"):
+                found[key] = line.split(":", 1)[1].strip()
+    return found
+
+
+def _big_bin_outfmt(text):
+    """The ``(c, C)`` pair from the ``big.bin`` out-format line (`%c|%C %n`)."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "|" not in stripped or not stripped.endswith("big.bin"):
+            continue
+        c_field, rest = stripped.split("|", 1)
+        fields = rest.split()
+        return c_field.strip(), (fields[0] if fields else "")
+    return None, None
 
 
 class TestCodecChoiceMatrix:
@@ -189,6 +268,76 @@ class TestCodecTransferDifferential:
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
         received = get_dest_received_dir(fs_dst, src)
         assert _tree_bytes(received) == _tree_bytes(rsync_dst)
+
+
+class TestChecksumChoiceDeltaSurface:
+    """--checksum-choice does not move the delta-transfer parity surface.
+
+    FastSync's delta BLOCK strong checksum is a fixed xxHash32, so the
+    negotiated algorithm only selects the whole-file comparison digest (and the
+    ``%C`` transfer digest).  A pre-seeded delta transfer must therefore land
+    byte-identical bytes and report the same counters for every choice, while
+    ``%C`` -- the one token that tracks the choice -- stays byte-identical to
+    rsync.  This pins the Track-3b reclassification in RSYNC_COMPAT.md.
+    """
+
+    CHOICES = ["xxh64", "xxh128", "xxh3", "md5", "md4", "sha1",
+               "xxh64,sha1", "sha1,xxh64"]
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_delta_surface_invariant_to_checksum_choice(self, shared_server):
+        src = _scratch("ccdelta_src")
+        basis = _make_delta_basis(src)
+        source_bytes = _tree_bytes(src)
+
+        rsync_c, fastsync_c, digests = {}, {}, {}
+        rsync_stats, fastsync_stats = {}, {}
+        for choice in self.CHOICES:
+            tag = choice.replace(",", "_")
+            rsync_dst = _scratch(f"ccdelta_rs_{tag}")
+            fs_dst = _scratch(f"ccdelta_fs_{tag}")
+            fs_root = get_dest_received_dir(fs_dst, src)
+            _seed_from_basis(basis, rsync_dst)
+            _seed_from_basis(basis, fs_root)
+
+            # Pin the block size on both ends so the literal/matched split is
+            # comparable (rsync's adaptive default would otherwise differ from
+            # FastSync's 8192-byte default).
+            rsync_result = _rsync(["-a", "--no-whole-file", "-B8192", "--stats",
+                                   "--out-format=%c|%C %n", f"--cc={choice}",
+                                   src + "/", rsync_dst + "/"])
+            assert rsync_result.returncode == 0, rsync_result.stderr
+            result, _ = run_client(
+                src, fs_dst,
+                flags=["-a", "--incremental", "--delta", "-B8192", "--stats",
+                       "--out-format=%c|%C %n", f"--cc={choice}"],
+                port=shared_server.port)
+            assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+
+            assert _tree_bytes(rsync_dst) == source_bytes, choice
+            assert _tree_bytes(fs_root) == source_bytes, choice
+            assert _delta_stats(rsync_result.stdout) == _delta_stats(result.stdout), choice
+
+            rs_c, rs_C = _big_bin_outfmt(rsync_result.stdout)
+            fs_c, fs_C = _big_bin_outfmt(result.stdout)
+            assert rs_C == fs_C, f"{choice}: %C rsync={rs_C!r} fastsync={fs_C!r}"
+            rsync_c[choice] = rs_c
+            fastsync_c[choice] = fs_c
+            digests[choice] = fs_C
+            rsync_stats[choice] = _delta_stats(rsync_result.stdout)
+            fastsync_stats[choice] = _delta_stats(result.stdout)
+
+        # The choice is only observable in %C, and it is effective (the digests
+        # are not all the same algorithm's output).
+        assert len(set(digests.values())) > 1, digests
+        # The compared --stats counters are invariant across choices in each tool
+        # (and were asserted equal cross-tool inside the loop).
+        assert len({tuple(sorted(s.items())) for s in rsync_stats.values()}) == 1, rsync_stats
+        assert len({tuple(sorted(s.items())) for s in fastsync_stats.values()}) == 1, fastsync_stats
+        # The block-checksum token (%c) is invariant across choices in each tool.
+        assert len(set(rsync_c.values())) == 1, rsync_c
+        assert len(set(fastsync_c.values())) == 1, fastsync_c
 
 
 class TestCodecNegotiationFallback:

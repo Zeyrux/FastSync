@@ -217,7 +217,21 @@ class _SlicingProxy:
 
 
 class TestDeleteTimingFinalStateParity:
-    """On a successful transfer the per-directory timings match rsync's result."""
+    """On a successful transfer the per-directory timings match rsync's result.
+
+    Plain ``--delete`` has no rsync-incompatible spelling: it defaults to
+    delete-during on both tools, so it is compared against rsync's own default.
+    ``--delete-commit`` is FastSync-only and selects the late whole-tree commit,
+    which is rsync's ``--delete-after`` timing.
+    """
+
+    # (fastsync flag, rsync flag)
+    PAIRS = [
+        ("--delete", "--delete"),
+        ("--delete-during", "--delete-during"),
+        ("--delete-delay", "--delete-delay"),
+        ("--delete-commit", "--delete-after"),
+    ]
 
     def _run_fastsync(self, tag, timing):
         source, dest, received = _seed_pair(tag)
@@ -226,28 +240,32 @@ class TestDeleteTimingFinalStateParity:
             result, _ = run_client(source, dest, flags=[timing], port=server.port)
         return result, received
 
-    @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
+    @pytest.mark.parametrize("fs_timing,rs_timing", PAIRS)
     @requires_rsync
-    def test_success_final_state_matches_rsync(self, timing):
+    def test_success_final_state_matches_rsync(self, fs_timing, rs_timing):
+        # Worker-safe names: xdist may run the parametrizations concurrently, so
+        # the flags are part of every fixture path.
+        label = f"{fs_timing.lstrip('-')}_vs_{rs_timing.lstrip('-')}"
         # Build the rsync fixture from the same seed so both sides start equal.
-        source, dest, received = _seed_pair("parity_rsync")
+        source, dest, received = _seed_pair(f"parity_rsync_{label}")
         source2 = source
-        rsync_dst = os.path.join(TEST_DATA_DIR, "dtp_parity_rsync_dst")
+        rsync_dst = os.path.join(TEST_DATA_DIR, f"dtp_rsync_{label}_dst")
         clean_dir(rsync_dst)
         # rsync mirrors src/ into dst/; seed the same extra.
         _write(os.path.join(rsync_dst, "d", "old_extra"), b"stale extra\n")
 
-        rsync_result = _rsync(["-a", timing, source2 + "/", rsync_dst + "/"])
+        rsync_result = _rsync(["-a", rs_timing, source2 + "/", rsync_dst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         rsync_tree = _tree(rsync_dst)
 
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(source, dest, flags=[timing], port=server.port)
+            result, _ = run_client(source, dest, flags=[fs_timing], port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
         fastsync_tree = _tree(received)
         assert fastsync_tree == rsync_tree, (
-            f"{timing}: fastsync tree {fastsync_tree} != rsync tree {rsync_tree}"
+            f"{fs_timing} vs rsync {rs_timing}: fastsync tree {fastsync_tree} != "
+            f"rsync tree {rsync_tree}"
         )
 
 
@@ -258,7 +276,8 @@ class TestDeleteTimingTypeConflictParity:
     @pytest.mark.parametrize("timing", ["--delete-during", "--delete-delay"])
     @requires_rsync
     def test_type_conflicts_match_rsync(self, timing):
-        source = os.path.join(TEST_DATA_DIR, "dtc_src")
+        label = timing.lstrip("-")
+        source = os.path.join(TEST_DATA_DIR, f"dtc_{label}_src")
         clean_dir(source)
         _write(os.path.join(source, "foo"), b"now a file\n")
         _write(os.path.join(source, "bar", "inner.txt"), b"now a dir\n")
@@ -268,13 +287,13 @@ class TestDeleteTimingTypeConflictParity:
             _write(os.path.join(root, "foo", "inner.txt"), b"was a dir\n")
             _write(os.path.join(root, "bar"), b"was a file\n")
 
-        rsync_dst = os.path.join(TEST_DATA_DIR, "dtc_rsync_dst")
+        rsync_dst = os.path.join(TEST_DATA_DIR, f"dtc_{label}_rsync_dst")
         seed_dest(rsync_dst)
         rsync_result = _rsync(["-a", timing, source + "/", rsync_dst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         rsync_tree = _tree(rsync_dst)
 
-        dest = os.path.join(TEST_DATA_DIR, "dtc_dst")
+        dest = os.path.join(TEST_DATA_DIR, f"dtc_{label}_dst")
         clean_dir(dest)
         received = get_dest_received_dir(dest, source)
         seed_dest(received)
@@ -288,17 +307,28 @@ class TestDeleteTimingTypeConflictParity:
 
 
 class TestDeleteTimingFailure:
-    """A mid-transfer failure distinguishes during from delay."""
+    """A mid-transfer failure distinguishes the during timings from the late
+    commit timings.
+
+    Plain ``--delete`` must behave like ``--delete-during`` (the rsync default),
+    removing the extras of the directories already reached; ``--delete-commit``
+    must behave like ``--delete-after`` and remove nothing until the transfer
+    has fully succeeded.
+    """
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_during_removes_delay_preserves_on_failure(self, mt):
-        source, dest, received = _seed_pair("failure", big=True)
+        source, dest, received = _seed_pair(f"failure_mt{int(mt)}", big=True)
         extra = os.path.join(received, "d", "old_extra")
         assert os.path.exists(extra)
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            for timing, expect_removed in (("--delete-during", True),
-                                           ("--delete-delay", False)):
+            for timing, expect_removed in (
+                    ("--delete-during", True),
+                    ("--delete", True),
+                    ("--delete-delay", False),
+                    ("--delete-commit", False),
+                    ("--delete-after", False)):
                 # Re-seed the extra before each run.
                 _write(extra, b"stale extra\n")
                 proxy = _SlicingProxy(server.port, forward_limit=MID_TRANSFER_BYTES, throttle=PROXY_THROTTLE)
@@ -313,13 +343,99 @@ class TestDeleteTimingFailure:
                 )
 
 
+class TestDeleteDelayDeletedCount:
+    """The reported deleted count must reflect entries actually removed."""
+
+    def test_refilled_deferred_dir_is_recursively_removed_and_counted(self):
+        """A directory snapshotted into a --delete-delay plan that is refilled
+        before the commit is re-scanned and removed recursively (rsync parity):
+        the late file and the directory are both counted as deleted."""
+        source = os.path.join(TEST_DATA_DIR, "ddc_src")
+        dest = os.path.join(TEST_DATA_DIR, "ddc_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        _write(os.path.join(source, "d", "keep.txt"), b"kept payload\n")
+        _write(os.path.join(source, "d", "big.bin"), b"B" * BIG_BYTES)
+        received = get_dest_received_dir(dest, source)
+        extra_dir = os.path.join(received, "d", "extradir")
+        os.makedirs(extra_dir, exist_ok=True)
+
+        def hook():
+            # Runs while big.bin is in flight, after d's delete plan was processed.
+            _write(os.path.join(extra_dir, "new.txt"), b"created mid-transfer\n")
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            proxy = _SlicingProxy(server.port, hook=hook, hook_after=MID_TRANSFER_BYTES,
+                                  throttle=PROXY_THROTTLE, wait_for_reply=True)
+            flags = ["--delete-delay", "--incremental", "--ignore-times", "--stats"]
+            result, _ = run_client(source, dest, flags=flags, port=proxy.port)
+            proxy.finish()
+        assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+        assert proxy.hook_called.is_set(), "hook never fired"
+        assert not os.path.exists(os.path.join(extra_dir, "new.txt")), "late file survived"
+        assert not os.path.isdir(extra_dir), "refilled extra dir survived"
+        deleted = None
+        for line in result.stdout.splitlines():
+            if line.startswith("Number of deleted files:"):
+                deleted = int(line.split(":", 1)[1].split()[0])
+        assert deleted == 2, (deleted, result.stdout)
+
+
+class TestDeleteDelayMaxDeleteParity:
+    """--max-delete with --delete-delay: a partial deletion still reports the
+    number of entries actually removed, matching rsync (the exact surviving set
+    can differ; only the count is compared)."""
+
+    @requires_rsync
+    def test_max_delete_count_matches_rsync(self):
+        source = os.path.join(TEST_DATA_DIR, "ddm_src")
+        rsync_dst = os.path.join(TEST_DATA_DIR, "ddm_rsync_dst")
+        clean_dir(source)
+        clean_dir(rsync_dst)
+        _write(os.path.join(source, "d", "keep.txt"), b"keep\n")
+        for i in range(1, 6):
+            _write(os.path.join(rsync_dst, "d", f"e{i}.txt"), f"extra{i}\n".encode())
+
+        rsync_result = _rsync(["-a", "--delete-delay", "--max-delete=2", "--stats",
+                               source + "/", rsync_dst + "/"])
+        # rsync exits 25 ("the --max-delete limit stopped deletions").
+        assert rsync_result.returncode == 25, rsync_result.stderr
+        rsync_count = _deleted_count(rsync_result.stdout)
+        assert rsync_count == 2, rsync_result.stdout
+
+        dest = os.path.join(TEST_DATA_DIR, "ddm_dst")
+        clean_dir(dest)
+        received = get_dest_received_dir(dest, source)
+        for i in range(1, 6):
+            _write(os.path.join(received, "d", f"e{i}.txt"), f"extra{i}\n".encode())
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(
+                source, dest,
+                flags=["--delete-delay", "--max-delete=2", "--stats"],
+                port=server.port,
+            )
+        # A capped --max-delete commit is a successful transfer that both tools
+        # report with exit 25.
+        assert result.returncode == 25, (result.stderr or result.stdout)[:300]
+        assert _deleted_count(result.stdout) == rsync_count, result.stdout
+
+
+def _deleted_count(text):
+    for line in text.splitlines():
+        if line.startswith("Number of deleted files:"):
+            return int(line.split(":", 1)[1].split()[0])
+    return None
+
+
 class TestDeleteDelayVsAfterSnapshot:
     """A destination entry created after its directory's scan survives under
     --delete-delay but is removed by --delete-after's fresh end scan."""
 
     @pytest.mark.parametrize("mt", [False, True])
     def test_late_created_extra_survives_delay_not_after(self, mt):
-        source, dest, received = _seed_pair("latecreate", big=True)
+        source, dest, received = _seed_pair(f"latecreate_mt{int(mt)}", big=True)
         old_extra = os.path.join(received, "d", "old_extra")
         new_extra = os.path.join(received, "d", "new_extra")
         with ServerManager() as server:
@@ -356,3 +472,68 @@ class TestDeleteDelayVsAfterSnapshot:
                     f"{timing} (mt={mt}): new_extra present="
                     f"{os.path.exists(new_extra)}, expected survives={new_survives}"
                 )
+
+
+class TestDeleteAfterThreadsKeepSet:
+    """Regression: -j/--threads must still transmit the delete keep-set in every
+    timing.  PipelineContextSender.delete_suppressed was left uninitialized, so a
+    garbage true silently skipped the late keep-set manifest under --threads.
+    Plain --delete now uses the per-directory plans, while --delete-commit /
+    --delete-after keep exercising the late whole-tree manifest."""
+
+    @pytest.mark.parametrize("delete_flag", ["--delete", "--delete-commit", "--delete-after"])
+    def test_threads_delete_after_sends_keep_set(self, delete_flag):
+        source, dest, received = _seed_pair("mtkeep")
+        extra = os.path.join(received, "d", "old_extra")
+        assert os.path.exists(extra)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest, flags=["--threads", delete_flag],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert not os.path.exists(extra), (
+            f"{delete_flag} --threads did not remove an extra: delete keep-set was suppressed"
+        )
+
+class TestDeleteDelayMaxDeleteRefilledDir:
+    """--delete-delay charges the --max-delete budget on ACTUAL removals: the
+    refilled directory's late content is removed first (consuming the one slot),
+    so the directory itself and a later extra are skipped, matching rsync.
+
+    The refilled directory is at the destination ROOT (its plan is always sent
+    first) and the skipped extra is under a separate source directory, so the
+    ordering that decides the budget charge is deterministic -- not readdir
+    order.  The refill is injected through the byte-barrier proxy so it is
+    causally after the plan frame."""
+
+    def test_budget_charged_on_actual_removal(self):
+        source = os.path.join(TEST_DATA_DIR, "ddmb_src")
+        dest = os.path.join(TEST_DATA_DIR, "ddmb_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        _write(os.path.join(source, "a", "keep.bin"), b"B" * BIG_BYTES)
+        _write(os.path.join(source, "b", "keep.txt"), b"keep\n")
+        received = get_dest_received_dir(dest, source)
+        refilled_dir = os.path.join(received, "xdir")
+        os.makedirs(refilled_dir, exist_ok=True)
+        later_dir = os.path.join(received, "b", "ydir")
+        os.makedirs(later_dir, exist_ok=True)
+
+        def hook():
+            _write(os.path.join(refilled_dir, "new.txt"), b"created mid-transfer\n")
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            proxy = _SlicingProxy(server.port, hook=hook, hook_after=MID_TRANSFER_BYTES,
+                                  throttle=PROXY_THROTTLE, wait_for_reply=True)
+            flags = ["--delete-delay", "--max-delete=1", "--incremental", "--ignore-times", "--stats"]
+            result, _ = run_client(source, dest, flags=flags, port=proxy.port)
+            proxy.finish()
+        assert result.returncode == 25, (result.stderr or result.stdout)[:400]
+        assert proxy.hook_called.is_set(), "hook never fired"
+        # The late content consumes the single budget slot; the refilled
+        # directory itself and the later extra are skipped.
+        assert not os.path.exists(os.path.join(refilled_dir, "new.txt")), "late file survived"
+        assert os.path.isdir(later_dir), "later extra was not skipped by the budget"
+        # The one actual removal is reported.
+        assert _deleted_count(result.stdout) == 1, result.stdout

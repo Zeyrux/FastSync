@@ -5,6 +5,7 @@
 #include "config.h"
 #include "file_receive.h"
 #include "protocol.h"
+#include "utils.h"
 #include <stdbool.h>
 
 /* Per-directory delete plans (protocol 2.24.0).
@@ -47,11 +48,14 @@ void delete_plan_sender_finalize(DeletePlanSender* sender, const ArrayList* sync
    Directory keep entries do not count, so an I/O error that hid every file
    still refuses to delete. */
 bool delete_plan_sender_empty(const DeletePlanSender* sender);
-/* Attach the global config sections advertised on the first plan frame. */
+/* Attach the global config sections advertised on the first plan frame.  The
+ * block is always transmitted by delete_plan_send_root(), on a config-only
+ * carrier frame when the scope allows no directory plan. */
 void delete_plan_sender_set_config(DeletePlanSender* sender, const ArrayList* protected_prefixes,
                                    const ArrayList* size_skipped, const ArrayList* missing_args);
 /* Send the root plan (even before any data, so root extras are handled like
- * rsync's first generator directory).  Returns -1 on I/O error. */
+ * rsync's first generator directory), after transmitting the per-run config
+ * block on its own carrier frame.  Returns -1 on I/O error. */
 int delete_plan_send_root(int fd, DeletePlanSender* sender);
 /* Send the plans for every ancestor of `path` (root-first) and, when is_dir,
  * for `path` itself; already-sent plans are skipped. */
@@ -76,8 +80,16 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
 DeleteCommitResult delete_plan_session_commit(DeletePlanSession* session, const Config* config);
 /* True once the shared --max-delete budget stopped part of a deletion. */
 bool delete_plan_session_limit_reached(const DeletePlanSession* session);
-/* Number of destination entries the session's plans removed (or, for
-   --delete-delay, snapshotted for removal), for the end-of-transfer stats. */
+/* Number of destination entries the session actually removed, for the
+   end-of-transfer stats.  For --delete-delay this excludes a snapshotted entry
+   that survived (e.g. a refilled directory that failed ENOTEMPTY), even though
+   that entry already consumed --max-delete budget at snapshot time. */
 size_t delete_plan_session_deleted(const DeletePlanSession* session);
+/* Install an observer invoked for every destination-relative path the session
+   truly removes (including the deferred --delete-delay commit), so the receiver
+   can report rsync's `deleting PATH` lines through the terminal STATUS_STATS
+   record.  Pass NULL/0 to clear. */
+void delete_plan_session_set_delete_observer(DeletePlanSession* session,
+                                             DeletePathObserver observer, void* context);
 
 #endif

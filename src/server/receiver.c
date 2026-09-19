@@ -61,13 +61,18 @@ bool receiver_send_final_success(int fd, const Config* config, const ReceiverOut
 }
 
 bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats* stats,
-                               const struct ArrayList* would_delete) {
+                               const struct ArrayList* would_delete,
+                               const struct ArrayList* deleted_paths) {
   if (!config->report_stats)
     return true;
   ReceiverStats local;
   memset(&local, 0, sizeof(local));
   const ReceiverStats* out = stats ? stats : &local;
-  size_t count = would_delete ? (size_t)would_delete->size : 0;
+  /* The path list carries the dry-run would-delete set for a -n run and the
+     actually-removed set for a real --info=del run. */
+  const struct ArrayList* paths =
+      config->dry_run ? would_delete : (config->report_deletes ? deleted_paths : NULL);
+  size_t count = paths ? (size_t)paths->size : 0;
   if (count > (size_t)MAX_MANIFEST_ENTRIES)
     count = MAX_MANIFEST_ENTRIES;
   ReceiverStats record = *out;
@@ -76,7 +81,7 @@ bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats
       !send_int(fd, (int)count))
     return false;
   for (size_t i = 0; i < count; i++) {
-    const char* path = (const char*)would_delete->items[i];
+    const char* path = (const char*)paths->items[i];
     if (!send_wire_str(fd, path ? path : ""))
       return false;
   }
@@ -88,6 +93,25 @@ bool receiver_send_stats_frame(int fd, const Config* config, const ReceiverStats
 static void receiver_tally_deleted(const ReceiverSink* sink, size_t deleted) {
   if (sink && sink->stats && deleted > 0)
     sink->stats->deleted_files += deleted;
+}
+
+/* Observer for --info=del: record each truly-removed destination-relative path
+   in the ArrayList passed as the observer context, so the terminal STATUS_STATS
+   frame can list it.  A failed append is best-effort (the deletion already
+   happened; output is cosmetic).  Shared by the single-threaded receiver and
+   the -m pipeline's deferred commit. */
+void receiver_record_deleted_path(void* context, const char* rel_path) {
+  ArrayList* paths = context;
+  if (!paths || !rel_path)
+    return;
+  /* Bound the retained list like the keep-set manifest: only MAX_MANIFEST_ENTRIES
+     paths are ever transmitted in the terminal STATUS_STATS frame, so recording
+     more only grows memory.  A hostile/huge deletion set is therefore capped. */
+  if ((size_t)paths->size >= (size_t)MAX_MANIFEST_ENTRIES)
+    return;
+  char* copy = str_dup(rel_path);
+  if (copy && !array_list_add(paths, copy))
+    free(copy);
 }
 
 static bool receiver_process_chunk(Chunk* chunk, const ReceiverSink* sink) {
@@ -281,14 +305,16 @@ int receiver_process(Config* config, int file_descriptor, const ReceiverSink* si
 
 /* Runs the whole receive loop.  The delete manifest may legitimately arrive
    either FIRST (--delete-before / --delete-during: the sender transmits the
-   validated keep-set before any file data) or LAST (plain --delete /
-   --delete-after / --delete-delay: the manifest closes the data stream).  In
+   validated keep-set before any file data) or LAST (--delete-after /
+   --delete-commit / --delete-delay: the manifest closes the data stream).  In
    the early modes the receiver deletes as soon as the manifest has been read
    and acknowledges with STATUS_OK so the sender only starts streaming once the
    deletion has committed (or failed); in the late modes the manifest is held
    and the deletion is committed only after the terminal STATUS_FINISHED proves
-   the whole transfer succeeded.  See receiver_process_pending() for how the -m
-   receiver defers that commit until its disk writer has drained. */
+   the whole transfer succeeded.  A plain --delete defaults to the per-directory
+   delete-during plan mode (no manifest at all).  See
+   receiver_process_pending() for how the -m receiver defers that commit until
+   its disk writer has drained. */
 int receiver_process_pending(Config* config, int file_descriptor, const ReceiverSink* sink,
                              DeleteManifest** pending_manifest, DeletePlanSession** pending_plans) {
   Status status;
@@ -398,9 +424,13 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
            --max-delete-capped commit still succeeds and the transfer proceeds;
            the terminal success frame reports the cap. */
         size_t deleted = 0;
-        DeleteCommitResult deletion = (config->use_delete || config->delete_missing_args)
-                                          ? manifest_delete_all_counted(config, manifest, &deleted)
-                                          : DELETE_COMMIT_OK;
+        DeletePathObserver observer =
+            (config->report_deletes && sink->deleted_paths) ? receiver_record_deleted_path : NULL;
+        DeleteCommitResult deletion =
+            (config->use_delete || config->delete_missing_args)
+                ? manifest_delete_all_observed(config, manifest, &deleted, observer,
+                                               (void*)sink->deleted_paths)
+                : DELETE_COMMIT_OK;
         receiver_tally_deleted(sink, deleted);
         delete_manifest_free(manifest);
         if (deletion == DELETE_COMMIT_ERROR) {
@@ -435,8 +465,12 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
         send_status(file_descriptor, STATUS_ERROR);
         goto fail;
       }
-      if (!plan_session)
+      if (!plan_session) {
         plan_session = delete_plan_session_create(config);
+        if (plan_session && config->report_deletes && sink->deleted_paths)
+          delete_plan_session_set_delete_observer(plan_session, receiver_record_deleted_path,
+                                                  (void*)sink->deleted_paths);
+      }
       if (!plan_session || delete_plan_session_receive(plan_session, config, file_descriptor) != 0)
         goto fail;
       if (delete_plan_session_limit_reached(plan_session) && !delete_limit_noted &&
@@ -479,8 +513,10 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
       deferred_manifest = NULL;
     } else {
       size_t deleted = 0;
-      DeleteCommitResult deletion =
-          manifest_delete_all_counted(config, deferred_manifest, &deleted);
+      DeletePathObserver observer =
+          (config->report_deletes && sink->deleted_paths) ? receiver_record_deleted_path : NULL;
+      DeleteCommitResult deletion = manifest_delete_all_observed(
+          config, deferred_manifest, &deleted, observer, (void*)sink->deleted_paths);
       receiver_tally_deleted(sink, deleted);
       delete_manifest_free(deferred_manifest);
       deferred_manifest = NULL;
@@ -498,6 +534,9 @@ int receiver_process_pending(Config* config, int file_descriptor, const Receiver
      hands the session to its caller instead, which commits after the disk
      writer drained. */
   if (plan_session) {
+    if (config->report_deletes && sink->deleted_paths)
+      delete_plan_session_set_delete_observer(plan_session, receiver_record_deleted_path,
+                                              (void*)sink->deleted_paths);
     if (pending_plans) {
       *pending_plans = plan_session;
       plan_session = NULL;
@@ -569,11 +608,15 @@ typedef struct {
      --delete would-delete path list collected while processing the manifest. */
   ReceiverStats stats;
   ArrayList* would_delete;
+  /* --info=del: actually-removed paths collected during the delete commit. */
+  ArrayList* deleted_paths;
 } ReceiverSaveContext;
 
 static bool receiver_save_file(File* file, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
   FileSaveResult result = FILE_SAVE_ERROR;
+  bool created = false;
+  unsigned created_dirs = 0;
   if (context->config->dry_run) {
     /* Defense in depth: a dry-run receiver mutates nothing even if a data
        frame reaches the sink (the sender is not supposed to send one). */
@@ -583,12 +626,17 @@ static bool receiver_save_file(File* file, void* context_pointer) {
        --remove-source-files sender keeps its source. */
     result = FILE_SAVE_SKIPPED;
   } else {
-    result = file_save_to_disk_full(context->config->receive_root_directory, file, context->config);
+    result = file_save_to_disk_full_ex(context->config->receive_root_directory, file,
+                                       context->config, &created, &created_dirs);
   }
   /* Wire-stats tally: bytes reconstructed from the basis file (delta matches)
      count as matched data in the end-of-transfer report. */
   if (result != FILE_SAVE_ERROR && file->matched_bytes > 0)
     context->stats.matched_data += file->matched_bytes;
+  /* Protocol 2.28.0: receiver-observed literal bytes and the created-entry
+     breakdown (regular/dir/link/special) for the `--stats` report. */
+  if (result == FILE_SAVE_WRITTEN)
+    receiver_stats_note_saved(&context->stats, file, created, created_dirs);
   /* A directory's metadata is deferred, never applied inline: collect it now
      and apply it at the end.  -O/--omit-dir-times and --preserve_perms/-times
      are honored by dir_metadata_list_apply's caller (see
@@ -621,7 +669,8 @@ static void receiver_note_delete_limit(void* context_pointer) {
 static bool receiver_send_success_frame(int fd, void* context_pointer) {
   ReceiverSaveContext* context = context_pointer;
   Status final_status = context->delete_limit_reached ? STATUS_DELETE_LIMIT : STATUS_OK;
-  if (!receiver_send_stats_frame(fd, context->config, &context->stats, context->would_delete))
+  if (!receiver_send_stats_frame(fd, context->config, &context->stats, context->would_delete,
+                                 context->deleted_paths))
     return false;
   /* Server-contacting --dry-run: nothing was staged or written, so there is
      nothing to publish and no directory times to stamp. */
@@ -651,8 +700,15 @@ int receiver_receive_files(Config* config, int file_descriptor) {
   ReceiverSaveContext context = {.config = config, .outcomes = {0}};
   dir_time_list_init(&context.dir_times);
   context.would_delete = array_list_create(free);
-  if (!context.would_delete)
+  /* report_deletes (--info=del / -i / --out-format under --delete) is the only
+     reason to retain the actually-removed paths; a plain --delete must not
+     str_dup every removal.  NULL is handled by every consumer. */
+  context.deleted_paths = config->report_deletes ? array_list_create(free) : NULL;
+  if (!context.would_delete || (config->report_deletes && !context.deleted_paths)) {
+    array_list_delete(context.would_delete);
+    array_list_delete(context.deleted_paths);
     return -1;
+  }
   ReceiverSink sink = {receiver_save_file,
                        &context,
                        true,
@@ -660,12 +716,14 @@ int receiver_receive_files(Config* config, int file_descriptor) {
                        receiver_send_success_frame,
                        receiver_note_delete_limit,
                        &context.stats,
-                       context.would_delete};
+                       context.would_delete,
+                       context.deleted_paths};
   int ret = receiver_process(config, file_descriptor, &sink);
   if (ret != 0 && config->delay_updates && config->delay_context)
     delay_updates_cleanup(config->delay_context);
   receiver_outcomes_destroy(&context.outcomes);
   dir_time_list_free(&context.dir_times);
   array_list_delete(context.would_delete);
+  array_list_delete(context.deleted_paths);
   return ret;
 }

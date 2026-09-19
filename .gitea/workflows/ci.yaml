@@ -49,6 +49,47 @@ jobs:
         if: github.event_name == 'push'
         run: python3 -m pytest tests/integration/ -n 4 --dist=load -m "not setpriv" --durations=25 --tb=short -q
 
+  # Differential rsync-parity gate: runs real rsync 3.4.1 and FastSync over the
+  # same corpora and compares destinations + normalized output.  The fast subset
+  # guards the ✅ surface on every PR; the full set (with FASTSYNC_PARITY_STRICT
+  # so a fixed caveat must be removed from the allowlist) burns the documented
+  # ⚠️/❌ residuals down on push.  See tests/integration/README.md.
+  parity-fast:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v11
+    needs: lint
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Configure
+        run: cmake -B build -S . -DSTRICT_WARNINGS=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Differential parity (fast subset)
+        run: python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity_ci -q
+
+  parity-full:
+    runs-on: ubuntu-latest
+    container: gitea.tap-tap.win/taptap/fastsync-ci:v11
+    needs: lint
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Configure
+        run: cmake -B build -S . -DSTRICT_WARNINGS=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Differential parity (full set)
+        run: FASTSYNC_PARITY_STRICT=1 python3 -m pytest tests/integration/test_differential_parity.py -n 4 --dist=load -m parity -q
+
   sanitizers:
     runs-on: ubuntu-latest
     container: gitea.tap-tap.win/taptap/fastsync-ci:v11

@@ -3,6 +3,7 @@
 
 #include "config.h"
 #include "file_types.h"
+#include "utils.h"
 #include <stdbool.h>
 
 /* Server-side file receive/save path. */
@@ -23,6 +24,16 @@ File* file_receive_hardlink(int file_descriptor);
 File* file_receive_symlink(int file_descriptor, const Config* config);
 File* file_receive_special(int file_descriptor);
 bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode);
+/* Testable basis quick-check / verification policy.  file_basis_quick_match is
+ * rsync's metadata quick-check for a basis candidate (equal size is required
+ * separately by the caller; this adds the --size-only / mtime / --modify-window
+ * leg).  file_basis_content_required reports whether a hit must ALSO be
+ * confirmed by a whole-file content digest (--verify-basis; false is the
+ * default rsync-parity behavior). */
+bool file_basis_quick_match(const Config* config, const struct stat* st, time_t check_mtime,
+                            long check_mtime_nsec);
+bool file_basis_content_required(const Config* config);
+
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 /* Extended variant used by the receiver.  `would_transfer` (may be NULL) is set
  * true only on the server-contacting --dry-run path when the file is not up to
@@ -126,6 +137,13 @@ bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest
 bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
                                           size_t max_delete, size_t* deleted, size_t* skipped,
                                           bool* limit_hit);
+/* Observer-aware form of manifest_delete_missing_args_limited: `observer` (may
+   be NULL) is invoked for every destination-relative path truly removed. */
+bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteManifest* manifest,
+                                                   size_t max_delete, size_t* deleted,
+                                                   size_t* skipped, bool* limit_hit,
+                                                   DeletePathObserver observer,
+                                                   void* observer_context);
 /* Outcome of committing a delete manifest.  LIMIT_REACHED reports rsync's
    partial --max-delete result: the budget allowed some deletions and the rest
    were skipped (the run still stores all file data but the client exits 25). */
@@ -146,6 +164,11 @@ DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* man
    removed (for the end-of-transfer wire stats).  `deleted` may be NULL. */
 DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
                                                size_t* deleted);
+/* Observer-aware form of manifest_delete_all_counted: `observer` (may be NULL)
+   is invoked for every destination-relative path truly removed. */
+DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteManifest* manifest,
+                                                size_t* deleted, DeletePathObserver observer,
+                                                void* observer_context);
 
 /* -n/--dry-run --delete would-delete reporting: walk the destination exactly as
    the delete pass would and append (strdup'd) destination-relative paths that
@@ -166,6 +189,22 @@ typedef enum { FILE_SAVE_ERROR = 0, FILE_SAVE_WRITTEN = 1, FILE_SAVE_SKIPPED = 2
 
 FileSaveResult file_save_to_disk_full(const char* root_directory, const File* file,
                                       const Config* config);
+/* Protocol 2.28.0 variant: also reports through `created` (when non-NULL)
+ * whether the destination entry did not exist before this save, and through
+ * `created_dirs` how many parent directories the confined walk created, so the
+ * receiver can build rsync's `Number of created files` breakdown.  The plain
+ * file_save_to_disk_full() is this with both out-params NULL. */
+FileSaveResult file_save_to_disk_full_ex(const char* root_directory, const File* file,
+                                         const Config* config, bool* created,
+                                         unsigned* created_dirs);
 bool file_save_to_disk(const char* root_directory, const File* file, const Config* config);
+
+/* Protocol 2.28.0 receiver counter accumulator: fold one successfully saved
+ * entry into `stats`, adding its receiver-observed literal bytes and, when
+ * `created`, the matching created-by-type counter (regular file / symlink /
+ * special) plus `created_dirs` implicitly-created parent directories.
+ * Non-first hardlink siblings contribute no literal bytes. */
+void receiver_stats_note_saved(ReceiverStats* stats, const File* file, bool created,
+                               unsigned created_dirs);
 
 #endif

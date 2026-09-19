@@ -23,6 +23,7 @@
 #include <langinfo.h>
 #include <limits.h>
 #include <locale.h>
+#include <math.h>
 #include <time.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -160,10 +161,16 @@ static int set_compression_choice(Config* config, const char* value) {
     return -1;
   }
   int algo;
-  if (strcasecmp(value, "auto") == 0)
-    algo = (int)compression_negotiate_default();
-  else
+  if (strcasecmp(value, "auto") == 0) {
+    algo = compression_choice_resolve();
+    if (algo < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+  } else {
     algo = compression_algo_from_name(value);
+  }
   if (algo < 0) {
     log_message(LOG_LEVEL_ERROR,
                 "--compress-choice '%s' is not a supported algorithm; FastSync supports zstd, "
@@ -227,16 +234,25 @@ static int set_checksum_choice(Config* config, const char* value) {
     config->cli_exit_code = 4;
     return -1;
   }
-  ChecksumAlgo negotiated = checksum_negotiate_default();
+  int negotiated = -1;
+  if (rc1 == 1 || rc2 == 1) {
+    negotiated = checksum_choice_resolve();
+    if (negotiated < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+  }
   if (rc1 == 1)
-    transfer = (int)negotiated;
+    transfer = negotiated;
   if (!name2)
     pre = transfer;
   else if (rc2 == 1)
-    pre = (int)negotiated;
+    pre = negotiated;
 
   config->checksum_algo = pre;
   config->checksum_transfer_algo = transfer;
+  config->checksum_choice_set = true;
   /* rsync: "none" for the transfer checksum forces --whole-file. */
   if (transfer == (int)CHECKSUM_ALGO_NONE)
     config->whole_file = true;
@@ -501,7 +517,10 @@ static bool is_accepted_debug_category(const char* name) {
 
 static bool is_accepted_info_category(const char* name) {
   static const char* const categories[] = {
-      "backup", "del", "flist", "mount", "nonreg", "progress", "remove", "syms", "symsafe",
+      "backup",
+      "mount",
+      "syms",
+      "symsafe",
   };
   for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
     if (strcmp(name, categories[i]) == 0)
@@ -608,14 +627,36 @@ static int parse_info_flags(const char* value, Config* config) {
       free(flags);
       return 1;
     }
-    if (strcmp(name, "copy") == 0 || strcmp(name, "name") == 0)
+    if (strcmp(name, "copy") == 0)
       flag = LOG_INFO_COPY;
-    else if (strcmp(name, "misc") == 0)
+    else if (strcmp(name, "name") == 0) {
+      /* name level 2 adds rsync's "is uptodate" lines. */
+      if (level == 0)
+        parsed &= ~(uint32_t)(LOG_INFO_NAME | LOG_INFO_NAME_UPTODATE);
+      else {
+        parsed |= LOG_INFO_NAME;
+        if (level >= 2)
+          parsed |= LOG_INFO_NAME_UPTODATE;
+        else
+          parsed &= ~(uint32_t)LOG_INFO_NAME_UPTODATE;
+      }
+      continue;
+    } else if (strcmp(name, "misc") == 0)
       flag = LOG_INFO_MISC;
     else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;
     else if (strcmp(name, "stats") == 0)
       flag = LOG_INFO_STATS;
+    else if (strcmp(name, "del") == 0)
+      flag = LOG_INFO_DEL;
+    else if (strcmp(name, "remove") == 0)
+      flag = LOG_INFO_REMOVE;
+    else if (strcmp(name, "flist") == 0)
+      flag = LOG_INFO_FLIST;
+    else if (strcmp(name, "nonreg") == 0)
+      flag = LOG_INFO_NONREG;
+    else if (strcmp(name, "progress") == 0)
+      flag = LOG_INFO_PROGRESS;
     else if (is_accepted_info_category(name))
       continue;
     else {
@@ -956,6 +997,12 @@ static const OptionEntry OPTION_TABLE[] = {
     {"--delete-during", "--del", OPT_FLAG, offsetof(Config, delete_during)},
     {"--delete-delay", NULL, OPT_FLAG, offsetof(Config, delete_delay)},
     {"--delete-after", NULL, OPT_FLAG, offsetof(Config, delete_after)},
+    /* FastSync-only long spelling of the late whole-tree commit, which selects
+       the same timing as rsync's --delete-after in FastSync (the whole-tree
+       keep-set manifest is committed only after the entire transfer succeeded).
+       Plain --delete now defaults to delete-during, so this restores the old
+       FastSync behavior; it maps onto the same delete_after wire field. */
+    {"--delete-commit", NULL, OPT_FLAG, offsetof(Config, delete_after)},
     {"--delete-excluded", NULL, OPT_FLAG, offsetof(Config, delete_excluded)},
     {"--max-delete", NULL, OPT_SIGNED_INT, offsetof(Config, max_delete)},
     {"--ignore-errors", NULL, OPT_FLAG, offsetof(Config, ignore_errors)},
@@ -1013,6 +1060,11 @@ static const OptionEntry OPTION_TABLE[] = {
      * --remote-option is parsed.  --trust-sender is a local receiver policy and
      * never travels to the remote peer. */
     {"--trust-sender", NULL, OPT_FLAG, offsetof(Config, trust_sender)},
+    /* FastSync-only (not an rsync option): require a basis-hit's content to
+     * match the source by whole-file digest instead of trusting rsync's
+     * size+mtime quick-check.  Long-only; crosses the wire so the receiver
+     * performs the extra read/hash. */
+    {"--verify-basis", NULL, OPT_FLAG, offsetof(Config, verify_basis)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -1055,6 +1107,7 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"xattrs", "X", offsetof(Config, preserve_xattrs)},
     {"acls", "A", offsetof(Config, preserve_acls)},
     {"fake-super", NULL, offsetof(Config, fake_super)},
+    {"verify-basis", NULL, offsetof(Config, verify_basis)},
 };
 
 static bool opt_is(const char* arg, const char* name, const char* alias) {
@@ -1438,6 +1491,8 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
         ctx->exit_code = -1;
         return true;
       }
+      if (entry->offset == offsetof(Config, compression_level))
+        config->compression_level_set = true;
       if (entry->offset == offsetof(Config, chmod_spec)) {
         mode_t ignored;
         if (!chmod_apply(0, config->chmod_spec, &ignored)) {
@@ -1464,7 +1519,9 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
   if (entry->offset == offsetof(Config, per_dir_filter) && config->per_dir_filter_count < INT_MAX)
     config->per_dir_filter_count++;
   /* A delete-timing flag selects when --delete removes extras, so it
-     implies --delete exactly like the rsync options do. */
+     implies --delete exactly like the rsync options do.  --delete-commit (the
+     FastSync-only late-commit spelling) is mapped onto delete_after and so is
+     covered here too. */
   if (entry->offset == offsetof(Config, delete_before) ||
       entry->offset == offsetof(Config, delete_during) ||
       entry->offset == offsetof(Config, delete_delay) ||
@@ -1722,6 +1779,7 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
           return true;
         }
         config->compression_level = (int)level;
+        config->compression_level_set = true;
         log_info_message(LOG_INFO_MISC, "Set Compression level to %ld", level);
         ctx->i++;
       }
@@ -1819,22 +1877,130 @@ static int set_log_file_option(Config* config, const char* log_path) {
   return 0;
 }
 
-/* Apply a --bwlimit value (kilobytes per second).  Returns 0 on success, -1 on
- * error. */
+/* Faithful port of rsync 3.4.1's `parse_size_arg(bwlimit_arg, 'K', "bwlimit",
+ * 512, -1, True)`: a default KiB suffix, binary (1024) multipliers unless a
+ * `b`/`B` decimal suffix or explicit `iB` is given, an optional decimal
+ * fraction, the P/T/G/M/K suffixes, and the special rules that a value of 0
+ * means "no limit" while any other value below 512 bytes is rejected.  The
+ * parsed byte count is then quantized to whole KiB exactly like rsync's
+ * `bwlimit = (size + 512) / 1024`.  Returns 0 on success, -1 on a parse error. */
+static int parse_bwlimit_value(const char* value, unsigned long long* bytes_per_sec_out) {
+  if (!value || !bytes_per_sec_out)
+    return -1;
+  const char* arg = value;
+  int reps;
+  long long mult;
+  while (*arg >= '0' && *arg <= '9')
+    arg++;
+  if (*arg != '\0' && (*arg == '.' || *arg == localeconv()->decimal_point[0]))
+    for (arg++; *arg >= '0' && *arg <= '9'; arg++) {
+    }
+
+  char suffix = *arg && *arg != '+' && *arg != '-' ? *arg++ : 'K';
+  switch (suffix) {
+  case 'b':
+  case 'B':
+    reps = 0;
+    break;
+  case 'k':
+  case 'K':
+    reps = 1;
+    break;
+  case 'm':
+  case 'M':
+    reps = 2;
+    break;
+  case 'g':
+  case 'G':
+    reps = 3;
+    break;
+  case 't':
+  case 'T':
+    reps = 4;
+    break;
+  case 'p':
+  case 'P':
+    reps = 5;
+    break;
+  default:
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value);
+    return -1;
+  }
+  if (*arg == 'b' || *arg == 'B') {
+    mult = 1000;
+    arg++;
+  } else if (*arg == '\0' || *arg == '+' || *arg == '-') {
+    mult = 1024;
+  } else if ((arg[0] == 'i' || arg[0] == 'I') && (arg[1] == 'b' || arg[1] == 'B')) {
+    mult = 1024;
+    arg += 2;
+  } else {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is invalid", value);
+    return -1;
+  }
+
+  long long base = 1;
+  for (int i = 0; i < reps; i++) {
+    if (base > LLONG_MAX / mult) {
+      log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
+      return -1;
+    }
+    base *= mult;
+  }
+  /* rsync multiplies the numeric prefix (atof) by mult^reps in a signed
+   * ssize_t, which is undefined on overflow.  Scale in double and range-check
+   * before converting, so a huge value is rejected as "too large" (where
+   * rsync's overflow happens to land on a negative result) without invoking
+   * signed-overflow UB. */
+  double scaled = (double)base * strtod(value, NULL);
+  /* (double)LLONG_MAX rounds up to 2^63, which is itself out of range for the
+   * cast, so reject at >= that bound; LLONG_MIN == -2^63 is exactly
+   * representable and thus castable, so the lower bound stays strict. */
+  if (!isfinite(scaled) || scaled >= (double)LLONG_MAX || scaled < (double)LLONG_MIN) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
+    return -1;
+  }
+  long long size = (long long)scaled;
+  if ((*arg == '+' || *arg == '-') && arg[1] == '1' && arg != value) {
+    /* The only form accepted here is "+1"/"-1" (a longer number leaves a
+       trailing byte and is rejected below), so apply the delta directly and
+       guard the one overflow direction. */
+    if (*arg == '+') {
+      if (size == LLONG_MAX) {
+        log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
+        return -1;
+      }
+      size += 1;
+    } else {
+      size -= 1;
+    }
+    arg += 2;
+  }
+  if (*arg != '\0' || size < 0) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is %s", value, size < 0 ? "too large" : "invalid");
+    return -1;
+  }
+  if (size != 0 && size < 512) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too small (min: 512 or 0 for unlimited)", value);
+    return -1;
+  }
+  long long kib = size == 0 ? 0 : (size + 512) / 1024;
+  if (kib > (long long)(ULLONG_MAX / 1024)) {
+    log_message(LOG_LEVEL_ERROR, "--bwlimit=%s is too large", value);
+    return -1;
+  }
+  *bytes_per_sec_out = (unsigned long long)kib * 1024;
+  return 0;
+}
+
+/* Apply a --bwlimit value using rsync 3.4.1's units/semantics.  Returns 0 on
+ * success, -1 on error. */
 static int set_bwlimit_option(const char* value) {
-  unsigned long long kbps;
-  if (parse_ull_arg(value, &kbps, "--bwlimit") != 0)
+  unsigned long long bytes_per_sec;
+  if (parse_bwlimit_value(value, &bytes_per_sec) != 0)
     return -1;
-  if (kbps == 0) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit must be a positive integer");
-    return -1;
-  }
-  if (kbps > ULLONG_MAX / 1024) {
-    log_message(LOG_LEVEL_ERROR, "--bwlimit value too large");
-    return -1;
-  }
-  io_set_bwlimit(kbps * 1024);
-  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", kbps);
+  io_set_bwlimit(bytes_per_sec);
+  log_info_message(LOG_INFO_MISC, "Set bandwidth limit to %llu KB/s", bytes_per_sec / 1024);
   return 0;
 }
 
@@ -2409,6 +2575,18 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
  * -1 on error. */
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
   set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  /* rsync's plain --delete defaults to delete-during (--del): each directory's
+     extras are removed as that directory is processed, so space is freed
+     progressively and a tight destination never has to hold the whole old+new
+     tree at once.  The late whole-tree commit FastSync historically used is
+     still selected explicitly by --delete-after or by the FastSync-only long
+     spelling --delete-commit (an exact alias for --delete-after).  Resolve the
+     default on the client, before validation and before the config crosses the
+     wire, so exactly one timing flag is ever set; an explicit timing (including
+     --delete-commit) always wins. */
+  if (config->use_delete && !config->delete_before && !config->delete_during &&
+      !config->delete_delay && !config->delete_after)
+    config->delete_during = true;
   if (config->compress_choice) {
     int algo = compression_algo_from_name(config->compress_choice);
     if (algo >= 0) {
@@ -2416,8 +2594,43 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
       config->use_compression = (algo != (int)COMPRESSION_ALGO_NONE);
     }
   }
-  if (config->use_compression && config->compression_algo == (int)COMPRESSION_ALGO_NONE)
-    config->compression_algo = (int)compression_negotiate_default();
+  /* A bare -z (no --compress-choice) resolves like rsync's "auto": the
+   * RSYNC_COMPRESS_LIST preference list first, then the compiled-in order.  A
+   * list that names no supported codec is rsync's failed negotiation (exit 4). */
+  if (config->use_compression && !config->compress_choice) {
+    int resolved = compression_choice_resolve();
+    if (resolved < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+    config->compression_algo = resolved;
+    if (resolved == (int)COMPRESSION_ALGO_NONE)
+      config->use_compression = false;
+  }
+  /* Apply rsync's per-codec compression level: an explicit --compress-level is
+   * clamped to the codec's range, otherwise the codec's own default is used. */
+  if (config->use_compression) {
+    CompressionAlgo algo = (CompressionAlgo)config->compression_algo;
+    config->compression_level = config->compression_level_set
+                                    ? compression_clamp_level(algo, config->compression_level)
+                                    : compression_default_level(algo);
+    log_debug_message(LOG_DEBUG_UTIL, "Client compression: %s (level %d)",
+                      compression_algo_name(algo), config->compression_level);
+  }
+  /* The negotiated checksum is always resolved (rsync negotiates one for the
+   * delta strong sum even without --checksum): RSYNC_CHECKSUM_LIST first, then
+   * the compiled-in order.  An explicit --checksum-choice already set it. */
+  if (!config->checksum_choice_set) {
+    int resolved = checksum_choice_resolve();
+    if (resolved < 0) {
+      log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
+      config->cli_exit_code = 4;
+      return -1;
+    }
+    config->checksum_algo = resolved;
+    config->checksum_transfer_algo = resolved;
+  }
   /* rsync parity: "none" as the pre-transfer checksum cannot be combined with
    * --checksum (exit 4).  The check runs here because --checksum may appear on
    * either side of --checksum-choice. */
@@ -2549,8 +2762,15 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
       }
     }
   }
-  config->report_stats = config->stats || config->show_progress || format_needs_wire ||
-                         (config->dry_run && config->use_delete);
+  /* --info=del on a real --delete run asks the receiver to report the paths it
+     actually removed; the report rides the STATUS_STATS path list, so the wire
+     stats frame must be negotiated too. */
+  config->report_deletes = config->use_delete && !config->dry_run &&
+                           ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
+                            config->out_format != NULL);
+  config->report_stats = config->stats || config->show_progress ||
+                         (config->info_level & LOG_INFO_PROGRESS) || format_needs_wire ||
+                         config->report_deletes || (config->dry_run && config->use_delete);
   return 0;
 }
 

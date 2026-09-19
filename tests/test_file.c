@@ -6,6 +6,7 @@
 #include "file_receive.h"
 #include "data.h"
 #include "config.h"
+#include "charset.h"
 #include "utils.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -1807,6 +1808,159 @@ static void test_receive_incremental_check_empty_path() {
   config_delete(cfg);
 }
 
+/* Pure policy helpers behind the basis quick-check / --verify-basis decision. */
+static void test_file_basis_quick_match_decision() {
+  Config* cfg = config_create();
+  EXPECT_NOT_NULL(cfg);
+  EXPECT_FALSE(file_basis_content_required(cfg));
+  cfg->verify_basis = true;
+  EXPECT_TRUE(file_basis_content_required(cfg));
+  cfg->verify_basis = false;
+
+  struct stat st;
+  memset(&st, 0, sizeof(st));
+  st.st_mtime = 1500000000;
+#ifdef __linux__
+  st.st_mtim.tv_nsec = 500;
+#endif
+  /* Equal size is required by the caller; this leg is the mtime / --size-only
+     rule.  Equal mtime matches, a different mtime misses by default. */
+  EXPECT_TRUE(file_basis_quick_match(cfg, &st, 1500000000, 500));
+  EXPECT_FALSE(file_basis_quick_match(cfg, &st, 1500000001, 500));
+  cfg->size_only = true;
+  EXPECT_TRUE(file_basis_quick_match(cfg, &st, 1500000001, 500));
+  cfg->size_only = false;
+  cfg->modify_window = 2;
+  EXPECT_TRUE(file_basis_quick_match(cfg, &st, 1500000002, 500));
+  config_delete(cfg);
+}
+
+/* End-to-end handshake decision for a same-size, same-mtime, DIFFERENT-content
+   basis.  Default (rsync parity): the metadata quick-check is trusted, the
+   receiver answers STATUS_OK and materializes the basis bytes.  --verify-basis:
+   the whole-file digest is required, the basis is rejected and the receiver
+   asks for the source (STATUS_NEXT + full transfer). */
+static void test_receive_incremental_check_basis_quick_check_and_verify() {
+  const char* root = "test_basis_quick_root";
+  const char* basis_dir = "test_basis_quick_root/basis";
+  const char* basis_file = "test_basis_quick_root/basis/f.txt";
+  unlink(basis_file);
+  unlink("test_basis_quick_root/f.txt");
+  rmdir(basis_dir);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0755), 0);
+  EXPECT_EQ_INT(mkdir(basis_dir, 0755), 0);
+
+  const char* src_bytes = "AAAA";
+  const unsigned long long size = 4;
+  const time_t mtime = 1500000000;
+  {
+    FILE* fh = fopen(basis_file, "wb");
+    EXPECT_NOT_NULL(fh);
+    // cppcheck-suppress knownConditionTrueFalse
+    if (fh) {
+      EXPECT_EQ_INT((int)fwrite("BBBB", 1, (size_t)size, fh), (int)size);
+      fclose(fh);
+    }
+  }
+  struct timespec ts[2] = {{mtime, 0}, {mtime, 0}};
+  EXPECT_EQ_INT(utimensat(AT_FDCWD, basis_file, ts, 0), 0);
+
+  char root_abs[PATH_MAX];
+  EXPECT_NOT_NULL(realpath(root, root_abs));
+  int root_fd = open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  EXPECT_TRUE(root_fd >= 0);
+  // cppcheck-suppress knownConditionTrueFalse
+  if (root_fd < 0) {
+    unlink(basis_file);
+    rmdir(basis_dir);
+    rmdir(root);
+    return;
+  }
+  EXPECT_TRUE(utils_set_authorized_root(root_fd, root_abs));
+
+  uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
+  size_t digest_len = 0;
+  EXPECT_TRUE(checksum_digest(CHECKSUM_ALGO_XXH64, 0, src_bytes, size, digest, sizeof(digest),
+                              &digest_len));
+
+  /* Route protocol I/O through the explicit descriptors (a previous test group
+     may have left io_set_fds() bound to its own pipe). */
+  io_set_fds(-1, -1);
+  io_set_bwlimit(0);
+
+  for (int verify = 0; verify <= 1; verify++) {
+    Config* cfg = config_create();
+    EXPECT_NOT_NULL(cfg);
+    cfg->receive_root_directory = str_dup(root_abs);
+    cfg->checksum = false;
+    cfg->checksum_algo = CHECKSUM_ALGO_XXH64;
+    cfg->checksum_seed = 0;
+    cfg->use_incremental = true;
+    cfg->use_delta = false;
+    cfg->use_metadata = false;
+    cfg->verify_basis = (verify != 0);
+    EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_LINK, "basis"), 0);
+
+    int p[2];
+    EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, p), 0);
+    EXPECT_TRUE(send_wire_str(p[1], "f.txt"));
+    unsigned long long check_size = size;
+    long long check_mtime = (long long)mtime;
+    long long check_mtime_nsec = 0;
+    EXPECT_TRUE(send_n_data(p[1], &check_size, sizeof(check_size)));
+    EXPECT_TRUE(send_n_data(p[1], &check_mtime, sizeof(check_mtime)));
+    EXPECT_TRUE(send_n_data(p[1], &check_mtime_nsec, sizeof(check_mtime_nsec)));
+    /* Only --verify-basis needs the digest (cfg->checksum is false) and the
+       pre-staged fallback full transfer the receiver will request. */
+    if (verify) {
+      uint8_t wire_len = (uint8_t)digest_len;
+      EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+      EXPECT_TRUE(send_n_data(p[1], digest, digest_len));
+      char* payload_bytes = str_dup(src_bytes);
+      EXPECT_NOT_NULL(payload_bytes);
+      Data* payload = data_create(payload_bytes, size);
+      EXPECT_NOT_NULL(payload);
+      // cppcheck-suppress knownConditionTrueFalse
+      if (payload)
+        EXPECT_TRUE(send_data(p[1], payload));
+      data_destroy(payload);
+    }
+
+    bool skipped = false;
+    File* file = receive_incremental_check(p[0], cfg, &skipped);
+    EXPECT_NOT_NULL(file);
+    // cppcheck-suppress knownConditionTrueFalse
+    if (file) {
+      EXPECT_FALSE(skipped);
+      Status reply = STATUS_ERROR;
+      EXPECT_TRUE(receive_status(p[1], &reply));
+      if (verify) {
+        EXPECT_EQ_INT((int)reply, (int)STATUS_NEXT);
+        EXPECT_NOT_NULL(file->data->data);
+        EXPECT_TRUE(file->data->data != NULL && memcmp(file->data->data, src_bytes, size) == 0);
+      } else {
+        EXPECT_EQ_INT((int)reply, (int)STATUS_OK);
+        EXPECT_TRUE(file->skip);
+        /* The default quick-check hit materializes from the basis PATH at
+           install time (streaming), so no content is buffered on the File. */
+        EXPECT_NOT_NULL(file->basis_link);
+        EXPECT_NULL(file->data->data);
+      }
+      file_destroy(file);
+    }
+    close(p[0]);
+    close(p[1]);
+    config_delete(cfg);
+  }
+
+  utils_set_authorized_root(-1, NULL);
+  close(root_fd);
+  unlink(basis_file);
+  rmdir(basis_dir);
+  rmdir(root);
+}
+
 /* -K/--keep-dirlinks secure open: with an authorized root, a destination path
  * component that is a symlink to an IN-ROOT directory is used as that directory
  * (its referent is opened through a relative O_NOFOLLOW walk from the root fd,
@@ -2140,6 +2294,8 @@ void test_file() {
   test_dir_time_list();
   test_dir_time_list_cap();
   test_receive_incremental_check_empty_path();
+  test_file_basis_quick_match_decision();
+  test_receive_incremental_check_basis_quick_check_and_verify();
   test_keep_dirlinks_secure_open();
   test_inplace_overwrite_clears_special_mode_bits();
   test_inplace_overwrite_metadata_strips_special_bits();

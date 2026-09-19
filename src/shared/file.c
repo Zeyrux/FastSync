@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "data.h"
+#include "checksum.h"
 #include "delta.h"
 #include "file.h"
 #include "file_store.h"
@@ -24,6 +25,13 @@
 #include "utils.h"
 #include "protocol.h"
 #include "xattr.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+/* Files larger than this are not loaded whole for transfer (the sender streams
+ * them); a whole-file digest is computed from the path instead.  Kept in sync
+ * with the sender's streaming threshold. */
+#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
@@ -37,6 +45,31 @@ static bool write_all(int fd, const void* data, unsigned long long size) {
     done += (unsigned long long)n;
   }
   return true;
+}
+
+/* Streaming copy of an open source descriptor into the just-created destination
+   `fd` (already at offset 0).  Used by the --copy-dest basis install so a basis
+   larger than any in-memory whole-file bound still materializes without
+   buffering the entire file.  `expected_size` is the caller-verified basis
+   size; the copy must produce exactly that many bytes (a short source is a hard
+   error, never a silently truncated destination).  The final ftruncate drops
+   any residual tail a raced-in longer source might have left. */
+static bool copy_fd_all(int dst_fd, int src_fd, unsigned long long expected_size) {
+  unsigned char buf[1 << 20];
+  unsigned long long done = 0;
+  while (done < expected_size) {
+    unsigned long long remaining = expected_size - done;
+    size_t want = remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+    ssize_t n = read(src_fd, buf, want);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return false;
+    if (!write_all(dst_fd, buf, (unsigned long long)n))
+      return false;
+    done += (unsigned long long)n;
+  }
+  return ftruncate(dst_fd, (off_t)expected_size) == 0;
 }
 
 /* Preallocate `size` bytes on `fd` before any data is written (--preallocate).
@@ -140,6 +173,12 @@ bool file_checksum(File* file, ChecksumAlgo algo, uint64_t seed, uint8_t* out, s
   if (file->data->size == 0) {
     return checksum_digest(algo, seed, "", 0, out, out_capacity, out_len);
   }
+  /* A streamed source (data not loaded) may exceed any in-memory whole-file
+     bound; hash it from the file path in bounded buffers instead of forcing a
+     full load.  This is the same digest the receiver recomputes on the basis. */
+  if (!file->data->data && file->path && file->data->size > STREAM_THRESHOLD &&
+      checksum_digest_file(algo, seed, file->path, out, out_capacity, out_len))
+    return true;
   if (!file->data->data && !file_load_data(file))
     return false;
   return checksum_digest(algo, seed, file->data->data, file->data->size, out, out_capacity,
@@ -176,6 +215,7 @@ File* file_create(const char* path) {
   file->is_dir = false;
   file->dir_time_only = false;
   file->basis_link = NULL;
+  file->basis_copy = NULL;
   file->link_group = 0;
   file->link_first = false;
   file->hardlink_target = NULL;
@@ -187,6 +227,7 @@ File* file_create(const char* path) {
   file->xattrs = NULL;
   file->dest_state = (OutputDestState){0};
   file->matched_bytes = 0;
+  file->literal_bytes = 0;
   return file;
 }
 
@@ -204,6 +245,8 @@ void file_destroy(void* item) {
   file->send_path = NULL;
   free(file->basis_link);
   file->basis_link = NULL;
+  free(file->basis_copy);
+  file->basis_copy = NULL;
   free(file->hardlink_target);
   file->hardlink_target = NULL;
   free(file->symlink_target);
@@ -614,6 +657,103 @@ static int open_dir_beneath_root(const char* resolved, const char* root) {
 }
 
 int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs) {
+  return file_open_secure_parent_counted(path, leaf_out, create_dirs, NULL, NULL);
+}
+
+/* The logical transfer root expressed in the same coordinate as the secure
+ * parent walk's `rel_buf` (relative to the authorized root, with a leading
+ * '/'), used as the floor at or below which a created directory is a real
+ * file-list entry.  The on-disk transfer root is the receive root joined to the
+ * wire path; the mirror scaffolding above it (the absolute source path below
+ * the destination root) is not an rsync entry.  Returns an allocated string or
+ * NULL (count every created component). */
+static char* transfer_root_floor(const Config* config) {
+  if (!config || !config->send_directory || config->send_directory[0] == '\0')
+    return NULL;
+  const char* spec = config->send_directory;
+  const char* after = spec;
+  if (spec[0] == '.' && spec[1] == '/') {
+    after = spec + 2;
+  } else {
+    const char* cut = strstr(spec, "/./");
+    if (cut)
+      after = cut + 3;
+  }
+  while (*after == '/')
+    after++;
+  char* wire_root = str_dup(after);
+  if (!wire_root)
+    return NULL;
+  size_t wlen = strlen(wire_root);
+  while (wlen > 0 && wire_root[wlen - 1] == '/')
+    wire_root[--wlen] = '\0';
+  if (wlen == 0) {
+    free(wire_root);
+    return NULL;
+  }
+  char* disk_root = config->receive_root_directory
+                        ? path_cat(config->receive_root_directory, wire_root)
+                        : str_dup(wire_root);
+  free(wire_root);
+  if (!disk_root)
+    return NULL;
+  const char* root_path = utils_get_authorized_root_path();
+  const char* floor = disk_root;
+  if (root_path && root_path[0] == '/') {
+    size_t rl = strlen(root_path);
+    while (rl > 0 && root_path[rl - 1] == '/')
+      rl--;
+    if (strncmp(disk_root, root_path, rl) == 0 && (disk_root[rl] == '/' || disk_root[rl] == '\0'))
+      floor = disk_root + rl;
+  }
+  while (*floor == '/')
+    floor++;
+  char* out = str_dup(floor);
+  free(disk_root);
+  if (!out)
+    return NULL;
+  if (out[0] == '\0') {
+    free(out);
+    return NULL;
+  }
+  return out;
+}
+
+/* A created parent component counts toward `Number of created files` only when
+ * its receive-root-relative path is at or below the logical transfer root
+ * (`count_floor`).  The transfer root itself corresponds to rsync's `.` entry
+ * (created on a fresh destination, pre-existing otherwise); the mirror
+ * scaffolding above it is FastSync's absolute-path layout, not an rsync entry. */
+static bool created_dir_counts(const char* count_floor, const char* rel_buf,
+                               const char* component) {
+  if (!count_floor)
+    return true;
+  char candidate[PATH_MAX];
+  int n = snprintf(candidate, sizeof(candidate), "%s/%s", rel_buf, component);
+  if (n < 0 || (size_t)n >= sizeof(candidate))
+    return false;
+  const char* cand = candidate;
+  while (*cand == '/')
+    cand++;
+  size_t fl = strlen(count_floor);
+  if (strncmp(cand, count_floor, fl) != 0)
+    return false;
+  return cand[fl] == '\0' || cand[fl] == '/';
+}
+
+/* Public wrapper for the receiver's created-directory accounting: the logical
+ * transfer root expressed receive-root-relative, or NULL when the wire paths
+ * carry no mirror scaffolding above it (--relative and --files-from, whose
+ * paths are already relative to the transfer root).  The caller frees a
+ * non-NULL result. */
+char* file_transfer_root_floor(const Config* config) {
+  if (!config || config->relative || config->files_from_set != NULL)
+    return NULL;
+  return transfer_root_floor(config);
+}
+
+int file_open_secure_parent_counted(const char* path, char** leaf_out, bool create_dirs,
+                                    unsigned* dirs_created, const char* count_floor) {
   char* copy = str_dup(path);
   if (!copy)
     return -1;
@@ -674,6 +814,14 @@ int file_open_secure_parent(const char* path, char** leaf_out, bool create_dirs)
       if (next < 0 && create_dirs && errno == ENOENT) {
         bool created = mkdirat(fd, component, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0;
         if (created || errno == EEXIST) {
+          /* Protocol 2.28.0: only directories the logical file list would
+             create count toward `Number of created files`; the mirror
+             scaffolding above the transfer root (e.g. the absolute source path
+             under the destination root) is not an rsync entry.  `count_floor`
+             is a receive-root-relative prefix that must be reached before a
+             created component is counted. */
+          if (created && dirs_created && created_dir_counts(count_floor, rel_buf, component))
+            (*dirs_created)++;
           /* P7 Wave E: --copy-as owns EVERY entry, including the intermediate
              directories this walk creates implicitly.  Its target ids are a
              global policy, so they are available here without per-entry source
@@ -806,6 +954,25 @@ bool file_ensure_directory_secure(const char* path) {
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     } else if (errno == EEXIST) {
       dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    }
+  } else if (dir_fd < 0 && errno == ENOTDIR) {
+    /* rsync replaces a destination non-directory (regular file) with an
+       incoming directory.  Confined to the already-opened secure parent fd:
+       the leaf is unlinked by name (never followed) and only a non-directory
+       is ever removed, so this cannot escape the authorized root or remove a
+       pre-existing directory tree.  A symlink is left alone (openat with
+       O_NOFOLLOW reports ELOOP, which takes no branch here), since replacing
+       it is not required for FastSync's transferred directories and keeps
+       --keep-dirlinks semantics untouched. */
+    struct stat leaf_st;
+    if (fstatat(parent_fd, leaf, &leaf_st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(leaf_st.st_mode) &&
+        !S_ISLNK(leaf_st.st_mode)) {
+      if (unlinkat(parent_fd, leaf, 0) == 0) {
+        if (mkdirat(parent_fd, leaf, (mode_t)(0777 & ~(mode_t)file_process_umask())) == 0)
+          created = true;
+        /* On failure dir_fd stays < 0 below, so the caller still sees it. */
+        dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      }
     }
   }
   bool ok = dir_fd >= 0;
@@ -1007,15 +1174,14 @@ static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXat
   }
 }
 
-static bool file_to_disk_secure_impl(const char* path, const void* data,
-                                     unsigned long long data_size, bool inplace, bool sparse,
-                                     bool preallocate, const FileMetadata* metadata,
-                                     FileAttrPolicy policy, bool update, bool no_replace,
-                                     bool use_fsync, const char* temp_dir,
-                                     const FileXattrList* xattrs, bool fake_super,
-                                     bool keep_partial) {
+static bool
+file_to_disk_secure_impl(const char* path, const void* data, unsigned long long data_size,
+                         bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
+                         FileAttrPolicy policy, bool update, bool no_replace, bool use_fsync,
+                         const char* temp_dir, const FileXattrList* xattrs, bool fake_super,
+                         bool keep_partial, unsigned* dirs_created, const char* count_floor) {
   char* leaf = NULL;
-  int dirfd = file_open_secure_parent(path, &leaf, true);
+  int dirfd = file_open_secure_parent_counted(path, &leaf, true, dirs_created, count_floor);
   if (dirfd < 0)
     return false;
   int fd = -1;
@@ -1306,7 +1472,7 @@ static bool file_to_disk_secure_impl(const char* path, const void* data,
                 "non-atomic copy into the destination directory");
     return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                     policy, update, no_replace, use_fsync, NULL, xattrs, fake_super,
-                                    keep_partial);
+                                    keep_partial, dirs_created, count_floor);
   }
   return ok;
 }
@@ -1315,7 +1481,8 @@ bool file_to_disk_secure(const char* path, const void* data, unsigned long long 
                          bool inplace, bool sparse, bool preallocate, const FileMetadata* metadata,
                          FileAttrPolicy policy, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  policy, false, false, false, temp_dir, NULL, false, false);
+                                  policy, false, false, false, temp_dir, NULL, false, false, NULL,
+                                  NULL);
 }
 
 bool file_to_disk_secure_update(const char* path, const void* data, unsigned long long data_size,
@@ -1323,7 +1490,8 @@ bool file_to_disk_secure_update(const char* path, const void* data, unsigned lon
                                 const FileMetadata* metadata, FileAttrPolicy policy,
                                 const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  policy, true, false, false, temp_dir, NULL, false, false);
+                                  policy, true, false, false, temp_dir, NULL, false, false, NULL,
+                                  NULL);
 }
 
 bool file_to_disk_secure_with_fsync(const char* path, const void* data,
@@ -1331,7 +1499,8 @@ bool file_to_disk_secure_with_fsync(const char* path, const void* data,
                                     bool preallocate, const FileMetadata* metadata,
                                     FileAttrPolicy policy, bool use_fsync, const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
-                                  policy, false, false, use_fsync, temp_dir, NULL, false, false);
+                                  policy, false, false, use_fsync, temp_dir, NULL, false, false,
+                                  NULL, NULL);
 }
 
 bool file_to_disk_secure_no_replace(const char* path, const void* data,
@@ -1339,7 +1508,8 @@ bool file_to_disk_secure_no_replace(const char* path, const void* data,
                                     const FileMetadata* metadata, FileAttrPolicy policy,
                                     const char* temp_dir) {
   return file_to_disk_secure_impl(path, data, data_size, false, sparse, preallocate, metadata,
-                                  policy, false, true, false, temp_dir, NULL, false, false);
+                                  policy, false, true, false, temp_dir, NULL, false, false, NULL,
+                                  NULL);
 }
 
 /* Receiver write-path variant that also applies the per-file xattrs (-X/-A)
@@ -1352,9 +1522,21 @@ bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long
                                const FileMetadata* metadata, FileAttrPolicy policy, bool update,
                                bool no_replace, bool use_fsync, const FileXattrList* xattrs,
                                bool fake_super, bool keep_partial, const char* temp_dir) {
+  return file_to_disk_secure_attrs_counted(path, data, data_size, inplace, sparse, preallocate,
+                                           metadata, policy, update, no_replace, use_fsync, xattrs,
+                                           fake_super, keep_partial, temp_dir, NULL, NULL);
+}
+
+bool file_to_disk_secure_attrs_counted(const char* path, const void* data,
+                                       unsigned long long data_size, bool inplace, bool sparse,
+                                       bool preallocate, const FileMetadata* metadata,
+                                       FileAttrPolicy policy, bool update, bool no_replace,
+                                       bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                       bool keep_partial, const char* temp_dir,
+                                       unsigned* dirs_created, const char* count_floor) {
   return file_to_disk_secure_impl(path, data, data_size, inplace, sparse, preallocate, metadata,
                                   policy, update, no_replace, use_fsync, temp_dir, xattrs,
-                                  fake_super, keep_partial);
+                                  fake_super, keep_partial, dirs_created, count_floor);
 }
 
 /* Atomic --link-dest install.  The destination is replaced (via a temporary
@@ -1372,16 +1554,176 @@ bool file_to_disk_secure_attrs(const char* path, const void* data, unsigned long
  * basis).  Likewise `xattrs`/`fake_super` are applied only on the copy
  * fallback, so a fallback copy preserves the per-file attributes instead of
  * silently dropping them. */
+/* Streaming --copy-dest basis install: atomically materialize `path` from the
+ * bytes of `basis_path` without holding the file in memory, so a basis larger
+ * than any whole-file bound still works.  Mirrors the ordinary secure store
+ * path (confined parent walk, temp + rename, --update/--ignore-existing/
+ * --preallocate/--temp-dir) but sources the data from the basis descriptor
+ * rather than a caller buffer, and applies the SOURCE metadata (rsync copies
+ * then fixes attributes).  A hard-link install that falls back to a byte copy
+ * also routes through here when the caller supplies the basis path. */
+static bool file_copy_basis_stream_impl(const char* path, const char* basis_path,
+                                        unsigned long long expected_size, bool preallocate,
+                                        const FileMetadata* metadata, FileAttrPolicy policy,
+                                        bool update, bool no_replace, bool use_fsync,
+                                        const FileXattrList* xattrs, bool fake_super,
+                                        const char* temp_dir, unsigned* dirs_created,
+                                        const char* count_floor) {
+  if (!path || !basis_path)
+    return false;
+  char* leaf = NULL;
+  int dirfd = file_open_secure_parent_counted(path, &leaf, true, dirs_created, count_floor);
+  if (dirfd < 0)
+    return false;
+
+  char* basis_leaf = NULL;
+  int basis_dirfd = file_open_secure_parent(basis_path, &basis_leaf, false);
+  int src_fd = -1;
+  if (basis_dirfd >= 0 && basis_leaf != NULL) {
+    /* O_NONBLOCK rejects a raced-in FIFO without blocking; the S_ISREG gate
+       below is the real type check. */
+    src_fd = openat(basis_dirfd, basis_leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    struct stat src_st;
+    if (src_fd >= 0 && (fstat(src_fd, &src_st) != 0 || !S_ISREG(src_st.st_mode))) {
+      close(src_fd);
+      src_fd = -1;
+    }
+  }
+  if (basis_dirfd >= 0)
+    close(basis_dirfd);
+  free(basis_leaf);
+  if (src_fd < 0) {
+    close(dirfd);
+    free(leaf);
+    return false;
+  }
+
+  struct stat destination_stat;
+  bool destination_is_regular = fstatat(dirfd, leaf, &destination_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+                                S_ISREG(destination_stat.st_mode);
+  if (update && metadata && destination_is_regular && stat_is_newer(&destination_stat, metadata)) {
+    close(src_fd);
+    close(dirfd);
+    free(leaf);
+    return true;
+  }
+  if (no_replace && file_path_exists_secure(path)) {
+    close(src_fd);
+    close(dirfd);
+    free(leaf);
+    return true;
+  }
+
+  int scratch_dirfd = -1;
+  if (temp_dir) {
+    scratch_dirfd = file_open_temp_dir(temp_dir);
+    if (scratch_dirfd < 0) {
+      int saved_errno = errno;
+      log_message(LOG_LEVEL_ERROR,
+                  "--temp-dir '%s' could not be opened (rsync requires it to already exist): %s",
+                  temp_dir, strerror(saved_errno));
+      close(src_fd);
+      close(dirfd);
+      free(leaf);
+      return false;
+    }
+  }
+
+  int target_dirfd = scratch_dirfd >= 0 ? scratch_dirfd : dirfd;
+  int tmp_size = snprintf(NULL, 0, ".%s.tmp.%ld.%llu", leaf, (long)getpid(), ~0ULL);
+  char* tmp = NULL;
+  bool ok = false;
+  if (tmp_size >= 0)
+    tmp = malloc((size_t)tmp_size + 1);
+  if (tmp) {
+    for (unsigned int i = 0; i < 100 && !ok; ++i) {
+      if (scratch_dirfd >= 0)
+        snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%llu", leaf, (long)getpid(),
+                 next_temp_sequence());
+      else
+        snprintf(tmp, (size_t)tmp_size + 1, ".%s.tmp.%ld.%u", leaf, (long)getpid(), i);
+      int fd =
+          openat(target_dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+      if (fd < 0) {
+        if (errno != EEXIST)
+          break;
+        continue;
+      }
+      bool wrote = true;
+      if (preallocate && expected_size > 0 && preallocate_fd(fd, expected_size) != 0)
+        wrote = false;
+      if (wrote)
+        wrote = copy_fd_all(fd, src_fd, expected_size);
+      if (wrote && metadata) {
+        if (!policy.perms &&
+            fchmod(fd, file_mode_base(metadata, destination_is_regular,
+                                      destination_is_regular ? destination_stat.st_mode & 0777
+                                                             : 0)) != 0)
+          wrote = false;
+        if (wrote)
+          wrote = file_restore_metadata_fd(fd, metadata, policy);
+      } else if (wrote && fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0) {
+        wrote = false;
+      }
+      if (wrote)
+        restore_extra_fd(fd, metadata, xattrs, fake_super, policy);
+      if (wrote && use_fsync)
+        wrote = fsync(fd) == 0;
+      if (close(fd) != 0)
+        wrote = false;
+      if (wrote && renameat(target_dirfd, tmp, dirfd, leaf) != 0)
+        wrote = false;
+      if (!wrote)
+        unlinkat(target_dirfd, tmp, 0);
+      ok = wrote;
+    }
+    free(tmp);
+  }
+  if (!ok && scratch_dirfd >= 0) {
+    /* Retry once with no scratch dir (rsync's EXDEV fallback). */
+    close(scratch_dirfd);
+    close(src_fd);
+    close(dirfd);
+    free(leaf);
+    return file_copy_basis_stream_impl(path, basis_path, expected_size, preallocate, metadata,
+                                       policy, update, no_replace, use_fsync, xattrs, fake_super,
+                                       NULL, dirs_created, count_floor);
+  }
+  if (scratch_dirfd >= 0)
+    close(scratch_dirfd);
+  close(src_fd);
+  close(dirfd);
+  free(leaf);
+  return ok;
+}
+
+/* --copy-dest basis install (streaming).  Applies the source metadata and the
+   per-file xattrs / --fake-super record. */
+bool file_copy_basis_stream_attrs(const char* path, const char* basis_path,
+                                  unsigned long long expected_size, bool preallocate,
+                                  const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+                                  bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                  const char* temp_dir) {
+  return file_copy_basis_stream_impl(path, basis_path, expected_size, preallocate, metadata, policy,
+                                     update, false, use_fsync, xattrs, fake_super, temp_dir, NULL,
+                                     NULL);
+}
+
 static bool file_to_disk_secure_link_impl(const char* path, const char* basis_path,
                                           const void* data, unsigned long long data_size,
                                           bool preallocate, const FileMetadata* metadata,
                                           FileAttrPolicy policy, bool use_fsync,
                                           const FileXattrList* xattrs, bool fake_super,
-                                          const char* temp_dir) {
+                                          const char* temp_dir, unsigned* dirs_created,
+                                          const char* count_floor) {
   if (!path || !basis_path)
     return false;
+  /* The caller-supplied buffer is no longer used: the copy fallback streams
+     from the basis path (which may hold an over-limit file).  Kept in the
+     signature for the existing API. */
+  (void)data;
   char* leaf = NULL;
-  int dirfd = file_open_secure_parent(path, &leaf, true);
+  int dirfd = file_open_secure_parent_counted(path, &leaf, true, dirs_created, count_floor);
   if (dirfd < 0)
     return false;
 
@@ -1463,10 +1805,17 @@ static bool file_to_disk_secure_link_impl(const char* path, const char* basis_pa
     close(dirfd);
     free(leaf);
     /* The basis file could not be linked in (missing, cross-device, refused
-       by the filesystem).  Write a byte-identical local copy instead. */
-    return file_to_disk_secure_attrs(path, data, data_size, false, false, preallocate, metadata,
-                                     policy, false, false, use_fsync, xattrs, fake_super, false,
-                                     temp_dir);
+       by the filesystem).  Stream a byte-identical local copy from the basis
+       itself (never the possibly-absent caller buffer) so an over-limit basis
+       still materializes.  When the basis path is not a readable regular file
+       (e.g. a directory raced in), fall back to the caller-supplied bytes. */
+    if (file_copy_basis_stream_impl(path, basis_path, data_size, preallocate, metadata, policy,
+                                    false, false, use_fsync, xattrs, fake_super, temp_dir,
+                                    dirs_created, count_floor))
+      return true;
+    return file_to_disk_secure_attrs_counted(
+        path, data, data_size, false, false, preallocate, metadata, policy, false, false, use_fsync,
+        xattrs, fake_super, false, temp_dir, dirs_created, count_floor);
   }
 
   if (scratch_dirfd >= 0)
@@ -1481,7 +1830,7 @@ bool file_to_disk_secure_link(const char* path, const char* basis_path, const vo
                               const FileMetadata* metadata, FileAttrPolicy policy, bool use_fsync,
                               const char* temp_dir) {
   return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
-                                       policy, use_fsync, NULL, false, temp_dir);
+                                       policy, use_fsync, NULL, false, temp_dir, NULL, NULL);
 }
 
 bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, const void* data,
@@ -1489,8 +1838,21 @@ bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, co
                                     const FileMetadata* metadata, FileAttrPolicy policy,
                                     bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                     const char* temp_dir) {
+  return file_to_disk_secure_link_attrs_counted(path, basis_path, data, data_size, preallocate,
+                                                metadata, policy, use_fsync, xattrs, fake_super,
+                                                temp_dir, NULL, NULL);
+}
+
+bool file_to_disk_secure_link_attrs_counted(const char* path, const char* basis_path,
+                                            const void* data, unsigned long long data_size,
+                                            bool preallocate, const FileMetadata* metadata,
+                                            FileAttrPolicy policy, bool use_fsync,
+                                            const FileXattrList* xattrs, bool fake_super,
+                                            const char* temp_dir, unsigned* dirs_created,
+                                            const char* count_floor) {
   return file_to_disk_secure_link_impl(path, basis_path, data, data_size, preallocate, metadata,
-                                       policy, use_fsync, xattrs, fake_super, temp_dir);
+                                       policy, use_fsync, xattrs, fake_super, temp_dir,
+                                       dirs_created, count_floor);
 }
 
 bool file_write_to_disk(const char* path, const void* data, unsigned long long data_size,

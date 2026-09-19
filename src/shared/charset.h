@@ -57,8 +57,9 @@ void charset_conversion_close(void* conversion);
 /* Process-wide wire conversion.  charset_wire_init_sender (client side) opens
  * LOCAL->REMOTE; charset_wire_init_receiver (server side) opens
  * wire(REMOTE)->server-local.  server_spec is the server's own --iconv, whose
- * LOCAL half may override the local charset the client assumed; NULL reuses
- * the client spec's LOCAL half.  Both return false on an unsupported spec.
+ * LOCAL half overrides the destination charset; NULL means the destination
+ * charset is the client spec's REMOTE half (rsync's push semantics: the wire
+ * bytes are written verbatim).  Both return false on an unsupported spec.
  * The state is freed with charset_wire_free. */
 bool charset_wire_init_sender(const char* spec);
 bool charset_wire_init_receiver(const char* spec, const char* server_spec);
@@ -66,9 +67,9 @@ void charset_wire_free(void);
 bool charset_wire_active(void);
 
 /* Pre-ack receiver-direction sanity (see charset_wire_init_receiver): true
- * when the exact wire->server-local conversion the receiver will use (client
- * spec's REMOTE half into the server's own LOCAL half, or the client's LOCAL
- * half when the server has no --iconv) opens and produces NUL-free output. */
+ * when the exact wire->destination conversion the receiver will use (client
+ * spec's REMOTE half into the server's own LOCAL half, or REMOTE->REMOTE when
+ * the server has no --iconv) opens and produces NUL-free output. */
 bool charset_wire_receiver_spec_valid(const char* spec, const char* server_spec);
 
 /* Convert a path across the wire in the process direction.  Returns a malloc'd

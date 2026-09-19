@@ -11,6 +11,7 @@
 #include "test_daemon_conf.h"
 #include "test_daemon_limits.h"
 #include "test_delay_updates.h"
+#include "test_delete_plan.h"
 #include "test_delta.h"
 #include "test_file.h"
 #include "test_file_list.h"
@@ -42,6 +43,7 @@
 #include "test_utils.h"
 #include "test_xattr.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <signal.h>
 
 // Define global test state variables
@@ -51,6 +53,11 @@ bool current_test_failed = false;
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
+  /* The codec/checksum resolvers consult rsync's preference-list environment
+   * variables; clear them so a developer's shell cannot change test outcomes.
+   * The env-specific tests set and restore their own values. */
+  unsetenv("RSYNC_COMPRESS_LIST");
+  unsetenv("RSYNC_CHECKSUM_LIST");
   printf("\033[1;36m=== RUNNING UNIT TESTS ===\033[0m\n\n");
 
   RUN_TEST(test_queue);
@@ -66,6 +73,7 @@ int main() {
   RUN_TEST(test_scanner);
   RUN_TEST(test_checksum);
   RUN_TEST(test_delta);
+  RUN_TEST(test_delete_plan);
   RUN_TEST(test_data);
   RUN_TEST(test_protocol);
   RUN_TEST(test_protocol_error);

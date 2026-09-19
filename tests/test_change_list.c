@@ -177,6 +177,40 @@ static void test_change_list_enabled() {
   config_delete(config); /* closes config->log_file */
 }
 
+/* %C uses the negotiated TRANSFER checksum's column width (not the pre-transfer
+ * whole-file digest), and `none` renders as a blank 2-char column, matching
+ * rsync.  A not-yet-filled checksum renders as spaces. */
+static void test_format_C_padding_uses_transfer_algo() {
+  ChangeEvent event = sample_event();
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  /* Deliberately different pre-transfer algorithm: the transfer one must win. */
+  config->checksum_algo = (int)CHECKSUM_ALGO_MD4;
+  struct {
+    int algo;
+    int width;
+  } cases[] = {
+      {CHECKSUM_ALGO_XXH128, 32}, {CHECKSUM_ALGO_XXH64, 16}, {CHECKSUM_ALGO_XXH3, 16},
+      {CHECKSUM_ALGO_MD5, 32},    {CHECKSUM_ALGO_MD4, 32},   {CHECKSUM_ALGO_SHA1, 40},
+      {CHECKSUM_ALGO_NONE, 2},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    config->checksum_transfer_algo = cases[i].algo;
+    char expected[64];
+    size_t n = 0;
+    expected[n++] = '[';
+    for (int j = 0; j < cases[i].width; j++)
+      expected[n++] = ' ';
+    expected[n++] = ']';
+    expected[n] = '\0';
+    char* line = change_render_format("[%C]", config, &event);
+    EXPECT_NOT_NULL(line);
+    EXPECT_EQ_STR(line, expected);
+    free(line);
+  }
+  config_delete(config);
+}
+
 void test_change_list() {
   test_format_tokens();
   test_format_unknown_tokens_preserved();
@@ -188,4 +222,5 @@ void test_change_list() {
   test_render_itemize_up_to_date_is_empty();
   test_render_list_line();
   test_change_list_enabled();
+  test_format_C_padding_uses_transfer_algo();
 }

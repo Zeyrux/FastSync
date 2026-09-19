@@ -23,6 +23,12 @@ void client_set_abort_armed(bool armed);
  * config_delete() once the call returns). */
 int send_files(Config* config);
 int send_files_multithreaded(Config** config);
+/* rsync's --ignore-errors deletion gate: with no I/O error during the scan the
+ * deletion phase always proceeds; with one it is suppressed unless
+ * `--ignore-errors` was given.  Exposed so the decision can be unit-tested
+ * without a privileged (mode-000) source directory.  See client_send.c. */
+bool ignore_errors_allows_delete(const Config* config, bool had_io_error);
+
 /* Phase 6 residual-batch (client-only).  See client_send.c. */
 int write_batch_from_source(const Config* config, const char* batch_path);
 int apply_batch_to_dest(const Config* config, const char* batch_path, const char* dest_root);

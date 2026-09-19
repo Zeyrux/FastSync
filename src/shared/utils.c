@@ -2,6 +2,7 @@
 #include "array_list.h"
 #include "log.h"
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -50,6 +51,31 @@ const char* utils_get_authorized_root_path(void) {
 bool path_is_within_root(const char* root, const char* path) {
   size_t root_len = strlen(root);
   return strncmp(root, path, root_len) == 0 && (path[root_len] == '\0' || path[root_len] == '/');
+}
+
+/* Borrowed transfer-relative view of `path`: strip any leading '/' and then a
+ * `root` prefix (its own leading/trailing slashes tolerated), returning a
+ * pointer into `path`.  Non-allocating, so it is safe on the hot scan/print
+ * paths.  A NULL/empty root, or a path not under `root`, leaves only the
+ * leading-slash strip.  `path` must be NUL-terminated and live in the caller. */
+const char* utils_strip_transfer_root(const char* path, const char* root) {
+  if (path == NULL)
+    return NULL;
+  const char* rel = path;
+  while (*rel == '/')
+    rel++;
+  if (root == NULL)
+    return rel;
+  while (*root == '/')
+    root++;
+  size_t root_len = strlen(root);
+  while (root_len > 0 && root[root_len - 1] == '/')
+    root_len--;
+  if (root_len == 0)
+    return rel;
+  if (strncmp(rel, root, root_len) == 0 && (rel[root_len] == '/' || rel[root_len] == '\0'))
+    return rel + root_len + (rel[root_len] == '/' ? 1 : 0);
+  return rel;
 }
 
 /* Open the destination root directory itself, confined to the authorized root.
@@ -115,6 +141,47 @@ char* str_dup(const char* string) {
     return NULL;
   memcpy(new_string, string, str_len + 1);
   return new_string;
+}
+
+int env_choice_first(const char* env_name, int (*resolve)(const char*), bool* specified) {
+  if (specified)
+    *specified = false;
+  if (!env_name || !resolve)
+    return -1;
+  const char* env = getenv(env_name);
+  if (!env)
+    return -1;
+
+  bool saw_nonblank = false;
+  const char* p = env;
+  while (*p) {
+    if (*p == '&')
+      break;
+    if (isspace((unsigned char)*p)) {
+      p++;
+      continue;
+    }
+    saw_nonblank = true;
+    char token[64];
+    size_t len = 0;
+    while (*p && *p != '&' && !isspace((unsigned char)*p)) {
+      if (len < sizeof(token) - 1)
+        token[len++] = *p;
+      p++;
+    }
+    token[len] = '\0';
+    if (len > 0) {
+      int id = resolve(token);
+      if (id >= 0) {
+        if (specified)
+          *specified = true;
+        return id;
+      }
+    }
+  }
+  if (specified)
+    *specified = saw_nonblank;
+  return -1;
 }
 
 #define STR_HASH_SET_MIN_CAPACITY 16
@@ -615,8 +682,10 @@ static bool is_synced_dir(const PathIndex* dirs, const char* rel) {
    like any other non-directory extra (never followed). */
 static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep,
                              const PathIndex* dirs, DeleteBudget* budget,
-                             const DeleteSkipEntry* skips, int skip_count, bool parent_deletable,
-                             bool* all_removed) {
+                             const DeleteSkipEntry* skips, int skip_count,
+                             const FilterRuleList* protect_rules, bool parent_deletable,
+                             bool* all_removed, DeletePathObserver observer,
+                             void* observer_context) {
   /* openat(dirfd, ".") opens an independent file description: a dup() would
      share dirfd's file offset and a prior pass could leave the stream drained. */
   int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -661,12 +730,23 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
       free(child_rel);
       continue;
     }
-    if (S_ISDIR(st.st_mode)) {
+    bool is_dir = S_ISDIR(st.st_mode);
+    if (protect_rules && filter_rules_apply_side(protect_rules, child_rel, entry->d_name, is_dir,
+                                                 FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT) {
+      /* A first-match protect rule shields the extra; for a directory the whole
+         subtree is shielded (rsync prunes an excluded directory), so do not
+         descend. */
+      local_survives = true;
+      free(child_rel);
+      continue;
+    }
+    if (is_dir) {
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       bool child_all_removed = false;
       if (childfd >= 0) {
-        if (!delete_extras_fd(childfd, child_rel, keep, dirs, budget, skips, skip_count, deletable,
-                              &child_all_removed))
+        if (!delete_extras_fd(childfd, child_rel, keep, dirs, budget, skips, skip_count,
+                              protect_rules, deletable, &child_all_removed, observer,
+                              observer_context))
           operation_ok = false;
         close(childfd);
       } else if (errno != ENOENT) {
@@ -693,6 +773,8 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
           local_survives = true;
         } else {
           budget->deleted++;
+          if (observer)
+            observer(observer_context, child_rel);
         }
       } else {
         local_survives = true;
@@ -713,6 +795,8 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
         local_survives = true;
       } else {
         budget->deleted++;
+        if (observer)
+          observer(observer_context, child_rel);
         char* escaped_path = output_escape(child_rel, log_get_8_bit_output());
         fprintf(stderr, "  Deleted: %s\n", escaped_path ? escaped_path : "<allocation failed>");
         free(escaped_path);
@@ -730,7 +814,8 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
    reportable children (depth-first), matching the delete pass's ordering. */
 static bool list_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep,
                            const PathIndex* dirs, ArrayList* out, size_t* recorded,
-                           const DeleteSkipEntry* skips, int skip_count, bool parent_deletable,
+                           const DeleteSkipEntry* skips, int skip_count,
+                           const FilterRuleList* protect_rules, bool parent_deletable,
                            bool* all_removed) {
   int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (scanfd < 0)
@@ -764,12 +849,21 @@ static bool list_extras_fd(int dirfd, const char* rel_path, const PathIndex* kee
       free(child_rel);
       continue;
     }
-    if (S_ISDIR(st.st_mode)) {
+    bool is_dir = S_ISDIR(st.st_mode);
+    if (protect_rules && filter_rules_apply_side(protect_rules, child_rel, entry->d_name, is_dir,
+                                                 FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT) {
+      /* Mirror the delete walk: a protected entry is never reported as a
+         would-delete and a protected directory's subtree is not enumerated. */
+      local_survives = true;
+      free(child_rel);
+      continue;
+    }
+    if (is_dir) {
       int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       bool child_all_removed = false;
       if (childfd >= 0) {
         if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count,
-                            deletable, &child_all_removed))
+                            protect_rules, deletable, &child_all_removed))
           operation_ok = false;
         close(childfd);
       } else if (errno != ENOENT) {
@@ -820,7 +914,7 @@ static bool list_extras_fd(int dirfd, const char* rel_path, const PathIndex* kee
 
 bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
                         const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
-                        ArrayList* out, size_t* count_out) {
+                        const FilterRuleList* protect_rules, ArrayList* out, size_t* count_out) {
   if (count_out)
     *count_out = 0;
   if (!manifest || !out)
@@ -856,7 +950,7 @@ bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
   bool all_removed = false;
   size_t recorded = 0;
   bool ok = list_extras_fd(rootfd, "", &keep, have_dirs ? &dirs : NULL, out, &recorded, skips,
-                           skip_count, false, &all_removed);
+                           skip_count, protect_rules, false, &all_removed);
   if (close(rootfd) != 0)
     ok = false;
   path_index_free(&keep);
@@ -867,10 +961,13 @@ bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
   return ok;
 }
 
-DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
-                                       const ArrayList* synced_dirs, size_t max_delete,
-                                       const DeleteSkipEntry* skips, int skip_count,
-                                       size_t* deleted_out, size_t* skipped_out) {
+DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
+                                                const ArrayList* synced_dirs, size_t max_delete,
+                                                const DeleteSkipEntry* skips, int skip_count,
+                                                const FilterRuleList* protect_rules,
+                                                size_t* deleted_out, size_t* skipped_out,
+                                                DeletePathObserver observer,
+                                                void* observer_context) {
   if (deleted_out)
     *deleted_out = 0;
   if (skipped_out)
@@ -910,8 +1007,9 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
   }
   DeleteBudget budget = {.max_delete = max_delete, .deleted = 0, .skipped = 0, .limit_hit = false};
   bool all_removed = false;
-  bool ok = delete_extras_fd(rootfd, "", &keep, have_dirs ? &dirs : NULL, &budget, skips,
-                             skip_count, false, &all_removed);
+  bool ok =
+      delete_extras_fd(rootfd, "", &keep, have_dirs ? &dirs : NULL, &budget, skips, skip_count,
+                       protect_rules, false, &all_removed, observer, observer_context);
   if (close(rootfd) != 0)
     ok = false;
   path_index_free(&keep);
@@ -926,8 +1024,18 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
   return budget.limit_hit ? DELETE_WALK_LIMIT_REACHED : DELETE_WALK_OK;
 }
 
+DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
+                                       const ArrayList* synced_dirs, size_t max_delete,
+                                       const DeleteSkipEntry* skips, int skip_count,
+                                       const FilterRuleList* protect_rules, size_t* deleted_out,
+                                       size_t* skipped_out) {
+  return delete_extras_limited_observed(dest_root, manifest, synced_dirs, max_delete, skips,
+                                        skip_count, protect_rules, deleted_out, skipped_out, NULL,
+                                        NULL);
+}
+
 bool delete_extras(const char* dest_root, const ArrayList* manifest) {
-  return delete_extras_limited(dest_root, manifest, NULL, SIZE_MAX, NULL, 0, NULL, NULL) ==
+  return delete_extras_limited(dest_root, manifest, NULL, SIZE_MAX, NULL, 0, NULL, NULL, NULL) ==
          DELETE_WALK_OK;
 }
 

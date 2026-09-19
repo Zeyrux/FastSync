@@ -1,4 +1,5 @@
 #include "checksum.h"
+#include "utils.h"
 #include <fcntl.h>
 #include <openssl/evp.h>
 #include <string.h>
@@ -223,17 +224,33 @@ bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, ui
   if (fd < 0)
     return false;
 
+  bool ok = checksum_digest_fd(algo, seed, fd, out, out_capacity, out_len);
+  close(fd);
+  return ok;
+}
+
+bool checksum_digest_fd(ChecksumAlgo algo, uint64_t seed, int fd, uint8_t* out, size_t out_capacity,
+                        size_t* out_len) {
+  if (fd < 0 || !out || !out_len || out_capacity < CHECKSUM_MAX_DIGEST_LEN)
+    return false;
+
+  if (algo == CHECKSUM_ALGO_NONE) {
+    /* No checksum requested: nothing to read; an empty digest succeeds. */
+    *out_len = 0;
+    return true;
+  }
+
   uint8_t buffer[64 * 1024];
   bool ok = false;
+  lseek(fd, 0, SEEK_SET);
 
-  if (algo == CHECKSUM_ALGO_MD5) {
+  if (algo == CHECKSUM_ALGO_MD5 || algo == CHECKSUM_ALGO_SHA1) {
+    const EVP_MD* md = algo == CHECKSUM_ALGO_MD5 ? EVP_md5() : EVP_sha1();
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) {
-      close(fd);
+    if (!ctx)
       return false;
-    }
     unsigned int digest_len = 0;
-    if (EVP_DigestInit_ex(ctx, EVP_md5(), NULL) == 1) {
+    if (EVP_DigestInit_ex(ctx, md, NULL) == 1) {
       ok = true;
       ssize_t got;
       while ((got = read(fd, buffer, sizeof(buffer))) > 0) {
@@ -250,7 +267,22 @@ bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, ui
         ok = false;
     }
     EVP_MD_CTX_free(ctx);
-    close(fd);
+    return ok;
+  }
+
+  if (algo == CHECKSUM_ALGO_MD4) {
+    Md4Ctx ctx;
+    md4_init(&ctx);
+    ok = true;
+    ssize_t got;
+    while ((got = read(fd, buffer, sizeof(buffer))) > 0)
+      md4_update(&ctx, buffer, (size_t)got);
+    if (got < 0)
+      ok = false;
+    if (ok) {
+      md4_final(&ctx, out);
+      *out_len = 16;
+    }
     return ok;
   }
 
@@ -260,16 +292,13 @@ bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, ui
     XXH64_reset(&xxh64, seed);
   } else if (algo == CHECKSUM_ALGO_XXH3 || algo == CHECKSUM_ALGO_XXH128) {
     xxh3 = XXH3_createState();
-    if (!xxh3) {
-      close(fd);
+    if (!xxh3)
       return false;
-    }
     if (algo == CHECKSUM_ALGO_XXH3)
       XXH3_64bits_reset_withSeed(xxh3, seed);
     else
       XXH3_128bits_reset_withSeed(xxh3, seed);
   } else {
-    close(fd);
     return false;
   }
 
@@ -303,7 +332,6 @@ bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, ui
   }
   if (xxh3)
     XXH3_freeState(xxh3);
-  close(fd);
   return ok;
 }
 
@@ -371,7 +399,7 @@ uint8_t checksum_digest_len(ChecksumAlgo algo) {
   return 0;
 }
 
-ChecksumAlgo checksum_negotiate_default(void) {
+static ChecksumAlgo compiled_checksum_preference_first(void) {
   /* rsync 3.4.1 default preference order; every entry is compiled in, so this
    * resolves to xxh128. */
   static const ChecksumAlgo preference[] = {
@@ -383,4 +411,17 @@ ChecksumAlgo checksum_negotiate_default(void) {
       return preference[i];
   }
   return CHECKSUM_ALGO_XXH64;
+}
+
+int checksum_choice_resolve(void) {
+  bool specified = false;
+  int env = env_choice_first("RSYNC_CHECKSUM_LIST", checksum_algo_from_name, &specified);
+  if (specified)
+    return env; /* -1 = the list named no supported checksum */
+  return (int)compiled_checksum_preference_first();
+}
+
+ChecksumAlgo checksum_negotiate_default(void) {
+  int resolved = checksum_choice_resolve();
+  return resolved >= 0 ? (ChecksumAlgo)resolved : compiled_checksum_preference_first();
 }

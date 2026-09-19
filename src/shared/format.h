@@ -57,14 +57,26 @@ bool format_dest_state_send(int fd, const OutputDestState* state);
 bool format_dest_state_receive(int fd, OutputDestState* state);
 
 /* End-of-transfer receiver counters reported through STATUS_STATS (protocol
- * 2.25.0) when the wire config carries report_stats.  `would_delete_count` is
- * the number of destination-relative paths the receiver would have deleted in a
- * -n/--dry-run --delete run; that many wire strings immediately follow the
- * fixed record (sent/read by the caller). */
+ * 2.25.0, extended in 2.28.0) when the wire config carries report_stats.
+ * `would_delete_count` is the number of destination-relative paths the receiver
+ * would have deleted in a -n/--dry-run --delete run; that many wire strings
+ * immediately follow the fixed record (sent/read by the caller).
+ *
+ * Protocol 2.28.0 adds the receiver-observed counters the sender cannot see:
+ * `literal_bytes` is the file data the receiver actually stored literally
+ * (whole files plus the literal fragments of a delta) and the four `created_*`
+ * counters split the destination entries the receiver newly created by type,
+ * reproducing rsync's `Number of created files` breakdown and an exact
+ * `Literal data` for a delta run. */
 typedef struct {
   unsigned long long matched_data;
   unsigned long long deleted_files;
   unsigned long long would_delete_count;
+  unsigned long long literal_bytes;
+  unsigned long long created_reg;
+  unsigned long long created_dir;
+  unsigned long long created_link;
+  unsigned long long created_special;
 } ReceiverStats;
 
 /* Fixed-width STATUS_STATS counter record.  The status frame and the optional
@@ -72,5 +84,28 @@ typedef struct {
  * failure. */
 bool format_stats_send(int fd, const ReceiverStats* stats);
 bool format_stats_receive(int fd, ReceiverStats* stats);
+
+/* Sender-side file-list accounting for rsync's `--stats` block.  Filled while
+ * the scan/send loops walk each entry: the flist counters describe every
+ * scanned source entry (transferred or skipped), while the transferred/literal
+ * counters describe only the regular files the receiver actually stored.  The
+ * type split lets the client print rsync's `Number of files` breakdown; the
+ * receiver-only counters (matched data, deleted, created) come from
+ * STATUS_STATS. */
+typedef struct {
+  unsigned long long flist_reg;
+  unsigned long long flist_dir;
+  unsigned long long flist_link;
+  unsigned long long flist_special;
+  unsigned long long total_file_size;       /* sum of entry sizes (link target len) */
+  unsigned long long transferred_regular;   /* regular files actually stored */
+  unsigned long long transferred_file_size; /* source size of those files */
+  /* Whole-file accuracy: the `--stats` "Literal data" row.  The sender counts
+   * the source size of every stored file, so a whole-file transfer matches
+   * rsync.  A delta run actually ships only the literal fragments of the diff
+   * (the rest is matched/copied), so here the value is an upper bound, not
+   * rsync's literal-byte total; see RSYNC_COMPAT.md's `--stats` row. */
+  unsigned long long literal_data;
+} TransferStats;
 
 #endif
