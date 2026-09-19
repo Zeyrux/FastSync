@@ -9,8 +9,11 @@
   `project(FastFileTransfer VERSION 2.28.0)`. The cycle batched all wire
   changes (stats counters, filter-rule block, `--verify-basis`) under the one
   bump.
-- **`main` = `ef76c90`** (tag `v2.26.0`); the 2.27.0/2.28.0 work is on `dev`
-  and not yet released. A `dev -> main` v2.28.0 release PR is the next step.
+- **Release `v2.28.0` tagged and merged to `main`** via PR #304
+  (`b4d54504`); tag `v2.28.0`. Main push CI run **585** fully green (lint,
+  build-and-test, parity-full, ASan, UBSan, fuzz-build, coverage, valgrind).
+  Gitea release `v2.28.0` published. `dev` and `main` are at the release
+  content.
 - Parity matrix: **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (was 111/13/33 at cycle start).
 - Working tree clean; feature branch deleted; no scratch trees or worktrees.
 
