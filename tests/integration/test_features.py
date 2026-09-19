@@ -589,11 +589,10 @@ class TestRemoteDryRun:
 
         Covers the three cases that a real run protects: the file being updated
         (in the keep set), a filter-excluded source entry (protected prefix), and
-        a --max-size-pruned source entry (always-protected prefix).  Only the
-        genuine destination-only extras may appear.  Residual: a destination-only
-        entry matching an exclude pattern is still removed (FastSync derives
-        delete protection from the source scan, not a receiver filter engine);
-        that divergence is pinned by TestOptionParity.
+        a --max-size-pruned source entry (always-protected prefix).  Track 4a
+        adds a fourth: a destination-only entry matching the exclude rule is
+        re-derived on the receiver and also protected, so only the genuine
+        destination-only `extra.txt` appears.
         """
         source = os.path.join(TEST_DATA_DIR, "dryrep_src")
         rdst = os.path.join(TEST_DATA_DIR, "dryrep_rdst")
@@ -610,7 +609,8 @@ class TestRemoteDryRun:
         os.makedirs(received, exist_ok=True)
         for root in (rdst, received):
             for name, data in (("a.txt", b"old\n"), ("keep.log", b"log\n"),
-                               ("big.bin", b"B" * 2000), ("extra.txt", b"extra\n")):
+                               ("big.bin", b"B" * 2000), ("extra.txt", b"extra\n"),
+                               ("stray.log", b"dest only\n")):
                 with open(os.path.join(root, name), "wb") as fh:
                     fh.write(data)
                 os.utime(os.path.join(root, name), (1_500_000_000, 1_500_000_000))
@@ -631,6 +631,8 @@ class TestRemoteDryRun:
         fs_del = sorted(l for l in (result.stdout or "").splitlines()
                         if l.startswith("*deleting"))
         assert fs_del == rsync_del, f"rsync={rsync_del}\nfastsync={fs_del}"
+        assert os.path.exists(os.path.join(received, "stray.log")), \
+            "destination-only exclude match must be protected in the dry-run report"
 
     @pytest.mark.ci
     def test_remote_dry_run_quiet_is_silent(self, shared_server):
@@ -4693,11 +4695,11 @@ class TestDeletePolicy:
             finally:
                 os.chmod(source, 0o755)
 
-    def test_delete_excluded_protection_is_sender_derived(self):
+    def test_delete_protection_reapplied_on_receiver(self):
         """Plain --delete protects destination mirrors of files the SOURCE scan
-        excluded, but a destination-only file that merely matches an exclude
-        rule is still an extra and is removed (protection never re-applies rules
-        to the destination)."""
+        excluded, and (track 4a) also protects a destination-only file matching
+        an exclude rule because the compiled rule set is re-applied on the
+        receiver, matching rsync."""
         source = os.path.join(TEST_DATA_DIR, "senderderived_src")
         clean_dir(source)
         self._write(os.path.join(source, "keep.txt"), b"kept\n")
@@ -4717,8 +4719,8 @@ class TestDeletePolicy:
                 f"delete sync failed: {(result.stderr or result.stdout)[:300]}"
             assert os.path.exists(os.path.join(received, "secret.log")), \
                 "source-excluded mirror was deleted under plain --delete"
-            assert not os.path.exists(os.path.join(received, "stray.log")), \
-                "destination-only file matching the exclude rule was left (should be deleted)"
+            assert os.path.exists(os.path.join(received, "stray.log")), \
+                "destination-only file matching the exclude rule must be protected like rsync"
 
 
 def _pin_mtime(path, ts):

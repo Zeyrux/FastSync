@@ -138,7 +138,7 @@ static void test_walker_removes_extras_keeps_manifest_and_protected() {
   DeleteSkipEntry skip = {"prot", false};
   size_t deleted = 0;
   DeleteWalkResult result =
-      delete_extras_limited(root, manifest, NULL, 100000, &skip, 1, &deleted, NULL);
+      delete_extras_limited(root, manifest, NULL, 100000, &skip, 1, NULL, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_FALSE(file_exists(root, "a.txt"));
   EXPECT_TRUE(file_exists(root, "keep.txt"));
@@ -173,7 +173,7 @@ static void test_walker_keeps_nested_manifest_dirs() {
   EXPECT_NOT_NULL(manifest);
   size_t deleted = 0;
   DeleteWalkResult result =
-      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, &deleted, NULL);
+      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, NULL, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_FALSE(file_exists(root, "extra.txt"));
   EXPECT_TRUE(file_exists(root, "keepdir/deep/keep.txt"));
@@ -204,7 +204,7 @@ static void test_walker_max_delete_partial_deletes_up_to_cap() {
   size_t deleted = 999;
   size_t skipped = 0;
   DeleteWalkResult result =
-      delete_extras_limited(root, manifest, NULL, 2, NULL, 0, &deleted, &skipped);
+      delete_extras_limited(root, manifest, NULL, 2, NULL, 0, NULL, &deleted, &skipped);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_LIMIT_REACHED);
   EXPECT_EQ_INT((int)deleted, 2);
   EXPECT_EQ_INT((int)skipped, 1);
@@ -225,7 +225,8 @@ static void test_walker_max_delete_exact_bound_deletes() {
   ArrayList* manifest = make_manifest_strings(keeps, 0);
   EXPECT_NOT_NULL(manifest);
   size_t deleted = 0;
-  DeleteWalkResult result = delete_extras_limited(root, manifest, NULL, 2, NULL, 0, &deleted, NULL);
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, NULL, 2, NULL, 0, NULL, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_EQ_INT((int)deleted, 2);
   EXPECT_FALSE(file_exists(root, "a.txt"));
@@ -258,7 +259,7 @@ static void test_walker_removes_extraneous_symlinks() {
   EXPECT_NOT_NULL(manifest);
   size_t deleted = 0;
   DeleteWalkResult result =
-      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, &deleted, NULL);
+      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, NULL, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_FALSE(file_exists(root, "link_file"));
   EXPECT_FALSE(file_exists(root, "link_dir"));
@@ -294,7 +295,7 @@ static void test_walker_confines_deletion_to_synced_dirs() {
   EXPECT_TRUE(array_list_add(dirs, str_dup("inscope")));
   size_t deleted = 0;
   DeleteWalkResult result =
-      delete_extras_limited(root, manifest, dirs, 100000, NULL, 0, &deleted, NULL);
+      delete_extras_limited(root, manifest, dirs, 100000, NULL, 0, NULL, &deleted, NULL);
   EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
   EXPECT_TRUE(file_exists(root, "rootextra.txt"));
   EXPECT_FALSE(file_exists(root, "inscope/extra.txt"));
@@ -319,6 +320,45 @@ static void test_walker_unlimited_deletes_all() {
   EXPECT_FALSE(file_exists(root, "a.txt"));
   EXPECT_FALSE(file_exists(root, "b.txt"));
   EXPECT_FALSE(dir_exists(root, "emptydir"));
+  array_list_delete(manifest);
+  remove_walk_tree(root);
+  free(root);
+}
+
+/* Receiver-side filter protection (protocol 2.28.0): a compiled protect rule
+   shields a DESTINATION-ONLY extra that never appeared on the sender, a risk
+   rule cancels an earlier/later protect (first match wins), and a dir-only
+   protect rule shields the whole subtree. */
+static void test_walker_protect_rules_shield_dest_only() {
+  char* root = make_walk_root("protectrules");
+  EXPECT_NOT_NULL(root);
+  EXPECT_TRUE(write_file_at(root, "keep.txt", "kept"));
+  EXPECT_TRUE(write_file_at(root, "extra.log", "risk cancels protect"));
+  EXPECT_TRUE(write_file_at(root, "safe.log", "protected"));
+  EXPECT_TRUE(write_file_at(root, "other.txt", "deleted"));
+  EXPECT_EQ_INT(make_subdir(root, "prot"), 0);
+  EXPECT_TRUE(write_file_at(root, "prot/inside.txt", "shielded subtree"));
+  EXPECT_TRUE(write_file_at(root, "prot/deep.log", "shielded subtree"));
+
+  const char* keeps[] = {"keep.txt"};
+  ArrayList* manifest = make_manifest_strings(keeps, 1);
+  EXPECT_NOT_NULL(manifest);
+  const char* rule_text[] = {"R extra.log", "P *.log", "P prot/"};
+  char err[160];
+  FilterRuleList* rules = filter_base_build(rule_text, 3, false, false, err, sizeof(err));
+  EXPECT_NOT_NULL(rules);
+  size_t deleted = 0;
+  DeleteWalkResult result =
+      delete_extras_limited(root, manifest, NULL, 100000, NULL, 0, rules, &deleted, NULL);
+  EXPECT_EQ_INT((int)result, (int)DELETE_WALK_OK);
+  EXPECT_TRUE(file_exists(root, "keep.txt"));
+  EXPECT_FALSE(file_exists(root, "extra.log")); /* risk wins the first match */
+  EXPECT_TRUE(file_exists(root, "safe.log"));   /* protect shields the extra */
+  EXPECT_FALSE(file_exists(root, "other.txt"));
+  EXPECT_TRUE(dir_exists(root, "prot"));
+  EXPECT_TRUE(file_exists(root, "prot/inside.txt"));
+  EXPECT_TRUE(file_exists(root, "prot/deep.log"));
+  filter_rule_list_free(rules);
   array_list_delete(manifest);
   remove_walk_tree(root);
   free(root);
@@ -626,6 +666,7 @@ void test_shared_utils() {
   test_walker_removes_extraneous_symlinks();
   test_walker_confines_deletion_to_synced_dirs();
   test_walker_unlimited_deletes_all();
+  test_walker_protect_rules_shield_dest_only();
   test_loopback_helpers();
   test_fd_peer_ip();
 

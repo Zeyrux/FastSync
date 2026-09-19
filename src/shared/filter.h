@@ -53,7 +53,7 @@ typedef struct {
   char* pattern;       /* cleaned glob pattern (no leading '/', no trailing '/') */
 } FilterRule;
 
-typedef struct {
+typedef struct FilterRuleList {
   FilterRule** items; /* owned array of rule pointers */
   int count;
   int capacity;

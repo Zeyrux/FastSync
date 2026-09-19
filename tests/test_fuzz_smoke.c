@@ -18,10 +18,11 @@
 
 /* P8 config-frame tail: super_mode (4) + copy-as presence (4) + uid (4) + gid (4). */
 #define P8_TAIL_BYTES 16
-/* Bytes after the P8 tail: report_dest_info (4), report_stats (4, wire-stats
- * wave) and compression_algo (4, codec wave).  The P8 fields sit this many
- * bytes before the end of the frame. */
-#define POST_P8_TAIL_BYTES 12
+/* Bytes after the P8 tail: report_dest_info (4), report_stats (4),
+ * report_deletes (4, --info=del wave), compression_algo (4, codec wave) and the
+ * receiver delete-protection count (4, protocol 2.28.0).  The P8 fields sit
+ * this many bytes before the end of the frame. */
+#define POST_P8_TAIL_BYTES 20
 
 /* Smoke test for chunk_deserialize fuzz target */
 static void test_fuzz_chunk_deserialize() {

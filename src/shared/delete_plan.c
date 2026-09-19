@@ -546,12 +546,18 @@ static int open_plan_dir(const Config* config, const char* dir) {
 typedef struct PlanSkips {
   DeleteSkipEntry* entries;
   int count;
+  /* Receiver-side delete-protection rules received on the config frame (NULL
+     when the sender sent none).  Evaluated per extra so a protect/risk rule is
+     honored under --delete-during/--delete-delay exactly like the whole-tree
+     commit walker. */
+  const FilterRuleList* protect_rules;
 } PlanSkips;
 
 static bool build_plan_skips(const Config* config, const DeletePlanSession* session,
                              PlanSkips* out) {
   out->entries = NULL;
   out->count = 0;
+  out->protect_rules = config->protect_rules;
   int count = (config->delay_updates ? 1 : 0) + config->basis_count +
               session->protected_prefixes->size + session->size_skipped->size;
   if (count == 0)
@@ -733,6 +739,10 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
     bool is_dir = S_ISDIR(st.st_mode);
     bool in_keep_dirs = is_dir && list_contains_str(keep_dirs, entry->d_name);
     bool in_keep_files = !is_dir && list_contains_str(keep_files, entry->d_name);
+    bool rule_protected =
+        skips->protect_rules &&
+        filter_rules_apply_side(skips->protect_rules, child_rel, entry->d_name, is_dir,
+                                FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT;
     if (in_keep_dirs) {
       local_survives = true;
     } else if (keep_dirs && !is_dir && list_contains_str(keep_dirs, entry->d_name)) {
@@ -750,11 +760,18 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
       else if (!removed)
         local_survives = true;
     } else if (is_dir) {
-      bool removed = false;
-      if (!process_extra_dir(dirfd, entry->d_name, child_rel, force_now, skips, session, &removed))
-        operation_ok = false;
-      else if (!removed)
+      if (rule_protected) {
         local_survives = true;
+      } else {
+        bool removed = false;
+        if (!process_extra_dir(dirfd, entry->d_name, child_rel, force_now, skips, session,
+                               &removed))
+          operation_ok = false;
+        else if (!removed)
+          local_survives = true;
+      }
+    } else if (rule_protected) {
+      local_survives = true;
     } else {
       if (!process_extra_file(dirfd, entry->d_name, child_rel, force_now, session))
         operation_ok = false;

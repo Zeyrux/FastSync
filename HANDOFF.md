@@ -52,9 +52,10 @@
    `tests/test_config.c`). Two residuals were reclassified **divergent**: `-M`
    over daemon/TCP (no argv channel in FastSync's binary config handshake;
    rsync-daemon differential pins the rsync behavior) and receiver-side
-   `protect`/`risk` re-derivation for destination-only entries (would need a
-   receiver filter engine; differential pins the divergence). The options pass
-   stands at **110 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
+    `protect`/`risk` re-derivation for destination-only entries (would need a
+    receiver filter engine; differential pins the divergence — **reversed by
+    track 4a below**, which adds that engine). The options pass
+    stands at **110 ✅ / 21 ⚠️ / 26 ❌**. New `tests/integration/test_option_parity.py`
    holds the rsync differentials (bwlimit parse+rate, info lines, real-setpriv
    `--ignore-errors`, rsync-daemon `-M`, filter-protect pin).
 
@@ -85,7 +86,8 @@
     `-n --delete` now sends the same filter-excluded + size-pruned protected
     prefixes and synchronized-directory scope as a real run (dry-run would-delete
     matches rsync for source-derived protections; the destination-only exclude
-    residual and readdir ordering remain); `--delete-delay` now charges
+    residual was later closed by track 4a, readdir ordering remains);
+    `--delete-delay` now charges
     `--max-delete` on actual removals and re-scans a queued directory at commit
     to remove content created after the plan, with an independent deferred-list
     cap (only partial-delete ordering remains); and `--info=name2` emits `NAME is
@@ -109,6 +111,26 @@
     transferred child, and no quick-check for symlinks/empty dirs) remain the
     caveats, so the row stays ⚠️ and the matrix is unchanged at
     **111 ✅ / 14 ⚠️ / 32 ❌ = 157**.
+
+13. **Wire parity track 4a** on `feat/parity-2.28` (`PROTOCOL_VERSION` stays
+    `2.28.0`): the receiver now has a delete-time filter engine. The sender
+    compiles its root-level selection rules exactly as the scanner does
+    (`filter_base_build`) and streams them as one bounded, self-describing
+    config-frame block (action, sides, anchored, dir-only, negate, owner,
+    pattern; bounded rule count and pattern bytes, unknown action/sides is a
+    protocol error). The receiver reconstructs `protect_rules` and applies them
+    first-match-wins to each extraneous destination path in every delete timing
+    (the whole-tree commit walker, the `--delete-during`/`--delete-delay`
+    per-directory plans, and the `-n` would-delete enumeration), so a
+    `P *.log` rule protects a destination-only `extra.log` like rsync (with
+    `risk` cancelling); the sender-derived protected-prefix behavior is
+    preserved when no rules are sent and `--delete-excluded` semantics are
+    unchanged. Per-directory merge (`:`/`.`) receiver re-derivation remains the
+    residual. `TestFilterProtect` (real + dry-run) plus differential cases
+    `filter_protect`, `filter_protect_during`, `filter_protect_delay` added and
+    the `--filter=RULE` row moves ❌ → ✅: matrix now
+    **115 ✅ / 11 ⚠️ / 31 ❌ = 157**; unit tests, the three named integration
+    files, clang-format and cppcheck clean.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).

@@ -116,6 +116,16 @@ def seed_delete_excluded(_src, rroot, froot):
         _mk(os.path.join(root, "keep.txt"), b"keep\n", _OLD_MTIME)
 
 
+def seed_filter_protect(_src, rroot, froot):
+    """Destination-only entries, including nested ones, for the receiver-side
+    `protect` rule: the `.log` extras must survive --delete, the rest go."""
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "extra.log"), b"dest-only log\n", _OLD_MTIME)
+        _mk(os.path.join(root, "other.txt"), b"dest-only other\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "extra2.log"), b"nested dest-only log\n", _OLD_MTIME)
+        _mk(os.path.join(root, "sub", "other2.txt"), b"nested dest-only other\n", _OLD_MTIME)
+
+
 def seed_max_delete(_src, rroot, froot):
     for root in (rroot, froot):
         _mk(os.path.join(root, "extra1.txt"), b"e1\n", _OLD_MTIME)
@@ -215,6 +225,18 @@ _CASES = [
            seed=seed_max_delete, server_args=DELETE,
            extra_check=max_delete_count_check, compare_tree=False,
            ref="--max-delete"),
+    H.Case("filter_protect", "filters",
+           ["-a", "--delete", "--filter=P *.log"],
+           seed=seed_filter_protect, server_args=DELETE, ci=True,
+           ref="--filter P/--protect receiver-side delete protection"),
+    H.Case("filter_protect_during", "filters",
+           ["-a", "--delete-during", "--filter=P *.log"],
+           seed=seed_filter_protect, server_args=DELETE, ci=True,
+           ref="--filter P/--protect under --delete-during"),
+    H.Case("filter_protect_delay", "filters",
+           ["-a", "--delete-delay", "--filter=P *.log"],
+           seed=seed_filter_protect, server_args=DELETE, ci=True,
+           ref="--filter P/--protect under --delete-delay"),
 
     # --- relative / dirs --------------------------------------------------
     H.Case("relative_general", "basic", ["-a", "-R"], layout=H.MIRROR_ABS,

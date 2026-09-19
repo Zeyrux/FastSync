@@ -1,6 +1,7 @@
 #include "test_config.h"
 #include "config.h"
 #include "delta.h"
+#include "filter.h"
 #include "identity.h"
 #include "multiprocessing.h"
 #include "protocol.h"
@@ -2590,6 +2591,46 @@ static bool basis_equal(const Config* a, const Config* b) {
   return true;
 }
 
+/* The receiver reconstructs its delete-protection list from the sender's
+ * compiled base rules, so compare the received list against a fresh
+ * filter_base_build() of the sender's raw --filter texts. */
+static bool filter_rules_equal(const Config* a, const FilterRuleList* got) {
+  int count = a->filters ? a->filters->size : 0;
+  const char** texts = NULL;
+  if (count > 0) {
+    texts = calloc((size_t)count, sizeof(char*));
+    if (!texts)
+      return false;
+    for (int i = 0; i < count; i++)
+      texts[i] = (const char*)a->filters->items[i];
+  }
+  char err[160];
+  FilterRuleList* expected =
+      filter_base_build(texts, count, a->cvs_exclude, a->delete_excluded, err, sizeof(err));
+  free(texts);
+  if (!expected)
+    return false;
+  bool equal = true;
+  int want = expected->count;
+  int have = got ? got->count : 0;
+  if (want != have) {
+    equal = false;
+  } else {
+    for (int i = 0; i < want; i++) {
+      const FilterRule* x = expected->items[i];
+      const FilterRule* y = got->items[i];
+      if (x->action != y->action || x->sides != y->sides || x->anchored != y->anchored ||
+          x->dir_only != y->dir_only || x->negate != y->negate ||
+          !str_opt_equal(x->owner, y->owner) || !str_opt_equal(x->pattern, y->pattern)) {
+        equal = false;
+        break;
+      }
+    }
+  }
+  filter_rule_list_free(expected);
+  return equal;
+}
+
 #define CONFIG_CMP_BOOL(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_INT(a, b, name) ((a)->name == (b)->name)
 #define CONFIG_CMP_RAW(a, b, name) ((a)->name == (b)->name)
@@ -2615,6 +2656,7 @@ static bool basis_equal(const Config* a, const Config* b) {
 #define CONFIG_CMP_COPY_AS_ID(a, b, name) (!(a)->copy_as_set || (a)->name == (b)->name)
 #define CONFIG_CMP_BLOCK_SKIP_SUFFIXES(a, b, name) skip_suffixes_equal((a), (b))
 #define CONFIG_CMP_BLOCK_BASIS(a, b, name) basis_equal((a), (b))
+#define CONFIG_CMP_BLOCK_PROTECT_RULES(a, b, name) filter_rules_equal((a), (b)->name)
 #define CONFIG_CMP_BLOCK_IDMAP(a, b, name)                                                         \
   idmap_equal((a)->name, (a)->name##_count, (b)->name, (b)->name##_count)
 
@@ -2829,6 +2871,14 @@ static void golden_config_populate(Config* c) {
   c->copy_as_set = true;
   c->copy_as_uid = 111;
   c->copy_as_gid = 222;
+  /* Compile-through delete-protection rules (protocol 2.28.0).  The golden
+   * sender serializes its compiled base rules, so populate a diverse set that
+   * exercises both sides, negate, anchoring and dir-only. */
+  c->filters = array_list_create(free);
+  array_list_add(c->filters, str_dup("P *.log"));
+  array_list_add(c->filters, str_dup("+r **/*.txt"));
+  array_list_add(c->filters, str_dup("H,!secret"));
+  array_list_add(c->filters, str_dup("- /sub/dir/"));
 }
 
 /* The pinned golden frame (protocol 2.28.0).  The values below are the only
@@ -2836,12 +2886,12 @@ static void golden_config_populate(Config* c) {
  * them ONLY with a PROTOCOL_VERSION bump and a documented reason.  The 2.24.0
  * delete-plan wave changed only the version string; 2.25.0 appended the
  * report_stats bool, 2.26.0 appended the compression_algo int, 2.27.0 appended
- * the report_deletes bool, and 2.28.0 changed only the version string (the
- * STATUS_STATS body grew, but the config frame layout is unchanged, so the
- * frame length is identical).  The byte-exact values are recomputed for the
- * merged layout. */
-#define GOLDEN_WIRE_LEN 709
-#define GOLDEN_WIRE_HASH 417335736347473203ULL
+ * the report_deletes bool, and 2.28.0 changed only the version string and
+ * appended the receiver-side delete-protection rule block (the STATUS_STATS
+ * body also grew, but that is not part of this frame).  The byte-exact values
+ * are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 882
+#define GOLDEN_WIRE_HASH 10588362715396735070ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;

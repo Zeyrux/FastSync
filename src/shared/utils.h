@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include "array_list.h"
+#include "filter.h"
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -148,7 +149,8 @@ bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSki
 DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* manifest,
                                        const ArrayList* synced_dirs, size_t max_delete,
                                        const DeleteSkipEntry* skips, int skip_count,
-                                       size_t* deleted_out, size_t* skipped_out);
+                                       const FilterRuleList* protect_rules, size_t* deleted_out,
+                                       size_t* skipped_out);
 
 /* Optional per-deletion observer: called for each destination-relative path
    actually removed (a file, symlink, or directory), in removal order, so the
@@ -156,10 +158,15 @@ DeleteWalkResult delete_extras_limited(const char* dest_root, const ArrayList* m
 typedef void (*DeletePathObserver)(void* context, const char* rel_path);
 
 /* `delete_extras_limited_observed` is delete_extras_limited with an optional
-   observer; the observer is invoked only for entries truly removed. */
+ * observer; the observer is invoked only for entries truly removed.  When
+ * `protect_rules` is non-NULL its receiver-side verdict is evaluated for every
+ * candidate extra: a first-match PROTECT leaves the entry (and, for a
+ * directory, its whole subtree) in place, while RISK/NONE fall through to the
+ * ordinary skip-prefix/keep-set logic. */
 DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const ArrayList* manifest,
                                                 const ArrayList* synced_dirs, size_t max_delete,
                                                 const DeleteSkipEntry* skips, int skip_count,
+                                                const FilterRuleList* protect_rules,
                                                 size_t* deleted_out, size_t* skipped_out,
                                                 DeletePathObserver observer,
                                                 void* observer_context);
@@ -170,7 +177,7 @@ DeleteWalkResult delete_extras_limited_observed(const char* dest_root, const Arr
    strings appended to `out` and receives their count in *count_out. */
 bool delete_extras_list(const char* dest_root, const ArrayList* manifest,
                         const ArrayList* synced_dirs, const DeleteSkipEntry* skips, int skip_count,
-                        ArrayList* out, size_t* count_out);
+                        const FilterRuleList* protect_rules, ArrayList* out, size_t* count_out);
 bool delete_extras(const char* dest_root, const ArrayList* manifest);
 /* Open the existing destination directory at `dest_root`, confined to the
    authorized root with an O_NOFOLLOW component walk (the same confinement the

@@ -4,6 +4,7 @@
 #include "array_list.h"
 #include "checksum.h"
 #include "compression.h"
+#include "filter.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -293,6 +294,20 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
 #define CONFIG_WIRE_CODEC_FIELDS(X)                                                                \
   X(compression_algo, int, COMPRESSION_ALGO_ZSTD, INT_COMPRESSION_ALGO)
 
+/* Receiver-side delete-protection filter rules (protocol 2.28.0).  The sender
+ * compiles its root-level selection rules exactly as the scanner does
+ * (filter_base_build over --filter/-f/--exclude/--include/-C) and streams them
+ * as one self-describing, bounded block (count followed by per-rule records).
+ * The receiver reconstructs `protect_rules` and evaluates them against
+ * DESTINATION-ONLY entries during the --delete extras walk, so a
+ * `protect`/`P` rule protects an extra that never appeared on the sender
+ * (rsync re-derives deletion protection from the filter list; FastSync
+ * historically derived it only from the source scan).  `protect_rules` is NULL
+ * on the sender and is owned/freed by the receiver Config.  Bounded by
+ * MAX_FILTER_RULES and MAX_FILTER_BYTES; an unknown action/sides is a protocol
+ * error. */
+#define CONFIG_WIRE_PROTECT_FIELDS(X) X(protect_rules, FilterRuleList*, NULL, BLOCK_PROTECT_RULES)
+
 /* All serialized fields, in exact wire order.  Concatenating the per-segment
  * lists here is what keeps the declaration order = the wire order. */
 #define CONFIG_WIRE_FIELDS(X)                                                                      \
@@ -315,7 +330,8 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   CONFIG_WIRE_PRIVILEGE_FIELDS(X)                                                                  \
   CONFIG_WIRE_COPY_AS_FIELDS(X)                                                                    \
   CONFIG_WIRE_OUTPUT_FIELDS(X)                                                                     \
-  CONFIG_WIRE_CODEC_FIELDS(X)
+  CONFIG_WIRE_CODEC_FIELDS(X)                                                                      \
+  CONFIG_WIRE_PROTECT_FIELDS(X)
 
 typedef struct Config {
   /* -j/--threads=N: number of parallel scanner worker threads for the -m
@@ -1025,10 +1041,22 @@ typedef struct Config {
  * same-version handshake (config_receive rejects a mismatched version before
  * parsing anything else) keeps mixed deployments from ever reaching that
  * state. */
+/* (9) Receiver-side delete protection (still protocol 2.28.0): the config frame
+ * gains one trailing self-describing block carrying the sender's compiled base
+ * filter rules so the receiver can protect DESTINATION-ONLY entries from
+ * --delete with `protect`/`risk` rules (rsync parity).  The block appends after
+ * compression_algo; see CONFIG_WIRE_PROTECT_FIELDS. */
 #define PROTOCOL_VERSION "2.28.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
+
+/* Bounds on the received receiver-side delete-protection rule block.  The rule
+ * count and the aggregate pattern+owner bytes are each capped so a hostile
+ * peer cannot pin unbounded pre-auth memory; both are validated strictly on
+ * receive (alongside the per-string ConfigStringBudget). */
+#define MAX_FILTER_RULES 4096
+#define MAX_FILTER_BYTES (256 * 1024)
 
 /* Upper bound on the number of --skip-compress suffixes accepted from the wire.
  * Each suffix is an independent wire string (up to MAX_STRING_SIZE = 64 KiB), so

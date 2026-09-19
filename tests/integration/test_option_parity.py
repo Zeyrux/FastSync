@@ -478,14 +478,14 @@ class TestRemoteOptionDaemon:
         assert "remote-option" in (result.stderr + result.stdout)
 
 
-class TestFilterProtectDivergence:
-    """Documented residual: a protect rule that matches only a destination-only
-    entry is not re-derived on the receiver (FastSync derives delete protection
-    from the source scan), so rsync protects the extra but FastSync removes it."""
+class TestFilterProtect:
+    """Receiver-derived delete protection: a `protect`/`P` rule is compiled by
+    the sender and sent on the config frame, so the receiver shields a
+    destination-only entry that never appeared on the sender, matching rsync."""
 
     @requires_rsync
     @pytest.mark.ci
-    def test_protect_dest_only_divergence(self, shared_server):
+    def test_protect_dest_only_matches_rsync(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "fpd_src")
         dest = os.path.join(TEST_DATA_DIR, "fpd_dst")
         rdst = os.path.join(TEST_DATA_DIR, "fpd_rdst")
@@ -498,6 +498,7 @@ class TestFilterProtectDivergence:
         rsync_result = _rsync(["-a", "--delete", "--filter=P *.log", source + "/", rdst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         assert os.path.exists(os.path.join(rdst, "extra.log")), "rsync did not protect extra.log"
+        assert not os.path.exists(os.path.join(rdst, "other.txt")), "rsync did not delete other.txt"
 
         clean_dir(dest)
         received = get_dest_received_dir(dest, source)
@@ -509,9 +510,29 @@ class TestFilterProtectDivergence:
                                    flags=["-a", "--delete", "--filter=P *.log"],
                                    port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:200]
-        # Pin the known divergence: FastSync deletes the destination-only file.
-        assert not os.path.exists(os.path.join(received, "extra.log")), (
-            "FastSync now protects destination-only P matches; the --filter row may be "
-            "upgradable to full parity"
-        )
+        assert os.path.exists(os.path.join(received, "extra.log")), (
+            "FastSync must protect a destination-only P match like rsync")
         assert not os.path.exists(os.path.join(received, "other.txt"))
+
+    @pytest.mark.ci
+    def test_protect_dest_only_dry_run_enumeration(self, shared_server):
+        source = os.path.join(TEST_DATA_DIR, "fpd_nd_src")
+        dest = os.path.join(TEST_DATA_DIR, "fpd_nd_dst")
+        clean_dir(source)
+        _write(os.path.join(source, "keep.txt"), b"keep\n")
+        received = get_dest_received_dir(dest, source)
+        clean_dir(received)
+        _write(os.path.join(received, "keep.txt"), b"keep\n")
+        _write(os.path.join(received, "extra.log"), b"extra\n")
+        _write(os.path.join(received, "other.txt"), b"other\n")
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, dest,
+                                   flags=["-a", "-n", "--delete", "--out-format=%n",
+                                          "--filter=P *.log"],
+                                   port=server.port)
+        assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+        assert "other.txt" in result.stdout, result.stdout
+        assert "extra.log" not in result.stdout, result.stdout
+        assert os.path.exists(os.path.join(received, "extra.log"))
+        assert os.path.exists(os.path.join(received, "other.txt"))

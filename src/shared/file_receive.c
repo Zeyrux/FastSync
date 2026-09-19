@@ -3328,7 +3328,7 @@ static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest
   size_t skipped = 0;
   DeleteWalkResult result = delete_extras_limited_observed(
       config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips, used,
-      &deleted, &skipped, observer, observer_context);
+      config->protect_rules, &deleted, &skipped, observer, observer_context);
   if (owned_prefixes) {
     for (int i = 0; i < config->basis_count; i++)
       free(owned_prefixes[i]);
@@ -3509,7 +3509,7 @@ static bool delete_missing_args_budgeted_observed(const Config* config, DeleteMa
           PrefixedDeleteObserver nested = {observer, observer_context, rel};
           DeleteWalkResult walk =
               no_keeps ? delete_extras_limited_observed(full, no_keeps, NULL, remaining, NULL, 0,
-                                                        &contents_deleted, &contents_skipped,
+                                                        NULL, &contents_deleted, &contents_skipped,
                                                         observer ? prefixed_delete_observer : NULL,
                                                         observer ? &nested : NULL)
                        : DELETE_WALK_ERROR;
@@ -3620,7 +3620,7 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
     used = idx;
   }
   bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                               skips, used, out, count_out);
+                               skips, used, config->protect_rules, out, count_out);
   if (owned_prefixes) {
     for (int i = 0; i < config->basis_count; i++)
       free(owned_prefixes[i]);
