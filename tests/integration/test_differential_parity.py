@@ -133,6 +133,16 @@ def seed_max_delete(_src, rroot, froot):
         _mk(os.path.join(root, "extra2.txt"), b"e2\n", _OLD_MTIME)
 
 
+def fuzzy_basis_seed(_src, rroot, froot):
+    """Seed a same-suffix sibling whose name is one edit from the source and
+    whose content matches it, with a DIFFERENT mtime so rsync's exact
+    size+mtime pass cannot fire: both tools must select it via the
+    name-distance pass.  Where the two tools' basis choices coincide the
+    block-level results are identical when the block size is pinned."""
+    for root in (rroot, froot):
+        _mk(os.path.join(root, "report_v1.txt"), H.FUZZY_PAYLOAD, _OLD_MTIME)
+
+
 def max_delete_count_check(_src, rroot, froot, _rs, _fs):
     """The exact survivor set is order-dependent; the count must still match."""
     r = H.snapshot(rroot)
@@ -207,6 +217,18 @@ _CASES = [
            ref="--backup"),
     H.Case("chmod", "basic", ["-a", "--chmod=Fu+rwx"], compare_modes=True,
            ci=True, ref="--chmod"),
+
+    # --- delta / similar-file basis (--fuzzy) -----------------------------
+    # Basis choices coincide here (same-suffix sibling, name distance one edit,
+    # content identical); with the block size pinned both tools report the same
+    # Matched/Literal/transferred counters.  The residual (FastSync's narrower
+    # delta size window) is covered by TestFuzzy in test_parity_quickwins.py.
+    H.Case("fuzzy_basis", "fuzzy",
+           ["-a", "--no-whole-file", "--fuzzy", "--stats", "-B8192"],
+           fastsync_flags=["-a", "--incremental", "--delta", "--fuzzy",
+                           "--stats", "--delta-block=8192"],
+           seed=fuzzy_basis_seed, stdout=H.STDOUT_STATS, ci=True,
+           ref="-y/--fuzzy similar-file basis"),
 
     # --- deletion ---------------------------------------------------------
     H.Case("delete", "basic", ["-a", "--delete"], seed=seed_extras,

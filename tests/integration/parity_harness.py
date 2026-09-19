@@ -229,6 +229,18 @@ def corpus_iconv(root: str) -> None:
         os.utime(full, (_SRC_MTIME, _SRC_MTIME))
 
 
+# Payload for the --fuzzy basis corpus: large enough for the delta engine's
+# 16 KiB minimum and with repeated content so a coinciding basis yields a
+# non-zero (and identical) Matched data count in both tools.
+FUZZY_PAYLOAD = (b"the quick brown fox jumps over the lazy dog\n" * 2000)[:65536]
+
+
+def corpus_fuzzy(root: str) -> None:
+    """A named regular file; the `fuzzy` seed adds the similar-suffix sibling."""
+    clean_dir(root)
+    _write(os.path.join(root, "report_v2.txt"), FUZZY_PAYLOAD)
+
+
 CORPORA: Dict[str, Callable[[str], None]] = {
     "basic": corpus_basic,
     "unicode": corpus_unicode,
@@ -240,6 +252,7 @@ CORPORA: Dict[str, Callable[[str], None]] = {
     "multidir": corpus_multidir,
     "relative": corpus_relative,
     "iconv": corpus_iconv,
+    "fuzzy": corpus_fuzzy,
 }
 
 

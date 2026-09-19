@@ -847,6 +847,92 @@ class TestVerifyAndFlip:
                 "--verify-basis must reject the same-size/different-content basis"
 
 
+def _stat_bytes(output, key):
+    """Parse a --stats byte counter (e.g. ``Matched data: 65,536 bytes``)."""
+    for line in output.splitlines():
+        if line.startswith(key + ":"):
+            raw = line.split(":", 1)[1].strip().split()[0]
+            return int(raw.replace(",", ""))
+    return None
+
+
+class TestFuzzy:
+    """Track 5b: `-y`/`--fuzzy` is an internal bandwidth optimization with a
+    byte-exact result.  FastSync ports rsync 3.4.1's weighted-Levenshtein name
+    heuristic, so where both delta engines admit the candidate the tools pick
+    the same basis (the ``fuzzy_basis`` differential asserts the tree and the
+    Matched/Literal counters match with the block size pinned).  The residual is
+    candidate ELIGIBILITY: FastSync's delta size gate (both files >= 16 KiB and
+    a <= 10x size ratio) is narrower than rsync's, which empirically uses a
+    fuzzy basis well beyond 10x and below 16 KiB.  These tests pin the window
+    boundary and prove the byte-exact fallback on both sides of it."""
+
+    _BASE = b"the quick brown fox jumps over the lazy dog\n" * 4000
+
+    def _src(self, tag):
+        source = os.path.join(TEST_DATA_DIR, f"fz_{tag}_src")
+        clean_dir(source)
+        return source
+
+    def _dst(self, tag):
+        d = os.path.join(TEST_DATA_DIR, f"fz_{tag}_dst")
+        clean_dir(d)
+        return d
+
+    def _run_both(self, shared_server, source, dest, rdst, payload, sibling,
+                  rs_extra=(), fs_extra=()):
+        with open(os.path.join(source, "report_v2.txt"), "wb") as fh:
+            fh.write(payload)
+        for root in (rdst, get_dest_received_dir(dest, source)):
+            os.makedirs(root, exist_ok=True)
+            with open(os.path.join(root, "report_v1.txt"), "wb") as fh:
+                fh.write(sibling)
+        rs = _rsync(["-a", "--no-whole-file", "--fuzzy", "--stats"] +
+                    list(rs_extra) + [source + "/", rdst + "/"])
+        assert rs.returncode == 0, rs.stderr[:300]
+        result, _ = run_client(
+            source, dest,
+            flags=["-a", "--incremental", "--delta", "--fuzzy", "--stats"] +
+            list(fs_extra),
+            port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        _assert_same_tree(rdst, get_dest_received_dir(dest, source), "(--fuzzy)")
+        return rs, result
+
+    @requires_rsync
+    def test_fuzzy_above_size_window_declines_but_tree_exact(self, shared_server):
+        """A sibling >10x the source is used by rsync but declined by FastSync's
+        delta size-ratio gate; both destinations stay byte-identical."""
+        n = 65536
+        payload = (self._BASE * ((n // len(self._BASE)) + 1))[:n]
+        sibling = (self._BASE * 200)[: n * 20]
+        source, dest, rdst = (self._src("big"), self._dst("big"),
+                              self._dst("big_r"))
+        rs, result = self._run_both(shared_server, source, dest, rdst,
+                                    payload, sibling)
+        assert _stat_bytes(rs.stdout, "Matched data") > 0, \
+            "rsync should still use a >10x fuzzy basis"
+        assert _stat_bytes(result.stdout, "Matched data") == 0, \
+            "FastSync's 10x delta size-ratio gate must decline the oversized basis"
+        assert _stat_bytes(result.stdout, "Literal data") == n
+
+    @requires_rsync
+    def test_fuzzy_below_delta_minimum_declines_but_tree_exact(self, shared_server):
+        """A sibling below the 16 KiB delta minimum is used by rsync but never
+        enters FastSync's delta/fuzzy path; both trees stay byte-identical."""
+        n = 8192
+        payload = (self._BASE * ((n // len(self._BASE)) + 1))[:n]
+        source, dest, rdst = (self._src("small"), self._dst("small"),
+                              self._dst("small_r"))
+        rs, result = self._run_both(shared_server, source, dest, rdst,
+                                    payload, payload)
+        assert _stat_bytes(rs.stdout, "Matched data") > 0, \
+            "rsync applies --fuzzy below 16 KiB"
+        assert _stat_bytes(result.stdout, "Matched data") == 0, \
+            "FastSync's 16 KiB delta minimum must bypass the fuzzy basis"
+        assert _stat_bytes(result.stdout, "Literal data") == n
+
+
 class TestIgnoreExistingShortCircuit:
     """#9: --ignore-existing is decided by the receiver during the per-file
     check, before the sender streams any payload.  A large destination file that

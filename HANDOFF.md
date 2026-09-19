@@ -75,7 +75,8 @@
    heuristic with a 10× size window, not rsync's matcher), but its residual is the
    candidate-selection heuristic itself: the final tree is byte-exact by design, so
    it is pinned by the `TestFuzzy` threshold suite rather than a byte-level rsync
-   differential. The parity-review pass then moved `--delete-delay` to ⚠️ (the
+   differential. (Track 5b later found the name heuristic is rsync's own and moved
+   the row ❌ → ⚠️, leaving only the narrower delta size window; see entry 15.) The parity-review pass then moved `--delete-delay` to ⚠️ (the
    plan-time `--max-delete` charge and non-recursive deferred removal differ from
    rsync when a snapshotted entry fails removal). Differential-gate allowlist
    entries `min_size`/`empty_dirs_recursive`/`dirs_plain` were removed. The
@@ -156,6 +157,22 @@
     `--compare-dest`/`--copy-dest`/`--link-dest` rows move ❌ → ⚠️ (relative-DIR
     resolution base and over-limit MISS refusal): matrix now
     **116 ✅ / 13 ⚠️ / 28 ❌ = 157**.
+
+15. **No-wire parity track 5b** on `feat/parity-2.28` (`PROTOCOL_VERSION` stays
+    `2.28.0` by project decision): `-y`/`--fuzzy` reclassified ❌ → ⚠️. A probe
+    against real rsync 3.4.1 (pinned `-B8192`, repeated-content 64 KiB corpus)
+    showed the name heuristic is already rsync's (`util1.c fuzzy_distance` /
+    `find_filename_suffix` + the exact size+mtime pass) and the output is always
+    byte-exact; the only residual is candidate ELIGIBILITY, because FastSync's
+    `delta_should_attempt` gate caps the size ratio at 10× and requires both
+    files ≥ 16 KiB while rsync will reuse a basis from 0.25× to 10000× and below
+    16 KiB. The choice is observable only as `--stats` bandwidth counters. Added
+    differential case `fuzzy_basis` (same-suffix sibling, one name edit,
+    identical content, block size pinned) asserting tree **and** normalized
+    `--stats` parity where the choices coincide, plus `TestFuzzy` pinning the
+    window boundary on both sides (>10× and <16 KiB siblings declined by
+    FastSync while rsync uses them, both trees byte-identical). Matrix now
+    **116 ✅ / 14 ⚠️ / 27 ❌ = 157**.
 
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
