@@ -24,6 +24,16 @@ File* file_receive_hardlink(int file_descriptor);
 File* file_receive_symlink(int file_descriptor, const Config* config);
 File* file_receive_special(int file_descriptor);
 bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode);
+/* Testable basis quick-check / verification policy.  file_basis_quick_match is
+ * rsync's metadata quick-check for a basis candidate (equal size is required
+ * separately by the caller; this adds the --size-only / mtime / --modify-window
+ * leg).  file_basis_content_required reports whether a hit must ALSO be
+ * confirmed by a whole-file content digest (--verify-basis; false is the
+ * default rsync-parity behavior). */
+bool file_basis_quick_match(const Config* config, const struct stat* st, time_t check_mtime,
+                            long check_mtime_nsec);
+bool file_basis_content_required(const Config* config);
+
 File* receive_incremental_check(int fd, const Config* config, bool* skipped);
 /* Extended variant used by the receiver.  `would_transfer` (may be NULL) is set
  * true only on the server-contacting --dry-run path when the file is not up to

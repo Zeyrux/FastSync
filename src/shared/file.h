@@ -163,6 +163,16 @@ bool file_to_disk_secure_link_attrs(const char* path, const char* basis_path, co
                                     const FileMetadata* metadata, FileAttrPolicy policy,
                                     bool use_fsync, const FileXattrList* xattrs, bool fake_super,
                                     const char* temp_dir);
+/* Streaming --copy-dest install: atomically materialize `path` by copying the
+ * bytes of `basis_path` through a bounded buffer (no whole-file buffering, so
+ * an arbitrarily large basis works), applying the SOURCE metadata and the
+ * per-file xattrs / --fake-super record.  `update` honors a newer destination;
+ * a --temp-dir scratch location falls back to a direct write on EXDEV. */
+bool file_copy_basis_stream_attrs(const char* path, const char* basis_path,
+                                  unsigned long long expected_size, bool preallocate,
+                                  const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+                                  bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+                                  const char* temp_dir);
 /* Protocol 2.28.0 receiver-stat variants: like the two above but additionally
  * report through `dirs_created` (when non-NULL) how many parent directories the
  * confined secure walk had to create that lie strictly below `count_floor` (a

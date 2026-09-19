@@ -138,6 +138,9 @@ void print_usage(void) {
   printf("                    into the destination instead of transferring its data\n");
   printf("  --link-dest <dir>   Like --copy-dest, but hard-links the unchanged file from DIR\n");
   printf("                    into the destination (repeatable; earlier DIRs win)\n");
+  printf("  --verify-basis      FastSync-only: require a basis hit's content to match the\n");
+  printf("                    source by whole-file digest instead of trusting rsync's\n");
+  printf("                    size+mtime (or --size-only) quick-check\n");
   printf("  --checksum-choice, --cc <alg>  Whole-file checksum algorithm for --incremental/\n");
   printf("                    --checksum compares.  Accepted: xxh128 (default), xxh3, xxh64\n");
   printf("                    (aka xxhash), md5, md4, sha1, or none.  A two-name\n");

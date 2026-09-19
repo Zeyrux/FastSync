@@ -340,6 +340,7 @@ static void test_parse_args_protocol_accept_current() {
 static void test_parse_args_protocol_rejects_other_versions() {
   static const char* const bad_versions[] = {"2.17",   "2.16",   "2.15.0", "2.16.0", "2.17.0",
                                              "2.18.0", "2.19.0", "2.20.0", "2.21.0", "2.22.0",
+                                             "2.23.0", "2.24.0", "2.25.0", "2.26.0", "2.27.0",
                                              "216",    "31",     "abc",    ""};
   for (size_t i = 0; i < sizeof(bad_versions) / sizeof(bad_versions[0]); i++) {
     Config* cfg = valid_client_config();
@@ -1042,6 +1043,23 @@ static void test_parse_args_basis_dirs() {
   EXPECT_EQ_INT(parse_args(cfg, 4, argv4, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->basis_count, 1);
   EXPECT_EQ_STR(cfg->basis_dirs[0].path, "snap/2026-01");
+  config_delete(cfg);
+}
+
+/* --verify-basis (FastSync-only, long-only): default off; parses on as a plain
+   boolean and leaves the basis implications intact. */
+static void test_parse_args_verify_basis() {
+  Config* cfg = config_create();
+  EXPECT_FALSE(cfg->verify_basis);
+  config_delete(cfg);
+
+  cfg = config_create();
+  int positional_args[2];
+  int positional_count = 0;
+  char* argv[] = {"fastsync", "--link-dest=prior", "--verify-basis", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->verify_basis);
+  EXPECT_TRUE(config_has_basis(cfg));
   config_delete(cfg);
 }
 
@@ -4831,6 +4849,7 @@ void test_client_cli() {
   test_parse_args_filter_rules();
   test_parse_args_from0_cvs_filter_file_flags();
   test_parse_args_basis_dirs();
+  test_parse_args_verify_basis();
   test_parse_args_basis_invalid_paths();
   test_validate_config_basis_rejects_chunk_serialization();
   test_parse_args_delete_policy_flags();

@@ -57,6 +57,11 @@ typedef struct {
    * equals the incoming file, and `data` is kept as the cross-filesystem
    * fallback (a local copy) if the hard link cannot be created. */
   char* basis_link;
+  /* Receiver-only, --copy-dest: when set (and basis_link is NULL), stream the
+   * basis file's bytes into the destination instead of `data`/`data->size`.
+   * This lets a basis larger than any whole-file bound materialize without
+   * buffering it; the source metadata on `metadata` is applied afterwards. */
+  char* basis_copy;
   /* --hard-links (-H), sender + receiver wire state.  link_group is a run-local
    * id shared by every member of one source inode (0 = not part of a group).
    * The FIRST member (link_first == true) carries its data on the wire and is

@@ -719,13 +719,18 @@ class TestVerifyAndFlip:
         source = self._src("cmpd")
         dest = self._dst("cmpd")
         rdst = self._dst("cmpd_r")
+        # Pin the mtime so rsync's size+mtime quick-check (and FastSync's
+        # default) matches deterministically across a second boundary.
+        OLD = 1_500_000_000
         with open(os.path.join(source, "f.txt"), "wb") as fh:
             fh.write(b"basis-content\n")
+        os.utime(os.path.join(source, "f.txt"), (OLD, OLD))
         # rsync resolves --compare-dest relative to the destination dir; its
         # basis file sits at the transfer-relative path.
         os.makedirs(os.path.join(rdst, "basis"), exist_ok=True)
         with open(os.path.join(rdst, "basis", "f.txt"), "wb") as fh:
             fh.write(b"basis-content\n")
+        os.utime(os.path.join(rdst, "basis", "f.txt"), (OLD, OLD))
         rs = _rsync(["-a", "--compare-dest=basis", source + "/", rdst + "/"])
         assert rs.returncode == 0, rs.stderr
         assert not os.path.exists(os.path.join(rdst, "f.txt")), \
@@ -738,6 +743,7 @@ class TestVerifyAndFlip:
         os.makedirs(basis, exist_ok=True)
         with open(os.path.join(basis, "f.txt"), "wb") as fh:
             fh.write(b"basis-content\n")
+        os.utime(os.path.join(basis, "f.txt"), (OLD, OLD))
         received = get_dest_received_dir(dest, source)
         result, _ = run_client(source, dest,
                                flags=["--compare-dest=basis", "--incremental"],
@@ -751,14 +757,17 @@ class TestVerifyAndFlip:
     def test_link_dest_hardlinks_matches_rsync(self, shared_server):
         source = self._src("linkd")
         dest = self._dst("linkd")
+        OLD = 1_500_000_000
         with open(os.path.join(source, "f.txt"), "wb") as fh:
             fh.write(b"link-basis-content\n")
+        os.utime(os.path.join(source, "f.txt"), (OLD, OLD))
         rel = os.path.abspath(source).lstrip(os.sep)
         basis = os.path.join(dest, "basis", rel)
         os.makedirs(basis, exist_ok=True)
         basis_file = os.path.join(basis, "f.txt")
         with open(basis_file, "wb") as fh:
             fh.write(b"link-basis-content\n")
+        os.utime(basis_file, (OLD, OLD))
         received = get_dest_received_dir(dest, source)
         result, _ = run_client(source, dest,
                                flags=["--link-dest=basis", "--incremental"],
@@ -771,12 +780,11 @@ class TestVerifyAndFlip:
 
     @requires_rsync
     def test_basis_dir_size_only_content_residual(self, shared_server):
-        """Documented residual (RSYNC_COMPAT.md basis-dir rows): FastSync
-        xxHash-verifies a basis hit, while rsync's `--size-only` quick check
-        trusts the size alone.  With a same-size, different-content basis,
-        rsync links/copies the wrong basis content while FastSync transfers the
-        source.  This test pins both observed behaviors (FastSync is stricter,
-        so the rows are reclassified Divergent)."""
+        """rsync parity (default): a basis hit is decided by the metadata
+        quick-check alone.  With `--size-only`, a same-size, different-content
+        basis is trusted, so rsync links the basis content and FastSync must now
+        do the same instead of xxHash-verifying it.  `--verify-basis` restores
+        the stricter content equality (covered by the differential test)."""
         source = self._src("basissz")
         rdest = self._dst("basissz_r")
         fdest = self._dst("basissz_f")
@@ -807,8 +815,36 @@ class TestVerifyAndFlip:
                                port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
         with open(os.path.join(received, "f.txt"), "rb") as fh:
+            assert fh.read() == b"BBBB\n", \
+                "FastSync must trust the metadata quick-check exactly like rsync"
+
+    @requires_rsync
+    def test_verify_basis_restores_content_check(self, shared_server):
+        """FastSync-only `--verify-basis`: a same-size, same-mtime basis with
+        different content is rejected by the whole-file digest, so the source is
+        transferred instead of installing the wrong basis bytes.  The default
+        (no flag) installs the basis content, matching rsync."""
+        source = self._src("vbasis")
+        fdest = self._dst("vbasis_f")
+        with open(os.path.join(source, "f.txt"), "wb") as fh:
+            fh.write(b"AAAA\n")
+        OLD = 1_400_000_000
+        os.utime(os.path.join(source, "f.txt"), (OLD, OLD))
+        rel = os.path.abspath(source).lstrip(os.sep)
+        basis = os.path.join(fdest, "basis", rel)
+        os.makedirs(basis, exist_ok=True)
+        with open(os.path.join(basis, "f.txt"), "wb") as fh:
+            fh.write(b"BBBB\n")
+        os.utime(os.path.join(basis, "f.txt"), (OLD, OLD))
+        received = get_dest_received_dir(fdest, source)
+        result, _ = run_client(source, fdest,
+                               flags=["-a", "--link-dest=basis", "--incremental",
+                                      "--verify-basis"],
+                               port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        with open(os.path.join(received, "f.txt"), "rb") as fh:
             assert fh.read() == b"AAAA\n", \
-                "FastSync must verify the basis content and transfer the source"
+                "--verify-basis must reject the same-size/different-content basis"
 
 
 class TestIgnoreExistingShortCircuit:

@@ -1047,53 +1047,6 @@ static bool files_from_list_check(const Config* config, ArrayList* missing_dest,
   return true;
 }
 
-/* Basis directories are honored by the receiver's per-file incremental check,
-   which (like every whole-file payload path in FastSync) is bounded by
-   MAX_RECEIVE_WHOLE_FILE_SIZE.  rsync would apply basis dirs to files of any
-   size; FastSync cannot, so when basis dirs are requested this preflight scan
-   refuses the run up front with a clear diagnostic instead of letting the
-   receiver abort the whole transfer mid-stream with no client explanation.
-   Returns true when the tree can be transferred. */
-static bool basis_oversize_preflight(const Config* config) {
-  PreparedScanner prepared;
-  if (!prepare_scanner(config, 0, &prepared))
-    return false;
-  DirectoryScanner* scanner =
-      directory_scanner_create_with_options(config->send_directory, &prepared.options);
-  if (!scanner) {
-    prepared_scanner_destroy(&prepared);
-    return false;
-  }
-  bool ok = true;
-  Chunk* chunk;
-  while ((chunk = directory_scanner_next(scanner)) != NULL) {
-    for (int i = 0; i < chunk->element_count; i++) {
-      File* f = chunk->items[i];
-      if (f == NULL || f->is_dir || f->data == NULL || f->data->size <= MAX_RECEIVE_WHOLE_FILE_SIZE)
-        continue;
-      char* escaped = output_escape(file_wire_path(f), config->eight_bit_output);
-      log_message(LOG_LEVEL_ERROR,
-                  "%s is %llu bytes, larger than the %llu-byte whole-file transfer limit; "
-                  "--compare-dest/--copy-dest/--link-dest cannot sync files above this limit",
-                  escaped ? escaped : "<allocation failed>", (unsigned long long)f->data->size,
-                  (unsigned long long)MAX_RECEIVE_WHOLE_FILE_SIZE);
-      free(escaped);
-      ok = false;
-      break;
-    }
-    chunk_destroy(chunk);
-    if (!ok)
-      break;
-  }
-  if (directory_scanner_failed(scanner) || directory_scanner_had_io_error(scanner))
-    ok = false;
-  /* The scanner borrows prepared.options' base_filters/hardlinks pointers, so
-     prepared must outlive the scanner. */
-  directory_scanner_destroy(scanner);
-  prepared_scanner_destroy(&prepared);
-  return ok;
-}
-
 /* Read the daemon's MOTD frame and, unless --no-motd, display it on stdout.
  *
  * The daemon sends the MOTD as the first thing after the config-frame STATUS_OK
@@ -1939,11 +1892,13 @@ static int incremental_check(Client* client, File* file, const Config* config,
     return -1;
   if (!send_n_data(client->file_descriptor, &mtime_nsec, sizeof(mtime_nsec)))
     return -1;
-  /* With alternate basis directories the receiver must be able to verify the
-   * content of every candidate basis file, so the sender supplies its whole-file
-   * digest (computed with the negotiated --checksum-choice algorithm and
-   * --checksum-seed) for every file even when --checksum was not requested. */
-  if (config->checksum || config_has_basis(config)) {
+  /* The whole-file digest (negotiated --checksum-choice algorithm and
+   * --checksum-seed) is only needed when it drives a decision: --checksum's
+   * per-file quick check, or a --verify-basis content equality.  Under the
+   * default metadata quick-check the receiver never reads it, so the sender
+   * skips the full-file read/hash exactly as rsync does for a plain
+   * --link-dest run. */
+  if (config->checksum || config->verify_basis) {
     uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
     size_t digest_len = 0;
     if (!file_checksum(file, (ChecksumAlgo)config->checksum_algo, config->checksum_seed, digest,
@@ -1952,6 +1907,15 @@ static int incremental_check(Client* client, File* file, const Config* config,
     uint8_t wire_len = (uint8_t)digest_len;
     if (!send_n_data(client->file_descriptor, &wire_len, sizeof(wire_len)) ||
         !send_n_data(client->file_descriptor, digest, wire_len))
+      return -1;
+  }
+  /* Basis directories: the receiver materializes a hit from the basis without a
+   * data frame, so it would otherwise only have the basis inode's metadata.
+   * Transmit the SOURCE metadata with the check (rsync's copy-then-fix) so a
+   * --copy-dest hit / --link-dest copy fallback applies the source's
+   * attributes.  Symmetric with incremental_check_receive_request. */
+  if (config_has_basis(config) && config->use_metadata) {
+    if (!metadata_send(client->file_descriptor, file->metadata))
       return -1;
   }
   Status s;
@@ -2193,12 +2157,6 @@ static int send_dry_run_remote(Config* config) {
   }
   if (missing_args)
     array_list_delete(missing_args);
-  /* Alternate basis dirs force the whole-file per-file check on the real
-     receiver; refuse an oversize source up front exactly as send_files does so
-     dry-run reports the same clear diagnostic instead of aborting mid-stream. */
-  if (config_has_basis(config) && !basis_oversize_preflight(config))
-    return 1;
-
   /* A live session may follow, so arm graceful abort handling. */
   client_set_abort_armed(true);
   Client* client = connect_transfer_client(config);
@@ -3240,11 +3198,6 @@ int send_files(Config* config) {
       array_list_delete(missing_args);
     return 1;
   }
-  if (config_has_basis(config) && !basis_oversize_preflight(config)) {
-    if (missing_args)
-      array_list_delete(missing_args);
-    return 1;
-  }
 
   /* From here on a server session may be live, so Ctrl-C/SIGTERM should set the
      abort flag (and be forwarded as STATUS_ABORT) instead of terminating. */
@@ -3678,11 +3631,6 @@ int send_files_multithreaded(Config** config_ptr) {
       return 1;
   }
   if (!files_from_list_check(config, missing_args, &skipped)) {
-    if (missing_args)
-      array_list_delete(missing_args);
-    return 1;
-  }
-  if (config_has_basis(config) && !basis_oversize_preflight(config)) {
     if (missing_args)
       array_list_delete(missing_args);
     return 1;

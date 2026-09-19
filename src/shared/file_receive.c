@@ -99,6 +99,12 @@ static FileSaveResult file_stage_delayed_update(const char* root_directory,
   if (file->basis_link) {
     ok = file_to_disk_secure_link(staged_path, file->basis_link, file->data->data, file->data->size,
                                   config->preallocate, metadata, policy, config->use_fsync, NULL);
+  } else if (file->basis_copy) {
+    /* --copy-dest basis hit: stream the basis into the staging tree (bounded
+       buffers, so an over-limit basis still stages). */
+    ok = file_copy_basis_stream_attrs(staged_path, file->basis_copy, file->data->size,
+                                      config->preallocate, metadata, policy, config->update,
+                                      config->use_fsync, file->xattrs, config->fake_super, NULL);
   } else {
     ok =
         file_to_disk_secure_attrs(staged_path, file->data->data, file->data->size, false, sparse,
@@ -652,7 +658,8 @@ FileSaveResult file_save_to_disk_full_ex(const char* root_directory, const File*
   char* destination_path = NULL;
   char *backup_path = NULL, *parent_copy = NULL;
 
-  if (!file || !file->path || !file->data || (file->data->size != 0 && !file->data->data) ||
+  if (!file || !file->path || !file->data ||
+      (file->data->size != 0 && !file->data->data && !file->basis_link && !file->basis_copy) ||
       (!file_get_trust_sender() && has_path_traversal(file->path)) ||
       (backup_enabled &&
        (!backup_suffix || backup_suffix[0] == '\0' || strchr(backup_suffix, '/') != NULL ||
@@ -975,6 +982,13 @@ FileSaveResult file_save_to_disk_full_ex(const char* root_directory, const File*
         disk_path, file->basis_link, file->data->data, file->data->size, config->preallocate,
         metadata, policy, config->use_fsync, file->xattrs, config->fake_super, confined_temp,
         created_dirs, count_floor);
+  } else if (config && file->basis_copy) {
+    /* --copy-dest: stream the basis bytes through a bounded buffer so a basis
+       larger than any whole-file bound still materializes.  The source
+       metadata was transmitted with the check frame. */
+    ok = file_copy_basis_stream_attrs(
+        disk_path, file->basis_copy, file->data->size, config->preallocate, metadata, policy,
+        config->update, config->use_fsync, file->xattrs, config->fake_super, confined_temp);
   } else {
     /* The plain no-replace / update / with-fsync engines, plus per-file xattr
        (-X/-A) and --fake-super application on the written fd. */
@@ -1298,16 +1312,17 @@ static File* receive_delta_file(int fd, const Config* config, const char* check_
 
 /* ---- Alternate basis directories (--compare-dest / --copy-dest / --link-dest) ----
  * The receiver consults the ordered basis-dir list only when the destination
- * entry is NOT already up to date.  An "exact match" requires an equal size,
- * an equal mtime (unless --size-only), and an equal content xxHash64, so a
- * hard link / local copy is only ever made from byte-identical content. */
+ * entry is NOT already up to date.  By default an "exact match" is rsync's
+ * metadata quick-check: an equal size and an equal mtime (unless --size-only).
+ * The FastSync-only --verify-basis additionally requires an equal whole-file
+ * content digest, so a hard link / local copy is only then made from
+ * byte-verified content. */
 
 typedef struct BasisMatch {
   bool hit;
   BasisDestType type;
   char* basis_path; /* owned absolute path of the matched basis file */
   struct stat st;   /* fstat() of the matched basis file */
-  Data* content;    /* owned basis bytes (or empty Data), NULL when not loaded */
 } BasisMatch;
 
 static void basis_match_free(BasisMatch* match) {
@@ -1315,8 +1330,6 @@ static void basis_match_free(BasisMatch* match) {
     return;
   free(match->basis_path);
   match->basis_path = NULL;
-  data_destroy(match->content);
-  match->content = NULL;
   match->hit = false;
   match->type = BASIS_DEST_NONE;
 }
@@ -1348,32 +1361,10 @@ static bool basis_open_regular(const char* path, unsigned long long expected_siz
   return true;
 }
 
-/* Read the whole remaining content of an open descriptor.  A zero-length file
-   yields an empty Data (data pointer NULL). */
-static Data* basis_read_content(int fd, unsigned long long size) {
-  if (size == 0)
-    return data_create_reserve(0);
-  if (size > MAX_RECEIVE_WHOLE_FILE_SIZE || size > SIZE_MAX)
-    return NULL;
-  void* buf = protocol_alloc((size_t)size);
-  if (!buf)
-    return NULL;
-  size_t got = 0;
-  while (got < (size_t)size) {
-    ssize_t n = read(fd, (char*)buf + got, (size_t)size - got);
-    if (n <= 0) {
-      free(buf);
-      return NULL;
-    }
-    got += (size_t)n;
-  }
-  return data_create(buf, (size_t)size);
-}
-
 /* --ignore-times forces every file to be updated, so no basis hit is ever
    declared (matching rsync, where -I prevents link-dest from linking). */
-static bool basis_quick_matches(const Config* config, const struct stat* st, time_t check_mtime,
-                                long check_mtime_nsec) {
+bool file_basis_quick_match(const Config* config, const struct stat* st, time_t check_mtime,
+                            long check_mtime_nsec) {
   if (config->size_only)
     return true;
   long mtime_nsec = 0;
@@ -1384,28 +1375,39 @@ static bool basis_quick_matches(const Config* config, const struct stat* st, tim
                                 config->modify_window);
 }
 
-/* Search the basis-dir list in command-line order and return the first exact
-   match.  When load_content is true the matched bytes are kept in out->content
-   so the caller can materialize the file without re-reading it.
+/* True when a basis hit must be confirmed by a whole-file content digest
+   (--verify-basis).  False is the rsync-parity default: the metadata
+   quick-check alone decides a hit. */
+bool file_basis_content_required(const Config* config) {
+  return config != NULL && config->verify_basis;
+}
 
-   An exact match ALSO requires the basis bytes' digest to equal the source's,
-   so `hash_content` gates the content read/hash itself.  A server-contacting
-   --dry-run passes hash_content=false: no basis file may be read or hashed
-   (that would be a 1-bit content oracle against a client-supplied digest), so a
-   metadata-only pass can never confirm a hit and declines it.  The real path
-   always passes hash_content=true, keeping its behavior byte-for-byte. */
+/* Search the basis-dir list in command-line order and return the first match.
+   By default (no --verify-basis) rsync's metadata quick-check is sufficient:
+   basis_open_regular has already required an equal size, and
+   file_basis_quick_match applies rsync's mtime (or --size-only) rule.
+   --verify-basis additionally requires the basis bytes' whole-file digest to
+   equal the sender's, restoring FastSync's historical content equality; that
+   digest is computed by streaming the open basis descriptor, so an arbitrarily
+   large basis is verified without buffering it.  A copy/link install re-reads
+   the basis from its path in bounded buffers, so no content buffer is kept.
+
+   `hash_content` gates content READS under --verify-basis: a server-contacting
+   --dry-run passes false because hashing a basis against a client-supplied
+   digest would be a 1-bit content oracle.  Without --verify-basis a dry-run can
+   still confirm the metadata-only hit without reading any basis bytes, matching
+   rsync's read-only quick-check. */
 static bool basis_match_find(const Config* config, const char* check_path,
                              unsigned long long check_size, time_t check_mtime,
                              long check_mtime_nsec, const uint8_t* check_digest,
-                             size_t check_digest_len, bool load_content, bool hash_content,
-                             BasisMatch* out) {
+                             size_t check_digest_len, bool hash_content, BasisMatch* out) {
   memset(out, 0, sizeof(*out));
   if (!config || !config_has_basis(config) || config->ignore_times)
     return false;
-  /* Dry-run: never read/hash basis content.  A hit cannot be decided from
-     metadata alone, so report no match (the caller treats it as would-transfer)
-     without touching the file's contents. */
-  if (!hash_content)
+  /* --verify-basis needs the basis content; a content-blind (dry-run) pass can
+     never confirm it and must not read the file, so decline without touching
+     the basis bytes. */
+  if (file_basis_content_required(config) && !hash_content)
     return false;
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
@@ -1424,29 +1426,26 @@ static bool basis_match_find(const Config* config, const char* check_path,
     int fd;
     struct stat st;
     if (basis_open_regular(candidate, check_size, &fd, &st)) {
-      if (basis_quick_matches(config, &st, check_mtime, check_mtime_nsec)) {
-        Data* content = basis_read_content(fd, check_size);
-        if (content) {
+      if (file_basis_quick_match(config, &st, check_mtime, check_mtime_nsec)) {
+        bool hit = true;
+        if (file_basis_content_required(config)) {
           uint8_t basis_digest[CHECKSUM_MAX_DIGEST_LEN];
           size_t basis_len = 0;
-          bool hashed = checksum_digest((ChecksumAlgo)config->checksum_algo, config->checksum_seed,
-                                        content->data, content->size, basis_digest,
-                                        sizeof(basis_digest), &basis_len);
-          if (hashed && basis_len == check_digest_len && check_digest_len > 0 &&
-              memcmp(basis_digest, check_digest, check_digest_len) == 0) {
-            out->hit = true;
-            out->type = entry->type;
-            out->basis_path = candidate;
-            candidate = NULL; /* ownership transferred to out */
-            out->st = st;
-            out->content = load_content ? content : NULL;
-            if (!load_content)
-              data_destroy(content);
-            close(fd);
-            return true;
-          }
+          bool hashed =
+              checksum_digest_fd((ChecksumAlgo)config->checksum_algo, config->checksum_seed, fd,
+                                 basis_digest, sizeof(basis_digest), &basis_len);
+          hit = hashed && basis_len == check_digest_len && check_digest_len > 0 &&
+                memcmp(basis_digest, check_digest, check_digest_len) == 0;
         }
-        data_destroy(content);
+        if (hit) {
+          out->hit = true;
+          out->type = entry->type;
+          out->basis_path = candidate;
+          candidate = NULL; /* ownership transferred to out */
+          out->st = st;
+          close(fd);
+          return true;
+        }
       }
       close(fd);
     }
@@ -1871,6 +1870,12 @@ typedef struct {
   long long check_mtime_nsec;
   uint8_t check_digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t check_digest_len;
+  /* Source metadata carried alongside the check frame whenever a basis dir is
+     configured (rsync keeps the whole file list; FastSync's sender-driven
+     incremental path otherwise never transmits metadata for a SKIPPED file).
+     A basis materialization applies these SOURCE attributes instead of the
+     basis inode's, matching rsync's "copy then fix attributes". */
+  FileMetadata* source_metadata;
   bool dest_exists; /* any destination entry exists (lstat succeeded) */
   bool has_old_file;
   int old_fd;
@@ -1903,6 +1908,8 @@ static void incremental_check_state_cleanup(IncrementalCheckState* state) {
   if (state->old_fd >= 0)
     close(state->old_fd);
   state->old_fd = -1;
+  file_metadata_destroy(state->source_metadata);
+  state->source_metadata = NULL;
   free(state->full_path);
   state->full_path = NULL;
   free(state->check_path);
@@ -1927,7 +1934,7 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
     send_error_detail(fd, "invalid check mtime nanoseconds");
     return INCREMENTAL_ERROR;
   }
-  if ((config->checksum || config_has_basis(config))) {
+  if ((config->checksum || config->verify_basis)) {
     uint8_t wire_len;
     if (!receive_n_data(fd, &wire_len, sizeof(wire_len)) || wire_len == 0 ||
         wire_len > CHECKSUM_MAX_DIGEST_LEN ||
@@ -1939,8 +1946,24 @@ static IncrementalCheckOutcome incremental_check_receive_request(IncrementalChec
     if (!receive_n_data(fd, state->check_digest, state->check_digest_len))
       return INCREMENTAL_ERROR;
   }
+  /* The sender transmits the source metadata with every basis-configured check
+     so a basis hit can be materialized with the SOURCE's attributes (rsync
+     copies/copies-then-fixes; the receiver would otherwise only have the basis
+     inode's stat).  The block is symmetric and consumed unconditionally here,
+     whether or not this file ends up as a basis hit. */
+  if (config_has_basis(config) && config->use_metadata) {
+    int meta_ok = 1;
+    state->source_metadata = metadata_receive(fd, &meta_ok);
+    if (!meta_ok)
+      return INCREMENTAL_ERROR;
+  }
 
-  if (state->check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
+  /* A basis-configured run may materialize a file larger than the whole-file
+     payload bound: a basis hit is streamed from the basis path (bounded
+     buffers), so the check size is not itself an allocation.  Every other
+     path (delta/append/full) still applies MAX_RECEIVE_WHOLE_FILE_SIZE, and a
+     miss simply falls through to the normal transfer with its own bound. */
+  if (!config_has_basis(config) && state->check_size > MAX_RECEIVE_WHOLE_FILE_SIZE) {
     send_error_detail(fd, "check size exceeds receiver limit");
     return INCREMENTAL_ERROR;
   }
@@ -2030,6 +2053,20 @@ incremental_check_ignore_existing(const IncrementalCheckState* state) {
   return INCREMENTAL_SKIP;
 }
 
+/* Metadata for a materialized basis hit: prefer the SOURCE metadata the sender
+   transmitted with the check frame (rsync copies then fixes the destination to
+   the source's attributes); fall back to the basis inode's own stat when
+   metadata was not negotiated.  Consumes state->source_metadata on success. */
+static FileMetadata* basis_take_metadata(IncrementalCheckState* state,
+                                         const struct stat* basis_st) {
+  if (state->source_metadata) {
+    FileMetadata* meta = state->source_metadata;
+    state->source_metadata = NULL;
+    return meta;
+  }
+  return file_metadata_create(NULL, basis_st, false, false);
+}
+
 /* --link-dest relink of an already up-to-date destination.  rsync hard-links a
    destination entry to a matching basis even when the entry is already correct,
    so a run over an existing tree still maximizes sharing with the basis.  Only a
@@ -2047,7 +2084,7 @@ static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalChe
   BasisMatch basis;
   basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                    (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                   true, true, &basis);
+                   true, &basis);
   /* Only a link-dest hit relinks; a copy-dest/compare-dest hit (or a miss) lets
      the up-to-date check below keep the existing destination. */
   if (!basis.hit || basis.type != BASIS_DEST_LINK) {
@@ -2060,11 +2097,16 @@ static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalChe
     return INCREMENTAL_CONTINUE;
   }
   File* materialized = file_create(state->check_path);
-  if (materialized && basis.content) {
+  if (materialized) {
     data_destroy(materialized->data);
-    materialized->data = basis.content;
-    basis.content = NULL;
-    materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
+    materialized->data = data_create_reserve((size_t)state->check_size);
+    if (!materialized->data) {
+      file_destroy(materialized);
+      materialized = NULL;
+    }
+  }
+  if (materialized) {
+    materialized->metadata = basis_take_metadata(state, &basis.st);
     materialized->skip = true;
     materialized->basis_link = basis.basis_path;
     basis.basis_path = NULL;
@@ -2072,9 +2114,6 @@ static IncrementalCheckOutcome incremental_check_link_dest_relink(IncrementalChe
       file_destroy(materialized);
       materialized = NULL;
     }
-  } else {
-    file_destroy(materialized);
-    materialized = NULL;
   }
   if (materialized) {
     if (!send_status(state->fd, STATUS_OK)) {
@@ -2175,12 +2214,13 @@ static IncrementalCheckOutcome incremental_check_quick_skip(IncrementalCheckStat
    materialize nothing (no basis link/copy, no append/delta/full transfer) and
    the sender must send no data, so answer STATUS_DRY_RUN_TRANSFER and stop.
 
-   The basis lookup is deliberately content-blind: a real run would only accept
-   a --compare-dest exact hit after hashing the basis file and comparing it with
-   the client-supplied digest, which in a dry-run is a 1-bit content oracle.
-   Under dry_run no basis bytes may be read, so an otherwise-matching entry is
-   treated as would-transfer instead of a skip.  Everything read here (the
-   destination file's metadata, basis candidates' metadata) is read-only. */
+   The basis lookup is content-blind: under the default metadata quick-check a
+   hit needs no basis bytes and is honored here just as in a real run; under
+   --verify-basis a real run hashes the basis against the client-supplied digest,
+   which in a dry-run is a 1-bit content oracle, so no basis bytes may be read
+   and an otherwise-matching entry is reported as would-transfer.  Everything
+   read here (the destination file's metadata, basis candidates' metadata) is
+   read-only. */
 static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalCheckState* state,
                                                                   bool* skipped,
                                                                   bool* would_transfer) {
@@ -2191,12 +2231,14 @@ static IncrementalCheckOutcome incremental_check_dry_run_shortcut(IncrementalChe
   bool skip_via_compare = false;
   if (config_has_basis(config) && !config->ignore_times) {
     BasisMatch basis;
-    /* hash_content=false: a dry-run must not read or hash the basis file.  No
-       content comparison is possible, so no compare-dest hit can be confirmed
-       and an otherwise-matching file is reported as would-transfer. */
+    /* hash_content=false: a dry-run must not read or hash the basis file, so
+       under --verify-basis no compare-dest hit can be confirmed and an
+       otherwise-matching file is reported as would-transfer.  Without
+       --verify-basis the metadata quick-check confirms it without touching any
+       basis bytes. */
     basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                      (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                     false, false, &basis);
+                     false, &basis);
     if (basis.hit && basis.type == BASIS_DEST_COMPARE && !state->has_old_file)
       skip_via_compare = true;
     basis_match_free(&basis);
@@ -2224,7 +2266,7 @@ static IncrementalCheckOutcome incremental_check_try_basis(IncrementalCheckState
   BasisMatch basis;
   basis_match_find(config, state->check_path, state->check_size, (time_t)state->check_mtime,
                    (long)state->check_mtime_nsec, state->check_digest, state->check_digest_len,
-                   true, true, &basis);
+                   true, &basis);
   if (basis.hit) {
     if (basis.type == BASIS_DEST_COMPARE) {
       basis_match_free(&basis);
@@ -2234,24 +2276,30 @@ static IncrementalCheckOutcome incremental_check_try_basis(IncrementalCheckState
         return INCREMENTAL_SKIP;
       }
     } else {
+      /* Copy/link installs source their bytes from the basis PATH at install
+         time (bounded buffers), so no whole-file content buffer is needed here
+         even for an over-limit basis. */
       File* materialized = file_create(state->check_path);
-      if (materialized && basis.content) {
+      if (materialized) {
         data_destroy(materialized->data);
-        materialized->data = basis.content;
-        basis.content = NULL;
-        materialized->metadata = file_metadata_create(NULL, &basis.st, false, false);
-        materialized->skip = true; /* receiver must not ack this as a data file */
-        if (basis.type == BASIS_DEST_LINK) {
-          materialized->basis_link = basis.basis_path;
-          basis.basis_path = NULL;
+        materialized->data = data_create_reserve((size_t)state->check_size);
+        if (!materialized->data) {
+          file_destroy(materialized);
+          materialized = NULL;
         }
+      }
+      if (materialized) {
+        materialized->metadata = basis_take_metadata(state, &basis.st);
+        materialized->skip = true; /* receiver must not ack this as a data file */
+        if (basis.type == BASIS_DEST_LINK)
+          materialized->basis_link = basis.basis_path;
+        else
+          materialized->basis_copy = basis.basis_path;
+        basis.basis_path = NULL;
         if (!materialized->metadata) {
           file_destroy(materialized);
           materialized = NULL;
         }
-      } else {
-        file_destroy(materialized);
-        materialized = NULL;
       }
       if (materialized) {
         if (!send_status(fd, STATUS_OK)) {

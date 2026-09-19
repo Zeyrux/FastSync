@@ -210,7 +210,8 @@ static void test_xattr_receive_drops_acl_without_preserve_acls() {
 
 /* MINOR-2: a --link-dest / -H copy fallback (linkat refused) must still apply
  * the per-file xattrs and --fake-super stat.  A DIRECTORY basis forces linkat
- * to fail with EPERM, exercising the byte-copy fallback deterministically.
+ * to fail with EPERM, exercising the byte-copy fallback deterministically (the
+ * basis is not a regular file, so the fallback uses the caller's bytes).
  * Guarded on filesystem xattr support. */
 static void test_link_copy_fallback_preserves_xattrs() {
   const char* dest = "test_link_xattr_dest.txt";

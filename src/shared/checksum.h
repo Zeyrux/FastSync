@@ -51,6 +51,13 @@ bool checksum_digest(ChecksumAlgo algo, uint64_t seed, const void* data, size_t 
 bool checksum_digest_file(ChecksumAlgo algo, uint64_t seed, const char* path, uint8_t* out,
                           size_t out_capacity, size_t* out_len);
 
+/* Descriptor form of the streaming digest: rewinds `fd` to the start and hashes
+ * to EOF without closing it.  Used by the --verify-basis path to hash an
+ * already-open, root-confined basis descriptor.  Same contract as
+ * checksum_digest_file. */
+bool checksum_digest_fd(ChecksumAlgo algo, uint64_t seed, int fd, uint8_t* out, size_t out_capacity,
+                        size_t* out_len);
+
 /* Resolve a --checksum-choice string (case-insensitive) to an algorithm id.
  * Accepts "xxh64"/"xxhash", "xxh3", "xxh128", "md5", "md4", "sha1", "none".
  * "auto" is not an algorithm here; the caller resolves it to the negotiated

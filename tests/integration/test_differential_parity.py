@@ -28,6 +28,7 @@ from common import (  # noqa: E402
     ServerManager,
     TEST_DATA_DIR,
     clean_dir,
+    get_dest_received_dir,
 )
 from parity_caveats import ASPECTS, caveat_for  # noqa: E402
 import parity_harness as H  # noqa: E402
@@ -350,7 +351,9 @@ def _result_aspects(result):
 _STANDALONE_REFS = {
     "incremental_modified": "-i/--itemize-changes + incremental second run",
     "compare_dest": "--compare-dest",
+    "copy_dest": "--copy-dest",
     "link_dest": "--link-dest",
+    "verify_basis": "--verify-basis (FastSync-only)",
     "added_and_deleted": "--delete across two runs",
     "added_and_deleted_seed": "--delete across two runs",
     "one_file_system": "-x/--one-file-system",
@@ -411,14 +414,17 @@ def test_compare_dest_skips_basis(parity_server_factory):
     fdst = os.path.join(TEST_DATA_DIR, "parity_cmpd_fdst")
     clean_dir(src)
     _mk(os.path.join(src, "f.txt"), b"basis-content\n")
+    _pin(os.path.join(src, "f.txt"), _OLD_MTIME)
     server = parity_server_factory(SUPER)
     rel = os.path.abspath(src).lstrip(os.sep)
 
     # rsync resolves --compare-dest relative to the destination dir; FastSync
     # resolves it under the receive root and appends the mirrored source path.
+    # Both rely on rsync's size+mtime quick-check, so the basis mtime is pinned
+    # to the source's to keep the match deterministic across a second boundary.
     def seed(_src, rroot, froot):
-        _mk(os.path.join(rroot, "basis", "f.txt"), b"basis-content\n")
-        _mk(os.path.join(fdst, "basis", rel, "f.txt"), b"basis-content\n")
+        _mk(os.path.join(rroot, "basis", "f.txt"), b"basis-content\n", _OLD_MTIME)
+        _mk(os.path.join(fdst, "basis", rel, "f.txt"), b"basis-content\n", _OLD_MTIME)
 
     def extra(_src, rroot, froot, _rs, _fs):
         out = []
@@ -446,12 +452,13 @@ def test_link_dest_hardlinks_basis(parity_server_factory):
     fdst = os.path.join(TEST_DATA_DIR, "parity_linkd_fdst")
     clean_dir(src)
     _mk(os.path.join(src, "f.txt"), b"link-basis-content\n")
+    _pin(os.path.join(src, "f.txt"), _OLD_MTIME)
     server = parity_server_factory(SUPER)
     rel = os.path.abspath(src).lstrip(os.sep)
 
     def seed(_src, rroot, froot):
-        _mk(os.path.join(rroot, "basis", "f.txt"), b"link-basis-content\n")
-        _mk(os.path.join(fdst, "basis", rel, "f.txt"), b"link-basis-content\n")
+        _mk(os.path.join(rroot, "basis", "f.txt"), b"link-basis-content\n", _OLD_MTIME)
+        _mk(os.path.join(fdst, "basis", rel, "f.txt"), b"link-basis-content\n", _OLD_MTIME)
 
     def extra(_src, rroot, froot, _rs, _fs):
         r_basis = os.stat(os.path.join(rroot, "basis", "f.txt")).st_ino
@@ -472,6 +479,106 @@ def test_link_dest_hardlinks_basis(parity_server_factory):
         ["-a", f"--link-dest={os.path.join(fdst, 'basis')}", "--incremental"],
         server, seed=seed, ignore_paths=("basis",), extra_check=extra)
     _run_and_check(case_id, result)
+
+
+@requires_rsync
+@parity
+def test_copy_dest_copies_basis(parity_server_factory):
+    """--copy-dest: a basis match is materialized as an independent copy with the
+    source's attributes, matching rsync (copy then fix attributes)."""
+    case_id = "copy_dest"
+    src = os.path.join(TEST_DATA_DIR, "parity_copyd_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_copyd_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_copyd_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "f.txt"), b"copy-basis-content\n")
+    _pin(os.path.join(src, "f.txt"), 1_600_000_000)
+    os.chmod(os.path.join(src, "f.txt"), 0o755)
+    server = parity_server_factory(SUPER)
+    rel = os.path.abspath(src).lstrip(os.sep)
+
+    def seed(_src, rroot, froot):
+        # Basis content matches the source; give the basis a different mode so a
+        # wrong "keep basis attributes" implementation is visible.
+        _mk(os.path.join(rroot, "basis", "f.txt"), b"copy-basis-content\n",
+            1_600_000_000)
+        os.chmod(os.path.join(rroot, "basis", "f.txt"), 0o644)
+        _mk(os.path.join(fdst, "basis", rel, "f.txt"), b"copy-basis-content\n",
+            1_600_000_000)
+        os.chmod(os.path.join(fdst, "basis", rel, "f.txt"), 0o644)
+
+    def extra(_src, rroot, froot, _rs, _fs):
+        out = []
+        bases = {"rsync": os.path.join(rroot, "basis", "f.txt"),
+                 "fastsync": os.path.join(fdst, "basis", rel, "f.txt")}
+        for label, root in (("rsync", rroot), ("fastsync", froot)):
+            target = os.path.join(root, "f.txt")
+            if not os.path.exists(target):
+                out.append(f"{label}: f.txt missing")
+                continue
+            if os.stat(target).st_ino == os.stat(bases[label]).st_ino:
+                out.append(f"{label}: f.txt is hard-linked, not copied")
+            if (os.stat(target).st_mode & 0o777) != 0o755:
+                out.append(f"{label}: f.txt mode "
+                           f"{oct(os.stat(target).st_mode & 0o777)} != 0o755")
+        return out
+
+    result = H.run_differential(
+        src, rdst, fdst,
+        ["-a", "--copy-dest=basis"],
+        ["-a", f"--copy-dest={os.path.join(fdst, 'basis')}", "--incremental"],
+        server, seed=seed, ignore_paths=("basis",), extra_check=extra,
+        compare_modes=True)
+    _run_and_check(case_id, result)
+
+
+@requires_rsync
+@parity
+def test_verify_basis_restores_strict_content(parity_server_factory):
+    """Default matches rsync's metadata quick-check; FastSync-only
+    `--verify-basis` restores strict content equality and transfers the source
+    when a same-size/different-content basis would otherwise be trusted."""
+    case_id = "verify_basis"
+    src = os.path.join(TEST_DATA_DIR, "parity_vbasis_src")
+    rdst = os.path.join(TEST_DATA_DIR, "parity_vbasis_rdst")
+    fdst = os.path.join(TEST_DATA_DIR, "parity_vbasis_fdst")
+    clean_dir(src)
+    _mk(os.path.join(src, "f.txt"), b"AAAA\n")
+    _pin(os.path.join(src, "f.txt"), _OLD_MTIME)
+    server = parity_server_factory(SUPER)
+    rel = os.path.abspath(src).lstrip(os.sep)
+
+    def seed(_src, rroot, froot):
+        # Same size and mtime as the source, different bytes: a metadata
+        # quick-check trusts it; --verify-basis must not.
+        for root, basis_rel in ((rroot, os.path.join("basis", "f.txt")),
+                                (fdst, os.path.join("basis", rel, "f.txt"))):
+            _mk(os.path.join(root, basis_rel), b"BBBB\n", _OLD_MTIME)
+
+    # Default: both tools trust the basis (rsync's quick check), so the
+    # destination carries the basis bytes and the trees match.
+    result = H.run_differential(
+        src, rdst, fdst,
+        ["-a", "--link-dest=basis"],
+        ["-a", f"--link-dest={os.path.join(fdst, 'basis')}", "--incremental"],
+        server, seed=seed, ignore_paths=("basis",))
+    _run_and_check(case_id + "_default", result)
+
+    # --verify-basis (FastSync only): the digest mismatch rejects the basis and
+    # the source is transferred, so the destination is the source bytes.  rsync
+    # has no such flag; assert the FastSync outcome directly against the source.
+    fdst2 = os.path.join(TEST_DATA_DIR, "parity_vbasis_fdst2")
+    clean_dir(fdst2)
+    for root, basis_rel in ((fdst2, os.path.join("basis", rel, "f.txt")),):
+        _mk(os.path.join(root, basis_rel), b"BBBB\n", _OLD_MTIME)
+    result, _ = H.run_fastsync(src, fdst2,
+                               ["-a", f"--link-dest={os.path.join(fdst2, 'basis')}",
+                                "--incremental", "--verify-basis"], server.port)
+    assert result.returncode == 0, (result.stderr or result.stdout)[:300]
+    target = os.path.join(get_dest_received_dir(fdst2, src), "f.txt")
+    with open(target, "rb") as fh:
+        assert fh.read() == b"AAAA\n", \
+            "--verify-basis must reject the same-size/different-content basis"
 
 
 @requires_rsync

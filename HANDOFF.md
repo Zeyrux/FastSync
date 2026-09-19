@@ -132,6 +132,31 @@
     **115 ✅ / 11 ⚠️ / 31 ❌ = 157**; unit tests, the three named integration
     files, clang-format and cppcheck clean.
 
+14. **Wire parity track 5a** on `feat/parity-2.28` (`PROTOCOL_VERSION` stays
+    `2.28.0` by project decision): the three basis-dir options now default to
+    rsync's metadata quick-check (equal size + equal mtime, or size alone under
+    `--size-only`; `-I` disables matching) instead of FastSync's historical
+    xxHash64 content equality, so a same-size/different-content basis is trusted
+    exactly as rsync trusts it. A new FastSync-only, long-only `--verify-basis`
+    flag restores the strict whole-file content equality; its bool is appended to
+    the basis block of the config frame (golden wire frame 882 → 886 bytes).
+    `--verify-basis` streams the confined basis descriptor to hash it, and a
+    basis hit is no longer capped at the 256 MiB whole-file payload bound:
+    `--copy-dest` streams the basis through a bounded buffer and `--link-dest`'s
+    copy fallback streams from the basis, so an over-limit hit materializes (a
+    basis MISS still falls back to the normal transfer and keeps its own bound).
+    A `--copy-dest` hit re-applies the SOURCE attributes (the sender transmits
+    the source metadata with the basis check frame), matching rsync's
+    "copy then fix attributes"; a `--link-dest` success keeps the shared inode's
+    attributes (writing through it would mutate the basis). Differential cases
+    `copy_dest` and `verify_basis` added; `test_basis_dir_size_only_content_residual`
+    converted to a passing parity assertion; `TestBasisDestDirs` updated for the
+    new default + `--verify-basis`; unit tests cover the quick-check/verify
+    decision and the same-size/different-content handshake. The
+    `--compare-dest`/`--copy-dest`/`--link-dest` rows move ❌ → ⚠️ (relative-DIR
+    resolution base and over-limit MISS refusal): matrix now
+    **116 ✅ / 13 ⚠️ / 28 ❌ = 157**.
+
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
 2. **Deferred security items** (documented, not implemented):

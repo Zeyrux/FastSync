@@ -2826,6 +2826,7 @@ static void golden_config_populate(Config* c) {
   c->skip_compress_suffixes[1] = str_dup(".xz");
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_COMPARE, "compare"), 0);
   EXPECT_EQ_INT(config_basis_append(c, BASIS_DEST_LINK, "link"), 0);
+  c->verify_basis = true;
   c->fuzzy = true;
   c->checksum_algo = CHECKSUM_ALGO_MD5;
   c->checksum_seed = 0x1122334455667788ULL;
@@ -2888,10 +2889,12 @@ static void golden_config_populate(Config* c) {
  * report_stats bool, 2.26.0 appended the compression_algo int, 2.27.0 appended
  * the report_deletes bool, and 2.28.0 changed only the version string and
  * appended the receiver-side delete-protection rule block (the STATUS_STATS
- * body also grew, but that is not part of this frame).  The byte-exact values
- * are recomputed for the merged layout. */
-#define GOLDEN_WIRE_LEN 882
-#define GOLDEN_WIRE_HASH 10588362715396735070ULL
+ * body also grew, but that is not part of this frame).  Track 5a appends the
+ * FastSync-only verify_basis bool to the basis block WITHOUT a version bump
+ * (project decision), so the frame grew by one int to 886 bytes.  The
+ * byte-exact values are recomputed for the merged layout. */
+#define GOLDEN_WIRE_LEN 886
+#define GOLDEN_WIRE_HASH 5809509022716816757ULL
 
 static unsigned long long fnv1a_64(const unsigned char* buf, size_t len) {
   unsigned long long h = 1469598103934665603ULL;
@@ -3040,6 +3043,7 @@ static void test_config_wire_golden_receive() {
            recv->groupmap[0].to_name != NULL && strcmp(recv->groupmap[0].to_name, "root") == 0;
       ok = ok && recv->basis_count == 2 && recv->basis_dirs[0].type == BASIS_DEST_COMPARE &&
            recv->basis_dirs[1].type == BASIS_DEST_LINK;
+      ok = ok && recv->verify_basis;
       ok = ok && recv->module != NULL && strcmp(recv->module, "goldenmod") == 0;
       ok = ok && recv->copy_as_set && recv->copy_as_uid == 111 && recv->copy_as_gid == 222;
     }

@@ -205,6 +205,7 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`) |
 | `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination |
 | `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win) |
+| `--verify-basis` | FastSync-only: require a basis hit (`--compare-dest`/`--copy-dest`/`--link-dest`) to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync) |
 | `--delete` | Delete files on receiver not present in source (default timing: delete-after, i.e. only after the whole transfer succeeded). Scoped to the synchronized directories, so `--files-from` subsets are safe |
 | `--delete-before` | Delete extras before the transfer starts (implies `--delete`) |
 | `--delete-during`, `--del` | Delete extras once the keep-set is known, before data is applied (implies `--delete`) |
@@ -567,6 +568,7 @@ remote SSH argv is already built injection-safe.
 | `--compare-dest <dir>` | Extra comparison basis: unchanged files are not transferred (requires/implies `--incremental`). |
 | `--copy-dest <dir>` | Like `--compare-dest`, but copies the unchanged file from DIR into the destination. |
 | `--link-dest <dir>` | Like `--copy-dest`, but hard-links the unchanged file from DIR (repeatable; earlier DIRs win). |
+| `--verify-basis` | FastSync-only: require a basis hit to match the source by whole-file digest instead of trusting the size+mtime quick-check (default matches rsync). |
 | `--preallocate` | Allocate destination file space up front (fail-fast on a full disk). |
 | `--append` | Resume a shorter destination by appending only its tail (prefix not verified; requires `--incremental`). |
 | `--append-verify` | Like `--append`, but verifies the retained prefix checksum first (falls back to a full transfer on mismatch). |

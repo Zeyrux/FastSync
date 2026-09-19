@@ -1054,6 +1054,11 @@ static const OptionEntry OPTION_TABLE[] = {
      * --remote-option is parsed.  --trust-sender is a local receiver policy and
      * never travels to the remote peer. */
     {"--trust-sender", NULL, OPT_FLAG, offsetof(Config, trust_sender)},
+    /* FastSync-only (not an rsync option): require a basis-hit's content to
+     * match the source by whole-file digest instead of trusting rsync's
+     * size+mtime quick-check.  Long-only; crosses the wire so the receiver
+     * performs the extra read/hash. */
+    {"--verify-basis", NULL, OPT_FLAG, offsetof(Config, verify_basis)},
 };
 
 /* Only boolean options with no required argument are safe to negate. */
@@ -1096,6 +1101,7 @@ static const NegatableOption NEGATABLE_OPTIONS[] = {
     {"xattrs", "X", offsetof(Config, preserve_xattrs)},
     {"acls", "A", offsetof(Config, preserve_acls)},
     {"fake-super", NULL, offsetof(Config, fake_super)},
+    {"verify-basis", NULL, offsetof(Config, verify_basis)},
 };
 
 static bool opt_is(const char* arg, const char* name, const char* alias) {

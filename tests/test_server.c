@@ -1063,14 +1063,18 @@ static void test_incremental_check_fifo_destination_does_not_hang() {
 }
 
 /* A server-contacting --dry-run with an alternate basis dir must never read or
-   hash the basis file.  An exact (size+mtime+content) basis match would
-   otherwise let a client probe the basis bytes against its own supplied digest
-   (a 1-bit content oracle).  The dry-run decision is metadata-only, so even a
-   byte-identical basis is reported as would-transfer, not a compare-dest skip. */
-static void test_incremental_check_dry_run_basis_does_not_read_content() {
+   hash the basis file.  Under the default metadata quick-check a hit needs no
+   basis bytes, so a compare-dest match is reported as a skip (STATUS_OK) just
+   like a real run -- and still no content is read.  Under --verify-basis a hit
+   would require hashing the basis against the client-supplied digest (a 1-bit
+   content oracle), which a dry-run must never do, so even a byte-identical
+   basis is reported as would-transfer.  The destination is never materialized
+   in either arm. */
+static void run_dry_run_basis_check(bool verify, Status expected) {
   Config* cfg = config_create();
   EXPECT_NOT_NULL(cfg);
   cfg->dry_run = true;
+  cfg->verify_basis = verify;
   char* root = make_check_root("dryb");
   EXPECT_NOT_NULL(root);
   cfg->receive_root_directory = str_dup(root);
@@ -1086,8 +1090,8 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
   EXPECT_EQ_INT(stat(basis_path, &bst), 0);
   EXPECT_EQ_INT(config_basis_append(cfg, BASIS_DEST_COMPARE, "basis"), 0);
 
-  /* The (correct) source digest for the basis bytes: an unfixed dry-run would
-     read+hash the basis and treat this as an exact compare-dest hit. */
+  /* The (correct) source digest for the basis bytes: a buggy dry-run that read
+     and hashed the basis would treat this as an exact compare-dest hit. */
   uint8_t digest[CHECKSUM_MAX_DIGEST_LEN];
   size_t digest_len = 0;
   EXPECT_TRUE(checksum_digest((ChecksumAlgo)cfg->checksum_algo, cfg->checksum_seed, content,
@@ -1106,7 +1110,8 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
     bool skipped = false;
     bool would_transfer = false;
     File* file = receive_incremental_check_ex(p[0], cfg, &skipped, &would_transfer);
-    bool ok = file == NULL && !skipped && would_transfer;
+    bool ok = file == NULL && skipped == (expected == STATUS_OK) &&
+              would_transfer == (expected != STATUS_OK);
     file_destroy(file);
     config_delete(cfg);
     close(p[0]);
@@ -1124,13 +1129,16 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
     EXPECT_TRUE(send_n_data(p[1], &size, sizeof(size)));
     EXPECT_TRUE(send_n_data(p[1], &mtime, sizeof(mtime)));
     EXPECT_TRUE(send_n_data(p[1], &mtime_nsec, sizeof(mtime_nsec)));
-    uint8_t wire_len = (uint8_t)digest_len;
-    EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
-    EXPECT_TRUE(send_n_data(p[1], digest, digest_len));
+    /* The digest is only on the wire when --checksum or --verify-basis needs it
+       (cfg->checksum is false here); the default quick-check arm sends none. */
+    if (verify) {
+      uint8_t wire_len = (uint8_t)digest_len;
+      EXPECT_TRUE(send_n_data(p[1], &wire_len, sizeof(wire_len)));
+      EXPECT_TRUE(send_n_data(p[1], digest, digest_len));
+    }
     Status s;
     EXPECT_TRUE(receive_status(p[1], &s));
-    /* A skip here would mean the receiver read+hashed the basis file. */
-    EXPECT_EQ_INT(s, STATUS_DRY_RUN_TRANSFER);
+    EXPECT_EQ_INT(s, expected);
 
     int status;
     waitpid(pid, &status, 0);
@@ -1146,6 +1154,11 @@ static void test_incremental_check_dry_run_basis_does_not_read_content() {
     free(root);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+}
+
+static void test_incremental_check_dry_run_basis_does_not_read_content() {
+  run_dry_run_basis_check(false, STATUS_OK);
+  run_dry_run_basis_check(true, STATUS_DRY_RUN_TRANSFER);
 }
 
 /* B1: a FIFO planted in a --link-dest basis directory must not block

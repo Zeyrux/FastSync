@@ -198,9 +198,18 @@ typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF 
   X(skip_compress_count, int, 0, INT_SKIPCOUNT)                                                    \
   X(skip_compress_suffixes, char**, NULL, BLOCK_SKIP_SUFFIXES)
 
+/* FastSync-only --verify-basis (protocol 2.28.0, no version bump by project
+ * decision): restores the stricter content equality on a basis hit.  By
+ * default a basis hit is accepted on rsync's metadata quick-check alone (equal
+ * size plus equal mtime, or size alone under --size-only); with this flag the
+ * receiver ALSO requires the basis bytes' whole-file digest (the negotiated
+ * --checksum-choice algorithm) to equal the sender's, exactly FastSync's
+ * historical behavior.  It is a receiver policy and crosses the wire so the
+ * receiver knows whether to read and hash the basis content. */
 #define CONFIG_WIRE_BASIS_FIELDS(X)                                                                \
   X(basis_count, int, 0, INT_BASISCOUNT)                                                           \
-  X(basis_dirs, BasisDest*, NULL, BLOCK_BASIS)
+  X(basis_dirs, BasisDest*, NULL, BLOCK_BASIS)                                                     \
+  X(verify_basis, bool, false, BOOL)
 
 #define CONFIG_WIRE_FUZZY_FIELDS(X) X(fuzzy, bool, false, BOOL)
 
