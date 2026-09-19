@@ -1,19 +1,16 @@
 """Differential coverage for ``--delete-delay`` + ``--max-delete`` with a
 refilled deferred directory.
 
-FastSync snapshots a directory's extras at plan time (``defer_add``) and charges
-``--max-delete`` then, and its deferred commit only removes the snapshot path, so
-a directory refilled before the commit survives ``ENOTEMPTY``.  rsync computes
-the deferred deletions during the transfer, charges ``--max-delete`` on actual
-removals, and recursively removes a queued directory -- so content created after
-the plan inside an extra directory is removed too.
+FastSync snapshots a directory's extras at plan time (``defer_add``) but charges
+``--max-delete`` only when a path is actually removed, and its deferred commit
+re-scans a queued directory and removes content created after the plan -- the
+same rules as rsync.  These tests run both tools on the same fixture and assert
+both sides remove the late content (recursively) and bound the deletion with
+``--max-delete`` identically.
 
-These tests run both tools on the same fixture and pin the shared budget bound
-(the later extra survives, both exit 25) plus the documented residual (the
-refilled directory's late content survives under FastSync, not rsync).  They are
-not part of the fast PR gate because the rsync side needs a wide real-time
-injection window (a throttled transfer), while the FastSync side uses the
-existing byte-deterministic slicing proxy.
+They are not part of the fast PR gate because the rsync side needs a wide
+real-time injection window (a throttled transfer), while the FastSync side uses
+the existing byte-deterministic slicing proxy.
 
 The refilled directory sits at the transfer ROOT, whose delete plan is always
 processed before any subdirectory's, so the budget is deterministically charged
@@ -101,7 +98,7 @@ def _rsync(args, timeout=120):
 
 
 class TestDeleteDelayRefilledDirVsRsync:
-    """The shared budget bound and the documented recursive-removal residual."""
+    """Both tools charge --max-delete on actual removals and recurse."""
 
     def _fastsync_refilled(self, tag, max_delete=None):
         """Run FastSync with the refill injected deterministically by the proxy
@@ -125,18 +122,18 @@ class TestDeleteDelayRefilledDirVsRsync:
         return result, received, late
 
     @requires_rsync
-    def test_max_delete_budget_bound_matches_and_residual_pinned(self):
-        # --- FastSync: budget charged at snapshot; late content preserved ---
+    def test_max_delete_budget_bound_matches(self):
+        # --- FastSync: the one actual removal is the late file; dirs survive ---
         result, received, late = self._fastsync_refilled("budget_fs", max_delete=1)
         assert result.returncode == 25, (result.stderr or result.stdout)[:300]
-        assert _deleted_count(result.stdout) == 0, result.stdout
-        assert os.path.exists(late), "FastSync removed the late content of a snapshotted dir"
+        assert _deleted_count(result.stdout) == 1, result.stdout
+        assert not os.path.exists(late), "FastSync kept the late content of a queued dir"
         assert os.path.isdir(os.path.join(received, "xdir"))
         assert os.path.isdir(os.path.join(received, "b", "ydir")), (
-            "FastSync did not charge the plan-time budget: b/ydir was removed"
+            "FastSync did not bound the deletion with --max-delete=1"
         )
 
-        # --- rsync: budget charged on actual removals; dirs removed recursively ---
+        # --- rsync: same budget rule and recursive removal ---
         source, rsync_dst = _seed_rsync("budget_rsync")
 
         def inject():
@@ -151,26 +148,23 @@ class TestDeleteDelayRefilledDirVsRsync:
         )
         t.join()
         assert rsync_result.returncode == 25, rsync_result.stderr
-        # rsync removes the late content (recursive deferred removal); FastSync
-        # keeps it and charges the snapshot directive instead.
+        assert _deleted_count(rsync_result.stdout) == _deleted_count(result.stdout)
         assert not os.path.exists(os.path.join(rsync_dst, "xdir", "new.txt")), (
             "rsync kept late content inside a queued directory"
         )
-        # The shared observable: the later extra survives in both tools under
-        # --max-delete=1, and both report the capped run with exit 25.
         assert os.path.isdir(os.path.join(rsync_dst, "b", "ydir")), (
             "rsync did not bound the deletion with --max-delete=1"
         )
         assert os.path.isdir(os.path.join(received, "b", "ydir"))
 
     @requires_rsync
-    def test_refilled_extra_dir_recursive_removal_residual(self):
-        """Without --max-delete the residual is a plain tree difference: rsync
-        removes the refilled extra directory (and its late content), FastSync
-        leaves the snapshot path in place on ENOTEMPTY."""
+    def test_refilled_extra_dir_recursive_removal_matches(self):
+        """Without --max-delete both tools remove the refilled extra directory
+        (and its late content)."""
         result, received, late = self._fastsync_refilled("recur_fs")
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
-        assert os.path.exists(late), "FastSync removed the refilled directory's late content"
+        assert not os.path.exists(late), "FastSync kept the refilled directory's late content"
+        assert not os.path.isdir(os.path.join(received, "xdir"))
 
         source, rsync_dst = _seed_rsync("recur_rsync")
 

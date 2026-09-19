@@ -412,11 +412,17 @@ struct DeletePlanSession {
   bool dry_run;
   size_t max_delete;
   size_t deleted;
-  /* Removals charged against --max-delete.  In --delete-delay mode a path is
-     planned (and the budget consumed) while scanning, but `deleted` advances
-     only when the commit actually unlinks it, so an entry that survives the
-     commit (a directory refilled mid-transfer -> ENOTEMPTY) is not reported. */
+  /* Removals charged against --max-delete.  The budget is charged on ACTUAL
+     removals (an unlink/rmdir that succeeded), matching rsync: a snapshotted
+     entry that fails removal consumes nothing, so a later extra is still
+     deleted.  `planned` and `deleted` advance together for the inline paths and
+     `apply_missing`; `deleted` is the reported count. */
   size_t planned;
+  /* Hard bound on the deferred snapshot list.  Because the budget is no longer
+     charged at snapshot time, this independent cap keeps a huge destination
+     from growing the list without limit (it matches the receiver's overall
+     deletion bound). */
+  size_t defer_cap;
   size_t skipped;
   bool limit_hit;
   bool limit_logged;
@@ -448,6 +454,7 @@ DeletePlanSession* delete_plan_session_create(const Config* config) {
       config->max_delete >= 0 && (size_t)config->max_delete < DELETE_PLAN_SERVER_LIMIT;
   session->max_delete =
       user_limited ? (size_t)config->max_delete : (size_t)DELETE_PLAN_SERVER_LIMIT;
+  session->defer_cap = DELETE_PLAN_SERVER_LIMIT;
   session->protected_prefixes = array_list_create(free);
   session->size_skipped = array_list_create(free);
   session->missing = array_list_create(free);
@@ -592,10 +599,15 @@ static void log_deleted(const char* rel) {
   free(escaped);
 }
 
-/* Append a snapshot path for --delete-delay.  The budget is charged here, but
- * `deleted` is not: the path counts only once apply_deferred_path truly
- * unlinks it. */
+/* Append a snapshot path for --delete-delay.  The budget is NOT charged here:
+ * the remover charges --max-delete only when a path is actually unlinked (see
+ * apply_deferred_path), so a snapshotted entry that survives ENOTEMPTY cannot
+ * deny budget to a later extra.  The independent `defer_cap` bounds the list. */
 static bool defer_add(DeletePlanSession* session, const char* rel) {
+  if ((size_t)session->deferred->size >= session->defer_cap) {
+    note_skipped(session);
+    return true;
+  }
   char* copy = str_dup(rel);
   if (!copy)
     return false;
@@ -603,7 +615,6 @@ static bool defer_add(DeletePlanSession* session, const char* rel) {
     free(copy);
     return false;
   }
-  session->planned++;
   return true;
 }
 
@@ -636,14 +647,14 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
     return false;
   if (survives)
     return true;
-  if (!budget_available(session)) {
-    note_skipped(session);
-    return true;
-  }
   if (session->defer && !force_now) {
     if (!defer_add(session, child_rel))
       return false;
     *removed = true;
+    return true;
+  }
+  if (!budget_available(session)) {
+    note_skipped(session);
     return true;
   }
   if (unlinkat(dirfd, name, AT_REMOVEDIR) == 0) {
@@ -665,12 +676,12 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
 
 static bool process_extra_file(int dirfd, const char* name, const char* child_rel, bool force_now,
                                DeletePlanSession* session) {
+  if (session->defer && !force_now) {
+    return defer_add(session, child_rel);
+  }
   if (!budget_available(session)) {
     note_skipped(session);
     return true;
-  }
-  if (session->defer && !force_now) {
-    return defer_add(session, child_rel);
   }
   if (unlinkat(dirfd, name, 0) == 0) {
     session->deleted++;
@@ -858,7 +869,9 @@ int delete_plan_session_receive(DeletePlanSession* session, const Config* config
 }
 
 /* Apply one snapshotted --delete-delay path (post-order: children precede their
- * parent directory). */
+ * parent directory).  A directory that is still present is re-scanned so content
+ * created after the plan is removed too; every actual removal charges
+ * --max-delete. */
 static bool apply_deferred_path(DeletePlanSession* session, const Config* config, const char* rel) {
   char* full = path_cat(config->receive_root_directory, rel);
   if (!full)
@@ -872,25 +885,78 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
   }
   struct stat st;
   if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-    bool absent = errno == ENOENT;
+    bool absent = errno == ENOENT || errno == ENOTDIR;
     close(parent_fd);
     free(leaf);
     return absent;
   }
-  int rc;
-  if (S_ISDIR(st.st_mode))
-    rc = unlinkat(parent_fd, leaf, AT_REMOVEDIR);
-  else
-    rc = unlinkat(parent_fd, leaf, 0);
-  bool ok = rc == 0 || errno == ENOENT || errno == ENOTEMPTY || errno == EEXIST;
-  if (rc == 0) {
+  if (S_ISDIR(st.st_mode)) {
+    if (!budget_available(session)) {
+      note_skipped(session);
+      close(parent_fd);
+      free(leaf);
+      return true;
+    }
+    int dirfd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dirfd < 0) {
+      bool absent = errno == ENOENT || errno == ENOTDIR;
+      close(parent_fd);
+      free(leaf);
+      return absent;
+    }
+    PlanSkips skips;
+    if (!build_plan_skips(config, session, &skips)) {
+      close(dirfd);
+      close(parent_fd);
+      free(leaf);
+      return false;
+    }
+    bool survives = false;
+    bool ok = process_children(dirfd, rel, NULL, NULL, false, true, &skips, session, &survives);
+    free(skips.entries);
+    close(dirfd);
+    if (!ok) {
+      close(parent_fd);
+      free(leaf);
+      return false;
+    }
+    if (!survives) {
+      if (!budget_available(session)) {
+        note_skipped(session);
+      } else if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) == 0) {
+        session->deleted++;
+        session->planned++;
+        log_deleted(rel);
+        notify_deleted(session, rel);
+      } else if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST) {
+        close(parent_fd);
+        free(leaf);
+        return false;
+      }
+    }
+    close(parent_fd);
+    free(leaf);
+    return true;
+  }
+  if (!budget_available(session)) {
+    note_skipped(session);
+    close(parent_fd);
+    free(leaf);
+    return true;
+  }
+  if (unlinkat(parent_fd, leaf, 0) == 0) {
     session->deleted++;
+    session->planned++;
     log_deleted(rel);
     notify_deleted(session, rel);
+  } else if (errno != ENOENT) {
+    close(parent_fd);
+    free(leaf);
+    return false;
   }
   close(parent_fd);
   free(leaf);
-  return ok;
+  return true;
 }
 
 void delete_plan_session_set_delete_observer(DeletePlanSession* session,

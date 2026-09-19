@@ -102,4 +102,13 @@ void change_emit_file_sent(const Config* config, const File* file);
 /* Build and emit a CHANGE_SENT event for an explicit directory entry (-d). */
 void change_emit_dir_sent(const Config* config, const File* file);
 
+/* Build and emit a CHANGE_UP_TO_DATE event for a file the receiver already had.
+ * With --info=name2 it renders rsync's "NAME is uptodate" line (no output
+ * otherwise). */
+void change_emit_file_uptodate(const Config* config, const File* file);
+
+/* Reset the lazy transfer-root `./` line emitted ahead of the first
+ * --info=name entry.  Call once at the start of a transfer. */
+void change_reset_name_root(void);
+
 #endif

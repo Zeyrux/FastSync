@@ -1393,6 +1393,29 @@ static void test_parse_args_debug_info_levels() {
   EXPECT_EQ_INT(cfg->info_level, LOG_INFO_STATS);
   config_delete(cfg);
 
+  /* --info=name level 2 enables the "is uptodate" marker; a later level-1 or
+     level-0 token clears it again. */
+  cfg = config_create();
+  char* name2_argv[] = {"fastsync", "--info=name2", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, name2_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_NAME | LOG_INFO_NAME_UPTODATE);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* name1_argv[] = {"fastsync", "--info=name2,name1", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, name1_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_NAME);
+  config_delete(cfg);
+
+  cfg = config_create();
+  char* name0_argv[] = {"fastsync", "--info=name2,name0", "/src", "/dst"};
+  positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, name0_argv, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->info_level, 0);
+  config_delete(cfg);
+
   cfg = config_create();
   char* bad_argv[] = {"fastsync", "--debug=123", "/src", "/dst"};
   positional_count = 0;

@@ -320,10 +320,10 @@ class TestDeleteTimingFailure:
 class TestDeleteDelayDeletedCount:
     """The reported deleted count must reflect entries actually removed."""
 
-    def test_refilled_deferred_dir_is_not_counted(self):
+    def test_refilled_deferred_dir_is_recursively_removed_and_counted(self):
         """A directory snapshotted into a --delete-delay plan that is refilled
-        before the commit survives ENOTEMPTY and must NOT inflate "Number of
-        deleted files" (regression for delete_plan.c counting at snapshot)."""
+        before the commit is re-scanned and removed recursively (rsync parity):
+        the late file and the directory are both counted as deleted."""
         source = os.path.join(TEST_DATA_DIR, "ddc_src")
         dest = os.path.join(TEST_DATA_DIR, "ddc_dst")
         clean_dir(source)
@@ -347,12 +347,13 @@ class TestDeleteDelayDeletedCount:
             proxy.finish()
         assert result.returncode == 0, (result.stderr or result.stdout)[:400]
         assert proxy.hook_called.is_set(), "hook never fired"
-        assert os.path.exists(os.path.join(extra_dir, "new.txt")), "late file vanished"
+        assert not os.path.exists(os.path.join(extra_dir, "new.txt")), "late file survived"
+        assert not os.path.isdir(extra_dir), "refilled extra dir survived"
         deleted = None
         for line in result.stdout.splitlines():
             if line.startswith("Number of deleted files:"):
                 deleted = int(line.split(":", 1)[1].split()[0])
-        assert deleted == 0, (deleted, result.stdout)
+        assert deleted == 2, (deleted, result.stdout)
 
 
 class TestDeleteDelayMaxDeleteParity:
@@ -468,10 +469,9 @@ class TestDeleteAfterThreadsKeepSet:
         )
 
 class TestDeleteDelayMaxDeleteRefilledDir:
-    """--delete-delay charges the --max-delete budget at plan/snapshot time, so a
-    refilled snapshotted directory that survives ENOTEMPTY still spends its slot
-    and a later extra is skipped, while the reported count stays at actual
-    removals.
+    """--delete-delay charges the --max-delete budget on ACTUAL removals: the
+    refilled directory's late content is removed first (consuming the one slot),
+    so the directory itself and a later extra are skipped, matching rsync.
 
     The refilled directory is at the destination ROOT (its plan is always sent
     first) and the skipped extra is under a separate source directory, so the
@@ -479,7 +479,7 @@ class TestDeleteDelayMaxDeleteRefilledDir:
     order.  The refill is injected through the byte-barrier proxy so it is
     causally after the plan frame."""
 
-    def test_budget_charged_at_plan_time(self):
+    def test_budget_charged_on_actual_removal(self):
         source = os.path.join(TEST_DATA_DIR, "ddmb_src")
         dest = os.path.join(TEST_DATA_DIR, "ddmb_dst")
         clean_dir(source)
@@ -504,9 +504,9 @@ class TestDeleteDelayMaxDeleteRefilledDir:
             proxy.finish()
         assert result.returncode == 25, (result.stderr or result.stdout)[:400]
         assert proxy.hook_called.is_set(), "hook never fired"
-        # The refilled directory still consumes the plan-time budget, so the
-        # later extra is skipped...
-        assert os.path.exists(os.path.join(refilled_dir, "new.txt")), "late file vanished"
-        assert os.path.isdir(later_dir), "later extra was not skipped by the plan-time budget"
-        # ...while the reported count reflects only actual removals (none here).
-        assert _deleted_count(result.stdout) == 0, result.stdout
+        # The late content consumes the single budget slot; the refilled
+        # directory itself and the later extra are skipped.
+        assert not os.path.exists(os.path.join(refilled_dir, "new.txt")), "late file survived"
+        assert os.path.isdir(later_dir), "later extra was not skipped by the budget"
+        # The one actual removal is reported.
+        assert _deleted_count(result.stdout) == 1, result.stdout

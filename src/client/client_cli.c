@@ -614,9 +614,19 @@ static int parse_info_flags(const char* value, Config* config) {
     }
     if (strcmp(name, "copy") == 0)
       flag = LOG_INFO_COPY;
-    else if (strcmp(name, "name") == 0)
-      flag = LOG_INFO_NAME;
-    else if (strcmp(name, "misc") == 0)
+    else if (strcmp(name, "name") == 0) {
+      /* name level 2 adds rsync's "is uptodate" lines. */
+      if (level == 0)
+        parsed &= ~(uint32_t)(LOG_INFO_NAME | LOG_INFO_NAME_UPTODATE);
+      else {
+        parsed |= LOG_INFO_NAME;
+        if (level >= 2)
+          parsed |= LOG_INFO_NAME_UPTODATE;
+        else
+          parsed &= ~(uint32_t)LOG_INFO_NAME_UPTODATE;
+      }
+      continue;
+    } else if (strcmp(name, "misc") == 0)
       flag = LOG_INFO_MISC;
     else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;

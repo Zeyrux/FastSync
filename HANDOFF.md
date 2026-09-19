@@ -81,6 +81,20 @@
    integrated stats+options+fs branch stands at **111 ✅ / 13 ⚠️ / 33 ❌ = 157**;
    full suite + ASan + clang-format + cppcheck clean.
 
+11. **No-wire parity track 1** on `feat/parity-2.28` (no protocol change):
+    `-n --delete` now sends the same filter-excluded + size-pruned protected
+    prefixes and synchronized-directory scope as a real run (dry-run would-delete
+    matches rsync for source-derived protections; the destination-only exclude
+    residual and readdir ordering remain); `--delete-delay` now charges
+    `--max-delete` on actual removals and re-scans a queued directory at commit
+    to remove content created after the plan, with an independent deferred-list
+    cap (only partial-delete ordering remains); and `--info=name2` emits `NAME is
+    uptodate` plus the leading `./` root name line for `--info=name` (only the
+    root-line trigger condition and receiver-side `skip` wording remain). Matrix
+    now **111 ✅ / 14 ⚠️ / 32 ❌ = 157**; differential + unit tests added in
+    `test_features.py`, `test_option_parity.py`, `test_delete_plan.c`,
+    `test_delete_delay_budget_parity.py`, `test_delete_timing_parity.py`.
+
 ## Next steps
 1. **Merge PR #284** (`dev` -> `main`) once reviewed (protected branch).
 2. **Deferred security items** (documented, not implemented):

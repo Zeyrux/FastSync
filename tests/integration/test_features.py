@@ -584,53 +584,53 @@ class TestRemoteDryRun:
             assert _snapshot_tree(received) == before, f"{flags} mutated the destination"
 
     @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
-    def test_dry_run_delete_lines_over_report_residual(self):
-        """Documented residual (RSYNC_COMPAT.md `-n/--dry-run` row): FastSync's
-        dry-run would-delete report includes the file that is merely being
-        updated (derived from the receiver's STATUS_STATS extras) and, unlike
-        rsync, also reports an excluded-but-protected extra.  rsync `-n -i
-        --delete` lists only genuine extras.  Pins the residual that keeps the
-        row Divergent."""
+    def test_dry_run_delete_lines_match_rsync(self):
+        """`-n --delete` lists exactly the destination extras rsync would remove.
+
+        Covers the three cases that a real run protects: the file being updated
+        (in the keep set), a filter-excluded source entry (protected prefix), and
+        a --max-size-pruned source entry (always-protected prefix).  Only the
+        genuine destination-only extras may appear.  Residual: a destination-only
+        entry matching an exclude pattern is still removed (FastSync derives
+        delete protection from the source scan, not a receiver filter engine);
+        that divergence is pinned by TestOptionParity.
+        """
         source = os.path.join(TEST_DATA_DIR, "dryrep_src")
         rdst = os.path.join(TEST_DATA_DIR, "dryrep_rdst")
         fdst = os.path.join(TEST_DATA_DIR, "dryrep_fdst")
         clean_dir(source)
         clean_dir(rdst)
         clean_dir(fdst)
-        with open(os.path.join(source, "a.txt"), "wb") as fh:
-            fh.write(b"new content\n")
+        for name, data in (("a.txt", b"new content\n"), ("keep.log", b"log\n"),
+                           ("big.bin", b"B" * 2000)):
+            with open(os.path.join(source, name), "wb") as fh:
+                fh.write(data)
         os.utime(os.path.join(source, "a.txt"), (1_700_000_000, 1_700_000_000))
-        for root in (rdst, fdst):
-            with open(os.path.join(root, "a.txt"), "wb") as fh:
-                fh.write(b"old\n")
-            for name, data in (("extra.log", b"log\n"), ("extra.txt", b"extra\n")):
+        received = get_dest_received_dir(fdst, source)
+        os.makedirs(received, exist_ok=True)
+        for root in (rdst, received):
+            for name, data in (("a.txt", b"old\n"), ("keep.log", b"log\n"),
+                               ("big.bin", b"B" * 2000), ("extra.txt", b"extra\n")):
                 with open(os.path.join(root, name), "wb") as fh:
                     fh.write(data)
-            for p in (os.path.join(root, "a.txt"), os.path.join(root, "extra.log"),
-                      os.path.join(root, "extra.txt")):
-                os.utime(p, (1_500_000_000, 1_500_000_000))
+                os.utime(os.path.join(root, name), (1_500_000_000, 1_500_000_000))
 
+        flags = ["-a", "-n", "-i", "--delete", "--exclude=*.log", "--max-size=1000"]
         r = subprocess.run(["rsync", "-an", "-i", "--delete", "--exclude=*.log",
-                            source + "/", rdst + "/"],
+                            "--max-size=1000", source + "/", rdst + "/"],
                            capture_output=True, text=True,
                            env=dict(os.environ, LC_ALL="C"))
         assert r.returncode == 0, r.stderr
-        rsync_del = {l.split(None, 1)[1] for l in r.stdout.splitlines()
-                     if l.startswith("*deleting")}
-        assert rsync_del == {"extra.txt"}, f"unexpected rsync deleting set: {rsync_del}"
+        rsync_del = sorted(l for l in r.stdout.splitlines() if l.startswith("*deleting"))
+        assert rsync_del == ["*deleting   extra.txt"], f"unexpected rsync set: {rsync_del}"
 
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(source, fdst,
-                                   flags=["-a", "-n", "-i", "--delete", "--exclude=*.log"],
-                                   port=server.port)
+            result, _ = run_client(source, fdst, flags=flags, port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
-        fs_del = {l.split(None, 1)[1] for l in (result.stdout or "").splitlines()
-                  if l.startswith("*deleting")}
-        # Documented over-report: the transferred/updated file and the excluded
-        # extra appear in FastSync's would-delete set.
-        assert "a.txt" in fs_del, "residual changed: FastSync no longer over-reports the update"
-        assert "extra.log" in fs_del, "residual changed: FastSync no longer reports excluded extra"
+        fs_del = sorted(l for l in (result.stdout or "").splitlines()
+                        if l.startswith("*deleting"))
+        assert fs_del == rsync_del, f"rsync={rsync_del}\nfastsync={fs_del}"
 
     @pytest.mark.ci
     def test_remote_dry_run_quiet_is_silent(self, shared_server):

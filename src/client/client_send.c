@@ -350,6 +350,7 @@ static void print_delete_reports(const Config* config, const ArrayList* paths) {
 }
 
 static void client_progress_begin(const Config* config) {
+  change_reset_name_root();
   g_progress_active =
       (config->show_progress || info_flag_enabled(config, LOG_INFO_PROGRESS)) && !config->quiet;
   g_progress_xferred = 0;
@@ -1928,11 +1929,41 @@ static int send_dry_run_remote(Config* config) {
   DirectoryScanner* scanner = NULL;
   ArrayList* dry_manifest = NULL;
   ArrayList* dry_dirs = NULL;
+  ArrayList* dry_excluded = NULL;
+  ArrayList* dry_size_skipped = NULL;
   if (!config_send(client->file_descriptor, config))
     goto dry_fail;
   receive_daemon_motd(client, config);
   if (!prepare_scanner(config, 0, &prepared))
     goto dry_fail;
+  /* -n --delete: build the same keep-set manifest, protected prefixes, and
+     synchronized-directory scope a real run would send, so the receiver's
+     read-only extras walk enumerates exactly the deletions a real run makes. */
+  if (config->use_delete) {
+    dry_manifest = array_list_create(free);
+    dry_dirs = array_list_create(free);
+    dry_size_skipped = array_list_create(free);
+    if (!dry_manifest || !dry_dirs || !dry_size_skipped)
+      goto dry_fail;
+    if (!config->delete_excluded) {
+      dry_excluded = array_list_create(free);
+      if (!dry_excluded)
+        goto dry_fail;
+      prepared.options.excluded_paths = dry_excluded;
+    }
+    prepared.options.size_skipped_paths = dry_size_skipped;
+    /* A --files-from subset confines the extras walk to the directories the
+       scan synchronized; a full recursive transfer marks the root itself. */
+    if (config->files_from_set == NULL) {
+      char* root_marker = delete_scope_root_marker(config);
+      if (!root_marker || !array_list_add(dry_dirs, root_marker)) {
+        free(root_marker);
+        goto dry_fail;
+      }
+    } else {
+      prepared.options.synced_dirs = dry_dirs;
+    }
+  }
   scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
   if (!scanner)
     goto dry_fail;
@@ -1940,26 +1971,6 @@ static int send_dry_run_remote(Config* config) {
   int file_count = 0;
   unsigned long long total_bytes = 0;
   char size_buffer[32];
-  /* -n --delete: build the same keep-set manifest a real run would send so the
-     receiver can enumerate (read-only) the destination extras.  Filter-excluded
-     and size-pruned protections are not propagated here, so a filtered dry-run
-     may over-report; the no-filter case is exact. */
-  dry_manifest = config->use_delete ? array_list_create(free) : NULL;
-  if (config->use_delete && !dry_manifest)
-    goto dry_fail;
-  /* Scope the receiver-side extras walk to the receive root (the "." sentinel),
-     exactly as the recursive transfer path does. */
-  if (config->use_delete) {
-    dry_dirs = array_list_create(free);
-    char* root_marker = dry_dirs ? str_dup(".") : NULL;
-    if (!dry_dirs || !root_marker || !array_list_add(dry_dirs, root_marker)) {
-      free(root_marker);
-      if (dry_dirs)
-        array_list_delete(dry_dirs);
-      dry_dirs = NULL;
-      goto dry_fail;
-    }
-  }
   if (!config->quiet)
     printf("Dry run: files to be transferred\n");
   Chunk* chunk;
@@ -2034,8 +2045,8 @@ static int send_dry_run_remote(Config* config) {
      the terminal FINISHED. */
   bool early_delete = config->use_delete && config_delete_timing_early(config);
   if (dry_manifest) {
-    if (send_delete_manifest(client->file_descriptor, dry_manifest, NULL, NULL, NULL, dry_dirs) !=
-        0)
+    if (send_delete_manifest(client->file_descriptor, dry_manifest, dry_excluded, dry_size_skipped,
+                             NULL, dry_dirs) != 0)
       goto dry_fail;
     if (early_delete) {
       Status ack;
@@ -2091,6 +2102,10 @@ dry_fail:
     array_list_delete(dry_manifest);
   if (dry_dirs)
     array_list_delete(dry_dirs);
+  if (dry_excluded)
+    array_list_delete(dry_excluded);
+  if (dry_size_skipped)
+    array_list_delete(dry_size_skipped);
   if (scanner)
     directory_scanner_destroy(scanner);
   prepared_scanner_destroy(&prepared);
@@ -2423,6 +2438,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     int rc = send_single_file(client, f, config, config->use_incremental, use_sendfile);
     if (rc == 1) {
       source_file_destroy(source);
+      change_emit_file_uptodate(config, f);
       continue;
     }
     if (rc < 0) {
