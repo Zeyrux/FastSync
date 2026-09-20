@@ -1855,25 +1855,6 @@ static bool scan_paths_only(const Config* config, const ScannerOptions* options,
   return ok;
 }
 
-/* Transmit any not-yet-sent per-directory delete plan needed by the entries in
- * `chunk` (ancestors root-first, then the entry's own directory for --dirs
- * entries) before its data frames go out, so --delete-during/--delete-delay
- * clear a directory's extras (and any type conflict) before the directory's
- * first write. */
-static int send_chunk_delete_plans(Client* client, DeletePlanSender* plans, const Chunk* chunk) {
-  if (!plans)
-    return 0;
-  for (int i = 0; i < chunk->element_count; i++) {
-    File* f = chunk->items[i];
-    if (!f)
-      continue;
-    if (delete_plan_send_for_path(client->file_descriptor, plans, file_wire_path(f), f->is_dir) !=
-        0)
-      return -1;
-  }
-  return 0;
-}
-
 static int incremental_check(Client* client, File* file, const Config* config,
                              DeltaSignature** out_sig, unsigned long long* resume_offset) {
   *out_sig = NULL;
@@ -2753,9 +2734,12 @@ static int send_chunks_multithreaded(void* pipeline_context) {
       return thrd_error;
     }
   } else if (context->delete_plans) {
-    /* --delete-during/--delete-delay: transmit the receive root's plan before
-       any data, exactly like rsync's first generator directory. */
-    if (delete_plan_send_root(client->file_descriptor, context->delete_plans) != 0) {
+    /* --delete-during/--delete-delay: transmit the COMPLETE per-directory plan
+       set before any data, so a mid-transfer abort has already applied every
+       planned removal exactly like rsync's generator (which runs ahead of its
+       throttled sender).  A completed run is unaffected. */
+    if (delete_plan_send_all(client->file_descriptor, context->delete_plans, context->plan_dirs) !=
+        0) {
       pipeline_cancel(context);
       disconnect_transfer_client(client);
       mark_sender_done(context);
@@ -2801,15 +2785,6 @@ static int send_chunks_multithreaded(void* pipeline_context) {
         return thrd_error;
       }
       break;
-    }
-    if (send_chunk_delete_plans(client, context->delete_plans, current_chunk) != 0) {
-      log_message(LOG_LEVEL_ERROR, "unexpected error while sending delete plan");
-      chunk_destroy(current_chunk);
-      pipeline_cancel(context);
-      disconnect_transfer_client(client);
-      mark_sender_done(context);
-      protocol_session_unbind();
-      return thrd_error;
     }
     if (send_chunk_with_removal(client, current_chunk, context->config,
                                 context->remove_source_files, &context->stats) != 0) {
@@ -2893,13 +2868,6 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                              NULL) != 0)
       goto send_fail;
   }
-  /* Emit the plans for source directories the data stream never triggered
-     (empty directories): their extras are still cleared while the directory
-     itself is kept. */
-  if (!context->scan_stopped_early && context->delete_plans && context->plan_dirs &&
-      delete_plan_send_remaining(client->file_descriptor, context->delete_plans,
-                                 context->plan_dirs) != 0)
-    goto send_fail;
   /* P7 Wave D: transmit the captured directory times last.  The scanner thread
      (and all parallel workers) has been joined before scanner_done was set, so
      the list is complete and race-free; on an early stop the list may be
@@ -3232,10 +3200,12 @@ int send_files(Config* config) {
   /* Traversed source directories for the per-directory delete keep set. */
   ArrayList* plan_dirs = NULL;
   bool delete_early = config->use_delete && config_delete_timing_early(config);
-  /* -d/--dirs does not recurse, so a per-directory plan would carry no child
-     information and could delete the contents of an untraversed directory;
-     fall back to the whole-tree end-of-transfer commit for that mode. */
-  bool delete_per_dir = config->use_delete && config_delete_timing_per_dir(config) && !config->dirs;
+  /* --delete-during/--delete-delay use per-directory plans for every transfer
+     shape.  For -d/--dirs the generator records only the directories whose
+     direct children it actually enumerated, so the plan removes extras directly
+     inside a listed directory while an untraversed (kept) subdirectory is
+     shielded -- rsync's `-d DIR/ --delete`. */
+  bool delete_per_dir = config->use_delete && config_delete_timing_per_dir(config);
   bool send_failed = false;
   bool had_scan_io = false;
   unsigned long long per_dir_non_dir_count = 0;
@@ -3287,12 +3257,12 @@ int send_files(Config* config) {
       prepared.options.synced_dirs = synced_dirs;
     }
   }
-  /* The late-timing modes (--delete-after/--delete-commit and a plain --delete
-     that fell back from per-dir mode because of -d/--dirs) build the manifest
+  /* The late-timing modes (--delete-after/--delete-commit) build the manifest
      while streaming and send it after the last data frame.  --delete-before
-     sends a whole-tree keep-set up front; --delete-during/--delete-delay build a
-     per-directory plan set up front (paths only) and stream the plans alongside
-     the data, so no manifest is kept during the data pass. */
+     sends a whole-tree keep-set up front; --delete-during/--delete-delay build
+     the complete per-directory plan set up front (paths only) and transmit it
+     all before the first data frame, so a mid-transfer abort has already
+     applied every planned removal. */
   if (delete_early) {
     /* Pass 1: collect the complete keep-set (paths only, no data loaded) and
        transmit it now, before any file data.  The receiver removes extras and
@@ -3335,9 +3305,10 @@ int send_files(Config* config) {
       goto send_fail;
   } else if (delete_per_dir) {
     /* --delete-during/--delete-delay: build one plan per source directory from a
-       path-only pre-scan and transmit the root plan now, before any data, so the
-       receive root's extras are handled exactly like rsync's first generator
-       directory.  The remaining plans are streamed with the data below. */
+       path-only pre-scan and transmit the COMPLETE plan set now, before any data,
+       so every planned removal has already been applied when a later transfer
+       phase fails -- exactly like rsync's generator, whose deletion list runs
+       ahead of its throttled sender.  A completed run is unaffected. */
     plan_sender = delete_plan_sender_create();
     plan_dirs = array_list_create(free);
     if (!plan_sender || !plan_dirs)
@@ -3368,7 +3339,7 @@ int send_files(Config* config) {
         plan_dirs = NULL;
         skip_delete = true;
       } else {
-        plans_ok = delete_plan_send_root(client->file_descriptor, plan_sender) == 0;
+        plans_ok = delete_plan_send_all(client->file_descriptor, plan_sender, plan_dirs) == 0;
       }
     }
     prepared.options.excluded_paths = NULL;
@@ -3455,11 +3426,6 @@ int send_files(Config* config) {
         goto send_fail;
       }
     }
-    if (send_chunk_delete_plans(client, plan_sender, current_chunk) != 0) {
-      chunk_destroy(current_chunk);
-      send_failed = true;
-      break;
-    }
     if (send_chunk_with_removal(client, current_chunk, config, remove_sources, &transfer_stats) !=
         0) {
       log_message(LOG_LEVEL_ERROR, "Failed to send chunk");
@@ -3542,12 +3508,6 @@ int send_files(Config* config) {
       }
     }
   }
-  /* Emit the plans for any source directories the data stream never triggered
-     (an empty directory has no file frame).  Sending them now still clears that
-     directory's destination extras while keeping the directory itself. */
-  if (!scan_stopped_early && plan_sender && plan_dirs &&
-      delete_plan_send_remaining(client->file_descriptor, plan_sender, plan_dirs) != 0)
-    goto send_fail;
   /* P7 Wave D: every directory has now been traversed (or the scan stopped
      early), so transmit the captured directory times last.  The receiver defers
      applying them until after its own deletion/publication phase. */
@@ -3714,10 +3674,11 @@ int send_files_multithreaded(Config** config_ptr) {
         return 1;
       }
     }
-    /* -d/--dirs does not recurse, so a per-directory plan would carry no child
-       information and could delete the contents of an untraversed directory;
-       fall back to the whole-tree end-of-transfer commit for that mode. */
-    bool per_dir = config_delete_timing_per_dir(config) && !config->dirs;
+    /* --delete-during/--delete-delay use per-directory plans for every transfer
+       shape.  The -d/--dirs generator records only the directories whose direct
+       children it enumerated, so extras directly inside a listed directory are
+       removed while an untraversed (kept) subdirectory is shielded. */
+    bool per_dir = config_delete_timing_per_dir(config);
     if (config_delete_timing_early(config) || per_dir) {
       /* --delete-before / --delete-during / --delete-delay: build the keep-set
          (paths only, nothing loaded or sent) up front so the sender thread can

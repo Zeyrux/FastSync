@@ -432,6 +432,17 @@ int delete_plan_send_remaining(int fd, DeletePlanSender* sender, const ArrayList
   return 0;
 }
 
+int delete_plan_send_all(int fd, DeletePlanSender* sender, const ArrayList* dirs) {
+  if (!sender)
+    return -1;
+  /* Root first: this also transmits the one-shot per-run config block on its
+     own carrier frame (see send_config_only), so it reaches the receiver even
+     when the scope permits no directory plan at all. */
+  if (delete_plan_send_root(fd, sender) != 0)
+    return -1;
+  return delete_plan_send_remaining(fd, sender, dirs);
+}
+
 /* ------------------------------------------------------------------ */
 /* Receiver: delete session                                           */
 /* ------------------------------------------------------------------ */

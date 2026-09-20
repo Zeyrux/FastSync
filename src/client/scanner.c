@@ -1451,6 +1451,17 @@ static File* dirs_next_file(DirectoryScanner* scanner) {
         scanner->dirs_root_emitted = true;
         if (scanner->options.prune_empty_dirs && dirs_source_dir_is_empty(scanner->root_path))
           return NULL;
+        /* The listed directory's direct children are about to be enumerated, so
+           its destination mirror is a synchronized directory: record it for the
+           per-directory delete plan.  The plan keeps the enumerated children and
+           shields untraversed subdirectories, so --delete-during removes extras
+           directly inside the listed directory without descending into a kept
+           (but untraversed) child -- exactly rsync's `-d DIR/ --delete`. */
+        if (!scanner_record_synced_dir(&scanner->options, scanner->root_path, "",
+                                       scanner->relative_mode)) {
+          scanner->failed = true;
+          return NULL;
+        }
         scanner->current_dir = opendir(scanner->root_path);
         if (!scanner->current_dir) {
           scanner->io_error = true;
