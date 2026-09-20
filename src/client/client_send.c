@@ -129,6 +129,21 @@ static void stats_type_breakdown(const TransferStats* stats, char* out, size_t o
                  out_size);
 }
 
+/* rsync's `Number of files` counts every directory.  A recursive scan that
+   preserves a directory attribute captures them in `dir_entries`; a `-r` scan
+   (no -t/-p) captures nothing, so fall back to the scanner's shared counter of
+   traversed directories that are not already represented by an inline
+   directory entry.  The -d generator counts its explicit directory entries
+   inline and does not traverse, so it is excluded here. */
+static unsigned long long dir_count_for_stats(const Config* config, const ArrayList* dir_entries,
+                                              atomic_ullong* counter) {
+  if (config == NULL || config->dirs || config->list_only)
+    return 0;
+  if (dir_metadata_should_capture(config))
+    return dir_entries != NULL ? (unsigned long long)dir_entries->size : 0;
+  return counter != NULL ? (unsigned long long)atomic_load(counter) : 0;
+}
+
 /* Print the rsync `--stats` block on stdout.  The source-side flist and
    transferred counters come from `stats` (filled while scanning/sending), the
    receiver-only counters from the STATUS_STATS frame, and the wire byte totals
@@ -387,6 +402,15 @@ static bool info_flag_enabled(const Config* config, LogInfoFlag flag) {
 static void print_delete_reports(const Config* config, const ArrayList* paths) {
   if (!config || !paths || config->quiet)
     return;
+  /* --debug=del is independent of the --info=del/itemize/out-format display:
+     emit the debug trace even when no deletion line would be printed. */
+  if (log_debug_enabled(LOG_DEBUG_DEL)) {
+    for (int i = 0; i < paths->size; i++) {
+      const char* raw = (const char*)paths->items[i];
+      const char* path = delete_display_path(config, raw);
+      log_debug_message(LOG_DEBUG_DEL, "del: %s", path ? path : raw);
+    }
+  }
   if (!(config->itemize_changes || config->out_format != NULL ||
         info_flag_enabled(config, LOG_INFO_DEL)))
     return;
@@ -665,6 +689,7 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->ignore_io_errors = config->ignore_errors;
   options->ignore_missing_args = config->ignore_missing_args || config->delete_missing_args;
   options->note_nonreg = (config->info_level & LOG_INFO_NONREG) != 0 && !config->quiet;
+  options->note_mount = (config->info_level & LOG_INFO_MOUNT) != 0 && !config->quiet;
   options->send_directory = config->send_directory;
   options->eight_bit_output = config->eight_bit_output;
   options->excluded_paths = NULL;
@@ -672,6 +697,9 @@ static bool prepare_scanner(const Config* config, int num_threads, PreparedScann
   options->size_skipped_paths = NULL;
   options->synced_dirs = NULL;
   options->hardlinks = NULL;
+  /* Set by the real send paths; NULL for the metadata-only scans (progress
+     pre-count, batch) that must not perturb the sender's --stats counter. */
+  options->dir_count = NULL;
   /* P7 Wave D: capture source directory metadata when a directory attribute is
      requested (-p for modes, -t for times unless -O omits them).  Whether they
      are APPLIED is decided receiver-side. */
@@ -730,6 +758,8 @@ static bool progress_precount_scan(const Config* config, ProgressPrecount* out) 
   ScannerOptions local = prepared.options;
   local.list_dirs = true;
   local.note_nonreg = false;
+  local.note_mount = false;
+  local.dir_count = NULL;
   local.use_metadata = false;
   local.preserve_xattrs = false;
   local.preserve_acls = false;
@@ -1336,6 +1366,7 @@ static bool finalize_transfer(Client* client, const Config* config, ArrayList* r
     return false;
   if (status == STATUS_STATS) {
     ReceiverStats scratch;
+    log_debug_message(LOG_DEBUG_RECV, "recv: receiver stats");
     /* A real --info=del run carries the actually-removed paths in the stats
        frame's path list; collect and print them in rsync's format. */
     ArrayList* deleted = config->report_deletes ? array_list_create(free) : NULL;
@@ -1885,6 +1916,8 @@ static int incremental_check(Client* client, File* file, const Config* config,
     if (!file_checksum(file, (ChecksumAlgo)config->checksum_algo, config->checksum_seed, digest,
                        sizeof(digest), &digest_len))
       return -1;
+    log_debug_message(LOG_DEBUG_HASH, "hash: %s (algo %d)", file_wire_path(file),
+                      config->checksum_algo);
     uint8_t wire_len = (uint8_t)digest_len;
     if (!send_n_data(client->file_descriptor, &wire_len, sizeof(wire_len)) ||
         !send_n_data(client->file_descriptor, digest, wire_len))
@@ -1919,6 +1952,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
     log_server_rejection("Server reported error for file");
     return -1;
   }
+  log_debug_message(LOG_DEBUG_RECV, "recv: check reply for %s", file_wire_path(file));
   if (s == STATUS_OK)
     return 1;
   if (s == STATUS_DELTA_SIGNATURE) {
@@ -1933,6 +1967,8 @@ static int incremental_check(Client* client, File* file, const Config* config,
       send_status(client->file_descriptor, STATUS_ERROR);
       return -1;
     }
+    log_debug_message(LOG_DEBUG_RECV, "recv: delta signature for %s (%d blocks)",
+                      file_wire_path(file), sig->block_count);
     *out_sig = sig;
     return 2;
   }
@@ -1973,6 +2009,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
 static int send_delta(Client* client, File* file, DeltaSignature* sig, Config* config) {
   Delta* delta = delta_compute_seeded(file->data->data, file->data->size, sig,
                                       config->delta_block_size, (uint32_t)config->checksum_seed);
+  log_debug_message(LOG_DEBUG_HASH, "deltasum: %s", file_wire_path(file));
   /* The receiver is blocked after sending the signature.  Every local
      fallback therefore needs the explicit NEXT response before full data. */
   if (!delta)
@@ -2446,6 +2483,7 @@ static int send_single_file(Client* client, File* file, Config* config, bool use
                             bool use_sendfile) {
   int compression_level = config->use_compression ? config->compression_level : 0;
   log_info_message(LOG_INFO_COPY, "Transferring %s", file->path);
+  log_debug_message(LOG_DEBUG_SEND, "send: %s", file_wire_path(file));
 
   if (!use_incremental) {
     if (use_sendfile) {
@@ -2886,8 +2924,8 @@ static int send_chunks_multithreaded(void* pipeline_context) {
                 "server reported a deletion failure (--delete); see the server log for the reason");
   if (ok)
     remove_transferred_sources(context->config, context->remove_source_files);
-  if (context->dir_entries)
-    context->stats.flist_dir += (unsigned long long)context->dir_entries->size;
+  context->stats.flist_dir +=
+      dir_count_for_stats(context->config, context->dir_entries, &context->dir_count);
   report_transfer_stats(context->config, &context->stats, start, &recv_stats);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %llu files, %.1f MB",
                    context->stats.transferred_regular,
@@ -2924,6 +2962,7 @@ static int scan_directory_multithreaded(void* pipeline_context) {
      parallel workers append under the context's dedicated mutex. */
   prepared.options.dir_entries = context->dir_entries;
   prepared.options.dir_entries_mutex = &context->dir_entries_mutex;
+  prepared.options.dir_count = context->config->stats ? &context->dir_count : NULL;
   if (!append_implied_dir_times(context->config, context->dir_entries)) {
     pipeline_cancel(context);
     protocol_session_unbind();
@@ -3192,6 +3231,9 @@ int send_files(Config* config) {
   /* P7 Wave D: captured source directory times, transmitted in trailing
      STATUS_DIR_TIMES frame(s) (only when metadata rides the wire). */
   ArrayList* dir_entries = NULL;
+  /* --stats directory accounting for the no-metadata (-r) case. */
+  atomic_ullong dir_count;
+  atomic_init(&dir_count, 0);
   /* Protected excluded prefixes (delete-excluded default protection). */
   ArrayList* excluded = NULL;
   /* Size-pruned prefixes (always protected) and synchronized directories. */
@@ -3373,6 +3415,7 @@ int send_files(Config* config) {
      the directory-time list (otherwise every directory would be captured
      twice). */
   prepared.options.dir_entries = dir_entries;
+  prepared.options.dir_count = config->stats ? &dir_count : NULL;
   scanner = directory_scanner_create_with_options(config->send_directory, &prepared.options);
   if (!scanner)
     goto send_fail;
@@ -3526,8 +3569,7 @@ int send_files(Config* config) {
      from the scanner's captured directory list (present whenever a directory
      attribute is preserved, e.g. -a/-t/-p).  The -d generator counts its
      explicit directory entries inline instead. */
-  if (dir_entries)
-    transfer_stats.flist_dir += (unsigned long long)dir_entries->size;
+  transfer_stats.flist_dir += dir_count_for_stats(config, dir_entries, &dir_count);
   report_transfer_stats(config, &transfer_stats, start, &recv_stats);
   log_info_message(LOG_INFO_STATS, "Transfer summary: %llu files, %.1f MB",
                    transfer_stats.transferred_regular,

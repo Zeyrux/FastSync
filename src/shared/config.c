@@ -79,7 +79,7 @@ static void config_set_defaults(Config* config) {
   config->cvs_exclude = false;
   config->per_dir_filter = false;
   config->per_dir_filter_count = 0;
-  config->one_file_system = false;
+  config->one_file_system = 0;
   config->no_implied_dirs = false;
   config->dirs = false;
   config->rsh_command = NULL;

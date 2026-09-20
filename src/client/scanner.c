@@ -219,8 +219,8 @@ typedef struct {
 /* --one-file-system (-x) decision. Only directories can carry a different
  * device than their parent (mount points), so this is checked when a child
  * directory is about to be descended into. */
-bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device) {
-  return !one_file_system || entry_device == root_device;
+bool scanner_same_filesystem(int one_file_system, dev_t root_device, dev_t entry_device) {
+  return one_file_system <= 0 || entry_device == root_device;
 }
 
 /* Build a payload-less directory File carrying the captured metadata (when
@@ -454,6 +454,40 @@ static void scanner_note_nonreg(const ScannerOptions* options, const char* fs_pa
   printf("skipping non-regular file \"%s\"\n", escaped ? escaped : rel);
   free(escaped);
   fflush(stdout);
+}
+
+/* rsync 3.4.1's `--info=mount` line, emitted when `-xx` drops a mount-point
+ * directory: `[sender] skipping mount-point dir NAME` (the client is the
+ * sender).  Plain `-x` keeps the empty directory and prints nothing, matching
+ * rsync. */
+static void scanner_note_mount(const ScannerOptions* options, const char* fs_path) {
+  if (!options || !options->note_mount || !fs_path)
+    return;
+  const char* rel = utils_strip_transfer_root(fs_path, options->send_directory);
+  char* escaped = output_escape(rel, options->eight_bit_output);
+  printf("[sender] skipping mount-point dir %s\n", escaped ? escaped : rel);
+  free(escaped);
+  fflush(stdout);
+}
+
+/* --debug=filter: a selection/filter decision dropped an entry. */
+static void scanner_note_filter(const ScannerOptions* options, const char* name) {
+  if (!options || !log_debug_enabled(LOG_DEBUG_FILTER) || !name)
+    return;
+  log_debug_message(LOG_DEBUG_FILTER, "filter: excluded %s", name);
+}
+
+/* Account for a directory that will not be represented by an inline directory
+ * entry.  Paired with scanner_dir_count_uncount for empty directories that are
+ * emitted inline, so every traversed directory is counted exactly once. */
+static void scanner_dir_count_count(const ScannerOptions* options) {
+  if (options && options->dir_count)
+    atomic_fetch_add(options->dir_count, 1);
+}
+
+static void scanner_dir_count_uncount(const ScannerOptions* options) {
+  if (options && options->dir_count)
+    atomic_fetch_sub(options->dir_count, 1);
 }
 
 /* A user-selection exclusion (--filter/-C/per-dir or --exclude/--include). */
@@ -1096,6 +1130,9 @@ static bool scanner_emit_empty_dir(DirectoryScanner* scanner, ArrayList* chunk_d
     file_destroy(dir);
     return false;
   }
+  /* The directory was counted when it was opened; this inline entry represents
+     it, so drop the counter to avoid counting it twice in --stats. */
+  scanner_dir_count_uncount(&scanner->options);
   return true;
 }
 
@@ -1185,6 +1222,8 @@ static int open_next_directory(DirectoryScanner* scanner) {
       scanner->failed = true;
       return -1;
     }
+    scanner_dir_count_count(&scanner->options);
+    log_debug_message(LOG_DEBUG_FLIST, "flist: scanning %s", scanner->current_path);
     if (scanner->options.capture_dir_times &&
         !scanner_capture_dir_time(
             scanner->options.dir_entries, scanner->options.dir_entries_mutex, scanner->root_path,
@@ -1692,6 +1731,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       break;
     }
     if (!passes_selection) {
+      scanner_note_filter(&scanner->options, name);
       free(rel_copy);
       continue;
     }
@@ -1700,6 +1740,13 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       free(rel_copy);
       if (!scanner_same_filesystem(scanner->options.one_file_system, scanner->root_dev,
                                    stats.st_dev)) {
+        if (scanner->options.one_file_system > 1) {
+          /* rsync's -xx drops the mount-point directory entirely (the plain -x
+             path below keeps it as an empty directory) and prints the
+             --info=mount line when that category is enabled. */
+          scanner_note_mount(&scanner->options, cur_path);
+          continue;
+        }
         /* rsync's -x/--one-file-system emits the mount-point directory entry
            itself (so the destination gets an empty directory) but does NOT
            descend into it.  Build a payload-less directory File and hand it to
@@ -2113,6 +2160,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
       free(prefixed);
     }
     if (!passes) {
+      scanner_note_filter(options, entry->d_name);
       free(rel);
       free(cur_path);
       return;
@@ -2120,6 +2168,14 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   }
   if (is_dir) {
     if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
+      if (options->one_file_system > 1) {
+        /* -xx: drop the mount-point directory entirely (rsync) and print the
+           --info=mount line when enabled. */
+        scanner_note_mount(options, cur_path);
+        free(rel);
+        free(cur_path);
+        return;
+      }
       /* -x/--one-file-system: emit the mount-point directory entry (empty) but
          do not descend into it (see the sequential scanner for the same rule). */
       File* mount = file_create(cur_path);
@@ -2257,6 +2313,7 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
     ps->failed = true;
     return false;
   }
+  log_debug_message(LOG_DEBUG_FLIST, "flist: scanning %s", root_directory);
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -2421,6 +2478,10 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     parallel_scanner_destroy(ps);
     return NULL;
   }
+  /* The root itself is a traversed directory (rsync counts it in
+     `Number of files`); the worker DirectoryScanners account for every
+     subdirectory below it. */
+  scanner_dir_count_count(options);
   /* P7 Wave D: the parallel scanner never runs a DirectoryScanner over the
      transfer root itself (it hands the root's immediate subdirectories to
      workers), so capture the root's directory time here. */

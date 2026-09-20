@@ -51,7 +51,7 @@ typedef struct {
   bool copy_dirlinks;
   bool munge_links;
   bool checksum;
-  bool one_file_system;
+  int one_file_system;
   /* Phase 4 special/devices: whether device nodes (--devices) and special files
    * (--specials) are preserved via recreation, and whether --copy-devices
    * copies a device's content as an ordinary regular file. */
@@ -130,6 +130,17 @@ typedef struct {
   /* --info=nonreg: print rsync's `skipping non-regular file "NAME"` line for a
    * non-regular entry that is not being preserved.  Client-only. */
   bool note_nonreg;
+  /* --info=mount: print rsync's `[sender] skipping mount-point dir NAME` when
+   * -xx drops a mount-point directory.  Client-only. */
+  bool note_mount;
+  /* --stats directory accounting for a `-r` run (no -t/-p): a shared counter of
+   * traversed directories that are NOT otherwise represented by an inline
+   * directory entry (rsync still counts every directory in `Number of files`).
+   * Incremented when a directory is opened and decremented when an empty
+   * directory is emitted inline (so it is counted exactly once).  Atomic
+   * because the parallel scanner's workers share it; NULL disables the
+   * accounting.  Client-only. */
+  atomic_ullong* dir_count;
   /* Source root and 8-bit-output policy used to render a `--info=nonreg` name
    * relative to the transfer root.  Borrowed read-only. */
   const char* send_directory;
@@ -266,7 +277,7 @@ void directory_scanner_destroy(DirectoryScanner* scanner);
 /* --one-file-system (-x) decision: a directory entry may be descended into
  * only when the option is disabled or the entry lives on the same device as
  * the transfer root. Exposed so tests can exercise the rule directly. */
-bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device);
+bool scanner_same_filesystem(int one_file_system, dev_t root_device, dev_t entry_device);
 
 /* Relative path of an on-disk path below `root` ("" == the root itself, NULL
  * when `fs_path` is not under `root`). Handles trailing slashes and a root of
