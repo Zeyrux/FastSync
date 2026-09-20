@@ -672,22 +672,24 @@ static bool is_synced_dir(const PathIndex* dirs, const char* rel) {
   return path_index_contains(dirs, rel[0] == '\0' ? "." : rel);
 }
 
-/* Remove the extras directly inside the directory open on `dirfd`, recursing
-   into every child directory so kept content below a synchronized prefix is
-   reached.  `all_removed` reports whether every child entry was removed (so the
-   caller may rmdir this directory).  A child directory is never removed when it
-   is itself a synchronized directory or holds kept content; with a dirs index
-   supplied, direct children of a non-synchronized directory are never extras at
-   all (they are left in place but still descended into).  Symlinks are unlinked
-   like any other non-directory extra (never followed). */
-static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep,
-                             const PathIndex* dirs, DeleteBudget* budget,
-                             const DeleteSkipEntry* skips, int skip_count,
-                             const FilterRuleList* protect_rules, bool parent_deletable,
-                             bool* all_removed, DeletePathObserver observer,
-                             void* observer_context) {
-  /* openat(dirfd, ".") opens an independent file description: a dup() would
-     share dirfd's file offset and a prior pass could leave the stream drained. */
+/* Unsigned byte-wise string compare, matching rsync's u_strcmp (a signed
+   strcmp would order bytes >= 0x80 differently). */
+static int delete_name_cmp(const char* a, const char* b) {
+  const unsigned char* pa = (const unsigned char*)a;
+  const unsigned char* pb = (const unsigned char*)b;
+  while (*pa != '\0' && *pa == *pb) {
+    pa++;
+    pb++;
+  }
+  return (int)*pa - (int)*pb;
+}
+
+bool delete_dir_entries_collect(int dirfd, DeleteDirEntry** out, size_t* count,
+                                bool* operation_ok) {
+  *out = NULL;
+  *count = 0;
+  if (operation_ok)
+    *operation_ok = true;
   int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (scanfd < 0)
     return false;
@@ -696,17 +698,127 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
     close(scanfd);
     return false;
   }
-  bool operation_ok = true;
-  bool local_survives = false;
-  /* A directory is deletable when it or ANY ancestor is synchronized; the
-     `parent_deletable` flag carries that down the recursion so dest-only
-     directories below a synchronized root are removed wholesale. */
-  bool deletable = parent_deletable || is_synced_dir(dirs, rel_path);
+  DeleteDirEntry* entries = NULL;
+  size_t used = 0;
+  size_t capacity = 0;
+  bool ok = true;
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    char* child_rel = path_cat((char*)rel_path, entry->d_name);
+    struct stat st;
+    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno != ENOENT && operation_ok)
+        *operation_ok = false;
+      continue;
+    }
+    if (used == capacity) {
+      size_t next = capacity == 0 ? 16 : capacity * 2;
+      DeleteDirEntry* grown = realloc(entries, next * sizeof(*grown));
+      if (!grown) {
+        ok = false;
+        break;
+      }
+      entries = grown;
+      capacity = next;
+    }
+    entries[used].name = str_dup(entry->d_name);
+    if (!entries[used].name) {
+      ok = false;
+      break;
+    }
+    entries[used].is_dir = S_ISDIR(st.st_mode);
+    used++;
+  }
+  closedir(dir);
+  if (!ok) {
+    delete_dir_entries_free(entries, used);
+    return false;
+  }
+  *out = entries;
+  *count = used;
+  return true;
+}
+
+void delete_dir_entries_free(DeleteDirEntry* entries, size_t count) {
+  if (!entries)
+    return;
+  for (size_t i = 0; i < count; i++)
+    free(entries[i].name);
+  free(entries);
+}
+
+/* rsync's extraneous-entry order: subdirectories before files, each group in
+   descending name order. */
+int delete_dir_entry_cmp_desc(const void* a, const void* b) {
+  const DeleteDirEntry* ea = a;
+  const DeleteDirEntry* eb = b;
+  if (ea->is_dir != eb->is_dir)
+    return ea->is_dir ? -1 : 1;
+  return -delete_name_cmp(ea->name, eb->name);
+}
+
+/* rsync's kept-subdirectory order: plain ascending name. */
+int delete_dir_entry_cmp_asc(const void* a, const void* b) {
+  const DeleteDirEntry* ea = a;
+  const DeleteDirEntry* eb = b;
+  return delete_name_cmp(ea->name, eb->name);
+}
+
+/* Remove the extras directly inside the directory open on `dirfd`, recursing
+   into every child directory so kept content below a synchronized prefix is
+   reached.  `all_removed` reports whether every child entry was removed (so the
+   caller may rmdir this directory).  A child directory is never removed when it
+   is itself a synchronized directory or holds kept content; with a dirs index
+   supplied, direct children of a non-synchronized directory are never extras at
+   all (they are left in place but still descended into).  Symlinks are unlinked
+   like any other non-directory extra (never followed).
+
+   Entries are processed in rsync's order (extraneous subdirectories in
+   descending name order, then extraneous files, then kept subdirectories in
+   ascending order) rather than readdir() order, so `--max-delete` leaves the
+   same survivors and the `--info=del`/dry-run line order matches rsync. */
+static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* keep,
+                             const PathIndex* dirs, DeleteBudget* budget,
+                             const DeleteSkipEntry* skips, int skip_count,
+                             const FilterRuleList* protect_rules, bool parent_deletable,
+                             bool* all_removed, DeletePathObserver observer,
+                             void* observer_context) {
+  DeleteDirEntry* entries = NULL;
+  size_t count = 0;
+  bool collect_ok = true;
+  if (!delete_dir_entries_collect(dirfd, &entries, &count, &collect_ok))
+    return false;
+  bool operation_ok = collect_ok;
+  bool local_survives = false;
+  bool* shielded = calloc(count ? count : 1, sizeof(bool));
+  bool* is_extra = calloc(count ? count : 1, sizeof(bool));
+  if (!shielded || !is_extra) {
+    free(shielded);
+    free(is_extra);
+    delete_dir_entries_free(entries, count);
+    return false;
+  }
+  /* A directory is deletable when it or ANY ancestor is synchronized; the
+     `parent_deletable` flag carries that down the recursion so dest-only
+     directories below a synchronized root are removed wholesale. */
+  bool deletable = parent_deletable || is_synced_dir(dirs, rel_path);
+  bool at_root = rel_path[0] == '\0';
+
+  /* Reproduce rsync's traversal order: extraneous subdirectories in descending
+     name order, then extraneous files in descending name order, and kept
+     subdirectories only afterwards (ascending).  Sorting up front also fixes the
+     identity of the survivors under a partial --max-delete. */
+  if (count > 1)
+    qsort(entries, count, sizeof(*entries), delete_dir_entry_cmp_desc);
+  size_t dir_count = 0;
+  while (dir_count < count && entries[dir_count].is_dir)
+    dir_count++;
+
+  /* Classify every entry up front (the verdict does not depend on processing
+     order) so the ordered passes below can act on it. */
+  for (size_t i = 0; i < count; i++) {
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
     if (!child_rel) {
       operation_ok = false;
       continue;
@@ -718,93 +830,142 @@ static bool delete_extras_fd(int dirfd, const char* rel_path, const PathIndex* k
        top-level-only prefix) and the basis prefixes are protected: a nested
        destination directory that happens to be called .fastsync-stage is
        ordinary content. */
-    if (path_under_skip_prefix(child_rel, rel_path[0] == '\0', skips, skip_count)) {
+    if (path_under_skip_prefix(child_rel, at_root, skips, skip_count)) {
+      shielded[i] = true;
       local_survives = true;
-      free(child_rel);
-      continue;
-    }
-    struct stat st;
-    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno != ENOENT)
-        operation_ok = false;
-      free(child_rel);
-      continue;
-    }
-    bool is_dir = S_ISDIR(st.st_mode);
-    if (protect_rules && filter_rules_apply_side(protect_rules, child_rel, entry->d_name, is_dir,
-                                                 FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT) {
+    } else if (protect_rules &&
+               filter_rules_apply_side(protect_rules, child_rel, entries[i].name, entries[i].is_dir,
+                                       FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT) {
       /* A first-match protect rule shields the extra; for a directory the whole
          subtree is shielded (rsync prunes an excluded directory), so do not
          descend. */
+      shielded[i] = true;
       local_survives = true;
-      free(child_rel);
+    } else if (entries[i].is_dir) {
+      bool child_synced = dirs && path_index_contains(dirs, child_rel);
+      is_extra[i] = deletable && !child_synced && !keep_is_dir(keep, child_rel);
+      if (!is_extra[i])
+        local_survives = true;
+    } else {
+      is_extra[i] = deletable && !keep_is_file(keep, child_rel);
+      if (!is_extra[i])
+        local_survives = true;
+    }
+    free(child_rel);
+  }
+
+  /* Pass 1: extraneous subdirectories, descending. */
+  for (size_t i = 0; i < dir_count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
       continue;
     }
-    if (is_dir) {
-      int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      bool child_all_removed = false;
-      if (childfd >= 0) {
-        if (!delete_extras_fd(childfd, child_rel, keep, dirs, budget, skips, skip_count,
-                              protect_rules, deletable, &child_all_removed, observer,
-                              observer_context))
-          operation_ok = false;
-        close(childfd);
-      } else if (errno != ENOENT) {
+    int childfd = openat(dirfd, entries[i].name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    bool child_all_removed = false;
+    if (childfd >= 0) {
+      if (!delete_extras_fd(childfd, child_rel, keep, dirs, budget, skips, skip_count,
+                            protect_rules, deletable, &child_all_removed, observer,
+                            observer_context))
         operation_ok = false;
-      }
-      bool child_synced = dirs && path_index_contains(dirs, child_rel);
-      if (child_synced || keep_is_dir(keep, child_rel)) {
-        /* A synchronized directory and a directory holding kept content are
-           never removed. */
-        local_survives = true;
-      } else if (child_all_removed && deletable) {
-        if (budget->deleted >= budget->max_delete) {
-          budget->limit_hit = true;
-          budget->skipped++;
-          local_survives = true;
-        } else if (unlinkat(dirfd, entry->d_name, AT_REMOVEDIR) != 0) {
-          /* ENOENT: already gone (fine).  ENOTEMPTY/EEXIST: the directory
-             still holds entries the walker leaves in place (a protected
-             excluded prefix, a kept file the manifest protects, a symlink);
-             rsync leaves such a directory behind, so this is not an error.
-             Only genuine I/O failures abort the deletion. */
-          if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST)
-            operation_ok = false;
-          local_survives = true;
-        } else {
-          budget->deleted++;
-          if (observer)
-            observer(observer_context, child_rel);
-        }
-      } else {
-        local_survives = true;
-      }
-    } else {
-      bool found = keep_is_file(keep, child_rel);
-      if (found || !deletable) {
-        /* Kept file, or a child of a directory that is not synchronized: never
-           an extra for this run. */
-        local_survives = true;
-      } else if (budget->deleted >= budget->max_delete) {
+      close(childfd);
+    } else if (errno != ENOENT) {
+      operation_ok = false;
+    }
+    if (child_all_removed && deletable) {
+      if (budget->deleted >= budget->max_delete) {
         budget->limit_hit = true;
         budget->skipped++;
         local_survives = true;
-      } else if (unlinkat(dirfd, entry->d_name, 0) != 0) {
-        if (errno != ENOENT)
+      } else if (unlinkat(dirfd, entries[i].name, AT_REMOVEDIR) != 0) {
+        /* ENOENT: already gone (fine).  ENOTEMPTY/EEXIST: the directory still
+           holds entries the walker leaves in place (a protected excluded
+           prefix, a kept file the manifest protects, a symlink); rsync leaves
+           such a directory behind, so this is not an error.  Only genuine I/O
+           failures abort the deletion. */
+        if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST)
           operation_ok = false;
         local_survives = true;
       } else {
         budget->deleted++;
+        /* rsync reports a removed directory with a trailing slash. */
+        if (observer) {
+          size_t len = strlen(child_rel);
+          char* with_slash = malloc(len + 2);
+          if (with_slash) {
+            memcpy(with_slash, child_rel, len);
+            with_slash[len] = '/';
+            with_slash[len + 1] = '\0';
+            observer(observer_context, with_slash);
+            free(with_slash);
+          } else {
+            observer(observer_context, child_rel);
+          }
+        }
+      }
+    } else {
+      local_survives = true;
+    }
+    free(child_rel);
+  }
+
+  /* Pass 2: extraneous files, descending. */
+  for (size_t i = dir_count; i < count; i++) {
+    if (!is_extra[i])
+      continue;
+    if (budget->deleted >= budget->max_delete) {
+      budget->limit_hit = true;
+      budget->skipped++;
+      local_survives = true;
+    } else if (unlinkat(dirfd, entries[i].name, 0) != 0) {
+      if (errno != ENOENT)
+        operation_ok = false;
+      local_survives = true;
+    } else {
+      budget->deleted++;
+      char* child_rel = path_cat((char*)rel_path, entries[i].name);
+      if (child_rel) {
         if (observer)
           observer(observer_context, child_rel);
         char* escaped_path = output_escape(child_rel, log_get_8_bit_output());
         fprintf(stderr, "  Deleted: %s\n", escaped_path ? escaped_path : "<allocation failed>");
         free(escaped_path);
       }
+      free(child_rel);
     }
+  }
+
+  /* Pass 3: kept subdirectories, ascending (rsync descends into these only
+     after the parent's own extras have been handled). */
+  for (size_t i = dir_count; i-- > 0;) {
+    if (is_extra[i] || shielded[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    int childfd = openat(dirfd, entries[i].name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    bool child_all_removed = false;
+    if (childfd >= 0) {
+      if (!delete_extras_fd(childfd, child_rel, keep, dirs, budget, skips, skip_count,
+                            protect_rules, deletable, &child_all_removed, observer,
+                            observer_context))
+        operation_ok = false;
+      close(childfd);
+    } else if (errno != ENOENT) {
+      operation_ok = false;
+    }
+    /* A kept/synchronized directory is never removed. */
+    local_survives = true;
     free(child_rel);
   }
-  closedir(dir);
+
+  free(shielded);
+  free(is_extra);
+  delete_dir_entries_free(entries, count);
   *all_removed = !local_survives;
   return operation_ok;
 }
@@ -817,97 +978,147 @@ static bool list_extras_fd(int dirfd, const char* rel_path, const PathIndex* kee
                            const DeleteSkipEntry* skips, int skip_count,
                            const FilterRuleList* protect_rules, bool parent_deletable,
                            bool* all_removed) {
-  int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (scanfd < 0)
+  DeleteDirEntry* entries = NULL;
+  size_t count = 0;
+  bool collect_ok = true;
+  if (!delete_dir_entries_collect(dirfd, &entries, &count, &collect_ok))
     return false;
-  DIR* dir = fdopendir(scanfd);
-  if (!dir) {
-    close(scanfd);
+  bool operation_ok = collect_ok;
+  bool local_survives = false;
+  bool* shielded = calloc(count ? count : 1, sizeof(bool));
+  bool* is_extra = calloc(count ? count : 1, sizeof(bool));
+  if (!shielded || !is_extra) {
+    free(shielded);
+    free(is_extra);
+    delete_dir_entries_free(entries, count);
     return false;
   }
-  bool operation_ok = true;
-  bool local_survives = false;
   bool deletable = parent_deletable || is_synced_dir(dirs, rel_path);
-  const struct dirent* entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
-    char* child_rel = path_cat((char*)rel_path, entry->d_name);
+  bool at_root = rel_path[0] == '\0';
+
+  /* Mirror the delete walk's rsync order (extraneous subdirectories descending,
+     then extraneous files descending, then kept subdirectories ascending). */
+  if (count > 1)
+    qsort(entries, count, sizeof(*entries), delete_dir_entry_cmp_desc);
+  size_t dir_count = 0;
+  while (dir_count < count && entries[dir_count].is_dir)
+    dir_count++;
+
+  for (size_t i = 0; i < count; i++) {
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
     if (!child_rel) {
       operation_ok = false;
       continue;
     }
-    if (path_under_skip_prefix(child_rel, rel_path[0] == '\0', skips, skip_count)) {
+    if (path_under_skip_prefix(child_rel, at_root, skips, skip_count)) {
+      shielded[i] = true;
       local_survives = true;
-      free(child_rel);
-      continue;
-    }
-    struct stat st;
-    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno != ENOENT)
-        operation_ok = false;
-      free(child_rel);
-      continue;
-    }
-    bool is_dir = S_ISDIR(st.st_mode);
-    if (protect_rules && filter_rules_apply_side(protect_rules, child_rel, entry->d_name, is_dir,
-                                                 FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT) {
+    } else if (protect_rules &&
+               filter_rules_apply_side(protect_rules, child_rel, entries[i].name, entries[i].is_dir,
+                                       FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT) {
       /* Mirror the delete walk: a protected entry is never reported as a
          would-delete and a protected directory's subtree is not enumerated. */
+      shielded[i] = true;
       local_survives = true;
-      free(child_rel);
+    } else if (entries[i].is_dir) {
+      bool child_synced = dirs && path_index_contains(dirs, child_rel);
+      is_extra[i] = deletable && !child_synced && !keep_is_dir(keep, child_rel);
+      if (!is_extra[i])
+        local_survives = true;
+    } else {
+      is_extra[i] = deletable && !keep_is_file(keep, child_rel);
+      if (!is_extra[i])
+        local_survives = true;
+    }
+    free(child_rel);
+  }
+
+  /* Pass 1: extraneous subdirectories, descending (recorded after contents). */
+  for (size_t i = 0; i < dir_count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
       continue;
     }
-    if (is_dir) {
-      int childfd = openat(dirfd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      bool child_all_removed = false;
-      if (childfd >= 0) {
-        if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count,
-                            protect_rules, deletable, &child_all_removed))
-          operation_ok = false;
-        close(childfd);
-      } else if (errno != ENOENT) {
+    int childfd = openat(dirfd, entries[i].name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    bool child_all_removed = false;
+    if (childfd >= 0) {
+      if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count,
+                          protect_rules, deletable, &child_all_removed))
         operation_ok = false;
-      }
-      bool child_synced = dirs && path_index_contains(dirs, child_rel);
-      if (child_synced || keep_is_dir(keep, child_rel)) {
-        local_survives = true;
-      } else if (child_all_removed && deletable) {
-        size_t len = strlen(child_rel);
-        char* copy = malloc(len + 2);
-        if (!copy) {
-          operation_ok = false;
-        } else {
-          memcpy(copy, child_rel, len);
-          copy[len] = '/';
-          copy[len + 1] = '\0';
-          if (!array_list_add(out, copy)) {
-            free(copy);
-            operation_ok = false;
-          } else {
-            (*recorded)++;
-          }
-        }
+      close(childfd);
+    } else if (errno != ENOENT) {
+      operation_ok = false;
+    }
+    if (child_all_removed && deletable) {
+      size_t len = strlen(child_rel);
+      char* copy = malloc(len + 2);
+      if (!copy) {
+        operation_ok = false;
       } else {
-        local_survives = true;
-      }
-    } else {
-      bool found = keep_is_file(keep, child_rel);
-      if (found || !deletable) {
-        local_survives = true;
-      } else {
-        char* copy = str_dup(child_rel);
-        if (!copy || !array_list_add(out, copy)) {
+        memcpy(copy, child_rel, len);
+        copy[len] = '/';
+        copy[len + 1] = '\0';
+        if (!array_list_add(out, copy)) {
           free(copy);
           operation_ok = false;
         } else {
           (*recorded)++;
         }
       }
+    } else {
+      local_survives = true;
     }
     free(child_rel);
   }
-  closedir(dir);
+
+  /* Pass 2: extraneous files, descending. */
+  for (size_t i = dir_count; i < count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    char* copy = str_dup(child_rel);
+    if (!copy || !array_list_add(out, copy)) {
+      free(copy);
+      operation_ok = false;
+    } else {
+      (*recorded)++;
+    }
+    free(child_rel);
+  }
+
+  /* Pass 3: kept subdirectories, ascending. */
+  for (size_t i = dir_count; i-- > 0;) {
+    if (is_extra[i] || shielded[i])
+      continue;
+    char* child_rel = path_cat((char*)rel_path, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    int childfd = openat(dirfd, entries[i].name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    bool child_all_removed = false;
+    if (childfd >= 0) {
+      if (!list_extras_fd(childfd, child_rel, keep, dirs, out, recorded, skips, skip_count,
+                          protect_rules, deletable, &child_all_removed))
+        operation_ok = false;
+      close(childfd);
+    } else if (errno != ENOENT) {
+      operation_ok = false;
+    }
+    local_survives = true;
+    free(child_rel);
+  }
+
+  free(shielded);
+  free(is_extra);
+  delete_dir_entries_free(entries, count);
   *all_removed = !local_survives;
   return operation_ok;
 }

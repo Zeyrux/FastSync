@@ -471,6 +471,24 @@ static void notify_deleted(DeletePlanSession* session, const char* rel) {
     session->observer(session->observer_context, rel);
 }
 
+/* A removed directory is reported with rsync's trailing slash (`deleting dir/`)
+   while files keep their bare path. */
+static void notify_deleted_dir(DeletePlanSession* session, const char* rel) {
+  if (!session || !session->observer || !rel)
+    return;
+  size_t len = strlen(rel);
+  char* with_slash = malloc(len + 2);
+  if (!with_slash) {
+    session->observer(session->observer_context, rel);
+    return;
+  }
+  memcpy(with_slash, rel, len);
+  with_slash[len] = '/';
+  with_slash[len + 1] = '\0';
+  session->observer(session->observer_context, with_slash);
+  free(with_slash);
+}
+
 DeletePlanSession* delete_plan_session_create(const Config* config) {
   if (!config)
     return NULL;
@@ -696,7 +714,7 @@ static bool process_extra_dir(int dirfd, const char* name, const char* child_rel
     session->deleted++;
     session->planned++;
     log_deleted(child_rel);
-    notify_deleted(session, child_rel);
+    notify_deleted_dir(session, child_rel);
     *removed = true;
     return true;
   }
@@ -733,81 +751,108 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
                              const ArrayList* keep_files, bool at_root, bool force_now,
                              const PlanSkips* skips, DeletePlanSession* session, bool* survives) {
   *survives = false;
-  int scanfd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (scanfd < 0)
+  DeleteDirEntry* entries = NULL;
+  size_t count = 0;
+  bool collect_ok = true;
+  if (!delete_dir_entries_collect(dirfd, &entries, &count, &collect_ok))
     return false;
-  DIR* dir = fdopendir(scanfd);
-  if (!dir) {
-    close(scanfd);
+  bool operation_ok = collect_ok;
+  bool local_survives = false;
+  bool* shielded = calloc(count ? count : 1, sizeof(bool));
+  bool* is_extra = calloc(count ? count : 1, sizeof(bool));
+  bool* force = calloc(count ? count : 1, sizeof(bool));
+  if (!shielded || !is_extra || !force) {
+    free(shielded);
+    free(is_extra);
+    free(force);
+    delete_dir_entries_free(entries, count);
     return false;
   }
-  bool operation_ok = true;
-  bool local_survives = false;
-  const struct dirent* entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
+
+  /* rsync's order: extraneous subdirectories in descending name order, then
+     extraneous files in descending name order (kept entries survive and are not
+     touched here — a kept subdirectory gets its own per-directory plan). */
+  if (count > 1)
+    qsort(entries, count, sizeof(*entries), delete_dir_entry_cmp_desc);
+  size_t dir_count = 0;
+  while (dir_count < count && entries[dir_count].is_dir)
+    dir_count++;
+
+  for (size_t i = 0; i < count; i++) {
     char* child_rel =
-        (strcmp(dir_rel, ".") == 0) ? str_dup(entry->d_name) : path_cat(dir_rel, entry->d_name);
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entries[i].name) : path_cat(dir_rel, entries[i].name);
     if (!child_rel) {
       operation_ok = false;
       continue;
     }
     if (path_under_skip_prefix(child_rel, at_root, skips->entries, skips->count)) {
+      shielded[i] = true;
       local_survives = true;
       free(child_rel);
       continue;
     }
-    struct stat st;
-    if (fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno != ENOENT)
-        operation_ok = false;
-      free(child_rel);
-      continue;
-    }
-    bool is_dir = S_ISDIR(st.st_mode);
-    bool in_keep_dirs = is_dir && list_contains_str(keep_dirs, entry->d_name);
-    bool in_keep_files = !is_dir && list_contains_str(keep_files, entry->d_name);
+    bool is_dir = entries[i].is_dir;
+    bool in_keep_dirs = is_dir && list_contains_str(keep_dirs, entries[i].name);
+    bool in_keep_files = !is_dir && list_contains_str(keep_files, entries[i].name);
     bool rule_protected =
         skips->protect_rules &&
-        filter_rules_apply_side(skips->protect_rules, child_rel, entry->d_name, is_dir,
+        filter_rules_apply_side(skips->protect_rules, child_rel, entries[i].name, is_dir,
                                 FILTER_SIDE_RECEIVER) == FILTER_ACTION_PROTECT;
-    if (in_keep_dirs) {
+    if (in_keep_dirs || in_keep_files || rule_protected) {
+      shielded[i] = true;
       local_survives = true;
-    } else if (keep_dirs && !is_dir && list_contains_str(keep_dirs, entry->d_name)) {
-      /* Destination file blocks a source directory: clear it now, whatever the
-         delete timing, so the directory can be created. */
-      if (!process_extra_file(dirfd, entry->d_name, child_rel, true, session))
-        operation_ok = false;
-    } else if (in_keep_files) {
-      local_survives = true;
-    } else if (keep_files && is_dir && list_contains_str(keep_files, entry->d_name)) {
-      /* Destination directory blocks a source file: remove it now. */
-      bool removed = false;
-      if (!process_extra_dir(dirfd, entry->d_name, child_rel, true, skips, session, &removed))
-        operation_ok = false;
-      else if (!removed)
-        local_survives = true;
     } else if (is_dir) {
-      if (rule_protected) {
-        local_survives = true;
-      } else {
-        bool removed = false;
-        if (!process_extra_dir(dirfd, entry->d_name, child_rel, force_now, skips, session,
-                               &removed))
-          operation_ok = false;
-        else if (!removed)
-          local_survives = true;
-      }
-    } else if (rule_protected) {
-      local_survives = true;
+      /* A destination directory blocks a source file of the same name: remove
+         it now, whatever the delete timing, so the file can be created. */
+      is_extra[i] = true;
+      force[i] = keep_files && list_contains_str(keep_files, entries[i].name);
     } else {
-      if (!process_extra_file(dirfd, entry->d_name, child_rel, force_now, session))
-        operation_ok = false;
+      /* A destination file blocks a source directory of the same name: clear it
+         now so the directory can be created. */
+      is_extra[i] = true;
+      force[i] = keep_dirs && list_contains_str(keep_dirs, entries[i].name);
     }
     free(child_rel);
   }
-  closedir(dir);
+
+  /* Pass 1: extraneous subdirectories, descending. */
+  for (size_t i = 0; i < dir_count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel =
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entries[i].name) : path_cat(dir_rel, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    bool removed = false;
+    if (!process_extra_dir(dirfd, entries[i].name, child_rel, force[i] || force_now, skips, session,
+                           &removed))
+      operation_ok = false;
+    else if (!removed)
+      local_survives = true;
+    free(child_rel);
+  }
+
+  /* Pass 2: extraneous files, descending. */
+  for (size_t i = dir_count; i < count; i++) {
+    if (!is_extra[i])
+      continue;
+    char* child_rel =
+        (strcmp(dir_rel, ".") == 0) ? str_dup(entries[i].name) : path_cat(dir_rel, entries[i].name);
+    if (!child_rel) {
+      operation_ok = false;
+      continue;
+    }
+    if (!process_extra_file(dirfd, entries[i].name, child_rel, force[i] || force_now, session))
+      operation_ok = false;
+    free(child_rel);
+  }
+
+  free(shielded);
+  free(is_extra);
+  free(force);
+  delete_dir_entries_free(entries, count);
   *survives = local_survives;
   return operation_ok;
 }
@@ -981,7 +1026,7 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
         session->deleted++;
         session->planned++;
         log_deleted(rel);
-        notify_deleted(session, rel);
+        notify_deleted_dir(session, rel);
       } else if (errno != ENOENT && errno != ENOTEMPTY && errno != EEXIST) {
         close(parent_fd);
         free(leaf);
