@@ -1,21 +1,22 @@
-# FastSync — Session Handoff (2026-09-19)
+# FastSync — Session Handoff (2026-09-20)
 
 ## Current status
-- **rsync-parity tracks 1-6 landed on `dev`** via **PR #303** (`10159dc`,
-  "feat(parity): rsync parity tracks 1-6 (protocol 2.28.0)"). Dev push CI run
-  **581** fully green: lint, build-and-test, parity-full, ASan, UBSan,
-  fuzz-build, coverage, valgrind.
+- **Release `v2.28.0`** is tagged and merged to `main` (PR #304, `b4d54504`).
+  `dev` is at `558782d` (the incremental-check flake fix).
 - **`PROTOCOL_VERSION` = `"2.28.0"`** (`src/shared/config.h`); CMake
-  `project(FastFileTransfer VERSION 2.28.0)`. The cycle batched all wire
-  changes (stats counters, filter-rule block, `--verify-basis`) under the one
-  bump.
-- **Release `v2.28.0` tagged and merged to `main`** via PR #304
-  (`b4d54504`); tag `v2.28.0`. Main push CI run **585** fully green (lint,
-  build-and-test, parity-full, ASan, UBSan, fuzz-build, coverage, valgrind).
-  Gitea release `v2.28.0` published. `dev` and `main` are at the release
-  content.
-- Parity matrix: **116 ✅ / 14 ⚠️ / 27 ❌ = 157** (was 111/13/33 at cycle start).
-- Working tree clean; feature branch deleted; no scratch trees or worktrees.
+  `project(FastFileTransfer VERSION 2.28.0)`.
+- **Parity cycle 2.29 on branch `feat/parity-2.29`** (from `dev` @ `558782d`),
+  no wire change. It closes the scanner-order, delete-timing, relative-basis and
+  fuzzy-eligibility residuals and improves the `--info`/`--stats`/`--debug`
+  partials. Parity matrix: **120 ✅ / 10 ⚠️ / 27 ❌ = 157** (was 116/14/27).
+  Remaining ⚠️ rows: `--info`, `--debug`, `--msgs2stderr`, `--stats`,
+  `--progress`, `--delete-before`, `--compare-dest`/`--copy-dest`/`--link-dest`
+  (over-256-MiB basis MISS), `-y`/`--fuzzy` (256 MiB buffer cap).
+- **Deferred (needs a wire bump):** the `--progress`/`--info` receiver→sender
+  event channel (root `./` line, ancestor suppression, `skip`/`backup` echo,
+  symlink/empty-dir quick-check); `--delete-before` phase-0 keep-set; and the
+  general >256 MiB single-file streaming limit (B4).
+- Feature branch `feat/parity-2.29`; integration PR to `dev` pending.
 
 
 ## What landed this session
