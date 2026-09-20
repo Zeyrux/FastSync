@@ -101,35 +101,51 @@ class TestDeleteOrderParity:
         "a_extra_dir/sub/g": b"g\n",
     }
 
-    @requires_rsync
-    def test_delete_during_deletion_order_matches_rsync(self):
+    def _seed_source(self):
         source = os.path.join(TEST_DATA_DIR, "order_del_src")
         clean_dir(source)
         _write(os.path.join(source, "keep.txt"), b"k\n")
         _write(os.path.join(source, "keepdir", "x.txt"), b"x\n")
         _write(os.path.join(source, "keep2", "y.txt"), b"y\n")
+        return source
 
-        rdst = os.path.join(TEST_DATA_DIR, "order_del_rdst")
+    def _assert_order(self, timing, dry_run=False):
+        source = self._seed_source()
+        rdst = os.path.join(TEST_DATA_DIR, f"order_{timing}_rdst")
         clean_dir(rdst)
         for rel, data in self._EXTRA.items():
             _write(os.path.join(rdst, rel), data)
-        rs = _rsync(["-a", "--delete-during", "--info=del", source + "/", rdst + "/"])
+        rs_flags = ["-a", "-n"] if dry_run else ["-a"]
+        rs = _rsync(rs_flags + [timing, "--info=del", source + "/", rdst + "/"])
         assert rs.returncode == 0, rs.stderr
 
-        fdst = os.path.join(TEST_DATA_DIR, "order_del_fdst")
+        fdst = os.path.join(TEST_DATA_DIR, f"order_{timing}_fdst")
         clean_dir(fdst)
         received = get_dest_received_dir(fdst, source)
         for rel, data in self._EXTRA.items():
             _write(os.path.join(received, rel), data)
+        fs_flags = ["-a", "-n"] if dry_run else ["-a"]
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
-            result, _ = run_client(source, fdst, flags=["-a", "--delete-during", "--info=del"],
+            result, _ = run_client(source, fdst, flags=fs_flags + [timing, "--info=del"],
                                    port=server.port)
         assert result.returncode == 0, (result.stderr or result.stdout)[:300]
 
         rsync_order = _deleting(rs.stdout)
         fsync_order = _deleting(result.stdout)
         assert sorted(fsync_order) == sorted(rsync_order), (
-            f"deleted set differs\nrsync={rsync_order}\nfastsync={fsync_order}")
+            f"{timing} deleted set differs\nrsync={rsync_order}\nfastsync={fsync_order}")
         assert fsync_order == rsync_order, (
-            f"deletion order differs\nrsync={rsync_order}\nfastsync={fsync_order}")
+            f"{timing} deletion order differs\nrsync={rsync_order}\nfastsync={fsync_order}")
+
+    @requires_rsync
+    def test_delete_during_deletion_order_matches_rsync(self):
+        self._assert_order("--delete-during")
+
+    @requires_rsync
+    def test_delete_delay_deletion_order_matches_rsync(self):
+        self._assert_order("--delete-delay")
+
+    @requires_rsync
+    def test_dry_run_delete_order_matches_rsync(self):
+        self._assert_order("--delete", dry_run=True)
