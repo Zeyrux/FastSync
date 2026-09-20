@@ -1389,6 +1389,43 @@ bool file_basis_content_required(const Config* config) {
   return config != NULL && config->verify_basis;
 }
 
+/* Probe one candidate basis file: open it (confined, O_NOFOLLOW) and apply
+   rsync's metadata quick-check; under --verify-basis also hash its bytes and
+   require the sender's digest.  On a hit record `candidate` in `out` and return
+   true.  The caller retains ownership of `candidate`. */
+static bool basis_match_probe(const Config* config, const char* candidate,
+                              unsigned long long check_size, time_t check_mtime,
+                              long check_mtime_nsec, const uint8_t* check_digest,
+                              size_t check_digest_len, BasisDestType type, BasisMatch* out) {
+  int fd;
+  struct stat st;
+  if (!basis_open_regular(candidate, check_size, &fd, &st))
+    return false;
+  bool hit = false;
+  if (file_basis_quick_match(config, &st, check_mtime, check_mtime_nsec)) {
+    hit = true;
+    if (file_basis_content_required(config)) {
+      uint8_t basis_digest[CHECKSUM_MAX_DIGEST_LEN];
+      size_t basis_len = 0;
+      bool hashed = checksum_digest_fd((ChecksumAlgo)config->checksum_algo, config->checksum_seed,
+                                       fd, basis_digest, sizeof(basis_digest), &basis_len);
+      hit = hashed && basis_len == check_digest_len && check_digest_len > 0 &&
+            memcmp(basis_digest, check_digest, check_digest_len) == 0;
+    }
+  }
+  close(fd);
+  if (!hit)
+    return false;
+  char* owned = str_dup(candidate);
+  if (!owned)
+    return false;
+  out->hit = true;
+  out->type = type;
+  out->basis_path = owned;
+  out->st = st;
+  return true;
+}
+
 /* Search the basis-dir list in command-line order and return the first match.
    By default (no --verify-basis) rsync's metadata quick-check is sufficient:
    basis_open_regular has already required an equal size, and
@@ -1403,7 +1440,22 @@ bool file_basis_content_required(const Config* config) {
    --dry-run passes false because hashing a basis against a client-supplied
    digest would be a 1-bit content oracle.  Without --verify-basis a dry-run can
    still confirm the metadata-only hit without reading any basis bytes, matching
-   rsync's read-only quick-check. */
+   rsync's read-only quick-check.
+
+   Path resolution (rsync 3.4.1 parity): rsync resolves a relative
+   --compare-dest/--copy-dest/--link-dest DIR against the destination directory
+   (the receiver's cwd) and appends the file's TRANSFER-RELATIVE name, e.g.
+   `--compare-dest=basis` with `rsync src/ dst/` probes `dst/basis/<name-inside-src>`.
+   FastSync's receive root IS the destination directory, but its default transfer
+   mirrors the absolute source path below that root, so check_path carries the
+   source-root scaffolding rsync would not append.  Recover rsync's spelling with
+   utils_strip_transfer_root for a relative DIR; under -R/--files-from the wire
+   path is already transfer-relative, so it is used as-is.  A relative DIR also
+   probes the historical mirror-appended spelling as a fallback, so existing
+   FastSync-laid-out snapshot trees keep resolving.  An absolute DIR is used
+   verbatim and keeps appending the destination-relative check_path (FastSync's
+   mirrored layout).  Every candidate stays confined to the authorized root by
+   file_open_secure_parent. */
 static bool basis_match_find(const Config* config, const char* check_path,
                              unsigned long long check_size, time_t check_mtime,
                              long check_mtime_nsec, const uint8_t* check_digest,
@@ -1416,47 +1468,39 @@ static bool basis_match_find(const Config* config, const char* check_path,
      the basis bytes. */
   if (file_basis_content_required(config) && !hash_content)
     return false;
+  const char* transfer_rel = check_path;
+  if (!config->relative && config->files_from_set == NULL)
+    transfer_rel = utils_strip_transfer_root(check_path, config->send_directory);
   for (int i = 0; i < config->basis_count; i++) {
     const BasisDest* entry = &config->basis_dirs[i];
     /* An absolute basis path is used verbatim (rsync semantics); a relative one
        is resolved below the receive root.  Both remain subject to the receiver's
        authorized-root confinement inside file_open_secure_parent. */
-    char* basis_dir = entry->path[0] == '/' ? str_dup(entry->path)
-                                            : path_cat(config->receive_root_directory, entry->path);
+    bool absolute = entry->path[0] == '/';
+    char* basis_dir =
+        absolute ? str_dup(entry->path) : path_cat(config->receive_root_directory, entry->path);
     if (!basis_dir)
       continue;
-    char* candidate = path_cat(basis_dir, check_path);
-    free(basis_dir);
-    if (!candidate)
-      continue;
-
-    int fd;
-    struct stat st;
-    if (basis_open_regular(candidate, check_size, &fd, &st)) {
-      if (file_basis_quick_match(config, &st, check_mtime, check_mtime_nsec)) {
-        bool hit = true;
-        if (file_basis_content_required(config)) {
-          uint8_t basis_digest[CHECKSUM_MAX_DIGEST_LEN];
-          size_t basis_len = 0;
-          bool hashed =
-              checksum_digest_fd((ChecksumAlgo)config->checksum_algo, config->checksum_seed, fd,
-                                 basis_digest, sizeof(basis_digest), &basis_len);
-          hit = hashed && basis_len == check_digest_len && check_digest_len > 0 &&
-                memcmp(basis_digest, check_digest, check_digest_len) == 0;
-        }
-        if (hit) {
-          out->hit = true;
-          out->type = entry->type;
-          out->basis_path = candidate;
-          candidate = NULL; /* ownership transferred to out */
-          out->st = st;
-          close(fd);
-          return true;
-        }
-      }
-      close(fd);
+    const char* names[2];
+    int name_count = 0;
+    if (absolute)
+      names[name_count++] = check_path;
+    else
+      names[name_count++] = transfer_rel;
+    if (!absolute && strcmp(transfer_rel, check_path) != 0)
+      names[name_count++] = check_path; /* historical mirror-appended spelling */
+    bool found = false;
+    for (int n = 0; n < name_count && !found; n++) {
+      char* candidate = path_cat(basis_dir, names[n]);
+      if (!candidate)
+        continue;
+      found = basis_match_probe(config, candidate, check_size, check_mtime, check_mtime_nsec,
+                                check_digest, check_digest_len, entry->type, out);
+      free(candidate);
     }
-    free(candidate);
+    free(basis_dir);
+    if (found)
+      return true;
   }
   return false;
 }
@@ -1489,9 +1533,12 @@ static bool basis_match_find(const Config* config, const char* check_path,
  *     followed and nothing outside the destination root is ever read;
  *   * dotfiles, directories, the target's own name, and the .fastsync-stage /
  *     temp scratch names are never candidates;
- *   * size gate = the delta engine's own bounds (delta_should_attempt: both
- *     files >= DELTA_MIN_FILE_SIZE, <= delta_max_file_size, ratio <= 10x),
- *     because FastSync's delta engine cannot use a basis outside them;
+ *   * size gate = rsync's, NOT the ordinary delta engine's bounds: any
+ *     non-empty regular sibling up to the receiver's whole-file buffer cap is
+ *     eligible, regardless of the 16 KiB delta minimum or the 10x delta size
+ *     ratio (rsync's find_fuzzy has no delta-size gate at all).  The delta
+ *     engine consumes the fuzzy basis through the same signature handshake
+ *     whether or not it is inside delta_should_attempt's window;
  *   * first pass = an exact size+mtime match wins regardless of name (rsync's
  *     "fuzzy size/modtime match");
  *   * otherwise the winner minimizes rsync's weighted Levenshtein distance
@@ -1639,8 +1686,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
                                        long check_mtime_nsec, unsigned long long* out_size) {
   *out_size = 0;
   if (!config || !config->receive_root_directory || !config->fuzzy || !config->use_delta ||
-      !check_path || check_size < DELTA_MIN_FILE_SIZE || check_size > config->delta_max_file_size ||
-      check_size > MAX_RECEIVE_WHOLE_FILE_SIZE)
+      !check_path || check_size > MAX_RECEIVE_WHOLE_FILE_SIZE)
     return NULL;
 
   char* full_path = path_cat(config->receive_root_directory, check_path);
@@ -1717,8 +1763,7 @@ static void* fuzzy_basis_find_and_load(const Config* config, const char* check_p
     if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode))
       continue;
     unsigned long long cand_size = (unsigned long long)st.st_size;
-    if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE ||
-        !delta_should_attempt(cand_size, check_size, config->delta_max_file_size))
+    if (cand_size == 0 || cand_size > MAX_RECEIVE_WHOLE_FILE_SIZE)
       continue;
     long cand_nsec = 0;
 #ifdef __linux__
