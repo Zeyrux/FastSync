@@ -149,3 +149,37 @@ class TestDeleteOrderParity:
     @requires_rsync
     def test_dry_run_delete_order_matches_rsync(self):
         self._assert_order("--delete", dry_run=True)
+
+    @requires_rsync
+    def test_partial_max_delete_survivor_order_matches_rsync(self):
+        """With the exact removal order matching rsync, a --max-delete cap stops
+        after the same entries, so the survivor set is identical too."""
+        source = os.path.join(TEST_DATA_DIR, "order_maxdel_src")
+        clean_dir(source)
+        _write(os.path.join(source, "keep.txt"), b"k\n")
+        extra = {f"e{i}.txt": b"x\n" for i in range(6)}
+        extra["ed/f"] = b"f\n"
+        extra["ed/g"] = b"g\n"
+
+        rdst = os.path.join(TEST_DATA_DIR, "order_maxdel_rdst")
+        clean_dir(rdst)
+        for rel, data in extra.items():
+            _write(os.path.join(rdst, rel), data)
+        rs = _rsync(["-a", "--delete-during", "--max-delete=3", "--info=del",
+                     source + "/", rdst + "/"])
+        assert rs.returncode in (0, 25), (rs.returncode, rs.stderr)
+
+        fdst = os.path.join(TEST_DATA_DIR, "order_maxdel_fdst")
+        clean_dir(fdst)
+        received = get_dest_received_dir(fdst, source)
+        for rel, data in extra.items():
+            _write(os.path.join(received, rel), data)
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            result, _ = run_client(source, fdst,
+                                   flags=["-a", "--delete-during", "--max-delete=3", "--info=del"],
+                                   port=server.port)
+        assert result.returncode in (0, 25), (result.returncode, result.stderr[:300])
+        assert _deleting(result.stdout) == _deleting(rs.stdout), (
+            f"partial --max-delete survivor order differs\n"
+            f"rsync={_deleting(rs.stdout)}\nfastsync={_deleting(result.stdout)}")
