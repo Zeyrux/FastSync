@@ -134,6 +134,28 @@ typedef struct {
    only DIRECT children of the destination root, i.e. child_rel has no '/'). */
 bool path_under_skip_prefix(const char* child_rel, bool at_root, const DeleteSkipEntry* skips,
                             int skip_count);
+/* One destination-directory entry collected up front so the delete walkers can
+   reproduce rsync's traversal order instead of readdir() order.  rsync processes
+   a directory's extraneous subdirectories first (descending name, depth-first),
+   then its extraneous files (descending name), and only afterwards descends into
+   its kept subdirectories (ascending name). */
+typedef struct {
+  char* name;
+  bool is_dir;
+} DeleteDirEntry;
+/* Collect the entries of the directory open on `dirfd` (excluding "." and ".."),
+   stat'ing each with AT_SYMLINK_NOFOLLOW.  On success *out is a malloc'd array of
+   *count entries whose names the caller frees with delete_dir_entries_free().
+   Returns false on an allocation/readdir failure; a vanished entry (ENOENT) is
+   skipped, any other stat failure is reported through *operation_ok while the
+   walk continues. */
+bool delete_dir_entries_collect(int dirfd, DeleteDirEntry** out, size_t* count, bool* operation_ok);
+void delete_dir_entries_free(DeleteDirEntry* entries, size_t count);
+/* Sort comparators: `_desc` orders subdirectories before files and each group by
+   descending name (rsync's extraneous-entry order); `_asc` orders plain ascending
+   name (rsync's kept-subdirectory order). */
+int delete_dir_entry_cmp_desc(const void* a, const void* b);
+int delete_dir_entry_cmp_asc(const void* a, const void* b);
 /* Remove files/dirs/symlinks under dest_root that are not listed in manifest
    without ever descending into a protected prefix (see DeleteSkipEntry).  When
    `synced_dirs` is non-NULL, extras are only removed directly inside a directory

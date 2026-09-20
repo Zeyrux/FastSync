@@ -4,6 +4,49 @@ All notable changes to FastSync are documented here. Versions match
 `PROTOCOL_VERSION` (printed by `fastsync --version`); the client and server must
 run the same version because the handshake is strict.
 
+## [Unreleased]
+
+The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).
+`RSYNC_COMPAT.md` moves from **116 ✅ / 14 ⚠️ / 27 ❌** to
+**120 ✅ / 10 ⚠️ / 27 ❌** of 157 rows.
+
+### Changed
+
+- **rsync-exact traversal order.** The sequential scanner now walks each
+  directory's entries in rsync 3.4.1's flist order (non-directories ascending,
+  then directories ascending, depth-first), so `--info=name`, the
+  `--delete-during`/`--delete-delay`/`-n` would-delete order and the partial
+  `--max-delete` survivor set match rsync byte-for-byte. `--threads` has no
+  rsync analogue and stays unordered.
+- **Delete timing.** The complete `--delete-during`/`--delete-delay`
+  per-directory plan set is transmitted before the first data frame, so a
+  mid-transfer abort has already removed every planned extra like rsync's
+  generator; `-d/--dirs` uses per-directory plans (shielded untraversed
+  subdirectories) instead of the end-of-transfer commit. `-n`, `--delete`,
+  `--del`/`--delete-during` and `--delete-delay` are now ✅ Parity.
+- **Basis directories.** A relative `--compare-dest`/`--copy-dest`/`--link-dest`
+  DIR resolves against the destination directory with the transfer-relative
+  name appended, exactly like rsync 3.4.1.
+- **`-y`/`--fuzzy`.** The candidate search no longer inherits the ordinary delta
+  engine's 16 KiB minimum or 10× size-ratio bound, so an oversized or
+  sub-16-KiB sibling is reused exactly as rsync reuses it.
+- `--info=mount` prints rsync's mount-point skip line (repeated `-xx` drops the
+  mount-point directory); `--info=stats` enables the `--stats` block; `-x` is
+  repeatable. `--stats` counts traversed directories for the `Number of files`
+  breakdown under a plain `-r` scan. `--debug` emits real output for
+  `flist`/`del`/`hash`/`deltasum`/`recv`/`filter`/`send`.
+
+### Known residuals
+
+- `--progress` and `--info` still need a receiver→sender event channel for the
+  root `./` line, ancestor-directory suppression, receiver-side `skip`/`backup`
+  wording, and symlink/empty-directory quick-checks.
+- `--delete-before`'s phase-0 late-file divergence remains (rsync's pre-scan
+  fixes the file list before the data pass).
+- A single file larger than 256 MiB cannot be streamed in the default path
+  (a general whole-file limit, not basis-specific).
+- `--stats` byte totals and `--msgs2stderr` stay documented divergences.
+
 ## [2.28.0] - 2026-09-20
 
 The rsync-parity cycle. `PROTOCOL_VERSION` moves `2.26.0 → 2.27.0 → 2.28.0`;

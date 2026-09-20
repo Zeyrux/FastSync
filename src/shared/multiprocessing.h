@@ -119,6 +119,10 @@ typedef struct {
   ArrayList* dir_entries;
   mtx_t dir_entries_mutex;
   bool dir_entries_mutex_init;
+  /* --stats directory accounting for a `-r` scan (no directory metadata):
+     shared by the parallel scanner workers, read by the sender thread once the
+     scanner is done.  See ScannerOptions.dir_count. */
+  atomic_ullong dir_count;
   /* Set by the sender thread when the receiver reported a --max-delete-capped
      deletion (STATUS_DELETE_LIMIT): the transfer succeeded and the process must
      exit 25 like rsync.  Read by the caller after the sender thread is joined. */

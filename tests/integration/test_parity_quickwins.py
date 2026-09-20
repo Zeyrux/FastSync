@@ -861,11 +861,11 @@ class TestFuzzy:
     byte-exact result.  FastSync ports rsync 3.4.1's weighted-Levenshtein name
     heuristic, so where both delta engines admit the candidate the tools pick
     the same basis (the ``fuzzy_basis`` differential asserts the tree and the
-    Matched/Literal counters match with the block size pinned).  The residual is
-    candidate ELIGIBILITY: FastSync's delta size gate (both files >= 16 KiB and
-    a <= 10x size ratio) is narrower than rsync's, which empirically uses a
-    fuzzy basis well beyond 10x and below 16 KiB.  These tests pin the window
-    boundary and prove the byte-exact fallback on both sides of it."""
+    Matched/Literal counters match with the block size pinned).  Candidate
+    ELIGIBILITY is now rsync's too: the fuzzy search no longer inherits the
+    ordinary delta engine's 16 KiB minimum or 10x size-ratio bound, so an
+    oversized or sub-16-KiB sibling is reused exactly as rsync reuses it.
+    These tests pin that window on both sides."""
 
     _BASE = b"the quick brown fox jumps over the lazy dog\n" * 4000
 
@@ -900,9 +900,10 @@ class TestFuzzy:
         return rs, result
 
     @requires_rsync
-    def test_fuzzy_above_size_window_declines_but_tree_exact(self, shared_server):
-        """A sibling >10x the source is used by rsync but declined by FastSync's
-        delta size-ratio gate; both destinations stay byte-identical."""
+    def test_fuzzy_above_size_window_matches_rsync(self, shared_server):
+        """A sibling >10x the source is used by rsync and by FastSync: fuzzy
+        eligibility is rsync's, not the ordinary delta size-ratio gate; both
+        destinations stay byte-identical and both reuse the basis."""
         n = 65536
         payload = (self._BASE * ((n // len(self._BASE)) + 1))[:n]
         sibling = (self._BASE * 200)[: n * 20]
@@ -911,15 +912,16 @@ class TestFuzzy:
         rs, result = self._run_both(shared_server, source, dest, rdst,
                                     payload, sibling)
         assert _stat_bytes(rs.stdout, "Matched data") > 0, \
-            "rsync should still use a >10x fuzzy basis"
-        assert _stat_bytes(result.stdout, "Matched data") == 0, \
-            "FastSync's 10x delta size-ratio gate must decline the oversized basis"
-        assert _stat_bytes(result.stdout, "Literal data") == n
+            "rsync should use a >10x fuzzy basis"
+        assert _stat_bytes(result.stdout, "Matched data") > 0, \
+            "FastSync must accept a >10x fuzzy basis like rsync"
+        assert _stat_bytes(result.stdout, "Literal data") < n
 
     @requires_rsync
-    def test_fuzzy_below_delta_minimum_declines_but_tree_exact(self, shared_server):
-        """A sibling below the 16 KiB delta minimum is used by rsync but never
-        enters FastSync's delta/fuzzy path; both trees stay byte-identical."""
+    def test_fuzzy_below_delta_minimum_matches_rsync(self, shared_server):
+        """A sibling below the 16 KiB delta minimum is used by rsync and by
+        FastSync: fuzzy eligibility no longer inherits the delta engine's
+        minimum; both trees stay byte-identical and both reuse the basis."""
         n = 8192
         payload = (self._BASE * ((n // len(self._BASE)) + 1))[:n]
         source, dest, rdst = (self._src("small"), self._dst("small"),
@@ -928,9 +930,9 @@ class TestFuzzy:
                                     payload, payload)
         assert _stat_bytes(rs.stdout, "Matched data") > 0, \
             "rsync applies --fuzzy below 16 KiB"
-        assert _stat_bytes(result.stdout, "Matched data") == 0, \
-            "FastSync's 16 KiB delta minimum must bypass the fuzzy basis"
-        assert _stat_bytes(result.stdout, "Literal data") == n
+        assert _stat_bytes(result.stdout, "Matched data") > 0, \
+            "FastSync must apply --fuzzy below 16 KiB like rsync"
+        assert _stat_bytes(result.stdout, "Literal data") < n
 
 
 class TestIgnoreExistingShortCircuit:

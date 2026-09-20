@@ -50,6 +50,7 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   protocol_session_set_max_alloc(&context->allocation_session, config->max_alloc);
   context->dir_entries = NULL;
   context->dir_entries_mutex_init = false;
+  atomic_init(&context->dir_count, 0);
   context->delete_limit = false;
   int init = 0;
   if (config->use_metadata) {

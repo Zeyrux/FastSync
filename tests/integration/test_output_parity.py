@@ -665,6 +665,46 @@ class TestWireStatsParity:
     @requires_rsync
     @pytest.mark.ci
     @pytest.mark.parametrize("mt", [False, True])
+    def test_stats_r_directory_breakdown_matches_rsync(self, shared_server, mt):
+        """A recursive `-r` scan (no -t/-p) exposes no directory metadata, but
+        rsync still counts every directory in `Number of files`; the sender's
+        lightweight directory counter must reproduce the `dir: N` category."""
+        source = os.path.join(TEST_DATA_DIR, "wire_stdir_src")
+        dest = os.path.join(TEST_DATA_DIR, "wire_stdir_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "wire_stdir_rdst")
+        clean_dir(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+        os.makedirs(os.path.join(source, "sub", "deep"))
+        os.makedirs(os.path.join(source, "empty"))
+        for rel in ("a.txt", os.path.join("sub", "b.txt"), os.path.join("sub", "deep", "c.txt")):
+            with open(os.path.join(source, rel), "wb") as fh:
+                fh.write(b"x\n")
+        os.makedirs(get_dest_received_dir(dest, source), exist_ok=True)
+
+        rsync_result = _rsync(["-r", "--stats", source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        flags = ["-r", "--stats"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        def stats_line(text, key):
+            for line in text.splitlines():
+                if line.startswith(key + ":"):
+                    return line
+            return None
+
+        r_files = stats_line(rsync_result.stdout, "Number of files")
+        f_files = stats_line(result.stdout, "Number of files")
+        # 3 regular files, 4 directories (root, sub, sub/deep, empty).
+        assert re.match(r"Number of files: 7 \(reg: 3, dir: 4\)$", r_files), r_files
+        assert f_files == r_files, (r_files, f_files)
+        assert (stats_line(result.stdout, "Number of regular files transferred") ==
+                stats_line(rsync_result.stdout, "Number of regular files transferred"))
+
+    @requires_rsync
+    @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
     def test_stats_created_and_literal_fresh_update_delta(self, shared_server, mt):
         """The receiver-observed counters must match rsync for the three
         transfer shapes: a fresh create (created breakdown + whole-file literal),

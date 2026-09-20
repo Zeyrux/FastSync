@@ -504,9 +504,8 @@ static bool split_flag_level(const char* token, char* name, size_t name_size, in
  * of rsync's `symsafe`, `hlink`, and `own`. */
 static bool is_accepted_debug_category(const char* name) {
   static const char* const categories[] = {
-      "acl",   "backup", "bind",   "chdir", "cmd",   "connect", "del",  "deltasum",
-      "dup",   "exit",   "filter", "flist", "fuzzy", "genr",    "hash", "hl",
-      "hlink", "iconv",  "nstr",   "own",   "owner", "recv",    "send", "time",
+      "acl",  "backup", "bind",  "chdir", "cmd",  "connect", "dup",   "exit", "fuzzy",
+      "genr", "hl",     "hlink", "iconv", "nstr", "own",     "owner", "time",
   };
   for (size_t i = 0; i < sizeof(categories) / sizeof(categories[0]); i++) {
     if (strcmp(name, categories[i]) == 0)
@@ -518,7 +517,6 @@ static bool is_accepted_debug_category(const char* name) {
 static bool is_accepted_info_category(const char* name) {
   static const char* const categories[] = {
       "backup",
-      "mount",
       "syms",
       "symsafe",
   };
@@ -571,6 +569,18 @@ static int parse_debug_flags(const char* value, Config* config) {
       flag = LOG_DEBUG_PACK;
     } else if (strcmp(name, "util") == 0) {
       flag = LOG_DEBUG_UTIL;
+    } else if (strcmp(name, "flist") == 0) {
+      flag = LOG_DEBUG_FLIST;
+    } else if (strcmp(name, "del") == 0) {
+      flag = LOG_DEBUG_DEL;
+    } else if (strcmp(name, "hash") == 0 || strcmp(name, "deltasum") == 0) {
+      flag = LOG_DEBUG_HASH;
+    } else if (strcmp(name, "recv") == 0) {
+      flag = LOG_DEBUG_RECV;
+    } else if (strcmp(name, "filter") == 0) {
+      flag = LOG_DEBUG_FILTER;
+    } else if (strcmp(name, "send") == 0) {
+      flag = LOG_DEBUG_SEND;
     } else if (is_accepted_debug_category(name)) {
       continue;
     } else {
@@ -645,9 +655,12 @@ static int parse_info_flags(const char* value, Config* config) {
       flag = LOG_INFO_MISC;
     else if (strcmp(name, "skip") == 0)
       flag = LOG_INFO_SKIP;
-    else if (strcmp(name, "stats") == 0)
+    else if (strcmp(name, "stats") == 0) {
       flag = LOG_INFO_STATS;
-    else if (strcmp(name, "del") == 0)
+      /* `--info=stats` requests the same transfer-statistics block as
+         `--stats`; `--info=stats0` turns it back off. */
+      config->stats = level > 0;
+    } else if (strcmp(name, "del") == 0)
       flag = LOG_INFO_DEL;
     else if (strcmp(name, "remove") == 0)
       flag = LOG_INFO_REMOVE;
@@ -655,6 +668,8 @@ static int parse_info_flags(const char* value, Config* config) {
       flag = LOG_INFO_FLIST;
     else if (strcmp(name, "nonreg") == 0)
       flag = LOG_INFO_NONREG;
+    else if (strcmp(name, "mount") == 0)
+      flag = LOG_INFO_MOUNT;
     else if (strcmp(name, "progress") == 0)
       flag = LOG_INFO_PROGRESS;
     else if (is_accepted_info_category(name))
@@ -1213,7 +1228,13 @@ static int apply_table_option(Config* config, const OptionEntry* entry, const ch
   void* field = (char*)config + entry->offset;
   switch (entry->kind) {
   case OPT_FLAG:
-    *(bool*)field = true;
+    /* -x/--one-file-system is repeatable in rsync: `-xx` increments the level so
+       the scanner drops mount-point directories instead of recreating them
+       empty.  Everything else is a plain boolean. */
+    if (entry->offset == offsetof(Config, one_file_system))
+      (*(int*)field)++;
+    else
+      *(bool*)field = true;
     return 0;
   case OPT_NOOP:
     return 0;
@@ -2574,7 +2595,11 @@ static bool cli_handle_outbuf_option(CliParseCtx* ctx) {
  * load --files-from once every argument has been seen.  Returns 0 on success,
  * -1 on error. */
 static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool no_incremental) {
-  set_log_level(config->quiet ? LOG_LEVEL_ERROR : (verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
+  /* An explicit --debug=FLAGS enables the debug log level by itself (rsync
+     behaviour); -v enables every other INFO-level message. */
+  bool debug_enabled = verbose || config->debug_level != 0;
+  set_log_level(config->quiet ? LOG_LEVEL_ERROR
+                              : (debug_enabled ? LOG_LEVEL_DEBUG : LOG_LEVEL_WARNING));
   /* rsync's plain --delete defaults to delete-during (--del): each directory's
      extras are removed as that directory is processed, so space is freed
      progressively and a tight destination never has to hold the whole old+new
@@ -2764,10 +2789,12 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   }
   /* --info=del on a real --delete run asks the receiver to report the paths it
      actually removed; the report rides the STATUS_STATS path list, so the wire
-     stats frame must be negotiated too. */
-  config->report_deletes = config->use_delete && !config->dry_run &&
-                           ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
-                            config->out_format != NULL);
+     stats frame must be negotiated too.  --debug=del needs the same paths, so
+     it opts into the existing report (no new wire field). */
+  config->report_deletes =
+      config->use_delete && !config->dry_run &&
+      ((config->info_level & LOG_INFO_DEL) != 0 || config->itemize_changes ||
+       config->out_format != NULL || (config->debug_level & LOG_DEBUG_DEL) != 0);
   config->report_stats = config->stats || config->show_progress ||
                          (config->info_level & LOG_INFO_PROGRESS) || format_needs_wire ||
                          config->report_deletes || (config->dry_run && config->use_delete);

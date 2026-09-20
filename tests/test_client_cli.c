@@ -762,8 +762,9 @@ static void test_parse_args_debug_flags() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_ALL);
-  EXPECT_EQ_INT(get_log_debug_flags(), LOG_DEBUG_ALL);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_IO | LOG_DEBUG_PROTO | LOG_DEBUG_PACK | LOG_DEBUG_UTIL);
+  EXPECT_EQ_INT(get_log_debug_flags(),
+                LOG_DEBUG_IO | LOG_DEBUG_PROTO | LOG_DEBUG_PACK | LOG_DEBUG_UTIL);
   config_delete(cfg);
 }
 
@@ -1421,10 +1422,9 @@ static void test_parse_args_info_name_and_help() {
   config_delete(cfg);
 }
 
-/* rsync 3.4.1's full --info/--debug vocabulary parses.  The info categories
- * with a FastSync event set their flag; the remaining rsync-only categories
- * (backup/mount/symsafe/syms) parse but stay silent.  Every --debug category
- * listed here is FastSync-silent, so debug_level stays 0. */
+/* rsync 3.4.1's full --info/--debug vocabulary parses.  The categories with a
+ * FastSync event set their flag; the remaining rsync-only categories
+ * (backup/symsafe/syms, acl/bind/chdir/...) parse but stay silent. */
 static void test_parse_args_rsync_flag_vocabulary_accepted() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--info=backup,del,flist,mount,nonreg,progress,remove,symsafe,syms",
@@ -1436,9 +1436,10 @@ static void test_parse_args_rsync_flag_vocabulary_accepted() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_NONREG |
+  EXPECT_EQ_INT(cfg->info_level, LOG_INFO_DEL | LOG_INFO_FLIST | LOG_INFO_MOUNT | LOG_INFO_NONREG |
                                      LOG_INFO_PROGRESS | LOG_INFO_REMOVE);
-  EXPECT_EQ_INT(cfg->debug_level, 0);
+  EXPECT_EQ_INT(cfg->debug_level, LOG_DEBUG_DEL | LOG_DEBUG_FLIST | LOG_DEBUG_HASH |
+                                      LOG_DEBUG_RECV | LOG_DEBUG_FILTER | LOG_DEBUG_SEND);
   config_delete(cfg);
 }
 

@@ -205,11 +205,22 @@ typedef struct {
   bool referent_error;
 } ScannerEntry;
 
+/* One inspected directory entry buffered so the sequential scanner can emit the
+   stream in rsync's flist order.  `name` is the raw dirent name (owned here);
+   `entry` is the scanner_inspect_entry() result whose path/link_target are owned
+   when `inspection == 1`; `inspection` is that call's return code (1 keep,
+   0 skip, <0 fatal). */
+typedef struct {
+  char* name;
+  ScannerEntry entry;
+  int inspection;
+} SortedEntry;
+
 /* --one-file-system (-x) decision. Only directories can carry a different
  * device than their parent (mount points), so this is checked when a child
  * directory is about to be descended into. */
-bool scanner_same_filesystem(bool one_file_system, dev_t root_device, dev_t entry_device) {
-  return !one_file_system || entry_device == root_device;
+bool scanner_same_filesystem(int one_file_system, dev_t root_device, dev_t entry_device) {
+  return one_file_system <= 0 || entry_device == root_device;
 }
 
 /* Build a payload-less directory File carrying the captured metadata (when
@@ -443,6 +454,40 @@ static void scanner_note_nonreg(const ScannerOptions* options, const char* fs_pa
   printf("skipping non-regular file \"%s\"\n", escaped ? escaped : rel);
   free(escaped);
   fflush(stdout);
+}
+
+/* rsync 3.4.1's `--info=mount` line, emitted when `-xx` drops a mount-point
+ * directory: `[sender] skipping mount-point dir NAME` (the client is the
+ * sender).  Plain `-x` keeps the empty directory and prints nothing, matching
+ * rsync. */
+static void scanner_note_mount(const ScannerOptions* options, const char* fs_path) {
+  if (!options || !options->note_mount || !fs_path)
+    return;
+  const char* rel = utils_strip_transfer_root(fs_path, options->send_directory);
+  char* escaped = output_escape(rel, options->eight_bit_output);
+  printf("[sender] skipping mount-point dir %s\n", escaped ? escaped : rel);
+  free(escaped);
+  fflush(stdout);
+}
+
+/* --debug=filter: a selection/filter decision dropped an entry. */
+static void scanner_note_filter(const ScannerOptions* options, const char* name) {
+  if (!options || !log_debug_enabled(LOG_DEBUG_FILTER) || !name)
+    return;
+  log_debug_message(LOG_DEBUG_FILTER, "filter: excluded %s", name);
+}
+
+/* Account for a directory that will not be represented by an inline directory
+ * entry.  Paired with scanner_dir_count_uncount for empty directories that are
+ * emitted inline, so every traversed directory is counted exactly once. */
+static void scanner_dir_count_count(const ScannerOptions* options) {
+  if (options && options->dir_count)
+    atomic_fetch_add(options->dir_count, 1);
+}
+
+static void scanner_dir_count_uncount(const ScannerOptions* options) {
+  if (options && options->dir_count)
+    atomic_fetch_sub(options->dir_count, 1);
 }
 
 /* A user-selection exclusion (--filter/-C/per-dir or --exclude/--include). */
@@ -687,6 +732,114 @@ skip:
   return 0;
 }
 
+static void sorted_entry_destroy(void* item) {
+  SortedEntry* se = (SortedEntry*)item;
+  if (!se)
+    return;
+  free(se->name);
+  free(se->entry.path);
+  free(se->entry.link_target);
+}
+
+/* rsync flist order within one directory: non-directories first, then
+   directories, each group by ascending name.  strcmp() compares as unsigned
+   char, matching rsync's f_name_cmp(). */
+static int sorted_entry_cmp(const void* a, const void* b) {
+  const SortedEntry* x = (const SortedEntry*)a;
+  const SortedEntry* y = (const SortedEntry*)b;
+  bool x_dir = x->inspection > 0 && x->entry.is_directory;
+  bool y_dir = y->inspection > 0 && y->entry.is_directory;
+  if (x_dir != y_dir)
+    return x_dir ? 1 : -1;
+  return strcmp(x->name, y->name);
+}
+
+static void scanner_free_sorted(DirectoryScanner* scanner) {
+  SortedEntry* entries = (SortedEntry*)scanner->sorted_entries;
+  for (size_t i = 0; i < scanner->sorted_count; i++)
+    sorted_entry_destroy(&entries[i]);
+  free(entries);
+  scanner->sorted_entries = NULL;
+  scanner->sorted_count = 0;
+  scanner->sorted_index = 0;
+}
+
+/* Read every entry of the open directory, inspect it once and store it sorted in
+   rsync's flist order.  Returns 0 on success, -1 on a fatal error (the caller
+   aborts the scan). */
+static int scanner_buffer_current_directory(DirectoryScanner* scanner) {
+  size_t capacity = 64;
+  size_t count = 0;
+  SortedEntry* entries = malloc(capacity * sizeof(*entries));
+  if (!entries) {
+    scanner->failed = true;
+    return -1;
+  }
+  const struct dirent* dirent;
+  while ((dirent = readdir(scanner->current_dir)) != NULL) {
+    if (strcmp(dirent->d_name, ".") == 0 || strcmp(dirent->d_name, "..") == 0)
+      continue;
+    if (count == capacity) {
+      size_t next = capacity * 2;
+      SortedEntry* grown = realloc(entries, next * sizeof(*entries));
+      if (!grown) {
+        scanner->failed = true;
+        break;
+      }
+      entries = grown;
+      capacity = next;
+    }
+    char* name = str_dup(dirent->d_name);
+    if (!name) {
+      scanner->failed = true;
+      break;
+    }
+    char* link_rel = child_rel_path(scanner->current_rel, dirent->d_name);
+    if (!link_rel) {
+      free(name);
+      scanner->failed = true;
+      break;
+    }
+    int inspection = scanner_inspect_entry(&scanner->options, scanner->current_path, link_rel,
+                                           dirent->d_name, &entries[count].entry);
+    free(link_rel);
+    if (inspection < 0) {
+      free(name);
+      scanner->failed = true;
+      break;
+    }
+    entries[count].name = name;
+    entries[count].inspection = inspection;
+    count++;
+  }
+  if (scanner->failed) {
+    for (size_t i = 0; i < count; i++)
+      sorted_entry_destroy(&entries[i]);
+    free(entries);
+    return -1;
+  }
+  qsort(entries, count, sizeof(*entries), sorted_entry_cmp);
+  scanner->sorted_entries = entries;
+  scanner->sorted_count = count;
+  scanner->sorted_index = 0;
+  return 0;
+}
+
+/* Push this directory's collected child directories onto the LIFO stack in
+   reverse so the first (ascending) child is popped first (depth-first). */
+static void scanner_push_pending_dirs(DirectoryScanner* scanner) {
+  ArrayList* pending = (ArrayList*)scanner->pending_dirs;
+  if (!pending)
+    return;
+  for (int i = pending->size - 1; i >= 0; i--) {
+    if (!queue_push(scanner->directories, pending->items[i])) {
+      dir_entry_destroy(pending->items[i]);
+      scanner->failed = true;
+    }
+  }
+  pending->size = 0;
+}
+
 DirectoryScanner* directory_scanner_create_with_options(const char* root_directory,
                                                         const ScannerOptions* options) {
   if (!root_directory || !options)
@@ -704,12 +857,22 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
     free(scanner);
     return NULL;
   }
+  scanner->pending_dirs = array_list_create(NULL);
+  if (!scanner->pending_dirs) {
+    queue_destroy(scanner->directories);
+    free(scanner);
+    return NULL;
+  }
   scanner->current_dir = NULL;
   scanner->current_path = NULL;
   scanner->current_depth = 0;
   scanner->failed = false;
+  scanner->sorted_entries = NULL;
+  scanner->sorted_count = 0;
+  scanner->sorted_index = 0;
   scanner->root_path = str_dup(root_directory);
   if (!scanner->root_path) {
+    array_list_delete(scanner->pending_dirs);
     queue_destroy(scanner->directories);
     free(scanner);
     return NULL;
@@ -729,6 +892,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
     scanner->filter_nodes = array_list_create(filter_node_destroy);
     if (!scanner->filter_nodes) {
       free(scanner->root_path);
+      array_list_delete(scanner->pending_dirs);
       queue_destroy(scanner->directories);
       free(scanner);
       return NULL;
@@ -739,6 +903,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
     if (stat(root_directory, &root_stats) != 0) {
       log_perror("Could not stat source directory");
       free(scanner->root_path);
+      array_list_delete(scanner->pending_dirs);
       queue_destroy(scanner->directories);
       array_list_delete(scanner->filter_nodes);
       free(scanner);
@@ -757,6 +922,7 @@ DirectoryScanner* directory_scanner_create_with_options(const char* root_directo
   if (!queue_enqueue(scanner->directories, root)) {
     dir_entry_destroy(root);
     free(scanner->root_path);
+    array_list_delete(scanner->pending_dirs);
     queue_destroy(scanner->directories);
     array_list_delete(scanner->filter_nodes);
     free(scanner);
@@ -808,6 +974,13 @@ void directory_scanner_destroy(DirectoryScanner* scanner) {
   free(scanner->current_path);
   free(scanner->current_rel);
   free(scanner->root_path);
+  scanner_free_sorted(scanner);
+  ArrayList* pending = (ArrayList*)scanner->pending_dirs;
+  if (pending) {
+    for (int i = 0; i < pending->size; i++)
+      dir_entry_destroy(pending->items[i]);
+    array_list_delete(pending);
+  }
   array_list_delete(scanner->filter_nodes);
   array_list_delete(scanner->dirs_batch);
   queue_destroy(scanner->directories);
@@ -957,6 +1130,9 @@ static bool scanner_emit_empty_dir(DirectoryScanner* scanner, ArrayList* chunk_d
     file_destroy(dir);
     return false;
   }
+  /* The directory was counted when it was opened; this inline entry represents
+     it, so drop the counter to avoid counting it twice in --stats. */
+  scanner_dir_count_uncount(&scanner->options);
   return true;
 }
 
@@ -975,7 +1151,7 @@ static int open_next_directory(DirectoryScanner* scanner) {
   scanner->current_path = NULL;
 
   while (!queue_is_empty(scanner->directories)) {
-    DirEntry* de = (DirEntry*)queue_dequeue(scanner->directories);
+    DirEntry* de = (DirEntry*)queue_pop(scanner->directories);
     scanner->current_path = de->path;
     scanner->current_depth = de->depth;
     /* The seed directory inherits the scanner's configured context (the root
@@ -1046,6 +1222,8 @@ static int open_next_directory(DirectoryScanner* scanner) {
       scanner->failed = true;
       return -1;
     }
+    scanner_dir_count_count(&scanner->options);
+    log_debug_message(LOG_DEBUG_FLIST, "flist: scanning %s", scanner->current_path);
     if (scanner->options.capture_dir_times &&
         !scanner_capture_dir_time(
             scanner->options.dir_entries, scanner->options.dir_entries_mutex, scanner->root_path,
@@ -1058,6 +1236,14 @@ static int open_next_directory(DirectoryScanner* scanner) {
       free(scanner->current_path);
       scanner->current_path = NULL;
       scanner->failed = true;
+      return -1;
+    }
+    /* Buffer and sort this directory's entries in rsync's flist order. */
+    if (scanner_buffer_current_directory(scanner) != 0) {
+      closedir(scanner->current_dir);
+      scanner->current_dir = NULL;
+      free(scanner->current_path);
+      scanner->current_path = NULL;
       return -1;
     }
     return 1;
@@ -1304,6 +1490,17 @@ static File* dirs_next_file(DirectoryScanner* scanner) {
         scanner->dirs_root_emitted = true;
         if (scanner->options.prune_empty_dirs && dirs_source_dir_is_empty(scanner->root_path))
           return NULL;
+        /* The listed directory's direct children are about to be enumerated, so
+           its destination mirror is a synchronized directory: record it for the
+           per-directory delete plan.  The plan keeps the enumerated children and
+           shields untraversed subdirectories, so --delete-during removes extras
+           directly inside the listed directory without descending into a kept
+           (but untraversed) child -- exactly rsync's `-d DIR/ --delete`. */
+        if (!scanner_record_synced_dir(&scanner->options, scanner->root_path, "",
+                                       scanner->relative_mode)) {
+          scanner->failed = true;
+          return NULL;
+        }
         scanner->current_dir = opendir(scanner->root_path);
         if (!scanner->current_dir) {
           scanner->io_error = true;
@@ -1415,8 +1612,7 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         break;
     }
 
-    const struct dirent* entry = readdir(scanner->current_dir);
-    if (entry == NULL) {
+    if (scanner->sorted_index >= scanner->sorted_count) {
       /* The directory is exhausted: if nothing was transferred or descended
          from it, recreate it at the destination as an explicit entry. */
       if (scanner->options.emit_empty_dirs && !scanner->current_dir_produced &&
@@ -1425,10 +1621,12 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         if (!scanner_emit_empty_dir(scanner, chunk_data))
           scanner->failed = true;
       }
+      scanner_push_pending_dirs(scanner);
       closedir(scanner->current_dir);
       scanner->current_dir = NULL;
       free(scanner->current_path);
       scanner->current_path = NULL;
+      scanner_free_sorted(scanner);
       if (scanner->failed) {
         array_list_delete(chunk_data);
         return NULL;
@@ -1436,26 +1634,15 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       continue;
     }
 
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-      continue;
+    SortedEntry* sorted = &((SortedEntry*)scanner->sorted_entries)[scanner->sorted_index++];
+    const char* name = sorted->name;
+    ScannerEntry* inspected = &sorted->entry;
+    int inspection = sorted->inspection;
 
-    ScannerEntry inspected;
-    char* link_rel = child_rel_path(scanner->current_rel, entry->d_name);
-    if (!link_rel) {
-      scanner->failed = true;
-      break;
-    }
-    int inspection = scanner_inspect_entry(&scanner->options, scanner->current_path, link_rel,
-                                           entry->d_name, &inspected);
-    free(link_rel);
-    if (inspection < 0) {
-      scanner->failed = true;
-      break;
-    }
     if (inspection == 0) {
       /* A dereferenced symlink with no referent is a partial-transfer error
          (rsync exit 23): record it as a non-fatal scan I/O error. */
-      if (inspected.referent_error)
+      if (inspected->referent_error)
         scanner->io_error = true;
       /* A user-selection exclude protects its destination mirror from --delete
          unless --delete-excluded; a size prune is always protected.  Other
@@ -1463,23 +1650,23 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
          --files-from the protected prefix must be the entry's bare relative
          wire path, not its source path (which would not match the destination
          layout and would leave the mirror deletable). */
-      if (inspected.excluded) {
+      if (inspected->excluded) {
         char* protected_path;
         if (scanner->relative_mode) {
-          protected_path = child_rel_path(scanner->current_rel, entry->d_name);
+          protected_path = child_rel_path(scanner->current_rel, name);
         } else if (scanner->options.relative_prefix) {
-          char* relc = child_rel_path(scanner->current_rel, entry->d_name);
+          char* relc = child_rel_path(scanner->current_rel, name);
           protected_path =
               relc ? scanner_prefix_send_path(scanner->options.relative_prefix, relc) : NULL;
           free(relc);
         } else {
-          protected_path = path_cat(scanner->current_path, entry->d_name);
+          protected_path = path_cat(scanner->current_path, name);
         }
         if (!protected_path) {
           scanner->failed = true;
           break;
         }
-        if (inspected.size_excluded)
+        if (inspected->size_excluded)
           scanner_record_size_skipped(scanner, protected_path);
         else
           scanner_record_excluded(scanner, protected_path);
@@ -1487,23 +1674,22 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       }
       continue;
     }
-    char* cur_path = inspected.path;
-    struct stat stats = inspected.stats;
+    char* cur_path = inspected->path;
+    struct stat stats = inspected->stats;
 
     /* --files-from allow-set and the filter layer apply to files and to
      * directories (an excluded directory is not descended into). */
-    bool is_dir = inspected.is_directory;
-    char* rel = child_rel_path(scanner->current_rel, entry->d_name);
+    bool is_dir = inspected->is_directory;
+    char* rel = child_rel_path(scanner->current_rel, name);
     if (!rel) {
-      free(cur_path);
       scanner->failed = true;
       break;
     }
     bool protect = false;
     bool passes_selection = entry_passes_selection(
-        scanner->options.file_list, scanner->options.base_filters, scanner->current_node, rel,
-        entry->d_name, is_dir, scanner->options.per_dir_filters,
-        scanner->options.exclude_per_dir_filter_files, &protect);
+        scanner->options.file_list, scanner->options.base_filters, scanner->current_node, rel, name,
+        is_dir, scanner->options.per_dir_filters, scanner->options.exclude_per_dir_filter_files,
+        &protect);
     /* A sender-side hide leaves the entry out of the transfer; an independent
        receiver-side protect rule keeps a transferred entry's destination mirror
        from being deleted.  Both are recorded in the same protection set. */
@@ -1525,7 +1711,6 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
           char* wrel = scanner_prefix_send_path(scanner->options.relative_prefix, rel);
           if (!wrel) {
             free(rel);
-            free(cur_path);
             scanner->failed = true;
             break;
           }
@@ -1542,13 +1727,12 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
     char* rel_copy = needs_rel ? str_dup(rel) : NULL;
     free(rel);
     if (rel_copy == NULL && needs_rel) {
-      free(cur_path);
       scanner->failed = true;
       break;
     }
     if (!passes_selection) {
+      scanner_note_filter(&scanner->options, name);
       free(rel_copy);
-      free(cur_path);
       continue;
     }
 
@@ -1556,6 +1740,13 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       free(rel_copy);
       if (!scanner_same_filesystem(scanner->options.one_file_system, scanner->root_dev,
                                    stats.st_dev)) {
+        if (scanner->options.one_file_system > 1) {
+          /* rsync's -xx drops the mount-point directory entirely (the plain -x
+             path below keeps it as an empty directory) and prints the
+             --info=mount line when that category is enabled. */
+          scanner_note_mount(&scanner->options, cur_path);
+          continue;
+        }
         /* rsync's -x/--one-file-system emits the mount-point directory entry
            itself (so the destination gets an empty directory) but does NOT
            descend into it.  Build a payload-less directory File and hand it to
@@ -1563,12 +1754,10 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         File* mount = scanner_build_dir_file(cur_path, &stats, &scanner->options);
         if (mount == NULL || !array_list_add(chunk_data, mount)) {
           file_destroy(mount);
-          free(cur_path);
           scanner->failed = true;
           break;
         }
         scanner->current_dir_produced = true;
-        free(cur_path);
         continue;
       }
       /* --list-only: list directory entries too (rsync prints them), even
@@ -1577,7 +1766,6 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
         File* dir = scanner_build_dir_file(cur_path, &stats, &scanner->options);
         if (dir == NULL || !array_list_add(chunk_data, dir)) {
           file_destroy(dir);
-          free(cur_path);
           scanner->failed = true;
           break;
         }
@@ -1586,32 +1774,29 @@ Chunk* directory_scanner_next(DirectoryScanner* scanner) {
       int next_depth = scanner->current_depth + 1;
       if (scanner->options.max_depth <= 0 || next_depth < scanner->options.max_depth) {
         DirEntry* de = dir_entry_create(cur_path, next_depth, scanner->current_node);
-        if (!de || !queue_enqueue(scanner->directories, de)) {
+        if (!de || !array_list_add((ArrayList*)scanner->pending_dirs, de)) {
           dir_entry_destroy(de);
           scanner->failed = true;
         }
       }
-      free(cur_path);
     } else {
       if (scanner->options.max_depth > 0 &&
           scanner->current_depth + 1 > scanner->options.max_depth) {
         free(rel_copy);
-        free(cur_path);
         continue;
       }
       File* file = file_create(cur_path);
-      free(cur_path);
       if (file == NULL) {
         free(rel_copy);
-        free(inspected.link_target);
-        inspected.link_target = NULL;
+        free(inspected->link_target);
+        inspected->link_target = NULL;
         scanner->failed = true;
         continue;
       }
-      if (inspected.is_symlink) {
+      if (inspected->is_symlink) {
         file->is_symlink = true;
-        file->symlink_target = inspected.link_target;
-        inspected.link_target = NULL;
+        file->symlink_target = inspected->link_target;
+        inspected->link_target = NULL;
       } else {
         file->data->size = stats.st_size;
       }
@@ -1975,6 +2160,7 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
       free(prefixed);
     }
     if (!passes) {
+      scanner_note_filter(options, entry->d_name);
       free(rel);
       free(cur_path);
       return;
@@ -1982,6 +2168,14 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   }
   if (is_dir) {
     if (!scanner_same_filesystem(options->one_file_system, root_dev, st.st_dev)) {
+      if (options->one_file_system > 1) {
+        /* -xx: drop the mount-point directory entirely (rsync) and print the
+           --info=mount line when enabled. */
+        scanner_note_mount(options, cur_path);
+        free(rel);
+        free(cur_path);
+        return;
+      }
       /* -x/--one-file-system: emit the mount-point directory entry (empty) but
          do not descend into it (see the sequential scanner for the same rule). */
       File* mount = file_create(cur_path);
@@ -2119,6 +2313,7 @@ static bool scan_root_directory(ParallelScanner* ps, const char* root_directory,
     ps->failed = true;
     return false;
   }
+  log_debug_message(LOG_DEBUG_FLIST, "flist: scanning %s", root_directory);
   const struct dirent* entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -2283,6 +2478,10 @@ ParallelScanner* parallel_scanner_create_with_options(const char* root_directory
     parallel_scanner_destroy(ps);
     return NULL;
   }
+  /* The root itself is a traversed directory (rsync counts it in
+     `Number of files`); the worker DirectoryScanners account for every
+     subdirectory below it. */
+  scanner_dir_count_count(options);
   /* P7 Wave D: the parallel scanner never runs a DirectoryScanner over the
      transfer root itself (it hands the root's immediate subdirectories to
      workers), so capture the root's directory time here. */

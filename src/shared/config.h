@@ -463,7 +463,9 @@ typedef struct Config {
    * /.rsync-filter' (the .rsync-filter files themselves are transferred); a
    * repeated -F adds --filter='- .rsync-filter' so they are excluded too. */
   int per_dir_filter_count;
-  bool one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries */
+  int one_file_system; /* -x/--one-file-system: do not cross filesystem boundaries.
+                          Repeated -x (rsync's -xx) drops the mount-point
+                          directory entirely instead of recreating it empty. */
   /* --no-implied-dirs: client-only.  With -R, do not transfer the source
    * metadata of the parent directories implied by a listed path; an unlisted
    * implied parent is still created (with default attributes) so the listed
