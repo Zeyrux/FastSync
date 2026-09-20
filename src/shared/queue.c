@@ -139,6 +139,23 @@ void* queue_dequeue(Queue* queue) {
   return item;
 }
 
+bool queue_push(Queue* queue, void* item) {
+  return queue_enqueue(queue, item);
+}
+
+void* queue_pop(Queue* queue) {
+  if (queue == NULL || queue_is_empty(queue)) {
+    log_perror("ERROR: Could not pop from null or empty queue.");
+    return NULL;
+  }
+
+  queue->rear = (queue->rear - 1 + queue->capacity) % queue->capacity;
+  void* item = queue->items[queue->rear];
+  queue->items[queue->rear] = NULL;
+  queue->size--;
+  return item;
+}
+
 void* queue_dequeue_multithreaded(Queue* queue, mtx_t* mutex, cnd_t* condition_not_empty,
                                   cnd_t* condition_not_full, const bool* other_thread_done) {
   mtx_lock(mutex);

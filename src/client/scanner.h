@@ -10,6 +10,7 @@
 #include "stop_condition.h"
 #include <dirent.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <sys/types.h>
 #include <threads.h>
@@ -188,6 +189,17 @@ typedef struct {
   int current_depth;
   dev_t root_dev;
   bool failed;
+  /* rsync-order traversal: each opened directory's entries are inspected once
+     and buffered (an internal SortedEntry[] owned here) sorted as rsync's flist
+     orders them -- non-directories ascending, then directories ascending.  The
+     entries are walked in order and child directories are collected in
+     `pending_dirs` (an ArrayList of DirEntry*, owned here) and pushed onto the
+     LIFO `directories` stack in reverse at directory exhaustion, so the emitted
+     stream is depth-first like rsync.  `sorted_*` are reset per directory. */
+  void* sorted_entries;
+  size_t sorted_count;
+  size_t sorted_index;
+  void* pending_dirs;
   /* Recursive scan: whether the open directory yielded any transferred or
      descended entry.  When it did not, closing it emits a directory entry so
      the empty source directory is recreated at the destination (rsync
