@@ -171,6 +171,38 @@ static void test_validate_config_unified_invariants() {
   config_delete(cfg);
 }
 
+/* The receiver enforces MAX_FILTER_RULES on the protect-rule block and would
+   otherwise fail the session with an opaque protocol error.  The client must
+   accept exactly the limit and reject one more up front, before any network
+   I/O, with an actionable message. */
+static void test_validate_config_filter_rule_limit() {
+  Config* cfg = valid_client_config();
+  cfg->filters = array_list_create(free);
+  EXPECT_NOT_NULL(cfg->filters);
+  for (int i = 0; i < MAX_FILTER_RULES; i++)
+    EXPECT_TRUE(array_list_add(cfg->filters, str_dup("- *.tmp")));
+  EXPECT_TRUE(validate_config(cfg)); /* exactly the limit is accepted */
+
+  FILE* log_capture = tmpfile();
+  EXPECT_NOT_NULL(log_capture);
+  log_set_file(log_capture);
+  EXPECT_TRUE(array_list_add(cfg->filters, str_dup("- *.bak")));
+  EXPECT_FALSE(validate_config(cfg)); /* one over the limit is rejected */
+  fflush(log_capture);
+  rewind(log_capture);
+  char line[512];
+  bool saw_message = false;
+  while (fgets(line, sizeof(line), log_capture) != NULL) {
+    if (strstr(line, "too many filter rules") != NULL && strstr(line, "(maximum 1024)") != NULL)
+      saw_message = true;
+  }
+  log_set_file(NULL);
+  fclose(log_capture);
+  EXPECT_TRUE(saw_message);
+
+  config_delete(cfg);
+}
+
 /* Test main() with --help flag (early return path, no server connection needed) */
 static void test_cli_help() {
   /* We can't easily call main() because it calls send_files which needs a server.
@@ -4824,6 +4856,7 @@ void test_client_cli() {
   test_validate_config_credentials_require_tls_or_loopback();
   test_validate_config_delta_sendfile_constraints();
   test_validate_config_unified_invariants();
+  test_validate_config_filter_rule_limit();
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();

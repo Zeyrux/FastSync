@@ -102,6 +102,16 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "%s", invariants_error);
     return false;
   }
+  /* The receiver rejects a protect-rule block with more than MAX_FILTER_RULES
+     entries as an opaque protocol error; reject an over-limit --filter set here,
+     before any network I/O, with an actionable message.  send_protect_entries()
+     re-checks the final built count because cvs-exclude / merge rules can
+     expand it beyond config->filters->size. */
+  if (config->filters && config->filters->size > MAX_FILTER_RULES) {
+    log_message(LOG_LEVEL_ERROR, "too many filter rules: %d (maximum %d)", config->filters->size,
+                MAX_FILTER_RULES);
+    return false;
+  }
   /* --protocol: FastSync has exactly one wire format, so the forced version
      must equal the current PROTOCOL_VERSION exactly.  Rejected here, before any
      network I/O, rather than letting the server hit its own mismatch check. */
