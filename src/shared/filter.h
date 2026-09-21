@@ -131,9 +131,4 @@ FilterRuleList* filter_file_read(const char* dir_path, const char* owner_rel, bo
 FilterAction filter_rules_apply_side(const FilterRuleList* list, const char* rel_path,
                                      const char* leaf, bool is_dir, unsigned side);
 
-/* Sender-side convenience wrapper (kept for callers/tests that only need the
- * transfer decision). */
-FilterAction filter_rules_apply(const FilterRuleList* list, const char* rel_path, const char* leaf,
-                                bool is_dir);
-
 #endif

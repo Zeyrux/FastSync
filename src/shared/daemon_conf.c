@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,14 +16,7 @@
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-static void set_error(char* err, size_t err_size, const char* fmt, ...) {
-  if (!err || err_size == 0)
-    return;
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(err, err_size, fmt, args);
-  va_end(args);
-}
+#define set_error utils_set_error
 
 /* Trim leading and trailing ASCII space/tab in place; returns the new start. */
 static char* trim_ws(char* s) {

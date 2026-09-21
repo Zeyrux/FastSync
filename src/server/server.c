@@ -226,11 +226,6 @@ static void release_authorization(void) {
     close(root_fd);
 }
 
-static bool path_is_within(const char* root, const char* path) {
-  size_t n = strlen(root);
-  return strncmp(root, path, n) == 0 && (path[n] == '\0' || path[n] == '/');
-}
-
 /* --mkpath contract: when the client's destination root directory does not
    exist yet on the server side, --mkpath tells the server to create it (and
    any missing leading components) below the authorized root at connection
@@ -790,7 +785,7 @@ void handler(int file_descriptor) {
   if (joined_destination)
     destination = joined_destination;
   if (!destination || has_path_traversal(destination) ||
-      !path_is_within(authorized_root, destination)) {
+      !path_is_within_root(authorized_root, destination)) {
     log_message(LOG_LEVEL_ERROR, "Rejected destination outside authorized root");
     free(joined_destination);
     joined_destination = NULL;

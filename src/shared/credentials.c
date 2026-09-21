@@ -8,7 +8,6 @@
 #include <openssl/evp.h>
 #include <openssl/params.h>
 #include <openssl/rand.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,14 +57,7 @@ struct CredentialStore {
 static const uint8_t k_dummy_stored_key[CREDENTIAL_KEY_LEN] = {0};
 static const uint8_t k_dummy_server_key[CREDENTIAL_KEY_LEN] = {0};
 
-static void set_error(char* err, size_t err_size, const char* fmt, ...) {
-  if (!err || err_size == 0)
-    return;
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(err, err_size, fmt, args);
-  va_end(args);
-}
+#define set_error utils_set_error
 
 static bool is_comment_char(char c) {
   return c == '#' || c == ';';

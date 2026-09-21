@@ -4,22 +4,12 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Write a diagnostic message into the caller's optional buffer.  A NULL `err`
- * (or a zero size) is a no-op, so a caller that only needs the boolean status
- * may pass NULL without the snprintf-on-NULL undefined behaviour. */
-static void filter_set_error(char* err, size_t err_size, const char* fmt, ...) {
-  if (!err || err_size == 0)
-    return;
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(err, err_size, fmt, ap);
-  va_end(ap);
-}
+/* Write a diagnostic message into the caller's optional buffer. */
+#define filter_set_error utils_set_error
 
 /* ---- Ordered rule lists ---- */
 
@@ -869,9 +859,4 @@ FilterAction filter_rules_apply_side(const FilterRuleList* list, const char* rel
       return action;
   }
   return FILTER_ACTION_NONE;
-}
-
-FilterAction filter_rules_apply(const FilterRuleList* list, const char* rel_path, const char* leaf,
-                                bool is_dir) {
-  return filter_rules_apply_side(list, rel_path, leaf, is_dir, FILTER_SIDE_SENDER);
 }

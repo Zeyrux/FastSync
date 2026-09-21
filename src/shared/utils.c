@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,15 @@ int utils_get_authorized_root_fd(void) {
 
 const char* utils_get_authorized_root_path(void) {
   return authorized_root_path;
+}
+
+void utils_set_error(char* err, size_t err_size, const char* fmt, ...) {
+  if (!err || err_size == 0)
+    return;
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(err, err_size, fmt, args);
+  va_end(args);
 }
 
 bool path_is_within_root(const char* root, const char* path) {
