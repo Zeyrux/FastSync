@@ -988,10 +988,11 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
     return false;
   char* leaf = NULL;
   int parent_fd = file_open_secure_parent(full, &leaf, false);
+  int open_errno = errno;
   free(full);
   if (parent_fd < 0) {
     free(leaf);
-    return errno == ENOENT || errno == ENOTDIR;
+    return open_errno == ENOENT || open_errno == ENOTDIR;
   }
   struct stat st;
   if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0) {

@@ -564,6 +564,15 @@ static const char* status_to_string(Status status) {
   }
 }
 
+/* Reject a raw wire status outside the known enum range before it is handed to
+ * callers, so an unknown/corrupt frame fails as a protocol error instead of
+ * being silently interpreted as an unexpected-but-valid verdict.  STATUS_OK is
+ * the first enumerator and STATUS_STATS the last, so the range check accepts
+ * every status the protocol defines. */
+static bool status_is_valid(Status status) {
+  return status >= STATUS_OK && status <= STATUS_STATS;
+}
+
 /* Shared string send/receive implementation.  `redact` selects whether the
  * payload body is written to the LOG_DEBUG_PROTO debug log: daemon auth material
  * (the username and the proof/signature fields) sets it so a --verbose log never
@@ -647,7 +656,7 @@ bool protocol_send_data(ProtocolSession* session, const Data* data) {
     return false;
   if (!protocol_send_n_data(session, data->data, data_size))
     return false;
-  log_debug_message(LOG_DEBUG_PROTO, "Send %lld data", data_size);
+  log_debug_message(LOG_DEBUG_PROTO, "Send %llu data", data_size);
   return true;
 }
 
@@ -681,7 +690,7 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
     protocol_release_memory_for_session(session, allocation_size);
     return NULL;
   }
-  log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
+  log_debug_message(LOG_DEBUG_PROTO, "Received %llu data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     protocol_release_memory_for_session(session, allocation_size);
@@ -791,6 +800,10 @@ bool protocol_receive_status(ProtocolSession* session, Status* status) {
   }
   if (!protocol_receive_n_data_until(session, status, sizeof(Status), deadline_ptr))
     return false;
+  if (!status_is_valid(*status)) {
+    log_message(LOG_LEVEL_ERROR, "Received unknown protocol status %d", *status);
+    return false;
+  }
   if (!protocol_capture_error_detail(session, status, deadline_ptr, NULL))
     return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
@@ -812,6 +825,10 @@ bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int
   deadline.tv_sec += timeout_sec;
   if (!protocol_receive_n_data_until(session, status, sizeof(Status), &deadline))
     return false;
+  if (!status_is_valid(*status)) {
+    log_message(LOG_LEVEL_ERROR, "Received unknown protocol status %d", *status);
+    return false;
+  }
   if (!protocol_capture_error_detail(session, status, &deadline, NULL))
     return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
@@ -925,6 +942,10 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
     Status received;
     if (!protocol_read_status_until(session, &received, &deadline))
       return false;
+    if (!status_is_valid(received)) {
+      log_message(LOG_LEVEL_ERROR, "Received unknown protocol status %d", received);
+      return false;
+    }
     if (!protocol_capture_error_detail(session, &received, &deadline, abort_check))
       return false;
     if (received == STATUS_KEEPALIVE) {

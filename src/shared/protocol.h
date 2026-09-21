@@ -269,6 +269,9 @@ bool protocol_send_int(ProtocolSession* session, int data);
 bool protocol_receive_int(ProtocolSession* session, int* data);
 bool protocol_send_status(ProtocolSession* session, Status status);
 bool protocol_receive_status(ProtocolSession* session, Status* status);
+/* As protocol_receive_status, but with an explicit per-message deadline
+ * (seconds) instead of the session's configured io_timeout_sec. */
+bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int timeout_sec);
 bool send_n_data(int file_descriptor, const void* data, size_t data_size);
 bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 

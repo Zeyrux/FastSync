@@ -86,11 +86,13 @@ PipelineContextSender* pipeline_context_sender_create(Config* config, Queue* que
   return context;
 
 fail:
-  log_perror("Error initializing synchronization objects");
+  log_message(LOG_LEVEL_ERROR, "%s", "Error initializing synchronization objects");
   if (context->dir_entries_mutex_init)
     mtx_destroy(&context->dir_entries_mutex);
   if (context->dir_entries)
     array_list_delete(context->dir_entries);
+  if (init >= 7)
+    mtx_destroy(&context->mutex_progress);
   if (init >= 6)
     cnd_destroy(&context->condition_not_empty_loader);
   if (init >= 5)
