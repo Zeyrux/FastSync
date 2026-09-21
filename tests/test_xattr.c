@@ -248,7 +248,7 @@ static void test_link_copy_fallback_preserves_xattrs() {
   m.crtime_valid = false;
 
   bool ok = file_to_disk_secure_link_attrs(dest, basis_dir, "payload", 7, false, &m,
-                                           (FileAttrPolicy){true, true, false, false}, false,
+                                           (FileAttrPolicy){true, true, false, false, true}, false,
                                            xattrs, true, NULL);
   xattr_list_free(xattrs);
   EXPECT_TRUE(ok);
@@ -369,7 +369,7 @@ static void test_fake_super_restore() {
   }
 
   /* No xattr present yet: restore is a silent no-op (returns false, no crash). */
-  FileAttrPolicy policy = {true, true, false, false};
+  FileAttrPolicy policy = {true, true, false, false, true};
   EXPECT_FALSE(fake_super_restore_fd(fd, policy));
 
   fake_super_store_fd(fd, 1001, 1002, 0751, 1700000000, 123456789);
@@ -423,7 +423,7 @@ static void test_fake_super_no_real_chown() {
   fake_super_store_fd(fd, 12345, 12346, 0755, 1700000000, 0);
 
   Config* c = config_create();
-  FileAttrPolicy policy = {true, true, false, false};
+  FileAttrPolicy policy = {true, true, false, false, true};
   EXPECT_NOT_NULL(c);
   /* The strongest ownership request available plus permitted super mode. */
   c->preserve_owner = true;
