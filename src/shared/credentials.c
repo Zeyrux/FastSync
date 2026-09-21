@@ -71,6 +71,31 @@ static bool is_comment_char(char c) {
   return c == '#' || c == ';';
 }
 
+/* True for a literal fd-backed store path: exactly "/dev/fd/<digits>" or
+ * "/proc/self/fd/<digits>", with no trailing component and no "..".  These name
+ * the calling process's own open descriptors (e.g. a bash process substitution
+ * `<(...)`, which passes /dev/fd/N), and both prefixes are symlinks by
+ * construction. */
+static bool is_fd_backed_path(const char* path) {
+  static const char* const prefixes[] = {"/dev/fd/", "/proc/self/fd/"};
+  if (!path)
+    return false;
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    const char* prefix = prefixes[i];
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(path, prefix, prefix_len) != 0)
+      continue;
+    const char* digits = path + prefix_len;
+    if (*digits < '0' || *digits > '9')
+      return false;
+    const char* p = digits;
+    while (*p >= '0' && *p <= '9')
+      p++;
+    return *p == '\0';
+  }
+  return false;
+}
+
 /* Open a --password-file / --early-input after verifying the EXACT inode we
  * will read: it must be owned by the effective user and grant no group/other
  * permission bit (so 0600 and stricter modes such as 0400 are accepted),
@@ -81,7 +106,14 @@ static bool is_comment_char(char c) {
  * and reopening it), so the permission decision is made on the same inode that
  * is read and cannot be raced by swapping the path between check and open.
  * O_NOFOLLOW refuses a symlinked path outright (ELOOP fails closed) instead of
- * following it before the owner/mode gate can run.  O_NONBLOCK keeps a FIFO
+ * following it before the owner/mode gate can run.  The one exception is a
+ * literal fd-backed path (/dev/fd/N or /proc/self/fd/N, see
+ * is_fd_backed_path): those entries are symlinks to the CALLING process's own
+ * descriptors, so following them is not the untrusted-symlink hazard
+ * O_NOFOLLOW guards against, and requiring O_NOFOLLOW would break the
+ * documented process-substitution/FIFO usage.  For them only, O_NOFOLLOW is
+ * omitted; the same fstat owner/mode gate still applies to the resolved inode.
+ * O_NONBLOCK keeps a FIFO
  * from blocking the open/read forever: an empty or writer-less FIFO yields
  * EOF/EAGAIN rather than hanging in fgets.  Only regular files and FIFOs pass
  * the ownership/mode checks; O_NONBLOCK is cleared for regular files, where it
@@ -89,7 +121,10 @@ static bool is_comment_char(char c) {
  *
  * Returns a FILE* the caller must fclose, or NULL with `err` filled. */
 static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
-  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+  if (!is_fd_backed_path(path))
+    flags |= O_NOFOLLOW;
+  int fd = open(path, flags);
   if (fd < 0) {
     set_error(err, err_size, "cannot open secret file '%s': %s", path, strerror(errno));
     return NULL;
