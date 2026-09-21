@@ -11,12 +11,17 @@ The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).
 **120 ✅ / 10 ⚠️ / 27 ❌** of 157 rows.
 
 An audit cycle follows on the same wire version (`PROTOCOL_VERSION` stays
-2.28.0): a security-and-correctness pass over the parity-2.29 baseline. It fixes
+2.28.0): a security-and-correctness pass over the parity-2.29 baseline, plus a
+set of audit follow-ups (filter merge modifiers, the `--inplace`/`--partial-dir`
+conflict, credential-file hardening, and small leak/log/test fixes). It fixes
 a `--temp-dir` symlink escape, gates client-controlled special permission bits,
-corrects `--partial-dir`/`--bwlimit`/`-z` behavior, rejects unsupported filter
-modifiers, and tightens client and wire validation. No parity row changes
-classification, so the matrix stays **120 ✅ / 10 ⚠️ / 27 ❌** of 157 rows; the
-affected rows' notes and the summary tally in `RSYNC_COMPAT.md` were updated.
+corrects `--partial-dir`/`--bwlimit`/`-z` behavior, handles unsupported filter
+modifiers, and tightens client and wire validation. The only parity
+reclassification is `--filter=RULE` moving ✅ → ⚠️, because its merge-only
+`e`/`n`/`w`/`-` modifiers are now accepted and consumed but their semantics
+remain unimplemented (accepted-but-ignored); the matrix is therefore **119 ✅ /
+11 ⚠️ / 27 ❌** of 157 rows. The affected rows' notes and the summary tally in
+`RSYNC_COMPAT.md` were updated.
 
 ### Changed
 
@@ -73,8 +78,10 @@ affected rows' notes and the summary tally in `RSYNC_COMPAT.md` were updated.
   conventional `022`, so implied parent directories created without `-p` are no
   longer world-writable `0777`.
 - **Credentials and signal handling hardened.** Secret files are opened with
-  `O_NOFOLLOW|O_NONBLOCK` (while allowing fd-backed store paths), and signal
-  handlers use `sigaction` with async-signal-safe bodies.
+  `O_NOFOLLOW|O_NONBLOCK` (while allowing fd-backed store paths and bound-waiting
+  a FIFO read for ~3 s so a slow process substitution works but a connected-but-
+  silent FIFO cannot hang), and signal handlers use `sigaction` with
+  async-signal-safe bodies.
 
 ### Fixed
 
@@ -90,20 +97,35 @@ affected rows' notes and the summary tally in `RSYNC_COMPAT.md` were updated.
 - **`--partial-dir` implies `--partial`.** Matching rsync 3.4.1 (which sets
   `keep_partial` after option parsing), `--partial-dir=DIR` alone retains an
   interrupted transfer's partial and wins over an explicit `--no-partial`;
-  `--inplace` still bypasses the partial machinery.
-- **Unsupported filter modifiers rejected.** The `x` xattr-name modifier and the
-  merge-only `e`/`n`/`w` modifiers are rejected with a clear error instead of
-  being silently ignored (`x` on merge/dir-merge rules) or folded into the
-  pattern (producing misleading merge-file errors). Glued patterns (`-newfile`,
-  `-e2e`) and mixed tokens (`H,!secret`) keep their historical parsing.
+  `--inplace` still bypasses the partial machinery, and combining `--inplace`
+  with `--partial-dir` is now rejected up front with rsync's message
+  (`--inplace cannot be used with --partial-dir`).
+- **Filter modifiers handled.** The `x` xattr-name modifier is rejected with a
+  clear error everywhere. The merge-only `e`/`n`/`w` and `-` modifiers are now
+  accepted and consumed on `merge`/`dir-merge` rules (so they no longer leak
+  into the merge filename) while still being rejected on non-merge rules,
+  matching rsync; their semantics remain unimplemented (accepted-but-ignored).
+  Glued patterns (`-newfile`, `-e2e`) and mixed tokens (`H,!secret`) keep their
+  historical parsing.
+- **Credential-file reads hardened.** Secret files (`--password-file`/
+  `--early-input`/`--hash-credentials` input) are opened with `O_NOFOLLOW`, so a
+  symlinked credential path now fails closed (`ELOOP`) instead of being followed
+  before the owner/mode gate; literal fd-backed paths (`/dev/fd/<digits>`,
+  `/proc/self/fd/<digits>`) are exempt so process substitution still works. A
+  FIFO/process-substitution read now waits under a bounded ~3 s deadline for its
+  writer, so a slow producer works while a connected-but-silent FIFO fails
+  instead of hanging.
 - **Miscellaneous correctness fixes:** `--filter` rule count is checked
   client-side against `MAX_FILTER_RULES` before any network I/O (the receiver
   still re-checks the expanded count); unknown wire `Status` values are rejected
   as protocol errors; a mutex leak on an init-failure path, an `errno` read
   after `free()` in deferred delete application, `log_perror` misuse for
   non-`errno` conditions, and a `NULL` `server_host`/`ssh_destination`
-  allocation path were fixed; `SSL_read` length is clamped and `sendfile`
-  `poll()` retries on `EINTR`.
+  allocation path were fixed (the `config_create` failure now releases through
+  `config_delete`); the decompression-limit log now prints the effective bound
+  rather than the compile-time ceiling; the daemon umask and root test fixtures
+  were hardened; `SSL_read` length is clamped and `sendfile` `poll()` retries on
+  `EINTR`.
 
 ### Refactored / Docs
 

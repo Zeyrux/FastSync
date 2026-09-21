@@ -43,7 +43,7 @@ cmake -B build -S . -DSANITIZER=undefined         # UndefinedBehaviorSanitizer (
 cmake -B build -S . -DSANITIZER=thread            # ThreadSanitizer (TSan); local-only, NOT in CI
 ```
 
-The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4 --dist=load`). The full coverage jobs (full integration suite as `-m "not setpriv"`, the `address`+`undefined` sanitizer matrix, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes. TSan is not part of the CI matrix and is a local-only configuration. The four `setpriv` privilege tests are excluded from CI via a marker because their result depends on the runner/container uid and host mount permissions.
+The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4 --dist=load`). The full coverage jobs (full integration suite as `-m "not setpriv"`, the `address`+`undefined` sanitizer matrix, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes. TSan is not part of the CI matrix and is a local-only configuration. The `setpriv`-marked privilege tests (four decorated functions, collecting to eight instances because two are parametrized) are excluded from CI via a marker because their result depends on the runner/container uid and host mount permissions.
 
 ## Build
 
