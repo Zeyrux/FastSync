@@ -54,13 +54,26 @@ bool client_abort_pending(void) {
 }
 
 #ifndef FASTSYNC_TEST_BUILD
+/* SIG_DFL disposition used by the handler's "not armed" fallback.  It is built
+ * once at load time so the handler can restore the default action with
+ * sigaction(2) -- which is async-signal-safe -- instead of signal(3), which is
+ * not.  The zero-initialized sa_mask is the empty set. */
+static const struct sigaction client_default_action = {
+    .sa_handler = SIG_DFL,
+    .sa_flags = 0,
+};
+
 /* Signal handler: perform NO work beyond storing the flag.  Logging, protocol
  * I/O and the STATUS_ABORT frame are all done later on the normal send path,
- * which is not async-signal-safe.  When no transfer is armed, fall back to the
- * default action so local-only modes remain interruptible. */
+ * which is not async-signal-safe.  When no transfer is armed, restore the
+ * default disposition (async-signal-safe sigaction) and re-raise so local-only
+ * modes remain interruptible.  The handler deliberately stays installed while a
+ * transfer is armed -- rather than using SA_RESETHAND -- so a second Ctrl-C
+ * during the graceful abort keeps setting the flag instead of hard-killing the
+ * process mid-cleanup. */
 static void client_signal_handler(int signo) {
   if (!client_abort_armed) {
-    signal(signo, SIG_DFL);
+    sigaction(signo, &client_default_action, NULL);
     raise(signo);
     return;
   }
