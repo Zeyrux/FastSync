@@ -610,8 +610,8 @@ remote SSH argv is already built injection-safe.
 | `--backup-dir <dir>` | Store backups under a separate directory (requires `--backup`). |
 | `--suffix <suffix>` | Set the backup filename suffix (default: `~`). |
 | `--partial` | Select partial-transfer handling. On failed/interrupted writes the already-written temp file is retained (best-effort) for resumption. With `--partial --partial-dir <dir>`, completed files are written under the partial directory and installed atomically. |
-| `--partial-dir <dir>` | Set a relative partial-transfer directory below the server destination root. Implies `--partial` (unless `--inplace`, which bypasses the partial/temp staging). |
-| `--inplace` | Write directly to the destination instead of using a temporary file. |
+| `--partial-dir <dir>` | Set a relative partial-transfer directory below the server destination root. Implies `--partial`. Rejected together with `--inplace` (`--inplace cannot be used with --partial-dir`, matching rsync), because the inplace path bypasses partial/temp staging. |
+| `--inplace` | Write directly to the destination instead of using a temporary file. Cannot be combined with `--partial-dir`. |
 | `--fsync` | Fsync every written file before publication. |
 | `--write-batch=FILE` | Run the normal live transfer and also emit a self-contained batch file of the source tree. |
 | `--only-write-batch=FILE` | Emit the batch file only (no destination, no server). |
