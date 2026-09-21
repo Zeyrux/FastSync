@@ -226,6 +226,7 @@ set(TEST_SRCS
 	tests/test_file.c
 	tests/test_file_list.c
 	tests/test_file_sendfile.c
+	tests/test_filter.c
 	tests/test_format.c
 	tests/test_fuzz_smoke.c
 	tests/test_glob.c

@@ -23,7 +23,9 @@
  *   dir-merge/: per-directory merge file (registered for the scanner)
  *   clear/!     clear the current rule list (takes no argument)
  * Modifiers: '/' absolute anchor, '!' negate match, 'C' inject CVS defaults,
- * 's' sender side, 'r' receiver side, 'p' perishable, 'x' xattr name rule.
+ * 's' sender side, 'r' receiver side, 'p' perishable.  The rsync 'x'
+ * (xattr-name) modifier and the merge-only 'e'/'n'/'w' modifiers are not
+ * implemented and are rejected explicitly.
  * A trailing '/' makes a pattern match directories only.  A leading '/' anchors
  * the pattern to its owner directory.
  */
