@@ -578,13 +578,18 @@ static void test_parse_args_partial_dir_implies_partial() {
     config_delete(cfg);
   }
   {
-    /* --inplace bypasses partial staging: the implication must not fire. */
+    /* --inplace bypasses partial staging, so parse_args must not set the
+       implied --partial; the combination itself is invalid (rsync parity:
+       "--inplace cannot be used with --partial-dir"), so validation rejects. */
     Config* cfg = config_create();
     char* argv[] = {"fastsync", "--inplace", "--partial-dir=.partial", "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
     EXPECT_FALSE(cfg->partial);
+    cfg->send_directory = str_dup("/src");
+    cfg->receive_root_directory = str_dup("/dst");
+    EXPECT_FALSE(validate_config(cfg));
     config_delete(cfg);
   }
   {

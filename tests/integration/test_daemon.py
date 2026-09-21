@@ -63,6 +63,10 @@ DETACH_MODULE = os.path.join(MODULE_ROOT, "detach")
 DETACH_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_detach.conf")
 DETACH_PORT = None
 
+# A dedicated config for the umask test: the daemon must be launched in the real
+# (double-fork) detach path, whose daemonize() applies umask(022).
+UMASK_CONF = os.path.join(TEST_DATA_DIR, "fastsyncd_umask.conf")
+
 # Passwords are never sent as plaintext and never logged; these literals are
 # only hashed into the server credential file / client password file.
 ALICE_PASS = "alice-s3cret"
@@ -332,20 +336,43 @@ class TestDaemonModuleSelection:
         assert not missing, f"missing: {missing[:5]}"
         assert not mismatches, f"mismatch: {mismatches[:5]}"
 
-    def test_daemon_new_dirs_not_world_writable(self, daemon):
+    def test_daemon_new_dirs_not_world_writable(self):
         """The daemon must not force umask 0: implied parent directories created
-        without -p are the source default (0755 under a 022 umask), never
-        world-writable 0777."""
+        without -p are the source default (0755 under the daemon's 022 umask),
+        never world-writable 0777.
+
+        This drives the real double-fork detach path, where the umask(022) fix
+        lives (daemonize()); the --no-detach path never calls it.  The launcher
+        is run with umask 0, so without the fix the daemon would inherit 0 and
+        create a 0777 directory; with the fix the assertion below fails only if
+        the fix regresses."""
+        port = _find_free_port()
+        with open(UMASK_CONF, "w") as f:
+            f.write("port = %d\n\n[files]\npath = %s\n" % (port, FILES_MODULE))
         sub = os.path.join(FILES_MODULE, "umask_check")
         shutil.rmtree(sub, ignore_errors=True)
         os.makedirs(sub, exist_ok=True)
-        result = _push("127.0.0.1::files/umask_check", daemon.port)
-        assert result.returncode == 0, result.stderr or result.stdout
-        received = get_dest_received_dir(sub, SOURCE_DIR)
-        nested = os.path.join(received, "nested")
-        assert os.path.isdir(nested), f"nested dir missing under {received}"
-        mode = stat.S_IMODE(os.stat(nested).st_mode)
-        assert (mode & 0o022) == 0, f"implied directory is group/other writable: {oct(mode)}"
+        log_path = os.path.join(TEST_DATA_DIR, "fastsyncd_umask.log")
+        log = open(log_path, "w")
+        cmd = SERVER_CMD + ["--daemon", "--config", UMASK_CONF, "--allow-unauthenticated"]
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                preexec_fn=lambda: os.umask(0))
+        try:
+            _wait_for_port(port, timeout=15)
+            result = _push("127.0.0.1::files/umask_check", port)
+            assert result.returncode == 0, result.stderr or result.stdout
+            received = get_dest_received_dir(sub, SOURCE_DIR)
+            nested = os.path.join(received, "nested")
+            assert os.path.isdir(nested), f"nested dir missing under {received}"
+            mode = stat.S_IMODE(os.stat(nested).st_mode)
+            assert (mode & 0o022) == 0, f"implied directory is group/other writable: {oct(mode)}"
+        finally:
+            _kill_by_cmdline_marker(UMASK_CONF)
+            log.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 class TestDaemonRejection:
