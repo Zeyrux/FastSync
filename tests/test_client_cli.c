@@ -511,6 +511,61 @@ static void test_parse_args_ignore_existing() {
   config_delete(cfg);
 }
 
+/* --partial-dir=DIR implies --partial, matching rsync 3.4.1.  rsync resolves
+ * this after option parsing, so the implication wins over an explicit
+ * --no-partial in either order.  It is skipped under --inplace, where partial
+ * staging is bypassed and the destination is written in place. */
+static void test_parse_args_partial_dir_implies_partial() {
+  {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* Explicit --no-partial before --partial-dir: --partial-dir still wins. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--no-partial", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* Reversed order must not change the precedence. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--partial-dir=.partial", "--no-partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* --inplace bypasses partial staging: the implication must not fire. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--inplace", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--no-partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->partial);
+    config_delete(cfg);
+  }
+}
+
 static void test_parse_args_executability() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "-E", "/src", "/dst"};
@@ -4784,6 +4839,7 @@ void test_client_cli() {
   test_parse_args_valid_port();
   test_parse_args_size_only();
   test_parse_args_ignore_existing();
+  test_parse_args_partial_dir_implies_partial();
   test_parse_args_executability();
   test_parse_args_chmod();
   test_parse_args_numeric_chmod();

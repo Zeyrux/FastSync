@@ -2612,6 +2612,15 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   if (config->use_delete && !config->delete_before && !config->delete_during &&
       !config->delete_delay && !config->delete_after)
     config->delete_during = true;
+  /* rsync parity: --partial-dir=DIR chooses where an interrupted transfer's
+     partial file is kept, so it implies --partial.  rsync applies the
+     implication after option parsing, so it wins over an explicit --no-partial
+     regardless of the order the two options appear in (verified on rsync
+     3.4.1).  --inplace is the exception: the destination file is written in
+     place with no partial/temp staging, so the partial machinery is bypassed
+     and the implication is skipped to leave --inplace behavior untouched. */
+  if (config->partial_dir && !config->inplace)
+    config->partial = true;
   if (config->compress_choice) {
     int algo = compression_algo_from_name(config->compress_choice);
     if (algo >= 0) {

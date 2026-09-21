@@ -288,7 +288,7 @@ void print_usage(void) {
   printf("  --log-file <path>, --log-file=<path>  Write log messages to file\n");
   printf("  --stderr=MODE       Route logging to stderr: errors or all\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
-  printf("  --partial-dir <dir> Directory for partial files\n");
+  printf("  --partial-dir <dir> Directory for partial files (implies --partial)\n");
   printf("  -T, --temp-dir <dir>  Scratch dir for temp files before atomic install.\n");
   printf("                      Confined to the receive root: a relative dir resolves below\n");
   printf("                      it and an absolute/traversal dir is rejected.  The dir must\n");
