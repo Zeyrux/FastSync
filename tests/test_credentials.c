@@ -719,6 +719,50 @@ static void test_credentials_read_secret_file_bad() {
   EXPECT_EQ_INT(credentials_read_secret_file(missing, NULL, NULL, err, sizeof(err)), -1);
 }
 
+/* A symlink planted at a password-file path is refused (O_NOFOLLOW) instead of
+ * being followed before the owner/mode gate, even when it resolves to a valid
+ * owner-only regular file. */
+static void test_credentials_read_secret_file_symlink_rejected() {
+  char err[512];
+  char* target = make_tmp_file("alice:correct horse battery staple\n");
+  EXPECT_NOT_NULL(target);
+
+  char link[256];
+  snprintf(link, sizeof(link), "/tmp/fs_cred_pwlink_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(link);
+  EXPECT_EQ_INT(symlink(target, link), 0);
+
+  char* user = (char*)1;
+  char* password = (char*)1;
+  EXPECT_EQ_INT(credentials_read_secret_file(link, &user, &password, err, sizeof(err)), -1);
+  EXPECT_NULL(user);
+  EXPECT_NULL(password);
+  EXPECT_TRUE(err[0] != '\0');
+
+  unlink(link); /* remove the symlink itself, not its target */
+  rm_temp(target);
+  free(target);
+}
+
+/* A named FIFO with no writer must not hang in fgets (O_NONBLOCK): the read
+ * fails cleanly with "no user:password line" instead of blocking forever. */
+static void test_credentials_read_secret_file_fifo_no_hang() {
+  char err[512];
+  char fifo[256];
+  snprintf(fifo, sizeof(fifo), "/tmp/fs_cred_pwfifo_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(fifo);
+  EXPECT_EQ_INT(mkfifo(fifo, 0600), 0);
+
+  char* user = (char*)1;
+  char* password = (char*)1;
+  EXPECT_EQ_INT(credentials_read_secret_file(fifo, &user, &password, err, sizeof(err)), -1);
+  EXPECT_NULL(user);
+  EXPECT_NULL(password);
+  EXPECT_TRUE(strstr(err, "no 'user:password'") != NULL || err[0] != '\0');
+
+  unlink(fifo);
+}
+
 static void test_credentials_hash_file() {
   char* plaintext = make_tmp_file("# comment\n\n alice :" KAT_PASSWORD "\nbob:bob-s3cret\n");
   EXPECT_NOT_NULL(plaintext);
@@ -1103,6 +1147,8 @@ void test_credentials(void) {
   test_credentials_early_input_merge();
   test_credentials_read_secret_file();
   test_credentials_read_secret_file_bad();
+  test_credentials_read_secret_file_symlink_rejected();
+  test_credentials_read_secret_file_fifo_no_hang();
   test_credentials_hash_file();
   test_credentials_rejects_group_or_other_accessible();
   test_credentials_dummy_key_persisted();
