@@ -2275,6 +2275,36 @@ class TestPartialDir:
         partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
         assert not os.path.exists(partial)
 
+    def test_partial_dir_alone_implies_partial(self, shared_server):
+        """--partial-dir=DIR with no --partial implies --partial, like rsync.
+
+        rsync 3.4.1 retains the staged partial when --partial-dir is given by
+        itself; before the implication was added FastSync discarded it.  The
+        transfer is made to fail deterministically by placing a non-empty
+        directory at the destination path, so the final partial-dir ->
+        destination rename fails and whatever was staged under the partial dir
+        stays on disk."""
+        source = os.path.join(TEST_DATA_DIR, "partial_dir_implied_src")
+        dest = os.path.join(TEST_DATA_DIR, "partial_dir_implied_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.bin")
+        with open(source_file, "wb") as f:
+            f.write(b"partial payload")
+
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(os.path.join(received, "f.bin"))
+        with open(os.path.join(received, "f.bin", "keep"), "wb") as f:
+            f.write(b"keep")
+
+        result, _ = run_client(source, dest, flags=["--partial-dir=.partial"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "expected the blocked install to fail"
+
+        partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
+        assert os.path.exists(partial), \
+            "--partial-dir alone must imply --partial and retain the partial file"
+
 
 class TestLargeFile:
     def test_transfer_100mb_file(self, shared_server):
