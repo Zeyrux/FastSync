@@ -1329,33 +1329,76 @@ static void test_parse_args_delete_timing_without_delete_rejected() {
   config_delete(cfg);
 }
 
-/* Parsed-but-unimplemented options must fail instead of being silently accepted. */
-static void test_parse_args_rejects_unimplemented_options() {
-  static const char* const options[] = {"--silent",
-                                        "--queue-size",
-                                        "-A",
-                                        "--acls",
-                                        "-X",
-                                        "--xattrs",
-                                        "-D",
-                                        "--devices",
-                                        "--delete-excluded",
-                                        "--max-delete",
-                                        "--prune-empty-dirs",
-                                        "--bind-address",
-                                        "--daemon",
-                                        "--config",
-                                        "--server"};
+/* Truly-unknown options (including server-only spellings) must be rejected
+ * through the unknown-option path instead of being silently accepted. */
+static void test_parse_args_rejects_unknown_options() {
+  static const char* const options[] = {"--silent", "--queue-size", "--bind-address",
+                                        "--daemon", "--config",     "--server"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
-    char* argv[] = {"fastsync", (char*)options[i], "dummy", "/src", "/dst"};
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
 
-    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+}
+
+/* Options that are genuinely implemented must parse successfully and record
+ * their effect, rather than being lumped in with the unknown-option set. */
+static void test_parse_args_accepts_implemented_metadata_options() {
+  Config* cfg = config_create();
+  char* argv_x[] = {"fastsync", "-X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_x, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_acls[] = {"fastsync", "--acls", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_acls, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_acls);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_d[] = {"fastsync", "-D", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_d, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_devices[] = {"fastsync", "--devices", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_devices, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_delete_excluded[] = {"fastsync", "--delete-excluded", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_delete_excluded, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->delete_excluded);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_max_delete[] = {"fastsync", "--max-delete=5", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_max_delete, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->max_delete, 5);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_prune[] = {"fastsync", "--prune-empty-dirs", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_prune, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->prune_empty_dirs);
+  config_delete(cfg);
 }
 
 /* Test both rsync-compatible quiet spellings and option ordering. */
@@ -4908,7 +4951,8 @@ void test_client_cli() {
   test_parse_args_delete_default_timing_and_commit();
   test_parse_args_delete_timing_conflict_rejected();
   test_parse_args_delete_timing_without_delete_rejected();
-  test_parse_args_rejects_unimplemented_options();
+  test_parse_args_rejects_unknown_options();
+  test_parse_args_accepts_implemented_metadata_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();
   test_parse_args_hard_links();
