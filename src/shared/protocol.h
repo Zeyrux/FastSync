@@ -220,6 +220,12 @@ SSL* io_get_ssl(void);
 unsigned long long protocol_bytes_written(void);
 unsigned long long protocol_bytes_read(void);
 void protocol_note_bytes_written(unsigned long long bytes);
+/* Apply --bwlimit pacing to bytes written outside protocol_send_n_data (the
+ * plaintext zero-copy sendfile fast path).  Resolves the bound/legacy session
+ * exactly as send_n_data does and runs the same token-bucket throttle, so the
+ * sendfile transport is paced identically to the buffered/TLS paths.  A no-op
+ * when the effective session has no bandwidth limit. */
+void protocol_throttle_bytes(size_t bytes);
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
 /* Transitional bridge for helpers whose signatures still carry only an fd. */

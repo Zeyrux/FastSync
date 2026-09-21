@@ -2,6 +2,7 @@
 #include "test_utils.h"
 #include <limits.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <threads.h>
 
@@ -669,6 +670,50 @@ static void test_receive_status_keepalive_emits() {
   close(to_peer[1]);
 }
 
+/* protocol_throttle_bytes() must apply the same token-bucket pacing as the
+ * buffered protocol send path, so the plaintext sendfile fast path honors
+ * --bwlimit exactly like the TLS path.  With bwlimit=1 MB/s the initial burst
+ * is 100 KB (bwlimit/10); pacing 150 KB therefore owes ~50 KB of debt, i.e. a
+ * ~50 ms sleep. */
+static void test_protocol_throttle_bytes_paces() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_bind(&session);
+  protocol_session_set_bwlimit(&session, 1000000ULL);
+
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  protocol_throttle_bytes(150000);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long elapsed_ms =
+      (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+  /* Allow for scheduler slack but require the bulk of the expected 50 ms. */
+  EXPECT_TRUE(elapsed_ms >= 40);
+
+  protocol_session_unbind();
+}
+
+/* With no bandwidth limit the primitive must not sleep, however many bytes it
+ * is handed. */
+static void test_protocol_throttle_bytes_unlimited() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_bind(&session);
+  protocol_session_set_bwlimit(&session, 0);
+
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  protocol_throttle_bytes(100000000ULL);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long elapsed_ms =
+      (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+  EXPECT_TRUE(elapsed_ms < 50);
+
+  protocol_session_unbind();
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -698,4 +743,6 @@ void test_protocol() {
   test_protocol_accounting_release_does_not_underflow();
   test_receive_data_charge_follows_owning_session();
   test_data_create_starts_uncharged_and_unowned();
+  test_protocol_throttle_bytes_paces();
+  test_protocol_throttle_bytes_unlimited();
 }
