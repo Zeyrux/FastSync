@@ -8,11 +8,13 @@
 #include <openssl/evp.h>
 #include <openssl/params.h>
 #include <openssl/rand.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* One store entry: a username and its salted PBKDF2 verifier.  The plaintext
@@ -105,11 +107,16 @@ static bool is_fd_backed_path(const char* path) {
  * O_NOFOLLOW guards against, and requiring O_NOFOLLOW would break the
  * documented process-substitution/FIFO usage.  For them only, O_NOFOLLOW is
  * omitted; the same fstat owner/mode gate still applies to the resolved inode.
- * O_NONBLOCK keeps a FIFO
- * from blocking the open/read forever: an empty or writer-less FIFO yields
- * EOF/EAGAIN rather than hanging in fgets.  Only regular files and FIFOs pass
- * the ownership/mode checks; O_NONBLOCK is cleared for regular files, where it
- * is a no-op anyway, so their stdio read path is byte-for-byte unchanged.
+ * O_NONBLOCK keeps the OPEN itself from
+ * blocking forever on a writer-less FIFO (a blocking O_RDONLY open would wait
+ * for a writer).  The fd is left nonblocking for FIFOs so a read never blocks
+ * either; the read loop (secret_read_line) absorbs the resulting EAGAIN by
+ * waiting, under a bounded deadline, for the writer -- this is what makes a
+ * slow process substitution (`--password-file <(sleep 1; ...)`) work while a
+ * writer-less FIFO still fails after the deadline instead of hanging.  Only
+ * regular files and FIFOs pass the ownership/mode checks; O_NONBLOCK is
+ * cleared for regular files, where it is a no-op anyway and no EAGAIN can
+ * occur, so their stdio read path is byte-for-byte unchanged.
  *
  * Returns a FILE* the caller must fclose, or NULL with `err` filled. */
 static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
@@ -152,6 +159,123 @@ static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
     return NULL;
   }
   return fp;
+}
+
+/* Overall bound on how long the reader waits for a process-substitution/FIFO
+ * writer to produce data before giving up.  It must comfortably exceed a
+ * producer's startup delay (e.g. `--password-file <(sleep 1; ...)`) while still
+ * bounding a writer-less FIFO, so a stray or hostile FIFO cannot stall the
+ * daemon or client indefinitely. */
+#define CREDENTIAL_FIFO_READ_TIMEOUT_MS 3000
+
+/* Monotonic milliseconds, used only for the read deadline (wall-clock changes
+ * must not extend or shorten the wait). */
+static int64_t credential_monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return 0;
+  return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Wait until `fd` is readable or the deadline passes.  Returns true when it is
+ * readable, false on timeout or a poll error (err filled).  EINTR is retried
+ * against the same deadline, so signals cannot extend the wait. */
+static bool credential_wait_readable(int fd, int64_t deadline, const char* label, const char* path,
+                                     char* err, size_t err_size) {
+  for (;;) {
+    int64_t remaining = deadline - credential_monotonic_ms();
+    if (remaining <= 0)
+      break;
+    if (remaining > INT_MAX)
+      remaining = INT_MAX;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int rc = poll(&pfd, 1, (int)remaining);
+    if (rc > 0)
+      return true;
+    if (rc == 0)
+      break;
+    if (errno != EINTR) {
+      set_error(err, err_size, "error waiting for %s '%s': %s", label, path, strerror(errno));
+      return false;
+    }
+  }
+  set_error(err, err_size, "timed out after %d ms waiting for %s '%s'",
+            CREDENTIAL_FIFO_READ_TIMEOUT_MS, label, path);
+  return false;
+}
+
+typedef enum {
+  SECRET_READ_LINE,
+  SECRET_READ_EOF,
+  SECRET_READ_ERROR,
+} SecretReadResult;
+
+/* Read one complete line from `fp` into `line` (capacity `cap`), including the
+ * trailing newline when present and always NUL-terminating.  `*out_len`
+ * receives strlen(line).
+ *
+ * A regular file is read exactly as before: secret_file_open leaves it
+ * blocking, so fgets never sees EAGAIN.  A FIFO stays nonblocking, so fgets
+ * returns NULL (or a partial line) with EAGAIN while the writer is still
+ * starting up; instead of treating that as a fatal error the loop clearerr()s
+ * and polls for readability against one overall deadline.  The `used`
+ * accumulator reassembles a line that arrived in several write()s into a single
+ * line, so a split write is not misparsed as two entries.
+ *
+ * Returns SECRET_READ_LINE, SECRET_READ_EOF, or SECRET_READ_ERROR (err filled)
+ * on timeout or a genuine read error. */
+static SecretReadResult secret_read_line(char* line, size_t cap, FILE* fp, const char* label,
+                                         const char* path, size_t* out_len, char* err,
+                                         size_t err_size) {
+  int fd = fileno(fp);
+  int64_t deadline = credential_monotonic_ms() + CREDENTIAL_FIFO_READ_TIMEOUT_MS;
+  size_t used = 0;
+  line[0] = '\0';
+  for (;;) {
+    errno = 0;
+    if (fgets(line + used, (int)(cap - used), fp)) {
+      used += strlen(line + used);
+      if (used > 0 && line[used - 1] == '\n') {
+        *out_len = used;
+        return SECRET_READ_LINE;
+      }
+      if (feof(fp)) {
+        *out_len = used; /* final unterminated line */
+        return SECRET_READ_LINE;
+      }
+      /* No newline and not EOF.  A full buffer is the caller's over-long-line
+       * case; otherwise the line is only partially available (a nonblocking
+       * FIFO under a slow writer), so any genuine read error fails and anything
+       * else waits for the rest. */
+      if (used >= cap - 1) {
+        *out_len = used;
+        return SECRET_READ_LINE;
+      }
+      int e = ferror(fp) ? errno : 0;
+      if (e != 0 && e != EAGAIN && e != EWOULDBLOCK) {
+        set_error(err, err_size, "error reading %s '%s': %s", label, path, strerror(e));
+        return SECRET_READ_ERROR;
+      }
+      clearerr(fp);
+      if (!credential_wait_readable(fd, deadline, label, path, err, err_size))
+        return SECRET_READ_ERROR;
+      continue;
+    }
+    /* fgets returned NULL: EOF, a not-yet-readable FIFO, or a real error. */
+    if (feof(fp)) {
+      *out_len = used;
+      return used > 0 ? SECRET_READ_LINE : SECRET_READ_EOF;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      clearerr(fp);
+      if (!credential_wait_readable(fd, deadline, label, path, err, err_size))
+        return SECRET_READ_ERROR;
+      continue;
+    }
+    set_error(err, err_size, "error reading %s '%s': %s", label, path,
+              errno != 0 ? strerror(errno) : "read failed");
+    return SECRET_READ_ERROR;
+  }
 }
 
 /* Trim leading/trailing ASCII space and tab in place; returns the new start. */
@@ -549,9 +673,17 @@ static CredentialStore* load_store_file(const char* path, char* err, size_t err_
   char line[CREDENTIAL_MAX_LINE + 2];
   bool ok = true;
 
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
+    size_t len = 0;
+    SecretReadResult rr =
+        secret_read_line(line, sizeof(line), fp, "credential file", path, &len, err, err_size);
+    if (rr == SECRET_READ_EOF)
+      break;
+    if (rr == SECRET_READ_ERROR) {
+      ok = false;
+      break;
+    }
     line_no++;
-    size_t len = strlen(line);
     if (len == CREDENTIAL_MAX_LINE + 1 && line[len - 1] != '\n' && !feof(fp)) {
       set_error(err, err_size, "credential file '%s' line %d exceeds the %d-byte limit", path,
                 line_no, CREDENTIAL_MAX_LINE);
@@ -1188,9 +1320,17 @@ int credentials_hash_file(const char* path, uint32_t iters, FILE* out, char* err
   int line_no = 0;
   int result = 0;
   char line[CREDENTIAL_MAX_LINE + 2];
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
+    size_t len = 0;
+    SecretReadResult rr =
+        secret_read_line(line, sizeof(line), fp, "plaintext file", path, &len, err, err_size);
+    if (rr == SECRET_READ_EOF)
+      break;
+    if (rr == SECRET_READ_ERROR) {
+      result = -1;
+      break;
+    }
     line_no++;
-    size_t len = strlen(line);
     if (len == CREDENTIAL_MAX_LINE + 1 && line[len - 1] != '\n' && !feof(fp)) {
       set_error(err, err_size, "plaintext file '%s' line %d exceeds the %d-byte limit", path,
                 line_no, CREDENTIAL_MAX_LINE);
@@ -1268,9 +1408,15 @@ int credentials_read_secret_file(const char* path, char** user_out, char** passw
   char line[CREDENTIAL_MAX_LINE + 2];
   int result = -1;
 
-  while (fgets(line, sizeof(line), fp)) {
+  for (;;) {
+    size_t len = 0;
+    SecretReadResult rr =
+        secret_read_line(line, sizeof(line), fp, "password file", path, &len, err, err_size);
+    if (rr == SECRET_READ_EOF)
+      break;
+    if (rr == SECRET_READ_ERROR)
+      goto done;
     line_no++;
-    size_t len = strlen(line);
     if (len == CREDENTIAL_MAX_LINE + 1 && line[len - 1] != '\n' && !feof(fp)) {
       set_error(err, err_size, "password file '%s' line %d exceeds the %d-byte limit", path,
                 line_no, CREDENTIAL_MAX_LINE);
