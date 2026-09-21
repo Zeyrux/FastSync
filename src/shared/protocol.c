@@ -390,7 +390,7 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
     if (session->ssl)
       wait_events = POLLOUT;
   }
-  log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zu", total_bytes_send);
+  log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zd", total_bytes_send);
   atomic_fetch_add(&io_bytes_written, (unsigned long long)total_bytes_send);
   return true;
 }

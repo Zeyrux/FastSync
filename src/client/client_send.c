@@ -1967,7 +1967,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
       send_status(client->file_descriptor, STATUS_ERROR);
       return -1;
     }
-    log_debug_message(LOG_DEBUG_RECV, "recv: delta signature for %s (%d blocks)",
+    log_debug_message(LOG_DEBUG_RECV, "recv: delta signature for %s (%u blocks)",
                       file_wire_path(file), sig->block_count);
     *out_sig = sig;
     return 2;

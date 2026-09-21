@@ -165,7 +165,7 @@ void print_usage(void) {
   printf("                    --no-delta, or --no-incremental)\n");
   printf("  --no-fuzzy          Disable --fuzzy\n");
   printf("  -B <n>, --block-size <n>, --delta-block <n>\n");
-  printf("                    Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
+  printf("                    Delta block size in bytes (default: %u)\n", DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
          DELTA_MAX_FILE_SIZE);
   printf("  -j, --threads[=N]   Enable the multithreaded scanner/loader/sender\n");

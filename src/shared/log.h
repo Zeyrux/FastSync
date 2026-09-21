@@ -5,6 +5,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Ask the compiler to type-check the printf-style arguments of the variadic
+ * logging helpers.  Only enabled for GNU-compatible compilers (gcc/clang). */
+#if defined(__GNUC__)
+#define LOG_PRINTF_ATTR(fmt_idx, first_vararg_idx)                                                 \
+  __attribute__((format(printf, fmt_idx, first_vararg_idx)))
+#else
+#define LOG_PRINTF_ATTR(fmt_idx, first_vararg_idx)
+#endif
+
 typedef enum { LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARNING, LOG_LEVEL_ERROR } LogLevel;
 typedef enum { LOG_STDERR_ERRORS, LOG_STDERR_ALL } LogStderrMode;
 
@@ -59,7 +68,7 @@ typedef enum {
                  LOG_INFO_PROGRESS | LOG_INFO_MOUNT,
 } LogInfoFlag;
 
-void log_message(LogLevel log_level, const char* message, ...);
+void log_message(LogLevel log_level, const char* message, ...) LOG_PRINTF_ATTR(2, 3);
 void log_perror(const char* context);
 void set_log_level(LogLevel level);
 void set_log_debug_flags(uint32_t flags);
@@ -68,10 +77,10 @@ uint32_t get_log_debug_flags(void);
  * the debug log level is enabled AND the flag is selected.  Hot paths use this
  * to skip expensive message formatting/escaping when the line is filtered. */
 bool log_debug_enabled(LogDebugFlag flag);
-void log_debug_message(LogDebugFlag flag, const char* message, ...);
+void log_debug_message(LogDebugFlag flag, const char* message, ...) LOG_PRINTF_ATTR(2, 3);
 void set_log_info_flags(uint32_t flags);
 uint32_t get_log_info_flags(void);
-void log_info_message(LogInfoFlag flag, const char* message, ...);
+void log_info_message(LogInfoFlag flag, const char* message, ...) LOG_PRINTF_ATTR(2, 3);
 void log_set_file(FILE* fp);
 void log_set_8_bit_output(bool enabled);
 bool log_get_8_bit_output(void);
