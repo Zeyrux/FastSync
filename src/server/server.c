@@ -1178,13 +1178,19 @@ static bool daemonize(void) {
       close(devnull);
   }
   /* Do not pin the launch CWD (module-relative 'path' entries would resolve
-   * against an unstable working directory) and drop the restrictive host umask
-   * so modules can create files/dirs with the modes the config requests. */
+   * against an unstable working directory).  Set a conservative daemon umask
+   * of 022 (the conventional service default): rsync never forces umask 0 --
+   * it reads and restores the inherited umask and creates new entries as
+   * 0777 & ~umask / source & ~umask without -p.  Forcing 0 here made every
+   * implied parent directory world-writable (0777) whenever -p metadata was not
+   * applied.  022 gives 0755 directories and source&~022 files, matching rsync
+   * under a normal daemon umask; -p/-a still restore the exact source mode via
+   * fchmod, which is unaffected by the umask. */
   if (chdir("/") != 0)
     log_message(LOG_LEVEL_WARNING, "daemon: chdir to / failed: %s", strerror(errno));
-  umask(0);
+  umask(022);
   /* Refresh the cached umask: main() captured the launch umask before this
-   * (single-threaded) umask(0), and file_mode_base() must see the daemon's
+   * (single-threaded) umask(022), and file_mode_base() must see the daemon's
    * actual umask. */
   file_umask_capture();
   return true;

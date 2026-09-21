@@ -332,6 +332,21 @@ class TestDaemonModuleSelection:
         assert not missing, f"missing: {missing[:5]}"
         assert not mismatches, f"mismatch: {mismatches[:5]}"
 
+    def test_daemon_new_dirs_not_world_writable(self, daemon):
+        """The daemon must not force umask 0: implied parent directories created
+        without -p are the source default (0755 under a 022 umask), never
+        world-writable 0777."""
+        sub = os.path.join(FILES_MODULE, "umask_check")
+        shutil.rmtree(sub, ignore_errors=True)
+        os.makedirs(sub, exist_ok=True)
+        result = _push("127.0.0.1::files/umask_check", daemon.port)
+        assert result.returncode == 0, result.stderr or result.stdout
+        received = get_dest_received_dir(sub, SOURCE_DIR)
+        nested = os.path.join(received, "nested")
+        assert os.path.isdir(nested), f"nested dir missing under {received}"
+        mode = stat.S_IMODE(os.stat(nested).st_mode)
+        assert (mode & 0o022) == 0, f"implied directory is group/other writable: {oct(mode)}"
+
 
 class TestDaemonRejection:
     def _tree_files(self):
