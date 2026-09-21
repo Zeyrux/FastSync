@@ -4,9 +4,9 @@ FastSync is a high-performance file synchronization system written in C11. It su
 
 ## Dependency installation
 
-**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v11`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest + pytest-xdist, openssh-client, Node.js, plus `rsync` 3.4.1 (with zstd/xxhash/lz4), `acl` and `attr` (setfacl/getfacl, setfattr/getfattr) for drop-in parity tests.
+**CI rule:** never add `apt-get install` / `pip install` steps to CI workflows — use the custom Docker image instead. The image is built from the repo-root `Dockerfile` and is the same image CI uses: `gitea.tap-tap.win/taptap/fastsync-ci:v11`. It contains the full toolchain: gcc/g++, CMake, libzstd-dev, zlib1g-dev, liblz4-dev, libxxhash-dev, libssl-dev, make, git, cppcheck, clang-format, python3 + pytest + pytest-xdist, openssh-client, Node.js, plus `rsync` 3.4.1 (with zstd/xxhash/lz4), `acl` and `attr` (setfacl/getfacl, setfattr/getfattr) for drop-in parity tests. (CMake hard-requires zstd, zlib, and lz4; xxHash is fetched via `FetchContent`.)
 
-**Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, OpenSSL, CMake, and gcc. The Docker image can also be used locally for CI parity.
+**Host rule:** for local development, use `nix-shell` (see `README.md`) which provides zstd, zlib, lz4, OpenSSL, CMake, and gcc. The Docker image can also be used locally for CI parity.
 
 ```bash
 # Use the prebuilt CI image directly (faster, guaranteed CI parity)
@@ -38,11 +38,12 @@ If a dependency is missing from the CI image, add it to the `Dockerfile` (and re
 When configuring for CI parity, use:
 ```bash
 cmake -B build -S . -DSTRICT_WARNINGS=ON        # -Wextra -Wpedantic -Werror
-cmake -B build -S . -DSANITIZER=address           # AddressSanitizer (ASan)
-cmake -B build -S . -DSANITIZER=thread            # ThreadSanitizer (TSan)
+cmake -B build -S . -DSANITIZER=address           # AddressSanitizer (ASan); in the CI matrix
+cmake -B build -S . -DSANITIZER=undefined         # UndefinedBehaviorSanitizer (UBSan); in the CI matrix
+cmake -B build -S . -DSANITIZER=thread            # ThreadSanitizer (TSan); local-only, NOT in CI
 ```
 
-The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4 --dist=load`). The full coverage jobs (full integration suite as `-m "not setpriv"`, sanitizer, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes. The two `setpriv` privilege tests are excluded from CI via a marker because their result depends on the runner/container uid and host mount permissions.
+The CI workflow (`.gitea/workflows/ci.yaml`) runs lint (clang-format, cppcheck), then a **fast PR gate** — build + unit + a representative subset of integration tests marked `@pytest.mark.ci`, parallelized with pytest-xdist (`-n 4 --dist=load`). The full coverage jobs (full integration suite as `-m "not setpriv"`, the `address`+`undefined` sanitizer matrix, fuzz, coverage, valgrind) run **only on push to `dev`/`main`**; pull requests skip them to keep PR CI under ~3 minutes. TSan is not part of the CI matrix and is a local-only configuration. The four `setpriv` privilege tests are excluded from CI via a marker because their result depends on the runner/container uid and host mount permissions.
 
 ## Build
 
@@ -105,7 +106,7 @@ Two main branches: `dev` (integration) and `main` (stable releases).
 
 ### Rules
 - **All PRs target `dev`** — never target `main` directly
-- **`dev` is the default branch** in Gitea repo settings
+- **`dev` is intended to be the default branch** in Gitea repo settings — verify in the repo settings, since this clone's `origin/HEAD` still points at `main`
 - **`main` is protected** — only merged from `dev` via PR with 2 approvals + full CI pass
 - **Feature/bug branches** branch from `dev`, PR back to `dev`
 - **`dev` → `main` merges** happen on-demand or weekly, requiring full CI + review
