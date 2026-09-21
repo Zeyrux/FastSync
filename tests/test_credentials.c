@@ -3,6 +3,7 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -763,6 +764,40 @@ static void test_credentials_read_secret_file_fifo_no_hang() {
   unlink(fifo);
 }
 
+/* fd-backed store paths (bash process substitution `<(...)`, i.e. /dev/fd/N and
+ * /proc/self/fd/N) are symlinks, so the ordinary O_NOFOLLOW rule would reject
+ * them with ELOOP.  They name the calling process's own descriptors, so they
+ * are exempt: opening one that points at an owner-only regular file is
+ * accepted, while a symlink at a NORMAL path is still rejected
+ * (test_credentials_read_secret_file_symlink_rejected). */
+static void test_credentials_read_secret_file_fd_backed_accepted() {
+  char err[512];
+  char* path = make_tmp_file("alice:correct horse battery staple\n");
+  EXPECT_NOT_NULL(path);
+
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  EXPECT_TRUE(fd >= 0);
+
+  const char* prefixes[] = {"/proc/self/fd/", "/dev/fd/"};
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    if (i == 1 && access("/dev/fd", F_OK) != 0)
+      continue; /* /dev/fd is not present on every system */
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "%s%d", prefixes[i], fd);
+    char* user = (char*)1;
+    char* password = (char*)1;
+    EXPECT_EQ_INT(credentials_read_secret_file(fd_path, &user, &password, err, sizeof(err)), 0);
+    EXPECT_EQ_STR(user, "alice");
+    EXPECT_EQ_STR(password, "correct horse battery staple");
+    free(user);
+    free(password);
+  }
+
+  close(fd);
+  rm_temp(path);
+  free(path);
+}
+
 static void test_credentials_hash_file() {
   char* plaintext = make_tmp_file("# comment\n\n alice :" KAT_PASSWORD "\nbob:bob-s3cret\n");
   EXPECT_NOT_NULL(plaintext);
@@ -1149,6 +1184,7 @@ void test_credentials(void) {
   test_credentials_read_secret_file_bad();
   test_credentials_read_secret_file_symlink_rejected();
   test_credentials_read_secret_file_fifo_no_hang();
+  test_credentials_read_secret_file_fd_backed_accepted();
   test_credentials_hash_file();
   test_credentials_rejects_group_or_other_accessible();
   test_credentials_dummy_key_persisted();
