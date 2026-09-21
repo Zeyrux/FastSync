@@ -28,6 +28,10 @@
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
+/* Files larger than this are not kept fully in memory while loading: the
+ * loader skips them so the sender streams from the path, and file_checksum
+ * hashes them from disk in bounded buffers instead of forcing a full load. */
+#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 #define MAX_MANIFEST_ENTRIES (1024 * 1024)
 /* Aggregate bytes retained by one received deletion manifest. */
 #define MAX_MANIFEST_BYTES (16ULL * 1024 * 1024)

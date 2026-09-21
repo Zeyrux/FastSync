@@ -22,7 +22,7 @@ void client_set_abort_armed(bool armed);
  * never free it, and the caller retains ownership (freeing it with
  * config_delete() once the call returns). */
 int send_files(Config* config);
-int send_files_multithreaded(Config** config);
+int send_files_multithreaded(Config* config);
 /* rsync's --ignore-errors deletion gate: with no I/O error during the scan the
  * deletion phase always proceeds; with one it is suppressed unless
  * `--ignore-errors` was given.  Exposed so the decision can be unit-tested

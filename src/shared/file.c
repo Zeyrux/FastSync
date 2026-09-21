@@ -26,11 +26,6 @@
 #include "protocol.h"
 #include "xattr.h"
 
-/* Files larger than this are not loaded whole for transfer (the sender streams
- * them); a whole-file digest is computed from the path instead.  Kept in sync
- * with the sender's streaming threshold. */
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
-
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
   unsigned long long done = 0;

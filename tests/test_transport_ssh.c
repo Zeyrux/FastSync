@@ -5,13 +5,13 @@
 static void test_ssh_connect_invalid_dest_no_colon() {
   /* cppcheck-suppress constVariablePointer */
   Client* client =
-      client_connect_ssh("invalid-destination-no-colon", 22, NULL, false, NULL, false, NULL, 0);
+      client_connect_ssh("invalid-destination-no-colon", 22, NULL, NULL, false, NULL, 0);
   EXPECT_NULL(client);
 }
 
 static void test_ssh_connect_invalid_dest_empty() {
   /* cppcheck-suppress constVariablePointer */
-  Client* client = client_connect_ssh("", 22, NULL, false, NULL, false, NULL, 0);
+  Client* client = client_connect_ssh("", 22, NULL, NULL, false, NULL, 0);
   EXPECT_NULL(client);
 }
 
@@ -22,7 +22,7 @@ static void test_ssh_connect_malformed() {
   setenv("PATH", "", 1);
 
   /* cppcheck-suppress constVariablePointer */
-  Client* client = client_connect_ssh(":", 22, NULL, false, NULL, false, NULL, 0);
+  Client* client = client_connect_ssh(":", 22, NULL, NULL, false, NULL, 0);
 
   if (saved_path) {
     setenv("PATH", saved_path, 1);
@@ -38,7 +38,7 @@ static void test_ssh_connect_malformed() {
  * The function launches ssh which will fail to connect, returns a Client. */
 static void test_ssh_connect_unreachable() {
   Client* client =
-      client_connect_ssh("nonexistent.invalid:/remote/path", 22, NULL, false, NULL, false, NULL, 0);
+      client_connect_ssh("nonexistent.invalid:/remote/path", 22, NULL, NULL, false, NULL, 0);
   if (client != NULL) {
     client_disconnect(client);
     client_delete(client);
@@ -47,22 +47,12 @@ static void test_ssh_connect_unreachable() {
 }
 
 static void test_ssh_remote_command_argument_modes() {
-  char* command = ssh_build_remote_command("fast sync; touch /tmp/pwned", false, NULL, 0);
+  char* command = ssh_build_remote_command("fast sync; touch /tmp/pwned", NULL, 0);
   EXPECT_EQ_STR(command, "'fast sync; touch /tmp/pwned' --stdio");
   free(command);
 
-  command = ssh_build_remote_command("fast'sync", false, NULL, 0);
+  command = ssh_build_remote_command("fast'sync", NULL, 0);
   EXPECT_EQ_STR(command, "'fast'\\''sync' --stdio");
-  free(command);
-
-  /* --old-args no longer disables injection-safe quoting: the path is still one
-     single-quoted word, even when it carries shell metacharacters. */
-  command = ssh_build_remote_command("fast sync; touch /tmp/pwned", true, NULL, 0);
-  EXPECT_EQ_STR(command, "'fast sync; touch /tmp/pwned' --stdio");
-  free(command);
-
-  command = ssh_build_remote_command("fast'sync; rm -rf /", true, NULL, 0);
-  EXPECT_EQ_STR(command, "'fast'\\''sync; rm -rf /' --stdio");
   free(command);
 }
 
@@ -120,12 +110,12 @@ static void test_ssh_build_client_argv_whitespace_command_and_port() {
  * returned and no command can run. */
 static void test_ssh_connect_rejects_option_host() {
   /* cppcheck-suppress constVariablePointer */
-  Client* client = client_connect_ssh("-oProxyCommand=touch /tmp/pwned:/remote", 22, NULL, false,
-                                      NULL, false, NULL, 0);
+  Client* client =
+      client_connect_ssh("-oProxyCommand=touch /tmp/pwned:/remote", 22, NULL, NULL, false, NULL, 0);
   EXPECT_NULL(client);
-  client = client_connect_ssh("-evil:/remote", 22, NULL, false, NULL, false, NULL, 0);
+  client = client_connect_ssh("-evil:/remote", 22, NULL, NULL, false, NULL, 0);
   EXPECT_NULL(client);
-  client = client_connect_ssh("user@:/remote", 22, NULL, false, NULL, false, NULL, 0);
+  client = client_connect_ssh("user@:/remote", 22, NULL, NULL, false, NULL, 0);
   EXPECT_NULL(client);
 }
 
@@ -135,13 +125,13 @@ static void test_ssh_connect_rejects_option_host() {
  * ssh_build_remote_command safety boundary for the server path. */
 static void test_ssh_remote_command_with_remote_options() {
   char* noop[] = {"--allow-delete"};
-  char* command = ssh_build_remote_command("fastsync-server", false, noop, 1);
+  char* command = ssh_build_remote_command("fastsync-server", noop, 1);
   EXPECT_EQ_STR(command, "'fastsync-server' --stdio '--allow-delete'");
   free(command);
 
   /* Multiple options append in order, each as its own quoted word. */
   char* multi[] = {"-v", "--allow-delete"};
-  command = ssh_build_remote_command("srv", false, multi, 2);
+  command = ssh_build_remote_command("srv", multi, 2);
   EXPECT_EQ_STR(command, "'srv' --stdio '-v' '--allow-delete'");
   free(command);
 
@@ -150,29 +140,24 @@ static void test_ssh_remote_command_with_remote_options() {
      break out into an arbitrary remote command. */
   char* val = strdup("--x=un'der; touch /tmp/pwned");
   char* dangerous[1] = {val};
-  command = ssh_build_remote_command("srv", false, dangerous, 1);
+  command = ssh_build_remote_command("srv", dangerous, 1);
   EXPECT_EQ_STR(command, "'srv' --stdio '--x=un'\\''der; touch /tmp/pwned'");
   free(command);
   free(val);
-
-  /* --old-args still quotes both the server path and the remote options. */
-  command = ssh_build_remote_command("srv", true, multi, 2);
-  EXPECT_EQ_STR(command, "'srv' --stdio '-v' '--allow-delete'");
-  free(command);
 }
 
 /* The remote command builder refuses to forward an empty or control-character
  * remote option (defense-in-depth independent of the CLI validation). */
 static void test_ssh_remote_command_rejects_bad_options() {
   char* empty[] = {""};
-  EXPECT_NULL(ssh_build_remote_command("srv", false, empty, 1));
+  EXPECT_NULL(ssh_build_remote_command("srv", empty, 1));
 
   char nl = '\n';
   char* newline[] = {&nl};
-  EXPECT_NULL(ssh_build_remote_command("srv", false, newline, 1));
+  EXPECT_NULL(ssh_build_remote_command("srv", newline, 1));
 
   char* with_null[] = {NULL};
-  EXPECT_NULL(ssh_build_remote_command("srv", false, with_null, 1));
+  EXPECT_NULL(ssh_build_remote_command("srv", with_null, 1));
 }
 
 void test_transport_ssh() {

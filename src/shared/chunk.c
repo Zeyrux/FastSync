@@ -17,8 +17,9 @@
 #include "protocol.h"
 #include "utils.h"
 
-/* Maximum individual file data size within a chunk (64 MB) */
-#define MAX_FILE_DATA_SIZE (64ULL * 1024 * 1024)
+/* Maximum individual file data size within a chunk (64 MB).  Distinct from the
+ * receiver's whole-file MAX_FILE_DATA_SIZE (256 MB) in file_receive.c. */
+#define MAX_CHUNK_FILE_DATA_SIZE (64ULL * 1024 * 1024)
 #define MAX_FILES_PER_CHUNK 65536U
 
 /* Reserve `charge` against `session`'s connection budget.  This mirrors the
@@ -382,9 +383,9 @@ Chunk* chunk_deserialize(Data* data, bool use_metadata) {
     }
 
     // Reject individual file data larger than the maximum allowed size.
-    if (file_data_size > MAX_FILE_DATA_SIZE) {
+    if (file_data_size > MAX_CHUNK_FILE_DATA_SIZE) {
       log_message(LOG_LEVEL_ERROR, "File data size %zu exceeds maximum %llu", file_data_size,
-                  (unsigned long long)MAX_FILE_DATA_SIZE);
+                  (unsigned long long)MAX_CHUNK_FILE_DATA_SIZE);
       goto error;
     }
 

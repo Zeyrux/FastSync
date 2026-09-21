@@ -3296,7 +3296,7 @@ int main(int argc, char* argv[]) {
       exit_code = 1;
     }
   } else if (config->use_multithreading) {
-    exit_code = send_files_multithreaded(&config);
+    exit_code = send_files_multithreaded(config);
   } else {
     exit_code = send_files(config);
   }
