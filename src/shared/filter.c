@@ -4,22 +4,12 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Write a diagnostic message into the caller's optional buffer.  A NULL `err`
- * (or a zero size) is a no-op, so a caller that only needs the boolean status
- * may pass NULL without the snprintf-on-NULL undefined behaviour. */
-static void filter_set_error(char* err, size_t err_size, const char* fmt, ...) {
-  if (!err || err_size == 0)
-    return;
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(err, err_size, fmt, ap);
-  va_end(ap);
-}
+/* Write a diagnostic message into the caller's optional buffer. */
+#define filter_set_error utils_set_error
 
 /* ---- Ordered rule lists ---- */
 
@@ -172,14 +162,74 @@ static bool is_modifier_char(char c) {
   return c == 's' || c == 'r' || c == 'p' || c == 'x' || c == '/' || c == '!' || c == 'C';
 }
 
+/* merge/dir-merge rules are the only rules rsync accepts the merge-file
+ * modifiers on. */
+static bool is_merge_rule(RuleKind kind) {
+  return kind == RULE_KIND_MERGE || kind == RULE_KIND_DIR_MERGE;
+}
+
+/* Merge-file modifiers rsync defines but FastSync does not implement:
+ * 'e' exclude the merge file itself, 'n' do not inherit the merge file, 'w'
+ * word-split the merge file.  They are recognized as part of a modifier run on
+ * every rule (so a pure e/n/w token is rejected rather than folded into the
+ * pattern), but are accepted (and ignored) only on merge/dir-merge rules. */
+static bool is_unsupported_modifier_char(char c) {
+  return c == 'e' || c == 'n' || c == 'w';
+}
+
+/* Merge-file modifiers rsync accepts on merge/dir-merge rules: 'e', 'n', 'w'
+ * and '-' (do not transfer the merge file). */
+static bool is_merge_modifier_char(char c) {
+  return c == 'e' || c == 'n' || c == 'w' || c == '-';
+}
+
+/* Characters that count as part of a modifier run for `kind` when deciding
+ * whether a token is a pure modifier run.  e/n/w count on every rule so that a
+ * pure e/n/w token is rejected on non-merge rules; '-' only on merge rules. */
+static bool is_modifier_scan_char(char c, RuleKind kind) {
+  return is_modifier_char(c) || is_unsupported_modifier_char(c) ||
+         (is_merge_rule(kind) && is_merge_modifier_char(c));
+}
+
+/* Characters actually consumed as modifiers for `kind`.  The merge-file
+ * modifiers are consumed only on merge/dir-merge rules; elsewhere e/n/w fall
+ * through to the pattern (so mixed tokens such as "H,!secret" keep their
+ * historical "ecret" pattern). */
+static bool is_consumed_modifier_char(char c, RuleKind kind) {
+  return is_modifier_char(c) || (is_merge_rule(kind) && is_merge_modifier_char(c));
+}
+
+/* Inspect the token that follows a rule name (up to the first space/underscore
+ * or the end).  If the token is composed *solely* of modifier characters and
+ * includes one that is invalid for `kind`, it is unambiguously a modifier run:
+ * return that character so the caller can reject it.  A token that contains any
+ * non-modifier character is a pattern (e.g. "-newfile") and returns '\0', which
+ * keeps the historical parsing of mixed tokens such as "H,!secret" intact. */
+static char unsupported_modifier_in_token(const char* tok, RuleKind kind) {
+  if (*tok == '\0' || *tok == ' ' || *tok == '_')
+    return '\0';
+  char bad = '\0';
+  for (const char* q = tok; *q != '\0' && *q != ' ' && *q != '_'; q++) {
+    if (!is_modifier_scan_char(*q, kind))
+      return '\0';
+    if (!is_merge_rule(kind) && is_unsupported_modifier_char(*q))
+      bad = *q;
+  }
+  return bad;
+}
+
 /* Parse "RULE[,MODIFIERS] [PATTERN]".  On success `kind`, `sides`,
  * `sides_explicit`, `negate`, `anchored_mod`, `perishable`, `xattr`,
  * `cvs_inject` and the pattern span (`pat_start`/`pat_len`, possibly 0 for
- * merge/clear) are filled.  Returns true on success. */
+ * merge/clear) are filled.  Returns true on success.
+ *
+ * On failure `*bad_mod` is set to the offending modifier character when the
+ * rule carried a modifier FastSync does not implement, and left '\0' for a
+ * generic syntax error so callers can emit a precise diagnostic. */
 static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
                               bool* sides_explicit, bool* negate, bool* anchored_mod,
                               bool* perishable, bool* xattr, bool* cvs_inject,
-                              const char** pat_start, size_t* pat_len) {
+                              const char** pat_start, size_t* pat_len, char* bad_mod) {
   const char* p = text;
   *sides = FILTER_SIDE_SENDER | FILTER_SIDE_RECEIVER;
   *sides_explicit = false;
@@ -190,6 +240,7 @@ static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
   *cvs_inject = false;
   *pat_start = NULL;
   *pat_len = 0;
+  *bad_mod = '\0';
 
   bool is_short = false;
   if (short_rule_char(*p, kind)) {
@@ -210,17 +261,25 @@ static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
   /* Modifiers: long names require a comma; short names may attach directly.
      Only commit a modifier run that terminates at a separator or the end, so a
      pattern such as "*.tmp" written as "-*.tmp" is not mistaken for modifiers. */
+  if (*p == ',') {
+    *bad_mod = unsupported_modifier_in_token(p + 1, *kind);
+  } else if (is_short) {
+    *bad_mod = unsupported_modifier_in_token(p, *kind);
+  }
+  if (*bad_mod != '\0')
+    return false;
+
   const char* mod_start = p;
   const char* mod_end = p;
   if (*p == ',') {
     p++;
     mod_start = p;
-    while (is_modifier_char(*p))
+    while (is_consumed_modifier_char(*p, *kind))
       p++;
     mod_end = p;
   } else if (is_short) {
     const char* scan = p;
-    while (is_modifier_char(*scan))
+    while (is_consumed_modifier_char(*scan, *kind))
       scan++;
     if (*scan == '\0' || *scan == ' ' || *scan == '_') {
       mod_start = p;
@@ -290,9 +349,13 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
   bool sides_explicit, negate, anchored_mod, perishable, xattr, cvs_inject;
   const char* pat;
   size_t pat_len;
+  char bad_mod;
   if (!parse_rule_syntax(p, &kind, &sides, &sides_explicit, &negate, &anchored_mod, &perishable,
-                         &xattr, &cvs_inject, &pat, &pat_len)) {
-    filter_set_error(err, err_size, "unrecognized filter rule syntax");
+                         &xattr, &cvs_inject, &pat, &pat_len, &bad_mod)) {
+    if (bad_mod != '\0')
+      filter_set_error(err, err_size, "unsupported filter modifier '%c'", bad_mod);
+    else
+      filter_set_error(err, err_size, "unrecognized filter rule syntax");
     return NULL;
   }
   if (cvs_inject) {
@@ -401,7 +464,6 @@ FilterRule* filter_rule_parse(const char* line, const FilterParseOptions* opts, 
   rule->dir_only = dir_only;
   rule->negate = negate;
   rule->perishable = perishable;
-  (void)xattr; /* xattr-name rules never match file/dir names; accepted/ignored */
   return rule;
 }
 
@@ -530,16 +592,27 @@ static bool filter_list_parse_append_depth(FilterRuleList* list, const char* lin
   bool sides_explicit, negate, anchored_mod, perishable, xattr, cvs_inject;
   const char* pat;
   size_t pat_len;
+  char bad_mod;
   if (!parse_rule_syntax(p, &kind, &sides, &sides_explicit, &negate, &anchored_mod, &perishable,
-                         &xattr, &cvs_inject, &pat, &pat_len)) {
-    filter_set_error(err, err_size, "unrecognized filter rule syntax: %s", p);
+                         &xattr, &cvs_inject, &pat, &pat_len, &bad_mod)) {
+    if (bad_mod != '\0')
+      filter_set_error(err, err_size, "unsupported filter modifier '%c': %s", bad_mod, p);
+    else
+      filter_set_error(err, err_size, "unrecognized filter rule syntax: %s", p);
     return false;
   }
   (void)sides_explicit;
   (void)negate;
   (void)anchored_mod;
   (void)perishable;
-  (void)xattr;
+
+  /* xattr-name rules are not implemented; reject them everywhere (including on
+   * merge/dir-merge, where the flag would otherwise be silently dropped) with
+   * the same diagnostic the standalone parser gives. */
+  if (xattr) {
+    filter_set_error(err, err_size, "xattr-name filter rules (the x modifier) are not supported");
+    return false;
+  }
 
   if (cvs_inject) {
     /* "C" injects the CVS defaults in place; no pattern is expected. */
@@ -810,9 +883,4 @@ FilterAction filter_rules_apply_side(const FilterRuleList* list, const char* rel
       return action;
   }
   return FILTER_ACTION_NONE;
-}
-
-FilterAction filter_rules_apply(const FilterRuleList* list, const char* rel_path, const char* leaf,
-                                bool is_dir) {
-  return filter_rules_apply_side(list, rel_path, leaf, is_dir, FILTER_SIDE_SENDER);
 }

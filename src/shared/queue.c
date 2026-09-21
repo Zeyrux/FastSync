@@ -128,7 +128,7 @@ bool queue_enqueue_multithreaded_cancel(Queue* queue, void* item, mtx_t* mutex,
 
 void* queue_dequeue(Queue* queue) {
   if (queue == NULL || queue_is_empty(queue)) {
-    log_perror("ERROR: Could not dequeue from null or empty queue.");
+    log_message(LOG_LEVEL_ERROR, "%s", "ERROR: Could not dequeue from null or empty queue.");
     return NULL;
   }
 
@@ -145,7 +145,7 @@ bool queue_push(Queue* queue, void* item) {
 
 void* queue_pop(Queue* queue) {
   if (queue == NULL || queue_is_empty(queue)) {
-    log_perror("ERROR: Could not pop from null or empty queue.");
+    log_message(LOG_LEVEL_ERROR, "%s", "ERROR: Could not pop from null or empty queue.");
     return NULL;
   }
 

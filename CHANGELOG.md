@@ -10,6 +10,19 @@ The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).
 `RSYNC_COMPAT.md` moves from **116 ✅ / 14 ⚠️ / 27 ❌** to
 **120 ✅ / 10 ⚠️ / 27 ❌** of 157 rows.
 
+An audit cycle follows on the same wire version (`PROTOCOL_VERSION` stays
+2.28.0): a security-and-correctness pass over the parity-2.29 baseline, plus a
+set of audit follow-ups (filter merge modifiers, the `--inplace`/`--partial-dir`
+conflict, credential-file hardening, and small leak/log/test fixes). It fixes
+a `--temp-dir` symlink escape, gates client-controlled special permission bits,
+corrects `--partial-dir`/`--bwlimit`/`-z` behavior, handles unsupported filter
+modifiers, and tightens client and wire validation. The only parity
+reclassification is `--filter=RULE` moving ✅ → ⚠️, because its merge-only
+`e`/`n`/`w`/`-` modifiers are now accepted and consumed but their semantics
+remain unimplemented (accepted-but-ignored); the matrix is therefore **119 ✅ /
+11 ⚠️ / 27 ❌** of 157 rows. The affected rows' notes and the summary tally in
+`RSYNC_COMPAT.md` were updated.
+
 ### Changed
 
 - **rsync-exact traversal order.** The sequential scanner now walks each
@@ -46,6 +59,81 @@ The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).
 - A single file larger than 256 MiB cannot be streamed in the default path
   (a general whole-file limit, not basis-specific).
 - `--stats` byte totals and `--msgs2stderr` stay documented divergences.
+
+### Security
+
+- **`--temp-dir` symlink escape fixed.** The receiver's scratch directory was
+  opened with a bare `open()`, so a symlink planted under the receive root could
+  redirect receiver scratch files outside the authorized root. The opened
+  directory is now judged by the real path of its fd (`/proc/self/fd` via
+  `realpath`) and an escaping target is refused (`EACCES`, logged); an in-root
+  link to another filesystem (the `EXDEV` fallback case) still works.
+- **Client-controlled special bits masked when super-user activities are not
+  permitted.** Setuid/setgid/sticky bits (`--perms`, `--chmod`, the symlink and
+  special-node paths, and deferred directory modes) are now stripped when the
+  connection forbids super activities (`--no-super`, a non-opted daemon module,
+  a privileged listener without `--allow-super`); exact rsync semantics are
+  preserved wherever super activities are permitted.
+- **Daemon umask no longer forced to `0`.** `daemonize()` now sets the
+  conventional `022`, so implied parent directories created without `-p` are no
+  longer world-writable `0777`.
+- **Credentials and signal handling hardened.** Secret files are opened with
+  `O_NOFOLLOW|O_NONBLOCK` (while allowing fd-backed store paths and bound-waiting
+  a FIFO read for ~3 s so a slow process substitution works but a connected-but-
+  silent FIFO cannot hang), and signal handlers use `sigaction` with
+  async-signal-safe bodies.
+
+### Fixed
+
+- **`-z` on 100–256 MiB files.** The decompressor's internal ceiling was 100 MiB
+  while the receiver advertises and the sender compresses whole files up to
+  `MAX_RECEIVE_WHOLE_FILE_SIZE` (256 MiB), so `-z` on a 100–256 MiB regular file
+  failed with `Declared decompressed size exceeds 104857600 bytes`. The ceiling
+  is now defined in terms of the protocol whole-file bound (still an
+  allocation-clamped bomb guard).
+- **`--bwlimit` now paces `--sendfile`.** The plaintext-TCP `--sendfile` fast
+  path bypassed the protocol's token bucket, so the limit was ignored there. It
+  now throttles through the same per-session leaky bucket as the TLS path.
+- **`--partial-dir` implies `--partial`.** Matching rsync 3.4.1 (which sets
+  `keep_partial` after option parsing), `--partial-dir=DIR` alone retains an
+  interrupted transfer's partial and wins over an explicit `--no-partial`;
+  `--inplace` still bypasses the partial machinery, and combining `--inplace`
+  with `--partial-dir` is now rejected up front with rsync's message
+  (`--inplace cannot be used with --partial-dir`).
+- **Filter modifiers handled.** The `x` xattr-name modifier is rejected with a
+  clear error everywhere. The merge-only `e`/`n`/`w` and `-` modifiers are now
+  accepted and consumed on `merge`/`dir-merge` rules (so they no longer leak
+  into the merge filename) while still being rejected on non-merge rules,
+  matching rsync; their semantics remain unimplemented (accepted-but-ignored).
+  Glued patterns (`-newfile`, `-e2e`) and mixed tokens (`H,!secret`) keep their
+  historical parsing.
+- **Credential-file reads hardened.** Secret files (`--password-file`/
+  `--early-input`/`--hash-credentials` input) are opened with `O_NOFOLLOW`, so a
+  symlinked credential path now fails closed (`ELOOP`) instead of being followed
+  before the owner/mode gate; literal fd-backed paths (`/dev/fd/<digits>`,
+  `/proc/self/fd/<digits>`) are exempt so process substitution still works. A
+  FIFO/process-substitution read now waits under a bounded ~3 s deadline for its
+  writer, so a slow producer works while a connected-but-silent FIFO fails
+  instead of hanging.
+- **Miscellaneous correctness fixes:** `--filter` rule count is checked
+  client-side against `MAX_FILTER_RULES` before any network I/O (the receiver
+  still re-checks the expanded count); unknown wire `Status` values are rejected
+  as protocol errors; a mutex leak on an init-failure path, an `errno` read
+  after `free()` in deferred delete application, `log_perror` misuse for
+  non-`errno` conditions, and a `NULL` `server_host`/`ssh_destination`
+  allocation path were fixed (the `config_create` failure now releases through
+  `config_delete`); the decompression-limit log now prints the effective bound
+  rather than the compile-time ceiling; the daemon umask and root test fixtures
+  were hardened; `SSL_read` length is clamped and `sendfile` `poll()` retries on
+  `EINTR`.
+
+### Refactored / Docs
+
+- Dropped dead `filter_rules_apply` and dead `--old-args` plumbing, unified
+  `set_error`, deduplicated `path_is_within` and shared constants, and added
+  printf format attributes (fixing format mismatches). `RSYNC_COMPAT.md`,
+  `CHANGELOG.md` and `HANDOFF.md` were updated for the audit cycle; the
+  `RSYNC_COMPAT.md` summary tally was corrected to match the rows.
 
 ## [2.28.0] - 2026-09-20
 

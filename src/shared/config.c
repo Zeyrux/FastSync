@@ -230,6 +230,13 @@ Config* config_create(void) {
   if (!config)
     return NULL;
   config_set_defaults(config);
+  /* config_set_defaults() dups the default server host; a failure there leaves
+   * server_host NULL and would crash later consumers, so fail the whole create
+   * (every caller already handles a NULL return). */
+  if (!config->server_host) {
+    config_delete(config);
+    return NULL;
+  }
   return config;
 }
 
@@ -686,9 +693,15 @@ int config_parse_ssh_dest(Config* config) {
     return daemon_dest_parse_error("invalid remote destination user@host (must not be empty or "
                                    "start with '-')",
                                    dest);
-  config->transport = TRANSPORT_SSH;
-  config->ssh_destination = str_dup(dest);
+  char* ssh_destination = str_dup(dest);
   char* path = str_dup(colon + 1);
+  if (!ssh_destination || !path) {
+    free(ssh_destination);
+    free(path);
+    return daemon_dest_parse_error("out of memory parsing remote destination", dest);
+  }
+  config->transport = TRANSPORT_SSH;
+  config->ssh_destination = ssh_destination;
   free(config->receive_root_directory);
   config->receive_root_directory = path;
   return 0;
@@ -1050,6 +1063,16 @@ static bool send_protect_entries(int fd, const Config* c) {
   free(texts);
   if (!rules) {
     log_message(LOG_LEVEL_ERROR, "invalid filter rule: %s", err);
+    return false;
+  }
+  /* The receiver rejects any block with more than MAX_FILTER_RULES entries as a
+   * protocol error; refuse to emit such a frame at all.  filter_base_build()
+   * can expand the client rule set (cvs-exclude, merge files), so this is the
+   * authoritative bound, not config->filters->size. */
+  if (rules->count < 0 || rules->count > MAX_FILTER_RULES) {
+    log_message(LOG_LEVEL_ERROR, "too many filter rules: %d (maximum %d)", rules->count,
+                MAX_FILTER_RULES);
+    filter_rule_list_free(rules);
     return false;
   }
   bool ok = send_int(fd, rules->count);

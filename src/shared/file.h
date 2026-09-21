@@ -103,8 +103,12 @@ bool file_remove_tree_secure(const char* path);
    the authorized root.  Used for the --delay-updates staging directory. */
 int file_open_private_dir(const char* dir_path);
 
-/* Open an existing --temp-dir scratch directory as-is (absolute or relative;
-   no creation, no root confinement), matching rsync's --temp-dir handling. */
+/* Open an existing --temp-dir scratch directory (relative or absolute; no
+   creation).  When an authorized receive root is configured the directory's
+   REAL path (symlinks resolved) must lie within it, so a client-planted
+   symlink cannot redirect receiver scratch files outside the sandbox; an
+   in-root symlink to another filesystem is still allowed for rsync's EXDEV
+   fallback. */
 int file_open_temp_dir(const char* dir_path);
 
 /* The file_to_disk_secure* variants write a temporary copy in the destination

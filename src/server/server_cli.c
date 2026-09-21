@@ -3,20 +3,12 @@
 #include "credentials.h"
 #include "utils.h"
 #include <limits.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 
-static void set_error(char* err, size_t err_size, const char* fmt, ...) {
-  if (!err || err_size == 0)
-    return;
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(err, err_size, fmt, args);
-  va_end(args);
-}
+#define set_error utils_set_error
 
 void server_cli_options_default(ServerCliOptions* opts) {
   if (!opts)

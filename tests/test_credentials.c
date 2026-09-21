@@ -3,12 +3,14 @@
 #include "test_utils.h"
 #include "utils.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Known-answer vector, independently recomputed with Python
@@ -719,6 +721,238 @@ static void test_credentials_read_secret_file_bad() {
   EXPECT_EQ_INT(credentials_read_secret_file(missing, NULL, NULL, err, sizeof(err)), -1);
 }
 
+/* A symlink planted at a password-file path is refused (O_NOFOLLOW) instead of
+ * being followed before the owner/mode gate, even when it resolves to a valid
+ * owner-only regular file. */
+static void test_credentials_read_secret_file_symlink_rejected() {
+  char err[512];
+  char* target = make_tmp_file("alice:correct horse battery staple\n");
+  EXPECT_NOT_NULL(target);
+
+  char link[256];
+  snprintf(link, sizeof(link), "/tmp/fs_cred_pwlink_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(link);
+  EXPECT_EQ_INT(symlink(target, link), 0);
+
+  char* user = (char*)1;
+  char* password = (char*)1;
+  EXPECT_EQ_INT(credentials_read_secret_file(link, &user, &password, err, sizeof(err)), -1);
+  EXPECT_NULL(user);
+  EXPECT_NULL(password);
+  EXPECT_TRUE(err[0] != '\0');
+
+  unlink(link); /* remove the symlink itself, not its target */
+  rm_temp(target);
+  free(target);
+}
+
+/* A named FIFO with no writer must not hang in fgets (O_NONBLOCK): the read
+ * fails cleanly with "no user:password line" instead of blocking forever. */
+static void test_credentials_read_secret_file_fifo_no_hang() {
+  char err[512];
+  char fifo[256];
+  snprintf(fifo, sizeof(fifo), "/tmp/fs_cred_pwfifo_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(fifo);
+  EXPECT_EQ_INT(mkfifo(fifo, 0600), 0);
+
+  char* user = (char*)1;
+  char* password = (char*)1;
+  EXPECT_EQ_INT(credentials_read_secret_file(fifo, &user, &password, err, sizeof(err)), -1);
+  EXPECT_NULL(user);
+  EXPECT_NULL(password);
+  EXPECT_TRUE(strstr(err, "no 'user:password'") != NULL || err[0] != '\0');
+
+  unlink(fifo);
+}
+
+/* Write `s` fully to `fd`, retrying EINTR. */
+static void write_all_fd(int fd, const char* s) {
+  size_t total = strlen(s);
+  size_t off = 0;
+  while (off < total) {
+    ssize_t w = write(fd, s + off, total - off);
+    if (w < 0) {
+      if (errno == EINTR)
+        continue;
+      return;
+    }
+    off += (size_t)w;
+  }
+}
+
+/* Deterministically model a slow process substitution (`--password-file
+ * <(sleep N; ...)`): attach a writer to the FIFO (so the reader sees EAGAIN --
+ * the empty/no-writer FIFO instead yields an immediate EOF), have it sleep
+ * `delay_ms`, then write `first` and, after another `delay_ms`, `second` (NULL
+ * for a single write).  Splitting across the delay exercises reassembly of a
+ * line delivered by several write()s.
+ *
+ * The parent keeps a spare read end open for the lifetime of the test so the
+ * writer always has a reader; the caller must close(*hold_out), waitpid() the
+ * returned pid and unlink the FIFO.  Returns the child pid, or -1 on setup
+ * failure. */
+static pid_t fifo_writer_sleep_then_write(const char* fifo, const char* first, unsigned delay_ms,
+                                          const char* second, int* hold_out) {
+  int sync[2];
+  if (pipe(sync) != 0)
+    return -1;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(sync[0]);
+    close(sync[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    close(sync[0]);
+    int wfd = open(fifo, O_WRONLY | O_CLOEXEC);
+    char ready = wfd >= 0 ? 1 : 0;
+    if (write(sync[1], &ready, 1) != 1)
+      _exit(1);
+    close(sync[1]);
+    if (wfd >= 0) {
+      usleep(delay_ms * 1000);
+      write_all_fd(wfd, first);
+      if (second) {
+        usleep(delay_ms * 1000);
+        write_all_fd(wfd, second);
+      }
+      close(wfd);
+    }
+    _exit(0);
+  }
+  close(sync[1]);
+  int hold = open(fifo, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  char ready = 0;
+  ssize_t got = read(sync[0], &ready, 1);
+  close(sync[0]);
+  if (got != 1 || ready != 1) {
+    if (hold >= 0)
+      close(hold);
+    return -1;
+  }
+  *hold_out = hold;
+  return pid;
+}
+
+/* A FIFO writer that produces its data after a short delay must be read
+ * successfully (the regression: O_NONBLOCK made fgets fail with EAGAIN before
+ * the writer ran). */
+static void test_credentials_read_secret_file_fifo_delayed_writer() {
+  char err[512];
+  char fifo[256];
+  snprintf(fifo, sizeof(fifo), "/tmp/fs_cred_pwfifo_slow_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(fifo);
+  EXPECT_EQ_INT(mkfifo(fifo, 0600), 0);
+
+  int hold = -1;
+  pid_t writer =
+      fifo_writer_sleep_then_write(fifo, "alice:correct horse battery staple\n", 250, NULL, &hold);
+  EXPECT_TRUE(writer > 0);
+
+  char* user = NULL;
+  char* password = NULL;
+  EXPECT_EQ_INT(credentials_read_secret_file(fifo, &user, &password, err, sizeof(err)), 0);
+  EXPECT_EQ_STR(user, "alice");
+  EXPECT_EQ_STR(password, "correct horse battery staple");
+  free(user);
+  free(password);
+
+  int status = 0;
+  waitpid(writer, &status, 0);
+  if (hold >= 0)
+    close(hold);
+  unlink(fifo);
+}
+
+/* The same, but the line is written in two chunks separated by the delay: the
+ * reader must reassemble one line rather than parse the first chunk as an
+ * empty-password entry. */
+static void test_credentials_read_secret_file_fifo_split_write() {
+  char err[512];
+  char fifo[256];
+  snprintf(fifo, sizeof(fifo), "/tmp/fs_cred_pwfifo_split_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(fifo);
+  EXPECT_EQ_INT(mkfifo(fifo, 0600), 0);
+
+  int hold = -1;
+  pid_t writer =
+      fifo_writer_sleep_then_write(fifo, "alice:correct horse", 200, " battery staple\n", &hold);
+  EXPECT_TRUE(writer > 0);
+
+  char* user = NULL;
+  char* password = NULL;
+  EXPECT_EQ_INT(credentials_read_secret_file(fifo, &user, &password, err, sizeof(err)), 0);
+  EXPECT_EQ_STR(user, "alice");
+  EXPECT_EQ_STR(password, "correct horse battery staple");
+  free(user);
+  free(password);
+
+  int status = 0;
+  waitpid(writer, &status, 0);
+  if (hold >= 0)
+    close(hold);
+  unlink(fifo);
+}
+
+/* The server-side store loader (--password-file / --early-input) must also
+ * accept a FIFO whose writer appears after a delay. */
+static void test_credentials_store_fifo_delayed_writer() {
+  char err[512];
+  char fifo[256];
+  snprintf(fifo, sizeof(fifo), "/tmp/fs_cred_storefifo_%d_%d", (int)getpid(), g_file_counter++);
+  unlink(fifo);
+  EXPECT_EQ_INT(mkfifo(fifo, 0600), 0);
+
+  int hold = -1;
+  pid_t writer = fifo_writer_sleep_then_write(fifo, KAT_STORE_LINE "\n", 250, NULL, &hold);
+  EXPECT_TRUE(writer > 0);
+
+  CredentialStore* store = credentials_load(fifo, NULL, err, sizeof(err));
+  EXPECT_NOT_NULL(store);
+  EXPECT_EQ_INT(credentials_store_size(store), 1);
+  credentials_free(store);
+
+  int status = 0;
+  waitpid(writer, &status, 0);
+  if (hold >= 0)
+    close(hold);
+  rm_temp(fifo);
+}
+
+/* fd-backed store paths (bash process substitution `<(...)`, i.e. /dev/fd/N and
+ * /proc/self/fd/N) are symlinks, so the ordinary O_NOFOLLOW rule would reject
+ * them with ELOOP.  They name the calling process's own descriptors, so they
+ * are exempt: opening one that points at an owner-only regular file is
+ * accepted, while a symlink at a NORMAL path is still rejected
+ * (test_credentials_read_secret_file_symlink_rejected). */
+static void test_credentials_read_secret_file_fd_backed_accepted() {
+  char err[512];
+  char* path = make_tmp_file("alice:correct horse battery staple\n");
+  EXPECT_NOT_NULL(path);
+
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  EXPECT_TRUE(fd >= 0);
+
+  const char* prefixes[] = {"/proc/self/fd/", "/dev/fd/"};
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    if (i == 1 && access("/dev/fd", F_OK) != 0)
+      continue; /* /dev/fd is not present on every system */
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "%s%d", prefixes[i], fd);
+    char* user = (char*)1;
+    char* password = (char*)1;
+    EXPECT_EQ_INT(credentials_read_secret_file(fd_path, &user, &password, err, sizeof(err)), 0);
+    EXPECT_EQ_STR(user, "alice");
+    EXPECT_EQ_STR(password, "correct horse battery staple");
+    free(user);
+    free(password);
+  }
+
+  close(fd);
+  rm_temp(path);
+  free(path);
+}
+
 static void test_credentials_hash_file() {
   char* plaintext = make_tmp_file("# comment\n\n alice :" KAT_PASSWORD "\nbob:bob-s3cret\n");
   EXPECT_NOT_NULL(plaintext);
@@ -1103,6 +1337,12 @@ void test_credentials(void) {
   test_credentials_early_input_merge();
   test_credentials_read_secret_file();
   test_credentials_read_secret_file_bad();
+  test_credentials_read_secret_file_symlink_rejected();
+  test_credentials_read_secret_file_fifo_no_hang();
+  test_credentials_read_secret_file_fifo_delayed_writer();
+  test_credentials_read_secret_file_fifo_split_write();
+  test_credentials_store_fifo_delayed_writer();
+  test_credentials_read_secret_file_fd_backed_accepted();
   test_credentials_hash_file();
   test_credentials_rejects_group_or_other_accessible();
   test_credentials_dummy_key_persisted();

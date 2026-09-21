@@ -28,6 +28,10 @@
 
 /* Maximum chunk size (64 MB) — prevents unbounded allocation from the wire */
 #define MAX_CHUNK_SIZE (64ULL * 1024 * 1024)
+/* Files larger than this are not kept fully in memory while loading: the
+ * loader skips them so the sender streams from the path, and file_checksum
+ * hashes them from disk in bounded buffers instead of forcing a full load. */
+#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 #define MAX_MANIFEST_ENTRIES (1024 * 1024)
 /* Aggregate bytes retained by one received deletion manifest. */
 #define MAX_MANIFEST_BYTES (16ULL * 1024 * 1024)
@@ -220,6 +224,12 @@ SSL* io_get_ssl(void);
 unsigned long long protocol_bytes_written(void);
 unsigned long long protocol_bytes_read(void);
 void protocol_note_bytes_written(unsigned long long bytes);
+/* Apply --bwlimit pacing to bytes written outside protocol_send_n_data (the
+ * plaintext zero-copy sendfile fast path).  Resolves the bound/legacy session
+ * exactly as send_n_data does and runs the same token-bucket throttle, so the
+ * sendfile transport is paced identically to the buffered/TLS paths.  A no-op
+ * when the effective session has no bandwidth limit. */
+void protocol_throttle_bytes(size_t bytes);
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
 /* Transitional bridge for helpers whose signatures still carry only an fd. */
@@ -263,6 +273,9 @@ bool protocol_send_int(ProtocolSession* session, int data);
 bool protocol_receive_int(ProtocolSession* session, int* data);
 bool protocol_send_status(ProtocolSession* session, Status status);
 bool protocol_receive_status(ProtocolSession* session, Status* status);
+/* As protocol_receive_status, but with an explicit per-message deadline
+ * (seconds) instead of the session's configured io_timeout_sec. */
+bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int timeout_sec);
 bool send_n_data(int file_descriptor, const void* data, size_t data_size);
 bool receive_n_data(int file_descriptor, void* data, size_t data_size);
 

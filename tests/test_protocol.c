@@ -2,6 +2,7 @@
 #include "test_utils.h"
 #include <limits.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <threads.h>
 
@@ -210,6 +211,38 @@ static void test_send_receive_status() {
     EXPECT_TRUE(receive_status(0, &received));
     EXPECT_EQ_INT((int)received, (int)statuses[i]);
   }
+
+  close(p[0]);
+  close(p[1]);
+}
+
+/* An unknown wire status outside the enum range must be rejected as a protocol
+ * error instead of being handed to the caller as an unexpected verdict.  The
+ * last known enumerator (STATUS_STATS) must still be accepted, proving the
+ * validation does not reject legitimate statuses. */
+static void test_receive_status_rejects_unknown() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+
+  Status bogus = (Status)(STATUS_STATS + 1);
+  EXPECT_EQ_INT((int)write(p[1], &bogus, sizeof(bogus)), (int)sizeof(bogus));
+  Status received = STATUS_OK;
+  EXPECT_FALSE(protocol_receive_status(&session, &received));
+
+  Status negative = (Status)-1;
+  EXPECT_EQ_INT((int)write(p[1], &negative, sizeof(negative)), (int)sizeof(negative));
+  EXPECT_FALSE(protocol_receive_status(&session, &received));
+
+  Status top = STATUS_STATS;
+  EXPECT_EQ_INT((int)write(p[1], &top, sizeof(top)), (int)sizeof(top));
+  EXPECT_TRUE(protocol_receive_status(&session, &received));
+  EXPECT_EQ_INT((int)received, (int)STATUS_STATS);
+
+  Status timed_bogus = (Status)(STATUS_STATS + 7);
+  EXPECT_EQ_INT((int)write(p[1], &timed_bogus, sizeof(timed_bogus)), (int)sizeof(timed_bogus));
+  EXPECT_FALSE(protocol_receive_status_timed(&session, &received, 5));
 
   close(p[0]);
   close(p[1]);
@@ -669,6 +702,50 @@ static void test_receive_status_keepalive_emits() {
   close(to_peer[1]);
 }
 
+/* protocol_throttle_bytes() must apply the same token-bucket pacing as the
+ * buffered protocol send path, so the plaintext sendfile fast path honors
+ * --bwlimit exactly like the TLS path.  With bwlimit=1 MB/s the initial burst
+ * is 100 KB (bwlimit/10); pacing 150 KB therefore owes ~50 KB of debt, i.e. a
+ * ~50 ms sleep. */
+static void test_protocol_throttle_bytes_paces() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_bind(&session);
+  protocol_session_set_bwlimit(&session, 1000000ULL);
+
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  protocol_throttle_bytes(150000);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long elapsed_ms =
+      (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+  /* Allow for scheduler slack but require the bulk of the expected 50 ms. */
+  EXPECT_TRUE(elapsed_ms >= 40);
+
+  protocol_session_unbind();
+}
+
+/* With no bandwidth limit the primitive must not sleep, however many bytes it
+ * is handed. */
+static void test_protocol_throttle_bytes_unlimited() {
+  ProtocolSession session;
+  protocol_session_init(&session, -1, -1);
+  protocol_session_bind(&session);
+  protocol_session_set_bwlimit(&session, 0);
+
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  protocol_throttle_bytes(100000000ULL);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long elapsed_ms =
+      (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+  EXPECT_TRUE(elapsed_ms < 2000);
+
+  protocol_session_unbind();
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -678,6 +755,7 @@ void test_protocol() {
   test_send_receive_data();
   test_send_receive_int();
   test_send_receive_status();
+  test_receive_status_rejects_unknown();
   test_protocol_session_io_timeout();
   test_protocol_server_io_timeout_floor();
   test_send_receive_status_timed();
@@ -698,4 +776,6 @@ void test_protocol() {
   test_protocol_accounting_release_does_not_underflow();
   test_receive_data_charge_follows_owning_session();
   test_data_create_starts_uncharged_and_unowned();
+  test_protocol_throttle_bytes_paces();
+  test_protocol_throttle_bytes_unlimited();
 }

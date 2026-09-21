@@ -301,6 +301,14 @@ static ProtocolSession* legacy_session(int read_fd, int write_fd) {
   return &legacy_io_session;
 }
 
+/* Pace an out-of-band write that bypassed protocol_send_n_data (the plaintext
+ * sendfile fast path).  The bound/legacy session is resolved exactly as
+ * send_n_data resolves it, so the same token-bucket state is throttled and the
+ * TLS and plaintext transports share identical --bwlimit semantics. */
+void protocol_throttle_bytes(size_t bytes) {
+  bw_throttle_session(legacy_session(-1, -1), bytes);
+}
+
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   return protocol_send_n_data(legacy_session(-1, file_descriptor), data, data_size);
 }
@@ -382,7 +390,7 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
     if (session->ssl)
       wait_events = POLLOUT;
   }
-  log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zu", total_bytes_send);
+  log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zd", total_bytes_send);
   atomic_fetch_add(&io_bytes_written, (unsigned long long)total_bytes_send);
   return true;
 }
@@ -439,12 +447,18 @@ static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, 
     }
 
     ssize_t bytes_received;
-    if (session->ssl)
-      bytes_received = SSL_read(session->ssl, (char*)data + total_bytes_received,
-                                data_size - total_bytes_received);
-    else
+    if (session->ssl) {
+      /* SSL_read takes an int length; clamp a >INT_MAX request into chunks
+       * (mirrors the send path) so the size_t downcast can never truncate into
+       * a negative/partial read. */
+      size_t ssl_chunk = data_size - total_bytes_received > (size_t)INT_MAX
+                             ? (size_t)INT_MAX
+                             : data_size - total_bytes_received;
+      bytes_received = SSL_read(session->ssl, (char*)data + total_bytes_received, (int)ssl_chunk);
+    } else {
       bytes_received =
           read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
+    }
     if (bytes_received <= 0) {
       if (session->ssl) {
         int ssl_err = SSL_get_error(session->ssl, (int)bytes_received);
@@ -550,6 +564,15 @@ static const char* status_to_string(Status status) {
   }
 }
 
+/* Reject a raw wire status outside the known enum range before it is handed to
+ * callers, so an unknown/corrupt frame fails as a protocol error instead of
+ * being silently interpreted as an unexpected-but-valid verdict.  STATUS_OK is
+ * the first enumerator and STATUS_STATS the last, so the range check accepts
+ * every status the protocol defines. */
+static bool status_is_valid(Status status) {
+  return status >= STATUS_OK && status <= STATUS_STATS;
+}
+
 /* Shared string send/receive implementation.  `redact` selects whether the
  * payload body is written to the LOG_DEBUG_PROTO debug log: daemon auth material
  * (the username and the proof/signature fields) sets it so a --verbose log never
@@ -633,7 +656,7 @@ bool protocol_send_data(ProtocolSession* session, const Data* data) {
     return false;
   if (!protocol_send_n_data(session, data->data, data_size))
     return false;
-  log_debug_message(LOG_DEBUG_PROTO, "Send %lld data", data_size);
+  log_debug_message(LOG_DEBUG_PROTO, "Send %llu data", data_size);
   return true;
 }
 
@@ -667,7 +690,7 @@ Data* protocol_receive_data_limited(ProtocolSession* session, unsigned long long
     protocol_release_memory_for_session(session, allocation_size);
     return NULL;
   }
-  log_debug_message(LOG_DEBUG_PROTO, "Received %lld data", size);
+  log_debug_message(LOG_DEBUG_PROTO, "Received %llu data", size);
   Data* result = data_create(data, (size_t)size);
   if (!result) {
     protocol_release_memory_for_session(session, allocation_size);
@@ -777,6 +800,10 @@ bool protocol_receive_status(ProtocolSession* session, Status* status) {
   }
   if (!protocol_receive_n_data_until(session, status, sizeof(Status), deadline_ptr))
     return false;
+  if (!status_is_valid(*status)) {
+    log_message(LOG_LEVEL_ERROR, "Received unknown protocol status %d", *status);
+    return false;
+  }
   if (!protocol_capture_error_detail(session, status, deadline_ptr, NULL))
     return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
@@ -798,6 +825,10 @@ bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int
   deadline.tv_sec += timeout_sec;
   if (!protocol_receive_n_data_until(session, status, sizeof(Status), &deadline))
     return false;
+  if (!status_is_valid(*status)) {
+    log_message(LOG_LEVEL_ERROR, "Received unknown protocol status %d", *status);
+    return false;
+  }
   if (!protocol_capture_error_detail(session, status, &deadline, NULL))
     return false;
   log_debug_message(LOG_DEBUG_PROTO, "Received Status: %s", status_to_string(*status));
@@ -911,6 +942,10 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
     Status received;
     if (!protocol_read_status_until(session, &received, &deadline))
       return false;
+    if (!status_is_valid(received)) {
+      log_message(LOG_LEVEL_ERROR, "Received unknown protocol status %d", received);
+      return false;
+    }
     if (!protocol_capture_error_detail(session, &received, &deadline, abort_check))
       return false;
     if (received == STATUS_KEEPALIVE) {

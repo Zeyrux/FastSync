@@ -2275,6 +2275,36 @@ class TestPartialDir:
         partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
         assert not os.path.exists(partial)
 
+    def test_partial_dir_alone_implies_partial(self, shared_server):
+        """--partial-dir=DIR with no --partial implies --partial, like rsync.
+
+        rsync 3.4.1 retains the staged partial when --partial-dir is given by
+        itself; before the implication was added FastSync discarded it.  The
+        transfer is made to fail deterministically by placing a non-empty
+        directory at the destination path, so the final partial-dir ->
+        destination rename fails and whatever was staged under the partial dir
+        stays on disk."""
+        source = os.path.join(TEST_DATA_DIR, "partial_dir_implied_src")
+        dest = os.path.join(TEST_DATA_DIR, "partial_dir_implied_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        source_file = os.path.join(source, "f.bin")
+        with open(source_file, "wb") as f:
+            f.write(b"partial payload")
+
+        received = get_dest_received_dir(dest, source)
+        os.makedirs(os.path.join(received, "f.bin"))
+        with open(os.path.join(received, "f.bin", "keep"), "wb") as f:
+            f.write(b"keep")
+
+        result, _ = run_client(source, dest, flags=["--partial-dir=.partial"],
+                               port=shared_server.port)
+        assert result.returncode != 0, "expected the blocked install to fail"
+
+        partial = os.path.join(dest, ".partial", os.path.relpath(source_file, os.path.sep))
+        assert os.path.exists(partial), \
+            "--partial-dir alone must imply --partial and retain the partial file"
+
 
 class TestLargeFile:
     def test_transfer_100mb_file(self, shared_server):
@@ -2606,35 +2636,30 @@ class TestTimeoutAndAllocLimits:
         mismatches, missing = verify_transfer(source, received)
         assert not missing and not mismatches
 
-    def test_temp_dir_cross_filesystem_fallback(self, shared_server):
-        """A confined relative --temp-dir that resolves (via a symlink under the
-        destination root) to another filesystem must fall back to a non-atomic
-        copy instead of aborting (rsync parity).  Skipped when no second
-        filesystem is available."""
-        shm = "/dev/shm"
-        if not os.path.isdir(shm):
-            pytest.skip("/dev/shm not available")
-        if os.stat(shm).st_dev == os.stat(TEST_DATA_DIR).st_dev:
-            pytest.skip("/dev/shm is on the same filesystem as the test data")
-        scratch = os.path.join(shm, f"fastsync_tmp_{os.getpid()}")
-        shutil.rmtree(scratch, ignore_errors=True)
-        os.makedirs(scratch)
+    def test_temp_dir_symlink_escape_rejected(self, shared_server):
+        """A symlink planted inside the destination root pointing outside it
+        must not redirect receiver scratch files: --temp-dir=<that link> is
+        refused and nothing is written at the link target.  An in-root symlink
+        (e.g. to a mount point that stays inside the authorized root) is still
+        accepted, preserving the engine's EXDEV cross-filesystem fallback."""
+        source, dest = self._seed("tempdir_escape_src")
+        outside = "/tmp/fastsync_tempdir_escape_%d" % os.getpid()
+        shutil.rmtree(outside, ignore_errors=True)
+        os.makedirs(outside)
+        link = os.path.join(dest, "escape_scratch")
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(outside, link)
         try:
-            source, dest = self._seed("tempdir_xdev_src")
-            # The receiver resolves a relative temp dir under the destination
-            # root; a symlink there points the scratch at the second filesystem.
-            link = os.path.join(dest, "xdev_scratch")
-            os.symlink(scratch, link)
-            result, _ = run_client(source, dest, flags=["--temp-dir", "xdev_scratch"],
+            result, _ = run_client(source, dest, flags=["--temp-dir", "escape_scratch"],
                                    port=shared_server.port)
-            assert result.returncode == 0, f"cross-fs temp-dir failed: {result.stderr[:300]}"
+            assert result.returncode != 0, "an escaping --temp-dir symlink must be refused"
             received = get_dest_received_dir(dest, source)
-            mismatches, missing = verify_transfer(source, received)
-            assert not missing, f"Missing: {missing}"
-            assert not mismatches, f"Mismatch: {mismatches}"
-            assert os.listdir(scratch) == [], "temp files left behind in the cross-fs scratch"
+            assert not os.path.exists(os.path.join(received, "f.txt")), \
+                "the receiver must not fall back to writing the file"
+            assert os.listdir(outside) == [], "receiver wrote outside the authorized root"
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            shutil.rmtree(outside, ignore_errors=True)
 
 
 class TestRemoteOptionTransport:
@@ -5781,6 +5806,35 @@ class TestStandaloneSuperDefault:
         assert result.returncode != 0, (
             "standalone server accepted --copy-as without --allow-super"
         )
+
+    @pytest.mark.skipif(
+        os.geteuid() != 0,
+        reason="root triggers the SUPER_MODE_OFF default and can create setuid sources",
+    )
+    def test_special_bits_masked_without_allow_super(self):
+        """A root standalone server without --allow-super forces SUPER_MODE_OFF,
+        so client-supplied setuid/setgid/sticky bits must be stripped even under
+        -p (they are super-user activities just like device-node creation)."""
+        source = os.path.join(TEST_DATA_DIR, "super_default_mode_src")
+        dest = os.path.join(TEST_DATA_DIR, "super_default_mode_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        src_file = os.path.join(source, "priv.sh")
+        with open(src_file, "wb") as f:
+            f.write(b"#!/bin/sh\necho hi\n")
+        os.chmod(src_file, 0o4755)
+        server = ServerManager()
+        server.start()  # deliberately no --allow-super -> SUPER_MODE_OFF as root
+        try:
+            result, _ = run_client(source, dest, flags=["-p"], port=server.port)
+        finally:
+            server.stop()
+        assert result.returncode == 0, f"exit {result.returncode}: {(result.stderr or '')[:200]}"
+        received = get_dest_received_dir(dest, source)
+        mode = stat.S_IMODE(os.stat(os.path.join(received, "priv.sh")).st_mode)
+        assert (mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)) == 0, \
+            f"--no-super receiver kept a privileged bit: {oct(mode)}"
+        assert (mode & 0o777) == 0o755, f"ordinary permission bits lost: {oct(mode)}"
 
     @pytest.mark.skipif(os.geteuid() != 0, reason="root can create the source device node")
     def test_devices_skipped_without_allow_super(self):

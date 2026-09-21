@@ -166,6 +166,8 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
     }
     struct pollfd pfd = {.fd = file_descriptor, .events = POLLOUT};
     int polled = poll(&pfd, 1, timeout);
+    if (polled < 0 && errno == EINTR)
+      continue;
     if (polled <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
       close(fd);
       return false;
@@ -183,6 +185,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
       return false;
     }
     protocol_note_bytes_written((unsigned long long)sent);
+    protocol_throttle_bytes((size_t)sent);
   }
 
   close(fd);

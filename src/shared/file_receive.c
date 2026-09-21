@@ -474,9 +474,13 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
   /* Under -p/--perms rsync copies the source's permission and special bits; a
    * kernel that denies setuid/setgid/sticky reports the failure rather than
    * having them masked here.  Without -p the node is created like any other new
-   * entry: source_mode & 0777 & ~umask. */
+   * entry: source_mode & 0777 & ~umask.  When super-user activities are
+   * forbidden, the special bits are stripped even under -p (they are
+   * super-user activities just like device-node creation). */
   mode_t perms = config->preserve_perms ? (mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777))
                                         : (mode & 0777 & ~(mode_t)file_process_umask());
+  if (!privilege_super_mode_permitted(config->super_mode))
+    perms &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
 
   int rc = is_fifo ? mkfifoat(parent_fd, leaf, perms)
                    : mknodat(parent_fd, leaf, create_mode | perms, rdev);
@@ -2949,8 +2953,12 @@ void dir_metadata_list_apply(const DirTimeList* list, const char* root_directory
       }
       if (mode_ready) {
         /* rsync -p copies the source directory mode exactly, including
-         * group/other write and the setgid/sticky bits. */
+         * group/other write and the setgid/sticky bits.  Setuid/setgid/sticky
+         * are super-user activities: when the connection forbade them
+         * (SUPER_MODE_OFF / --no-super), strip them even under -p. */
         mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
+        if (!privilege_super_mode_permitted(config->super_mode))
+          safe_mode &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
         if (dir_fd < 0) {
           char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
           log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",

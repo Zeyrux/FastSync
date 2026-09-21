@@ -16,6 +16,7 @@
 #include "test_file.h"
 #include "test_file_list.h"
 #include "test_file_sendfile.h"
+#include "test_filter.h"
 #include "test_format.h"
 #include "test_fuzz_smoke.h"
 #include "test_glob.h"
@@ -80,6 +81,7 @@ int main() {
   RUN_TEST(test_receiver_timeout);
   RUN_TEST(test_metadata);
   RUN_TEST(test_glob);
+  RUN_TEST(test_filter);
   RUN_TEST(test_iconv);
   RUN_TEST(test_file);
   RUN_TEST(test_file_list);

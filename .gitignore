@@ -12,3 +12,12 @@ build_docker2/
 # Test/run artifacts
 root/
 test_partial_install_tmp/
+
+# Editor/tooling + test caches/artifacts
+.pytest_cache/
+*.gcda
+*.gcno
+*.gcov
+di/
+test_data-manual/
+*.log

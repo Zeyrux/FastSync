@@ -26,9 +26,9 @@ elseif(NOT SANITIZER STREQUAL "none")
 endif()
 
 # --- Strict warnings option ---
-option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Werror)" OFF)
+option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Wformat-signedness, Werror)" OFF)
 if(STRICT_WARNINGS)
-	add_compile_options(-Wextra -Wpedantic -Werror)
+	add_compile_options(-Wextra -Wpedantic -Wformat-signedness -Werror)
 endif()
 
 # --- Coverage option ---
@@ -226,6 +226,7 @@ set(TEST_SRCS
 	tests/test_file.c
 	tests/test_file_list.c
 	tests/test_file_sendfile.c
+	tests/test_filter.c
 	tests/test_format.c
 	tests/test_fuzz_smoke.c
 	tests/test_glob.c

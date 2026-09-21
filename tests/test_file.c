@@ -377,6 +377,98 @@ static void test_file_save_to_disk_temp_dir_confined() {
   rmdir(outside);
 }
 
+/* A client-planted symlink under the receive root must never redirect the
+ * --temp-dir scratch directory outside the authorized root: the REAL path of
+ * the opened dir is checked.  An in-root symlink (the EXDEV cross-filesystem
+ * case) must still be accepted. */
+static void test_file_open_temp_dir_symlink_confinement() {
+  const char* root = "test_tempdir_link_root";
+  const char* outside = "test_tempdir_link_outside";
+  char root_abs[PATH_MAX];
+  char outside_abs[PATH_MAX];
+  unlink("test_tempdir_link_root/escape");
+  unlink("test_tempdir_link_root/inside_link");
+  rmdir("test_tempdir_link_root/scratch");
+  rmdir(root);
+  rmdir(outside);
+
+  int mkdir_root_ret = mkdir(root, 0755);
+  int mkdir_outside_ret = mkdir(outside, 0755);
+  bool root_resolved = realpath(root, root_abs) != NULL;
+  bool outside_resolved = realpath(outside, outside_abs) != NULL;
+  int root_fd = root_resolved ? open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+
+  bool root_set = false;
+  bool scratch_ok = false;
+  int scratch_fd = -1;
+  bool escape_staged = false;
+  int escape_fd = 0;
+  bool inside_staged = false;
+  int inside_fd = -1;
+  char* scratch = NULL;
+  char* escape = NULL;
+  char* inside_link = NULL;
+
+  /* Only touch the global authorized root and the scratch fixtures once the
+     setup succeeded; the teardown below always runs regardless. */
+  if (root_fd >= 0 && outside_resolved) {
+    root_set = utils_set_authorized_root(root_fd, root_abs);
+
+    /* An existing in-root scratch dir opens normally. */
+    scratch = path_cat(root_abs, "scratch");
+    if (scratch && mkdir(scratch, 0755) == 0) {
+      scratch_ok = true;
+      scratch_fd = file_open_temp_dir(scratch);
+      if (scratch_fd >= 0)
+        close(scratch_fd);
+    }
+
+    /* A symlink whose target is outside the root is refused. */
+    escape = path_cat(root_abs, "escape");
+    if (escape && symlink(outside_abs, escape) == 0) {
+      escape_staged = true;
+      escape_fd = file_open_temp_dir(escape);
+    }
+
+    /* A symlink that stays inside the root is accepted (EXDEV fallback). */
+    inside_link = path_cat(root_abs, "inside_link");
+    if (inside_link && scratch && symlink(scratch, inside_link) == 0) {
+      inside_staged = true;
+      inside_fd = file_open_temp_dir(inside_link);
+      if (inside_fd >= 0)
+        close(inside_fd);
+    }
+  }
+
+  /* Release the global authorized root and all fixtures BEFORE asserting:
+     EXPECT_* returns early on failure, so a failed assertion must not be able
+     to leave the process state poisoned or leak root_fd. */
+  utils_set_authorized_root(-1, NULL);
+  if (root_fd >= 0)
+    close(root_fd);
+  free(inside_link);
+  free(escape);
+  free(scratch);
+  unlink("test_tempdir_link_root/escape");
+  unlink("test_tempdir_link_root/inside_link");
+  rmdir("test_tempdir_link_root/scratch");
+  rmdir(root);
+  rmdir(outside);
+
+  EXPECT_EQ_INT(mkdir_root_ret, 0);
+  EXPECT_EQ_INT(mkdir_outside_ret, 0);
+  EXPECT_TRUE(root_resolved);
+  EXPECT_TRUE(outside_resolved);
+  EXPECT_TRUE(root_fd >= 0);
+  EXPECT_TRUE(root_set);
+  EXPECT_TRUE(scratch_ok);
+  EXPECT_TRUE(scratch_fd >= 0);
+  EXPECT_TRUE(escape_staged);
+  EXPECT_EQ_INT(escape_fd, -1);
+  EXPECT_TRUE(inside_staged);
+  EXPECT_TRUE(inside_fd >= 0);
+}
+
 /* Issue #251: file_save_to_disk_full must distinguish receiver-side skips
    (--existing/--ignore-existing/--update) from real writes so the sender can
    decide whether --remove-source-files may unlink its source. */
@@ -1040,8 +1132,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
 
   /* No -p/-E: the pre-existing 0640 survives the atomic overwrite. */
   bool ok = file_to_disk_secure_attrs(path, "data", 4, false, false, false, &m,
-                                      (FileAttrPolicy){false, false, false, false}, false, false,
-                                      false, NULL, false, false, NULL);
+                                      (FileAttrPolicy){false, false, false, false, true}, false,
+                                      false, false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -1049,8 +1141,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
 
   /* -p: the source mode wins. */
   ok = file_to_disk_secure_attrs(path, "data2", 5, false, false, false, &m,
-                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){true, true, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0755);
@@ -1060,8 +1152,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
      source 0755 gives 0750, not 0751 and not the scratch 0711. */
   EXPECT_EQ_INT(chmod(path, 0640), 0);
   ok = file_to_disk_secure_attrs(path, "data3", 6, false, false, false, &m,
-                                 (FileAttrPolicy){false, false, false, true}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, true, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(path, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0750);
@@ -1073,8 +1165,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
   const char* fresh = "test_attr_split_fresh.txt";
   unlink(fresh);
   ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, &m,
-                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(fresh, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), (int)(m.mode & 0777 & ~(mode_t)file_process_umask()));
@@ -1083,8 +1175,8 @@ static void test_atomic_no_perms_preserves_destination_mode() {
   /* Without any metadata the historical fixed 0644 default still applies. */
   unlink(fresh);
   ok = file_to_disk_secure_attrs(fresh, "data", 4, false, false, false, NULL,
-                                 (FileAttrPolicy){false, false, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){false, false, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   EXPECT_EQ_INT(stat(fresh, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
@@ -1104,8 +1196,8 @@ static void test_new_file_mode_honors_source_and_umask() {
   m.gid = getegid();
 
   bool ok = file_to_disk_secure_attrs(path, "x", 1, false, false, false, &m,
-                                      (FileAttrPolicy){false, false, false, false}, false, false,
-                                      false, NULL, false, false, NULL);
+                                      (FileAttrPolicy){false, false, false, false, true}, false,
+                                      false, false, NULL, false, false, NULL);
   EXPECT_TRUE(ok);
   struct stat st;
   EXPECT_EQ_INT(stat(path, &st), 0);
@@ -1663,8 +1755,8 @@ static void test_file_write_to_disk_partial_retention() {
   m.atime_valid = false;
   m.crtime_valid = false;
   bool ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
-                                      (FileAttrPolicy){true, true, false, false}, false, false,
-                                      false, NULL, false, true, NULL);
+                                      (FileAttrPolicy){true, true, false, false, true}, false,
+                                      false, false, NULL, false, true, NULL);
   EXPECT_FALSE(ok); /* the write itself succeeded, but metadata restore failed */
   /* Retained: the already-written temp now sits at the destination path. */
   int fd = open(path, O_RDONLY);
@@ -1683,8 +1775,8 @@ static void test_file_write_to_disk_partial_retention() {
 
   /* Same failure with keep_partial=false: temp is unlinked, nothing retained. */
   ok = file_to_disk_secure_attrs(path, content, strlen(content), false, false, true, &m,
-                                 (FileAttrPolicy){true, true, false, false}, false, false, false,
-                                 NULL, false, false, NULL);
+                                 (FileAttrPolicy){true, true, false, false, true}, false, false,
+                                 false, NULL, false, false, NULL);
   EXPECT_FALSE(ok);
   EXPECT_TRUE(access(path, F_OK) == -1);
 }
@@ -2264,6 +2356,7 @@ void test_file() {
   test_file_save_to_disk_ignore_existing_entry_types();
   test_file_save_to_disk_partial_install();
   test_file_save_to_disk_temp_dir_confined();
+  test_file_open_temp_dir_symlink_confinement();
   test_file_save_to_disk_reports_skips();
   test_file_write_to_disk_sparse_preserves_holes();
   test_file_write_to_disk_partial_retention();

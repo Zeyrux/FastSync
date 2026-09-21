@@ -53,7 +53,7 @@ bool validate_config(const Config* config) {
     return false;
   }
   if (config->compression_threads > 0 && !config->use_compression) {
-    log_message(LOG_LEVEL_ERROR, "--compress-threads requires compression (-c or -z)");
+    log_message(LOG_LEVEL_ERROR, "--compress-threads requires compression (-z/--compress)");
     return false;
   }
   if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
@@ -73,6 +73,13 @@ bool validate_config(const Config* config) {
   /* -4 and -6 are mutually exclusive: a socket address family cannot be both. */
   if (config->ipv4 && config->ipv6) {
     log_message(LOG_LEVEL_ERROR, "-4/--ipv4 and -6/--ipv6 are mutually exclusive");
+    return false;
+  }
+  /* rsync 3.4.1 rejects --inplace together with --partial-dir (exit 1): the
+     inplace write path bypasses partial staging, so a partial-dir name would be
+     silently ignored.  Match rsync's message and refuse before any I/O. */
+  if (config->inplace && config->partial_dir) {
+    log_message(LOG_LEVEL_ERROR, "--inplace cannot be used with --partial-dir");
     return false;
   }
   if (config->log_file_format && !config->log_file) {
@@ -100,6 +107,16 @@ bool validate_config(const Config* config) {
   const char* invariants_error = config_invariants_error(config);
   if (invariants_error) {
     log_message(LOG_LEVEL_ERROR, "%s", invariants_error);
+    return false;
+  }
+  /* The receiver rejects a protect-rule block with more than MAX_FILTER_RULES
+     entries as an opaque protocol error; reject an over-limit --filter set here,
+     before any network I/O, with an actionable message.  send_protect_entries()
+     re-checks the final built count because cvs-exclude / merge rules can
+     expand it beyond config->filters->size. */
+  if (config->filters && config->filters->size > MAX_FILTER_RULES) {
+    log_message(LOG_LEVEL_ERROR, "too many filter rules: %d (maximum %d)", config->filters->size,
+                MAX_FILTER_RULES);
     return false;
   }
   /* --protocol: FastSync has exactly one wire format, so the forced version

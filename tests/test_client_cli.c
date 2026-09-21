@@ -171,6 +171,38 @@ static void test_validate_config_unified_invariants() {
   config_delete(cfg);
 }
 
+/* The receiver enforces MAX_FILTER_RULES on the protect-rule block and would
+   otherwise fail the session with an opaque protocol error.  The client must
+   accept exactly the limit and reject one more up front, before any network
+   I/O, with an actionable message. */
+static void test_validate_config_filter_rule_limit() {
+  Config* cfg = valid_client_config();
+  cfg->filters = array_list_create(free);
+  EXPECT_NOT_NULL(cfg->filters);
+  for (int i = 0; i < MAX_FILTER_RULES; i++)
+    EXPECT_TRUE(array_list_add(cfg->filters, str_dup("- *.tmp")));
+  EXPECT_TRUE(validate_config(cfg)); /* exactly the limit is accepted */
+
+  FILE* log_capture = tmpfile();
+  EXPECT_NOT_NULL(log_capture);
+  log_set_file(log_capture);
+  EXPECT_TRUE(array_list_add(cfg->filters, str_dup("- *.bak")));
+  EXPECT_FALSE(validate_config(cfg)); /* one over the limit is rejected */
+  fflush(log_capture);
+  rewind(log_capture);
+  char line[512];
+  bool saw_message = false;
+  while (fgets(line, sizeof(line), log_capture) != NULL) {
+    if (strstr(line, "too many filter rules") != NULL && strstr(line, "(maximum 1024)") != NULL)
+      saw_message = true;
+  }
+  log_set_file(NULL);
+  fclose(log_capture);
+  EXPECT_TRUE(saw_message);
+
+  config_delete(cfg);
+}
+
 /* Test main() with --help flag (early return path, no server connection needed) */
 static void test_cli_help() {
   /* We can't easily call main() because it calls send_files which needs a server.
@@ -509,6 +541,66 @@ static void test_parse_args_ignore_existing() {
   EXPECT_TRUE(cfg->ignore_existing);
 
   config_delete(cfg);
+}
+
+/* --partial-dir=DIR implies --partial, matching rsync 3.4.1.  rsync resolves
+ * this after option parsing, so the implication wins over an explicit
+ * --no-partial in either order.  It is skipped under --inplace, where partial
+ * staging is bypassed and the destination is written in place. */
+static void test_parse_args_partial_dir_implies_partial() {
+  {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* Explicit --no-partial before --partial-dir: --partial-dir still wins. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--no-partial", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* Reversed order must not change the precedence. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--partial-dir=.partial", "--no-partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_TRUE(cfg->partial);
+    config_delete(cfg);
+  }
+  {
+    /* --inplace bypasses partial staging, so parse_args must not set the
+       implied --partial; the combination itself is invalid (rsync parity:
+       "--inplace cannot be used with --partial-dir"), so validation rejects. */
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--inplace", "--partial-dir=.partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->partial);
+    cfg->send_directory = str_dup("/src");
+    cfg->receive_root_directory = str_dup("/dst");
+    EXPECT_FALSE(validate_config(cfg));
+    config_delete(cfg);
+  }
+  {
+    Config* cfg = config_create();
+    char* argv[] = {"fastsync", "--no-partial", "/src", "/dst"};
+    int positional_args[2];
+    int positional_count = 0;
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
+    EXPECT_FALSE(cfg->partial);
+    config_delete(cfg);
+  }
 }
 
 static void test_parse_args_executability() {
@@ -1242,33 +1334,76 @@ static void test_parse_args_delete_timing_without_delete_rejected() {
   config_delete(cfg);
 }
 
-/* Parsed-but-unimplemented options must fail instead of being silently accepted. */
-static void test_parse_args_rejects_unimplemented_options() {
-  static const char* const options[] = {"--silent",
-                                        "--queue-size",
-                                        "-A",
-                                        "--acls",
-                                        "-X",
-                                        "--xattrs",
-                                        "-D",
-                                        "--devices",
-                                        "--delete-excluded",
-                                        "--max-delete",
-                                        "--prune-empty-dirs",
-                                        "--bind-address",
-                                        "--daemon",
-                                        "--config",
-                                        "--server"};
+/* Truly-unknown options (including server-only spellings) must be rejected
+ * through the unknown-option path instead of being silently accepted. */
+static void test_parse_args_rejects_unknown_options() {
+  static const char* const options[] = {"--silent", "--queue-size", "--bind-address",
+                                        "--daemon", "--config",     "--server"};
 
   for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
     Config* cfg = config_create();
-    char* argv[] = {"fastsync", (char*)options[i], "dummy", "/src", "/dst"};
+    char* argv[] = {"fastsync", (char*)options[i], "/src", "/dst"};
     int positional_args[2];
     int positional_count = 0;
 
-    EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+    EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
     config_delete(cfg);
   }
+}
+
+/* Options that are genuinely implemented must parse successfully and record
+ * their effect, rather than being lumped in with the unknown-option set. */
+static void test_parse_args_accepts_implemented_metadata_options() {
+  Config* cfg = config_create();
+  char* argv_x[] = {"fastsync", "-X", "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_x, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_xattrs);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_acls[] = {"fastsync", "--acls", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_acls, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_acls);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_d[] = {"fastsync", "-D", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_d, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  EXPECT_TRUE(cfg->preserve_specials);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_devices[] = {"fastsync", "--devices", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_devices, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->preserve_devices);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_delete_excluded[] = {"fastsync", "--delete-excluded", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_delete_excluded, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->delete_excluded);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_max_delete[] = {"fastsync", "--max-delete=5", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_max_delete, positional_args, &positional_count), 0);
+  EXPECT_EQ_INT(cfg->max_delete, 5);
+  config_delete(cfg);
+
+  cfg = config_create();
+  positional_count = 0;
+  char* argv_prune[] = {"fastsync", "--prune-empty-dirs", "/src", "/dst"};
+  EXPECT_EQ_INT(parse_args(cfg, 4, argv_prune, positional_args, &positional_count), 0);
+  EXPECT_TRUE(cfg->prune_empty_dirs);
+  config_delete(cfg);
 }
 
 /* Test both rsync-compatible quiet spellings and option ordering. */
@@ -4769,6 +4904,7 @@ void test_client_cli() {
   test_validate_config_credentials_require_tls_or_loopback();
   test_validate_config_delta_sendfile_constraints();
   test_validate_config_unified_invariants();
+  test_validate_config_filter_rule_limit();
   test_cli_help();
   test_cli_archive_flags();
   test_cli_dry_run();
@@ -4784,6 +4920,7 @@ void test_client_cli() {
   test_parse_args_valid_port();
   test_parse_args_size_only();
   test_parse_args_ignore_existing();
+  test_parse_args_partial_dir_implies_partial();
   test_parse_args_executability();
   test_parse_args_chmod();
   test_parse_args_numeric_chmod();
@@ -4819,7 +4956,8 @@ void test_client_cli() {
   test_parse_args_delete_default_timing_and_commit();
   test_parse_args_delete_timing_conflict_rejected();
   test_parse_args_delete_timing_without_delete_rejected();
-  test_parse_args_rejects_unimplemented_options();
+  test_parse_args_rejects_unknown_options();
+  test_parse_args_accepts_implemented_metadata_options();
   test_parse_args_quiet();
   test_parse_args_human_readable();
   test_parse_args_hard_links();

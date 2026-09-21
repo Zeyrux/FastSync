@@ -54,13 +54,26 @@ bool client_abort_pending(void) {
 }
 
 #ifndef FASTSYNC_TEST_BUILD
+/* SIG_DFL disposition used by the handler's "not armed" fallback.  It is built
+ * once at load time so the handler can restore the default action with
+ * sigaction(2) -- which is async-signal-safe -- instead of signal(3), which is
+ * not.  The zero-initialized sa_mask is the empty set. */
+static const struct sigaction client_default_action = {
+    .sa_handler = SIG_DFL,
+    .sa_flags = 0,
+};
+
 /* Signal handler: perform NO work beyond storing the flag.  Logging, protocol
  * I/O and the STATUS_ABORT frame are all done later on the normal send path,
- * which is not async-signal-safe.  When no transfer is armed, fall back to the
- * default action so local-only modes remain interruptible. */
+ * which is not async-signal-safe.  When no transfer is armed, restore the
+ * default disposition (async-signal-safe sigaction) and re-raise so local-only
+ * modes remain interruptible.  The handler deliberately stays installed while a
+ * transfer is armed -- rather than using SA_RESETHAND -- so a second Ctrl-C
+ * during the graceful abort keeps setting the flag instead of hard-killing the
+ * process mid-cleanup. */
 static void client_signal_handler(int signo) {
   if (!client_abort_armed) {
-    signal(signo, SIG_DFL);
+    sigaction(signo, &client_default_action, NULL);
     raise(signo);
     return;
   }
@@ -2612,6 +2625,15 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   if (config->use_delete && !config->delete_before && !config->delete_during &&
       !config->delete_delay && !config->delete_after)
     config->delete_during = true;
+  /* rsync parity: --partial-dir=DIR chooses where an interrupted transfer's
+     partial file is kept, so it implies --partial.  rsync applies the
+     implication after option parsing, so it wins over an explicit --no-partial
+     regardless of the order the two options appear in (verified on rsync
+     3.4.1).  --inplace is the exception: the destination file is written in
+     place with no partial/temp staging, so the partial machinery is bypassed
+     and the implication is skipped to leave --inplace behavior untouched. */
+  if (config->partial_dir && !config->inplace)
+    config->partial = true;
   if (config->compress_choice) {
     int algo = compression_algo_from_name(config->compress_choice);
     if (algo >= 0) {
@@ -3274,7 +3296,7 @@ int main(int argc, char* argv[]) {
       exit_code = 1;
     }
   } else if (config->use_multithreading) {
-    exit_code = send_files_multithreaded(&config);
+    exit_code = send_files_multithreaded(config);
   } else {
     exit_code = send_files(config);
   }

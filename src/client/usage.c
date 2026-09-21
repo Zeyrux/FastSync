@@ -19,7 +19,9 @@ void print_usage(void) {
   printf("\n");
   printf("Options:\n");
   printf("  -c, --checksum      Verify content by checksum instead of size+mtime\n");
-  printf("  -z, --compress [level]  Enable compression (level 1-22, default 5)\n");
+  printf("  -z, --compress [level]  Enable compression.  The default level is\n");
+  printf("                      per-codec: zstd 3 (range 1-22), zlib/zlibx 6, lz4\n");
+  printf("                      ignores the level\n");
   printf("  -a, --archive       rsync archive mode (-rlptgoD): links, perms, times,\n");
   printf("                      owner, group, devices and specials; not\n");
   printf("                      compression/multithreading\n");
@@ -36,8 +38,8 @@ void print_usage(void) {
   printf("                      arguments, e.g. -e \"ssh -p 2222\"\n");
   printf("  --rsync-path <path>  Alias for --fastsync-server-path (path to the\n");
   printf("                      fastsync server binary on the remote side)\n");
-  printf("  --blocking-io        Leave the SSH transport socket without read/write\n");
-  printf("                      timeouts so it blocks naturally\n");
+  printf("  --blocking-io        SSH transport only: leave the socket without read/write\n");
+  printf("                      timeouts so it blocks naturally (no effect on TCP)\n");
   printf("  --outbuf=MODE        stdout/stderr buffering: N (none/unbuffered),\n");
   printf("                      L (line-buffered), or B (block-buffered, default)\n");
   printf("  --progress          Show transfer progress\n");
@@ -49,6 +51,7 @@ void print_usage(void) {
   printf("                      converted before transmission and back on receipt; a\n");
   printf("                      name that cannot be represented in the target charset\n");
   printf("                      fails that transfer cleanly (rsync-compatible)\n");
+  printf("  --no-iconv          Disable --iconv charset conversion (same as --iconv=-)\n");
   printf("  --protocol=NUM       Force the wire protocol version (must equal the current\n");
   printf("                       PROTOCOL_VERSION; FastSync cannot speak older/virtual\n");
   printf("                       wire formats)\n");
@@ -162,7 +165,7 @@ void print_usage(void) {
   printf("                    --no-delta, or --no-incremental)\n");
   printf("  --no-fuzzy          Disable --fuzzy\n");
   printf("  -B <n>, --block-size <n>, --delta-block <n>\n");
-  printf("                    Delta block size in bytes (default: %d)\n", DELTA_BLOCK_SIZE_DEFAULT);
+  printf("                    Delta block size in bytes (default: %u)\n", DELTA_BLOCK_SIZE_DEFAULT);
   printf("  --delta-max <n>     Max file size for delta transfer (default: %llu)\n",
          DELTA_MAX_FILE_SIZE);
   printf("  -j, --threads[=N]   Enable the multithreaded scanner/loader/sender\n");
@@ -192,6 +195,10 @@ void print_usage(void) {
   printf("  -U, --atimes        Preserve access times\n");
   printf("  -N, --crtimes       Capture birth time; cannot be applied (documented\n");
   printf("                      divergence)\n");
+  printf("  -O, --omit-dir-times  Do not apply modification times to directories\n");
+  printf("  -J, --omit-link-times Do not apply times to symlinks\n");
+  printf("  --open-noatime      Open source files with O_NOATIME so reading for a\n");
+  printf("                      transfer does not update their access time\n");
   printf("  -X, --xattrs        Preserve user extended attributes (user.* only;\n");
   printf("                      privileged security.*/trusted.* namespaces are\n");
   printf("                      never captured or applied)\n");
@@ -287,8 +294,12 @@ void print_usage(void) {
   printf("  -x, --one-file-system  Do not cross filesystem boundaries\n");
   printf("  --log-file <path>, --log-file=<path>  Write log messages to file\n");
   printf("  --stderr=MODE       Route logging to stderr: errors or all\n");
+  printf("  --msgs2stderr       Route all messages to stderr (deprecated spelling of\n");
+  printf("                      --stderr=all)\n");
+  printf("  --no-msgs2stderr    Select errors-only stderr (deprecated spelling; the\n");
+  printf("                      default)\n");
   printf("  --partial           Keep partial files on interrupted transfer\n");
-  printf("  --partial-dir <dir> Directory for partial files\n");
+  printf("  --partial-dir <dir> Directory for partial files (implies --partial)\n");
   printf("  -T, --temp-dir <dir>  Scratch dir for temp files before atomic install.\n");
   printf("                      Confined to the receive root: a relative dir resolves below\n");
   printf("                      it and an absolute/traversal dir is rejected.  The dir must\n");
@@ -337,7 +348,8 @@ void print_usage(void) {
   printf("  --append-verify     Like --append, but verifies the retained prefix checksum\n");
   printf("                    before appending (falls back to a full transfer on mismatch)\n");
   printf("  --fsync             Fsync every written file before publication\n");
-  printf("  --compress-level <n>    Compression level (default: 5)\n");
+  printf("  --compress-level <n>    Compression level (per-codec default: zstd 3,\n");
+  printf("                      zlib/zlibx 6, lz4 ignores it)\n");
   printf("  --zl <n>             Alias for --compress-level\n");
   printf("  --skip-compress=LIST    Skip compression for suffixes in LIST (separated by\n");
   printf("                      '/' as in rsync, or ','); a leading dot is optional.  The\n");
@@ -349,19 +361,19 @@ void print_usage(void) {
 }
 
 void print_debug_usage(void) {
-  printf("Emitting debug flags: IO,PROTO,PACK,UTIL,ALL,NONE\n");
+  printf("Emitting debug flags: IO,PROTO,PACK,UTIL,FLIST,DEL,HASH,DELTASUM,\n");
+  printf("RECV,FILTER,SEND,ALL,NONE\n");
   printf("Also accepted for rsync CLI parity (silent): ACL,BACKUP,BIND,CHDIR,\n");
-  printf("CONNECT,CMD,DEL,DELTASUM,DUP,EXIT,FILTER,FLIST,FUZZY,GENR,HASH,HLINK,\n");
-  printf("ICONV,NSTR,OWN,RECV,SEND,TIME.\n");
+  printf("CONNECT,CMD,DUP,EXIT,FUZZY,GENR,HLINK,ICONV,NSTR,OWN,TIME.\n");
   printf("Flags may be comma-separated, for example: --debug=io,proto\n");
   printf("An optional level suffix is accepted (e.g. --debug=io2); level 0\n");
   printf("silences that item.  Unknown names are rejected.\n");
 }
 
 void print_info_usage(void) {
-  printf("Emitting info flags: COPY,NAME,MISC,SKIP,STATS,ALL,NONE\n");
-  printf("Also accepted for rsync CLI parity (silent): BACKUP,DEL,FLIST,MOUNT,\n");
-  printf("NONREG,PROGRESS,REMOVE,SYMSAFE.\n");
+  printf("Emitting info flags: COPY,MISC,SKIP,STATS,DEL,REMOVE,NAME,FLIST,\n");
+  printf("NONREG,PROGRESS,MOUNT,ALL,NONE\n");
+  printf("Also accepted for rsync CLI parity (silent): BACKUP,SYMS,SYMSAFE.\n");
   printf("Flags may be comma-separated, for example: --info=name,stats\n");
   printf("An optional level suffix is accepted (e.g. --info=stats2); level 0\n");
   printf("silences that item.  Unknown names are rejected.\n");

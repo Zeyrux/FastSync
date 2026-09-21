@@ -25,13 +25,6 @@
 #include "utils.h"
 #include "protocol.h"
 #include "xattr.h"
-#include <fcntl.h>
-#include <unistd.h>
-
-/* Files larger than this are not loaded whole for transfer (the sender streams
- * them); a whole-file digest is computed from the path instead.  Kept in sync
- * with the sender's streaming threshold. */
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
 
 static bool write_all(int fd, const void* data, unsigned long long size) {
   const unsigned char* p = data;
@@ -1136,17 +1129,51 @@ int file_open_private_dir(const char* dir_path) {
   return fd;
 }
 
-/* Open a --temp-dir scratch directory exactly as rsync does: the directory must
- * already exist and is used as given (an absolute path is used verbatim, a
- * relative one was already resolved against the destination root by the
- * caller).  Unlike file_open_private_dir this neither creates it nor confines
- * it below the receive root, because rsync accepts any temp dir -- including
- * one outside the destination tree or on another filesystem.  Returns an
- * O_DIRECTORY|O_CLOEXEC fd, or -1 on error. */
+/* Open a --temp-dir scratch directory.  The directory must already exist (rsync
+ * never creates it); a relative path was already resolved against the
+ * destination root by the caller.  Unlike file_open_private_dir this neither
+ * creates it nor requires it to be a direct child of the receive root, because
+ * rsync permits a scratch dir that (via a symlink) lands on another filesystem
+ * -- but it MUST resolve inside the authorized receive root.  The directory is
+ * opened following symlinks and then judged by the REAL path of the opened fd
+ * (through /proc/self/fd), so a client-planted symlink under the receive root
+ * can never redirect receiver scratch files outside the sandbox while an
+ * in-root link to another filesystem (the EXDEV fallback case) still works.
+ * Returns an O_DIRECTORY|O_CLOEXEC fd, or -1 on error (errno set; an escaping
+ * target is reported as EACCES with a logged reason). */
 int file_open_temp_dir(const char* dir_path) {
   if (!dir_path)
     return -1;
-  return open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  const char* root = utils_get_authorized_root_path();
+  if (!root) {
+    /* No authorized root (e.g. a local batch apply): nothing to confine
+       against, so preserve the historical open-as-given behavior. */
+    return fd;
+  }
+  char fd_path[64];
+  int fd_path_length = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+  char resolved[PATH_MAX];
+  if (fd_path_length < 0 || (size_t)fd_path_length >= sizeof(fd_path) ||
+      !realpath(fd_path, resolved)) {
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+  if (!path_is_within_root(root, resolved)) {
+    char* escaped = output_escape(dir_path, log_get_8_bit_output());
+    log_message(LOG_LEVEL_ERROR,
+                "--temp-dir '%s' resolves outside the authorized receive root; refusing",
+                escaped ? escaped : "<allocation failed>");
+    free(escaped);
+    close(fd);
+    errno = EACCES;
+    return -1;
+  }
+  return fd;
 }
 
 /* After the content and mode/times are restored on the just-written file, apply
@@ -1859,6 +1886,6 @@ bool file_write_to_disk(const char* path, const void* data, unsigned long long d
                         bool inplace, bool sparse) {
   if (!path || (!data && data_size != 0) || has_path_traversal(path))
     return false;
-  FileAttrPolicy policy = {false, false, false, false};
+  FileAttrPolicy policy = {0};
   return file_to_disk_secure(path, data, data_size, inplace, sparse, false, NULL, policy, NULL);
 }

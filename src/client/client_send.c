@@ -37,8 +37,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define STREAM_THRESHOLD (64ULL * 1024 * 1024)
-
 /* Aggregate loaded payload bytes the sender may buffer across the loader queue
    and the chunk in flight.  Sending one chunk adds up to ~2 * MAX_CHUNK_SIZE of
    transient serialize/compress buffers on top of the queued payloads, so this
@@ -1115,7 +1113,7 @@ static Client* connect_transfer_client(const Config* config) {
       return NULL;
     }
     return client_connect_ssh(config->ssh_destination, config->ssh_port,
-                              config->fastsync_server_path, config->old_args, config->rsh_command,
+                              config->fastsync_server_path, config->rsh_command,
                               config->blocking_io, config->remote_options,
                               config->remote_option_count);
   }
@@ -1967,7 +1965,7 @@ static int incremental_check(Client* client, File* file, const Config* config,
       send_status(client->file_descriptor, STATUS_ERROR);
       return -1;
     }
-    log_debug_message(LOG_DEBUG_RECV, "recv: delta signature for %s (%d blocks)",
+    log_debug_message(LOG_DEBUG_RECV, "recv: delta signature for %s (%u blocks)",
                       file_wire_path(file), sig->block_count);
     *out_sig = sig;
     return 2;
@@ -3617,10 +3615,9 @@ send_fail:
   return ret;
 }
 
-int send_files_multithreaded(Config** config_ptr) {
-  if (!config_ptr || !*config_ptr)
+int send_files_multithreaded(Config* config) {
+  if (!config)
     return 1;
-  Config* config = *config_ptr;
   if (config->list_only)
     return send_list_only(config);
   if (config->dry_run)
