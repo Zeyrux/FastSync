@@ -53,7 +53,7 @@ bool validate_config(const Config* config) {
     return false;
   }
   if (config->compression_threads > 0 && !config->use_compression) {
-    log_message(LOG_LEVEL_ERROR, "--compress-threads requires compression (-c or -z)");
+    log_message(LOG_LEVEL_ERROR, "--compress-threads requires compression (-z/--compress)");
     return false;
   }
   if (config->transport == TRANSPORT_SSH && config->use_sendfile) {
