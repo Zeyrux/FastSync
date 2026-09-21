@@ -16,7 +16,14 @@
 #include <zstd.h>
 
 #define INITIAL_DECOMPRESS_BUF_SIZE (1024 * 1024)
-#define MAX_DECOMPRESSED_SIZE (100ULL * 1024 * 1024) /* 100 MB hard ceiling */
+
+/* Hard ceiling for a single decompression.  The sender compresses whole files
+ * up to the protocol's whole-file receive bound, so the decompressor must
+ * accept payloads that large; referencing the protocol constant keeps the two
+ * bounds from drifting apart (they previously did: a 100 MB ceiling rejected
+ * 100-256 MB files).  This remains a real bomb guard -- every allocation in the
+ * paths below is clamped to it -- so it must not exceed the protocol bound. */
+#define MAX_DECOMPRESSED_SIZE MAX_RECEIVE_WHOLE_FILE_SIZE
 
 /* rsync 3.4.1's built-in skip-compress suffix list (the `--skip-compress`
  * defaults, in the man page's order).  rsync stores it as space-separated

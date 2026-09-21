@@ -3,7 +3,9 @@
 #include "compression.h"
 #include "data.h"
 #include "file.h"
+#include "protocol.h"
 #include "utils.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -213,6 +215,67 @@ static void test_data_decompress_unknown_size_frame() {
   EXPECT_EQ_INT(memcmp(decompressed->data, original, len), 0);
 
   data_destroy(decompressed);
+  data_destroy(frame);
+}
+
+/* The receiver advertises MAX_RECEIVE_WHOLE_FILE_SIZE (256 MiB) and the sender
+ * compresses whole files, so the decompressor's internal ceiling must match that
+ * protocol bound.  A 130 MiB payload -- above the old 100 MiB ceiling but below
+ * the protocol bound -- must round-trip through
+ * data_decompress_limited(..., MAX_RECEIVE_WHOLE_FILE_SIZE).  The payload is all
+ * zeros so it compresses to a tiny frame while still declaring its full size. */
+static void test_data_decompress_limited_whole_file_ceiling() {
+  const size_t size = 130ULL * 1024 * 1024;
+  Data* input = data_create_empty(size);
+  EXPECT_NOT_NULL(input);
+  memset(input->data, 0, size);
+  input->size = size;
+
+  /* Threaded zstd stores the content size in the frame header, as the sender
+   * does for whole files, so the decompressor sees the exact declared size. */
+  Data* compressed = data_compress_codec(input, COMPRESSION_ALGO_ZSTD, 1, 2);
+  EXPECT_NOT_NULL(compressed);
+  /* Premise: the declared size sits between the old 100 MiB cap and the
+   * protocol whole-file bound -- exactly the range that used to be rejected. */
+  unsigned long long declared =
+      ZSTD_getFrameContentSize((uint8_t*)compressed->data + 1, compressed->size - 1);
+  EXPECT_TRUE(declared > (100ULL * 1024 * 1024));
+  EXPECT_TRUE(declared <= MAX_RECEIVE_WHOLE_FILE_SIZE);
+
+  Data* out = data_decompress_limited(compressed, MAX_RECEIVE_WHOLE_FILE_SIZE);
+  EXPECT_NOT_NULL(out);
+  EXPECT_EQ_INT((int)out->size, (int)size);
+  EXPECT_EQ_INT(memcmp(out->data, input->data, size), 0);
+
+  data_destroy(out);
+  data_destroy(compressed);
+  data_destroy(input);
+}
+
+/* A frame declaring an uncompressed size above the hard ceiling is still
+ * rejected before any allocation, even when the caller passes a limit higher
+ * than the protocol bound.  The 13-byte header is a valid zstd frame header with
+ * an 8-byte content size and no blocks; rejection happens at the size check. */
+static void test_data_decompress_limited_rejects_over_ceiling() {
+  const uint64_t declared = MAX_RECEIVE_WHOLE_FILE_SIZE + 1;
+  Data* frame = data_create_empty(1 + 13);
+  EXPECT_NOT_NULL(frame);
+  uint8_t* p = (uint8_t*)frame->data;
+  p[0] = (uint8_t)COMPRESSION_ALGO_ZSTD;
+  p[1] = 0x28; /* zstd magic number, little-endian */
+  p[2] = 0xB5;
+  p[3] = 0x2F;
+  p[4] = 0xFD;
+  p[5] = 0xE0; /* Frame_Header_Descriptor: 8-byte content size, single segment */
+  for (int i = 0; i < 8; i++)
+    p[6 + i] = (uint8_t)((declared >> (8 * i)) & 0xff);
+  frame->size = 1 + 13;
+  /* Guard the premise: zstd reads back exactly the declared over-ceiling size. */
+  EXPECT_EQ_INT((int)ZSTD_getFrameContentSize(p + 1, frame->size - 1), (int)declared);
+
+  EXPECT_NULL(data_decompress_limited(frame, MAX_RECEIVE_WHOLE_FILE_SIZE * 2));
+  EXPECT_NULL(data_decompress_limited(frame, MAX_RECEIVE_WHOLE_FILE_SIZE));
+
   data_destroy(frame);
 }
 
@@ -467,6 +530,8 @@ void test_compression() {
   test_data_compress_decompress_roundtrip();
   test_data_compress_decompress_large();
   test_data_decompress_unknown_size_frame();
+  test_data_decompress_limited_whole_file_ceiling();
+  test_data_decompress_limited_rejects_over_ceiling();
   test_data_decompress_truncated_frame_fails();
   test_skip_compress_suffix_matching();
   test_data_compress_with_threads_roundtrip();
