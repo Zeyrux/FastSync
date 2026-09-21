@@ -162,33 +162,57 @@ static bool is_modifier_char(char c) {
   return c == 's' || c == 'r' || c == 'p' || c == 'x' || c == '/' || c == '!' || c == 'C';
 }
 
-/* Modifiers rsync defines but FastSync does not implement.  They must still be
- * consumed as part of the modifier run so they are rejected explicitly instead
- * of leaking into the pattern (which produced misleading failures such as
- * "could not read merge file 'n file'"). */
+/* merge/dir-merge rules are the only rules rsync accepts the merge-file
+ * modifiers on. */
+static bool is_merge_rule(RuleKind kind) {
+  return kind == RULE_KIND_MERGE || kind == RULE_KIND_DIR_MERGE;
+}
+
+/* Merge-file modifiers rsync defines but FastSync does not implement:
+ * 'e' exclude the merge file itself, 'n' do not inherit the merge file, 'w'
+ * word-split the merge file.  They are recognized as part of a modifier run on
+ * every rule (so a pure e/n/w token is rejected rather than folded into the
+ * pattern), but are accepted (and ignored) only on merge/dir-merge rules. */
 static bool is_unsupported_modifier_char(char c) {
   return c == 'e' || c == 'n' || c == 'w';
 }
 
-/* Characters that are part of a modifier run, whether supported or not. */
-static bool is_modifier_scan_char(char c) {
-  return is_modifier_char(c) || is_unsupported_modifier_char(c);
+/* Merge-file modifiers rsync accepts on merge/dir-merge rules: 'e', 'n', 'w'
+ * and '-' (do not transfer the merge file). */
+static bool is_merge_modifier_char(char c) {
+  return c == 'e' || c == 'n' || c == 'w' || c == '-';
+}
+
+/* Characters that count as part of a modifier run for `kind` when deciding
+ * whether a token is a pure modifier run.  e/n/w count on every rule so that a
+ * pure e/n/w token is rejected on non-merge rules; '-' only on merge rules. */
+static bool is_modifier_scan_char(char c, RuleKind kind) {
+  return is_modifier_char(c) || is_unsupported_modifier_char(c) ||
+         (is_merge_rule(kind) && is_merge_modifier_char(c));
+}
+
+/* Characters actually consumed as modifiers for `kind`.  The merge-file
+ * modifiers are consumed only on merge/dir-merge rules; elsewhere e/n/w fall
+ * through to the pattern (so mixed tokens such as "H,!secret" keep their
+ * historical "ecret" pattern). */
+static bool is_consumed_modifier_char(char c, RuleKind kind) {
+  return is_modifier_char(c) || (is_merge_rule(kind) && is_merge_modifier_char(c));
 }
 
 /* Inspect the token that follows a rule name (up to the first space/underscore
  * or the end).  If the token is composed *solely* of modifier characters and
- * includes one FastSync does not implement, it is unambiguously a modifier run:
+ * includes one that is invalid for `kind`, it is unambiguously a modifier run:
  * return that character so the caller can reject it.  A token that contains any
  * non-modifier character is a pattern (e.g. "-newfile") and returns '\0', which
  * keeps the historical parsing of mixed tokens such as "H,!secret" intact. */
-static char unsupported_modifier_in_token(const char* tok) {
+static char unsupported_modifier_in_token(const char* tok, RuleKind kind) {
   if (*tok == '\0' || *tok == ' ' || *tok == '_')
     return '\0';
   char bad = '\0';
   for (const char* q = tok; *q != '\0' && *q != ' ' && *q != '_'; q++) {
-    if (!is_modifier_scan_char(*q))
+    if (!is_modifier_scan_char(*q, kind))
       return '\0';
-    if (is_unsupported_modifier_char(*q))
+    if (!is_merge_rule(kind) && is_unsupported_modifier_char(*q))
       bad = *q;
   }
   return bad;
@@ -238,9 +262,9 @@ static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
      Only commit a modifier run that terminates at a separator or the end, so a
      pattern such as "*.tmp" written as "-*.tmp" is not mistaken for modifiers. */
   if (*p == ',') {
-    *bad_mod = unsupported_modifier_in_token(p + 1);
+    *bad_mod = unsupported_modifier_in_token(p + 1, *kind);
   } else if (is_short) {
-    *bad_mod = unsupported_modifier_in_token(p);
+    *bad_mod = unsupported_modifier_in_token(p, *kind);
   }
   if (*bad_mod != '\0')
     return false;
@@ -250,12 +274,12 @@ static bool parse_rule_syntax(const char* text, RuleKind* kind, unsigned* sides,
   if (*p == ',') {
     p++;
     mod_start = p;
-    while (is_modifier_char(*p))
+    while (is_consumed_modifier_char(*p, *kind))
       p++;
     mod_end = p;
   } else if (is_short) {
     const char* scan = p;
-    while (is_modifier_char(*scan))
+    while (is_consumed_modifier_char(*scan, *kind))
       scan++;
     if (*scan == '\0' || *scan == ' ' || *scan == '_') {
       mod_start = p;

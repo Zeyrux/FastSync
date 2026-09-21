@@ -24,8 +24,12 @@
  *   clear/!     clear the current rule list (takes no argument)
  * Modifiers: '/' absolute anchor, '!' negate match, 'C' inject CVS defaults,
  * 's' sender side, 'r' receiver side, 'p' perishable.  The rsync 'x'
- * (xattr-name) modifier and the merge-only 'e'/'n'/'w' modifiers are not
- * implemented and are rejected explicitly.
+ * (xattr-name) modifier is not implemented and is rejected explicitly
+ * everywhere.  The merge-file modifiers 'e' (exclude the merge file itself),
+ * 'n' (do not inherit the merge file), 'w' (word-split the merge file) and '-'
+ * (do not transfer the merge file) are accepted and consumed only on merge/
+ * dir-merge rules (rejected on every other rule, matching rsync); their
+ * semantics are not implemented and they are otherwise ignored.
  * A trailing '/' makes a pattern match directories only.  A leading '/' anchors
  * the pattern to its owner directory.
  */

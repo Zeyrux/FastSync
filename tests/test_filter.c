@@ -40,11 +40,17 @@ static void test_filter_list_rejects_xattr_modifier() {
 }
 
 static void test_filter_list_rejects_unsupported_modifiers() {
+  /* The merge-file modifiers e/n/w/- are invalid on every non-merge rule; a
+     token made up solely of modifier characters is a modifier run, so it must
+     be rejected rather than folded into the pattern. */
   static const char* const rules[] = {
       "-e foo", /* e: merge-only in rsync */
       "-n foo", /* n: merge-only in rsync */
       "-w foo", /* w: merge-only in rsync */
-      "merge,n /tmp/x", ".e /tmp/x", "dir-merge,e .rules", "exclude,w foo",
+      "-new",   /* pure modifier letters (n/e/w) */
+      "-press", /* pure modifier letters (p/r/e/s) */
+      "exclude,w foo", "exclude,e foo", "exclude,n foo",
+      "hide,w foo",    "protect,n foo", "risk,e foo",
   };
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
     FilterRuleList* list = filter_rule_list_create();
@@ -55,6 +61,63 @@ static void test_filter_list_rejects_unsupported_modifiers() {
     EXPECT_TRUE(strstr(err, "unsupported filter modifier") != NULL);
     filter_rule_list_free(list);
   }
+}
+
+/* rsync accepts the merge-file modifiers e/n/w/- on merge and dir-merge rules.
+ * They must be consumed so they never leak into the merge filename. */
+static void test_filter_list_accepts_merge_modifiers() {
+  char tmpl[] = "/tmp/fastsync_filter_mmod_XXXXXX";
+  EXPECT_TRUE(mkdtemp(tmpl) != NULL);
+  char path[512];
+  snprintf(path, sizeof(path), "%s/rules", tmpl);
+  FILE* fp = fopen(path, "w");
+  EXPECT_NOT_NULL(fp);
+  fputs("- *.tmp\n", fp);
+  fclose(fp);
+
+  /* merge with e/n/w/- consumes the modifiers and reads the right file. */
+  static const char* const fmts[] = {
+      "merge,e %s", "merge,n %s", "merge,w %s", "merge,- %s", ".e %s", ".- %s",
+  };
+  for (size_t i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
+    FilterRuleList* list = filter_rule_list_create();
+    EXPECT_NOT_NULL(list);
+    char rule[600];
+    char err[256] = "";
+    snprintf(rule, sizeof(rule), fmts[i], path);
+    bool ok = filter_rule_list_parse_append(list, rule, NULL, NULL, err, sizeof(err));
+    if (!ok)
+      printf("    merge rule '%s' errored: %s\n", rule, err);
+    EXPECT_TRUE(ok);
+    EXPECT_EQ_INT(list->count, 1);
+    EXPECT_EQ_STR(list->items[0]->pattern, "*.tmp");
+    filter_rule_list_free(list);
+  }
+
+  /* dir-merge with e/n/w/- registers the basename without the modifiers. */
+  static const struct {
+    const char* rule;
+    const char* want;
+  } drules[] = {
+      {"dir-merge,e .rules", ".rules"}, {"dir-merge,n .rules", ".rules"},
+      {"dir-merge,w .rules", ".rules"}, {"dir-merge,- .rules", ".rules"},
+      {":e .rules", ".rules"},          {":- .rules", ".rules"},
+  };
+  for (size_t i = 0; i < sizeof(drules) / sizeof(drules[0]); i++) {
+    FilterRuleList* list = filter_rule_list_create();
+    EXPECT_NOT_NULL(list);
+    char err[256] = "";
+    bool ok = filter_rule_list_parse_append(list, drules[i].rule, NULL, NULL, err, sizeof(err));
+    if (!ok)
+      printf("    dir-merge rule '%s' errored: %s\n", drules[i].rule, err);
+    EXPECT_TRUE(ok);
+    EXPECT_EQ_INT(list->dir_merge_count, 1);
+    EXPECT_EQ_STR(list->dir_merge_names[0], drules[i].want);
+    filter_rule_list_free(list);
+  }
+
+  unlink(path);
+  rmdir(tmpl);
 }
 
 static void test_filter_list_accepts_supported_rules_and_modifiers() {
@@ -223,6 +286,7 @@ static void test_filter_rules_apply_supported_modifiers() {
 void test_filter() {
   test_filter_list_rejects_xattr_modifier();
   test_filter_list_rejects_unsupported_modifiers();
+  test_filter_list_accepts_merge_modifiers();
   test_filter_list_accepts_supported_rules_and_modifiers();
   test_filter_list_merge_file_still_supported();
   test_filter_rule_parse_rejects_unsupported_and_keeps_supported();
