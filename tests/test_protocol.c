@@ -216,6 +216,38 @@ static void test_send_receive_status() {
   close(p[1]);
 }
 
+/* An unknown wire status outside the enum range must be rejected as a protocol
+ * error instead of being handed to the caller as an unexpected verdict.  The
+ * last known enumerator (STATUS_STATS) must still be accepted, proving the
+ * validation does not reject legitimate statuses. */
+static void test_receive_status_rejects_unknown() {
+  int p[2];
+  EXPECT_EQ_INT(pipe(p), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, p[0], p[1]);
+
+  Status bogus = (Status)(STATUS_STATS + 1);
+  EXPECT_EQ_INT((int)write(p[1], &bogus, sizeof(bogus)), (int)sizeof(bogus));
+  Status received = STATUS_OK;
+  EXPECT_FALSE(protocol_receive_status(&session, &received));
+
+  Status negative = (Status)-1;
+  EXPECT_EQ_INT((int)write(p[1], &negative, sizeof(negative)), (int)sizeof(negative));
+  EXPECT_FALSE(protocol_receive_status(&session, &received));
+
+  Status top = STATUS_STATS;
+  EXPECT_EQ_INT((int)write(p[1], &top, sizeof(top)), (int)sizeof(top));
+  EXPECT_TRUE(protocol_receive_status(&session, &received));
+  EXPECT_EQ_INT((int)received, (int)STATUS_STATS);
+
+  Status timed_bogus = (Status)(STATUS_STATS + 7);
+  EXPECT_EQ_INT((int)write(p[1], &timed_bogus, sizeof(timed_bogus)), (int)sizeof(timed_bogus));
+  EXPECT_FALSE(protocol_receive_status_timed(&session, &received, 5));
+
+  close(p[0]);
+  close(p[1]);
+}
+
 static void test_receive_n_data_truncated() {
   int p[2];
   EXPECT_EQ_INT(pipe(p), 0);
@@ -723,6 +755,7 @@ void test_protocol() {
   test_send_receive_data();
   test_send_receive_int();
   test_send_receive_status();
+  test_receive_status_rejects_unknown();
   test_protocol_session_io_timeout();
   test_protocol_server_io_timeout_floor();
   test_send_receive_status_timed();
