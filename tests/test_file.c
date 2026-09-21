@@ -411,8 +411,7 @@ static void test_file_open_temp_dir_symlink_confinement() {
   EXPECT_EQ_INT(mkdir(scratch, 0755), 0);
   int scratch_fd = file_open_temp_dir(scratch);
   EXPECT_TRUE(scratch_fd >= 0);
-  if (scratch_fd >= 0)
-    close(scratch_fd);
+  close(scratch_fd);
 
   /* A symlink whose target is outside the root is refused. */
   char* escape = path_cat(root_abs, "escape");
@@ -426,8 +425,7 @@ static void test_file_open_temp_dir_symlink_confinement() {
   EXPECT_EQ_INT(symlink(scratch, inside_link), 0);
   int link_fd = file_open_temp_dir(inside_link);
   EXPECT_TRUE(link_fd >= 0);
-  if (link_fd >= 0)
-    close(link_fd);
+  close(link_fd);
 
   free(inside_link);
   free(escape);

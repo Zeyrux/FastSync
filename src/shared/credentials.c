@@ -141,9 +141,9 @@ static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
    * most systems, but explicit.  Failures here are ignored: O_NONBLOCK on a
    * regular file does not affect reads either way. */
   if (S_ISREG(st.st_mode)) {
-    int flags = fcntl(fd, F_GETFL);
-    if (flags >= 0)
-      (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    int status_flags = fcntl(fd, F_GETFL);
+    if (status_flags >= 0)
+      (void)fcntl(fd, F_SETFL, status_flags & ~O_NONBLOCK);
   }
   FILE* fp = fdopen(fd, "r");
   if (!fp) {
