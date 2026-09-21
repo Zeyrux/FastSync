@@ -25,8 +25,6 @@
 #include "utils.h"
 #include "protocol.h"
 #include "xattr.h"
-#include <fcntl.h>
-#include <unistd.h>
 
 /* Files larger than this are not loaded whole for transfer (the sender streams
  * them); a whole-file digest is computed from the path instead.  Kept in sync

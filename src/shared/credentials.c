@@ -80,12 +80,16 @@ static bool is_comment_char(char c) {
  * path and then fstat the resulting fd (rather than stat()ing the path first
  * and reopening it), so the permission decision is made on the same inode that
  * is read and cannot be raced by swapping the path between check and open.
- * The path may be a process-substitution pipe (`<(...)` -> /dev/fd/N), so
- * regular files and FIFOs are accepted when the ownership/mode checks pass.
+ * O_NOFOLLOW refuses a symlinked path outright (ELOOP fails closed) instead of
+ * following it before the owner/mode gate can run.  O_NONBLOCK keeps a FIFO
+ * from blocking the open/read forever: an empty or writer-less FIFO yields
+ * EOF/EAGAIN rather than hanging in fgets.  Only regular files and FIFOs pass
+ * the ownership/mode checks; O_NONBLOCK is cleared for regular files, where it
+ * is a no-op anyway, so their stdio read path is byte-for-byte unchanged.
  *
  * Returns a FILE* the caller must fclose, or NULL with `err` filled. */
 static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
     set_error(err, err_size, "cannot open secret file '%s': %s", path, strerror(errno));
     return NULL;
@@ -104,6 +108,15 @@ static FILE* secret_file_open(const char* path, char* err, size_t err_size) {
               path);
     close(fd);
     return NULL;
+  }
+  /* O_NONBLOCK is only meaningful for the FIFO allowance.  Restore blocking
+   * mode on a regular file so its read path is exactly as before; a no-op on
+   * most systems, but explicit.  Failures here are ignored: O_NONBLOCK on a
+   * regular file does not affect reads either way. */
+  if (S_ISREG(st.st_mode)) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0)
+      (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
   }
   FILE* fp = fdopen(fd, "r");
   if (!fp) {
