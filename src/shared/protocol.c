@@ -301,6 +301,14 @@ static ProtocolSession* legacy_session(int read_fd, int write_fd) {
   return &legacy_io_session;
 }
 
+/* Pace an out-of-band write that bypassed protocol_send_n_data (the plaintext
+ * sendfile fast path).  The bound/legacy session is resolved exactly as
+ * send_n_data resolves it, so the same token-bucket state is throttled and the
+ * TLS and plaintext transports share identical --bwlimit semantics. */
+void protocol_throttle_bytes(size_t bytes) {
+  bw_throttle_session(legacy_session(-1, -1), bytes);
+}
+
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
   return protocol_send_n_data(legacy_session(-1, file_descriptor), data, data_size);
 }
@@ -439,12 +447,18 @@ static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, 
     }
 
     ssize_t bytes_received;
-    if (session->ssl)
-      bytes_received = SSL_read(session->ssl, (char*)data + total_bytes_received,
-                                data_size - total_bytes_received);
-    else
+    if (session->ssl) {
+      /* SSL_read takes an int length; clamp a >INT_MAX request into chunks
+       * (mirrors the send path) so the size_t downcast can never truncate into
+       * a negative/partial read. */
+      size_t ssl_chunk = data_size - total_bytes_received > (size_t)INT_MAX
+                             ? (size_t)INT_MAX
+                             : data_size - total_bytes_received;
+      bytes_received = SSL_read(session->ssl, (char*)data + total_bytes_received, (int)ssl_chunk);
+    } else {
       bytes_received =
           read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
+    }
     if (bytes_received <= 0) {
       if (session->ssl) {
         int ssl_err = SSL_get_error(session->ssl, (int)bytes_received);
