@@ -20,6 +20,12 @@ CLIENT_CMD = [os.path.join(BUILD_DIR, "client")]
 _WORKER = os.environ.get("PYTEST_XDIST_WORKER")
 TEST_DATA_DIR = os.path.join(PROJECT_ROOT, f"test_data-{_WORKER}" if _WORKER else "test_data")
 
+# Default wall-clock budget for a short-lived client invocation.  Every client
+# is expected to finish well within this; the bound exists so a hung client
+# fails the test instead of stalling the whole CI run indefinitely.  Callers
+# that legitimately need longer can pass an explicit ``timeout``.
+CLIENT_TIMEOUT = 180
+
 
 class ServerManager:
     """Manages a long-lived server process. Reuses across test cases."""
@@ -137,7 +143,40 @@ class CountingProxy:
         return result
 
 
-def run_client(source_dir, dest_dir, flags=None, port=None, extra_args=None):
+def _run_client_cmd(cmd, timeout):
+    """Run one client command, returning ``(result, duration)``.
+
+    On timeout the client is killed and a result-like ``CompletedProcess`` with
+    a non-zero returncode is returned instead of raising, so callers keep the
+    established ``(result, duration)`` contract and the failure carries the
+    command plus whatever output was captured for diagnosis.
+    """
+    start = time.monotonic()
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        duration = time.monotonic() - start
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        diagnostic = (
+            f"client timed out after {timeout}s\n"
+            f"command: {cmd!r}\n"
+            f"--- captured stdout ---\n{stdout}\n"
+            f"--- captured stderr ---\n{stderr}"
+        )
+        result = subprocess.CompletedProcess(cmd, returncode=-1,
+                                             stdout=stdout, stderr=diagnostic)
+        return result, duration
+    duration = time.monotonic() - start
+    return result, duration
+
+
+def run_client(source_dir, dest_dir, flags=None, port=None, extra_args=None,
+               timeout=CLIENT_TIMEOUT):
     """Run the client and return (result, duration)."""
     cmd = CLIENT_CMD + ["--source-dir", source_dir, "--dest-dir", dest_dir, "--save-to-disk"]
     if port:
@@ -146,23 +185,18 @@ def run_client(source_dir, dest_dir, flags=None, port=None, extra_args=None):
         cmd += flags
     if extra_args:
         cmd += extra_args
-    start = time.monotonic()
-    result = subprocess.run(cmd, text=True, capture_output=True)
-    duration = time.monotonic() - start
-    return result, duration
+    return _run_client_cmd(cmd, timeout)
 
 
-def run_client_posix(source_dir, dest_dir, flags=None, port=None):
+def run_client_posix(source_dir, dest_dir, flags=None, port=None,
+                     timeout=CLIENT_TIMEOUT):
     """Run the client with positional args (rsync-style)."""
     cmd = CLIENT_CMD + [source_dir, dest_dir, "--save-to-disk"]
     if port:
         cmd += ["--server-port", str(port)]
     if flags:
         cmd += flags
-    start = time.monotonic()
-    result = subprocess.run(cmd, text=True, capture_output=True)
-    duration = time.monotonic() - start
-    return result, duration
+    return _run_client_cmd(cmd, timeout)
 
 
 def generate_test_files(source_dir, full=False):
@@ -238,8 +272,17 @@ def make_result(name, success, duration=None, error=""):
 
 
 def get_dest_received_dir(dest_dir, source_dir):
-    """Get the path where received files land inside dest_dir."""
-    return os.path.join(dest_dir, os.path.abspath(source_dir).lstrip(os.sep))
+    """Get the path where received files land inside dest_dir.
+
+    FastSync mirrors the absolute source path below the receive root with the
+    leading root separator removed.  Strip that separator explicitly rather
+    than with ``str.lstrip(os.sep)``: ``lstrip`` removes a *set* of characters
+    rather than a path prefix, which is not the same operation.
+    """
+    abs_source = os.path.abspath(source_dir)
+    if abs_source.startswith(os.sep):
+        abs_source = abs_source[len(os.sep):]
+    return os.path.join(dest_dir, abs_source)
 
 
 def _find_free_port():
