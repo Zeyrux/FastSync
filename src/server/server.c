@@ -1055,15 +1055,40 @@ done:
 #ifndef FASTSYNC_SERVER_AS_LIB
 static Server* g_server = NULL;
 
+/* Signal handler for the foreground daemon/standalone listener.
+ *
+ * Async-signal-safety: _exit(2) is on the POSIX async-signal-safe list and is
+ * the ONLY thing done here.  The previous body called server_delete()
+ * (close/free/SSL_CTX_free), daemon_conf_free() and credentials_free(); none of
+ * those (free/malloc, and much of OpenSSL teardown) are async-signal-safe, so a
+ * signal delivered while the main thread was inside malloc/free could deadlock
+ * or corrupt the heap.
+ *
+ * Residual (documented, not hidden): the in-memory teardown is skipped on the
+ * signal path.  That is safe because the parent daemon owns no persistent
+ * resource that survives process exit -- the listening socket is closed by the
+ * kernel, the connection registry is an anonymous MAP_SHARED mapping with no
+ * named backing object, and the daemon config/credential stores are plain heap
+ * allocations.  Connection children are separate processes and handle their own
+ * temp files/locks.  The normal (non-signal) shutdown path in main() still runs
+ * the full teardown, so no cleanup is dropped on the common path.  Wiring the
+ * accept loop (transport_tcp.c, outside this change's scope) to a flag-based
+ * self-pipe shutdown would let the frees run context-safely; it is deliberately
+ * deferred rather than risk restructuring the daemon loop. */
 static void cleanup(int sig) {
   (void)sig;
-  if (g_server)
-    server_delete(&g_server);
-  daemon_conf_free(g_daemon_conf);
-  g_daemon_conf = NULL;
-  credentials_free(g_credentials);
-  g_credentials = NULL;
   _exit(0);
+}
+
+/* Install a signal handler with sigaction(2) (the required async-signal-safe
+ * install primitive; signal(3) is not specified to be async-signal-safe). */
+static void install_cleanup_handler(int signo) {
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = cleanup;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;
+  sigaction(signo, &action, NULL);
 }
 
 static void print_server_usage(void) {
@@ -1259,8 +1284,8 @@ int main(int argc, char* argv[]) {
    * this process-global policy cannot be re-enabled by a future caller. */
   server_allow_super = opts.allow_super && !opts.stdio_mode;
   server_iconv_spec = opts.iconv_spec;
-  signal(SIGINT, cleanup);
-  signal(SIGTERM, cleanup);
+  install_cleanup_handler(SIGINT);
+  install_cleanup_handler(SIGTERM);
   /* Server-owned socket deadline floor: the client default --timeout=0 would
    * otherwise leave accepted sockets without SO_RCVTIMEO/SO_SNDTIMEO and let a
    * silent peer hold a connection (and its process slot) forever. */
