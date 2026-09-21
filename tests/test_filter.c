@@ -179,8 +179,10 @@ static void test_filter_rules_apply_supported_modifiers() {
     const char* texts[] = {"- *.tmp"};
     FilterRuleList* list = filter_base_build(texts, 1, false, false, NULL, 0);
     EXPECT_NOT_NULL(list);
-    EXPECT_EQ_INT(filter_rules_apply(list, "b.tmp", "b.tmp", false), FILTER_ACTION_EXCLUDE);
-    EXPECT_EQ_INT(filter_rules_apply(list, "a.txt", "a.txt", false), FILTER_ACTION_NONE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "b.tmp", "b.tmp", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_EXCLUDE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "a.txt", "a.txt", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_NONE);
     filter_rule_list_free(list);
   }
   /* anchored include then exclude-all */
@@ -188,8 +190,10 @@ static void test_filter_rules_apply_supported_modifiers() {
     const char* texts[] = {"+ /a.txt", "- *"};
     FilterRuleList* list = filter_base_build(texts, 2, false, false, NULL, 0);
     EXPECT_NOT_NULL(list);
-    EXPECT_EQ_INT(filter_rules_apply(list, "a.txt", "a.txt", false), FILTER_ACTION_INCLUDE);
-    EXPECT_EQ_INT(filter_rules_apply(list, "b.txt", "b.txt", false), FILTER_ACTION_EXCLUDE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "a.txt", "a.txt", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_INCLUDE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "b.txt", "b.txt", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_EXCLUDE);
     filter_rule_list_free(list);
   }
   /* negate */
@@ -197,8 +201,10 @@ static void test_filter_rules_apply_supported_modifiers() {
     const char* texts[] = {"-! *.o"};
     FilterRuleList* list = filter_base_build(texts, 1, false, false, NULL, 0);
     EXPECT_NOT_NULL(list);
-    EXPECT_EQ_INT(filter_rules_apply(list, "foo.c", "foo.c", false), FILTER_ACTION_EXCLUDE);
-    EXPECT_EQ_INT(filter_rules_apply(list, "foo.o", "foo.o", false), FILTER_ACTION_NONE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "foo.c", "foo.c", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_EXCLUDE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "foo.o", "foo.o", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_NONE);
     filter_rule_list_free(list);
   }
   /* dir-only trailing slash */
@@ -206,8 +212,10 @@ static void test_filter_rules_apply_supported_modifiers() {
     const char* texts[] = {"+ dir/", "- *"};
     FilterRuleList* list = filter_base_build(texts, 2, false, false, NULL, 0);
     EXPECT_NOT_NULL(list);
-    EXPECT_EQ_INT(filter_rules_apply(list, "dir", "dir", true), FILTER_ACTION_INCLUDE);
-    EXPECT_EQ_INT(filter_rules_apply(list, "dir", "dir", false), FILTER_ACTION_EXCLUDE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "dir", "dir", true, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_INCLUDE);
+    EXPECT_EQ_INT(filter_rules_apply_side(list, "dir", "dir", false, FILTER_SIDE_SENDER),
+                  FILTER_ACTION_EXCLUDE);
     filter_rule_list_free(list);
   }
 }

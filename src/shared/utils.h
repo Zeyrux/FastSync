@@ -225,6 +225,11 @@ void utils_set_authorized_root_fd(int fd);
  * threads spawn; see utils.c). */
 int utils_get_authorized_root_fd(void);
 const char* utils_get_authorized_root_path(void);
+/* Write a diagnostic message into a caller-supplied buffer, mirroring
+ * vsnprintf.  A NULL `err` or a zero `err_size` is a no-op, so a caller that
+ * only needs the boolean status may safely pass NULL.  Returns nothing; the
+ * buffer is always NUL-terminated by vsnprintf when err_size > 0. */
+void utils_set_error(char* err, size_t err_size, const char* fmt, ...);
 /* True when `path` is `root` itself or lies directly beneath it: a lexical
  * prefix test requiring the byte after `root` to be '\0' or '/'.  Both `root`
  * and `path` must be absolute canonical paths free of "."/".." components (the
