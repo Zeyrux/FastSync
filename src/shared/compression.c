@@ -644,8 +644,7 @@ static Data* zstd_decompress(Data* compressed_data, size_t maximum_size) {
     }
     if (ret > 0 && output.pos == output.size) {
       if (buf_size >= hard_limit || buf_size > SIZE_MAX / 2) {
-        log_message(LOG_LEVEL_ERROR, "Decompressed data exceeds %llu bytes",
-                    (unsigned long long)MAX_DECOMPRESSED_SIZE);
+        log_message(LOG_LEVEL_ERROR, "Decompressed data exceeds %llu bytes", hard_limit);
         data_destroy(uncompressed_data);
         uncompressed_data = NULL;
         goto cleanup;

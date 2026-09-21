@@ -234,7 +234,7 @@ Config* config_create(void) {
    * server_host NULL and would crash later consumers, so fail the whole create
    * (every caller already handles a NULL return). */
   if (!config->server_host) {
-    free(config);
+    config_delete(config);
     return NULL;
   }
   return config;

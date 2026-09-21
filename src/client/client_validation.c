@@ -75,6 +75,13 @@ bool validate_config(const Config* config) {
     log_message(LOG_LEVEL_ERROR, "-4/--ipv4 and -6/--ipv6 are mutually exclusive");
     return false;
   }
+  /* rsync 3.4.1 rejects --inplace together with --partial-dir (exit 1): the
+     inplace write path bypasses partial staging, so a partial-dir name would be
+     silently ignored.  Match rsync's message and refuse before any I/O. */
+  if (config->inplace && config->partial_dir) {
+    log_message(LOG_LEVEL_ERROR, "--inplace cannot be used with --partial-dir");
+    return false;
+  }
   if (config->log_file_format && !config->log_file) {
     log_message(LOG_LEVEL_ERROR, "--log-file-format requires --log-file");
     return false;

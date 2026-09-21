@@ -391,52 +391,82 @@ static void test_file_open_temp_dir_symlink_confinement() {
   rmdir("test_tempdir_link_root/scratch");
   rmdir(root);
   rmdir(outside);
-  EXPECT_EQ_INT(mkdir(root, 0755), 0);
-  EXPECT_EQ_INT(mkdir(outside, 0755), 0);
-  EXPECT_NOT_NULL(realpath(root, root_abs));
-  EXPECT_NOT_NULL(realpath(outside, outside_abs));
-  int root_fd = open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  EXPECT_TRUE(root_fd >= 0);
-  // cppcheck-suppress knownConditionTrueFalse
-  if (root_fd < 0) {
-    rmdir(root);
-    rmdir(outside);
-    return;
+
+  int mkdir_root_ret = mkdir(root, 0755);
+  int mkdir_outside_ret = mkdir(outside, 0755);
+  bool root_resolved = realpath(root, root_abs) != NULL;
+  bool outside_resolved = realpath(outside, outside_abs) != NULL;
+  int root_fd = root_resolved ? open(root_abs, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+
+  bool root_set = false;
+  bool scratch_ok = false;
+  int scratch_fd = -1;
+  bool escape_staged = false;
+  int escape_fd = 0;
+  bool inside_staged = false;
+  int inside_fd = -1;
+  char* scratch = NULL;
+  char* escape = NULL;
+  char* inside_link = NULL;
+
+  /* Only touch the global authorized root and the scratch fixtures once the
+     setup succeeded; the teardown below always runs regardless. */
+  if (root_fd >= 0 && outside_resolved) {
+    root_set = utils_set_authorized_root(root_fd, root_abs);
+
+    /* An existing in-root scratch dir opens normally. */
+    scratch = path_cat(root_abs, "scratch");
+    if (scratch && mkdir(scratch, 0755) == 0) {
+      scratch_ok = true;
+      scratch_fd = file_open_temp_dir(scratch);
+      if (scratch_fd >= 0)
+        close(scratch_fd);
+    }
+
+    /* A symlink whose target is outside the root is refused. */
+    escape = path_cat(root_abs, "escape");
+    if (escape && symlink(outside_abs, escape) == 0) {
+      escape_staged = true;
+      escape_fd = file_open_temp_dir(escape);
+    }
+
+    /* A symlink that stays inside the root is accepted (EXDEV fallback). */
+    inside_link = path_cat(root_abs, "inside_link");
+    if (inside_link && scratch && symlink(scratch, inside_link) == 0) {
+      inside_staged = true;
+      inside_fd = file_open_temp_dir(inside_link);
+      if (inside_fd >= 0)
+        close(inside_fd);
+    }
   }
-  EXPECT_TRUE(utils_set_authorized_root(root_fd, root_abs));
 
-  /* An existing in-root scratch dir opens normally. */
-  char* scratch = path_cat(root_abs, "scratch");
-  EXPECT_NOT_NULL(scratch);
-  EXPECT_EQ_INT(mkdir(scratch, 0755), 0);
-  int scratch_fd = file_open_temp_dir(scratch);
-  EXPECT_TRUE(scratch_fd >= 0);
-  close(scratch_fd);
-
-  /* A symlink whose target is outside the root is refused. */
-  char* escape = path_cat(root_abs, "escape");
-  EXPECT_NOT_NULL(escape);
-  EXPECT_EQ_INT(symlink(outside_abs, escape), 0);
-  EXPECT_EQ_INT(file_open_temp_dir(escape), -1);
-
-  /* A symlink that stays inside the root is accepted (EXDEV fallback path). */
-  char* inside_link = path_cat(root_abs, "inside_link");
-  EXPECT_NOT_NULL(inside_link);
-  EXPECT_EQ_INT(symlink(scratch, inside_link), 0);
-  int link_fd = file_open_temp_dir(inside_link);
-  EXPECT_TRUE(link_fd >= 0);
-  close(link_fd);
-
+  /* Release the global authorized root and all fixtures BEFORE asserting:
+     EXPECT_* returns early on failure, so a failed assertion must not be able
+     to leave the process state poisoned or leak root_fd. */
+  utils_set_authorized_root(-1, NULL);
+  if (root_fd >= 0)
+    close(root_fd);
   free(inside_link);
   free(escape);
   free(scratch);
-  utils_set_authorized_root(-1, NULL);
-  close(root_fd);
   unlink("test_tempdir_link_root/escape");
   unlink("test_tempdir_link_root/inside_link");
   rmdir("test_tempdir_link_root/scratch");
   rmdir(root);
   rmdir(outside);
+
+  EXPECT_EQ_INT(mkdir_root_ret, 0);
+  EXPECT_EQ_INT(mkdir_outside_ret, 0);
+  EXPECT_TRUE(root_resolved);
+  EXPECT_TRUE(outside_resolved);
+  EXPECT_TRUE(root_fd >= 0);
+  EXPECT_TRUE(root_set);
+  EXPECT_TRUE(scratch_ok);
+  EXPECT_TRUE(scratch_fd >= 0);
+  EXPECT_TRUE(escape_staged);
+  EXPECT_EQ_INT(escape_fd, -1);
+  EXPECT_TRUE(inside_staged);
+  EXPECT_TRUE(inside_fd >= 0);
 }
 
 /* Issue #251: file_save_to_disk_full must distinguish receiver-side skips
