@@ -26,9 +26,9 @@ elseif(NOT SANITIZER STREQUAL "none")
 endif()
 
 # --- Strict warnings option ---
-option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Werror)" OFF)
+option(STRICT_WARNINGS "Enable strict warnings (Wextra, Wpedantic, Wformat-signedness, Werror)" OFF)
 if(STRICT_WARNINGS)
-	add_compile_options(-Wextra -Wpedantic -Werror)
+	add_compile_options(-Wextra -Wpedantic -Wformat-signedness -Werror)
 endif()
 
 # --- Coverage option ---

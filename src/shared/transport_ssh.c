@@ -87,7 +87,7 @@ static int parse_remote_dest(const char* dest, RemoteDest* r) {
   return 0;
 }
 
-char* ssh_build_remote_command(const char* server_path, bool old_args, char* const* remote_options,
+char* ssh_build_remote_command(const char* server_path, char* const* remote_options,
                                int remote_option_count) {
   const char* path = server_path ? server_path : "fastsync-server";
   const char* suffix = " --stdio";
@@ -105,9 +105,7 @@ char* ssh_build_remote_command(const char* server_path, bool old_args, char* con
      shell word (remote options below reuse the same escaping), then
      " --stdio".  Quoting the path is the only injection-safe construction: an
      unquoted path would carry shell metacharacters straight into the remote
-     shell command.  --old-args is kept for CLI/ABI compatibility but no longer
-     disables that protection. */
-  (void)old_args;
+     shell command.  (rsync's --old-args no longer disables that protection.) */
   size_t quote_count = 0;
   for (const char* p = path; *p; p++)
     if (*p == '\'')
@@ -296,8 +294,8 @@ void ssh_free_client_argv(char** argv) {
 }
 
 Client* client_connect_ssh(const char* destination, int port, const char* server_path,
-                           bool old_args, const char* rsh_command, bool blocking_io,
-                           char* const* remote_options, int remote_option_count) {
+                           const char* rsh_command, bool blocking_io, char* const* remote_options,
+                           int remote_option_count) {
   RemoteDest r;
   if (parse_remote_dest(destination, &r) != 0) {
     char* escaped = output_escape(destination, false);
@@ -376,7 +374,7 @@ Client* client_connect_ssh(const char* destination, int port, const char* server
       snprintf(ssh_user, ssh_user_len, "%s", r.host);
 
     char* remote_command =
-        ssh_build_remote_command(server_path, old_args, remote_options, remote_option_count);
+        ssh_build_remote_command(server_path, remote_options, remote_option_count);
     if (!remote_command)
       ssh_child_setup_failed(exec_pipe[1]);
     char** ssh_argv = ssh_build_client_argv(rsh_command, port, ssh_user, remote_command);
