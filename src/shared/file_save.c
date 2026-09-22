@@ -748,50 +748,27 @@ static FileSaveResult file_save_directory_to_disk(const FileSavePlan* plan, bool
   } else if (ok && identity_copy_as_active()) {
     ok = false;
   }
-  /* Mode next: fchmod also rewrites the ACL mask, so the xattrs/ACLs below must
-     follow it.  The --chmod/permission-bits handling matches the recursive
-     dir_metadata_list_apply() path exactly. */
-  if (ok && file->metadata && plan->config && plan->config->preserve_perms) {
-    const Config* config = plan->config;
-    if (dir_fd < 0) {
-      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-      log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
-                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-      free(escaped_path);
-    } else {
-      mode_t dir_mode = file->metadata->mode;
-      bool mode_ready = true;
-      if (config->chmod_spec && *config->chmod_spec &&
-          !chmod_apply(dir_mode, config->chmod_spec, &dir_mode)) {
-        char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-        log_message(LOG_LEVEL_WARNING, "Failed to apply --chmod to directory %s",
-                    escaped_path ? escaped_path : "<allocation failed>");
-        free(escaped_path);
-        mode_ready = false;
-      }
-      if (mode_ready) {
-        /* rsync -p copies the source directory mode exactly, including
-           group/other write and the setgid/sticky bits.  Setuid/setgid/sticky
-           are super-user activities: when the connection forbade them
-           (SUPER_MODE_OFF / --no-super), strip them even under -p. */
-        mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
-        if (!privilege_super_mode_permitted(config->super_mode))
-          safe_mode &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
-        if (fchmod(dir_fd, safe_mode) != 0) {
-          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
-          log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
-                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
-          free(escaped_path);
-        }
-      }
-    }
-  }
-  /* xattrs/ACLs after fchmod (the mode change can rewrite the ACL mask; the
-     ACL xattrs must be (re)applied last).  Best-effort: a per-attribute failure
-     is logged and skipped by xattr_apply_fd(), never fatal. */
+  /* The final source MODE is deliberately NOT applied inline.  A restrictive
+     source mode (for example 0555) would make the directory unwritable before
+     its children are created, so a non-root receiver fails each child with
+     EACCES.  The receiver feeds every is_dir entry -- including this explicit
+     --dirs/STATUS_MKDIR one -- into the deferred DirTimeList, and
+     dir_metadata_list_apply() stamps the exact mode once the whole transfer has
+     finished, exactly as it does for the recursive path.  Leaving the directory
+     at its creation mode keeps it writable for the children until then.
+
+     The xattrs below are still applied inline so a direct
+     file_save_to_disk_full() caller (which has no deferred pass) also gets
+     --dirs directory xattrs.  Because the inline mode is absent, the inline
+     order here is ownership, then xattrs, then timestamps; the recursive path
+     (which DOES apply a mode) orders them times, mode, xattrs -- the difference
+     is intentional, and the deferred pass re-stamps mode and xattrs last.
+     Best-effort: a per-attribute failure is logged and skipped by
+     xattr_apply_fd(), never fatal. */
   if (ok && plan->config && plan->config->use_xattrs && dir_fd >= 0 && file->xattrs)
     xattr_apply_fd(dir_fd, file->xattrs);
-  /* Timestamps last so no later chmod/xattr is mistaken for a content update.
+  /* Timestamps last so no later inline ownership/xattr change is mistaken for a
+     content update; the deferred pass re-stamps them after every child write.
      -J/--omit-dir-times suppresses the directory mtime; --atimes/-U applies
      only when the source atime is valid, exactly as the recursive path. */
   if (ok && file->metadata && plan->config && plan->config->preserve_times &&
@@ -804,9 +781,10 @@ static FileSaveResult file_save_directory_to_disk(const FileSavePlan* plan, bool
       times[0].tv_nsec = file->metadata->atime_nsec;
     }
     if (parent_fd >= 0 && utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+      int saved_errno = errno;
       char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING, "Failed to set directory timestamps on %s: %s",
-                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(saved_errno));
       free(escaped_path);
     }
   }
