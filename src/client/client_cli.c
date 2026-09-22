@@ -962,6 +962,13 @@ static const OptionEntry OPTION_TABLE[] = {
     /* rsync -r/--recursive: FastSync is always recursive, so this is a
      * faithful no-op (accepted silently, never consumes an argument). */
     {"--recursive", "-r", OPT_NOOP, 0},
+    /* rsync's incremental-recursion scan-mode switch.  FastSync always performs
+     * a single full recursive scan, so both spellings are accepted as no-ops:
+     * the destination is identical whichever mode the caller requests.
+     * --no-inc-recursive is handled before the generic --no-* negation branch
+     * (see cli_handle_pre_negation) but is registered here for discoverability. */
+    {"--inc-recursive", NULL, OPT_NOOP, 0},
+    {"--no-inc-recursive", NULL, OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
     /* rsync's --old-args: accepted for CLI compatibility as a documented no-op
      * (the remote server path is always safely quoted; see usage.c).  It is
@@ -1387,6 +1394,12 @@ static bool cli_handle_pre_negation(CliParseCtx* ctx) {
       ctx->no_delta = true;
     else if (strcmp(arg, "--no-incremental") == 0)
       ctx->no_incremental = true;
+    /* Real rsync option names that merely start with "--no-" and are inert
+     * no-ops (e.g. --no-inc-recursive) are registered as OPT_NOOP entries;
+     * accept them before the generic negation table would reject the name. */
+    const OptionEntry* noop = find_table_option(arg);
+    if (noop && noop->kind == OPT_NOOP)
+      return true;
     if (apply_negation(config, arg) != 0) {
       ctx->exit_code = -1;
       return true;

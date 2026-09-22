@@ -339,12 +339,16 @@ static void test_file_save_to_disk_temp_dir_confined() {
   const char* root = "test_temp_confine_tmp";
   const char* dest_file = "test_temp_confine_tmp/file.txt";
   char outside[PATH_MAX];
+  char inside_abs[PATH_MAX];
   snprintf(outside, sizeof(outside), "/tmp/fastsync_temp_outside_%d", (int)getpid());
   unlink(dest_file);
   rmdir("test_temp_confine_tmp/scratch");
+  rmdir("test_temp_confine_tmp/abs_scratch");
   rmdir(root);
   mkdir(root, 0755);
   mkdir("test_temp_confine_tmp/scratch", 0755);
+  mkdir("test_temp_confine_tmp/abs_scratch", 0755);
+  EXPECT_NOT_NULL(realpath("test_temp_confine_tmp/abs_scratch", inside_abs));
   mkdir(outside, 0755);
 
   File* f = file_create("file.txt");
@@ -364,6 +368,13 @@ static void test_file_save_to_disk_temp_dir_confined() {
   config->temp_dir = str_dup("../escape");
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_ERROR);
   EXPECT_EQ_INT(access(dest_file, F_OK), -1);
+  /* An absolute temp dir that canonicalizes INSIDE the receive root is
+     accepted and used (the parity win); destination is still written. */
+  free(config->temp_dir);
+  config->temp_dir = str_dup(inside_abs);
+  EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(access(dest_file, F_OK), 0);
+  unlink(dest_file);
   free(config->temp_dir);
   config->temp_dir = str_dup("scratch");
   EXPECT_EQ_INT(file_save_to_disk_full(root, f, config), FILE_SAVE_WRITTEN);
@@ -373,6 +384,7 @@ static void test_file_save_to_disk_temp_dir_confined() {
   config_delete(config);
   unlink(dest_file);
   rmdir("test_temp_confine_tmp/scratch");
+  rmdir("test_temp_confine_tmp/abs_scratch");
   rmdir(root);
   rmdir(outside);
 }
