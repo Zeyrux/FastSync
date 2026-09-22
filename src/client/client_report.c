@@ -521,7 +521,7 @@ static void client_progress_emit_ancestors(const Config* config, const char* rel
       if (key != NULL && array_list_add(g_progress_emitted_keys, key)) {
         str_hash_set_insert_ref(&g_progress_emitted, key);
         if (g_change_dirs_active) {
-          File* dir = progress_dir_lookup(prefix);
+          const File* dir = progress_dir_lookup(prefix);
           if (dir != NULL)
             change_emit_dir_sent(config, dir);
         } else {
@@ -603,7 +603,7 @@ void client_progress_begin(const Config* config) {
      -i/--out-format it is the root change line (`.d..t...... ./`); otherwise it
      is the plain --info=name / --progress name line. */
   if (g_change_dirs_active) {
-    File* root = progress_dir_lookup("");
+    const File* root = progress_dir_lookup("");
     if (root != NULL)
       change_emit_dir_sent(config, root);
   } else {
