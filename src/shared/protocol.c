@@ -302,11 +302,14 @@ static ProtocolSession* legacy_session(int read_fd, int write_fd) {
 }
 
 /* Pace an out-of-band write that bypassed protocol_send_n_data (the plaintext
- * sendfile fast path).  The bound/legacy session is resolved exactly as
- * send_n_data resolves it, so the same token-bucket state is throttled and the
- * TLS and plaintext transports share identical --bwlimit semantics. */
-void protocol_throttle_bytes(size_t bytes) {
-  bw_throttle_session(legacy_session(-1, -1), bytes);
+ * sendfile fast path).  The bound/legacy session is resolved exactly as the
+ * preceding send_n_data(fd, ...) resolved it, so the same token-bucket state is
+ * throttled and the TLS and plaintext transports share identical --bwlimit
+ * semantics.  Passing the wire fd (rather than -1) is essential: the sendfile
+ * send left legacy_io_session.write_fd bound to it, so resolving with -1 would
+ * mismatch, re-initialize the session and hand out a second first-call burst. */
+void protocol_throttle_bytes(int file_descriptor, size_t bytes) {
+  bw_throttle_session(legacy_session(-1, file_descriptor), bytes);
 }
 
 bool send_n_data(int file_descriptor, const void* data, size_t data_size) {
