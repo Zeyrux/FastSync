@@ -6,6 +6,8 @@ run the same version because the handshake is strict.
 
 ## [Unreleased]
 
+## [2.29.0] - 2026-09-23
+
 The rsync-parity cycle 2.29 (no wire change; `PROTOCOL_VERSION` stays 2.28.0).
 `RSYNC_COMPAT.md` moves from **116 ✅ / 14 ⚠️ / 27 ❌** to
 **120 ✅ / 10 ⚠️ / 27 ❌** of 157 rows.
