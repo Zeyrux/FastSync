@@ -714,27 +714,107 @@ static FileSaveResult file_save_directory_to_disk(const FileSavePlan* plan, bool
     return FILE_SAVE_ERROR;
   bool dir_existed = file_path_exists_secure(dir_path);
   bool ok = file_ensure_directory_secure(dir_path);
+  /* One confined, no-follow descriptor drives ownership/mode/xattr/timestamp
+     application so none of them can follow a same-named symlink planted after
+     the mkdir.  This mirrors the O_DIRECTORY|O_NOFOLLOW fd that
+     dir_metadata_list_apply() opens for the recursive path; the fd is reached
+     through the already-confined parent. */
+  char* leaf = NULL;
+  int parent_fd = -1;
+  int dir_fd = -1;
+  if (ok) {
+    parent_fd = file_open_secure_parent(dir_path, &leaf, false);
+    if (parent_fd >= 0)
+      dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  }
   /* P7 Wave E: apply the negotiated ownership to the directory ITSELF (not
      just the files inside it).  --copy-as and every explicit identity policy
      own every entry, so a directory must not keep the receiver's owner while
      its children get the policy owner.  Applied no-follow on the confined
-     parent fd after the mkdir; identity_apply_ownership_link() is itself a
-     no-op unless an identity policy is active. */
+     parent fd; identity_apply_ownership_link() is itself a no-op unless an
+     identity policy is active.  Ownership runs before the mode because a chown
+     clears setuid/setgid.  A failed REQUIRED --copy-as ownership fails the
+     entry; every other policy stays best-effort. */
   if (ok && file->metadata && identity_active_enabled()) {
-    char* leaf = NULL;
-    int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
     if (parent_fd >= 0) {
       if (!identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
                                          (int32_t)file->metadata->gid))
         ok = false;
-      close(parent_fd);
     } else if (identity_copy_as_active()) {
       /* The directory exists (ok) but its required --copy-as ownership could
          not be applied because the confined parent could not be opened. */
       ok = false;
     }
-    free(leaf);
+  } else if (ok && identity_copy_as_active()) {
+    ok = false;
   }
+  /* Mode next: fchmod also rewrites the ACL mask, so the xattrs/ACLs below must
+     follow it.  The --chmod/permission-bits handling matches the recursive
+     dir_metadata_list_apply() path exactly. */
+  if (ok && file->metadata && plan->config && plan->config->preserve_perms) {
+    const Config* config = plan->config;
+    if (dir_fd < 0) {
+      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to open directory %s to set its mode: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+      free(escaped_path);
+    } else {
+      mode_t dir_mode = file->metadata->mode;
+      bool mode_ready = true;
+      if (config->chmod_spec && *config->chmod_spec &&
+          !chmod_apply(dir_mode, config->chmod_spec, &dir_mode)) {
+        char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+        log_message(LOG_LEVEL_WARNING, "Failed to apply --chmod to directory %s",
+                    escaped_path ? escaped_path : "<allocation failed>");
+        free(escaped_path);
+        mode_ready = false;
+      }
+      if (mode_ready) {
+        /* rsync -p copies the source directory mode exactly, including
+           group/other write and the setgid/sticky bits.  Setuid/setgid/sticky
+           are super-user activities: when the connection forbade them
+           (SUPER_MODE_OFF / --no-super), strip them even under -p. */
+        mode_t safe_mode = dir_mode & (mode_t)(S_ISUID | S_ISGID | S_ISVTX | 0777);
+        if (!privilege_super_mode_permitted(config->super_mode))
+          safe_mode &= ~(mode_t)(S_ISUID | S_ISGID | S_ISVTX);
+        if (fchmod(dir_fd, safe_mode) != 0) {
+          char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+          log_message(LOG_LEVEL_WARNING, "Failed to set directory mode on %s: %s",
+                      escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+          free(escaped_path);
+        }
+      }
+    }
+  }
+  /* xattrs/ACLs after fchmod (the mode change can rewrite the ACL mask; the
+     ACL xattrs must be (re)applied last).  Best-effort: a per-attribute failure
+     is logged and skipped by xattr_apply_fd(), never fatal. */
+  if (ok && plan->config && plan->config->use_xattrs && dir_fd >= 0 && file->xattrs)
+    xattr_apply_fd(dir_fd, file->xattrs);
+  /* Timestamps last so no later chmod/xattr is mistaken for a content update.
+     -J/--omit-dir-times suppresses the directory mtime; --atimes/-U applies
+     only when the source atime is valid, exactly as the recursive path. */
+  if (ok && file->metadata && plan->config && plan->config->preserve_times &&
+      !plan->config->omit_dir_times) {
+    struct timespec times[2] = {
+        {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+        {.tv_sec = file->metadata->mtime_sec, .tv_nsec = file->metadata->mtime_nsec}};
+    if (plan->config->preserve_atimes && file->metadata->atime_valid) {
+      times[0].tv_sec = file->metadata->atime_sec;
+      times[0].tv_nsec = file->metadata->atime_nsec;
+    }
+    if (parent_fd >= 0 && utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to set directory timestamps on %s: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(errno));
+      free(escaped_path);
+    }
+  }
+  if (dir_fd >= 0)
+    close(dir_fd);
+  if (parent_fd >= 0)
+    close(parent_fd);
+  free(leaf);
   free(dir_path);
   if (ok && created && !dir_existed)
     *created = true;
