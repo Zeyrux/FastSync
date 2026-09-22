@@ -50,16 +50,48 @@
 
 typedef struct ssl_st SSL;
 
+typedef struct ProtocolSession ProtocolSession;
+
+/*
+ * Transport vtable: the per-session set of I/O primitives the three protocol
+ * loops (send, receive, status-read) dispatch through.  The ops are selected
+ * once, when the session is initialized or its SSL is installed, so the loops
+ * never branch on the transport at runtime.  A plaintext session uses the
+ * read()/write() ops; a TLS session uses the SSL_read()/SSL_write() ops.
+ *
+ * `send`/`recv` attempt exactly one transfer and return:
+ *   > 0                    bytes transferred,
+ *   PROTOCOL_IO_RETRY      no progress; poll on *wait_events and retry,
+ *   PROTOCOL_IO_CLOSED     peer closed the stream,
+ *   PROTOCOL_IO_ERROR      fatal transport error.
+ * `has_pending` reports bytes already buffered by the transport (a TLS record
+ * residue); the receive loops skip the poll() gate when it is true.
+ */
+typedef struct ProtocolIoOps {
+  ssize_t (*send)(ProtocolSession* session, const void* data, size_t size, short* wait_events);
+  ssize_t (*recv)(ProtocolSession* session, void* data, size_t size, short* wait_events);
+  bool (*has_pending)(const ProtocolSession* session);
+} ProtocolIoOps;
+
+/* Negative sentinels returned by ProtocolIoOps.send/recv (see above). */
+enum {
+  PROTOCOL_IO_RETRY = -1,
+  PROTOCOL_IO_CLOSED = -2,
+  PROTOCOL_IO_ERROR = -3,
+};
+
 /*
  * Explicit owner of protocol I/O.  A session does not own the descriptors or
  * SSL object; it only describes the transport used by a transfer.  This makes
  * it safe to pass the transport to a worker without relying on inherited
  * thread-local state.
  */
-typedef struct ProtocolSession {
+struct ProtocolSession {
   int read_fd;
   int write_fd;
   SSL* ssl;
+  /* Transport dispatch selected by protocol_session_init()/set_ssl(). */
+  const ProtocolIoOps* ops;
   unsigned long long bwlimit;
   long long bw_tokens;
   long long bw_last_refill_sec;
@@ -75,7 +107,7 @@ typedef struct ProtocolSession {
    * SO_RCVTIMEO/SO_SNDTIMEO.  The server does not propagate a client 0 here: it
    * installs protocol_server_io_timeout_sec() so its sessions keep a floor. */
   int io_timeout_sec;
-} ProtocolSession;
+};
 
 typedef int Status;
 enum NET_STATUS {
