@@ -99,17 +99,20 @@ set(SHARED_SRCS
 	src/shared/daemon_limits.c
 	src/shared/data.c
 	src/shared/delay_updates.c
+	src/shared/delete_commit.c
 	src/shared/delete_plan.c
 	src/shared/delta.c
 	src/shared/file.c
 	src/shared/file_list.c
 	src/shared/file_receive.c
+	src/shared/file_save.c
 	src/shared/file_send.c
 	src/shared/file_store.c
 	src/shared/filter.c
 	src/shared/format.c
 	src/shared/hardlink.c
 	src/shared/identity.c
+	src/shared/incremental_check.c
 	src/shared/log.c
 	src/shared/metadata.c
 	src/shared/motd.c
