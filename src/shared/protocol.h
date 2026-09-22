@@ -249,13 +249,15 @@ unsigned long long io_get_bwlimit(void);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
 /* SSL object of the transport in effect on this thread: the currently bound
- * session's SSL when a session is bound, otherwise the legacy thread-local
+ * session's SSL when a TLS session is bound, otherwise the legacy thread-local
  * io_ssl.  NULL for a plaintext transport.  Unlike io_get_ssl(), this resolves
  * worker threads that bound a TLS session via protocol_session_set_ssl()/
  * protocol_session_bind() but never called io_set_ssl() themselves (C11
- * _Thread_local state is not inherited by a new thread).  Callers that must
- * choose a TLS-only code path (e.g. file_send.c's sendfile fallback) must use
- * this instead of io_get_ssl(). */
+ * _Thread_local state is not inherited by a new thread).  A bound session only
+ * wins when its selected dispatch is TLS; a bound plaintext session (ssl ==
+ * NULL) falls back to io_ssl so it can never mask a live encrypted transport.
+ * Callers that must choose a TLS-only code path (e.g. file_send.c's sendfile
+ * fallback) must use this instead of io_get_ssl(). */
 SSL* protocol_current_ssl(void);
 
 /* Process-wide wire byte counters.  protocol_send_n_data/protocol_receive_n_data
