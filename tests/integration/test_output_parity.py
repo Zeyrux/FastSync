@@ -242,6 +242,75 @@ class TestItemizeParity:
 
     @requires_rsync
     @pytest.mark.ci
+    def test_itemize_info_flist_header_matches_rsync(self, shared_server):
+        """`-i --info=flist` prints rsync's file-list header: the -i change
+        lines alone do not enable the flist category, but an explicit --info=flist
+        must not be suppressed when itemizing."""
+        source = os.path.join(TEST_DATA_DIR, "out_itemfl_src")
+        dest = os.path.join(TEST_DATA_DIR, "out_itemfl_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "out_itemfl_rdst")
+        _make_output_tree(source)
+        clean_dir(dest)
+        clean_dir(rdst)
+        flags = ["-a", "-i", "--info=flist"]
+        rsync_result = _rsync(flags + [source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+        assert "sending incremental file list" in rsync_result.stdout
+        assert "sending incremental file list" in result.stdout, result.stdout
+        # -i alone (no explicit --info=flist) must stay silent like rsync.
+        clean_dir(dest)
+        clean_dir(rdst)
+        rsync_plain = _rsync(["-a", "-i", source + "/", rdst + "/"])
+        plain, _ = run_client(source, dest, flags=["-a", "-i"],
+                              port=shared_server.port)
+        assert "sending incremental file list" not in rsync_plain.stdout
+        assert "sending incremental file list" not in plain.stdout, plain.stdout
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_itemize_files_from_dirs_root_and_ancestors(self, shared_server):
+        """The -d/--files-from dirs generator emits the transfer-root line and
+        rsync's implied ancestor directory lines.  The generator traverses no
+        directories, so those must be synthesized from the listed entries."""
+        source = os.path.join(TEST_DATA_DIR, "out_itemff_src")
+        dest = os.path.join(TEST_DATA_DIR, "out_itemff_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "out_itemff_rdst")
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "sub", "deep"))
+        with open(os.path.join(source, "sub", "deep", "d.txt"), "wb") as fh:
+            fh.write(b"deep\n")
+        clean_dir(dest)
+        clean_dir(rdst)
+        listing = os.path.join(TEST_DATA_DIR, "out_itemff.list")
+        with open(listing, "w") as fh:
+            fh.write("sub/deep/d.txt\n")
+
+        flags = ["-d", "-i", "--files-from=" + listing]
+        rsync_result = _rsync(flags + [source + "/", rdst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, result.stderr[:300]
+
+        def dir_lines(text):
+            return sorted(line for line in text.splitlines()
+                          if line.rsplit(" ", 1)[-1].endswith("/"))
+
+        # rsync emits the implied parents (sub/, sub/deep/) but never the root
+        # here; FastSync emits the same set plus its unconditional root line.
+        expected = [line for line in dir_lines(rsync_result.stdout)
+                    if not line.rsplit(" ", 1)[-1] == "./"]
+        fast = dir_lines(result.stdout)
+        assert [line for line in fast if not line.rsplit(" ", 1)[-1] == "./"] == expected, (
+            f"rsync={rsync_result.stdout!r} fastsync={result.stdout!r}"
+        )
+        assert "cd+++++++++ sub/" in fast, result.stdout
+        assert "cd+++++++++ sub/deep/" in fast, result.stdout
+        assert any(line.rsplit(" ", 1)[-1] == "./" for line in fast), result.stdout
+
+    @requires_rsync
+    @pytest.mark.ci
     def test_itemize_modified_file_matches_rsync(self, shared_server):
         source = os.path.join(TEST_DATA_DIR, "out_item2_src")
         dest = os.path.join(TEST_DATA_DIR, "out_item2_dst")
@@ -317,6 +386,47 @@ class TestOutFormatParity:
         for line in result.stdout.splitlines():
             if line:
                 assert pattern.match(line), f"bad %M format: {line!r}"
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_out_format_directory_metadata_with_delete_during(self):
+        """--delete-during/--delete-delay reuse the per-directory plan pre-scan,
+        whose list carries no metadata.  Directory %M/%B/%U/%G must still come
+        from the source, exactly as the plain recursive scan renders them."""
+        source = os.path.join(TEST_DATA_DIR, "out_fmtmeta_src")
+        dest = os.path.join(TEST_DATA_DIR, "out_fmtmeta_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "out_fmtmeta_rdst")
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "sub", "deep"))
+        with open(os.path.join(source, "a.txt"), "wb") as fh:
+            fh.write(b"hello\n")
+        with open(os.path.join(source, "sub", "b.txt"), "wb") as fh:
+            fh.write(b"world\n")
+        clean_dir(dest)
+        clean_dir(rdst)
+
+        def dir_lines(text):
+            # Directory names are the last whitespace-separated token.
+            return sorted(line for line in text.splitlines()
+                          if line.rsplit(" ", 1)[-1].endswith("/")
+                          and line.rsplit(" ", 1)[-1] != "./")
+
+        for timing in ("--delete-during", "--delete-delay"):
+            for fmt in ("%M %n", "%B %n", "%U %G %n"):
+                clean_dir(dest)
+                clean_dir(rdst)
+                flags = ["-a", "--out-format=" + fmt, timing]
+                rsync_result = _rsync(flags + [source + "/", rdst + "/"])
+                assert rsync_result.returncode == 0, rsync_result.stderr
+                with ServerManager() as server:
+                    server.start(extra_args=["--allow-delete"])
+                    result, _ = run_client(source, dest, flags=flags, port=server.port)
+                assert result.returncode == 0, result.stderr[:300]
+                assert dir_lines(result.stdout) == dir_lines(rsync_result.stdout), (
+                    f"{timing} {fmt}: rsync={rsync_result.stdout!r} "
+                    f"fastsync={result.stdout!r}"
+                )
+                assert "1970/" not in result.stdout, result.stdout
 
 
 class TestListOnlyParity:
