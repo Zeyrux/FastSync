@@ -136,6 +136,9 @@ set(SERVER_MAIN_SRCS src/server/server.c)
 # Client implementation (no main): everything except the CLI entry point.
 set(CLIENT_CORE_SRCS
 	src/client/change_list.c
+	src/client/client_manifest.c
+	src/client/client_report.c
+	src/client/client_scan.c
 	src/client/client_send.c
 	src/client/client_validation.c
 	src/client/scanner.c
