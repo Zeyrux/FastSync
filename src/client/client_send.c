@@ -654,7 +654,11 @@ static bool send_symlink_entry(const Client* client, File* file, const Config* c
   if (!send_status(fd, STATUS_SYMLINK) || !send_wire_str(fd, file_wire_path(file)) ||
       !send_wire_str(fd, file->symlink_target))
     return false;
-  return !config->use_metadata || metadata_send(fd, file->metadata);
+  if (config->use_metadata && !metadata_send(fd, file->metadata))
+    return false;
+  /* Symlink xattrs/ACLs (-X/-A) ride the same trailing block as regular files
+     and directories when the xattr transport was negotiated. */
+  return !config->use_xattrs || xattr_send(fd, file->xattrs);
 }
 
 // Send a single file directly via sendfile (non-incremental path).

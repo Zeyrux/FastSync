@@ -83,7 +83,7 @@ typedef struct {
 typedef enum SuperMode { SUPER_MODE_AUTO = 0, SUPER_MODE_ON = 1, SUPER_MODE_OFF = 2 } SuperMode;
 
 /* ===========================================================================
- * Config wire-field table (single source of truth for protocol 2.28.0).
+ * Config wire-field table (single source of truth for protocol 2.29.0).
  *
  * Every field below crosses the wire.  The table is the ONLY place a
  * serialized field is named: config.h expands CONFIG_WIRE_FIELDS() to declare
@@ -1071,7 +1071,20 @@ typedef struct Config {
  * filter rules so the receiver can protect DESTINATION-ONLY entries from
  * --delete with `protect`/`risk` rules (rsync parity).  The block appends after
  * compression_algo; see CONFIG_WIRE_PROTECT_FIELDS. */
-#define PROTOCOL_VERSION "2.28.0"
+/* (10) Symlink xattrs/ACLs (protocol 2.29.0): the config-frame LAYOUT is
+ * unchanged (the derived use_xattrs bit already crosses the wire), but the
+ * STATUS_SYMLINK frame BODY grows a trailing bounded xattr block when -X/-A is
+ * negotiated -- exactly the block STATUS_MKDIR, STATUS_DIR_TIMES and regular
+ * files already carry.  The sender captures the symlink's OWN xattrs with
+ * llistxattr/lgetxattr (so it can never attach the REFERENT's attributes to the
+ * link) and the receiver re-applies them to the link itself with lsetxattr on a
+ * confined /proc/self/fd/<parent>/<leaf> path (there is no *at xattr syscall and
+ * fsetxattr cannot target a symlink).  A 2.28 peer that does not consume the new
+ * trailing block would desynchronize after every symlink, so the protocol
+ * version must bump; the strict same-version handshake (config_receive rejects a
+ * mismatched version before parsing anything else) keeps a 2.29 client and a
+ * 2.28 server from ever reaching that state. */
+#define PROTOCOL_VERSION "2.29.0"
 #define DEFAULT_CHUNK_SIZE (10 * 1024 * 1024)
 /* Upper bound on total basis-dir entries (rsync caps --link-dest at 20). */
 #define MAX_BASIS_DIRS 64
