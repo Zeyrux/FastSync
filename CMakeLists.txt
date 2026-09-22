@@ -139,6 +139,8 @@ set(CLIENT_CORE_SRCS
 	src/client/client_send.c
 	src/client/client_validation.c
 	src/client/scanner.c
+	src/client/scanner_filter.c
+	src/client/scanner_parallel.c
 	src/client/usage.c
 )
 set(CLIENT_MAIN_SRCS src/client/client_cli.c)
