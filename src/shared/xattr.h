@@ -110,16 +110,32 @@ bool xattr_apply_fd(int fd, const FileXattrList* list);
 
 /* Receiver: apply every entry to the symlink named by (parent_fd, leaf) WITHOUT
  * following it, via lsetxattr() on the confined path
- * "/proc/self/fd/<parent_fd>/<leaf>".  A symlink cannot be targeted by the
- * fd-relative fsetxattr() path: there is no *at() xattr syscall and the kernel
- * rejects xattr syscalls on an O_PATH descriptor, so the already-opened,
+ * "/proc/self/fd/<parent_fd>/<leaf>".  Every incoming name is independently
+ * re-validated against xattr_name_appliable() with `preserve_acls`, exactly like
+ * xattr_apply_fd(): a non-whitelisted namespace (including the reserved
+ * --fake-super key) is skipped, so this primitive stays confined even if handed
+ * a hand-crafted list.  A symlink cannot be targeted by the fd-relative
+ * fsetxattr() path: there is no *at() xattr syscall and the kernel rejects
+ * xattr syscalls on an O_PATH descriptor, so the already-opened,
  * confinement-checked parent directory is the anchor and only the final
  * component is the (no-follow) link.  `leaf` must be a single path component.
- * Best-effort exactly like xattr_apply_fd(): a per-attribute failure (on Linux
- * every set on a symlink fails with EPERM) is logged once and skipped, never
- * fatal.  Returns false only for an invalid anchor/list; true when an apply was
- * attempted.  The reserved --fake-super key is never applied. */
-bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list);
+ *
+ * Portability: the "/proc/self/fd/<parent_fd>" anchor requires a mounted /proc.
+ * Where /proc is unavailable (or the fd cannot be addressed that way) the
+ * lsetxattr simply fails and is skipped -- the apply is best-effort exactly like
+ * xattr_apply_fd(), so no error is propagated and the transfer continues.  A
+ * per-attribute failure (on Linux every set on a symlink fails with EPERM) is
+ * logged once and skipped, never fatal.  Returns false only for an invalid
+ * anchor/list; true when an apply was attempted.
+ *
+ * Residual TOCTOU: `leaf` is a caller-supplied name resolved by path in the
+ * parent, so a local writer could replace the just-created symlink between its
+ * creation and lsetxattr().  This is bounded: it requires write access to the
+ * confinement-checked destination directory (already trusted), can only install
+ * a whitelisted user namespace or POSIX-ACL name, and never follows the link (a
+ * replacement symlink is still applied to as the final, no-follow component). */
+bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list,
+                               bool preserve_acls);
 
 /* --fake-super: write the source uid/gid/mode/rdev record into the reserved
  * FAKESUPER_XATTR on `fd`, using rsync 3.4.1's exact grammar (see the key

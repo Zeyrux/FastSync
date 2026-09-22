@@ -8,6 +8,7 @@
 #include "identity.h"
 #include "metadata.h"
 #include "protocol.h"
+#include "scanner_internal.h"
 #include "test_utils.h"
 #include <fcntl.h>
 #include <stdint.h>
@@ -741,16 +742,16 @@ static void test_xattr_apply_path_nofollow_does_not_follow() {
   EXPECT_TRUE(xattr_list_append(list, "user.added", "x", 1));
 
   /* Invalid anchors are refused before any syscall (no fd/leaf/list). */
-  EXPECT_FALSE(xattr_apply_path_nofollow(-1, "link", list));
-  EXPECT_FALSE(xattr_apply_path_nofollow(0, "", list));
-  EXPECT_FALSE(xattr_apply_path_nofollow(0, "a/b", list));
-  EXPECT_FALSE(xattr_apply_path_nofollow(0, "link", NULL));
+  EXPECT_FALSE(xattr_apply_path_nofollow(-1, "link", list, false));
+  EXPECT_FALSE(xattr_apply_path_nofollow(0, "", list, false));
+  EXPECT_FALSE(xattr_apply_path_nofollow(0, "a/b", list, false));
+  EXPECT_FALSE(xattr_apply_path_nofollow(0, "link", NULL, false));
 
   /* The confined parent directory is the anchor; the final component is the
      link.  Best-effort: returns true even when the kernel refuses. */
   int dir_fd = open(root, O_RDONLY | O_DIRECTORY);
   EXPECT_TRUE(dir_fd >= 0);
-  EXPECT_TRUE(xattr_apply_path_nofollow(dir_fd, "link", list));
+  EXPECT_TRUE(xattr_apply_path_nofollow(dir_fd, "link", list, false));
   close(dir_fd);
 
   /* The referent must be untouched: a following apply would have set user.orig
@@ -775,6 +776,57 @@ static void test_xattr_apply_path_nofollow_does_not_follow() {
   unlink(link);
   unlink(target);
   rmdir(root);
+}
+
+/* Protocol 2.29.0 scanner wiring: scanner_capture_xattrs() must choose the
+ * NO-FOLLOW capture for a symlink entry, so the link's FileXattrList never
+ * carries the REFERENT's user.* attributes.  xattr_capture_path_nofollow() is
+ * already covered directly above; this exercises the scanner CALL SITE, which is
+ * what makes the no-follow variant actually reach symlink entries.  If the
+ * scanner regressed to the path-following capture, file->xattrs would contain
+ * user.symref and this test fails.  Guarded on filesystem xattr support. */
+static void test_scanner_symlink_capture_is_nofollow() {
+  const char* target = "test_scanner_symlink_xattr_target";
+  const char* link = "test_scanner_symlink_xattr_link";
+  unlink(link);
+  unlink(target);
+  int fd = open(target, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool has_xattr = setxattr(target, "user.symref", "referent", 8, 0) == 0;
+  close(fd);
+  if (!has_xattr) {
+    unlink(target);
+    return; /* filesystem without xattr support */
+  }
+  if (symlink(target, link) != 0) {
+    unlink(target);
+    return;
+  }
+
+  DirectoryScanner scanner;
+  memset(&scanner, 0, sizeof(scanner));
+  scanner.options.preserve_xattrs = true;
+  File* file = file_create(link);
+  EXPECT_NOT_NULL(file);
+  file->is_symlink = true;
+
+  scanner_capture_xattrs(&scanner, file);
+
+  /* The referent's attribute must not appear on the symlink's captured list. */
+  bool leaked = false;
+  for (int i = 0; file->xattrs && i < file->xattrs->count; i++) {
+    if (strcmp(file->xattrs->items[i].name, "user.symref") == 0)
+      leaked = true;
+  }
+  EXPECT_FALSE(leaked);
+  /* On Linux the VFS associates no xattrs with a symlink, so the capture is
+     NULL (never an empty-but-valid list). */
+  EXPECT_NULL(file->xattrs);
+
+  file_destroy(file);
+  unlink(link);
+  unlink(target);
 }
 
 /* Protocol 2.29.0: a STATUS_SYMLINK frame followed by an -X/-A xattr block is
@@ -843,6 +895,7 @@ static void test_symlink_frame_carries_xattrs() {
 void test_xattr() {
   test_xattr_list_clone();
   test_xattr_capture_symlink_nofollow();
+  test_scanner_symlink_capture_is_nofollow();
   test_xattr_apply_path_nofollow_does_not_follow();
   test_symlink_frame_carries_xattrs();
   test_xattr_wire_roundtrip();

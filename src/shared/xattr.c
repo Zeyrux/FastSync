@@ -383,8 +383,17 @@ bool xattr_apply_fd(int fd, const FileXattrList* list) {
  * referent.  fsetxattr cannot be used (no *at xattr syscall exists, and the
  * kernel rejects xattr syscalls on an O_PATH descriptor), so the already-open,
  * confinement-checked parent directory is addressed through /proc/self/fd and
- * the final component is applied with lsetxattr, which does not follow it. */
-bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list) {
+ * the final component is applied with lsetxattr, which does not follow it.
+ *
+ * The list is trusted to come from xattr_receive() (already whitelisted), but
+ * every name is re-validated here so this path-based primitive is confined on
+ * its own -- this is the only apply primitive that addresses a path, and the
+ * header promises a whitelisted apply.  The apply is best-effort: if /proc is
+ * not mounted (the anchor cannot be formed) or the kernel refuses the set, the
+ * failure is skipped and never fails the transfer.  See xattr.h for the bounded
+ * residual TOCTOU between link creation and lsetxattr. */
+bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list,
+                               bool preserve_acls) {
   if (parent_fd < 0 || !leaf || leaf[0] == '\0' || strchr(leaf, '/') != NULL || !list)
     return false;
   if (list->count == 0)
@@ -403,9 +412,10 @@ bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrL
   int first_errno = 0;
   for (int i = 0; i < list->count; i++) {
     const FileXattr* xa = &list->items[i];
-    /* Defense in depth: even a hand-crafted list can never apply the reserved
-       --fake-super key (only fake_super_store_fd may write it). */
-    if (strcmp(xa->name, FAKESUPER_XATTR) == 0)
+    /* Defense in depth: re-validate against the receiver's full whitelist, so a
+       hand-crafted list can never apply a privileged namespace or the reserved
+       --fake-super key through this path-based primitive. */
+    if (!xattr_name_appliable(xa->name, preserve_acls))
       continue;
     if (lsetxattr(path, xa->name, xa->value, xa->value_len, 0) != 0) {
       if (!warned) {
