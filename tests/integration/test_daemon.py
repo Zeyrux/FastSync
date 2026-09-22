@@ -229,6 +229,7 @@ def daemon_env():
             "\n"
             "[files]\n"
             "path = %s\n"
+            "read only = no\n"
             "\n"
             "[readonly]\n"
             "path = %s\n"
@@ -236,18 +237,22 @@ def daemon_env():
             "\n"
             "[locked]\n"
             "path = %s\n"
+            "read only = no\n"
             "auth users = alice\n"
             "\n"
             "[team]\n"
             "path = %s\n"
+            "read only = no\n"
             "auth users = alice,bob\n"
             "\n"
             "[owner]\n"
             "path = %s\n"
+            "read only = no\n"
             "client owner = yes\n"
             "\n"
             "[denied]\n"
             "path = %s\n"
+            "read only = no\n"
             "hosts deny = 127.0.0.1\n"
             % (config_port, FILES_MODULE, READONLY_MODULE, AUTH_MODULE, TEAM_MODULE, OWNER_MODULE,
                DENIED_MODULE))
@@ -266,7 +271,8 @@ def daemon_env():
     global DETACH_PORT
     DETACH_PORT = _find_free_port()
     with open(DETACH_CONF, "w") as f:
-        f.write("port = %d\n\n[detach]\npath = %s\n" % (DETACH_PORT, DETACH_MODULE))
+        f.write("port = %d\n\n[detach]\npath = %s\nread only = no\n"
+                % (DETACH_PORT, DETACH_MODULE))
 
     yield
     _kill_by_cmdline_marker(DETACH_CONF)
@@ -353,7 +359,8 @@ class TestDaemonModuleSelection:
         the fix regresses."""
         port = _find_free_port()
         with open(UMASK_CONF, "w") as f:
-            f.write("port = %d\n\n[files]\npath = %s\n" % (port, FILES_MODULE))
+            f.write("port = %d\n\n[files]\npath = %s\nread only = no\n"
+                    % (port, FILES_MODULE))
         sub = os.path.join(FILES_MODULE, "umask_check")
         shutil.rmtree(sub, ignore_errors=True)
         os.makedirs(sub, exist_ok=True)
@@ -1128,7 +1135,8 @@ class TestDaemonMotd:
         motd_line = "motd file = %s\n" % motd_path if motd_path else ""
         os.makedirs(self.MOTD_MODULE, exist_ok=True)
         with open(self.MOTD_CONF, "w") as f:
-            f.write("port = %d\n%s\n[files]\npath = %s\n" % (port, motd_line, self.MOTD_MODULE))
+            f.write("port = %d\n%s\n[files]\npath = %s\nread only = no\n"
+                    % (port, motd_line, self.MOTD_MODULE))
         d = DaemonManager()
         d.start(self.MOTD_CONF, port_override=port)
         return d, port
@@ -1365,6 +1373,7 @@ class TestDaemonConnectionLimits:
                     "\n"
                     "[locked]\n"
                     "path = %s\n"
+                    "read only = no\n"
                     "auth users = alice\n"
                     % (port, AUTH_MODULE))
         d = DaemonManager()
@@ -1402,6 +1411,7 @@ class TestDaemonConnectionLimits:
                     "\n"
                     "[files]\n"
                     "path = %s\n"
+                    "read only = no\n"
                     "max connections = 2\n"
                     % (port, FILES_MODULE))
         d = DaemonManager()

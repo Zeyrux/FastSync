@@ -1,5 +1,6 @@
 #include "daemon_conf.h"
 #include "credentials.h"
+#include "log.h"
 #include "utils.h"
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -77,11 +78,13 @@ static const char* const kRsyncInertGlobalKeys[] = {
 
 /* rsync 3.4.1 rsyncd.conf MODULE keys accepted in a [module] section that have
  * no FastSync equivalent (accepted-and-documented inert).  Keys with a FastSync
- * meaning (`path`, `read only`, `auth users`, `max connections`,
+ * meaning (`path`, `read only`, `write only`, `auth users`, `max connections`,
  * `hosts allow`/`hosts deny`, `client owner`) are handled by apply_module_key
  * before this list is consulted.  Security-relevant keys (`exclude`, `filter`,
  * `secrets file`, `refuse options`, ...) are inert, so a daemon-side filter or
- * rsync secrets file is NOT enforced: see RSYNC_COMPAT.md for the residual. */
+ * rsync secrets file is NOT enforced: each is loudly warned about at load time
+ * (see kRsyncUnenforcedModuleSecurityKeys) and documented as a residual in
+ * RSYNC_COMPAT.md. */
 static const char* const kRsyncInertModuleKeys[] = {
     "comment",
     "use chroot",
@@ -110,7 +113,6 @@ static const char* const kRsyncInertModuleKeys[] = {
     "numeric ids",
     "fake super",
     "munge symlinks",
-    "write only",
     "list",
     "dont compress",
     "charset",
@@ -132,8 +134,57 @@ static const char* const kRsyncInertModuleKeys[] = {
     "ignore nonreadable",
 };
 
+/* Subset of the inert rsync keys whose intent is access control (data
+ * visibility, credential source, transfer hooks, daemon privilege), plus the
+ * global keys that shape the daemon's privilege/identity.  These load for
+ * rsync-config compatibility, but because FastSync ignores them an operator
+ * migrating a hardened rsyncd.conf must not believe the restriction applies.
+ * The loader emits one LOG_LEVEL_WARNING per occurrence naming the key (and the
+ * module, for a module key).  `write only` is deliberately absent: it is mapped
+ * onto writability instead (FastSync is push-only, so a write-only module is
+ * simply writable). */
+static const char* const kRsyncUnenforcedModuleSecurityKeys[] = {
+    "secrets file",
+    "auth digest",
+    "refuse options",
+    "exclude",
+    "include",
+    "exclude from",
+    "include from",
+    "filter",
+    "max size",
+    "min size",
+    "pre-xfer exec",
+    "post-xfer exec",
+    "incoming chmod",
+    "outgoing chmod",
+    "name converter",
+    "use chroot",
+    "daemon chroot",
+    "uid",
+    "gid",
+    "daemon uid",
+    "daemon gid",
+    "munge symlinks",
+    "fake super",
+    "strict modes",
+    "proxy protocol",
+    "proxy protocol hosts",
+};
+
+static const char* const kRsyncUnenforcedGlobalSecurityKeys[] = {
+    "use chroot",
+    "uid",
+    "gid",
+    "strict modes",
+};
+
 #define kRsyncInertGlobalCount (sizeof(kRsyncInertGlobalKeys) / sizeof(kRsyncInertGlobalKeys[0]))
 #define kRsyncInertModuleCount (sizeof(kRsyncInertModuleKeys) / sizeof(kRsyncInertModuleKeys[0]))
+#define kRsyncUnenforcedModuleSecurityCount                                                        \
+  (sizeof(kRsyncUnenforcedModuleSecurityKeys) / sizeof(kRsyncUnenforcedModuleSecurityKeys[0]))
+#define kRsyncUnenforcedGlobalSecurityCount                                                        \
+  (sizeof(kRsyncUnenforcedGlobalSecurityKeys) / sizeof(kRsyncUnenforcedGlobalSecurityKeys[0]))
 
 static bool parse_bool_value(const char* value, bool* out) {
   if (strcasecmp(value, "yes") == 0 || strcasecmp(value, "true") == 0 || strcmp(value, "1") == 0) {
@@ -352,7 +403,10 @@ DaemonConf* daemon_conf_create(void) {
   if (!conf)
     return NULL;
   conf->global.port = DAEMON_CONF_DEFAULT_PORT;
-  conf->global.read_only_default = false;
+  /* rsync modules are READ-ONLY unless `read only = no` (or `write only = yes`)
+   * is set, so FastSync must default the same way: a migrated rsyncd.conf that
+   * omits `read only` is served read-only, never writable. */
+  conf->global.read_only_default = true;
   conf->global.max_connections = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS;
   conf->global.auth_failure_delay_ms = DAEMON_CONF_DEFAULT_AUTH_FAILURE_DELAY_MS;
   conf->global.max_connections_per_host = DAEMON_CONF_DEFAULT_MAX_CONNECTIONS_PER_HOST;
@@ -483,8 +537,14 @@ static bool apply_global_key(DaemonConf* conf, char* key, const char* value, boo
     return store_host_list(&conf->global.hosts_deny, &conf->global.hosts_deny_count, value,
                            "hosts deny", NULL, replace_hosts, err, err_size);
   /* A recognized rsync global key with no FastSync equivalent loads inert. */
-  if (key_in_list(key, kRsyncInertGlobalKeys, kRsyncInertGlobalCount))
+  if (key_in_list(key, kRsyncInertGlobalKeys, kRsyncInertGlobalCount)) {
+    if (key_in_list(key, kRsyncUnenforcedGlobalSecurityKeys, kRsyncUnenforcedGlobalSecurityCount))
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon config: global key '%s' is accepted for rsync compatibility but is NOT "
+                  "enforced by FastSync; the restriction it expresses will not be applied",
+                  key);
     return true;
+  }
   set_error(err, err_size, "unknown global key '%s'", key);
   return false;
 }
@@ -514,6 +574,25 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     }
     module->read_only = parsed;
     module->read_only_explicit = true;
+    return true;
+  }
+  /* rsync's `write only = yes` makes the module client-writable.  FastSync has
+   * no read/pull path, so mapping it to writability is the exact
+   * security-relevant effect; set `read_only_explicit` so a global default
+   * cannot override the module's explicit choice.  `write only = no` is the
+   * rsync default and leaves the module's read-only state untouched. */
+  if (key_equals(key, "write only")) {
+    bool parsed;
+    if (!parse_bool_value(value, &parsed)) {
+      set_error(err, err_size,
+                "module '%s': 'write only' must be yes/no (or true/false/1/0), got '%s'",
+                module->name, value);
+      return false;
+    }
+    if (parsed) {
+      module->read_only = false;
+      module->read_only_explicit = true;
+    }
     return true;
   }
   if (key_equals(key, "client owner")) {
@@ -584,8 +663,14 @@ static bool apply_module_key(DaemonModule* module, char* key, char* value, char*
     return store_host_list(&module->hosts_deny, &module->hosts_deny_count, value, "hosts deny",
                            module->name, false, err, err_size);
   /* A recognized rsync module key with no FastSync equivalent loads inert. */
-  if (key_in_list(key, kRsyncInertModuleKeys, kRsyncInertModuleCount))
+  if (key_in_list(key, kRsyncInertModuleKeys, kRsyncInertModuleCount)) {
+    if (key_in_list(key, kRsyncUnenforcedModuleSecurityKeys, kRsyncUnenforcedModuleSecurityCount))
+      log_message(LOG_LEVEL_WARNING,
+                  "daemon config: module '%s' key '%s' is accepted for rsync compatibility but is "
+                  "NOT enforced by FastSync; the restriction it expresses will not be applied",
+                  module->name, key);
     return true;
+  }
   set_error(err, err_size, "unknown key '%s' in module '%s'", key, module->name);
   return false;
 }
