@@ -768,9 +768,17 @@ and `address`, the global section accepts:
 - `hosts allow` / `hosts deny` — comma- and/or whitespace-separated host access
   patterns.
 
-A `[module]` requires `path`, and may also set `read only`, `client owner`,
-`auth users`, `max connections` (0 = unlimited; enforced per module across all
-connection children), and its own `hosts allow`/`hosts deny`.
+A `[module]` requires `path`, and may also set `read only`, `write only`,
+`client owner`, `auth users`, `max connections` (0 = unlimited; enforced per
+module across all connection children), and its own `hosts allow`/`hosts deny`.
+
+Like rsync, a module is **read-only by default**: a bare `[module]` with only a
+`path` refuses a write transfer. Opt a module into writability explicitly with
+`read only = no` or `write only = yes`; a global `read only` value in the
+section before the first `[module]` sets the default for later modules, and a
+module's own `read only`/`write only = yes` always wins over it. An
+rsync-style `write only = yes` is mapped to writability because FastSync is
+push-only (a module can never be read from the network).
 
 The per-host cap and the shared auth lockout identify a source by its numeric
 peer IP. **Loopback peers (127.0.0.0/8, IPv6 `::1`) are exempt**: every local

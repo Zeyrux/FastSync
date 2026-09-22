@@ -79,6 +79,24 @@ of 157 rows.
 - **Daemon umask no longer forced to `0`.** `daemonize()` now sets the
   conventional `022`, so implied parent directories created without `-p` are no
   longer world-writable `0777`.
+- **Daemon modules are read-only by default.** A `--daemon` module is now
+  served read-only unless it sets `read only = no` (or rsync's `write only =
+  yes`), matching rsync: a real `rsyncd.conf` that omits `read only` is no
+  longer silently writable. A global `read only` still sets the default for
+  later modules, and an explicit module value wins. This is a behavior change
+  for existing FastSync-native configs that relied on the old writable default;
+  add `read only = no` to keep them writable. An rsync `write only = yes` is
+  mapped to writability (FastSync is push-only, so a module can never be read
+  from the network).
+- **Accepted-but-unenforced rsync security keys now warn at startup.** The
+  rsync keys FastSync recognizes but does not implement — `secrets file`,
+  `refuse options`, `exclude`/`include`/`filter`, `max size`/`min size`,
+  `pre-xfer exec`/`post-xfer exec`, `incoming chmod`/`outgoing chmod`,
+  `name converter`, `use chroot`, `uid`/`gid`, and the rest of the
+  access-control set — load for migration compatibility but now emit a
+  `WARN` naming the key (and module) so an operator does not believe the
+  restriction is enforced. `auth users`/`secrets file` stay fail-closed: a
+  module declaring `auth users` still requires a FastSync credential store.
 - **Credentials and signal handling hardened.** Secret files are opened with
   `O_NOFOLLOW|O_NONBLOCK` (while allowing fd-backed store paths and bound-waiting
   a FIFO read for ~3 s so a slow process substitution works but a connected-but-
