@@ -20,9 +20,9 @@
 
 static void config_set_defaults(Config* config) {
   config->scanner_threads = 0;
-  config->metadata_explicitly_disabled = false;
-  config->preserve_perms_explicit_off = false;
-  config->preserve_times_explicit_off = false;
+  config->cli.preserve_perms_explicit_off = false;
+  config->cli.preserve_times_explicit_off = false;
+  config->cli.metadata_explicitly_disabled = false;
   config->show_progress = false;
   config->compression_threads = 0;
   config->ssh_port = 22;
@@ -44,8 +44,8 @@ static void config_set_defaults(Config* config) {
   config->tls_ca = NULL;
   config->server_host = str_dup("127.0.0.1");
   config->server_port = 8080;
-  config->server_port_set = false;
-  config->server_host_set = false;
+  config->cli.server_port_set = false;
+  config->cli.server_host_set = false;
   /* rsync defaults: --timeout=0 (I/O timeouts disabled) and --contimeout=60.
    * A value of 0 disables the client's own deadline on both the socket layer
    * (tcp_set_timeouts) and the protocol layer
@@ -68,10 +68,10 @@ static void config_set_defaults(Config* config) {
   config->human_readable = false;
   config->ignore_errors = false;
   config->ignore_missing_args = false;
-  config->checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
-  config->cli_exit_code = 0;
-  config->compression_level_set = false;
-  config->checksum_choice_set = false;
+  config->cli.checksum_transfer_algo = CHECKSUM_ALGO_DEFAULT;
+  config->cli.cli_exit_code = 0;
+  config->cli.compression_level_set = false;
+  config->cli.checksum_choice_set = false;
   config->filters = NULL;
   config->files_from = NULL;
   config->files_from_set = NULL;
@@ -85,7 +85,6 @@ static void config_set_defaults(Config* config) {
   config->rsh_command = NULL;
   config->blocking_io = false;
   config->outbuf = OUTBUF_BLOCK;
-  config->old_args = false;
   config->remote_options = NULL;
   config->remote_option_count = 0;
   config->address = NULL;
@@ -101,7 +100,7 @@ static void config_set_defaults(Config* config) {
   config->trust_sender = false;
   config->stop_after_mins = 0;
   config->stop_at = 0;
-  config->stop_at_set = false;
+  config->cli.stop_at_set = false;
   config->write_batch = NULL;
   config->only_write_batch = NULL;
   config->read_batch = NULL;
@@ -342,7 +341,8 @@ bool config_derived_use_metadata(const Config* config) {
       config->chown_uid_set || config->chown_gid_set || config->usermap_count > 0 ||
       config->groupmap_count > 0 || config->update)
     return true;
-  return (config->use_incremental || config->use_delta) && !config->metadata_explicitly_disabled;
+  return (config->use_incremental || config->use_delta) &&
+         !config->cli.metadata_explicitly_disabled;
 }
 
 bool config_has_basis(const Config* config) {

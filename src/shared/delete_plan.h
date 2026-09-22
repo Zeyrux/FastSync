@@ -3,6 +3,7 @@
 
 #include "array_list.h"
 #include "config.h"
+#include "delete.h"
 #include "file_receive.h"
 #include "protocol.h"
 #include "utils.h"

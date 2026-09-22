@@ -245,7 +245,7 @@ static char* change_render_name_uptodate(const ChangeEvent* event) {
  * resolves to xxh128, so an explicit selection and the default both render the
  * selected algorithm's digest. */
 static ChecksumAlgo out_format_checksum_algo(const Config* config) {
-  return (ChecksumAlgo)config->checksum_transfer_algo;
+  return (ChecksumAlgo)config->cli.checksum_transfer_algo;
 }
 
 /* Render a digest as rsync's sum_as_hex: xxh128 prints the HIGH 64-bit half

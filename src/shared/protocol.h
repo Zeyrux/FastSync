@@ -225,11 +225,14 @@ unsigned long long protocol_bytes_written(void);
 unsigned long long protocol_bytes_read(void);
 void protocol_note_bytes_written(unsigned long long bytes);
 /* Apply --bwlimit pacing to bytes written outside protocol_send_n_data (the
- * plaintext zero-copy sendfile fast path).  Resolves the bound/legacy session
- * exactly as send_n_data does and runs the same token-bucket throttle, so the
- * sendfile transport is paced identically to the buffered/TLS paths.  A no-op
- * when the effective session has no bandwidth limit. */
-void protocol_throttle_bytes(size_t bytes);
+ * plaintext zero-copy sendfile fast path).  `file_descriptor` is the wire fd
+ * the bytes were written to, so the legacy session is resolved exactly as the
+ * preceding send_n_data call resolved it (the bound TLS session still wins when
+ * set); resolving with the same fd avoids re-initializing the legacy session
+ * and granting a second first-call burst.  Runs the same token-bucket throttle,
+ * so the sendfile transport is paced identically to the buffered/TLS paths.  A
+ * no-op when the effective session has no bandwidth limit. */
+void protocol_throttle_bytes(int file_descriptor, size_t bytes);
 
 void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd);
 /* Transitional bridge for helpers whose signatures still carry only an fd. */

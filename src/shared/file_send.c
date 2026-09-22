@@ -185,7 +185,7 @@ bool file_send_sendfile_with_skip(File* file, int file_descriptor, bool use_meta
       return false;
     }
     protocol_note_bytes_written((unsigned long long)sent);
-    protocol_throttle_bytes((size_t)sent);
+    protocol_throttle_bytes(file_descriptor, (size_t)sent);
   }
 
   close(fd);
