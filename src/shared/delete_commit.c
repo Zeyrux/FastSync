@@ -126,38 +126,6 @@ typedef struct {
   bool limit_hit;
 } DeleteBudgetState;
 
-/* Build the delete-walk protection prefix for one basis directory.  The walker
-   compares paths relative to the receive root, so a relative entry is already
-   in the right form; an absolute entry that lies below the root is converted to
-   its root-relative form, and one outside the root returns NULL (the walk
-   cannot reach it, and it is not protected data beneath the root).  Exposed so
-   tests can exercise the root-of-"/" child mapping directly. */
-char* file_receive_basis_delete_relative(const Config* config, const char* path) {
-  if (!path)
-    return NULL;
-  if (path[0] != '/')
-    return str_dup(path);
-  const char* root = config->receive_root_directory;
-  if (!root || root[0] != '/')
-    return NULL;
-  size_t root_len = strlen(root);
-  while (root_len > 1 && root[root_len - 1] == '/')
-    root_len--;
-  if (strncmp(path, root, root_len) != 0)
-    return NULL;
-  if (root_len == 1) {
-    /* `root` is "/" (the only single-character absolute root): every absolute
-       path is below it, and the child relative form is everything after the
-       leading '/'. */
-    if (path[1] == '\0')
-      return NULL; /* identical to the root, not a child */
-    return str_dup(path + 1);
-  }
-  if (path[root_len] != '/')
-    return NULL; /* identical or a sibling sharing a name prefix */
-  return str_dup(path + root_len + 1);
-}
-
 /* Remove every destination entry under the receive root that is not in the
    keep-set, bounded by the shared budget (a smaller client --max-delete=NUM
    replaces the server hard bound; rsync deletes up to the bound and skips the
@@ -174,55 +142,13 @@ static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest
   if (!config || !manifest || !manifest->keeps)
     return false;
   fprintf(stderr, "Deleting files not in manifest...\n");
-  /* Protected entries:
-     - the --delay-updates staging name, protected only as a DIRECT child of the
-       receive root (a nested destination directory that happens to be named
-       .fastsync-stage is ordinary content);
-     - alternate basis directories (--compare-dest / --copy-dest / --link-dest)
-       at any depth: they are extra comparison snapshots the user pointed at,
-       not destination content, and deleting them would destroy the very files a
-       --link-dest run just linked into place;
-     - the sender-side protected prefixes (source paths excluded by filters and
-       paths pruned by --max-size/--min-size), at any depth, so their destination
-       mirror survives --delete unless --delete-excluded opts back into removing
-       the filter-excluded ones (size-pruned entries are always protected). */
-  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
-                   (manifest->protected ? manifest->protected->size : 0);
-  DeleteSkipEntry* skips = NULL;
-  char** owned_prefixes = NULL;
-  int used = 0;
-  if (skip_count > 0) {
-    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
-    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
-      free(skips);
-      free(owned_prefixes);
-      return false;
-    }
-    int idx = 0;
-    if (config->delay_updates) {
-      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
-      skips[idx].top_level_only = true;
-      idx++;
-    }
-    for (int i = 0; i < config->basis_count; i++) {
-      /* An absolute basis outside the receive root is unreachable by this walk,
-         so it contributes no protection prefix (and no slot). */
-      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
-      if (!prefix)
-        continue;
-      owned_prefixes[i] = prefix;
-      skips[idx].prefix = prefix;
-      skips[idx].top_level_only = false;
-      idx++;
-    }
-    for (int i = 0; i < manifest->protected->size; i++) {
-      skips[idx].prefix = (const char*)manifest->protected->items[i];
-      skips[idx].top_level_only = false;
-      idx++;
-    }
-    used = idx;
-  }
+  /* Protected entries: the --delay-updates staging name (only as a DIRECT child
+     of the receive root), the alternate basis directories and the sender-side
+     protected prefixes (filter-excluded and size-pruned source mirrors), all at
+     any depth.  See delete_skips_build(). */
+  DeleteSkipSet skips;
+  if (!delete_skips_build(config, manifest->protected, NULL, true, &skips))
+    return false;
   /* Clamp rather than subtract: an accounting bug where deleted already exceeds
      max_delete must never underflow into an effectively unlimited budget. */
   size_t remaining;
@@ -235,14 +161,9 @@ static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest
   size_t deleted = 0;
   size_t skipped = 0;
   DeleteWalkResult result = delete_extras_limited_observed(
-      config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips, used,
-      config->protect_rules, &deleted, &skipped, observer, observer_context);
-  if (owned_prefixes) {
-    for (int i = 0; i < config->basis_count; i++)
-      free(owned_prefixes[i]);
-  }
-  free(owned_prefixes);
-  free(skips);
+      config->receive_root_directory, manifest->keeps, manifest->dirs, remaining, skips.entries,
+      skips.count, config->protect_rules, &deleted, &skipped, observer, observer_context);
+  delete_skips_free(&skips);
   budget->deleted += deleted;
   budget->skipped += skipped;
   if (result == DELETE_WALK_LIMIT_REACHED) {
@@ -303,35 +224,12 @@ static bool delete_missing_args_budgeted_observed(const Config* config, DeleteMa
   if (!manifest->missing || manifest->missing->size == 0)
     return true;
   fprintf(stderr, "Deleting destination mirrors of missing source arguments...\n");
-  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count;
-  DeleteSkipEntry* skips = NULL;
-  char** owned_prefixes = NULL;
-  int used = 0;
-  if (skip_count > 0) {
-    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
-    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
-      free(skips);
-      free(owned_prefixes);
-      return false;
-    }
-    int idx = 0;
-    if (config->delay_updates) {
-      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
-      skips[idx].top_level_only = true;
-      idx++;
-    }
-    for (int i = 0; i < config->basis_count; i++) {
-      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
-      if (!prefix)
-        continue;
-      owned_prefixes[i] = prefix;
-      skips[idx].prefix = prefix;
-      skips[idx].top_level_only = false;
-      idx++;
-    }
-    used = idx;
-  }
+  /* The staging directory and basis snapshots stay protected exactly as in the
+     extras walker (the missing-args path overrides the ordinary protected
+     prefixes, so those are not passed here). */
+  DeleteSkipSet skips;
+  if (!delete_skips_build(config, NULL, NULL, true, &skips))
+    return false;
   bool ok = true;
   for (int i = 0; i < manifest->missing->size; i++) {
     const char* rel = (const char*)manifest->missing->items[i];
@@ -343,7 +241,7 @@ static bool delete_missing_args_budgeted_observed(const Config* config, DeleteMa
       continue;
     }
     bool at_root = strchr(rel, '/') == NULL;
-    if (path_under_skip_prefix(rel, at_root, skips, used)) {
+    if (path_under_skip_prefix(rel, at_root, skips.entries, skips.count)) {
       char* escaped = output_escape(rel, log_get_8_bit_output());
       log_message(LOG_LEVEL_WARNING,
                   "missing-args path '%s' is protected (staging directory or basis snapshot); "
@@ -472,12 +370,7 @@ static bool delete_missing_args_budgeted_observed(const Config* config, DeleteMa
     if (!ok)
       break;
   }
-  if (owned_prefixes) {
-    for (int i = 0; i < config->basis_count; i++)
-      free(owned_prefixes[i]);
-  }
-  free(owned_prefixes);
-  free(skips);
+  delete_skips_free(&skips);
   return ok;
 }
 
@@ -489,52 +382,12 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
     *count_out = 0;
   if (!config || !manifest || !manifest->keeps || !out)
     return false;
-  int skip_count = (config->delay_updates ? 1 : 0) + config->basis_count +
-                   (manifest->protected ? manifest->protected->size : 0);
-  DeleteSkipEntry* skips = NULL;
-  char** owned_prefixes = NULL;
-  int used = 0;
-  if (skip_count > 0) {
-    skips = calloc((size_t)skip_count, sizeof(DeleteSkipEntry));
-    owned_prefixes = calloc((size_t)config->basis_count, sizeof(char*));
-    if (!skips || (config->basis_count > 0 && !owned_prefixes)) {
-      free(skips);
-      free(owned_prefixes);
-      return false;
-    }
-    int idx = 0;
-    if (config->delay_updates) {
-      skips[idx].prefix = DELAY_UPDATES_STAGING_DIR;
-      skips[idx].top_level_only = true;
-      idx++;
-    }
-    for (int i = 0; i < config->basis_count; i++) {
-      /* Normalize exactly like the real commit path: a relative entry is
-         already root-relative, an absolute one inside the receive root is
-         converted, and one outside contributes no protection prefix. */
-      char* prefix = file_receive_basis_delete_relative(config, config->basis_dirs[i].path);
-      if (!prefix)
-        continue;
-      owned_prefixes[i] = prefix;
-      skips[idx].prefix = prefix;
-      skips[idx].top_level_only = false;
-      idx++;
-    }
-    for (int i = 0; i < manifest->protected->size; i++) {
-      skips[idx].prefix = (const char*)manifest->protected->items[i];
-      skips[idx].top_level_only = false;
-      idx++;
-    }
-    used = idx;
-  }
+  DeleteSkipSet skips;
+  if (!delete_skips_build(config, manifest->protected, NULL, true, &skips))
+    return false;
   bool ok = delete_extras_list(config->receive_root_directory, manifest->keeps, manifest->dirs,
-                               skips, used, config->protect_rules, out, count_out);
-  if (owned_prefixes) {
-    for (int i = 0; i < config->basis_count; i++)
-      free(owned_prefixes[i]);
-  }
-  free(owned_prefixes);
-  free(skips);
+                               skips.entries, skips.count, config->protect_rules, out, count_out);
+  delete_skips_free(&skips);
   return ok;
 }
 

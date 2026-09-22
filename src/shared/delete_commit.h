@@ -3,7 +3,7 @@
 
 #include "array_list.h"
 #include "config.h"
-#include "utils.h"
+#include "delete.h"
 #include <stdbool.h>
 
 /* Delete-commit module: delete-manifest receive plus the budgeted extras and
@@ -102,9 +102,5 @@ DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteMani
    clean walk; `*count_out` receives the number of paths appended. */
 bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, ArrayList* out,
                                 size_t* count_out);
-/* Convert one basis-directory path to the receive-root-relative protection
-   prefix the delete walker uses (NULL when it lies outside the root).  Exposed
-   for unit tests of the root-of-"/" and normalization edge cases. */
-char* file_receive_basis_delete_relative(const Config* config, const char* path);
 
 #endif
