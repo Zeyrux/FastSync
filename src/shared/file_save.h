@@ -12,8 +12,16 @@
 
 /* Outcome of a single file_save_to_disk operation.  The receiver needs to
    distinguish "written" from "skipped" so --remove-source-files can be told
-   which sources were actually stored. */
-typedef enum { FILE_SAVE_ERROR = 0, FILE_SAVE_WRITTEN = 1, FILE_SAVE_SKIPPED = 2 } FileSaveResult;
+   which sources were actually stored.  FILE_SAVE_FAILED is a per-entry failure
+   (for example a device node that mknodat() refused with EPERM/EACCES): it is
+   logged and counted by the receiver but does NOT abort the transfer, matching
+   rsync's continue-and-exit-partial behavior. */
+typedef enum {
+  FILE_SAVE_ERROR = 0,
+  FILE_SAVE_WRITTEN = 1,
+  FILE_SAVE_SKIPPED = 2,
+  FILE_SAVE_FAILED = 3
+} FileSaveResult;
 
 bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode);
 

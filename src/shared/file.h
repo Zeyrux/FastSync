@@ -182,13 +182,12 @@ bool file_copy_basis_stream_attrs(const char* path, const char* basis_path,
  * confined secure walk had to create that lie strictly below `count_floor` (a
  * receive-root-relative prefix, or NULL for all).  Used to reproduce rsync's
  * `Number of created files` directory count on a fresh destination. */
-bool file_to_disk_secure_attrs_counted(const char* path, const void* data,
-                                       unsigned long long data_size, bool inplace, bool sparse,
-                                       bool preallocate, const FileMetadata* metadata,
-                                       FileAttrPolicy policy, bool update, bool no_replace,
-                                       bool use_fsync, const FileXattrList* xattrs, bool fake_super,
-                                       bool keep_partial, const char* temp_dir,
-                                       unsigned* dirs_created, const char* count_floor);
+bool file_to_disk_secure_attrs_counted(
+    const char* path, const void* data, unsigned long long data_size, bool inplace, bool sparse,
+    bool preallocate, const FileMetadata* metadata, FileAttrPolicy policy, bool update,
+    bool no_replace, bool use_fsync, const FileXattrList* xattrs, bool fake_super,
+    bool keep_partial, const char* temp_dir, unsigned* dirs_created, const char* count_floor,
+    uint32_t fake_super_rdev_major, uint32_t fake_super_rdev_minor);
 bool file_to_disk_secure_link_attrs_counted(const char* path, const char* basis_path,
                                             const void* data, unsigned long long data_size,
                                             bool preallocate, const FileMetadata* metadata,

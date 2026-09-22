@@ -401,12 +401,13 @@ bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode) {
  *
  * Privilege gating: making a real device node requires CAP_MKNOD (root); making
  * a FIFO works unprivileged (mkfifo).  A device node whose mknodat() fails with
- * EPERM/EACCES is a genuine transfer error (rsync parity: rsync reports the
- * mknod failure and the run exits partial, code 23).  Only the unprivileged
- * FIFO/socket (--specials) path keeps the best-effort skip, because those are
- * normally creatable without privilege and a failure there is environmental.
- * CI runs non-root, so device creation is expected to fail there; only a FIFO
- * is honestly assertable unprivileged.
+ * EPERM/EACCES is a PER-ENTRY failure (rsync parity: rsync reports the mknod
+ * failure, still transfers the rest, and exits partial, code 23), reported as
+ * FILE_SAVE_FAILED so the receiver counts it and continues.  Only the
+ * unprivileged FIFO/socket (--specials) path keeps the best-effort skip,
+ * because those are normally creatable without privilege and a failure there is
+ * environmental.  CI runs non-root, so device creation is expected to fail
+ * there; only a FIFO is honestly assertable unprivileged.
  *
  * Confinement: the parent directory is opened fd-relative below the receive
  * root (file_open_secure_parent: O_NOFOLLOW, no "..", root-checked) and the
@@ -548,10 +549,10 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
       const char* shown_path = escaped_path ? escaped_path : "<allocation failed>";
       if (is_char || is_blk) {
         /* rsync parity: a device node that cannot be created (no CAP_MKNOD, or
-         * super-user activities not permitted) is a genuine transfer error.
-         * rsync reports `mknod ".../node" failed: ...` and the run exits
-         * partial (23); FastSync surfaces it through the outcome aggregation
-         * instead of silently skipping the entry.  FIFO/socket creation
+         * super-user activities not permitted) is a per-entry failure.  rsync
+         * logs `mknod ".../node" failed: ...`, still transfers the remaining
+         * files, and exits partial (23); FastSync logs it, counts it, and
+         * continues rather than aborting the stream.  FIFO/socket creation
          * (--specials) keeps the best-effort skip path below. */
         log_message(LOG_LEVEL_ERROR,
                     "cannot create %s %s: %s\n"
@@ -561,7 +562,7 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
         close(parent_fd);
         free(leaf);
         free(destination);
-        return FILE_SAVE_ERROR;
+        return FILE_SAVE_FAILED;
       }
       /* Missing CAP_MKNOD / parent write permission for a FIFO/socket: the
          environment cannot create the node, so skip instead of failing the
@@ -936,6 +937,14 @@ static bool file_save_try_special_dispatch(const FileSavePlan* plan, bool* creat
   /* Device/special node (--devices/--specials): recreate the node instead of
      writing content (privilege-gated, confined, rdev-validated). */
   if (file->is_special) {
+    /* Under --fake-super rsync never mknod()s a device: it writes a regular
+       empty file and records the real rdev in user.rsync.%stat.  Fall through to
+       the ordinary writer so the device round-trips (its S_IFMT mode bits and
+       rdev are parked in the record).  Without --fake-super the node is
+       recreated (or, when privilege is refused, handled per-entry). */
+    mode_t special_mode = file->metadata ? file->metadata->mode : 0;
+    if (config && config->fake_super && (S_ISCHR(special_mode) || S_ISBLK(special_mode)))
+      return false;
     *out = file_save_special_to_disk(plan->root_directory, file, config, created);
     return true;
   }
@@ -1110,7 +1119,7 @@ static bool file_save_install_data(FileSavePlan* plan, const FileMetadata* metad
         config && config->preallocate, metadata, plan->policy, config && config->update,
         config && config->ignore_existing, config && config->use_fsync, file->xattrs,
         config ? config->fake_super : false, config ? config->partial : false, plan->confined_temp,
-        created_dirs, count_floor);
+        created_dirs, count_floor, (uint32_t)file->rdev_major, (uint32_t)file->rdev_minor);
   }
   free(count_floor);
   return ok;

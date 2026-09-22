@@ -64,6 +64,13 @@ def test_read_batch_absolute_temp_dir_inside_root_accepted(tmp_path):
     clean_dir(dest)
     scratch = os.path.join(dest, "scratch")
     os.makedirs(scratch)
+    # Stamp the scratch dir with an old mtime so the test can prove the receiver
+    # really created (and then removed) its temp file there: the directory mtime
+    # changes when an entry is created/removed, so a silently-ignored --temp-dir
+    # would leave the stamp untouched.  An empty scratch dir alone does not
+    # distinguish "used and cleaned up" from "never used".
+    stale_mtime = 946684800  # 2000-01-01
+    os.utime(scratch, (stale_mtime, stale_mtime))
 
     batch = _make_batch(str(tmp_path), source)
     result = _run(["--read-batch", batch, dest, "--temp-dir", scratch])
@@ -73,6 +80,9 @@ def test_read_batch_absolute_temp_dir_inside_root_accepted(tmp_path):
     for rel, data in FILES.items():
         assert _read(os.path.join(received, rel)) == data, f"content mismatch for {rel}"
     assert os.listdir(scratch) == [], "scratch dir was not left clean"
+    assert os.stat(scratch).st_mtime != stale_mtime, (
+        "--temp-dir scratch dir was never written to (temp file not created there)"
+    )
 
 
 @pytest.mark.ci
@@ -98,6 +108,11 @@ def test_tcp_absolute_temp_dir_inside_root_accepted(shared_server):
     clean_dir(dest)
     scratch = os.path.join(dest, "scratch")
     os.makedirs(scratch)
+    # See test_read_batch_absolute_temp_dir_inside_root_accepted: the stale
+    # mtime makes actual scratch usage observable (the temp file creation and
+    # removal bump the directory mtime).
+    stale_mtime = 946684800  # 2000-01-01
+    os.utime(scratch, (stale_mtime, stale_mtime))
 
     result, _ = run_client(source, dest, flags=["--temp-dir", scratch], port=shared_server.port)
     assert result.returncode == 0, (result.stdout, result.stderr)[:300]
@@ -105,6 +120,9 @@ def test_tcp_absolute_temp_dir_inside_root_accepted(shared_server):
     for rel, data in FILES.items():
         assert _read(os.path.join(received, rel)) == data, f"content mismatch for {rel}"
     assert os.listdir(scratch) == [], "scratch dir was not left clean"
+    assert os.stat(scratch).st_mtime != stale_mtime, (
+        "--temp-dir scratch dir was never written to (temp file not created there)"
+    )
 
 
 def test_tcp_absolute_temp_dir_outside_root_rejected(shared_server):

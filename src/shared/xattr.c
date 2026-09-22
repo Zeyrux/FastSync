@@ -7,6 +7,7 @@
 #include "utils.h"
 #include "file_types.h"
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -386,6 +387,56 @@ void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, uint
   }
 }
 
+/* Parse rsync's `user.rsync.%stat` grammar strictly:
+ *   "<octal st_mode> <rdev_major>,<rdev_minor> <uid>:<gid>"
+ * Every field is parsed with strtoul() so an out-of-range value is a clean
+ * rejection rather than the undefined behavior sscanf("%u") exhibited, each
+ * field is range-checked against the same bounds the wire validator uses, and
+ * the whole record must be consumed (only trailing whitespace is tolerated) so
+ * trailing garbage is refused.  Returns false on any malformed input. */
+static bool fake_super_parse_stat(const char* record, unsigned* mode_out, unsigned* rdev_major_out,
+                                  unsigned* rdev_minor_out, unsigned* uid_out, unsigned* gid_out) {
+  if (!record)
+    return false;
+  char* end = NULL;
+  const char* p = record;
+  errno = 0;
+  unsigned long mode = strtoul(p, &end, 8);
+  if (errno != 0 || end == p || mode > (unsigned long)UINT_MAX || *end != ' ')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long rdev_major = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || rdev_major > 0xffffUL || *end != ',')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long rdev_minor = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || rdev_minor > 0x00ffffffUL || *end != ' ')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long uid = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || uid > (unsigned long)UINT_MAX || *end != ':')
+    return false;
+  p = end + 1;
+  errno = 0;
+  unsigned long gid = strtoul(p, &end, 10);
+  if (errno != 0 || end == p || gid > (unsigned long)UINT_MAX)
+    return false;
+  p = end;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    p++;
+  if (*p != '\0')
+    return false;
+  *mode_out = (unsigned)mode;
+  *rdev_major_out = (unsigned)rdev_major;
+  *rdev_minor_out = (unsigned)rdev_minor;
+  *uid_out = (unsigned)uid;
+  *gid_out = (unsigned)gid;
+  return true;
+}
+
 /* --fake-super replay: read the freshly-stored record and re-apply its
  * permission bits fd-relative.  The recorded uid/gid are retained for a later
  * privileged restore but are NEVER chowned here: --fake-super only RECORDS
@@ -403,7 +454,7 @@ bool fake_super_restore_fd(int fd, FileAttrPolicy policy) {
     return false; /* absent or filesystem without xattrs: silent no-op */
   record[len] = '\0';
   unsigned ul_mode, rdev_major, rdev_minor, ul_uid, ul_gid;
-  if (sscanf(record, "%o %u,%u %u:%u", &ul_mode, &rdev_major, &rdev_minor, &ul_uid, &ul_gid) != 5)
+  if (!fake_super_parse_stat(record, &ul_mode, &rdev_major, &rdev_minor, &ul_uid, &ul_gid))
     return false; /* malformed record: skip, never fatal */
 
   /* --fake-super NEVER performs a real chown: that would defeat the whole point
