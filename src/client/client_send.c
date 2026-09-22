@@ -838,6 +838,10 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       if (chunk->items[i] == NULL)
         continue;
       transfer_stats_note_entry(stats, chunk->items[i]);
+      /* The chunk-serialization path emits no --progress name lines, so only
+         feed -i/--out-format its ancestor directory lines here. */
+      if (config->itemize_changes || config->out_format != NULL)
+        client_change_emit_ancestors(config, chunk->items[i]);
       if (chunk->items[i]->is_dir)
         change_emit_dir_sent(config, chunk->items[i]);
       else
@@ -859,6 +863,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
          source to remove and no incremental check. */
       if (!send_directory_entry(client, f, config))
         return -1;
+      client_change_emit_ancestors(config, f);
       change_emit_dir_sent(config, f);
       client_progress_name(config, f);
       continue;
@@ -873,6 +878,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
           !send_int(client->file_descriptor, f->link_group) ||
           !send_wire_str(client->file_descriptor, f->hardlink_target))
         return -1;
+      client_change_emit_ancestors(config, f);
       change_emit_file_sent(config, f);
       client_progress_name(config, f);
       continue;
@@ -881,6 +887,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     if (f->is_symlink) {
       if (!send_symlink_entry(client, f, config))
         return -1;
+      client_change_emit_ancestors(config, f);
       change_emit_file_sent(config, f);
       client_progress_name(config, f);
       continue;
@@ -890,6 +897,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
     if (f->is_special) {
       if (!file_send_special(f, client->file_descriptor, config->use_metadata))
         return -1;
+      client_change_emit_ancestors(config, f);
       change_emit_file_sent(config, f);
       client_progress_name(config, f);
       continue;
@@ -913,6 +921,7 @@ static int send_chunk_with_removal(Client* client, Chunk* chunk, Config* config,
       return -1;
     }
     transfer_stats_note_transferred(stats, f);
+    client_change_emit_ancestors(config, f);
     change_emit_file_sent_bytes(config, f, protocol_bytes_written() - bytes_before,
                                 protocol_bytes_read() - read_before);
     client_progress_file(config, f);
@@ -1567,7 +1576,10 @@ static bool send_files_prepare_delete(Config* config, SendFilesState* state) {
  * runs the shared cleanup). */
 static bool send_files_run(Config* config, SendFilesState* state) {
   Client* client = state->client;
-  if (progress_requested(config))
+  /* --progress needs the file-list total; -i/--out-format needs the directory
+     entries.  Either way one paths-only pre-count supplies both, and a
+     --delete-during/--delete-delay pre-scan is reused when present. */
+  if (progress_requested(config) || config->itemize_changes || config->out_format != NULL)
     client_progress_prepare(config, state->plan_dirs, state->per_dir_non_dir_count);
   /* Phase 6: compute the client-only stop deadline once at transfer start.  The
      early-delete pre-scan above deliberately ignores it so the keep-set (and
@@ -2045,9 +2057,10 @@ int send_files_multithreaded(Config* config) {
     return 1;
   }
   /* --progress/--info=progress: pre-count the file list for rsync's to-chk
-     denominator, reusing a --delete-during/--delete-delay pre-scan when one
+     denominator; -i/--out-format: pre-count the directory entries.  One pass
+     supplies both, reusing a --delete-during/--delete-delay pre-scan when one
      already ran. */
-  if (progress_requested(config))
+  if (progress_requested(config) || config->itemize_changes || config->out_format != NULL)
     client_progress_prepare(config, context->plan_dirs, pre_scan_non_dir);
 
   thrd_t scanner, loader, sender;

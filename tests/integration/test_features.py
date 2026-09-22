@@ -2786,7 +2786,12 @@ class TestItemizeChanges:
                                flags=["--preserve", "-i", "--incremental"],
                                port=shared_server.port)
         assert result.returncode == 0, f"incremental itemize failed: {result.stderr[:200]}"
-        itemized = [line for line in result.stdout.splitlines() if line and line[0] in ">.<c"]
+        # -i also emits the transfer-root and directory lines; only FILE entries
+        # matter here, so drop any line whose name has a trailing '/'.
+        itemized = [
+            line for line in result.stdout.splitlines()
+            if line and line[0] in ">.<c" and not line.rsplit(" ", 1)[-1].endswith("/")
+        ]
         assert itemized == [], f"unchanged files were itemized: {itemized[:5]}"
 
     def test_multithreaded_emits_same_itemize_lines(self, shared_server):

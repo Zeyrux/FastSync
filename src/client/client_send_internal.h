@@ -64,6 +64,9 @@ void client_progress_cleanup(void);
 void client_progress_begin(const Config* config);
 void client_progress_file(const Config* config, const File* file);
 void client_progress_name(const Config* config, const File* file);
+/* Emit a transferred entry's ancestor directories (as -i/--out-format change
+ * lines or --progress name lines) before the entry's own line. */
+void client_change_emit_ancestors(const Config* config, const File* file);
 void client_progress_uptodate(const Config* config, const File* file);
 void client_progress_prepare(const Config* config, const ArrayList* plan_dirs,
                              unsigned long long plan_non_dir_count);

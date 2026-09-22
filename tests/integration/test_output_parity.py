@@ -26,6 +26,17 @@ def _rsync(args):
     )
 
 
+def _file_entry_line(text):
+    """The file entry line for a single-file transfer.
+
+    -i/--out-format emit the transfer-root (and directory) lines too, so the
+    file entry is not necessarily the first line; for the one-file corpora used
+    by the wire-counter tests it is the last non-empty line.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
 def _make_selection_tree(root):
     clean_dir(root)
     os.makedirs(os.path.join(root, "sub"))
@@ -183,6 +194,51 @@ class TestItemizeParity:
             if line.startswith(">f") or line.startswith("cL")
         )
         assert fast_lines == rsync_lines, f"rsync={rsync_lines} fastsync={fast_lines}"
+
+    @requires_rsync
+    @pytest.mark.ci
+    def test_itemize_directory_lines_match_rsync(self, shared_server):
+        """#292: -i/--out-format emit rsync's directory lines (including the
+        transfer root) in rsync's depth-first order."""
+        source = os.path.join(TEST_DATA_DIR, "out_itemdir_src")
+        dest = os.path.join(TEST_DATA_DIR, "out_itemdir_dst")
+        rdst = os.path.join(TEST_DATA_DIR, "out_itemdir_rdst")
+        clean_dir(source)
+        os.makedirs(os.path.join(source, "sub", "deep"))
+        os.makedirs(os.path.join(source, "emptydir"))
+        with open(os.path.join(source, "a.txt"), "wb") as fh:
+            fh.write(b"hello\n")
+        with open(os.path.join(source, "sub", "b.txt"), "wb") as fh:
+            fh.write(b"world\n")
+        with open(os.path.join(source, "sub", "deep", "d.txt"), "wb") as fh:
+            fh.write(b"deep\n")
+        clean_dir(dest)
+        clean_dir(rdst)
+
+        def dir_lines(text):
+            # Any line whose name ends with '/' is a directory entry.
+            return sorted(
+                line for line in text.splitlines()
+                if line.rsplit(" ", 1)[-1].endswith("/")
+            )
+
+        for fmt in (None, "%i %n%L"):
+            rsync_flags = ["-a", "-i"] if fmt is None else ["-a", "--out-format=" + fmt]
+            fast_flags = rsync_flags
+            clean_dir(rdst)
+            clean_dir(dest)
+            rsync_result = _rsync(rsync_flags + [source + "/", rdst + "/"])
+            assert rsync_result.returncode == 0, rsync_result.stderr
+            result, _ = run_client(source, dest, flags=fast_flags,
+                                   port=shared_server.port)
+            assert result.returncode == 0, result.stderr[:300]
+            expected = [l for l in dir_lines(rsync_result.stdout)
+                        if not l.rsplit(" ", 1)[-1] == "./"]
+            fast = dir_lines(result.stdout)
+            assert [l for l in fast if not l.rsplit(" ", 1)[-1] == "./"] == expected, (
+                f"fmt={fmt} rsync={rsync_result.stdout!r} fastsync={result.stdout!r}"
+            )
+            assert ".d..t...... ./" in fast, f"missing root line: {result.stdout!r}"
 
     @requires_rsync
     @pytest.mark.ci
@@ -387,8 +443,8 @@ class TestWireStatsParity:
         result, _ = run_client(source, dest, flags=["-a", "--out-format=" + fmt],
                                port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
-        rb, rl = (int(x) for x in rsync_result.stdout.split()[:2])
-        fb, fl = (int(x) for x in result.stdout.split()[:2])
+        rb, rl = (int(x) for x in _file_entry_line(rsync_result.stdout).split()[:2])
+        fb, fl = (int(x) for x in _file_entry_line(result.stdout).split()[:2])
         assert rl == fl == 5000, (rsync_result.stdout, result.stdout)
         assert rb > rl, f"rsync %b must include framing: {rsync_result.stdout!r}"
         assert fb > fl, f"fastsync %b must include framing: {result.stdout!r}"
@@ -421,7 +477,9 @@ class TestWireStatsParity:
         assert file_lines(result.stdout) == file_lines(rsync_result.stdout), (
             f"rsync={rsync_result.stdout!r} fastsync={result.stdout!r}"
         )
-        assert result.stdout.split()[0] == rsync_result.stdout.split()[0] == "16", (
+        fs_c = _file_entry_line(result.stdout).split()[0]
+        rs_c = _file_entry_line(rsync_result.stdout).split()[0]
+        assert fs_c == rs_c == "16", (
             f"%c must be rsync's 16-byte sum header: {result.stdout!r}"
         )
 
@@ -450,8 +508,8 @@ class TestWireStatsParity:
                                       "--out-format=" + fmt],
                                port=shared_server.port)
         assert result.returncode == 0, result.stderr[:300]
-        rs_c = int(rsync_result.stdout.split()[0])
-        fs_c = int(result.stdout.split()[0])
+        rs_c = int(_file_entry_line(rsync_result.stdout).split()[0])
+        fs_c = int(_file_entry_line(result.stdout).split()[0])
         # No basis exists, so rsync still reports only its sum header.
         assert rs_c == 16, rsync_result.stdout
         # FastSync reports its own handshake bytes and is not aligned.
