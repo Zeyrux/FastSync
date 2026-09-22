@@ -6675,13 +6675,25 @@ class TestExtendedAttributes:
         assert os.path.islink(dst_link), "destination link entry is not a symlink"
         assert os.readlink(dst_link) == "target.txt"
 
-        # The no-follow guarantee: the referent's attribute must never leak onto
-        # the symlink entry.
+        # The no-follow guarantee.  Checking only the link's own xattr list is
+        # vacuous on Linux (lsetxattr on a symlink always fails EPERM), so also
+        # prove the apply never followed the link: the destination REFERENT must
+        # keep its own user.* value untouched.
+        dst_target = os.path.join(received, "target.txt")
+        assert os.getxattr(dst_target, "user.referent-only") == b"referent-value", (
+            "the destination symlink apply followed the link and rewrote the "
+            "referent's xattr"
+        )
         link_names = os.listxattr(dst_link, follow_symlinks=False)
         assert "user.referent-only" not in link_names, (
             "the destination symlink captured its REFERENT's xattr "
             "(path-following capture bug)"
         )
+        if sys.platform.startswith("linux"):
+            assert link_names == [], (
+                "Linux associates no xattrs with a symlink; the link entry must "
+                "carry none"
+            )
         if link_xattr_supported:
             assert os.getxattr(
                 dst_link, "user.link-own", follow_symlinks=False
