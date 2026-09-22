@@ -99,8 +99,10 @@ static ssize_t tls_io_send(ProtocolSession* session, const void* data, size_t si
       return PROTOCOL_IO_RETRY;
     }
     /* A signal (e.g. Ctrl-C) interrupts the blocking TLS write: retry so the
-     * send loop can observe the abort flag at the next checkpoint. */
-    if (ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
+     * send loop can observe the abort flag at the next checkpoint.  Only an
+     * actual negative return is an interrupted syscall; a 0-byte SSL_write is
+     * not a valid EINTR retry. */
+    if (written < 0 && ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
       return PROTOCOL_IO_RETRY;
     return PROTOCOL_IO_ERROR;
   }
@@ -125,8 +127,13 @@ static ssize_t tls_io_recv(ProtocolSession* session, void* data, size_t size, sh
       return PROTOCOL_IO_RETRY;
     }
     /* A signal interrupts the blocking TLS read: retry (mirrors the send path)
-     * so the loop reaches its next abort/deadline checkpoint. */
-    if (ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
+     * so the loop reaches its next abort/deadline checkpoint.  Only an actual
+     * negative return is an interrupted syscall: a 0-byte SSL_read is an
+     * unexpected EOF (the peer closed without close_notify), which OpenSSL also
+     * reports as SSL_ERROR_SYSCALL with errno possibly still EINTR from an
+     * earlier interrupted poll/read.  Retrying that would busy-spin the
+     * status-read loop until its deadline, so classify it as closed instead. */
+    if (received < 0 && ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
       return PROTOCOL_IO_RETRY;
     /* A zero-length SSL_read is the peer's clean close_notify (or EOF without
      * one); report it distinctly so the caller can log it as a close. */
@@ -396,9 +403,12 @@ SSL* protocol_current_ssl(void) {
   /* The bound session is the authoritative transport for a worker thread: it
    * was explicitly handed to protocol_session_bind() and carries its own SSL,
    * whereas io_ssl is thread-local and NULL in a thread that never performed
-   * the handshake.  With no session bound (the fd-shim path), fall back to the
-   * legacy thread-local SSL. */
-  if (bound_session)
+   * the handshake.  Only a session whose selected dispatch is TLS may supply
+   * the SSL: a bound plaintext session has ssl == NULL and must not shadow a
+   * live thread-local io_ssl, or file_send.c would take the raw sendfile(2)
+   * path on a socket this thread is driving with TLS.  With no TLS session
+   * bound (plaintext session, or the fd-shim path), fall back to io_ssl. */
+  if (bound_session && bound_session->ops == &tls_io_ops && bound_session->ssl)
     return bound_session->ssl;
   return io_ssl;
 }
