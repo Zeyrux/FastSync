@@ -16,7 +16,7 @@ Ask the user or determine from context:
 - **Minor** (x.Y.0) — new features, backward compatible
 - **Patch** (x.y.Z) — bug fixes, no protocol changes
 
-Current version: `PROTOCOL_VERSION "2.26.0"` in `src/shared/config.h`
+Current version: `PROTOCOL_VERSION "2.29.0"` in `src/shared/config.h`
 
 ### Step 2: Check Protocol Version
 

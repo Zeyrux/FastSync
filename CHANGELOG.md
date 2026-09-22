@@ -25,6 +25,28 @@ remain unimplemented (accepted-but-ignored); the matrix is therefore **119 ✅ /
 fixes** below) moves `-F` and `-i` to ⚠️, for a final **117 ✅ / 13 ⚠️ / 27 ❌**
 of 157 rows.
 
+A no-wire parity burn-down cycle follows on 2.28.0: it accepts
+`--inc-recursive`/`--no-inc-recursive` as inert no-ops, accepts an absolute
+`--temp-dir` that canonicalizes inside the receive root, closes the
+`--delete-before` phase-0 divergence (both the single-threaded and `--threads`
+data passes replay the pre-scan list), makes `--fake-super` interoperable with
+rsync's `user.rsync.%stat` key/grammar (regular files and char/block devices
+faked as regular files), turns a failed device `mknod` into a continuing
+per-entry failure, and accepts a practical subset of rsync's `rsyncd.conf`
+grammar (modules are read-only by default, and accepted-but-unenforced
+access-control keys emit a startup warning). The matrix moves to **119 ✅ /
+14 ⚠️ / 24 ❌** of 157 rows.
+
+A structural cycle then lands a transport I/O vtable over TCP/TLS (fixing the
+TLS-multithreaded sendfile path and making the per-thread SSL resolution
+explicit) and bumps the wire to **2.29.0**: the `STATUS_SYMLINK` frame grows an
+optional symlink-xattr block (captured no-follow with `llistxattr`/`lgetxattr`,
+applied no-follow with `lsetxattr`). Because the handshake is strict, 2.28.0 and
+2.29.0 peers are incompatible. Note: Linux refuses to associate xattrs with a
+symlink at all, so the symlink-xattr block is a no-op on Linux and is carried
+for correctness on platforms/filesystems that do support it; the config-frame
+layout is unchanged (golden length still 886).
+
 ### Changed
 
 - **rsync-exact traversal order.** The sequential scanner now walks each
