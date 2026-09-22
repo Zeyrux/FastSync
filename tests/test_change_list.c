@@ -195,7 +195,7 @@ static void test_format_C_padding_uses_transfer_algo() {
       {CHECKSUM_ALGO_NONE, 2},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    config->checksum_transfer_algo = cases[i].algo;
+    config->cli.checksum_transfer_algo = cases[i].algo;
     char expected[64];
     size_t n = 0;
     expected[n++] = '[';

@@ -1578,7 +1578,7 @@ static bool send_files_run(Config* config, SendFilesState* state) {
     now_mono.tv_nsec = 0;
   }
   state->stop = stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins,
-                                    config->stop_at_set, config->stop_at, now_mono);
+                                    config->cli.stop_at_set, config->stop_at, now_mono);
   state->prepared.options.stop_condition = &state->stop;
   /* The early-delete pre-scan above already ran; only the data pass should feed
      the directory-time list (otherwise every directory would be captured
@@ -1916,7 +1916,7 @@ int send_files_multithreaded(Config* config) {
     now_mono.tv_nsec = 0;
   }
   context->stop_condition =
-      stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins, config->stop_at_set,
+      stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins, config->cli.stop_at_set,
                           config->stop_at, now_mono);
   bool collect_excluded = config->use_delete && !config->delete_excluded;
   unsigned long long pre_scan_non_dir = 0;

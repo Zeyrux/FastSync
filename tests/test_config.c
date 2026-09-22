@@ -2533,15 +2533,15 @@ static void test_config_derived_use_metadata() {
   /* Incremental/delta imply metadata unless --no-preserve disabled it. */
   c->use_incremental = true;
   EXPECT_TRUE(config_derived_use_metadata(c));
-  c->metadata_explicitly_disabled = true;
+  c->cli.metadata_explicitly_disabled = true;
   EXPECT_FALSE(config_derived_use_metadata(c));
-  c->metadata_explicitly_disabled = false;
+  c->cli.metadata_explicitly_disabled = false;
   c->use_incremental = false;
   c->use_delta = true;
   EXPECT_TRUE(config_derived_use_metadata(c));
-  c->metadata_explicitly_disabled = true;
+  c->cli.metadata_explicitly_disabled = true;
   EXPECT_FALSE(config_derived_use_metadata(c));
-  c->metadata_explicitly_disabled = false;
+  c->cli.metadata_explicitly_disabled = false;
   c->use_delta = false;
 
   /* Flags that must NOT imply metadata on their own. */

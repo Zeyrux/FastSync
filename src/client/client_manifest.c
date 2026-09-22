@@ -31,7 +31,7 @@ bool dry_run_targets_server(const Config* config) {
     return true;
   if (config->module && config->module[0] != '\0')
     return true;
-  if (config->server_host_set || config->server_port_set)
+  if (config->cli.server_host_set || config->cli.server_port_set)
     return true;
   if (config->use_tls)
     return true;

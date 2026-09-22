@@ -170,7 +170,7 @@ static int set_positive_int_option(int* dest, const char* value, const char* opt
  * name is a hard error with rsync's exit code 4, never a silent no-op. */
 static int set_compression_choice(Config* config, const char* value) {
   if (!value) {
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   int algo;
@@ -178,7 +178,7 @@ static int set_compression_choice(Config* config, const char* value) {
     algo = compression_choice_resolve();
     if (algo < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
   } else {
@@ -189,7 +189,7 @@ static int set_compression_choice(Config* config, const char* value) {
                 "--compress-choice '%s' is not a supported algorithm; FastSync supports zstd, "
                 "lz4, zlib, zlibx, none or auto",
                 value);
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   const char* canonical = compression_algo_name((CompressionAlgo)algo);
@@ -226,7 +226,7 @@ static int resolve_checksum_name(const char* name, size_t len, int* out) {
  * resolves to FastSync's negotiated default (xxh128). */
 static int set_checksum_choice(Config* config, const char* value) {
   if (!value) {
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   const char* comma = strchr(value, ',');
@@ -244,7 +244,7 @@ static int set_checksum_choice(Config* config, const char* value) {
                 "--checksum-choice '%s' is invalid; FastSync supports xxh64 (or xxhash), xxh128, "
                 "xxh3, md5, md4, sha1, none or auto, optionally as 'transfer,pre-transfer'",
                 value);
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
   int negotiated = -1;
@@ -252,7 +252,7 @@ static int set_checksum_choice(Config* config, const char* value) {
     negotiated = checksum_choice_resolve();
     if (negotiated < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
   }
@@ -264,8 +264,8 @@ static int set_checksum_choice(Config* config, const char* value) {
     pre = negotiated;
 
   config->checksum_algo = pre;
-  config->checksum_transfer_algo = transfer;
-  config->checksum_choice_set = true;
+  config->cli.checksum_transfer_algo = transfer;
+  config->cli.checksum_choice_set = true;
   /* rsync: "none" for the transfer checksum forces --whole-file. */
   if (transfer == (int)CHECKSUM_ALGO_NONE)
     config->whole_file = true;
@@ -963,7 +963,10 @@ static const OptionEntry OPTION_TABLE[] = {
      * faithful no-op (accepted silently, never consumes an argument). */
     {"--recursive", "-r", OPT_NOOP, 0},
     {"--update", "-u", OPT_FLAG, offsetof(Config, update)},
-    {"--old-args", NULL, OPT_FLAG, offsetof(Config, old_args)},
+    /* rsync's --old-args: accepted for CLI compatibility as a documented no-op
+     * (the remote server path is always safely quoted; see usage.c).  It is
+     * recognized but stores no Config field. */
+    {"--old-args", NULL, OPT_NOOP, 0},
     {"--rsh", "-e", OPT_STRING, offsetof(Config, rsh_command)},
     {"--blocking-io", NULL, OPT_FLAG, offsetof(Config, blocking_io)},
     {"--links", "-l", OPT_FLAG, offsetof(Config, follow_symlinks)},
@@ -1196,12 +1199,12 @@ static int apply_negation(Config* config, const char* arg) {
     config->preserve_times = false;
     config->preserve_owner = false;
     config->preserve_group = false;
-    config->metadata_explicitly_disabled = true;
+    config->cli.metadata_explicitly_disabled = true;
     /* --no-preserve is an explicit opt-out of the whole bundle: record it so
      * the --incremental/--delta auto-preserve in cli_finalize_config does not
      * silently re-enable perms/times. */
-    config->preserve_perms_explicit_off = true;
-    config->preserve_times_explicit_off = true;
+    config->cli.preserve_perms_explicit_off = true;
+    config->cli.preserve_times_explicit_off = true;
     return 0;
   }
   *(bool*)((char*)config + entry->offset) = false;
@@ -1209,9 +1212,9 @@ static int apply_negation(Config* config, const char* arg) {
    * auto-preserve the OTHER attribute without undoing this one.  A later
    * -p/-t sets the attribute directly; this flag only gates the implication. */
   if (entry->offset == offsetof(Config, preserve_perms))
-    config->preserve_perms_explicit_off = true;
+    config->cli.preserve_perms_explicit_off = true;
   else if (entry->offset == offsetof(Config, preserve_times))
-    config->preserve_times_explicit_off = true;
+    config->cli.preserve_times_explicit_off = true;
   return 0;
 }
 
@@ -1440,7 +1443,7 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->stop_at_set = true;
+    config->cli.stop_at_set = true;
     return true;
   }
   if (strcmp(arg, "--stop-at") == 0) {
@@ -1455,7 +1458,7 @@ static bool cli_handle_range_time_options(CliParseCtx* ctx) {
       ctx->exit_code = -1;
       return true;
     }
-    config->stop_at_set = true;
+    config->cli.stop_at_set = true;
     return true;
   }
   const char* threads_prefix = "--compress-threads=";
@@ -1526,7 +1529,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
         return true;
       }
       if (entry->offset == offsetof(Config, compression_level))
-        config->compression_level_set = true;
+        config->cli.compression_level_set = true;
       if (entry->offset == offsetof(Config, chmod_spec)) {
         mode_t ignored;
         if (!chmod_apply(0, config->chmod_spec, &ignored)) {
@@ -1539,7 +1542,7 @@ static bool cli_handle_table_option(CliParseCtx* ctx) {
          defaults to 127.0.0.1, so a value check cannot distinguish it).  Used
          by --dry-run to route an explicit remote target to the server. */
       if (entry->offset == offsetof(Config, server_host))
-        config->server_host_set = true;
+        config->cli.server_host_set = true;
     }
   } else if (apply_table_option(config, entry, NULL) != 0) {
     ctx->exit_code = -1;
@@ -1813,7 +1816,7 @@ static bool cli_handle_transfer_flags(CliParseCtx* ctx) {
           return true;
         }
         config->compression_level = (int)level;
-        config->compression_level_set = true;
+        config->cli.compression_level_set = true;
         log_info_message(LOG_INFO_MISC, "Set Compression level to %ld", level);
         ctx->i++;
       }
@@ -1877,7 +1880,7 @@ static int set_server_port_option(Config* config, const char* value, const char*
     return -1;
   }
   config->server_port = port;
-  config->server_port_set = true;
+  config->cli.server_port_set = true;
   return 0;
 }
 
@@ -2648,7 +2651,7 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
     int resolved = compression_choice_resolve();
     if (resolved < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_COMPRESS_LIST names no supported compression algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
     config->compression_algo = resolved;
@@ -2659,7 +2662,7 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * clamped to the codec's range, otherwise the codec's own default is used. */
   if (config->use_compression) {
     CompressionAlgo algo = (CompressionAlgo)config->compression_algo;
-    config->compression_level = config->compression_level_set
+    config->compression_level = config->cli.compression_level_set
                                     ? compression_clamp_level(algo, config->compression_level)
                                     : compression_default_level(algo);
     log_debug_message(LOG_DEBUG_UTIL, "Client compression: %s (level %d)",
@@ -2668,22 +2671,22 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
   /* The negotiated checksum is always resolved (rsync negotiates one for the
    * delta strong sum even without --checksum): RSYNC_CHECKSUM_LIST first, then
    * the compiled-in order.  An explicit --checksum-choice already set it. */
-  if (!config->checksum_choice_set) {
+  if (!config->cli.checksum_choice_set) {
     int resolved = checksum_choice_resolve();
     if (resolved < 0) {
       log_message(LOG_LEVEL_ERROR, "RSYNC_CHECKSUM_LIST names no supported checksum algorithm");
-      config->cli_exit_code = 4;
+      config->cli.cli_exit_code = 4;
       return -1;
     }
     config->checksum_algo = resolved;
-    config->checksum_transfer_algo = resolved;
+    config->cli.checksum_transfer_algo = resolved;
   }
   /* rsync parity: "none" as the pre-transfer checksum cannot be combined with
    * --checksum (exit 4).  The check runs here because --checksum may appear on
    * either side of --checksum-choice. */
   if (config->checksum && config->checksum_algo == (int)CHECKSUM_ALGO_NONE) {
     log_message(LOG_LEVEL_ERROR, "Invalid checksum-choice for --checksum: none");
-    config->cli_exit_code = 4;
+    config->cli.cli_exit_code = 4;
     return -1;
   }
 
@@ -2762,11 +2765,11 @@ static int cli_finalize_config(Config* config, bool verbose, bool no_delta, bool
    * explicitly negated them (--no-perms/--no-times/--no-preserve).  This runs
    * BEFORE the derived use_metadata bit so the transport frame is still sent
    * for the incremental/delta handshake even when both attributes were negated
-   * via --no-preserve (metadata_explicitly_disabled handles that opt-out). */
-  if (preserve_implied && !config->metadata_explicitly_disabled) {
-    if (!config->preserve_perms_explicit_off)
+   * via --no-preserve (cli.metadata_explicitly_disabled handles that opt-out). */
+  if (preserve_implied && !config->cli.metadata_explicitly_disabled) {
+    if (!config->cli.preserve_perms_explicit_off)
       config->preserve_perms = true;
-    if (!config->preserve_times_explicit_off)
+    if (!config->cli.preserve_times_explicit_off)
       config->preserve_times = true;
   }
 
@@ -3153,7 +3156,7 @@ int main(int argc, char* argv[]) {
   int parse_ret = parse_args(config, argc, argv, positional_args, &positional_count);
   if (parse_ret != 0) {
     if (parse_ret < 0)
-      exit_code = config->cli_exit_code ? config->cli_exit_code : 1;
+      exit_code = config->cli.cli_exit_code ? config->cli.cli_exit_code : 1;
     goto cleanup;
   }
 
