@@ -428,7 +428,9 @@ static void scan_root_entry(const ScannerOptions* options, const FilterNode* roo
   }
   if ((options->preserve_xattrs || options->preserve_acls) &&
       !(file->link_group != 0 && !file->link_first))
-    file->xattrs = xattr_capture_path(file->path, options->preserve_acls);
+    file->xattrs = file->is_symlink
+                       ? xattr_capture_path_nofollow(file->path, options->preserve_acls)
+                       : xattr_capture_path(file->path, options->preserve_acls);
   if (!array_list_add(root_files, file)) {
     free(rel);
     file_destroy(file);

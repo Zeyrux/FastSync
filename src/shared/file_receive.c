@@ -482,6 +482,14 @@ File* file_receive_symlink(int file_descriptor, const Config* config) {
       return NULL;
     }
   }
+  /* Symlink xattrs/ACLs (-X/-A) arrive in the same trailing block as the other
+     entry kinds; the block is present iff use_xattrs (which itself implies
+     use_metadata, so the metadata frame above is always consumed first). */
+  if (config && !receive_file_xattrs(file, file_descriptor, config)) {
+    file_destroy(file);
+    free(target);
+    return NULL;
+  }
   file->is_symlink = true;
   file->symlink_target = target;
   return file;

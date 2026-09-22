@@ -923,6 +923,19 @@ static FileSaveResult file_save_symlink_to_disk(const FileSavePlan* plan, bool* 
     ok = file_restore_symlink_metadata(link_path, file->metadata, link_policy,
                                        config->omit_link_times);
   }
+  /* -X/-A: apply the symlink's OWN xattrs with a no-follow primitive.  The
+     confined parent directory is the anchor and the final component is applied
+     with lsetxattr, so the referent is never touched.  Best-effort: on Linux
+     the VFS refuses xattrs on symlinks, so this is normally a no-op. */
+  if (ok && config && config->use_xattrs && file->xattrs) {
+    char* leaf = NULL;
+    int parent_fd = file_open_secure_parent(link_path, &leaf, false);
+    if (parent_fd >= 0) {
+      xattr_apply_path_nofollow(parent_fd, leaf, file->xattrs);
+      close(parent_fd);
+    }
+    free(leaf);
+  }
   if (ok && created && !link_existed)
     *created = true;
   free(link_path);

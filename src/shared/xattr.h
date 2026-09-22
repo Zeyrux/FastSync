@@ -26,8 +26,11 @@
  *     and total bytes) on BOTH ends to prevent OOM/memory abuse; an oversized
  *     or malformed frame is a clean protocol rejection, never an allocation
  *     blowup.
- *   * Application is confined to the exact destination file descriptor
- *     (fsetxattr on the just-written fd), never a caller-controlled path.
+ *   * Application is confined to the exact destination entry: fsetxattr on the
+ *     just-written fd for regular files/directories, and for a symlink an
+ *     lsetxattr on "/proc/self/fd/<parent_fd>/<leaf>" reached through the
+ *     already-opened, confinement-checked parent directory -- never a
+ *     caller-controlled path, and never following the link.
  */
 
 /* Reserved key used by --fake-super to park the source's privileged ownership
@@ -79,6 +82,17 @@ bool xattr_name_appliable(const char* name, bool preserve_acls);
  * distinct from NULL. */
 FileXattrList* xattr_capture_path(const char* path, bool preserve_acls);
 
+/* Sender: like xattr_capture_path() but reads the xattrs of `path` ITSELF,
+ * never following a final symlink (llistxattr/lgetxattr).  A symlink entry must
+ * use this so the scanner never captures the REFERENT's attributes onto the
+ * link (the path-following variant would).  On Linux the VFS refuses to
+ * associate xattrs with symlinks at all, so this normally returns NULL; it is
+ * still correct and portable for a filesystem/platform that supports them.
+ * The same whitelist/bounds as xattr_capture_path() apply.  Returns NULL when
+ * the link has no appliable xattrs (or the filesystem does not support them);
+ * an empty-but-valid list is never returned distinct from NULL. */
+FileXattrList* xattr_capture_path_nofollow(const char* path, bool preserve_acls);
+
 /* Wire: bounded serialization.  xattr_send returns false on write failure; an
  * empty/NULL list transmits a zero-count block.  xattr_receive returns NULL and
  * sets *ok = 0 on any malformed / oversized / non-whitelisted entry.  When
@@ -93,6 +107,19 @@ FileXattrList* xattr_receive(int fd, int* ok, bool preserve_acls);
  * file the process does not own) is logged and skipped, never fatal.  Returns
  * true when apply was attempted (allowing callers to treat it as best-effort). */
 bool xattr_apply_fd(int fd, const FileXattrList* list);
+
+/* Receiver: apply every entry to the symlink named by (parent_fd, leaf) WITHOUT
+ * following it, via lsetxattr() on the confined path
+ * "/proc/self/fd/<parent_fd>/<leaf>".  A symlink cannot be targeted by the
+ * fd-relative fsetxattr() path: there is no *at() xattr syscall and the kernel
+ * rejects xattr syscalls on an O_PATH descriptor, so the already-opened,
+ * confinement-checked parent directory is the anchor and only the final
+ * component is the (no-follow) link.  `leaf` must be a single path component.
+ * Best-effort exactly like xattr_apply_fd(): a per-attribute failure (on Linux
+ * every set on a symlink fails with EPERM) is logged once and skipped, never
+ * fatal.  Returns false only for an invalid anchor/list; true when an apply was
+ * attempted.  The reserved --fake-super key is never applied. */
+bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list);
 
 /* --fake-super: write the source uid/gid/mode/rdev record into the reserved
  * FAKESUPER_XATTR on `fd`, using rsync 3.4.1's exact grammar (see the key

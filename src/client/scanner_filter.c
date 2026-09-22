@@ -282,11 +282,15 @@ bool entry_passes_selection(const FileListSet* file_list, const FilterRuleList* 
 }
 
 /* Best-effort capture of the file's whitelisted xattrs (-X/-A).  A failure to
- * read xattrs is non-fatal: the file is transferred without them. */
+ * read xattrs is non-fatal: the file is transferred without them.  A symlink
+ * entry reads the LINK's own xattrs (never the referent's) with the no-follow
+ * variant; on Linux the VFS refuses xattrs on symlinks, so that yields NULL. */
 void scanner_capture_xattrs(const DirectoryScanner* scanner, File* file) {
   if (!scanner || !file || !(scanner->options.preserve_xattrs || scanner->options.preserve_acls))
     return;
-  file->xattrs = xattr_capture_path(file->path, scanner->options.preserve_acls);
+  file->xattrs = file->is_symlink
+                     ? xattr_capture_path_nofollow(file->path, scanner->options.preserve_acls)
+                     : xattr_capture_path(file->path, scanner->options.preserve_acls);
 }
 
 /* Apply --hard-links (-H) detection to one regular File.  On a sibling (a
