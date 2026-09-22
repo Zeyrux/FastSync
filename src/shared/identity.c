@@ -654,6 +654,11 @@ int identity_parse_map(Config* config, const char* value, bool is_group) {
         free(list);
         return -1;
       }
+      /* Every rule emitted by the expansion took its own str_dup of the name,
+       * so the parse-time copy is unreachable on success: release it here (the
+       * failure path above already does).  `parsed.to_name` is NULL for a
+       * numeric TO. */
+      free(parsed.to_name);
       continue;
     }
     if (identity_parse_from(from_token, is_group, &parsed.from, &parsed.from_hi) != 0) {
