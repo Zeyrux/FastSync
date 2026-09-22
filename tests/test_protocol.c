@@ -1,9 +1,13 @@
 #include "protocol.h"
 #include "test_utils.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <openssl/ssl.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #include <threads.h>
@@ -786,6 +790,129 @@ static void test_protocol_throttle_bytes_legacy_same_session() {
   io_set_fds(-1, -1);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Transport-vtable dispatch tests.
+ * ------------------------------------------------------------------------- */
+
+static int dispatch_send_calls;
+static int dispatch_recv_calls;
+
+static ssize_t counting_send(ProtocolSession* session, const void* data, size_t size,
+                             short* wait_events) {
+  dispatch_send_calls++;
+  ssize_t written = write(session->write_fd, data, size);
+  if (written < 0)
+    return errno == EINTR ? PROTOCOL_IO_RETRY : PROTOCOL_IO_ERROR;
+  if (written == 0)
+    return PROTOCOL_IO_ERROR;
+  *wait_events = POLLOUT;
+  return written;
+}
+
+static ssize_t counting_recv(ProtocolSession* session, void* data, size_t size,
+                             short* wait_events) {
+  dispatch_recv_calls++;
+  ssize_t received = read(session->read_fd, data, size);
+  if (received < 0)
+    return errno == EINTR ? PROTOCOL_IO_RETRY : PROTOCOL_IO_ERROR;
+  if (received == 0)
+    return PROTOCOL_IO_CLOSED;
+  *wait_events = POLLIN;
+  return received;
+}
+
+static bool counting_has_pending(const ProtocolSession* session) {
+  (void)session;
+  return false;
+}
+
+static const ProtocolIoOps counting_ops = {
+    .send = counting_send,
+    .recv = counting_recv,
+    .has_pending = counting_has_pending,
+};
+
+/* A plain-TCP socketpair session must route every byte through the ops table:
+ * installing a counting ops wrapper proves the send/receive loops dispatch via
+ * session->ops instead of branching on session->ssl. */
+static void test_protocol_dispatch_via_ops() {
+  int sv[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+  ProtocolSession sender;
+  ProtocolSession receiver;
+  protocol_session_init(&sender, sv[0], sv[0]);
+  protocol_session_set_bwlimit(&sender, 0);
+  protocol_session_init(&receiver, sv[1], sv[1]);
+  protocol_session_set_bwlimit(&receiver, 0);
+  EXPECT_NOT_NULL(sender.ops);
+  EXPECT_NOT_NULL(receiver.ops);
+
+  dispatch_send_calls = 0;
+  dispatch_recv_calls = 0;
+  sender.ops = &counting_ops;
+  receiver.ops = &counting_ops;
+
+  const char payload[] = "dispatch-through-vtable";
+  EXPECT_TRUE(protocol_send_n_data(&sender, payload, sizeof(payload)));
+  char received[sizeof(payload)] = {0};
+  EXPECT_TRUE(protocol_receive_n_data(&receiver, received, sizeof(received)));
+  EXPECT_EQ_INT(memcmp(payload, received, sizeof(payload)), 0);
+  EXPECT_TRUE(dispatch_send_calls > 0);
+  EXPECT_TRUE(dispatch_recv_calls > 0);
+
+  close(sv[0]);
+  close(sv[1]);
+}
+
+typedef struct {
+  ProtocolSession* session;
+  SSL* expected_ssl;
+  SSL* resolved_ssl;
+  SSL* thread_local_ssl;
+} SslResolverWorkerArg;
+
+static int ssl_resolver_worker(void* arg) {
+  SslResolverWorkerArg* worker = arg;
+  protocol_session_bind(worker->session);
+  worker->resolved_ssl = protocol_current_ssl();
+  worker->thread_local_ssl = io_get_ssl();
+  protocol_session_unbind();
+  return thrd_success;
+}
+
+/* The worker-thread bug fix: a thread that bound a TLS session but never ran
+ * the handshake has io_ssl == NULL, yet protocol_current_ssl() must return the
+ * session's SSL so callers pick the TLS path. */
+static void test_protocol_current_ssl_prefers_bound_session() {
+  SSL_CTX* ctx = SSL_CTX_new(TLS_method());
+  EXPECT_NOT_NULL(ctx);
+  SSL* ssl = SSL_new(ctx);
+  EXPECT_NOT_NULL(ssl);
+
+  int sv[2];
+  EXPECT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+  ProtocolSession session;
+  protocol_session_init(&session, sv[0], sv[0]);
+  protocol_session_set_ssl(&session, ssl);
+
+  /* Clear the calling thread's legacy SSL: only the bound session carries it. */
+  io_set_fds(-1, -1);
+
+  SslResolverWorkerArg arg = {
+      .session = &session, .expected_ssl = ssl, .resolved_ssl = NULL, .thread_local_ssl = ssl};
+  thrd_t worker;
+  EXPECT_EQ_INT(thrd_create(&worker, ssl_resolver_worker, &arg), thrd_success);
+  EXPECT_EQ_INT(thrd_join(worker, NULL), thrd_success);
+  EXPECT_TRUE(arg.resolved_ssl == ssl);
+  EXPECT_NULL(arg.thread_local_ssl);
+
+  close(sv[0]);
+  close(sv[1]);
+  SSL_free(ssl);
+  SSL_CTX_free(ctx);
+}
+
 void test_protocol() {
   test_send_receive_n_data();
   test_send_receive_n_data_zero();
@@ -819,4 +946,6 @@ void test_protocol() {
   test_protocol_throttle_bytes_paces();
   test_protocol_throttle_bytes_unlimited();
   test_protocol_throttle_bytes_legacy_same_session();
+  test_protocol_dispatch_via_ops();
+  test_protocol_current_ssl_prefers_bound_session();
 }

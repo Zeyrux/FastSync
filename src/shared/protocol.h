@@ -50,16 +50,48 @@
 
 typedef struct ssl_st SSL;
 
+typedef struct ProtocolSession ProtocolSession;
+
+/*
+ * Transport vtable: the per-session set of I/O primitives the three protocol
+ * loops (send, receive, status-read) dispatch through.  The ops are selected
+ * once, when the session is initialized or its SSL is installed, so the loops
+ * never branch on the transport at runtime.  A plaintext session uses the
+ * read()/write() ops; a TLS session uses the SSL_read()/SSL_write() ops.
+ *
+ * `send`/`recv` attempt exactly one transfer and return:
+ *   > 0                    bytes transferred,
+ *   PROTOCOL_IO_RETRY      no progress; poll on *wait_events and retry,
+ *   PROTOCOL_IO_CLOSED     peer closed the stream,
+ *   PROTOCOL_IO_ERROR      fatal transport error.
+ * `has_pending` reports bytes already buffered by the transport (a TLS record
+ * residue); the receive loops skip the poll() gate when it is true.
+ */
+typedef struct ProtocolIoOps {
+  ssize_t (*send)(ProtocolSession* session, const void* data, size_t size, short* wait_events);
+  ssize_t (*recv)(ProtocolSession* session, void* data, size_t size, short* wait_events);
+  bool (*has_pending)(const ProtocolSession* session);
+} ProtocolIoOps;
+
+/* Negative sentinels returned by ProtocolIoOps.send/recv (see above). */
+enum {
+  PROTOCOL_IO_RETRY = -1,
+  PROTOCOL_IO_CLOSED = -2,
+  PROTOCOL_IO_ERROR = -3,
+};
+
 /*
  * Explicit owner of protocol I/O.  A session does not own the descriptors or
  * SSL object; it only describes the transport used by a transfer.  This makes
  * it safe to pass the transport to a worker without relying on inherited
  * thread-local state.
  */
-typedef struct ProtocolSession {
+struct ProtocolSession {
   int read_fd;
   int write_fd;
   SSL* ssl;
+  /* Transport dispatch selected by protocol_session_init()/set_ssl(). */
+  const ProtocolIoOps* ops;
   unsigned long long bwlimit;
   long long bw_tokens;
   long long bw_last_refill_sec;
@@ -75,7 +107,7 @@ typedef struct ProtocolSession {
    * SO_RCVTIMEO/SO_SNDTIMEO.  The server does not propagate a client 0 here: it
    * installs protocol_server_io_timeout_sec() so its sessions keep a floor. */
   int io_timeout_sec;
-} ProtocolSession;
+};
 
 typedef int Status;
 enum NET_STATUS {
@@ -216,6 +248,15 @@ void io_set_bwlimit(unsigned long long bytes_per_sec);
 unsigned long long io_get_bwlimit(void);
 void io_set_ssl(SSL* ssl);
 SSL* io_get_ssl(void);
+/* SSL object of the transport in effect on this thread: the currently bound
+ * session's SSL when a session is bound, otherwise the legacy thread-local
+ * io_ssl.  NULL for a plaintext transport.  Unlike io_get_ssl(), this resolves
+ * worker threads that bound a TLS session via protocol_session_set_ssl()/
+ * protocol_session_bind() but never called io_set_ssl() themselves (C11
+ * _Thread_local state is not inherited by a new thread).  Callers that must
+ * choose a TLS-only code path (e.g. file_send.c's sendfile fallback) must use
+ * this instead of io_get_ssl(). */
+SSL* protocol_current_ssl(void);
 
 /* Process-wide wire byte counters.  protocol_send_n_data/protocol_receive_n_data
  * update them; the zero-copy sendfile path reports through
