@@ -1,6 +1,8 @@
 #include "protocol.h"
 #include "test_utils.h"
+#include <fcntl.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -715,7 +717,7 @@ static void test_protocol_throttle_bytes_paces() {
 
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
-  protocol_throttle_bytes(150000);
+  protocol_throttle_bytes(-1, 150000);
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   long long elapsed_ms =
@@ -736,7 +738,7 @@ static void test_protocol_throttle_bytes_unlimited() {
 
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
-  protocol_throttle_bytes(100000000ULL);
+  protocol_throttle_bytes(-1, 100000000ULL);
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   long long elapsed_ms =
@@ -744,6 +746,44 @@ static void test_protocol_throttle_bytes_unlimited() {
   EXPECT_TRUE(elapsed_ms < 2000);
 
   protocol_session_unbind();
+}
+
+/* Regression for the plaintext sendfile path: it calls protocol_throttle_bytes()
+ * immediately after send_n_data(), which already bound legacy_io_session.write_fd
+ * to the wire fd.  Resolving the throttle session with (read=-1, write=-1)
+ * mismatched that fd and re-initialized the legacy session, granting a *second*
+ * first-call burst and discarding the accumulated debt.  This drives the same
+ * sequence and asserts the debt from send_n_data carries into the throttle. */
+static void test_protocol_throttle_bytes_legacy_same_session() {
+  const size_t payload = 150000; /* 1.5x the 100 KB burst at --bwlimit=1 MB/s */
+  unsigned char* buffer = malloc(payload);
+  EXPECT_TRUE(buffer != NULL);
+  memset(buffer, 0, payload);
+
+  io_set_fds(-1, -1);
+  io_set_bwlimit(1000000ULL);
+
+  int fd = open("/dev/null", O_WRONLY);
+  EXPECT_TRUE(fd >= 0);
+
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  /* send_n_data() consumes the whole 100 KB burst and sleeps ~50 ms. */
+  EXPECT_TRUE(send_n_data(fd, buffer, payload));
+  /* The throttle must share that session, so the 150 KB is all debt and sleeps
+     ~150 ms (total ~200 ms).  A re-initialized session would hand out a fresh
+     100 KB burst and sleep only ~50 ms (total ~100 ms). */
+  protocol_throttle_bytes(fd, payload);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long elapsed_ms =
+      (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+  EXPECT_TRUE(elapsed_ms >= 150);
+
+  close(fd);
+  free(buffer);
+  io_set_bwlimit(0);
+  io_set_fds(-1, -1);
 }
 
 void test_protocol() {
@@ -778,4 +818,5 @@ void test_protocol() {
   test_data_create_starts_uncharged_and_unowned();
   test_protocol_throttle_bytes_paces();
   test_protocol_throttle_bytes_unlimited();
+  test_protocol_throttle_bytes_legacy_same_session();
 }

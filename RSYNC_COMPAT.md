@@ -1013,7 +1013,12 @@ integration tests unless it is explicitly listed as a limitation.
 
 - **`--temp-dir` is confined to the receive root on the receiver:** a relative
   dir resolves below it; an absolute path or one containing `..` is rejected.
-  An `EXDEV` install falls back to a non-atomic copy instead of aborting.
+  An `EXDEV` install falls back to a non-atomic copy instead of aborting. (The
+  confined receiver path cannot be mount-tested in the CI container — no
+  `CAP_SYS_ADMIN` and unprivileged user namespaces are disabled — so the
+  cross-filesystem fallback is exercised end-to-end through the unconfined local
+  `--read-batch` apply against a `/dev/shm` scratch dir, in
+  `tests/integration/test_temp_dir_exdev.py`.)
 - **Deletion scoping:** the manifest carries the synchronized directories, so
   the extras walk only visits their subtrees; `--files-from` subsets no longer
   delete untransmitted paths outside the listed directories.
