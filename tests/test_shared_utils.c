@@ -1,4 +1,5 @@
 #include "test_shared_utils.h"
+#include "delete.h"
 #include "utils.h"
 #include "protocol.h"
 #include "test_utils.h"

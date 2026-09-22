@@ -99,6 +99,7 @@ set(SHARED_SRCS
 	src/shared/daemon_limits.c
 	src/shared/data.c
 	src/shared/delay_updates.c
+	src/shared/delete.c
 	src/shared/delete_commit.c
 	src/shared/delete_plan.c
 	src/shared/delta.c

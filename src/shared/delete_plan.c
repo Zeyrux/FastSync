@@ -2,6 +2,7 @@
 
 #include "charset.h"
 #include "delay_updates.h"
+#include "delete.h"
 #include "file.h"
 #include "log.h"
 #include "utils.h"
@@ -601,9 +602,8 @@ static int open_plan_dir(const Config* config, const char* dir) {
   return fd;
 }
 
-typedef struct PlanSkips {
-  DeleteSkipEntry* entries;
-  int count;
+typedef struct {
+  DeleteSkipSet set;
   /* Receiver-side delete-protection rules received on the config frame (NULL
      when the sender sent none).  Evaluated per extra so a protect/risk rule is
      honored under --delete-during/--delete-delay exactly like the whole-tree
@@ -613,39 +613,12 @@ typedef struct PlanSkips {
 
 static bool build_plan_skips(const Config* config, const DeletePlanSession* session,
                              PlanSkips* out) {
-  out->entries = NULL;
-  out->count = 0;
   out->protect_rules = config->protect_rules;
-  int count = (config->delay_updates ? 1 : 0) + config->basis_count +
-              session->protected_prefixes->size + session->size_skipped->size;
-  if (count == 0)
-    return true;
-  out->entries = calloc((size_t)count, sizeof(DeleteSkipEntry));
-  if (!out->entries)
-    return false;
-  int idx = 0;
-  if (config->delay_updates) {
-    out->entries[idx].prefix = DELAY_UPDATES_STAGING_DIR;
-    out->entries[idx].top_level_only = true;
-    idx++;
-  }
-  for (int i = 0; i < config->basis_count; i++) {
-    out->entries[idx].prefix = config->basis_dirs[i].path;
-    out->entries[idx].top_level_only = false;
-    idx++;
-  }
-  for (int i = 0; i < session->protected_prefixes->size; i++) {
-    out->entries[idx].prefix = (const char*)session->protected_prefixes->items[i];
-    out->entries[idx].top_level_only = false;
-    idx++;
-  }
-  for (int i = 0; i < session->size_skipped->size; i++) {
-    out->entries[idx].prefix = (const char*)session->size_skipped->items[i];
-    out->entries[idx].top_level_only = false;
-    idx++;
-  }
-  out->count = idx;
-  return true;
+  /* The per-directory plan walk keeps each basis path verbatim (it does not
+     convert an absolute under-root path to its root-relative form, unlike the
+     whole-tree commit walk). */
+  return delete_skips_build(config, session->protected_prefixes, session->size_skipped, false,
+                            &out->set);
 }
 
 static bool budget_available(const DeletePlanSession* session) {
@@ -796,7 +769,7 @@ static bool process_children(int dirfd, const char* dir_rel, const ArrayList* ke
       operation_ok = false;
       continue;
     }
-    if (path_under_skip_prefix(child_rel, at_root, skips->entries, skips->count)) {
+    if (path_under_skip_prefix(child_rel, at_root, skips->set.entries, skips->set.count)) {
       shielded[i] = true;
       local_survives = true;
       free(child_rel);
@@ -883,7 +856,7 @@ static bool apply_plan_dir(DeletePlanSession* session, const Config* config, con
   bool survives = false;
   bool ok = process_children(dirfd, dir, dirs, files, strcmp(dir, ".") == 0, false, &skips, session,
                              &survives);
-  free(skips.entries);
+  delete_skips_free(&skips.set);
   close(dirfd);
   if (!ok)
     log_message(LOG_LEVEL_ERROR, "deletion failed while removing extraneous files");
@@ -1024,7 +997,7 @@ static bool apply_deferred_path(DeletePlanSession* session, const Config* config
     }
     bool survives = false;
     bool ok = process_children(dirfd, rel, NULL, NULL, false, true, &skips, session, &survives);
-    free(skips.entries);
+    delete_skips_free(&skips.set);
     close(dirfd);
     if (!ok) {
       close(parent_fd);
