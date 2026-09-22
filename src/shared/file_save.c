@@ -400,11 +400,13 @@ bool file_special_rdev_valid(int32_t major, int32_t minor, mode_t mode) {
 /* ---- Device/special node RECREATION (--devices/--specials), receiver side ----
  *
  * Privilege gating: making a real device node requires CAP_MKNOD (root); making
- * a FIFO works unprivileged (mkfifo).  When the receiver lacks the capability,
- * mknodat() fails with EPERM and the entry is SKIPPED with a warning -- the
- * whole transfer must NOT abort just because the environment cannot make the
- * node.  CI runs non-root, so device creation is expected to skip there and
- * only a FIFO is honestly assertable unprivileged.
+ * a FIFO works unprivileged (mkfifo).  A device node whose mknodat() fails with
+ * EPERM/EACCES is a genuine transfer error (rsync parity: rsync reports the
+ * mknod failure and the run exits partial, code 23).  Only the unprivileged
+ * FIFO/socket (--specials) path keeps the best-effort skip, because those are
+ * normally creatable without privilege and a failure there is environmental.
+ * CI runs non-root, so device creation is expected to fail there; only a FIFO
+ * is honestly assertable unprivileged.
  *
  * Confinement: the parent directory is opened fd-relative below the receive
  * root (file_open_secure_parent: O_NOFOLLOW, no "..", root-checked) and the
@@ -542,13 +544,32 @@ static FileSaveResult file_save_special_to_disk(const char* root_directory, cons
                   node_kind, escaped_path ? escaped_path : "<allocation failed>");
       free(escaped_path);
     } else if (errno == EPERM || errno == EACCES) {
-      /* Missing CAP_MKNOD / parent write permission: the environment cannot
-         create the node, so skip instead of failing the whole run. */
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());
+      const char* shown_path = escaped_path ? escaped_path : "<allocation failed>";
+      if (is_char || is_blk) {
+        /* rsync parity: a device node that cannot be created (no CAP_MKNOD, or
+         * super-user activities not permitted) is a genuine transfer error.
+         * rsync reports `mknod ".../node" failed: ...` and the run exits
+         * partial (23); FastSync surfaces it through the outcome aggregation
+         * instead of silently skipping the entry.  FIFO/socket creation
+         * (--specials) keeps the best-effort skip path below. */
+        log_message(LOG_LEVEL_ERROR,
+                    "cannot create %s %s: %s\n"
+                    "  --devices node creation needs privilege (CAP_MKNOD)",
+                    node_kind, shown_path, strerror(errno));
+        free(escaped_path);
+        close(parent_fd);
+        free(leaf);
+        free(destination);
+        return FILE_SAVE_ERROR;
+      }
+      /* Missing CAP_MKNOD / parent write permission for a FIFO/socket: the
+         environment cannot create the node, so skip instead of failing the
+         whole run. */
       log_message(LOG_LEVEL_WARNING,
                   "skipping %s: cannot create %s node (%s)\n"
-                  "  --devices/--specials node creation needs privilege (CAP_MKNOD)",
-                  escaped_path ? escaped_path : "<allocation failed>", node_kind, strerror(errno));
+                  "  --specials node creation needs privilege (CAP_MKNOD)",
+                  shown_path, node_kind, strerror(errno));
       free(escaped_path);
     } else {
       char* escaped_path = output_escape(file->path, log_get_8_bit_output());

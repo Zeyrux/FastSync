@@ -156,8 +156,8 @@ static void test_xattr_capture_and_appliable() {
   EXPECT_TRUE(xattr_name_appliable("user.foo", false));
   EXPECT_TRUE(xattr_name_appliable("user.foo", true));
   /* The reserved fake-super key is receiver-only and never forwarded/applied. */
-  EXPECT_FALSE(xattr_name_appliable("user.fastsync.stat", false));
-  EXPECT_FALSE(xattr_name_appliable("user.fastsync.stat", true));
+  EXPECT_FALSE(xattr_name_appliable("user.rsync.%stat", false));
+  EXPECT_FALSE(xattr_name_appliable("user.rsync.%stat", true));
   /* B4: the ACL names require --acls; -X alone must not authorize them. */
   EXPECT_FALSE(xattr_name_appliable("system.posix_acl_access", false));
   EXPECT_FALSE(xattr_name_appliable("system.posix_acl_default", false));
@@ -351,9 +351,10 @@ static void test_xattr_capture_filters_acls() {
 }
 
 /* --fake-super replay: fake_super_store_fd records the source stat into the
- * reserved xattr, and fake_super_restore_fd re-applies mode/mtime (and owner,
- * when the process may) fd-relative.  Restore must also be a safe no-op with no
- * xattr present.  Guarded on filesystem xattr support. */
+ * reserved xattr, and fake_super_restore_fd re-applies the permission bits
+ * fd-relative (mtime travels through the normal metadata path; the owner is
+ * never chowned).  Restore must also be a safe no-op with no xattr present.
+ * Guarded on filesystem xattr support. */
 static void test_fake_super_restore() {
   const char* path = "test_fake_super_restore.txt";
   unlink(path);
@@ -373,7 +374,7 @@ static void test_fake_super_restore() {
   FileAttrPolicy policy = {true, true, false, false, true};
   EXPECT_FALSE(fake_super_restore_fd(fd, policy));
 
-  fake_super_store_fd(fd, 1001, 1002, 0751, 1700000000, 123456789);
+  fake_super_store_fd(fd, 1001, 1002, S_IFREG | 0751, 0, 0);
   EXPECT_TRUE(fake_super_restore_fd(fd, policy));
   struct stat st;
   EXPECT_EQ_INT(fstat(fd, &st), 0);
@@ -381,7 +382,7 @@ static void test_fake_super_restore() {
 
   /* Strict rsync parity: -p restores the recorded mode exactly, including
      group/other write (a recorded 0666 restores as 0666). */
-  fake_super_store_fd(fd, 1001, 1002, 0666, 1700000000, 0);
+  fake_super_store_fd(fd, 1001, 1002, S_IFREG | 0666, 0, 0);
   EXPECT_TRUE(fake_super_restore_fd(fd, policy));
   EXPECT_EQ_INT(fstat(fd, &st), 0);
   EXPECT_EQ_INT((int)(st.st_mode & 0777), 0666);
@@ -396,6 +397,58 @@ static void test_fake_super_restore() {
   EXPECT_FALSE(fake_super_restore_fd(fd, policy));
   fstat(fd, &st);
   EXPECT_EQ_INT((int)st.st_mtime, (int)before);
+
+  close(fd);
+  unlink(path);
+}
+
+/* The stored record is rsync 3.4.1's exact grammar
+ *   "<octal st_mode with S_IFMT> <rdev_major>,<rdev_minor> <uid>:<gid>"
+ * so a fake-super tree is readable by rsync.  Also pins two rsync parity
+ * rules: the special bits are stored in the record but NOT applied to the real
+ * file, and a device record's rdev round-trips through the parser.  Guarded on
+ * filesystem xattr support. */
+static void test_fake_super_rsync_format() {
+  const char* path = "test_fake_super_format.txt";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool has_xattr = setxattr(path, "user.fastsync.xprobe", "p", 1, 0) == 0;
+  if (has_xattr)
+    removexattr(path, "user.fastsync.xprobe");
+  if (!has_xattr) {
+    close(fd);
+    unlink(path);
+    return; /* skip silently when the filesystem has no xattr support */
+  }
+
+  /* A setuid regular file: the full st_mode (with S_IFMT + special bits) is
+     recorded, rdev is 0,0, and the owner is uid:gid. */
+  fake_super_store_fd(fd, 1234, 5678, S_IFREG | 04711, 0, 0);
+  char value[128];
+  ssize_t got = fgetxattr(fd, FAKESUPER_XATTR, value, sizeof(value));
+  EXPECT_EQ_INT((int)got, 20);
+  EXPECT_TRUE(got == 20 && memcmp(value, "104711 0,0 1234:5678", 20) == 0);
+
+  /* The special bits in the record are NOT installed on the real file. */
+  FileAttrPolicy policy = {true, true, false, false, true};
+  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
+  struct stat st;
+  EXPECT_EQ_INT(fstat(fd, &st), 0);
+  EXPECT_EQ_INT((int)(st.st_mode & 07777), 0711);
+  EXPECT_EQ_INT((int)(st.st_mode & (S_ISUID | S_ISGID | S_ISVTX)), 0);
+
+  /* A device record (char 1,3, uid 111, gid 222) parses without error and
+     still never real-chowns or installs the device's mode bits verbatim. */
+  EXPECT_EQ_INT((int)fsetxattr(fd, FAKESUPER_XATTR, "20644 1,3 111:222", 17, 0), 0);
+  struct stat before;
+  fstat(fd, &before);
+  EXPECT_TRUE(fake_super_restore_fd(fd, policy));
+  fstat(fd, &st);
+  EXPECT_EQ_INT((int)(st.st_mode & 0777), 0644);
+  EXPECT_EQ_INT((int)st.st_uid, (int)before.st_uid);
+  EXPECT_EQ_INT((int)st.st_gid, (int)before.st_gid);
 
   close(fd);
   unlink(path);
@@ -421,7 +474,7 @@ static void test_fake_super_no_real_chown() {
   }
   struct stat before;
   EXPECT_EQ_INT(fstat(fd, &before), 0);
-  fake_super_store_fd(fd, 12345, 12346, 0755, 1700000000, 0);
+  fake_super_store_fd(fd, 12345, 12346, S_IFREG | 0755, 0, 0);
 
   Config* c = config_create();
   FileAttrPolicy policy = {true, true, false, false, true};
@@ -600,6 +653,7 @@ void test_xattr() {
   test_xattr_receive_drops_acl_without_preserve_acls();
   test_link_copy_fallback_preserves_xattrs();
   test_fake_super_restore();
+  test_fake_super_rsync_format();
   test_fake_super_no_real_chown();
   test_fake_super_storage_resolution();
   test_file_save_directory_applies_xattrs();

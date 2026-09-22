@@ -208,10 +208,11 @@ void print_usage(void) {
   printf("  -A, --acls          Preserve POSIX ACLs (the system.posix_acl_* xattrs;\n");
   printf("                      setting an ACL the receiver is not permitted to\n");
   printf("                      set is warned and skipped, never fatal)\n");
-  printf("  --fake-super        Store the source uid/gid/mode/mtime in a reserved\n");
-  printf("                      user.fastsync.stat xattr on each written file and\n");
-  printf("                      re-apply it (fd-relative) on a privileged run; the\n");
-  printf("                      recording format diverges from rsync's user.rsync.%%stat%%\n");
+  printf("  --fake-super        Store the source mode/rdev/uid/gid in rsync's\n");
+  printf("                      reserved user.rsync.%%stat xattr on each written\n");
+  printf("                      file (interoperable with rsync); it never performs a\n");
+  printf("                      real chown, so an unprivileged receiver records the\n");
+  printf("                      privileged stat for a later restore\n");
   printf("  --super             Permit the receiver to attempt super-user activities\n");
   printf("                      (char/block device-node creation, --write-devices)\n");
   printf("                      within the confined receive root.  Never elevates\n");

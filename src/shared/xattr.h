@@ -31,11 +31,14 @@
  */
 
 /* Reserved key used by --fake-super to park the source's privileged ownership
- * / mode / mtime on the destination file as an unprivileged user.* xattr, so a
- * later privileged restore could re-apply them.  Exact documented format:
- *   uid:gid:mode:mtime_sec:mtime_nsec           (decimal, decimal, octal, dec, dec)
- * e.g. "1000:1000:644:1765238400:0". */
-#define FAKESUPER_XATTR "user.fastsync.stat"
+ * / mode / rdev on the destination file as an unprivileged user.* xattr, so the
+ * tree is interoperable with rsync 3.4.1 and a later privileged restore can
+ * re-apply them.  This is rsync's own key and value grammar exactly:
+ *   <octal st_mode with S_IFMT> <rdev_major>,<rdev_minor> <uid>:<gid>
+ * e.g. "104711 0,0 1234:5678" for a setuid regular file owned by 1234:5678,
+ * or "20644 1,3 111:222" for a char device.  mtime is deliberately NOT part of
+ * the record: exactly like rsync, the file's own timestamp carries it. */
+#define FAKESUPER_XATTR "user.rsync.%stat"
 
 /* --- bounds --- */
 #define XATTR_NAME_MAX 255                /* xattr names are limited to 255 bytes */
@@ -91,24 +94,28 @@ FileXattrList* xattr_receive(int fd, int* ok, bool preserve_acls);
  * true when apply was attempted (allowing callers to treat it as best-effort). */
 bool xattr_apply_fd(int fd, const FileXattrList* list);
 
-/* --fake-super: write the source uid/gid/mode/mtime record into the reserved
- * FAKESUPER_XATTR on `fd`.  Best-effort (logged, never fatal).  Only meaningful
- * when metadata was transmitted so the values exist. */
-void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, int64_t mtime_sec,
-                         int64_t mtime_nsec);
+/* --fake-super: write the source uid/gid/mode/rdev record into the reserved
+ * FAKESUPER_XATTR on `fd`, using rsync 3.4.1's exact grammar (see the key
+ * comment above).  `mode` is the full st_mode including its S_IFMT bits.
+ * Best-effort (logged, never fatal).  Only meaningful when metadata was
+ * transmitted so the values exist. */
+void fake_super_store_fd(int fd, uint32_t uid, uint32_t gid, uint32_t mode, uint32_t rdev_major,
+                         uint32_t rdev_minor);
 
 /* --fake-super replay: parse the FAKESUPER_XATTR record previously written on
- * `fd` by fake_super_store_fd and re-apply mode/mtime fd-relative.  The
- * recorded uid/gid are deliberately NOT chowned for real: --fake-super only
- * RECORDS ownership (the caller stores the resolved mapping via
- * identity_resolve_storage_ids), it never performs a real chown.  Best-effort:
- * absence of the xattr or a malformed record is a silent no-op that never fails
- * the transfer.  The MODE leg is applied only when policy.perms||policy.
- * executability and the MTIME leg only when policy.times, so the fake-super
- * replay cannot bypass the per-attribute split; the mode follows the normal
- * metadata path exactly (under --perms the source mode is copied verbatim,
- * special and group/other write bits included).
- * Returns true when the xattr was present and parsed. */
+ * `fd` by fake_super_store_fd and re-apply the recorded permission bits
+ * fd-relative.  The recorded uid/gid are deliberately NOT chowned for real:
+ * --fake-super only RECORDS ownership (the caller stores the resolved mapping
+ * via identity_resolve_storage_ids), it never performs a real chown.  The
+ * recorded rdev is retained for a later privileged restore but is not acted on
+ * here.  Best-effort: absence of the xattr or a malformed record is a silent
+ * no-op that never fails the transfer.  The MODE leg is applied only when
+ * policy.perms||policy.executability, and the recorded special bits
+ * (setuid/setgid/sticky) are NOT applied to the real file -- exactly like
+ * rsync's fake-super receiver, which stores the full mode in the xattr but
+ * strips the special bits on disk.  mtime is not part of the record; the normal
+ * metadata path carries it (policy.times) exactly as rsync sets the file's own
+ * timestamp.  Returns true when the xattr was present and parsed. */
 bool fake_super_restore_fd(int fd, FileAttrPolicy policy);
 
 #endif
