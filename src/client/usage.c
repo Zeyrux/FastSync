@@ -26,6 +26,9 @@ void print_usage(void) {
   printf("                      owner, group, devices and specials; not\n");
   printf("                      compression/multithreading\n");
   printf("  -r, --recursive     Recurse into directories (FastSync is always recursive)\n");
+  printf("  --inc-recursive     Accepted for rsync CLI compatibility; no effect (FastSync\n");
+  printf("                      always performs a full scan, so the destination is identical)\n");
+  printf("  --no-inc-recursive  Accepted for rsync CLI compatibility; no effect\n");
   printf("  -n, --dry-run       Show what would be transferred\n");
   printf("  --remove-source-files  Remove regular source files after successful transfer\n");
   printf("  -p, --perms         Preserve permission bits\n");

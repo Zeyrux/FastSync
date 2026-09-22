@@ -5040,10 +5040,12 @@ static void test_parse_args_include_exclude_order() {
   config_delete(cfg3);
 }
 
-/* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive) must never
- * swallow the next argv: `fastsync -s SRC DST` keeps both positionals. */
+/* OPT_NOOP compatibility flags (-s/--secluded-args, -r/--recursive, and the
+ * --inc-recursive/--no-inc-recursive scan-mode pair) must never swallow the
+ * next argv: `fastsync -s SRC DST` keeps both positionals. */
 static void test_parse_args_noop_does_not_consume_argv() {
-  static const char* const noops[] = {"-s", "--secluded-args", "-r", "--recursive"};
+  static const char* const noops[] = {"-s",          "--secluded-args", "-r",
+                                      "--recursive", "--inc-recursive", "--no-inc-recursive"};
   for (size_t i = 0; i < sizeof(noops) / sizeof(noops[0]); i++) {
     Config* cfg = config_create();
     int positional_args[2];
