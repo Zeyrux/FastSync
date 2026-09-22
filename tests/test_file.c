@@ -21,6 +21,9 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <unistd.h>
 
 static void test_file_create() {
@@ -1414,8 +1417,15 @@ static void test_device_mknod_failure_is_per_entry() {
   if (saved == 0 && seteuid(65534) == 0)
     dropped = true;
   FileSaveResult result = file_save_to_disk_full(root, f, cfg);
-  if (dropped)
+  if (dropped) {
     EXPECT_EQ_INT(seteuid(saved), 0);
+#ifdef __linux__
+    /* A setuid transition clears the process dumpable flag, which makes
+     * LeakSanitizer's ptrace-based thread suspension fail at exit.  Restore it
+     * so the ASan/UBSan CI jobs can still run the leak check. */
+    (void)prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+#endif
+  }
 
   EXPECT_EQ_INT(result, FILE_SAVE_FAILED);
   /* Nothing was created: no device node and no regular-file fallback. */
