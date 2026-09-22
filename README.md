@@ -233,9 +233,9 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `-h, --human-readable` | Format transfer byte/rate counts with rsync's decimal (base-1000) units |
 | `--max-depth <n>` | Maximum directory depth to recurse (0 = unlimited, default: 0) |
 | `--log-file <path>` | Write log messages to file instead of stderr |
-| `--write-batch=FILE` | Run the normal live transfer and also emit a self-contained batch file of the source tree |
-| `--only-write-batch=FILE` | Emit the batch file only (no destination, no server) |
-| `--read-batch=FILE` | Apply a batch file to the destination (no source, no server) |
+| `--write-batch=FILE` | Run the normal live transfer and also emit a self-contained batch file of the source tree (FastSync-native format, not rsync-interoperable) |
+| `--only-write-batch=FILE` | Emit the batch file only (no destination, no server); FastSync-native format, not rsync-interoperable |
+| `--read-batch=FILE` | Apply a batch file to the destination (no source, no server); FastSync-native format, not rsync-interoperable |
 | `--source-dir <path>` | Source directory (overrides `FASTSYNC_SOURCE_DIR`) |
 | `--dest-dir <path>` | Server destination directory (overrides `FASTSYNC_DEST_DIR`) |
 | `--save-to-disk` | Write received files to disk |
@@ -248,12 +248,12 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `-4, --ipv4` | Force IPv4 for destination resolution |
 | `-6, --ipv6` | Force IPv6 for destination resolution |
 | `--sockopts=OPTS` | Comma-separated OPT=VAL socket options applied before connect (`TCP_NODELAY`, `SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`, `SO_REUSEADDR`) |
-| `--bwlimit <KB/s>` | Bandwidth limit in kilobytes per second; also paces `--sendfile` transfers |
+| `--bwlimit <RATE>` | Bandwidth limit, using rsync's exact `parse_size_arg` grammar: a bare value is KiB/s; `K`/`M`/`G`/`T`/`P` are binary suffixes; `KB`/`MB` are decimal and `KiB`/`MiB` binary; decimals are accepted and quantized to whole KiB; `0` (or empty) means no limit. Also paces `--sendfile` transfers |
 | `--chunk-size <n>` | Chunk size in bytes (default: 10485760) |
 | `--timeout <sec>` | I/O timeout in seconds, applied to both the socket (`SO_RCVTIMEO`/`SO_SNDTIMEO`) and the per-message protocol poll deadline. Default `0` = disabled (matching rsync); `0` disables it. `--no-timeout` is the negation. The value is not sent on the wire; the server side keeps its own safe floor. |
 | `--contimeout <sec>` | Connection timeout in seconds (default: 60, matching rsync); `0` disables it (`--no-contimeout` is the negation) |
 | `--stop-after=MINS` | Stop the transfer after MINS minutes (a positive integer); whatever was already transferred is kept |
-| `--stop-at=TIME` | Stop at an absolute time (`HH:MM`, `HH:MM:SS`, or `now+N[smhd]`); an early stop skips the late `--delete` keep-set |
+| `--stop-at=TIME` | Stop at an absolute time. Accepts rsync's `parse_time` forms (`Y-M-DTh:m`, `Y/M/DTh:m`, `Y-M-D`, `M-D`, `D`, `h:m`, `:m`, `T h:m`; omitted fields resolve to the next matching point in the local timezone), plus `now+N[smhd]` and FastSync's `HH:MM`/`HH:MM:SS` clock-time spelling. An early stop skips the late `--delete` keep-set |
 | `-b, --backup` | Backup existing destination files before overwriting |
 | `--backup-dir <dir>` | Target directory for backups (requires `--backup`) |
 | `--tls` | Enable TLS encryption |
@@ -535,7 +535,7 @@ features without changing the meaning of ordinary compatibility options.
 | `--server-host <host>` | Select the TCP server host. |
 | `--server-port <port>` | Select the TCP server port (`--port <port>` and `--port=<port>` are rsync-friendly aliases). |
 | `--tls` | Enable TLS for TCP transport. |
-| `--bwlimit <KB/s>` | Apply token-bucket bandwidth limiting (also paces `--sendfile` transfers). |
+| `--bwlimit <RATE>` | Apply token-bucket bandwidth limiting with rsync's exact `parse_size_arg` grammar (bare = KiB/s, `K`/`M`/`G`/`T`/`P` binary, `KB`/`MB` decimal, `KiB`/`MiB` binary, decimals quantized to whole KiB, `0`/empty = no limit; also paces `--sendfile` transfers). |
 | `--progress` | Show rsync-style per-file progress blocks from the receiver's wire counters; the root `./` line is printed whenever progress is active (rsync prints it only when the transfer root is created). |
 | `--stats` | Print transfer statistics, including the receiver-only counters reported over the wire; `Number of files`/`Number of created files` carry rsync's per-type breakdown (deleted files are a single total). |
 | `--timeout <seconds>` | Set the socket **and** per-message protocol I/O timeout. Default `0` = disabled (matching rsync); `0` disables it. |
@@ -613,11 +613,11 @@ remote SSH argv is already built injection-safe.
 | `--partial-dir <dir>` | Set a relative partial-transfer directory below the server destination root. Implies `--partial`. Rejected together with `--inplace` (`--inplace cannot be used with --partial-dir`, matching rsync), because the inplace path bypasses partial/temp staging. |
 | `--inplace` | Write directly to the destination instead of using a temporary file. Cannot be combined with `--partial-dir`. |
 | `--fsync` | Fsync every written file before publication. |
-| `--write-batch=FILE` | Run the normal live transfer and also emit a self-contained batch file of the source tree. |
-| `--only-write-batch=FILE` | Emit the batch file only (no destination, no server). |
-| `--read-batch=FILE` | Apply a batch file to the destination (no source, no server). |
+| `--write-batch=FILE` | Run the normal live transfer and also emit a self-contained batch file of the source tree (FastSync-native format, not rsync-interoperable). |
+| `--only-write-batch=FILE` | Emit the batch file only (no destination, no server); FastSync-native format, not rsync-interoperable. |
+| `--read-batch=FILE` | Apply a batch file to the destination (no source, no server); FastSync-native format, not rsync-interoperable. |
 | `--stop-after=MINS` | Stop the transfer after MINS minutes; whatever was already transferred is kept. |
-| `--stop-at=TIME` | Stop at an absolute time (`HH:MM`, `HH:MM:SS`, or `now+N[smhd]`). An early stop skips the late `--delete` keep-set. |
+| `--stop-at=TIME` | Stop at an absolute time. Accepts rsync's `parse_time` forms (`Y-M-DTh:m`, `Y/M/DTh:m`, `Y-M-D`, `M-D`, `D`, `h:m`, `:m`, `T h:m`; omitted fields resolve to the next matching point in the local timezone), plus `now+N[smhd]` and FastSync's `HH:MM`/`HH:MM:SS` clock-time spelling. An early stop skips the late `--delete` keep-set. |
 
 ### Metadata and links
 
@@ -689,7 +689,7 @@ remote SSH argv is already built injection-safe.
 | `--fastsync-server-path <path>` | Remote FastSync server path for SSH mode (client-only; never crosses the wire). |
 | `--rsync-path <path>` | Alias for `--fastsync-server-path`. |
 | `-M`, `--remote-option=OPT` | Append OPT to the remote server invocation over SSH (repeatable; rejected for daemon/TCP destinations). |
-| `--trust-sender` | Receiver-local: trust the remote sender's file list and skip path re-validation (does not affect symlink targets). |
+| `--trust-sender` | Receiver-local: trust the remote sender's file list and skip path re-validation (does not affect symlink targets). **On the client this flag alone is inert** — it is never sent on the wire; the server must be started with its own `--trust-sender`, or the client must forward it with `-M--trust-sender` (SSH only). |
 | `--timeout <sec>` | Socket + per-message I/O timeout; default `0` = disabled. |
 | `--contimeout <sec>` | Connection timeout; default 60; `0` disables. |
 | `--source-dir <path>` | Set the source directory explicitly. |
@@ -732,14 +732,14 @@ remote SSH argv is already built injection-safe.
 | `-6`, `--ipv6` | Bind an IPv6 socket. |
 | `--allow-delete` | Permit client delete manifests. Deletion is refused by default. This also gates `--force` (which can recursively replace/remove a destination directory tree). |
 | `--allow-super` | Standalone TCP listener only: keep super-user activities enabled for a **root** receiver. Without it a root standalone server forces `SUPER_MODE_OFF`, so client `--devices`/`--write-devices`/`--super` and client-chosen ownership requests are skipped/refused. Rejected with `--stdio` (the SSH remote argv is client-composed; use a forced command if the default must hold). No effect when not root. Daemon modules opt in per module with `client owner = yes`. |
-| `--trust-sender` | Trust the remote sender's file list: skip the receiver's up-front path-traversal re-validation (fewer checks, faster, potentially unsafe; off by default). It does not affect symlink targets, which are stored verbatim either way. |
+| `--trust-sender` | Trust the remote sender's file list: skip the receiver's up-front path-traversal re-validation (fewer checks, faster, potentially unsafe; off by default). It does not affect symlink targets, which are stored verbatim either way. A client `--trust-sender` is never sent over the wire — the server must set this flag itself, or the client must forward it via `-M--trust-sender`. |
 | `--no-super` | Operator veto: never attempt super-user activities (ownership, device nodes) even as root, and refuse any client `--copy-as`/`--super` request. |
 | `--allow-unauthenticated` | Permit plaintext/anonymous network clients; an auth-required module still accepts only opted-in loopback plaintext. |
 | `--iconv=LOCAL[,REMOTE]` | Declare this server's LOCAL charset for file-name conversion. |
-| `--password-file=FILE` | Credential store for modules that declare `auth users`. Requires `--daemon`. |
-| `--early-input=FILE` | Second credential store layered over `--password-file`. Requires `--daemon`. |
-| `--hash-credentials <file>` | Read `<file>`'s `user:password` lines and print PBKDF2 credential-store lines to stdout, then exit. Cannot be combined with `--daemon` or `--stdio`. |
-| `--iterations N` | PBKDF2 iteration count for `--hash-credentials` (default 600000, range 100000–10000000). Requires `--hash-credentials`. |
+| `--password-file=FILE` | Credential store for modules that declare `auth users`. Requires `--daemon`. FastSync-native SCRAM/PBKDF2 format, not rsync-interoperable. |
+| `--early-input=FILE` | Second credential store layered over `--password-file`. Requires `--daemon`. FastSync-native format, not rsync-interoperable. |
+| `--hash-credentials <file>` | Read `<file>`'s `user:password` lines and print PBKDF2 credential-store lines to stdout, then exit. Cannot be combined with `--daemon` or `--stdio`. FastSync-native, not rsync-interoperable. |
+| `--iterations N` | PBKDF2 iteration count for `--hash-credentials` (default 600000, range 100000–10000000). Requires `--hash-credentials`. FastSync-native, not rsync-interoperable. |
 | `-v`, `--verbose` | Enable debug logging. |
 | `--help` | Print server usage. |
 
@@ -897,8 +897,10 @@ The project will reach the drop-in replacement goal in stages:
    completion wave's scope; the tests live in `tests/integration/` and skip
    cleanly when rsync is unavailable.
 3. `-a` implements full rsync `-rlptgoD`; under `-p` the source mode is copied
-   exactly (no masking). Ownership application stays privilege-gated, as in
-   rsync.
+   exactly, including group/other-write bits, with setuid/setgid/sticky copied
+   only when super-user activities are permitted (masked under
+   `SUPER_MODE_OFF`/`--no-super`). Ownership application stays privilege-gated,
+   as in rsync.
 4. Symlink (verbatim storage), sparse-file, metadata, delete-policy (including
    `--max-delete` partial + exit 25, per-directory `--delete-during`/
    `--delete-delay`), codecs, and resumable-write semantics are implemented;
