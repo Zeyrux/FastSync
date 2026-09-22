@@ -384,7 +384,7 @@ static ReceiverStep receiver_handle_mkdir(ReceiverPendingState* state) {
   return RECEIVER_STEP_NEXT;
 }
 
-static ReceiverStep receiver_handle_dir_times(ReceiverPendingState* state) {
+static ReceiverStep receiver_handle_dir_times(const ReceiverPendingState* state) {
   if (!receiver_process_dir_times(state->fd, state->config, state->sink))
     return RECEIVER_STEP_ERROR;
   return RECEIVER_STEP_NEXT;

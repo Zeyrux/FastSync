@@ -1653,7 +1653,7 @@ static bool send_files_run(Config* config, SendFilesState* state) {
 /* Completion tail: send the late delete manifest and captured directory times,
  * finalize the receiver handshake, remove transferred sources and report stats.
  * Returns the rsync-compatible exit code. */
-static int send_files_finalize(Config* config, SendFilesState* state) {
+static int send_files_finalize(const Config* config, SendFilesState* state) {
   Client* client = state->client;
   if (directory_scanner_failed(state->scanner))
     return 1;
@@ -1916,8 +1916,8 @@ int send_files_multithreaded(Config* config) {
     now_mono.tv_nsec = 0;
   }
   context->stop_condition =
-      stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins, config->cli.stop_at_set,
-                          config->stop_at, now_mono);
+      stop_condition_make(config->stop_after_mins > 0, config->stop_after_mins,
+                          config->cli.stop_at_set, config->stop_at, now_mono);
   bool collect_excluded = config->use_delete && !config->delete_excluded;
   unsigned long long pre_scan_non_dir = 0;
   if (config->use_delete) {

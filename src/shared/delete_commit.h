@@ -44,7 +44,7 @@ DeleteManifest* receive_manifest_entries(int fd);
    protected-prefix skips).  `--max-delete` and `--force` are honored here.  The
    caller decides WHEN to run it based on the negotiated delete timing.  Returns
    false (and the transfer fails) when the deletion cannot be committed. */
-bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
+bool manifest_delete_extras(const Config* config, const DeleteManifest* manifest);
 /* --delete-missing-args exact-path deletions: remove each destination mirror
    in `manifest->missing` (never blocked by the protected prefixes, staging dir
    and basis dirs excluded).  A regular file/symlink is unlinked; an empty
@@ -53,22 +53,20 @@ bool manifest_delete_extras(const Config* config, DeleteManifest* manifest);
    parity).  A missing path is a no-op.  Returns false only on a genuine
    confinement or I/O error (the run then fails); tolerated per-path cases are
    reported and skipped. */
-bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest);
+bool manifest_delete_missing_args(const Config* config, const DeleteManifest* manifest);
 /* Budgeted form of manifest_delete_missing_args for the per-directory delete
    session: each removed mirror draws from `max_delete` (SIZE_MAX = unlimited)
    and the tallies are accumulated into `*deleted`/`*skipped`.  `*limit_hit` is set
    when the budget stopped the pass with entries left over.  Returns false only
    on a genuine deletion error. */
-bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
+bool manifest_delete_missing_args_limited(const Config* config, const DeleteManifest* manifest,
                                           size_t max_delete, size_t* deleted, size_t* skipped,
                                           bool* limit_hit);
 /* Observer-aware form of manifest_delete_missing_args_limited: `observer` (may
    be NULL) is invoked for every destination-relative path truly removed. */
-bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteManifest* manifest,
-                                                   size_t max_delete, size_t* deleted,
-                                                   size_t* skipped, bool* limit_hit,
-                                                   DeletePathObserver observer,
-                                                   void* observer_context);
+bool manifest_delete_missing_args_limited_observed(
+    const Config* config, const DeleteManifest* manifest, size_t max_delete, size_t* deleted,
+    size_t* skipped, bool* limit_hit, DeletePathObserver observer, void* observer_context);
 /* Outcome of committing a delete manifest.  LIMIT_REACHED reports rsync's
    partial --max-delete result: the budget allowed some deletions and the rest
    were skipped (the run still stores all file data but the client exits 25). */
@@ -84,15 +82,16 @@ typedef enum {
    share one --max-delete budget.  Returns DELETE_COMMIT_OK when nothing was to
    do or everything committed, DELETE_COMMIT_LIMIT_REACHED when the budget
    stopped part of the work, or DELETE_COMMIT_ERROR on a genuine failure. */
-DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest);
+DeleteCommitResult manifest_delete_all(const Config* config, const DeleteManifest* manifest);
 /* Like manifest_delete_all, but reports how many destination entries the commit
    removed (for the end-of-transfer wire stats).  `deleted` may be NULL. */
-DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
+DeleteCommitResult manifest_delete_all_counted(const Config* config, const DeleteManifest* manifest,
                                                size_t* deleted);
 /* Observer-aware form of manifest_delete_all_counted: `observer` (may be NULL)
    is invoked for every destination-relative path truly removed. */
-DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteManifest* manifest,
-                                                size_t* deleted, DeletePathObserver observer,
+DeleteCommitResult manifest_delete_all_observed(const Config* config,
+                                                const DeleteManifest* manifest, size_t* deleted,
+                                                DeletePathObserver observer,
                                                 void* observer_context);
 
 /* -n/--dry-run --delete would-delete reporting: walk the destination exactly as
@@ -100,7 +99,7 @@ DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteMani
    WOULD be removed to `out`, without touching disk.  Uses the same staging-dir,
    basis-dir and protected-prefix skips as the real commit.  Returns true on a
    clean walk; `*count_out` receives the number of paths appended. */
-bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, ArrayList* out,
-                                size_t* count_out);
+bool manifest_would_delete_list(const Config* config, const DeleteManifest* manifest,
+                                ArrayList* out, size_t* count_out);
 
 #endif

@@ -341,7 +341,8 @@ bool config_derived_use_metadata(const Config* config) {
       config->chown_uid_set || config->chown_gid_set || config->usermap_count > 0 ||
       config->groupmap_count > 0 || config->update)
     return true;
-  return (config->use_incremental || config->use_delta) && !config->cli.metadata_explicitly_disabled;
+  return (config->use_incremental || config->use_delta) &&
+         !config->cli.metadata_explicitly_disabled;
 }
 
 bool config_has_basis(const Config* config) {

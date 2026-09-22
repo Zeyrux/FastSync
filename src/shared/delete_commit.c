@@ -136,7 +136,7 @@ typedef struct {
    alternate basis directories are never destination content and are skipped at
    any depth.  Returns true unless a traversal/unlink error aborted the walk;
    the budget's limit_hit/skipped fields report a cap-stopped run. */
-static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest* manifest,
+static bool delete_extras_budgeted_observed(const Config* config, const DeleteManifest* manifest,
                                             DeleteBudgetState* budget, DeletePathObserver observer,
                                             void* observer_context) {
   if (!config || !manifest || !manifest->keeps)
@@ -177,7 +177,7 @@ static bool delete_extras_budgeted_observed(const Config* config, DeleteManifest
   return true;
 }
 
-static bool delete_extras_budgeted(const Config* config, DeleteManifest* manifest,
+static bool delete_extras_budgeted(const Config* config, const DeleteManifest* manifest,
                                    DeleteBudgetState* budget) {
   return delete_extras_budgeted_observed(config, manifest, budget, NULL, NULL);
 }
@@ -215,7 +215,8 @@ static void prefixed_delete_observer(void* context, const char* rel) {
    --max-delete budget: once it is exhausted the remaining requests are skipped
    and counted.  Returns false only on a genuine error (a confinement failure on
    a validated path or an I/O error), which fails the run. */
-static bool delete_missing_args_budgeted_observed(const Config* config, DeleteManifest* manifest,
+static bool delete_missing_args_budgeted_observed(const Config* config,
+                                                  const DeleteManifest* manifest,
                                                   DeleteBudgetState* budget,
                                                   DeletePathObserver observer,
                                                   void* observer_context) {
@@ -376,8 +377,8 @@ static bool delete_missing_args_budgeted_observed(const Config* config, DeleteMa
 
 /* Public wrappers used outside the commit path (and by unit tests): no
    --max-delete budget. */
-bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, ArrayList* out,
-                                size_t* count_out) {
+bool manifest_would_delete_list(const Config* config, const DeleteManifest* manifest,
+                                ArrayList* out, size_t* count_out) {
   if (count_out)
     *count_out = 0;
   if (!config || !manifest || !manifest->keeps || !out)
@@ -391,30 +392,28 @@ bool manifest_would_delete_list(const Config* config, DeleteManifest* manifest, 
   return ok;
 }
 
-bool manifest_delete_extras(const Config* config, DeleteManifest* manifest) {
+bool manifest_delete_extras(const Config* config, const DeleteManifest* manifest) {
   DeleteBudgetState budget = {
       .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
   return delete_extras_budgeted(config, manifest, &budget);
 }
 
-bool manifest_delete_missing_args(const Config* config, DeleteManifest* manifest) {
+bool manifest_delete_missing_args(const Config* config, const DeleteManifest* manifest) {
   DeleteBudgetState budget = {
       .max_delete = SIZE_MAX, .deleted = 0, .skipped = 0, .limit_hit = false};
   return delete_missing_args_budgeted_observed(config, manifest, &budget, NULL, NULL);
 }
 
-bool manifest_delete_missing_args_limited(const Config* config, DeleteManifest* manifest,
+bool manifest_delete_missing_args_limited(const Config* config, const DeleteManifest* manifest,
                                           size_t max_delete, size_t* deleted, size_t* skipped,
                                           bool* limit_hit) {
   return manifest_delete_missing_args_limited_observed(config, manifest, max_delete, deleted,
                                                        skipped, limit_hit, NULL, NULL);
 }
 
-bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteManifest* manifest,
-                                                   size_t max_delete, size_t* deleted,
-                                                   size_t* skipped, bool* limit_hit,
-                                                   DeletePathObserver observer,
-                                                   void* observer_context) {
+bool manifest_delete_missing_args_limited_observed(
+    const Config* config, const DeleteManifest* manifest, size_t max_delete, size_t* deleted,
+    size_t* skipped, bool* limit_hit, DeletePathObserver observer, void* observer_context) {
   DeleteBudgetState budget = {
       .max_delete = max_delete, .deleted = 0, .skipped = 0, .limit_hit = false};
   bool ok =
@@ -435,17 +434,18 @@ bool manifest_delete_missing_args_limited_observed(const Config* config, DeleteM
    removal fail).  The ordinary extras walk then runs when --delete is active.
    Both draw from one --max-delete budget; the result reports a cap-stopped
    (partial) commit distinctly so the client can exit 25 like rsync. */
-DeleteCommitResult manifest_delete_all(const Config* config, DeleteManifest* manifest) {
+DeleteCommitResult manifest_delete_all(const Config* config, const DeleteManifest* manifest) {
   return manifest_delete_all_counted(config, manifest, NULL);
 }
 
-DeleteCommitResult manifest_delete_all_counted(const Config* config, DeleteManifest* manifest,
+DeleteCommitResult manifest_delete_all_counted(const Config* config, const DeleteManifest* manifest,
                                                size_t* deleted) {
   return manifest_delete_all_observed(config, manifest, deleted, NULL, NULL);
 }
 
-DeleteCommitResult manifest_delete_all_observed(const Config* config, DeleteManifest* manifest,
-                                                size_t* deleted, DeletePathObserver observer,
+DeleteCommitResult manifest_delete_all_observed(const Config* config,
+                                                const DeleteManifest* manifest, size_t* deleted,
+                                                DeletePathObserver observer,
                                                 void* observer_context) {
   if (deleted)
     *deleted = 0;
