@@ -78,6 +78,13 @@ typedef struct {
      path-only pre-scan on the calling thread and the pipeline scanner must not
      append to it.  Set once before the worker threads start. */
   bool early_delete;
+  /* --delete-before: the path-only pre-scan that built the early keep-set,
+     retained as the pipeline's file list (owning Chunk*; consumed and NULLed by
+     the scanner thread) so the data pass replays rsync's single file list
+     instead of re-reading the source.  NULL in every other mode, where the
+     scanner thread scans normally.  Set once before the worker threads start
+     and freed with the context. */
+  ArrayList* prescan_chunks;
   /* Non-NULL for --delete-during/--delete-delay: the per-directory plan set
      prebuilt by the path-only pre-scan on the calling thread.  The sender
      thread transmits the root plan before any data and the remaining plans

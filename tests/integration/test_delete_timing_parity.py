@@ -559,56 +559,72 @@ class TestDeleteDelayMaxDeleteRefilledDir:
 
 class TestDeleteBeforeLateFileParity:
     """rsync builds its file list once, so a source file created after that scan
-    is NOT transferred and its destination extra is deleted.  FastSync's
-    single-threaded --delete-before used to re-scan the source in its data pass
-    and would transfer the late file (a safe superset); it now replays the
-    pre-scan file list instead, matching rsync.
+    is NOT transferred and its destination extra is deleted.  FastSync used to
+    re-scan the source in its data pass (single-threaded) or pipeline a fresh
+    re-scan against the pre-scan keep-set (``--threads``) and would transfer the
+    late file (a safe superset); both paths now replay the pre-scan file list
+    instead, matching rsync.
 
     The late file is injected through the config-ack barrier: the first client
     bytes after the config ack are the pre-scan keep-set manifest, so the hook
     runs causally after the source scan and before the receiver's delete ack
-    releases the client into its data pass -- deterministic, no timing guess.
+    releases the client into its data pass.
+
+    For ``--threads`` the pipeline scanner runs concurrently with the sender, so
+    the injection must land while that re-scan is still in flight to be observed
+    by it.  The source is therefore a tree of ``_N_DIRS`` directories: the
+    injection writes the late file into EVERY directory, so it is enough that
+    any one directory is still unscanned when the hook fires.  The tree is sized
+    so the hook (a localhost round trip) lands long before a full scan finishes;
+    a re-scanning pipeline then transfers the late files for the directories it
+    has not yet reached, which the tree comparison catches.
     """
 
+    _N_DIRS = 2000
+
     @requires_rsync
-    def test_late_source_file_not_transferred_and_extra_deleted(self):
-        source = os.path.join(TEST_DATA_DIR, "dblate_src")
-        dest = os.path.join(TEST_DATA_DIR, "dblate_dst")
-        rsync_dst = os.path.join(TEST_DATA_DIR, "dblate_rsync_dst")
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_late_source_file_not_transferred_and_extra_deleted(self, mt):
+        tag = f"dblate_mt{int(mt)}"
+        source = os.path.join(TEST_DATA_DIR, f"{tag}_src")
+        dest = os.path.join(TEST_DATA_DIR, f"{tag}_dst")
+        rsync_dst = os.path.join(TEST_DATA_DIR, f"{tag}_rsync_dst")
         clean_dir(source)
         clean_dir(dest)
         clean_dir(rsync_dst)
-        _write(os.path.join(source, "d", "keep.txt"), b"kept payload\n")
+        for i in range(self._N_DIRS):
+            _write(os.path.join(source, f"dir{i:05d}", "keep.txt"), b"kept payload\n")
         # Both destinations carry the would-be late file as an extra.
         for root in (dest, rsync_dst):
-            _write(os.path.join(get_dest_received_dir(root, source), "d", "late.txt"),
-                   b"stale extra\n")
+            received = get_dest_received_dir(root, source)
+            for i in range(self._N_DIRS):
+                _write(os.path.join(received, f"dir{i:05d}", "late.txt"), b"stale extra\n")
 
-        # rsync reference: the same source with no late file; the extra is removed
-        # and nothing is transferred for the (never-scanned) late path.
+        # rsync reference: the same source with no late file; the extras are
+        # removed and nothing is transferred for the (never-scanned) late paths.
         rsync_result = _rsync(["-a", "--delete-before", source + "/", rsync_dst + "/"])
         assert rsync_result.returncode == 0, rsync_result.stderr
         rsync_tree = _tree(rsync_dst)
-        assert "d/late.txt" not in rsync_tree
+        assert "dir00000/late.txt" not in rsync_tree
 
         received = get_dest_received_dir(dest, source)
-        late_source = os.path.join(source, "d", "late.txt")
 
         def hook():
-            # Runs after the pre-scan and before the data pass begins.
-            _write(late_source, b"created after the scan\n")
+            # Runs after the pre-scan and before the receiver's delete ack.
+            for i in range(self._N_DIRS):
+                _write(os.path.join(source, f"dir{i:05d}", "late.txt"),
+                       b"created after the scan\n")
 
         with ServerManager() as server:
             server.start(extra_args=["--allow-delete"])
             proxy = _SlicingProxy(server.port, hook=hook, hook_after_config_ack=True)
-            result, _ = run_client(source, dest, flags=["--delete-before"], port=proxy.port)
+            flags = ["--delete-before"] + (["--threads=4"] if mt else [])
+            result, _ = run_client(source, dest, flags=flags, port=proxy.port)
             proxy.finish()
         assert result.returncode == 0, (result.stderr or result.stdout)[:400]
         assert proxy.hook_called.is_set(), "late-file hook never fired"
-        assert os.path.exists(late_source), "the source late file unexpectedly vanished"
-        assert not os.path.exists(os.path.join(received, "d", "late.txt")), (
-            "late source file was transferred: the single-threaded data pass re-scanned"
-        )
         assert _tree(received) == rsync_tree, (
-            f"fastsync tree {_tree(received)} != rsync tree {rsync_tree}"
+            f"late source {'multithreaded' if mt else 'single-threaded'} data pass re-scanned: "
+            f"{sum(1 for p in _tree(received) if p.endswith('late.txt'))} late files were "
+            "transferred"
         )
