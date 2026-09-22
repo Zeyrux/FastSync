@@ -381,21 +381,28 @@ bool files_from_list_check(const Config* config, ArrayList* missing_dest, int* s
    paths, loading and sending nothing.  --delete-before/--delete-during need the
    complete keep-set manifest before the first data byte, so it is built by a
    dedicated pre-scan pass and transmitted early; the data pass then re-scans
-   with a fresh scanner.  A source I/O error is fatal unless the options carry
-   --ignore-errors, in which case the scan continues past the unreadable
-   directory and *io_error_out reports it (the caller still performs the
-   deletion but reports the run as errored). */
+   with a fresh scanner.  --delete-before additionally replays this very scan as
+   its data pass (rsync's single file list), so `chunks_out` (optional) retains
+   the scanned Chunk objects for the caller to send instead of destroying them;
+   the caller owns the list and must give it a chunk_destroy destructor.  A
+   source I/O error is fatal unless the options carry --ignore-errors, in which
+   case the scan continues past the unreadable directory and *io_error_out
+   reports it (the caller still performs the deletion but reports the run as
+   errored). */
 bool scan_paths_only(const Config* config, const ScannerOptions* options, ArrayList* manifest,
                      DeletePlanSender* plans, bool* io_error_out,
-                     unsigned long long* non_dir_count_out) {
+                     unsigned long long* non_dir_count_out, ArrayList* chunks_out,
+                     bool emit_nonreg) {
   if (io_error_out)
     *io_error_out = false;
   if (non_dir_count_out)
     *non_dir_count_out = 0;
   ScannerOptions local = *options;
-  /* The pre-scan is a paths-only pass with no client output; it must not emit
-     --info=nonreg lines (the data pass does that once). */
-  local.note_nonreg = false;
+  /* The pre-scan is normally a paths-only pass with no client output: it must
+     not emit --info=nonreg lines because the data pass re-scans and emits them
+     once.  When the caller replays this scan as the data pass (--delete-before)
+     there is no later scan, so it opts in and the lines are emitted here. */
+  local.note_nonreg = emit_nonreg && options->note_nonreg;
   DirectoryScanner* scanner = directory_scanner_create_with_options(config->send_directory, &local);
   if (!scanner)
     return false;
@@ -430,7 +437,16 @@ bool scan_paths_only(const Config* config, const ScannerOptions* options, ArrayL
         break;
       }
     }
-    chunk_destroy(chunk);
+    if (chunks_out) {
+      /* Retain the chunk for the caller's data pass; ownership moves with it. */
+      if (!array_list_add(chunks_out, chunk)) {
+        ok = false;
+        chunk_destroy(chunk);
+        break;
+      }
+    } else {
+      chunk_destroy(chunk);
+    }
   }
   if (ok) {
     /* Keep every traversed source directory, including empty ones, so a plan

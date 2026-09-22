@@ -111,13 +111,20 @@ class _SlicingProxy:
     """
 
     def __init__(self, target_port, forward_limit=None, hook=None, hook_after=0,
-                 throttle=0.0, wait_for_reply=False):
+                 throttle=0.0, wait_for_reply=False, hook_after_config_ack=False):
         self.target = ("127.0.0.1", target_port)
         self.forward_limit = forward_limit
         self.hook = hook
         self.hook_after = hook_after
         self.throttle = throttle
         self.wait_for_reply = wait_for_reply
+        # When set, the hook fires on the FIRST client->server bytes that follow
+        # the config-frame ack, BEFORE they are forwarded.  For --delete-before
+        # those bytes are the keep-set manifest, so this runs the hook after the
+        # client's source pre-scan but before the receiver's delete ack releases
+        # the client into its data pass -- a deterministic late-file window.
+        self.hook_after_config_ack = hook_after_config_ack
+        self.config_acked = False
         self.server_replied = threading.Event()
         self.hook_called = threading.Event()
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -165,6 +172,13 @@ class _SlicingProxy:
                                 socks = []
                                 break
                             data = data[:room]
+                        if (self.hook_after_config_ack and self.config_acked and self.hook is not None
+                                and not self.hook_called.is_set()):
+                            # The first client bytes after the config ack are the
+                            # pre-scan keep-set manifest: run the injection before
+                            # forwarding so it is causally after the source scan.
+                            self.hook()
+                            self.hook_called.set()
                         backend.sendall(data)
                         forwarded += len(data)
                         self._maybe_hook(forwarded)
@@ -177,6 +191,7 @@ class _SlicingProxy:
                         client.sendall(data)
                         # Any server reply proves the receiver consumed the
                         # frames that precede it, so the hook barrier is met.
+                        self.config_acked = True
                         self.server_replied.set()
                         self._maybe_hook(forwarded)
         except OSError:
@@ -198,8 +213,11 @@ class _SlicingProxy:
     def _maybe_hook(self, forwarded):
         """Fire the one-shot hook once its barrier is satisfied: enough client
         bytes have been forwarded and, when ``wait_for_reply`` is set, the
-        server has sent a reply proving it processed the preceding frames."""
-        if self.hook is None or self.hook_called.is_set():
+        server has sent a reply proving it processed the preceding frames.
+
+        ``hook_after_config_ack`` uses its own barrier (see ``_serve``), so the
+        byte/reply heuristic is bypassed entirely."""
+        if self.hook is None or self.hook_called.is_set() or self.hook_after_config_ack:
             return
         if forwarded < self.hook_after:
             return
@@ -537,3 +555,60 @@ class TestDeleteDelayMaxDeleteRefilledDir:
         assert os.path.isdir(later_dir), "later extra was not skipped by the budget"
         # The one actual removal is reported.
         assert _deleted_count(result.stdout) == 1, result.stdout
+
+
+class TestDeleteBeforeLateFileParity:
+    """rsync builds its file list once, so a source file created after that scan
+    is NOT transferred and its destination extra is deleted.  FastSync's
+    single-threaded --delete-before used to re-scan the source in its data pass
+    and would transfer the late file (a safe superset); it now replays the
+    pre-scan file list instead, matching rsync.
+
+    The late file is injected through the config-ack barrier: the first client
+    bytes after the config ack are the pre-scan keep-set manifest, so the hook
+    runs causally after the source scan and before the receiver's delete ack
+    releases the client into its data pass -- deterministic, no timing guess.
+    """
+
+    @requires_rsync
+    def test_late_source_file_not_transferred_and_extra_deleted(self):
+        source = os.path.join(TEST_DATA_DIR, "dblate_src")
+        dest = os.path.join(TEST_DATA_DIR, "dblate_dst")
+        rsync_dst = os.path.join(TEST_DATA_DIR, "dblate_rsync_dst")
+        clean_dir(source)
+        clean_dir(dest)
+        clean_dir(rsync_dst)
+        _write(os.path.join(source, "d", "keep.txt"), b"kept payload\n")
+        # Both destinations carry the would-be late file as an extra.
+        for root in (dest, rsync_dst):
+            _write(os.path.join(get_dest_received_dir(root, source), "d", "late.txt"),
+                   b"stale extra\n")
+
+        # rsync reference: the same source with no late file; the extra is removed
+        # and nothing is transferred for the (never-scanned) late path.
+        rsync_result = _rsync(["-a", "--delete-before", source + "/", rsync_dst + "/"])
+        assert rsync_result.returncode == 0, rsync_result.stderr
+        rsync_tree = _tree(rsync_dst)
+        assert "d/late.txt" not in rsync_tree
+
+        received = get_dest_received_dir(dest, source)
+        late_source = os.path.join(source, "d", "late.txt")
+
+        def hook():
+            # Runs after the pre-scan and before the data pass begins.
+            _write(late_source, b"created after the scan\n")
+
+        with ServerManager() as server:
+            server.start(extra_args=["--allow-delete"])
+            proxy = _SlicingProxy(server.port, hook=hook, hook_after_config_ack=True)
+            result, _ = run_client(source, dest, flags=["--delete-before"], port=proxy.port)
+            proxy.finish()
+        assert result.returncode == 0, (result.stderr or result.stdout)[:400]
+        assert proxy.hook_called.is_set(), "late-file hook never fired"
+        assert os.path.exists(late_source), "the source late file unexpectedly vanished"
+        assert not os.path.exists(os.path.join(received, "d", "late.txt")), (
+            "late source file was transferred: the single-threaded data pass re-scanned"
+        )
+        assert _tree(received) == rsync_tree, (
+            f"fastsync tree {_tree(received)} != rsync tree {rsync_tree}"
+        )
