@@ -735,11 +735,13 @@ typedef struct Config {
    * --copy-as) imply it. */
   /* fake_super */
   /* --fake-super: receiver-only.  When set, each written file additionally gets
-   * a reserved user.fastsync.stat xattr recording the RESOLVED uid/gid (the
+   * rsync's reserved user.rsync.%stat xattr recording the RESOLVED uid/gid (the
    * source's own when no ownership request is active, else the --chown/--usermap
-   * result) plus mode/mtime so a later privileged restore could re-apply them.
-   * It NEVER real-chowns: the point is to record the source ownership on an
-   * unprivileged receiver.  Crosses the wire. */
+   * result) plus the full mode and rdev, in rsync 3.4.1's grammar, so the tree is
+   * interoperable and a later privileged restore could re-apply them.  mtime is
+   * carried by the file's own timestamp, exactly as rsync does it.  It NEVER
+   * real-chowns: the point is to record the source ownership on an unprivileged
+   * receiver.  Crosses the wire. */
   /* module */
   /* Daemon module selection (Wave A, protocol 2.15.0).  Client-composed from a
    * host::module/path destination; NULL or "" means "no module" (the ordinary

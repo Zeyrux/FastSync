@@ -1189,14 +1189,15 @@ static void restore_extra_fd(int fd, const FileMetadata* metadata, const FileXat
        ownership request (--chown/--usermap/--groupmap/--copy-as or -o/-g) is
        active, the resolved mapping; otherwise the source's own id.  The real
        chown is suppressed (identity_apply_ownership early-returns under
-       --fake-super) so recording never defeats the flag.  Mode/mtime are still
-       replayed (policy-gated) so unprivileged --fake-super keeps working. */
+       --fake-super) so recording never defeats the flag.  The recorded stat is
+       rsync's format; the permission bits are replayed (policy-gated) so
+       unprivileged --fake-super keeps working while mtime comes from the
+       normal metadata path above. */
     uint32_t store_uid;
     uint32_t store_gid;
     identity_resolve_storage_ids((int32_t)metadata->uid, (int32_t)metadata->gid, &store_uid,
                                  &store_gid);
-    fake_super_store_fd(fd, store_uid, store_gid, (uint32_t)metadata->mode, metadata->mtime_sec,
-                        metadata->mtime_nsec);
+    fake_super_store_fd(fd, store_uid, store_gid, (uint32_t)metadata->mode, 0, 0);
     fake_super_restore_fd(fd, policy);
   }
 }

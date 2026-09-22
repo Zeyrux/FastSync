@@ -187,7 +187,7 @@ This produces `./build/client` and `./build/server`. `compile_commands.json` is 
 | `--groupmap=MAP` | Map group names when applying ownership |
 | `--numeric-ids` | Apply source numeric uid/gid directly instead of mapping by name |
 | `--copy-as=USER[:GROUP]` | Force every written entry to USER[:GROUP] (requires a privileged receiver) |
-| `--fake-super` | Record the resolved owner plus mode/time in a reserved `user.fastsync.stat` xattr and replay mode/time; never performs a real chown |
+| `--fake-super` | Record the resolved owner plus full mode/rdev in rsync's reserved `user.rsync.%stat` xattr (rsync 3.4.1 grammar) and replay the permission bits; never performs a real chown |
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes) |
 | `-D` | Preserve device and special files (implies `--devices --specials`) |
 | `--devices` | Recreate device nodes on the destination (privileged; skipped without `CAP_MKNOD`) |
@@ -643,7 +643,7 @@ remote SSH argv is already built injection-safe.
 | `--groupmap=MAP` | Map group names when applying ownership (same syntax as `--usermap`). |
 | `--numeric-ids` | Mapping modifier: apply the source numeric uid/gid directly instead of mapping by name (combine with `-o`/`-g`, `-a`, or a map). |
 | `--copy-as=USER[:GROUP]` | Force every written entry to USER[:GROUP]; requires a privileged receiver. |
-| `--fake-super` | Record the resolved owner plus mode/time in a reserved `user.fastsync.stat` xattr and replay mode/time; never performs a real chown. |
+| `--fake-super` | Record the resolved owner plus full mode/rdev in rsync's reserved `user.rsync.%stat` xattr (rsync 3.4.1 grammar) and replay the permission bits; never performs a real chown. |
 | `--super` | Permit the receiver to attempt confined super-user activities (device nodes). |
 | `--no-super` | Forbid those super-user activities even when the receiver is root. |
 | `-l`, `--links` | Copy symlinks as symlinks; the target is stored verbatim (absolute and `..`-bearing targets included), matching rsync. |
