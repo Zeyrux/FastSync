@@ -2,6 +2,7 @@
 #include "xattr.h"
 #include "config.h"
 #include "file.h"
+#include "file_save.h"
 #include "identity.h"
 #include "protocol.h"
 #include "test_utils.h"
@@ -540,6 +541,54 @@ static void test_xattr_list_clone() {
   xattr_list_free(clone);
 }
 
+/* #286.3: an explicit directory entry (--dirs, STATUS_MKDIR) that carries a
+ * captured user.* xattr must have it applied fd-relative by the directory
+ * install path itself -- not only by the receiver's deferred DirTimeList, which
+ * a direct file_save_to_disk_full() caller does not use. */
+static void test_file_save_directory_applies_xattrs() {
+  const char* root = "test_save_dir_xattr_tmp";
+  const char* leaf = "subdir";
+  const char* path = "test_save_dir_xattr_tmp/subdir";
+  rmdir(path);
+  rmdir(root);
+  EXPECT_EQ_INT(mkdir(root, 0700), 0);
+  /* The working directory may be a filesystem without user xattrs (e.g. some
+     tmpfs mounts): skip cleanly rather than fail the suite. */
+  if (setxattr(root, "user.fastsync-dirprobe", "p", 1, 0) != 0) {
+    rmdir(root);
+    return;
+  }
+  removexattr(root, "user.fastsync-dirprobe");
+
+  File* dir = file_create(leaf);
+  EXPECT_NOT_NULL(dir);
+  dir->is_dir = true;
+  FileXattrList* xattrs = xattr_list_new();
+  EXPECT_NOT_NULL(xattrs);
+  EXPECT_TRUE(xattr_list_append(xattrs, "user.dirxattr", "dirvalue", 8));
+  dir->xattrs = xattrs;
+
+  Config* config = config_create();
+  EXPECT_NOT_NULL(config);
+  config->use_metadata = true;
+  config->use_xattrs = true;
+  config->preserve_xattrs = true;
+
+  EXPECT_EQ_INT(file_save_to_disk_full(root, dir, config), FILE_SAVE_WRITTEN);
+  EXPECT_EQ_INT(access(path, F_OK), 0);
+
+  char value[32];
+  ssize_t got = getxattr(path, "user.dirxattr", value, sizeof(value));
+  EXPECT_EQ_INT((int)got, 8);
+  EXPECT_TRUE(got == 8 && memcmp(value, "dirvalue", 8) == 0);
+
+  file_destroy(dir);
+  config_delete(config);
+  removexattr(path, "user.dirxattr");
+  rmdir(path);
+  rmdir(root);
+}
+
 void test_xattr() {
   test_xattr_list_clone();
   test_xattr_wire_roundtrip();
@@ -553,4 +602,5 @@ void test_xattr() {
   test_fake_super_restore();
   test_fake_super_no_real_chown();
   test_fake_super_storage_resolution();
+  test_file_save_directory_applies_xattrs();
 }

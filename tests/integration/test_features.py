@@ -6751,6 +6751,31 @@ class TestExtendedAttributes:
         assert os.getxattr(os.path.join(received, "sub"), "user.subdir") == b"s"
 
     @pytest.mark.ci
+    @pytest.mark.parametrize("mt", [False, True])
+    def test_dirs_directory_xattr_applied(self, shared_server, mt):
+        """#286.3: -d/-X must apply a transferred directory's user.* xattr at the
+        destination through the --dirs STATUS_MKDIR path (both the
+        single-threaded and -m/--threads receiver paths)."""
+        source, dest = self._source_and_dest("dirsxattr")
+        sub = os.path.join(source, "sub")
+        os.makedirs(sub)
+        if not _xattr_supported(sub):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(sub, "user.dirsdir", b"dirs-value")
+        lst = os.path.join(TEST_DATA_DIR, "dirs_xattr_list.txt")
+        with open(lst, "wb") as fh:
+            fh.write(b"sub\n")
+
+        flags = ["--files-from", lst, "--dirs", "-R", "-X"] + (["--threads"] if mt else [])
+        result, _ = run_client(source, dest, flags=flags, port=shared_server.port)
+        assert result.returncode == 0, \
+            f"--dirs -X sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = os.path.join(dest, "sub")
+        assert os.path.isdir(received), "--dirs directory entry was not created"
+        assert os.getxattr(received, "user.dirsdir") == b"dirs-value", \
+            "the --dirs directory's user.* xattr was not applied at the destination"
+
+    @pytest.mark.ci
     def test_directory_default_acl_preserved(self, shared_server):
         """#286.3: -aA must preserve a directory's default POSIX ACL (the
         system.posix_acl_default xattr), which regular-file ACLs do not cover."""
