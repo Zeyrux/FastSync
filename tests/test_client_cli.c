@@ -3541,9 +3541,14 @@ static void test_parse_args_usermap_rsync_forms() {
 
 /* Independent oracle for the FROM name-glob tests: enumerate the sender's
  * account database and fill `ids` with the DISTINCT ids whose name matches
- * `glob`, sorted ascending.  Returns the count (bounded by `max`). */
+ * `glob`, sorted ascending.  Returns the count, or -1 if the matching set
+ * exceeds `max` distinct ids -- production has no such bound on the number of
+ * candidates it scans, so a truncated set would under-count runs and flake on
+ * hosts with very large account databases.  Callers must skip (not fail) on
+ * -1. */
 static int cli_collect_glob_ids(const char* glob, bool is_group, int32_t* ids, int max) {
   int n = 0;
+  bool overflow = false;
   if (is_group) {
     setgrent();
     struct group* gr;
@@ -3557,8 +3562,13 @@ static int cli_collect_glob_ids(const char* glob, bool is_group, int32_t* ids, i
       for (int i = 0; i < n; i++)
         if (ids[i] == id)
           dup = true;
-      if (!dup && n < max)
-        ids[n++] = id;
+      if (dup)
+        continue;
+      if (n >= max) {
+        overflow = true;
+        break;
+      }
+      ids[n++] = id;
     }
     endgrent();
   } else {
@@ -3574,8 +3584,13 @@ static int cli_collect_glob_ids(const char* glob, bool is_group, int32_t* ids, i
       for (int i = 0; i < n; i++)
         if (ids[i] == id)
           dup = true;
-      if (!dup && n < max)
-        ids[n++] = id;
+      if (dup)
+        continue;
+      if (n >= max) {
+        overflow = true;
+        break;
+      }
+      ids[n++] = id;
     }
     endpwent();
   }
@@ -3588,7 +3603,7 @@ static int cli_collect_glob_ids(const char* glob, bool is_group, int32_t* ids, i
     }
     ids[j + 1] = key;
   }
-  return n;
+  return overflow ? -1 : n;
 }
 
 static int cli_count_runs(const int32_t* ids, int n) {
@@ -3615,8 +3630,10 @@ static void test_parse_args_identity_map_from_name_glob(bool is_group) {
     const char glob[3] = {c, '*', '\0'};
     int n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
     if (n < 2)
-      continue;
+      continue; /* no matches, or the set overflowed the oracle's buffer */
     int runs = cli_count_runs(ids, n);
+    if (runs > MAX_IDENTITY_MAP)
+      continue; /* production would reject this expansion; try another prefix */
     if (runs >= 2 || chosen_c == 0) {
       chosen_c = c;
       chosen_n = n;
@@ -3630,6 +3647,8 @@ static void test_parse_args_identity_map_from_name_glob(bool is_group) {
 
   const char glob[3] = {chosen_c, '*', '\0'};
   chosen_n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+  if (chosen_n < 2)
+    return; /* account DB changed under us: skip, don't flake */
   chosen_runs = cli_count_runs(ids, chosen_n);
   EXPECT_TRUE(chosen_n >= 2);
 
@@ -3675,6 +3694,58 @@ static void test_parse_args_usermap_from_name_glob() {
 
 static void test_parse_args_groupmap_from_name_glob() {
   test_parse_args_identity_map_from_name_glob(true);
+}
+
+/* Regression for a leak in the FROM name-glob success path: the TO side is
+ * parsed into `parsed.to_name` before the glob is expanded, and every emitted
+ * rule takes its own str_dup of that name -- so the parse-time copy must be
+ * released before the branch continues.  A numeric TO has to_name == NULL and
+ * cannot expose the leak, hence this uses a NAME TO.  The name is resolved on
+ * the receiver (not here), so any well-formed non-glob name works.  Run this
+ * under ASan/valgrind to catch the leak. */
+static void test_parse_args_identity_map_from_name_glob_name_to(bool is_group) {
+  int32_t ids[512];
+  char chosen_c = 0;
+  for (char c = 'a'; c <= 'z'; c++) {
+    const char glob[3] = {c, '*', '\0'};
+    int n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+    if (n < 2)
+      continue;
+    if (cli_count_runs(ids, n) > MAX_IDENTITY_MAP)
+      continue;
+    chosen_c = c;
+    break;
+  }
+  if (chosen_c == 0)
+    return; /* no multi-match prefix on this host (skipped, not failed) */
+
+  const char glob[3] = {chosen_c, '*', '\0'};
+  char map_value[32];
+  snprintf(map_value, sizeof(map_value), "%s:nobody", glob);
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", is_group ? "--groupmap" : "--usermap", map_value, "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+
+  int got = is_group ? cfg->groupmap_count : cfg->usermap_count;
+  EXPECT_TRUE(got >= 1);
+  const IdentityMap* map = is_group ? cfg->groupmap : cfg->usermap;
+  for (int r = 0; r < got; r++) {
+    EXPECT_EQ_INT(map[r].to, 0);
+    EXPECT_NOT_NULL(map[r].to_name);
+    if (map[r].to_name)
+      EXPECT_EQ_STR(map[r].to_name, "nobody");
+  }
+  config_delete(cfg);
+}
+
+static void test_parse_args_usermap_from_name_glob_name_to() {
+  test_parse_args_identity_map_from_name_glob_name_to(false);
+}
+
+static void test_parse_args_groupmap_from_name_glob_name_to() {
+  test_parse_args_identity_map_from_name_glob_name_to(true);
 }
 
 /* #294: an expansion that would push the map past MAX_IDENTITY_MAP must fail
@@ -5053,6 +5124,8 @@ void test_client_cli() {
   test_parse_args_usermap_rsync_forms();
   test_parse_args_usermap_from_name_glob();
   test_parse_args_groupmap_from_name_glob();
+  test_parse_args_usermap_from_name_glob_name_to();
+  test_parse_args_groupmap_from_name_glob_name_to();
   test_parse_args_identity_map_from_name_glob_over_cap();
   test_parse_args_identity_map_chown_conflict();
   test_parse_args_chown();
