@@ -730,7 +730,7 @@ static void test_parse_args_port_alias() {
   EXPECT_EQ_INT(cfg->server_port, 9000);
   /* The default port is 8080; the explicit bit is what lets --dry-run tell an
      explicit remote target from the default and route to the server. */
-  EXPECT_TRUE(cfg->server_port_set);
+  EXPECT_TRUE(cfg->cli.server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -738,7 +738,7 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9001);
-  EXPECT_TRUE(cfg->server_port_set);
+  EXPECT_TRUE(cfg->cli.server_port_set);
   config_delete(cfg);
 
   cfg = config_create();
@@ -746,7 +746,7 @@ static void test_parse_args_port_alias() {
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_long, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->server_port, 9002);
-  EXPECT_TRUE(cfg->server_port_set);
+  EXPECT_TRUE(cfg->cli.server_port_set);
   config_delete(cfg);
 }
 
@@ -757,18 +757,18 @@ static void test_parse_args_server_host_sets_routing_bit() {
   Config* cfg = config_create();
   int positional_args[2];
   int positional_count = 0;
-  EXPECT_FALSE(cfg->server_host_set);
+  EXPECT_FALSE(cfg->cli.server_host_set);
   char* argv_space[] = {"fastsync", "--server-host", "example.test", "/src", "/dst"};
   EXPECT_EQ_INT(parse_args(cfg, 5, argv_space, positional_args, &positional_count), 0);
   EXPECT_EQ_STR(cfg->server_host, "example.test");
-  EXPECT_TRUE(cfg->server_host_set);
+  EXPECT_TRUE(cfg->cli.server_host_set);
   config_delete(cfg);
 
   cfg = config_create();
   char* argv_inline[] = {"fastsync", "--server-host=example.test", "/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv_inline, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->server_host_set);
+  EXPECT_TRUE(cfg->cli.server_host_set);
   config_delete(cfg);
 }
 
@@ -1726,7 +1726,7 @@ static void test_parse_args_no_preserve_blocks_implicit_metadata() {
 
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
     EXPECT_FALSE(cfg->use_metadata);
-    EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+    EXPECT_TRUE(cfg->cli.metadata_explicitly_disabled);
     config_delete(cfg);
   }
 }
@@ -1777,7 +1777,7 @@ static void test_parse_args_checksum_choice_rejects_unsupported() {
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
-    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+    EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
     config_delete(cfg);
   }
 }
@@ -1817,7 +1817,7 @@ static void test_parse_args_checksum_choice_new_algos() {
     positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
     EXPECT_EQ_INT(cfg->checksum_algo, single[i]);
-    EXPECT_EQ_INT(cfg->checksum_transfer_algo, single[i]);
+    EXPECT_EQ_INT(cfg->cli.checksum_transfer_algo, single[i]);
     config_delete(cfg);
   }
 
@@ -1827,7 +1827,7 @@ static void test_parse_args_checksum_choice_new_algos() {
   char* argv5[] = {"fastsync", "--cc=sha1,md4", "/checksum/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv5, positional_args, &positional_count), 0);
-  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_SHA1);
+  EXPECT_EQ_INT(cfg->cli.checksum_transfer_algo, (int)CHECKSUM_ALGO_SHA1);
   EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD4);
   config_delete(cfg);
 
@@ -1849,14 +1849,14 @@ static void test_parse_args_checksum_none_with_checksum_rejected() {
   int positional_args[2];
   int positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
 
   cfg = config_create();
   char* argv2[] = {"fastsync", "--checksum", "--cc=md5,none", "/checksum/src", "/dst"};
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 5, argv2, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
 
   /* "none" as the TRANSFER checksum with a real pre-transfer checksum is
@@ -1958,7 +1958,7 @@ static void test_parse_args_compress_choice_parity() {
     int positional_args[2];
     int positional_count = 0;
     EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
-    EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+    EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
     config_delete(cfg);
   }
 }
@@ -2078,6 +2078,9 @@ static void test_parse_args_temp_dir() {
   config_delete(cfg);
 }
 
+/* --old-args is accepted for rsync CLI compatibility as a documented no-op (the
+ * remote server path is always safely quoted); it stores no Config field, so
+ * parsing it must simply succeed and leave the positional arguments intact. */
 static void test_parse_args_old_args() {
   Config* cfg = config_create();
   char* argv[] = {"fastsync", "--old-args", "/src", "/dst"};
@@ -2085,7 +2088,7 @@ static void test_parse_args_old_args() {
   int positional_count = 0;
 
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
-  EXPECT_TRUE(cfg->old_args);
+  EXPECT_EQ_INT(positional_count, 2);
   config_delete(cfg);
 }
 
@@ -2719,7 +2722,7 @@ static void test_parse_args_compression_env_list() {
   cfg = config_create();
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
   unsetenv("RSYNC_COMPRESS_LIST");
 }
@@ -2734,7 +2737,7 @@ static void test_parse_args_checksum_env_list() {
   setenv("RSYNC_CHECKSUM_LIST", "md5", 1);
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), 0);
   EXPECT_EQ_INT(cfg->checksum_algo, (int)CHECKSUM_ALGO_MD5);
-  EXPECT_EQ_INT(cfg->checksum_transfer_algo, (int)CHECKSUM_ALGO_MD5);
+  EXPECT_EQ_INT(cfg->cli.checksum_transfer_algo, (int)CHECKSUM_ALGO_MD5);
   config_delete(cfg);
 
   /* An explicit --cc wins. */
@@ -2750,7 +2753,7 @@ static void test_parse_args_checksum_env_list() {
   cfg = config_create();
   positional_count = 0;
   EXPECT_EQ_INT(parse_args(cfg, 4, argv, positional_args, &positional_count), -1);
-  EXPECT_EQ_INT(cfg->cli_exit_code, 4);
+  EXPECT_EQ_INT(cfg->cli.cli_exit_code, 4);
   config_delete(cfg);
   unsetenv("RSYNC_CHECKSUM_LIST");
 }
@@ -4385,7 +4388,7 @@ static void test_parse_args_preserve_long_form() {
 }
 
 /* --no-perms/--no-times/--no-owner/--no-group (long and short) clear only
- * their own attribute bit; they never set metadata_explicitly_disabled. */
+ * their own attribute bit; they never set cli.metadata_explicitly_disabled. */
 static void test_parse_args_preserve_negations() {
   struct {
     const char* arg;
@@ -4413,7 +4416,7 @@ static void test_parse_args_preserve_negations() {
       bool expected = all[j] != cases[i].offset;
       EXPECT_TRUE(*(bool*)((char*)cfg + all[j]) == expected);
     }
-    EXPECT_FALSE(cfg->metadata_explicitly_disabled);
+    EXPECT_FALSE(cfg->cli.metadata_explicitly_disabled);
     /* -a's devices/specials keep the metadata frame on. */
     EXPECT_TRUE(cfg->use_metadata);
     config_delete(cfg);
@@ -4456,7 +4459,7 @@ static void test_parse_args_no_preserve_disables_bundle() {
   EXPECT_FALSE(cfg->preserve_times);
   EXPECT_FALSE(cfg->preserve_owner);
   EXPECT_FALSE(cfg->preserve_group);
-  EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+  EXPECT_TRUE(cfg->cli.metadata_explicitly_disabled);
   EXPECT_TRUE(cfg->use_incremental);
   EXPECT_FALSE(cfg->use_metadata);
   config_delete(cfg);
@@ -4509,7 +4512,7 @@ static void test_parse_args_incremental_implies_preserve() {
   EXPECT_EQ_INT(parse_args(cfg, 5, argv4, positional_args, &positional_count), 0);
   EXPECT_FALSE(cfg->preserve_perms);
   EXPECT_FALSE(cfg->preserve_times);
-  EXPECT_TRUE(cfg->metadata_explicitly_disabled);
+  EXPECT_TRUE(cfg->cli.metadata_explicitly_disabled);
   EXPECT_FALSE(cfg->use_metadata);
   config_delete(cfg);
 }
