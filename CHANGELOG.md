@@ -21,7 +21,9 @@ reclassification is `--filter=RULE` moving ✅ → ⚠️, because its merge-onl
 `e`/`n`/`w`/`-` modifiers are now accepted and consumed but their semantics
 remain unimplemented (accepted-but-ignored); the matrix is therefore **119 ✅ /
 11 ⚠️ / 27 ❌** of 157 rows. The affected rows' notes and the summary tally in
-`RSYNC_COMPAT.md` were updated.
+`RSYNC_COMPAT.md` were updated. A following triage-fix cycle (see **Triage
+fixes** below) moves `-F` and `-i` to ⚠️, for a final **117 ✅ / 13 ⚠️ / 27 ❌**
+of 157 rows.
 
 ### Changed
 
@@ -134,6 +136,32 @@ remain unimplemented (accepted-but-ignored); the matrix is therefore **119 ✅ /
   printf format attributes (fixing format mismatches). `RSYNC_COMPAT.md`,
   `CHANGELOG.md` and `HANDOFF.md` were updated for the audit cycle; the
   `RSYNC_COMPAT.md` summary tally was corrected to match the rows.
+
+### Triage fixes
+
+- **`--dirs` directory xattrs applied inline.** A `-d/--dirs` transfer now
+  applies captured directory `-X`/`-A` xattrs fd-relative on the directory entry
+  instead of dropping them, so directory xattrs survive the non-recursive path
+  (`src/shared/file_save.c`, `tests/test_xattr.c`).
+- **Directory/root itemize and `--out-format` lines.** `-i`/`--itemize-changes`
+  and `--out-format` now emit the transfer-root `./` line and per-directory
+  `cd...`/`.d..t...` lines, rendered by the shared itemize code. This matches
+  rsync's fresh-transfer output; because the root line is unconditional and an
+  incremental re-run may itemize directories/symlinks that rsync's quick-check
+  leaves silent, `-i` is now a ⚠️ Caveat row.
+- **FROM name globs for identity maps.** `--usermap`/`--groupmap` `FROM` tokens
+  now accept `*`/`?`/`[...]` globs, expanded sender-side against the passwd/group
+  database and collapsed into bounded numeric ranges (`MAX_IDENTITY_MAP`),
+  matching rsync.
+- **Transport fallback unit tests.** Added unit coverage for the TCP/TLS
+  transport fallback paths (`tests/test_transport_tcp.c`,
+  `tests/test_transport_tls.c`).
+- **Docs corrections.** `RSYNC_COMPAT.md`/`README.md` corrected stale parity
+  claims for issues #286–#297: the `-F` and `-i` reclassifications, the
+  `--munge-links` direction, the accepted checksum/compression name sets,
+  `--bwlimit` parsing, `--stop-at` grammar, `--trust-sender`, symlink xattrs, and
+  the native/non-interoperable batch and credential notes. The summary tally is
+  now **117 ✅ / 13 ⚠️ / 27 ❌** of 157 rows.
 
 ## [2.28.0] - 2026-09-20
 

@@ -3,6 +3,7 @@
 #include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
@@ -11,6 +12,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static bool identity_id_fits_int32(unsigned long id);
 
 /* The active identity snapshot lives in a per-process global.  The TCP server
  * forks one child process per connection, so a connection never shares this
@@ -419,17 +422,10 @@ static int identity_parse_from(const char* token, bool is_group, int32_t* out_fr
     /* Not a numeric LOW-HIGH range: fall through and treat as a name (a
      * hyphenated account name like "wayne-smith" must still resolve). */
   }
-  /* A sender-side name.  A wildcard other than the bare '*' is matched by rsync
-   * against the sender's names; because FastSync transmits numeric ids only, the
-   * receiver cannot evaluate it, so reject rather than silently mis-match. */
-  if (identity_token_has_glob(token)) {
-    log_message(LOG_LEVEL_ERROR,
-                "%smap FROM '%s': name wildcards other than '*' are not supported "
-                "(FastSync transmits numeric ids, so sender names are unavailable on the "
-                "receiver)",
-                is_group ? "--group" : "--user", token);
-    return -1;
-  }
+  /* A sender-side name.  A FROM name wildcard other than the bare '*' is handled
+   * by identity_expand_from_glob() in the caller (it expands against the
+   * sender's account database at CLI-parse time), so this function only sees the
+   * bare '*' or a literal name here. */
   int32_t id;
   if (identity_resolve_token(token, is_group, &id) != 0)
     return -1;
@@ -486,6 +482,138 @@ static int identity_append_rule(IdentityMap** map, int* count, const IdentityMap
   return 0;
 }
 
+/* True when `lo` and `hi` are adjacent ids (no overflow at INT32_MAX). */
+static bool identity_ids_adjacent(int32_t lo, int32_t hi) {
+  return lo < INT32_MAX && hi == lo + 1;
+}
+
+static int identity_id_cmp(const void* a, const void* b) {
+  int32_t x = *(const int32_t*)a;
+  int32_t y = *(const int32_t*)b;
+  return (x > y) - (x < y);
+}
+
+static bool identity_ids_push(int32_t** ids, size_t* count, size_t* cap, int32_t id) {
+  if (*count == *cap) {
+    size_t grown_cap = *cap ? *cap * 2 : 16;
+    int32_t* grown = realloc(*ids, grown_cap * sizeof(int32_t));
+    if (!grown)
+      return false;
+    *ids = grown;
+    *cap = grown_cap;
+  }
+  (*ids)[(*count)++] = id;
+  return true;
+}
+
+/* Expand a FROM name wildcard (rsync's match against sender-side account names)
+ * into one rule per contiguous run of matching numeric ids, all sharing the same
+ * TO side.  FastSync transmits numeric ids only, so the wildcard must be
+ * resolved here -- at CLI-parse time -- against the SENDER's passwd/group
+ * database; the receiver has no sender names to match.  Contiguous matched ids
+ * are collapsed into a single LOW-HIGH range (a range of adjacent ids contains
+ * exactly the ids it spans, so this is semantically exact).  Returns 0 on
+ * success, -1 on an allocation failure, a wildcard that matches no sender
+ * account, or an expansion that would push the map past MAX_IDENTITY_MAP. */
+static int identity_expand_from_glob(Config* config, const char* glob, bool is_group,
+                                     const IdentityMap* to_rule) {
+  const char* optname = is_group ? "--groupmap" : "--usermap";
+  size_t cap = 0;
+  size_t n = 0;
+  int32_t* ids = NULL;
+  bool alloc_failed = false;
+
+  if (is_group) {
+    setgrent();
+    struct group* gr;
+    while ((gr = getgrent()) != NULL) {
+      if (fnmatch(glob, gr->gr_name, 0) != 0)
+        continue;
+      if (!identity_id_fits_int32((unsigned long)gr->gr_gid))
+        continue;
+      if (!identity_ids_push(&ids, &n, &cap, (int32_t)gr->gr_gid)) {
+        alloc_failed = true;
+        break;
+      }
+    }
+    endgrent();
+  } else {
+    setpwent();
+    struct passwd* pw;
+    while ((pw = getpwent()) != NULL) {
+      if (fnmatch(glob, pw->pw_name, 0) != 0)
+        continue;
+      if (!identity_id_fits_int32((unsigned long)pw->pw_uid))
+        continue;
+      if (!identity_ids_push(&ids, &n, &cap, (int32_t)pw->pw_uid)) {
+        alloc_failed = true;
+        break;
+      }
+    }
+    endpwent();
+  }
+
+  if (alloc_failed) {
+    free(ids);
+    log_message(LOG_LEVEL_ERROR, "%s: memory allocation failed expanding FROM '%s'", optname, glob);
+    return -1;
+  }
+  if (n == 0) {
+    free(ids);
+    log_message(LOG_LEVEL_ERROR, "%s FROM '%s': no source account name matches the wildcard",
+                optname, glob);
+    return -1;
+  }
+
+  qsort(ids, n, sizeof(int32_t), identity_id_cmp);
+  size_t unique = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (unique == 0 || ids[unique - 1] != ids[i])
+      ids[unique++] = ids[i];
+  }
+  n = unique;
+
+  int runs = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (i == 0 || !identity_ids_adjacent(ids[i - 1], ids[i]))
+      runs++;
+  }
+
+  IdentityMap** map = is_group ? &config->groupmap : &config->usermap;
+  int* count = is_group ? &config->groupmap_count : &config->usermap_count;
+  if (*count > MAX_IDENTITY_MAP - runs) {
+    log_message(LOG_LEVEL_ERROR,
+                "%s FROM '%s': the name wildcard expands to %d rule(s), which would exceed "
+                "the maximum of %d map rules",
+                optname, glob, runs, MAX_IDENTITY_MAP);
+    free(ids);
+    return -1;
+  }
+
+  for (size_t i = 0; i < n;) {
+    size_t j = i;
+    while (j + 1 < n && identity_ids_adjacent(ids[j], ids[j + 1]))
+      j++;
+    IdentityMap rule;
+    rule.from = ids[i];
+    rule.from_hi = ids[j];
+    rule.to = to_rule->to;
+    rule.to_name = to_rule->to_name ? str_dup(to_rule->to_name) : NULL;
+    if (to_rule->to_name && !rule.to_name) {
+      free(ids);
+      return -1;
+    }
+    if (identity_append_rule(map, count, &rule) != 0) {
+      free(rule.to_name);
+      free(ids);
+      return -1;
+    }
+    i = j + 1;
+  }
+  free(ids);
+  return 0;
+}
+
 int identity_parse_map(Config* config, const char* value, bool is_group) {
   if (!config || !value || *value == '\0') {
     log_message(LOG_LEVEL_ERROR, "%smap requires a value", is_group ? "--group" : "--user");
@@ -509,6 +637,30 @@ int identity_parse_map(Config* config, const char* value, bool is_group) {
     char* to_token = colon + 1;
     IdentityMap parsed;
     memset(&parsed, 0, sizeof(parsed));
+    /* A FROM name wildcard (anything with a glob metacharacter other than the
+     * bare '*') is expanded against the sender's account database here, while
+     * the sender's passwd/group DB is still available; the resulting numeric
+     * rules travel on the wire like an explicit list.  The TO side is parsed
+     * first so every expanded rule shares it. */
+    if (strcmp(from_token, "*") != 0 && identity_token_has_glob(from_token)) {
+      if (identity_parse_to(to_token, is_group, &parsed.to, &parsed.to_name) != 0) {
+        log_message(LOG_LEVEL_ERROR, "%s could not parse TO '%s' in '%s'", optname, to_token,
+                    value);
+        free(list);
+        return -1;
+      }
+      if (identity_expand_from_glob(config, from_token, is_group, &parsed) != 0) {
+        free(parsed.to_name);
+        free(list);
+        return -1;
+      }
+      /* Every rule emitted by the expansion took its own str_dup of the name,
+       * so the parse-time copy is unreachable on success: release it here (the
+       * failure path above already does).  `parsed.to_name` is NULL for a
+       * numeric TO. */
+      free(parsed.to_name);
+      continue;
+    }
     if (identity_parse_from(from_token, is_group, &parsed.from, &parsed.from_hi) != 0) {
       log_message(LOG_LEVEL_ERROR,
                   "%s could not resolve FROM '%s' in '%s' (a name must exist on the "

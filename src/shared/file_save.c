@@ -714,27 +714,85 @@ static FileSaveResult file_save_directory_to_disk(const FileSavePlan* plan, bool
     return FILE_SAVE_ERROR;
   bool dir_existed = file_path_exists_secure(dir_path);
   bool ok = file_ensure_directory_secure(dir_path);
+  /* One confined, no-follow descriptor drives ownership/mode/xattr/timestamp
+     application so none of them can follow a same-named symlink planted after
+     the mkdir.  This mirrors the O_DIRECTORY|O_NOFOLLOW fd that
+     dir_metadata_list_apply() opens for the recursive path; the fd is reached
+     through the already-confined parent. */
+  char* leaf = NULL;
+  int parent_fd = -1;
+  int dir_fd = -1;
+  if (ok) {
+    parent_fd = file_open_secure_parent(dir_path, &leaf, false);
+    if (parent_fd >= 0)
+      dir_fd = openat(parent_fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  }
   /* P7 Wave E: apply the negotiated ownership to the directory ITSELF (not
      just the files inside it).  --copy-as and every explicit identity policy
      own every entry, so a directory must not keep the receiver's owner while
      its children get the policy owner.  Applied no-follow on the confined
-     parent fd after the mkdir; identity_apply_ownership_link() is itself a
-     no-op unless an identity policy is active. */
+     parent fd; identity_apply_ownership_link() is itself a no-op unless an
+     identity policy is active.  Ownership runs before the mode because a chown
+     clears setuid/setgid.  A failed REQUIRED --copy-as ownership fails the
+     entry; every other policy stays best-effort. */
   if (ok && file->metadata && identity_active_enabled()) {
-    char* leaf = NULL;
-    int parent_fd = file_open_secure_parent(dir_path, &leaf, false);
     if (parent_fd >= 0) {
       if (!identity_apply_ownership_link(parent_fd, leaf, (int32_t)file->metadata->uid,
                                          (int32_t)file->metadata->gid))
         ok = false;
-      close(parent_fd);
     } else if (identity_copy_as_active()) {
       /* The directory exists (ok) but its required --copy-as ownership could
          not be applied because the confined parent could not be opened. */
       ok = false;
     }
-    free(leaf);
+  } else if (ok && identity_copy_as_active()) {
+    ok = false;
   }
+  /* The final source MODE is deliberately NOT applied inline.  A restrictive
+     source mode (for example 0555) would make the directory unwritable before
+     its children are created, so a non-root receiver fails each child with
+     EACCES.  The receiver feeds every is_dir entry -- including this explicit
+     --dirs/STATUS_MKDIR one -- into the deferred DirTimeList, and
+     dir_metadata_list_apply() stamps the exact mode once the whole transfer has
+     finished, exactly as it does for the recursive path.  Leaving the directory
+     at its creation mode keeps it writable for the children until then.
+
+     The xattrs below are still applied inline so a direct
+     file_save_to_disk_full() caller (which has no deferred pass) also gets
+     --dirs directory xattrs.  Because the inline mode is absent, the inline
+     order here is ownership, then xattrs, then timestamps; the recursive path
+     (which DOES apply a mode) orders them times, mode, xattrs -- the difference
+     is intentional, and the deferred pass re-stamps mode and xattrs last.
+     Best-effort: a per-attribute failure is logged and skipped by
+     xattr_apply_fd(), never fatal. */
+  if (ok && plan->config && plan->config->use_xattrs && dir_fd >= 0 && file->xattrs)
+    xattr_apply_fd(dir_fd, file->xattrs);
+  /* Timestamps last so no later inline ownership/xattr change is mistaken for a
+     content update; the deferred pass re-stamps them after every child write.
+     -J/--omit-dir-times suppresses the directory mtime; --atimes/-U applies
+     only when the source atime is valid, exactly as the recursive path. */
+  if (ok && file->metadata && plan->config && plan->config->preserve_times &&
+      !plan->config->omit_dir_times) {
+    struct timespec times[2] = {
+        {.tv_sec = 0, .tv_nsec = UTIME_OMIT},
+        {.tv_sec = file->metadata->mtime_sec, .tv_nsec = file->metadata->mtime_nsec}};
+    if (plan->config->preserve_atimes && file->metadata->atime_valid) {
+      times[0].tv_sec = file->metadata->atime_sec;
+      times[0].tv_nsec = file->metadata->atime_nsec;
+    }
+    if (parent_fd >= 0 && utimensat(parent_fd, leaf, times, AT_SYMLINK_NOFOLLOW) != 0) {
+      int saved_errno = errno;
+      char* escaped_path = output_escape(dir_path, log_get_8_bit_output());
+      log_message(LOG_LEVEL_WARNING, "Failed to set directory timestamps on %s: %s",
+                  escaped_path ? escaped_path : "<allocation failed>", strerror(saved_errno));
+      free(escaped_path);
+    }
+  }
+  if (dir_fd >= 0)
+    close(dir_fd);
+  if (parent_fd >= 0)
+    close(parent_fd);
+  free(leaf);
   free(dir_path);
   if (ok && created && !dir_existed)
     *created = true;
