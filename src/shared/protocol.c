@@ -38,6 +38,129 @@ static atomic_ullong io_bytes_read = 0;
 
 static unsigned long long global_bwlimit(void);
 
+/* ------------------------------------------------------------------------- *
+ * Transport vtable implementations.
+ *
+ * Each op performs exactly one transfer attempt.  WANT_READ/WANT_WRITE and an
+ * EINTR-interrupted syscall are reported as PROTOCOL_IO_RETRY (with
+ * *wait_events set to the poll event the caller must wait on); a clean peer
+ * close is PROTOCOL_IO_CLOSED and anything else is PROTOCOL_IO_ERROR.  This
+ * keeps every WANT_READ/WANT_WRITE and EINTR retry exactly where it was before
+ * the vtable was introduced, just moved behind the function pointer.
+ * ------------------------------------------------------------------------- */
+
+static ssize_t plain_io_send(ProtocolSession* session, const void* data, size_t size,
+                             short* wait_events) {
+  ssize_t written = write(session->write_fd, data, size);
+  if (written < 0) {
+    if (errno == EINTR)
+      return PROTOCOL_IO_RETRY;
+    return PROTOCOL_IO_ERROR;
+  }
+  if (written == 0)
+    return PROTOCOL_IO_ERROR;
+  *wait_events = POLLOUT;
+  return written;
+}
+
+static ssize_t plain_io_recv(ProtocolSession* session, void* data, size_t size,
+                             short* wait_events) {
+  ssize_t received = read(session->read_fd, data, size);
+  if (received < 0) {
+    if (errno == EINTR)
+      return PROTOCOL_IO_RETRY;
+    return PROTOCOL_IO_ERROR;
+  }
+  if (received == 0)
+    return PROTOCOL_IO_CLOSED;
+  *wait_events = POLLIN;
+  return received;
+}
+
+static bool plain_io_has_pending(const ProtocolSession* session) {
+  (void)session;
+  return false;
+}
+
+static ssize_t tls_io_send(ProtocolSession* session, const void* data, size_t size,
+                           short* wait_events) {
+  /* SSL_write takes an int length; clamp a >INT_MAX request into chunks so the
+   * size_t downcast can never truncate into a negative/partial write. */
+  size_t chunk = size > (size_t)INT_MAX ? (size_t)INT_MAX : size;
+  ssize_t written = SSL_write(session->ssl, data, (int)chunk);
+  if (written <= 0) {
+    int ssl_err = SSL_get_error(session->ssl, (int)written);
+    if (ssl_err == SSL_ERROR_WANT_WRITE) {
+      *wait_events = POLLOUT;
+      return PROTOCOL_IO_RETRY;
+    }
+    if (ssl_err == SSL_ERROR_WANT_READ) {
+      *wait_events = POLLIN;
+      return PROTOCOL_IO_RETRY;
+    }
+    /* A signal (e.g. Ctrl-C) interrupts the blocking TLS write: retry so the
+     * send loop can observe the abort flag at the next checkpoint.  Only an
+     * actual negative return is an interrupted syscall; a 0-byte SSL_write is
+     * not a valid EINTR retry. */
+    if (written < 0 && ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
+      return PROTOCOL_IO_RETRY;
+    return PROTOCOL_IO_ERROR;
+  }
+  *wait_events = POLLOUT;
+  return written;
+}
+
+static ssize_t tls_io_recv(ProtocolSession* session, void* data, size_t size, short* wait_events) {
+  /* SSL_read takes an int length; clamp a >INT_MAX request into chunks
+   * (mirrors the send path) so the size_t downcast can never truncate into a
+   * negative/partial read. */
+  size_t chunk = size > (size_t)INT_MAX ? (size_t)INT_MAX : size;
+  ssize_t received = SSL_read(session->ssl, data, (int)chunk);
+  if (received <= 0) {
+    int ssl_err = SSL_get_error(session->ssl, (int)received);
+    if (ssl_err == SSL_ERROR_WANT_WRITE) {
+      *wait_events = POLLOUT;
+      return PROTOCOL_IO_RETRY;
+    }
+    if (ssl_err == SSL_ERROR_WANT_READ) {
+      *wait_events = POLLIN;
+      return PROTOCOL_IO_RETRY;
+    }
+    /* A signal interrupts the blocking TLS read: retry (mirrors the send path)
+     * so the loop reaches its next abort/deadline checkpoint.  Only an actual
+     * negative return is an interrupted syscall: a 0-byte SSL_read is an
+     * unexpected EOF (the peer closed without close_notify), which OpenSSL also
+     * reports as SSL_ERROR_SYSCALL with errno possibly still EINTR from an
+     * earlier interrupted poll/read.  Retrying that would busy-spin the
+     * status-read loop until its deadline, so classify it as closed instead. */
+    if (received < 0 && ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
+      return PROTOCOL_IO_RETRY;
+    /* A zero-length SSL_read is the peer's clean close_notify (or EOF without
+     * one); report it distinctly so the caller can log it as a close. */
+    if (received == 0)
+      return PROTOCOL_IO_CLOSED;
+    return PROTOCOL_IO_ERROR;
+  }
+  *wait_events = POLLIN;
+  return received;
+}
+
+static bool tls_io_has_pending(const ProtocolSession* session) {
+  return session->ssl != NULL && SSL_pending(session->ssl) > 0;
+}
+
+static const ProtocolIoOps plain_io_ops = {
+    .send = plain_io_send,
+    .recv = plain_io_recv,
+    .has_pending = plain_io_has_pending,
+};
+
+static const ProtocolIoOps tls_io_ops = {
+    .send = tls_io_send,
+    .recv = tls_io_recv,
+    .has_pending = tls_io_has_pending,
+};
+
 static bool protocol_reserve_memory(ProtocolSession* session, size_t charge) {
   unsigned long long allocated = atomic_load(&session->total_allocated_bytes);
   while (true) {
@@ -79,6 +202,7 @@ void io_set_fds(int read_fd, int write_fd) {
   legacy_io_session.read_fd = read_fd;
   legacy_io_session.write_fd = write_fd;
   legacy_io_session.ssl = NULL;
+  legacy_io_session.ops = &plain_io_ops;
   legacy_io_session.eight_bit_output = false;
   atomic_store(&legacy_io_session.total_allocated_bytes, 0);
   legacy_io_session.max_alloc = DEFAULT_MAX_ALLOC;
@@ -91,6 +215,7 @@ void protocol_session_init(ProtocolSession* session, int read_fd, int write_fd) 
   memset(session, 0, sizeof(*session));
   session->read_fd = read_fd;
   session->write_fd = write_fd;
+  session->ops = &plain_io_ops;
   session->max_alloc = DEFAULT_MAX_ALLOC;
   session->io_timeout_sec = RECEIVE_TIMEOUT_SEC;
   atomic_init(&session->total_allocated_bytes, 0);
@@ -158,8 +283,12 @@ void protocol_session_unbind(void) {
 }
 
 void protocol_session_set_ssl(ProtocolSession* session, SSL* ssl) {
-  if (session)
-    session->ssl = ssl;
+  if (!session)
+    return;
+  session->ssl = ssl;
+  /* Select the transport dispatch once, here, instead of branching on the SSL
+   * pointer inside every I/O loop. */
+  session->ops = ssl ? &tls_io_ops : &plain_io_ops;
 }
 
 static void bw_mutex_init(void) {
@@ -270,6 +399,20 @@ SSL* io_get_ssl(void) {
   return io_ssl;
 }
 
+SSL* protocol_current_ssl(void) {
+  /* The bound session is the authoritative transport for a worker thread: it
+   * was explicitly handed to protocol_session_bind() and carries its own SSL,
+   * whereas io_ssl is thread-local and NULL in a thread that never performed
+   * the handshake.  Only a session whose selected dispatch is TLS may supply
+   * the SSL: a bound plaintext session has ssl == NULL and must not shadow a
+   * live thread-local io_ssl, or file_send.c would take the raw sendfile(2)
+   * path on a socket this thread is driving with TLS.  With no TLS session
+   * bound (plaintext session, or the fd-shim path), fall back to io_ssl. */
+  if (bound_session && bound_session->ops == &tls_io_ops && bound_session->ssl)
+    return bound_session->ssl;
+  return io_ssl;
+}
+
 unsigned long long protocol_bytes_written(void) {
   return atomic_load(&io_bytes_written);
 }
@@ -298,6 +441,7 @@ static ProtocolSession* legacy_session(int read_fd, int write_fd) {
     protocol_session_set_bwlimit(&legacy_io_session, global_bwlimit());
   }
   legacy_io_session.ssl = io_ssl;
+  legacy_io_session.ops = io_ssl ? &tls_io_ops : &plain_io_ops;
   return &legacy_io_session;
 }
 
@@ -335,8 +479,9 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
   if (!data && data_size != 0)
     return false;
   log_debug_message(LOG_DEBUG_IO, "    Sending n Data: %zu", data_size);
-  if (!session)
+  if (!session || !session->ops)
     return false;
+  const ProtocolIoOps* ops = session->ops;
   /* A non-positive session timeout disables the deadline entirely (rsync's
    * --timeout=0 default); poll then blocks until the socket becomes writable. */
   int timeout_sec = session->io_timeout_sec > 0 ? session->io_timeout_sec : 0;
@@ -362,36 +507,16 @@ bool protocol_send_n_data(ProtocolSession* session, const void* data, size_t dat
       continue;
     if (pfd.revents & (POLLERR | POLLNVAL))
       return false;
-    ssize_t bytes_send;
-    if (session->ssl) {
-      /* SSL_write takes an int length; clamp a >INT_MAX request into chunks so
-       * the size_t downcast can never truncate into a negative/partial write. */
-      size_t ssl_chunk = chunk > (size_t)INT_MAX ? (size_t)INT_MAX : chunk;
-      bytes_send = SSL_write(session->ssl, (const char*)data + total_bytes_send, (int)ssl_chunk);
-    } else {
-      bytes_send = write(fd, (const char*)data + total_bytes_send, chunk);
-    }
+    ssize_t bytes_send =
+        ops->send(session, (const char*)data + total_bytes_send, chunk, &wait_events);
+    if (bytes_send == PROTOCOL_IO_RETRY)
+      continue;
     if (bytes_send <= 0) {
-      if (session->ssl) {
-        int ssl_err = SSL_get_error(session->ssl, (int)bytes_send);
-        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
-          wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
-          continue;
-        }
-        /* A signal (e.g. Ctrl-C) interrupts the blocking TLS write: retry so
-           the send loop can observe the abort flag at the next checkpoint. */
-        if (ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
-          continue;
-      } else if (errno == EINTR) {
-        continue;
-      }
       log_message(LOG_LEVEL_ERROR, "Could not send data");
       return false;
     }
     bw_throttle_session(session, (size_t)bytes_send);
     total_bytes_send += bytes_send;
-    if (session->ssl)
-      wait_events = POLLOUT;
   }
   log_debug_message(LOG_DEBUG_IO, "    Send n Data: %zd", total_bytes_send);
   atomic_fetch_add(&io_bytes_written, (unsigned long long)total_bytes_send);
@@ -424,14 +549,15 @@ bool protocol_receive_n_data(ProtocolSession* session, void* data, size_t data_s
 static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, size_t data_size,
                                           const struct timespec* deadline) {
   log_debug_message(LOG_DEBUG_IO, "    Receiving n Data: %zu", data_size);
-  if (!session)
+  if (!session || !session->ops)
     return false;
+  const ProtocolIoOps* ops = session->ops;
   int fd = session->read_fd;
 
   size_t total_bytes_received = 0;
   short wait_events = POLLIN;
   while (total_bytes_received < data_size) {
-    if (!session->ssl || SSL_pending(session->ssl) == 0) {
+    if (!ops->has_pending(session)) {
       struct pollfd pfd = {.fd = fd, .events = wait_events};
       /* A NULL deadline means "wait indefinitely" (timeout disabled). */
       int poll_result = poll(&pfd, 1, deadline ? deadline_remaining_ms(deadline) : -1);
@@ -449,43 +575,19 @@ static bool protocol_receive_n_data_until(ProtocolSession* session, void* data, 
         return false;
     }
 
-    ssize_t bytes_received;
-    if (session->ssl) {
-      /* SSL_read takes an int length; clamp a >INT_MAX request into chunks
-       * (mirrors the send path) so the size_t downcast can never truncate into
-       * a negative/partial read. */
-      size_t ssl_chunk = data_size - total_bytes_received > (size_t)INT_MAX
-                             ? (size_t)INT_MAX
-                             : data_size - total_bytes_received;
-      bytes_received = SSL_read(session->ssl, (char*)data + total_bytes_received, (int)ssl_chunk);
-    } else {
-      bytes_received =
-          read(fd, (char*)data + total_bytes_received, data_size - total_bytes_received);
+    ssize_t bytes_received = ops->recv(session, (char*)data + total_bytes_received,
+                                       data_size - total_bytes_received, &wait_events);
+    if (bytes_received == PROTOCOL_IO_RETRY)
+      continue;
+    if (bytes_received == PROTOCOL_IO_CLOSED) {
+      log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
+      return false;
     }
     if (bytes_received <= 0) {
-      if (session->ssl) {
-        int ssl_err = SSL_get_error(session->ssl, (int)bytes_received);
-        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
-          wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
-          continue;
-        }
-        /* A signal interrupts the blocking TLS read: retry (mirrors the send
-           path and protocol_read_status_until) so the loop reaches its next
-           abort/deadline checkpoint instead of failing spuriously. */
-        if (ssl_err == SSL_ERROR_SYSCALL && errno == EINTR)
-          continue;
-      } else if (errno == EINTR) {
-        continue;
-      }
-      if (bytes_received == 0)
-        log_message(LOG_LEVEL_ERROR, "Connection closed while receiving data");
-      else
-        log_message(LOG_LEVEL_ERROR, "Could not receive bytes");
+      log_message(LOG_LEVEL_ERROR, "Could not receive bytes");
       return false;
     }
     total_bytes_received += (size_t)bytes_received;
-    if (session->ssl)
-      wait_events = POLLIN;
   }
   log_debug_message(LOG_DEBUG_IO, "    Received n Data: %zu", total_bytes_received);
   atomic_fetch_add(&io_bytes_read, (unsigned long long)total_bytes_received);
@@ -845,11 +947,14 @@ bool protocol_receive_status_timed(ProtocolSession* session, Status* status, int
  * reply across a frame boundary.  Returns false on timeout/EOF/error. */
 static bool protocol_read_status_until(ProtocolSession* session, Status* status,
                                        const struct timespec* deadline) {
+  if (!session || !session->ops)
+    return false;
+  const ProtocolIoOps* ops = session->ops;
   Status received = STATUS_ERROR;
   size_t got = 0;
   short wait_events = POLLIN;
   while (got < sizeof(Status)) {
-    if (!session->ssl || SSL_pending(session->ssl) == 0) {
+    if (!ops->has_pending(session)) {
       int remaining_ms = deadline ? deadline_remaining_ms(deadline) : -1;
       if (remaining_ms == 0) {
         log_message(LOG_LEVEL_ERROR, "Receive timeout while reading status");
@@ -869,21 +974,11 @@ static bool protocol_read_status_until(ProtocolSession* session, Status* status,
       if (pfd.revents & (POLLERR | POLLNVAL))
         return false;
     }
-    ssize_t bytes_received;
-    if (session->ssl)
-      bytes_received = SSL_read(session->ssl, (char*)&received + got, sizeof(Status) - got);
-    else
-      bytes_received = read(session->read_fd, (char*)&received + got, sizeof(Status) - got);
+    ssize_t bytes_received =
+        ops->recv(session, (char*)&received + got, sizeof(Status) - got, &wait_events);
+    if (bytes_received == PROTOCOL_IO_RETRY)
+      continue;
     if (bytes_received <= 0) {
-      if (session->ssl) {
-        int ssl_err = SSL_get_error(session->ssl, (int)bytes_received);
-        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-          wait_events = ssl_err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
-          continue;
-        }
-      }
-      if (bytes_received < 0 && errno == EINTR)
-        continue;
       log_message(LOG_LEVEL_ERROR, "Connection closed while receiving status");
       return false;
     }
@@ -912,7 +1007,7 @@ bool protocol_receive_status_keepalive(ProtocolSession* session, Status* status,
   while (true) {
     if (abort_check && abort_check())
       return false;
-    if (!session->ssl || SSL_pending(session->ssl) == 0) {
+    if (!session->ops || !session->ops->has_pending(session)) {
       int remaining_ms = deadline_remaining_ms(&deadline);
       if (remaining_ms <= 0) {
         log_message(LOG_LEVEL_ERROR, "Receive timeout after %ds", timeout_sec);

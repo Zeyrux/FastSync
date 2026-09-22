@@ -134,16 +134,23 @@ static bool xattr_name_is_posix_acl(const char* name) {
 
 /* ---- SENDER: capture ---- */
 
-FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
+/* The two syscall families differ only in whether the FINAL component is
+ * followed (`listxattr`/`getxattr` follow; `llistxattr`/`lgetxattr` do not), so
+ * one common implementation backs both public entry points. */
+typedef ssize_t (*XattrListFn)(const char* path, char* list, size_t size);
+typedef ssize_t (*XattrGetFn)(const char* path, const char* name, void* value, size_t size);
+
+static FileXattrList* xattr_capture_common(const char* path, bool preserve_acls,
+                                           XattrListFn list_fn, XattrGetFn get_fn) {
   if (!path)
     return NULL;
-  ssize_t list_size = listxattr(path, NULL, 0);
+  ssize_t list_size = list_fn(path, NULL, 0);
   if (list_size <= 0)
     return NULL; /* no xattrs, ENOTSUP, or error: nothing appliable */
   char* names = malloc((size_t)list_size);
   if (!names)
     return NULL;
-  ssize_t got = listxattr(path, names, (size_t)list_size);
+  ssize_t got = list_fn(path, names, (size_t)list_size);
   if (got < 0) {
     free(names);
     return NULL;
@@ -166,7 +173,7 @@ FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
        negotiated.  Without it a plain -X capture never carries an ACL. */
     if (!xattr_name_appliable(name, preserve_acls))
       continue;
-    ssize_t value_size = getxattr(path, name, NULL, 0);
+    ssize_t value_size = get_fn(path, name, NULL, 0);
     if (value_size < 0)
       continue;
     if (value_size > XATTR_VALUE_MAX)
@@ -179,7 +186,7 @@ FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
       free(names);
       return NULL;
     }
-    ssize_t read_len = getxattr(path, name, buffer, (size_t)value_size);
+    ssize_t read_len = get_fn(path, name, buffer, (size_t)value_size);
     if (read_len < 0 || read_len != value_size) {
       free(buffer);
       continue;
@@ -199,6 +206,14 @@ FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
     return NULL;
   }
   return list;
+}
+
+FileXattrList* xattr_capture_path(const char* path, bool preserve_acls) {
+  return xattr_capture_common(path, preserve_acls, listxattr, getxattr);
+}
+
+FileXattrList* xattr_capture_path_nofollow(const char* path, bool preserve_acls) {
+  return xattr_capture_common(path, preserve_acls, llistxattr, lgetxattr);
 }
 
 /* ---- WIRE ---- */
@@ -361,6 +376,59 @@ bool xattr_apply_fd(int fd, const FileXattrList* list) {
   if (warned)
     log_message(LOG_LEVEL_WARNING, "could not set one or more xattrs on the destination file: %s",
                 strerror(first_errno));
+  return true;
+}
+
+/* Symlink counterpart of xattr_apply_fd(): target the link ITSELF, never its
+ * referent.  fsetxattr cannot be used (no *at xattr syscall exists, and the
+ * kernel rejects xattr syscalls on an O_PATH descriptor), so the already-open,
+ * confinement-checked parent directory is addressed through /proc/self/fd and
+ * the final component is applied with lsetxattr, which does not follow it.
+ *
+ * The list is trusted to come from xattr_receive() (already whitelisted), but
+ * every name is re-validated here so this path-based primitive is confined on
+ * its own -- this is the only apply primitive that addresses a path, and the
+ * header promises a whitelisted apply.  The apply is best-effort: if /proc is
+ * not mounted (the anchor cannot be formed) or the kernel refuses the set, the
+ * failure is skipped and never fails the transfer.  See xattr.h for the bounded
+ * residual TOCTOU between link creation and lsetxattr. */
+bool xattr_apply_path_nofollow(int parent_fd, const char* leaf, const FileXattrList* list,
+                               bool preserve_acls) {
+  if (parent_fd < 0 || !leaf || leaf[0] == '\0' || strchr(leaf, '/') != NULL || !list)
+    return false;
+  if (list->count == 0)
+    return true;
+  char prefix[64];
+  int prefix_len = snprintf(prefix, sizeof(prefix), "/proc/self/fd/%d/", parent_fd);
+  if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix))
+    return false;
+  size_t leaf_len = strlen(leaf);
+  char* path = malloc((size_t)prefix_len + leaf_len + 1);
+  if (!path)
+    return false;
+  memcpy(path, prefix, (size_t)prefix_len);
+  memcpy(path + prefix_len, leaf, leaf_len + 1);
+  bool warned = false;
+  int first_errno = 0;
+  for (int i = 0; i < list->count; i++) {
+    const FileXattr* xa = &list->items[i];
+    /* Defense in depth: re-validate against the receiver's full whitelist, so a
+       hand-crafted list can never apply a privileged namespace or the reserved
+       --fake-super key through this path-based primitive. */
+    if (!xattr_name_appliable(xa->name, preserve_acls))
+      continue;
+    if (lsetxattr(path, xa->name, xa->value, xa->value_len, 0) != 0) {
+      if (!warned) {
+        warned = true;
+        first_errno = errno;
+      }
+    }
+  }
+  if (warned)
+    log_message(LOG_LEVEL_WARNING,
+                "could not set one or more xattrs on the destination symlink: %s",
+                strerror(first_errno));
+  free(path);
   return true;
 }
 

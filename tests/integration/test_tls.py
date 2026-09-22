@@ -146,9 +146,16 @@ class TestTLSBasic:
         assert not missing, f"Missing files: {missing}"
         assert not mismatches, f"Mismatched files: {mismatches}"
 
-    @pytest.mark.xfail(reason="TLS multithreading has architectural limitations with per-thread SSL context")
+    @pytest.mark.ci
     def test_tls_with_multithreading(self, certs):
-        """TLS + multithreading."""
+        """TLS + multithreading + --sendfile.
+
+        Exercises the TLS/sendfile interaction end to end: with --sendfile the
+        sender must route the file body through the buffered TLS path rather
+        than raw sendfile(2) on the encrypted socket.  The focused decision
+        guard lives in tests/test_protocol.c
+        (test_tls_sendfile_decision_uses_buffered_path).
+        """
         clean_dir(DEST_DIR)
         with ServerManager() as server:
             server.start(extra_args=[
@@ -157,7 +164,7 @@ class TestTLSBasic:
             ])
             result, dur = run_client(
                 SOURCE_DIR, DEST_DIR,
-                flags=["--threads", "--tls",
+                flags=["--threads", "--sendfile", "--tls",
                        "--cert", certs["client_cert"], "--key", certs["client_key"],
                        "--ca", certs["ca"]],
                 port=server.port,

@@ -6638,6 +6638,68 @@ class TestExtendedAttributes:
         assert os.getxattr(os.path.join(received, "data.txt"), "user.k") == b"v"
 
     @pytest.mark.ci
+    def test_symlink_own_xattrs_never_referent(self, shared_server):
+        """Protocol 2.29.0: a symlink's STATUS_SYMLINK frame carries a trailing
+        xattr block captured with llistxattr/lgetxattr (no follow) and applied
+        with lsetxattr on the link itself.  Linux's VFS refuses to associate
+        xattrs with a symlink at all, so the portable guarantee asserted here is
+        the no-follow one: a referent that carries user.* must NOT have those
+        attributes appear on the destination symlink entry (the old
+        path-following capture would have copied the referent's attrs onto the
+        link).  On a platform/filesystem that does support symlink xattrs the
+        full round-trip of the link's own attribute is asserted too."""
+        source, dest = self._source_and_dest("symlink_xattr")
+        target = os.path.join(source, "target.txt")
+        with open(target, "wb") as fh:
+            fh.write(b"referent payload\n")
+        if not _xattr_supported(target):
+            pytest.skip("filesystem does not support user xattrs")
+        os.setxattr(target, "user.referent-only", b"referent-value")
+
+        link = os.path.join(source, "link")
+        os.symlink("target.txt", link)
+        link_xattr_supported = False
+        try:
+            os.setxattr(link, "user.link-own", b"link-value", follow_symlinks=False)
+            link_xattr_supported = os.getxattr(
+                link, "user.link-own", follow_symlinks=False
+            ) == b"link-value"
+        except (OSError, AttributeError, NotImplementedError):
+            link_xattr_supported = False
+
+        result, _ = run_client(source, dest, flags=["-aX"], port=shared_server.port)
+        assert result.returncode == 0, \
+            f"-aX symlink sync failed: {(result.stderr or result.stdout)[:300]}"
+        received = get_dest_received_dir(dest, source)
+        dst_link = os.path.join(received, "link")
+        assert os.path.islink(dst_link), "destination link entry is not a symlink"
+        assert os.readlink(dst_link) == "target.txt"
+
+        # The no-follow guarantee.  Checking only the link's own xattr list is
+        # vacuous on Linux (lsetxattr on a symlink always fails EPERM), so also
+        # prove the apply never followed the link: the destination REFERENT must
+        # keep its own user.* value untouched.
+        dst_target = os.path.join(received, "target.txt")
+        assert os.getxattr(dst_target, "user.referent-only") == b"referent-value", (
+            "the destination symlink apply followed the link and rewrote the "
+            "referent's xattr"
+        )
+        link_names = os.listxattr(dst_link, follow_symlinks=False)
+        assert "user.referent-only" not in link_names, (
+            "the destination symlink captured its REFERENT's xattr "
+            "(path-following capture bug)"
+        )
+        if sys.platform.startswith("linux"):
+            assert link_names == [], (
+                "Linux associates no xattrs with a symlink; the link entry must "
+                "carry none"
+            )
+        if link_xattr_supported:
+            assert os.getxattr(
+                dst_link, "user.link-own", follow_symlinks=False
+            ) == b"link-value", "the symlink's own xattr did not round-trip"
+
+    @pytest.mark.ci
     def test_acls_via_posix_acl_xattr(self, shared_server):
         source, dest = self._source_and_dest("acl")
         f = os.path.join(source, "data.txt")
