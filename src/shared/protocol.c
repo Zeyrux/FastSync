@@ -270,6 +270,17 @@ SSL* io_get_ssl(void) {
   return io_ssl;
 }
 
+SSL* protocol_current_ssl(void) {
+  /* The bound session is the authoritative transport for a worker thread: it
+   * was explicitly handed to protocol_session_bind() and carries its own SSL,
+   * whereas io_ssl is thread-local and NULL in a thread that never performed
+   * the handshake.  With no session bound (the fd-shim path), fall back to the
+   * legacy thread-local SSL. */
+  if (bound_session)
+    return bound_session->ssl;
+  return io_ssl;
+}
+
 unsigned long long protocol_bytes_written(void) {
   return atomic_load(&io_bytes_written);
 }

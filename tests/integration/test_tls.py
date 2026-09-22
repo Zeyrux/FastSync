@@ -146,7 +146,6 @@ class TestTLSBasic:
         assert not missing, f"Missing files: {missing}"
         assert not mismatches, f"Mismatched files: {mismatches}"
 
-    @pytest.mark.xfail(reason="TLS multithreading has architectural limitations with per-thread SSL context")
     def test_tls_with_multithreading(self, certs):
         """TLS + multithreading."""
         clean_dir(DEST_DIR)
