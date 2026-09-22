@@ -10,6 +10,8 @@
 #include "protocol.h"
 #include "test_utils.h"
 #include "utils.h"
+#include <fnmatch.h>
+#include <grp.h>
 #include <pwd.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -3537,6 +3539,172 @@ static void test_parse_args_usermap_rsync_forms() {
   config_delete(cfg);
 }
 
+/* Independent oracle for the FROM name-glob tests: enumerate the sender's
+ * account database and fill `ids` with the DISTINCT ids whose name matches
+ * `glob`, sorted ascending.  Returns the count (bounded by `max`). */
+static int cli_collect_glob_ids(const char* glob, bool is_group, int32_t* ids, int max) {
+  int n = 0;
+  if (is_group) {
+    setgrent();
+    struct group* gr;
+    while ((gr = getgrent()) != NULL) {
+      if (fnmatch(glob, gr->gr_name, 0) != 0)
+        continue;
+      if ((unsigned long)gr->gr_gid > (unsigned long)INT32_MAX)
+        continue;
+      int32_t id = (int32_t)gr->gr_gid;
+      bool dup = false;
+      for (int i = 0; i < n; i++)
+        if (ids[i] == id)
+          dup = true;
+      if (!dup && n < max)
+        ids[n++] = id;
+    }
+    endgrent();
+  } else {
+    setpwent();
+    struct passwd* pw;
+    while ((pw = getpwent()) != NULL) {
+      if (fnmatch(glob, pw->pw_name, 0) != 0)
+        continue;
+      if ((unsigned long)pw->pw_uid > (unsigned long)INT32_MAX)
+        continue;
+      int32_t id = (int32_t)pw->pw_uid;
+      bool dup = false;
+      for (int i = 0; i < n; i++)
+        if (ids[i] == id)
+          dup = true;
+      if (!dup && n < max)
+        ids[n++] = id;
+    }
+    endpwent();
+  }
+  for (int i = 1; i < n; i++) {
+    int32_t key = ids[i];
+    int j = i - 1;
+    while (j >= 0 && ids[j] > key) {
+      ids[j + 1] = ids[j];
+      j--;
+    }
+    ids[j + 1] = key;
+  }
+  return n;
+}
+
+static int cli_count_runs(const int32_t* ids, int n) {
+  int runs = 0;
+  for (int i = 0; i < n; i++) {
+    if (i == 0 || ids[i - 1] == INT32_MAX || ids[i] != ids[i - 1] + 1)
+      runs++;
+  }
+  return runs;
+}
+
+/* #294: a FROM name wildcard must expand, at CLI-parse time, against the
+ * sender's account database into numeric id/range rules.  Prefer a prefix that
+ * matches >=2 DISTINCT NON-contiguous ids (exercising multi-rule expansion); if
+ * no such prefix exists on this host, fall back to one whose ids are contiguous
+ * (exercising range collapse).  The expected rules are derived independently by
+ * enumerating the same database. */
+static void test_parse_args_identity_map_from_name_glob(bool is_group) {
+  int32_t ids[512];
+  int chosen_n = 0;
+  int chosen_runs = 0;
+  char chosen_c = 0;
+  for (char c = 'a'; c <= 'z'; c++) {
+    const char glob[3] = {c, '*', '\0'};
+    int n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+    if (n < 2)
+      continue;
+    int runs = cli_count_runs(ids, n);
+    if (runs >= 2 || chosen_c == 0) {
+      chosen_c = c;
+      chosen_n = n;
+      chosen_runs = runs;
+    }
+    if (runs >= 2)
+      break;
+  }
+  if (chosen_c == 0)
+    return; /* no multi-match prefix on this host (skipped, not failed) */
+
+  const char glob[3] = {chosen_c, '*', '\0'};
+  chosen_n = cli_collect_glob_ids(glob, is_group, ids, (int)(sizeof(ids) / sizeof(ids[0])));
+  chosen_runs = cli_count_runs(ids, chosen_n);
+  EXPECT_TRUE(chosen_n >= 2);
+
+  char map_value[16];
+  snprintf(map_value, sizeof(map_value), "%s:@0", glob);
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", is_group ? "--groupmap" : "--usermap", map_value, "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), 0);
+
+  int got = is_group ? cfg->groupmap_count : cfg->usermap_count;
+  EXPECT_EQ_INT(got, chosen_runs);
+  const IdentityMap* map = is_group ? cfg->groupmap : cfg->usermap;
+  /* Every matched id is covered by some expanded rule. */
+  for (int i = 0; i < chosen_n; i++) {
+    bool covered = false;
+    for (int r = 0; r < got; r++)
+      if (ids[i] >= map[r].from && ids[i] <= map[r].from_hi)
+        covered = true;
+    EXPECT_TRUE(covered);
+  }
+  /* Every id inside every expanded range is one the glob actually matched, so
+   * the range collapse cannot over-match a name that does not fit the glob. */
+  for (int r = 0; r < got; r++) {
+    EXPECT_EQ_INT(map[r].to, 0);
+    for (int32_t v = map[r].from; v <= map[r].from_hi; v++) {
+      bool expected = false;
+      for (int i = 0; i < chosen_n; i++)
+        if (ids[i] == v)
+          expected = true;
+      EXPECT_TRUE(expected);
+      if (v == INT32_MAX)
+        break;
+    }
+  }
+  config_delete(cfg);
+}
+
+static void test_parse_args_usermap_from_name_glob() {
+  test_parse_args_identity_map_from_name_glob(false);
+}
+
+static void test_parse_args_groupmap_from_name_glob() {
+  test_parse_args_identity_map_from_name_glob(true);
+}
+
+/* #294: an expansion that would push the map past MAX_IDENTITY_MAP must fail
+ * with a clear error rather than silently truncating.  Prefill the map to the
+ * cap and then add a wildcard guaranteed to match at least the current user. */
+static void test_parse_args_identity_map_from_name_glob_over_cap() {
+  const struct passwd* self = getpwuid(geteuid());
+  if (!self || self->pw_name[0] == '\0')
+    return;
+  char glob[8];
+  snprintf(glob, sizeof(glob), "%c*", self->pw_name[0]);
+
+  size_t need = (size_t)MAX_IDENTITY_MAP * 6 + strlen(glob) + 4 + 1;
+  char* value = malloc(need);
+  if (!value)
+    return;
+  size_t off = 0;
+  for (int i = 0; i < MAX_IDENTITY_MAP; i++)
+    off += (size_t)snprintf(value + off, need - off, "@0:@0,");
+  snprintf(value + off, need - off, "%s:@0", glob);
+
+  Config* cfg = config_create();
+  char* argv[] = {"fastsync", "--usermap", value, "/src", "/dst"};
+  int positional_args[2];
+  int positional_count = 0;
+  EXPECT_EQ_INT(parse_args(cfg, 5, argv, positional_args, &positional_count), -1);
+  config_delete(cfg);
+  free(value);
+}
+
 /* #294: rsync refuses to mix --chown with --usermap/--groupmap on the same
  * side (either order).  --chown=USER conflicts with a prior --usermap;
  * --chown=:GROUP conflicts with a prior --groupmap; the opposite side is fine. */
@@ -3716,7 +3884,8 @@ static void test_parse_args_rejects_malformed_identity() {
       {"--usermap", "definitely_not_a_real_user_zzz:@1"},
       {"--usermap", "0-"},
       {"--usermap", "5-2:@1"},
-      {"--usermap", "roo*:@1"},
+      {"--usermap", "zzz_definitely_no_such_user_glob_zzz*:@1"},
+      {"--groupmap", "zzz_definitely_no_such_group_glob_zzz*:@1"},
       {"--groupmap", "@1"},
       {"--groupmap", "no_such_group_qqq:x"},
       {"--chown", "a:b:c"},
@@ -4882,6 +5051,9 @@ void test_client_cli() {
   test_parse_args_groupmap();
   test_parse_args_usermap_name_resolution();
   test_parse_args_usermap_rsync_forms();
+  test_parse_args_usermap_from_name_glob();
+  test_parse_args_groupmap_from_name_glob();
+  test_parse_args_identity_map_from_name_glob_over_cap();
   test_parse_args_identity_map_chown_conflict();
   test_parse_args_chown();
   test_parse_args_copy_as();

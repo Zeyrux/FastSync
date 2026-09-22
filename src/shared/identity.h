@@ -25,8 +25,14 @@
 
 /* Parse one --usermap= / --groupmap= value (comma-separated FROM:TO rules,
  * first match wins) into config->usermap / config->groupmap.  is_group selects
- * the group tables and name databases.  Returns 0 on success, -1 on a
- * malformed spec or an unresolvable name (never a silent no-op). */
+ * the group tables and name databases.  A FROM name wildcard (containing `*`,
+ * `?` or `[...]`, but not the bare `*`) is expanded against the SENDER's
+ * account database at parse time into one or more numeric id/range rules
+ * (contiguous ids collapse to a range) sharing the same TO, because only
+ * numeric ids cross the wire; the expansion is capped at MAX_IDENTITY_MAP and a
+ * wildcard matching no account is an error.  Returns 0 on success, -1 on a
+ * malformed spec, an unresolvable name, an unmatched wildcard, or a map that
+ * would exceed MAX_IDENTITY_MAP (never a silent no-op). */
 int identity_parse_map(Config* config, const char* value, bool is_group);
 
 /* Parse --chown=USER:GROUP.  Supports USER:GROUP, USER (owner only), :GROUP
