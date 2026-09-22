@@ -106,12 +106,16 @@ static void test_client_connect_tls_releases_fd_on_setup_failure() {
   EXPECT_EQ_INT(getsockname(s->file_descriptor, (struct sockaddr*)&bound, &bound_len), 0);
   int port = ntohs(bound.sin_port);
 
-  int before = tls_count_open_fds();
+  /* The /proc/self/fd delta is unreliable under valgrind (its own lazy fd
+   * activity perturbs the baseline); keep the functional assertions and skip
+   * only the count checks there. */
+  bool check_fds = !is_running_under_valgrind();
+  int before = check_fds ? tls_count_open_fds() : -1;
   Client* c = client_create();
   EXPECT_NOT_NULL(c);
   EXPECT_FALSE(client_connect_tls(c, "127.0.0.1", port, NULL, NULL, NULL));
   EXPECT_TRUE(c->file_descriptor == -1);
-  if (before >= 0)
+  if (check_fds && before >= 0)
     EXPECT_EQ_INT(tls_count_open_fds(), before);
   client_delete(c);
   server_delete(&s);

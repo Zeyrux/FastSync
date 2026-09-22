@@ -266,12 +266,36 @@ static int count_open_fds(void) {
   return count;
 }
 
+/* True when two sockaddrs name the same endpoint (family, address, and port).
+ * Comparing only the IP would let a connection to a different port on the same
+ * host pass, so the port is part of the identity. */
+static bool sockaddr_same_endpoint(const struct sockaddr_storage* a,
+                                   const struct sockaddr_storage* b) {
+  if (a->ss_family != b->ss_family)
+    return false;
+  if (a->ss_family == AF_INET) {
+    const struct sockaddr_in* ia = (const struct sockaddr_in*)a;
+    const struct sockaddr_in* ib = (const struct sockaddr_in*)b;
+    return ia->sin_port == ib->sin_port && ia->sin_addr.s_addr == ib->sin_addr.s_addr;
+  }
+  if (a->ss_family == AF_INET6) {
+    const struct sockaddr_in6* ia = (const struct sockaddr_in6*)a;
+    const struct sockaddr_in6* ib = (const struct sockaddr_in6*)b;
+    return ia->sin6_port == ib->sin6_port &&
+           memcmp(&ia->sin6_addr, &ib->sin6_addr, sizeof(ia->sin6_addr)) == 0;
+  }
+  return false;
+}
+
 /* Bind + listen on the SECOND address getaddrinfo returns for "localhost", so
  * the first candidate is connection-refused and the shared connect loop must
- * fall back to a later one.  Returns the listener fd and its port, or -1 when
- * this host does not resolve localhost to at least two addresses (the test then
- * skips rather than claiming coverage it does not have). */
-static int bind_second_localhost_address(int* out_port) {
+ * fall back to a later one.  On success the actual bound endpoint is written to
+ * out_bound/out_bound_len (the caller asserts the winning connect landed on it).
+ * Returns the listener fd and its port, or -1 when this host does not resolve
+ * localhost to at least two addresses (the test then skips rather than claiming
+ * coverage it does not have). */
+static int bind_second_localhost_address(int* out_port, struct sockaddr_storage* out_bound,
+                                         socklen_t* out_bound_len) {
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
@@ -303,6 +327,10 @@ static int bind_second_localhost_address(int* out_port) {
     freeaddrinfo(res);
     return -1;
   }
+  if (out_bound)
+    *out_bound = bound;
+  if (out_bound_len)
+    *out_bound_len = bound_len;
   if (bound.ss_family == AF_INET6)
     *out_port = ntohs(((struct sockaddr_in6*)&bound)->sin6_port);
   else
@@ -316,18 +344,29 @@ static int bind_second_localhost_address(int* out_port) {
  * (proving the failed attempt's fd was closed before the retry). */
 static void test_tcp_connect_falls_back_to_next_address() {
   int port = 0;
-  int listener = bind_second_localhost_address(&port);
+  struct sockaddr_storage bound;
+  int listener = bind_second_localhost_address(&port, &bound, NULL);
   if (listener < 0)
     return; /* localhost is single-address on this host: cannot exercise fallback */
-  int before = count_open_fds();
+
+  /* The /proc/self/fd delta is unreliable under valgrind (its own lazy fd
+   * activity perturbs the baseline), so only the functional assertions run
+   * there; the fd-count checks are skipped. */
+  bool check_fds = !is_running_under_valgrind();
+  int before = check_fds ? count_open_fds() : -1;
+
   Client* c = client_create();
   EXPECT_NOT_NULL(c);
   EXPECT_TRUE(client_connect(c, "localhost", port));
   EXPECT_TRUE(c->file_descriptor >= 0);
-  if (before >= 0)
+  /* The winning candidate must be the endpoint we bound (the second
+   * getaddrinfo entry).  Without this, a re-resolution that dropped the second
+   * address would make the test pass without ever exercising fallback. */
+  EXPECT_TRUE(sockaddr_same_endpoint(&c->address, &bound));
+  if (check_fds && before >= 0)
     EXPECT_EQ_INT(count_open_fds(), before + 1);
   client_disconnect(c);
-  if (before >= 0)
+  if (check_fds && before >= 0)
     EXPECT_EQ_INT(count_open_fds(), before);
   client_delete(c);
   close(listener);
@@ -336,7 +375,13 @@ static void test_tcp_connect_falls_back_to_next_address() {
 /* #219 AC3: a connect that fails on every candidate leaves at most one
  * descriptor (the last failed attempt) and none after client_disconnect. */
 static void test_tcp_connect_failed_attempts_do_not_leak_fds() {
-  /* Reserve an ephemeral port, then close it: connecting to it must fail. */
+  if (is_running_under_valgrind())
+    return; /* /proc/self/fd delta is perturbed by valgrind's own lazy fds */
+
+  /* Keep an ephemeral loopback port bound (but NOT listening) for the whole
+   * assertion: the port stays occupied by our own socket, so the kernel
+   * deterministically refuses a connect() to it.  This closes the bind/close/
+   * connect TOCTOU window in which a parallel test could claim the port. */
   int probe = socket(AF_INET, SOCK_STREAM, 0);
   EXPECT_TRUE(probe >= 0);
   struct sockaddr_in addr;
@@ -348,18 +393,20 @@ static void test_tcp_connect_failed_attempts_do_not_leak_fds() {
   socklen_t addr_len = sizeof(addr);
   EXPECT_EQ_INT(getsockname(probe, (struct sockaddr*)&addr, &addr_len), 0);
   int port = ntohs(addr.sin_port);
-  close(probe);
 
   int before = count_open_fds();
   Client* c = client_create();
   EXPECT_NOT_NULL(c);
-  EXPECT_FALSE(client_connect(c, "localhost", port));
+  /* The literal loopback address has a single getaddrinfo candidate -- the one
+   * our bound socket owns -- so the connect is deterministically refused. */
+  EXPECT_FALSE(client_connect(c, "127.0.0.1", port));
   if (before >= 0)
     EXPECT_TRUE(count_open_fds() <= before + 1);
   client_disconnect(c);
   if (before >= 0)
     EXPECT_EQ_INT(count_open_fds(), before);
   client_delete(c);
+  close(probe);
 }
 
 /* #219 AC3: the shared tcp_connect_socket_ex() (used by both the plain and TLS
